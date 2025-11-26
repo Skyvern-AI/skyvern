@@ -50,8 +50,12 @@ UPLOAD_GOAL = """- The intention to upload a file: {intention}.
 
 
 async def _get_element_id_by_selector(selector: str, page: Page) -> str | None:
-    locator = page.locator(selector)
-    element_id = await locator.get_attribute("unique_id")
+    try:
+        locator = page.locator(selector)
+        element_id = await locator.get_attribute("unique_id", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+    except Exception:
+        LOG.exception("Failed to get element id by selector", selector=selector)
+        return None
     return element_id
 
 
@@ -549,6 +553,87 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 print(result)
             print(f"{'-' * 50}\n")
         return result
+
+    async def ai_locate_element(
+        self,
+        prompt: str,
+    ) -> str | None:
+        """Locate an element on the page using AI and return its XPath selector.
+
+        Args:
+            prompt: Natural language description of the element to locate (e.g., 'find "download invoices" button')
+
+        Returns:
+            XPath selector string (e.g., 'xpath=//button[@id="download"]') or None if not found
+        """
+        scraped_page_refreshed = await self.scraped_page.refresh()
+        context = skyvern_context.ensure_context()
+
+        prompt_rendered = _render_template_with_label(prompt, label=self.current_label)
+
+        locate_element_prompt = load_prompt_with_elements(
+            element_tree_builder=scraped_page_refreshed,
+            prompt_engine=prompt_engine,
+            template_name="single-locate-element",
+            html_need_skyvern_attrs=True,
+            data_extraction_goal=prompt_rendered,
+            current_url=scraped_page_refreshed.url,
+            local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
+        )
+
+        step = None
+        if context.organization_id and context.task_id and context.step_id:
+            step = await app.DATABASE.get_step(
+                step_id=context.step_id,
+                organization_id=context.organization_id,
+            )
+
+        result = await app.EXTRACTION_LLM_API_HANDLER(
+            prompt=locate_element_prompt,
+            step=step,
+            screenshots=scraped_page_refreshed.screenshots,
+            prompt_name="single-locate-element",
+        )
+
+        if not result or not isinstance(result, dict):
+            LOG.error(
+                "AI locate element failed - invalid result",
+                result=result,
+                result_type=type(result).__name__,
+                prompt=prompt_rendered,
+            )
+            return None
+
+        element_id = result.get("element_id", None)
+        confidence = result.get("confidence_float", 0.0)
+
+        xpath: str | None = None
+        if element_id:
+            skyvern_element_data = scraped_page_refreshed.id_to_element_dict.get(element_id)
+            if skyvern_element_data and "xpath" in skyvern_element_data:
+                xpath = skyvern_element_data.get("xpath")
+
+        if not xpath:
+            xpath = result.get("xpath", None)
+
+        if not xpath:
+            LOG.error(
+                "AI locate element failed - no xpath in element data",
+                element_id=element_id,
+                result=result,
+                prompt=prompt_rendered,
+            )
+            return None
+
+        LOG.info(
+            "AI locate element result",
+            element_id=element_id,
+            xpath=xpath,
+            confidence=confidence,
+            prompt=prompt_rendered,
+        )
+
+        return xpath
 
     async def ai_act(
         self,

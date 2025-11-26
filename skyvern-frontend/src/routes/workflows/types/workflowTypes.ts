@@ -288,6 +288,7 @@ export type WorkflowBlockBase = {
   output_parameter: OutputParameter;
   continue_on_failure: boolean;
   model: WorkflowModel | null;
+  next_block_label?: string | null;
 };
 
 export type TaskBlock = WorkflowBlockBase & {
@@ -522,6 +523,7 @@ export type HttpRequestBlock = WorkflowBlockBase & {
 };
 
 export type WorkflowDefinition = {
+  version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
 };

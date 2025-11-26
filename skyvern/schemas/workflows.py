@@ -22,6 +22,7 @@ class BlockType(StrEnum):
     TASK = "task"
     TaskV2 = "task_v2"
     FOR_LOOP = "for_loop"
+    CONDITIONAL = "conditional"
     CODE = "code"
     TEXT_PROMPT = "text_prompt"
     DOWNLOAD_TO_S3 = "download_to_s3"
@@ -197,9 +198,21 @@ class OutputParameterYAML(ParameterYAML):
 
 class BlockYAML(BaseModel, abc.ABC):
     block_type: BlockType
-    label: str
+    label: str = Field(description="Author-facing identifier; must be unique per workflow.")
+    next_block_label: str | None = Field(
+        default=None,
+        description="Optional pointer to the label of the next block. "
+        "When omitted, it will default to sequential order. See [[s-4bnl]].",
+    )
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
+
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("Block labels cannot be empty.")
+        return value
 
 
 class TaskBlockYAML(BlockYAML):
@@ -530,6 +543,7 @@ BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_t
 
 
 class WorkflowDefinitionYAML(BaseModel):
+    version: int = 1
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
 

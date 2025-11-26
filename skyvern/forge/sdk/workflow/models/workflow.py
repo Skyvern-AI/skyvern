@@ -51,6 +51,7 @@ class RunWorkflowResponse(BaseModel):
 
 
 class WorkflowDefinition(BaseModel):
+    version: int = 1
     parameters: list[PARAMETER_TYPE]
     blocks: List[BlockTypeVar]
 

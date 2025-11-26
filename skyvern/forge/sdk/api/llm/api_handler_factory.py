@@ -2,7 +2,7 @@ import dataclasses
 import json
 import time
 from asyncio import CancelledError
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 import litellm
 import structlog
@@ -38,6 +38,19 @@ from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension,
 LOG = structlog.get_logger()
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
+
+
+@runtime_checkable
+class RouterWithModelList(Protocol):
+    model_list: list[dict[str, Any]]
+
+
+def _get_primary_model_dict(router: Any, main_model_group: str) -> dict[str, Any] | None:
+    if isinstance(router, RouterWithModelList):
+        for model_dict in router.model_list:
+            if model_dict.get("model_name") == main_model_group:
+                return model_dict
+    return None
 
 
 class LLMCallStats(BaseModel):
@@ -88,9 +101,34 @@ class LLMAPIHandlerFactory:
                 check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
             except Exception:
                 check_model = model_label
+
+        # Check reasoning support (safe call - log but don't fail if litellm errors)
+        supports_reasoning = False
+        if check_model:
+            try:
+                supports_reasoning = litellm.supports_reasoning(model=check_model)
+            except Exception as exc:  # pragma: no cover - diagnostic safeguard
+                LOG.debug(
+                    "Failed to check reasoning support via litellm",
+                    model=check_model,
+                    error=str(exc),
+                )
+
         try:
-            # Early return if model doesn't support reasoning
-            if check_model and not litellm.supports_reasoning(model=check_model):
+            # Gemini router/fallback configs (e.g., gemini-2.5-pro-gpt-5-fallback-router)
+            # are not recognized by litellm, but they do support reasoning budgets.
+            if not supports_reasoning and model_label:
+                model_label_lower = model_label.lower()
+                if "gemini" in model_label_lower and "fallback" in model_label_lower:
+                    supports_reasoning = True
+                    LOG.info(
+                        "Forcing reasoning support for Gemini fallback model",
+                        prompt_name=prompt_name,
+                        budget=new_budget,
+                        model=model_label,
+                    )
+
+            if check_model and not supports_reasoning:
                 LOG.info(
                     "Thinking budget optimization not supported for model",
                     prompt_name=prompt_name,
@@ -251,7 +289,8 @@ class LLMAPIHandlerFactory:
             use_message_history: bool = False,
             raw_response: bool = False,
             window_dimension: Resolution | None = None,
-        ) -> dict[str, Any]:
+            force_dict: bool = True,
+        ) -> dict[str, Any] | Any:
             """
             Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
 
@@ -340,18 +379,36 @@ class LLMAPIHandlerFactory:
 
             vertex_cache_attached = False
             cache_resource_name = getattr(context, "vertex_cache_name", None)
+            primary_model_dict = _get_primary_model_dict(router, main_model_group)
+
+            # Add cached_content to primary model's litellm_params (not global parameters)
+            # This ensures it's only passed to the Gemini primary, not to fallback models.
+            # By setting it in the model-specific litellm_params, LiteLLM will only include it
+            # when calling the primary model. When falling back to GPT-5, the fallback model's
+            # litellm_params won't have cached_content, so it won't be sent.
             if (
                 cache_resource_name
                 and prompt_name == EXTRACT_ACTION_PROMPT_NAME
                 and getattr(context, "use_prompt_caching", False)
+                and "gemini" in main_model_group.lower()
+                and primary_model_dict is not None
             ):
-                parameters = {**parameters, "cached_content": cache_resource_name}
+                litellm_params = primary_model_dict.setdefault("litellm_params", {})
+                litellm_params["cached_content"] = cache_resource_name
                 vertex_cache_attached = True
                 LOG.info(
-                    "Adding Vertex AI cache reference to router request",
+                    "Adding Vertex AI cache reference to primary model in router",
                     prompt_name=prompt_name,
-                    cache_attached=True,
+                    primary_model=main_model_group,
+                    fallback_model=llm_config.fallback_model_group,
                 )
+            elif primary_model_dict and "litellm_params" in primary_model_dict:
+                if primary_model_dict["litellm_params"].pop("cached_content", None):
+                    LOG.info(
+                        "Removed Vertex AI cache reference from primary model in router",
+                        prompt_name=prompt_name,
+                        primary_model=main_model_group,
+                    )
 
             llm_request_payload = {
                 "model": llm_key,
@@ -482,7 +539,7 @@ class LLMAPIHandlerFactory:
                     reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_token_count=cached_tokens if cached_tokens > 0 else None,
                 )
-            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
             parsed_response_json = json.dumps(parsed_response, indent=2)
             if step and not is_speculative_step:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
@@ -585,7 +642,8 @@ class LLMAPIHandlerFactory:
             use_message_history: bool = False,
             raw_response: bool = False,
             window_dimension: Resolution | None = None,
-        ) -> dict[str, Any]:
+            force_dict: bool = True,
+        ) -> dict[str, Any] | Any:
             start_time = time.time()
             active_parameters = base_parameters or {}
             if parameters is None:
@@ -677,6 +735,7 @@ class LLMAPIHandlerFactory:
                 cache_resource_name
                 and prompt_name == EXTRACT_ACTION_PROMPT_NAME
                 and getattr(context, "use_prompt_caching", False)
+                and "gemini" in model_name.lower()
             ):
                 active_parameters["cached_content"] = cache_resource_name
                 vertex_cache_attached = True
@@ -685,6 +744,14 @@ class LLMAPIHandlerFactory:
                     prompt_name=prompt_name,
                     cache_attached=True,
                 )
+            elif "cached_content" in active_parameters:
+                removed_cache = active_parameters.pop("cached_content", None)
+                if removed_cache:
+                    LOG.info(
+                        "Removed Vertex AI cache reference from request",
+                        prompt_name=prompt_name,
+                        cache_was_attached=True,
+                    )
 
             llm_request_payload = {
                 "model": model_name,
@@ -816,7 +883,7 @@ class LLMAPIHandlerFactory:
                     cached_token_count=cached_tokens if cached_tokens > 0 else None,
                     thought_cost=llm_cost,
                 )
-            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(parsed_response, indent=2).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
@@ -957,8 +1024,9 @@ class LLMCaller:
         use_message_history: bool = False,
         raw_response: bool = False,
         window_dimension: Resolution | None = None,
+        force_dict: bool = True,
         **extra_parameters: Any,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | Any:
         start_time = time.perf_counter()
         active_parameters = self.base_parameters or {}
         if parameters is None:
@@ -1140,7 +1208,7 @@ class LLMCaller:
         if raw_response:
             return response.model_dump(exclude_none=True)
 
-        parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix)
+        parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix, force_dict)
         parsed_response_json = json.dumps(parsed_response, indent=2)
         if step and not is_speculative_step:
             await app.ARTIFACT_MANAGER.create_llm_artifact(
