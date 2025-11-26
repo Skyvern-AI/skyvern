@@ -3174,6 +3174,7 @@ class WorkflowService:
                 disable_cache=block_yaml.disable_cache,
                 complete_on_download=True,
                 complete_verification=True,
+                include_action_history_in_verification=True,
                 download_timeout=block_yaml.download_timeout,
             )
         elif block_yaml.block_type == BlockType.TaskV2:
