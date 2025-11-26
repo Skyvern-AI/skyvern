@@ -789,7 +789,7 @@ class WorkflowService:
                 loaded_script_module = None
 
         # Mark workflow as running with appropriate engine
-        run_with = "code" if script_blocks_by_label else "agent"
+        run_with = "code" if workflow_script and is_script_run and script_blocks_by_label else "agent"
         await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id, run_with=run_with)
 
         if block_labels and len(block_labels):
