@@ -2181,6 +2181,12 @@ class ForgeAgent:
         if not working_page:
             raise MissingBrowserStatePage()
 
+        try:
+            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info("Failed to wait for animation end, ignore it", exc_info=True)
+
         context = skyvern_context.ensure_context()
         scrolling_number = context.max_screenshot_scrolls
         if scrolling_number is None:
