@@ -9,8 +9,10 @@ from openai import AsyncAzureOpenAI, AsyncOpenAI
 from skyvern.config import Settings
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
+from skyvern.forge.sdk.api.real_azure import RealAzureClientFactory
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
@@ -20,7 +22,7 @@ from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
-from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
@@ -46,6 +48,7 @@ class ForgeApp:
     OPENAI_CLIENT: AsyncOpenAI | AsyncAzureOpenAI
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
     UI_TARS_CLIENT: AsyncOpenAI | None
+    AZURE_CLIENT_FACTORY: AzureClientFactory
     SECONDARY_LLM_API_HANDLER: LLMAPIHandler
     SELECT_AGENT_LLM_API_HANDLER: LLMAPIHandler
     NORMAL_SELECT_AGENT_LLM_API_HANDLER: LLMAPIHandler
@@ -166,12 +169,17 @@ def create_forge_app() -> ForgeApp:
     app.AGENT_FUNCTION = AgentFunction()
     app.PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=app.DATABASE)
 
+    app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
     app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = BitwardenCredentialVaultService()
     app.AZURE_CREDENTIAL_VAULT_SERVICE = (
         AzureCredentialVaultService(
-            tenant_id=settings.AZURE_TENANT_ID,  # type: ignore[arg-type]
-            client_id=settings.AZURE_CLIENT_ID,  # type: ignore[arg-type]
-            client_secret=settings.AZURE_CLIENT_SECRET,  # type: ignore[arg-type]
+            app.AZURE_CLIENT_FACTORY.create_from_client_secret(
+                AzureClientSecretCredential(
+                    tenant_id=settings.AZURE_TENANT_ID,  # type: ignore
+                    client_id=settings.AZURE_CLIENT_ID,  # type: ignore
+                    client_secret=settings.AZURE_CLIENT_SECRET,  # type: ignore
+                )
+            ),
             vault_name=settings.AZURE_CREDENTIAL_VAULT,  # type: ignore[arg-type]
         )
         if settings.AZURE_CREDENTIAL_VAULT

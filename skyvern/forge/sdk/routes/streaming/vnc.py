@@ -89,7 +89,7 @@ async def stream(
     organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
 
     if not organization_id:
-        LOG.error("Authentication failed.", task_id=task_id, workflow_run_id=workflow_run_id)
+        LOG.warning("Authentication failed.", task_id=task_id, workflow_run_id=workflow_run_id)
         return
 
     vnc_channel: VncChannel
