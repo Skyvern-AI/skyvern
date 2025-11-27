@@ -76,22 +76,21 @@ async def get_workflow_script(
             return None, rendered_cache_key_value
 
         # Check if there are existing cached scripts for this workflow + cache_key_value
-        existing_scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
+        existing_script = await app.DATABASE.get_workflow_script_by_cache_key_value(
             organization_id=workflow.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=rendered_cache_key_value,
             statuses=[status],
         )
 
-        if existing_scripts:
+        if existing_script:
             LOG.info(
                 "Found cached script for workflow",
                 workflow_id=workflow.workflow_id,
                 cache_key_value=rendered_cache_key_value,
                 workflow_run_id=workflow_run.workflow_run_id,
-                script_count=len(existing_scripts),
             )
-            return existing_scripts[0], rendered_cache_key_value
+            return existing_script, rendered_cache_key_value
 
         return None, rendered_cache_key_value
 

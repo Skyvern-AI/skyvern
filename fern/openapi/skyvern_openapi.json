@@ -3797,7 +3797,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -4083,7 +4096,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -5133,6 +5159,7 @@
           "task",
           "task_v2",
           "for_loop",
+          "conditional",
           "code",
           "text_prompt",
           "download_to_s3",
@@ -5153,6 +5180,83 @@
           "human_interaction"
         ],
         "title": "BlockType"
+      },
+      "BranchCondition": {
+        "properties": {
+          "criteria": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BranchCriteria"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "order": {
+            "type": "integer",
+            "minimum": 0,
+            "title": "Order"
+          },
+          "is_default": {
+            "type": "boolean",
+            "title": "Is Default",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "order"
+        ],
+        "title": "BranchCondition",
+        "description": "Represents a single conditional branch edge within a ConditionalBlock."
+      },
+      "BranchCriteria": {
+        "properties": {
+          "criteria_type": {
+            "type": "string",
+            "title": "Criteria Type"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "criteria_type"
+        ],
+        "title": "BranchCriteria",
+        "description": "Abstract interface describing how a branch condition should be evaluated."
       },
       "BrowserProfile": {
         "properties": {
@@ -5502,7 +5606,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -5616,7 +5733,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -5660,6 +5790,72 @@
           "code"
         ],
         "title": "CodeBlockYAML"
+      },
+      "ConditionalBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "conditional",
+            "title": "Block Type",
+            "default": "conditional"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "branches": {
+            "items": {
+              "$ref": "#/components/schemas/BranchCondition"
+            },
+            "type": "array",
+            "title": "Branches"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter"
+        ],
+        "title": "ConditionalBlock",
+        "description": "Branching block that selects the next block label based on ordered conditions."
       },
       "ContextParameter": {
         "properties": {
@@ -6251,7 +6447,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -6307,7 +6516,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -6420,30 +6642,24 @@
         "title": "ExtractAction",
         "description": "Extract data action parameters."
       },
-      "LocateElementAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "locate_element",
-            "title": "Type",
-            "default": "locate_element"
-          },
-          "prompt": {
-            "type": "string",
-            "title": "Prompt",
-            "description": "Natural language prompt to locate an element",
-            "default": ""
-          }
-        },
-        "type": "object",
-        "title": "LocateElementAction",
-        "description": "Locate element action parameters."
-      },
       "ExtractionBlock": {
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -6723,7 +6939,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -6832,7 +7061,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -7118,7 +7360,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -7400,7 +7655,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -7472,7 +7740,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -7540,7 +7821,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -7683,7 +7977,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -7935,7 +8242,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -7971,6 +8291,9 @@
           "loop_blocks": {
             "items": {
               "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ConditionalBlock"
+                },
                 {
                   "$ref": "#/components/schemas/ForLoopBlock"
                 },
@@ -8040,6 +8363,7 @@
                 "mapping": {
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
+                  "conditional": "#/components/schemas/ConditionalBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "extraction": "#/components/schemas/ExtractionBlock",
                   "file_download": "#/components/schemas/FileDownloadBlock",
@@ -8161,7 +8485,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -8297,7 +8634,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -8458,7 +8808,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -8554,7 +8917,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -8884,7 +9260,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -9187,11 +9576,43 @@
         "title": "InputTextAction",
         "description": "Input text action parameters."
       },
+      "LocateElementAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "locate_element",
+            "title": "Type",
+            "default": "locate_element"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Natural language prompt to locate an element",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "title": "LocateElementAction",
+        "description": "Locate element action parameters."
+      },
       "LoginBlock": {
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -9477,7 +9898,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -9901,7 +10335,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -10181,7 +10628,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -10692,7 +11152,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -10761,7 +11234,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -11235,7 +11721,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -11333,7 +11832,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -11675,7 +12187,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -11961,7 +12486,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -12709,7 +13247,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -12808,7 +13359,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -12891,7 +13455,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -13028,7 +13605,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -13433,7 +14023,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -13495,7 +14098,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -13536,7 +14152,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -13816,7 +14445,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -13876,7 +14518,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -14162,7 +14817,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -14280,7 +14948,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -14394,7 +15075,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -14841,6 +15535,11 @@
       },
       "WorkflowDefinition": {
         "properties": {
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "default": 1
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -14901,6 +15600,9 @@
           "blocks": {
             "items": {
               "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ConditionalBlock"
+                },
                 {
                   "$ref": "#/components/schemas/ForLoopBlock"
                 },
@@ -14970,6 +15672,7 @@
                 "mapping": {
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
+                  "conditional": "#/components/schemas/ConditionalBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "extraction": "#/components/schemas/ExtractionBlock",
                   "file_download": "#/components/schemas/FileDownloadBlock",
@@ -15005,6 +15708,11 @@
       },
       "WorkflowDefinitionYAML": {
         "properties": {
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "default": 1
+          },
           "parameters": {
             "items": {
               "oneOf": [

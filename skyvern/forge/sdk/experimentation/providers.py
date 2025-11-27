@@ -57,7 +57,7 @@ class BaseExperimentationProvider(ABC):
             payload = await self.get_payload(feature_name, distinct_id, properties)
             self.payload_map[feature_name][distinct_id] = payload
             if payload:
-                LOG.info("Feature payload is found", flag=feature_name, distinct_id=distinct_id)
+                LOG.info("Feature payload is found", flag=feature_name, distinct_id=distinct_id, payload=payload)
         return self.payload_map[feature_name][distinct_id]
 
 

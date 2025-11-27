@@ -441,7 +441,7 @@ async def get_workflow_script_blocks(
     cache_key = block_script_request.cache_key or workflow.cache_key or ""
     status = block_script_request.status
 
-    scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
+    script = await app.DATABASE.get_workflow_script_by_cache_key_value(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         workflow_run_id=block_script_request.workflow_run_id,
@@ -450,7 +450,7 @@ async def get_workflow_script_blocks(
         statuses=[status] if status else None,
     )
 
-    if not scripts:
+    if not script:
         LOG.info(
             "No scripts found for workflow",
             workflow_permanent_id=workflow_permanent_id,
@@ -460,9 +460,8 @@ async def get_workflow_script_blocks(
         )
         return empty
 
-    first_script = scripts[0]
     return await get_script_blocks_response(
-        script_revision_id=first_script.script_revision_id,
+        script_revision_id=script.script_revision_id,
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
     )

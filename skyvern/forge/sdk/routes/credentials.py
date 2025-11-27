@@ -178,22 +178,14 @@ async def get_totp_codes(
         description="Maximum number of codes to return.",
     ),
 ) -> list[TOTPCode]:
-    if totp_identifier:
-        codes = await app.DATABASE.get_otp_codes(
-            organization_id=curr_org.organization_id,
-            totp_identifier=totp_identifier,
-            otp_type=otp_type,
-            workflow_run_id=workflow_run_id,
-            limit=limit,
-        )
-    else:
-        codes = await app.DATABASE.get_recent_otp_codes(
-            organization_id=curr_org.organization_id,
-            limit=limit,
-            valid_lifespan_minutes=None,
-            otp_type=otp_type,
-            workflow_run_id=workflow_run_id,
-        )
+    codes = await app.DATABASE.get_recent_otp_codes(
+        organization_id=curr_org.organization_id,
+        limit=limit,
+        valid_lifespan_minutes=None,
+        otp_type=otp_type,
+        workflow_run_id=workflow_run_id,
+        totp_identifier=totp_identifier,
+    )
 
     return codes
 

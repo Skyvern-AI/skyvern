@@ -279,7 +279,12 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                               className="ml-auto"
                               checked={data.runSequentially}
                               onCheckedChange={(value) => {
-                                update({ runSequentially: value });
+                                update({
+                                  runSequentially: value,
+                                  sequentialKey: value
+                                    ? data.sequentialKey
+                                    : null,
+                                });
                               }}
                             />
                           </div>

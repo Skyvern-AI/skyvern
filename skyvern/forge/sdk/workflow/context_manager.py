@@ -387,7 +387,8 @@ class WorkflowRunContext:
         # If the parameter is an Azure secret, fetch the secret value and store it in the secrets dict
         # The value of the parameter will be the random secret id with format `secret_<uuid>`.
         # We'll replace the random secret id with the actual secret value when we need to use it.
-        async with AsyncAzureVaultClient.create_default() as azure_vault_client:
+        azure_vault_client = app.AZURE_CLIENT_FACTORY.create_default()
+        async with azure_vault_client:
             secret_value = await azure_vault_client.get_secret(parameter.azure_key, vault_name)
             if secret_value is not None:
                 random_secret_id = self.generate_random_secret_id()
@@ -989,10 +990,10 @@ class WorkflowRunContext:
             organization.organization_id, OrganizationAuthTokenType.azure_client_secret_credential.value
         )
         if org_auth_token:
-            azure_vault_client = AsyncAzureVaultClient.create_from_client_secret(org_auth_token.credential)
+            azure_vault_client = app.AZURE_CLIENT_FACTORY.create_from_client_secret(org_auth_token.credential)
         else:
             # Use the DefaultAzureCredential if not configured on organization level
-            azure_vault_client = AsyncAzureVaultClient.create_default()
+            azure_vault_client = app.AZURE_CLIENT_FACTORY.create_default()
         return azure_vault_client
 
     def _add_secret_parameter_value(self, parameter: Parameter, key: str, value: str) -> None:

@@ -185,6 +185,12 @@ navigation:
               - GET /v1/browser_sessions/{browser_session_id}
               - POST /v1/browser_sessions/{browser_session_id}/close
               - GET /v1/browser_sessions
+          - section: Browser Profiles
+            contents:
+              - POST /v1/browser_profiles
+              - GET /v1/browser_profiles
+              - GET /v1/browser_profiles/{profile_id}
+              - DELETE /v1/browser_profiles/{profile_id}
           - section: Credentials
             contents:
               - POST /v1/credentials

@@ -50,8 +50,12 @@ UPLOAD_GOAL = """- The intention to upload a file: {intention}.
 
 
 async def _get_element_id_by_selector(selector: str, page: Page) -> str | None:
-    locator = page.locator(selector)
-    element_id = await locator.get_attribute("unique_id")
+    try:
+        locator = page.locator(selector)
+        element_id = await locator.get_attribute("unique_id", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+    except Exception:
+        LOG.exception("Failed to get element id by selector", selector=selector)
+        return None
     return element_id
 
 

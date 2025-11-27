@@ -49,7 +49,6 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.azure import AsyncAzureStorageClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -383,13 +382,7 @@ class Block(BaseModel, abc.ABC):
                 )
             else:
                 try:
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            workflow_run_id,
-                            properties={"organization_id": str(organization_id)},
-                        )
-                    )
+                    screenshot = await browser_state.take_fullpage_screenshot()
                 except Exception:
                     LOG.warning(
                         "Failed to take screenshot before executing the block, ignoring the exception",
@@ -693,13 +686,7 @@ class BaseTaskBlock(Block):
 
                 try:
                     # add screenshot artifact for the first task
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            workflow_run_id,
-                            properties={"organization_id": str(organization_id)},
-                        )
-                    )
+                    screenshot = await browser_state.take_fullpage_screenshot()
                     if screenshot:
                         await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                             workflow_run_block=workflow_run_block,
@@ -2334,7 +2321,7 @@ class FileUploadBlock(Block):
                 if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
                     raise AzureConfigurationError("Azure Storage is not configured")
 
-                azure_client = AsyncAzureStorageClient(
+                azure_client = app.AZURE_CLIENT_FACTORY.create_storage_client(
                     storage_account_name=actual_azure_storage_account_name,
                     storage_account_key=actual_azure_storage_account_key,
                 )

@@ -378,13 +378,7 @@ async def _take_workflow_run_block_screenshot(
     if not browser_state:
         LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
     else:
-        screenshot = await browser_state.take_fullpage_screenshot(
-            use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "ENABLE_PLAYWRIGHT_FULLPAGE",
-                workflow_run_id,
-                properties={"organization_id": str(organization_id)},
-            )
-        )
+        screenshot = await browser_state.take_fullpage_screenshot()
         if screenshot:
             await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                 workflow_run_block=workflow_run_block,
@@ -945,7 +939,7 @@ async def _regenerate_script_block_after_ai_fallback(
         if not cache_key_value:
             cache_key_value = cache_key  # Fallback
 
-        existing_scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
+        existing_script = await app.DATABASE.get_workflow_script_by_cache_key_value(
             organization_id=organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=cache_key_value,
@@ -953,11 +947,11 @@ async def _regenerate_script_block_after_ai_fallback(
             statuses=[ScriptStatus.published],
         )
 
-        if not existing_scripts:
+        if not existing_script:
             LOG.error("No existing script found to regenerate", cache_key=cache_key, cache_key_value=cache_key_value)
             return
 
-        current_script = existing_scripts[0]
+        current_script = existing_script
         LOG.info(
             "Regenerating script block after AI fallback",
             script_id=current_script.script_id,

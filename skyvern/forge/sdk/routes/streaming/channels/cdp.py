@@ -13,6 +13,8 @@ Channel data:
 from __future__ import annotations
 
 import asyncio
+import functools
+import pathlib
 import typing as t
 
 import structlog
@@ -183,3 +185,17 @@ class CdpChannel:
         except Exception:
             LOG.exception(f"{self.class_name} failed to evaluate js", expression=expression, **self.identity)
             raise
+
+    @functools.lru_cache(maxsize=None)
+    def js(self, file_name: str) -> str:
+        base_path = pathlib.Path(__file__).parent / "js"
+        file_name = file_name.lstrip("/")
+
+        if not file_name.endswith(".js"):
+            file_name += ".js"
+
+        relative_path = pathlib.Path(file_name)
+        full_path = base_path / relative_path
+
+        with open(full_path, encoding="utf-8") as f:
+            return f.read()

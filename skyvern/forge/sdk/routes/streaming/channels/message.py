@@ -14,6 +14,7 @@ Channel data:
 
 import asyncio
 import dataclasses
+import enum
 import typing as t
 
 import structlog
@@ -22,6 +23,7 @@ from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosedError
 
 from skyvern.forge.sdk.routes.streaming.channels.execution import execution_channel
+from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEvent, ExfiltrationChannel
 from skyvern.forge.sdk.routes.streaming.registries import (
     add_message_channel,
     del_message_channel,
@@ -42,10 +44,42 @@ LOG = structlog.get_logger()
 Loops = list[asyncio.Task]  # aka "queue-less actors"; or "programs"
 
 
+class MessageKind(enum.StrEnum):
+    ASK_FOR_CLIPBOARD_RESPONSE = "ask-for-clipboard-response"
+    BEGIN_EXFILTRATION = "begin-exfiltration"
+    BROWSER_TABS = "browser-tabs"
+    CEDE_CONTROL = "cede-control"
+    END_EXFILTRATION = "end-exfiltration"
+    EXFILTRATED_EVENT = "exfiltrated-event"
+    TAKE_CONTROL = "take-control"
+
+
+class ExfiltratedEventSource(enum.StrEnum):
+    CONSOLE = "console"
+    CDP = "cdp"
+    NOT_SPECIFIED = "[not-specified]"
+
+
+@dataclasses.dataclass
+class TabInfo:
+    id: str
+    title: str
+    url: str
+    # --
+    active: bool = False
+    favicon: str | None = None
+    isReady: bool = True
+    pageNumber: int | None = None
+
+
 MessageKinds = t.Literal[
-    "ask-for-clipboard-response",
-    "cede-control",
-    "take-control",
+    MessageKind.ASK_FOR_CLIPBOARD_RESPONSE,
+    MessageKind.BEGIN_EXFILTRATION,
+    MessageKind.BROWSER_TABS,
+    MessageKind.CEDE_CONTROL,
+    MessageKind.END_EXFILTRATION,
+    MessageKind.EXFILTRATED_EVENT,
+    MessageKind.TAKE_CONTROL,
 ]
 
 
@@ -55,41 +89,92 @@ class Message:
 
 
 @dataclasses.dataclass
+class MessageInBeginExfiltration(Message):
+    kind: t.Literal[MessageKind.BEGIN_EXFILTRATION] = MessageKind.BEGIN_EXFILTRATION
+
+
+@dataclasses.dataclass
+class MessageInEndExfiltration(Message):
+    kind: t.Literal[MessageKind.END_EXFILTRATION] = MessageKind.END_EXFILTRATION
+
+
+@dataclasses.dataclass
 class MessageInTakeControl(Message):
-    kind: t.Literal["take-control"] = "take-control"
+    kind: t.Literal[MessageKind.TAKE_CONTROL] = MessageKind.TAKE_CONTROL
 
 
 @dataclasses.dataclass
 class MessageInCedeControl(Message):
-    kind: t.Literal["cede-control"] = "cede-control"
+    kind: t.Literal[MessageKind.CEDE_CONTROL] = MessageKind.CEDE_CONTROL
 
 
 @dataclasses.dataclass
 class MessageInAskForClipboardResponse(Message):
-    kind: t.Literal["ask-for-clipboard-response"] = "ask-for-clipboard-response"
+    kind: t.Literal[MessageKind.ASK_FOR_CLIPBOARD_RESPONSE] = MessageKind.ASK_FOR_CLIPBOARD_RESPONSE
     text: str = ""
 
 
-ChannelMessage = t.Union[
-    MessageInAskForClipboardResponse,
-    MessageInCedeControl,
-    MessageInTakeControl,
-]
+@dataclasses.dataclass
+class MessageOutExfiltratedEvent(Message):
+    kind: t.Literal[MessageKind.EXFILTRATED_EVENT] = MessageKind.EXFILTRATED_EVENT
+    event_name: str = "[not-specified]"
+
+    # TODO(jdo): improve typing for params
+    params: dict = dataclasses.field(default_factory=dict)
+    source: ExfiltratedEventSource = ExfiltratedEventSource.NOT_SPECIFIED
+
+
+@dataclasses.dataclass
+class MessageOutTabInfo(Message):
+    kind: t.Literal[MessageKind.BROWSER_TABS] = MessageKind.BROWSER_TABS
+    tabs: list[TabInfo] = dataclasses.field(default_factory=list)
+
+
+MessageIn = (
+    MessageInAskForClipboardResponse
+    | MessageInBeginExfiltration
+    | MessageInCedeControl
+    | MessageInEndExfiltration
+    | MessageInTakeControl
+)
+
+
+MessageOut = MessageOutExfiltratedEvent | MessageOutTabInfo
+
+
+ChannelMessage = MessageIn | MessageOut
 
 
 def reify_channel_message(data: dict) -> ChannelMessage:
     kind = data.get("kind", None)
 
     match kind:
-        case "ask-for-clipboard-response":
+        case MessageKind.ASK_FOR_CLIPBOARD_RESPONSE:
             text = data.get("text") or ""
             return MessageInAskForClipboardResponse(text=text)
-        case "cede-control":
+        case MessageKind.BEGIN_EXFILTRATION:
+            return MessageInBeginExfiltration()
+        case MessageKind.CEDE_CONTROL:
             return MessageInCedeControl()
-        case "take-control":
+        case MessageKind.END_EXFILTRATION:
+            return MessageInEndExfiltration()
+        case MessageKind.TAKE_CONTROL:
             return MessageInTakeControl()
         case _:
             raise ValueError(f"Unknown message kind: '{kind}'")
+
+
+def message_to_dict(message: MessageOut) -> dict:
+    """
+    Convert message to dict with enums as their values.
+    """
+
+    def convert_value(obj: t.Any) -> t.Any:
+        if isinstance(obj, enum.Enum):
+            return obj.value
+        return obj
+
+    return dataclasses.asdict(message, dict_factory=lambda x: {k: convert_value(v) for k, v in x})
 
 
 @dataclasses.dataclass
@@ -102,7 +187,7 @@ class MessageChannel:
     organization_id: str
     websocket: WebSocket
     # --
-    out_queue: asyncio.Queue = dataclasses.field(default_factory=asyncio.Queue)  # warn: unbounded
+    out_queue: asyncio.Queue[MessageOut] = dataclasses.field(default_factory=asyncio.Queue)  # warn: unbounded
     browser_session: AddressablePersistentBrowserSession | None = None
     workflow_run: WorkflowRun | None = None
 
@@ -147,18 +232,31 @@ class MessageChannel:
 
         return True
 
-    async def drain(self) -> list[dict]:
-        datums: list[dict] = []
+    async def drain(self) -> list[dict | MessageOut]:
+        datums: list[dict | MessageOut] = []
 
-        tasks = [
-            asyncio.create_task(self.receive_from_out_queue()),
-            asyncio.create_task(self.receive_from_user()),
-        ]
+        result = await asyncio.gather(
+            self.receive_from_out_queue(),
+            self.receive_from_user(),
+        )
 
-        results = await asyncio.gather(*tasks)
+        # NOTE(jdo): mypy seems to be unable to infer this, whereas pylance has
+        # no issue; added explicit type hints here to help mypy out.
+        out_queue: list[MessageOut] = result[0]
+        in_queue: list[dict] = result[1]
 
-        for result in results:
-            datums.extend(result)
+        for out_message in out_queue:
+            datums.append(out_message)
+
+        for in_message in in_queue:
+            if isinstance(in_message, dict):
+                datums.append(in_message)
+            else:
+                LOG.error(
+                    f"{self.class_name} drain dropping user message: unexpected result type: {type(in_message)}",
+                    message=in_message,
+                    **self.identity,
+                )
 
         if datums:
             LOG.info(f"{self.class_name} Drained {len(datums)} messages from message channel.", **self.identity)
@@ -183,8 +281,8 @@ class MessageChannel:
 
         return datums
 
-    async def receive_from_out_queue(self) -> list[dict]:
-        datums: list[dict] = []
+    async def receive_from_out_queue(self) -> list[MessageOut]:
+        datums: list[MessageOut] = []
 
         while True:
             try:
@@ -197,8 +295,8 @@ class MessageChannel:
 
         return datums
 
-    def receive_from_out_queue_nowait(self) -> list[dict]:
-        datums: list[dict] = []
+    def receive_from_out_queue_nowait(self) -> list[MessageOut]:
+        datums: list[MessageOut] = []
 
         while True:
             try:
@@ -209,13 +307,14 @@ class MessageChannel:
 
         return datums
 
-    async def send(self, *, messages: list[dict]) -> t.Self:
+    # async def send(self, *, messages: list[dict]) -> t.Self:
+    async def send(self, *, messages: list[MessageOut]) -> t.Self:
         for message in messages:
             await self.out_queue.put(message)
 
         return self
 
-    def send_nowait(self, *, messages: list[dict]) -> t.Self:
+    def send_nowait(self, *, messages: list[MessageOut]) -> t.Self:
         for message in messages:
             self.out_queue.put_nowait(message)
 
@@ -255,28 +354,43 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
     """
 
     class_name = message_channel.class_name
+    exfiltration_channel: ExfiltrationChannel | None = None
 
-    async def handle_data(data: dict) -> None:
-        nonlocal class_name
-
-        try:
-            message = reify_channel_message(data)
-        except ValueError:
-            LOG.error(f"MessageChannel: cannot reify channel message from data: {data}", **message_channel.identity)
+    async def send(message: MessageOut) -> None:
+        if message_channel.websocket.client_state != WebSocketState.CONNECTED:
             return
 
-        message_kind = message.kind
+        data = message_to_dict(message)
 
-        match message_kind:
-            case "ask-for-clipboard-response":
-                if not isinstance(message, MessageInAskForClipboardResponse):
-                    LOG.error(
-                        f"{class_name} invalid message type for ask-for-clipboard-response.",
-                        message=message,
-                        **message_channel.identity,
-                    )
-                    return
+        try:
+            await message_channel.websocket.send_json(data)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            LOG.exception("MessageChannel: failed to send data.")
 
+    async def handle_data(data: dict | MessageOut) -> None:
+        nonlocal class_name
+        nonlocal exfiltration_channel
+        message: ChannelMessage
+
+        if isinstance(data, MessageOut):
+            message = data
+        elif isinstance(data, dict):
+            try:
+                message = reify_channel_message(data)
+            except ValueError:
+                LOG.error(f"MessageChannel: cannot reify channel message from data: {data}", **message_channel.identity)
+                return
+        else:
+            LOG.error(
+                f"{class_name} cannot handle data: expected dict or MessageOut, got {type(data)}",
+                **message_channel.identity,
+            )
+            return
+
+        match message.kind:
+            case MessageKind.ASK_FOR_CLIPBOARD_RESPONSE:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
@@ -292,7 +406,43 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 async with execution_channel(vnc_channel) as execute:
                     await execute.paste_text(text)
 
-            case "cede-control":
+            case MessageKind.BEGIN_EXFILTRATION:
+                if exfiltration_channel is not None:
+                    LOG.error(
+                        "MessageChannel: cannot begin exfiltration: already active.", message_channel=message_channel
+                    )
+                    return
+
+                vnc_channel = get_vnc_channel(message_channel.client_id)
+
+                if not vnc_channel:
+                    LOG.error(
+                        f"{class_name} no vnc channel client found for message channel - cannot exfiltrate.",
+                        message=message,
+                        **message_channel.identity,
+                    )
+                    return
+
+                def on_event(events: list[ExfiltratedEvent]) -> None:
+                    for event in events:
+                        message_out_exfiltrated_event = MessageOutExfiltratedEvent(
+                            kind=t.cast(t.Literal[MessageKind.EXFILTRATED_EVENT], event.kind),
+                            event_name=event.event_name,
+                            params=event.params,
+                            source=t.cast(ExfiltratedEventSource, event.source or ExfiltratedEventSource.NOT_SPECIFIED),
+                        )
+
+                        message_channel.send_nowait(messages=[message_out_exfiltrated_event])
+
+                exfiltration_channel = await ExfiltrationChannel(
+                    on_event=on_event,
+                    vnc_channel=vnc_channel,
+                ).start()
+
+            case MessageKind.BROWSER_TABS:
+                await send(message)
+
+            case MessageKind.CEDE_CONTROL:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
@@ -304,7 +454,24 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     return
                 vnc_channel.interactor = "agent"
 
-            case "take-control":
+            case MessageKind.END_EXFILTRATION:
+                if exfiltration_channel is None:
+                    return
+
+                await exfiltration_channel.stop()
+
+                exfiltration_channel = None
+
+            case MessageKind.EXFILTRATED_EVENT:
+                await send(message)
+
+            # case MessageKind.GET_TAB_INFO:
+            #     """
+            #     TODO(jdo): implement - this is an on-demand request for tab info, which is
+            #     required when connecting to an existing browser session.
+            #     """
+
+            case MessageKind.TAKE_CONTROL:
                 LOG.info(f"{class_name} processing take-control message.", **message_channel.identity)
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
@@ -318,8 +485,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 vnc_channel.interactor = "user"
 
             case _:
-                LOG.error(f"{class_name} unknown message kind: '{message_kind}'", **message_channel.identity)
-                return
+                t.assert_never(message.kind)
 
     async def frontend_to_backend() -> None:
         nonlocal class_name
@@ -331,9 +497,9 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 datums = await message_channel.drain()
 
                 for data in datums:
-                    if not isinstance(data, dict):
+                    if not isinstance(data, (dict, MessageOut)):
                         LOG.error(
-                            f"{class_name} cannot create message: expected dict, got {type(data)}",
+                            f"{class_name} cannot handle message: expected dict or MessageOut, got {type(data)}",
                             **message_channel.identity,
                         )
                         continue

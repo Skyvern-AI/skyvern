@@ -2,7 +2,6 @@ import uuid
 from typing import Annotated, Literal, Union
 
 import structlog
-from azure.identity.aio import ClientSecretCredential
 from pydantic import BaseModel, Field, TypeAdapter
 
 from skyvern.forge import app
@@ -41,14 +40,8 @@ class AzureCredentialVaultService(CredentialVaultService):
         Union[_PasswordCredentialDataImage, _CreditCardCredentialDataImage], Field(discriminator="type")
     ]
 
-    def __init__(self, tenant_id: str, client_id: str, client_secret: str, vault_name: str):
-        self._client = AsyncAzureVaultClient(
-            ClientSecretCredential(
-                tenant_id=tenant_id,
-                client_id=client_id,
-                client_secret=client_secret,
-            )
-        )
+    def __init__(self, client: AsyncAzureVaultClient, vault_name: str):
+        self._client = client
         self._vault_name = vault_name
 
     async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:

@@ -317,9 +317,6 @@ class BitwardenService:
                 raise BitwardenListItemsError("No collection ID or organization ID provided -- this is required")
             items_result = await BitwardenService.run_command(list_command, timeout=timeout)
 
-            if items_result.stderr and "Event post failed" not in items_result.stderr:
-                raise BitwardenListItemsError(items_result.stderr)
-
             # Parse the items and extract credentials
             try:
                 items = json.loads(items_result.stdout)

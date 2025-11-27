@@ -45,6 +45,7 @@ async def get_action_history(
                     "success",
                     "exception_type",
                     "exception_message",
+                    "download_triggered",
                 },
             ),
         }
