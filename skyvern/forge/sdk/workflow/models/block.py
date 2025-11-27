@@ -49,7 +49,6 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.azure import AsyncAzureStorageClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -2322,7 +2321,7 @@ class FileUploadBlock(Block):
                 if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
                     raise AzureConfigurationError("Azure Storage is not configured")
 
-                azure_client = AsyncAzureStorageClient(
+                azure_client = app.AZURE_CLIENT_FACTORY.create_storage_client(
                     storage_account_name=actual_azure_storage_account_name,
                     storage_account_key=actual_azure_storage_account_key,
                 )
