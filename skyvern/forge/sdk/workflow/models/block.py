@@ -3966,14 +3966,14 @@ class ConditionalBlock(Block):
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.CONDITIONAL] = BlockType.CONDITIONAL  # type: ignore
 
-    branches: list[BranchCondition] = Field(default_factory=list)
+    branch_conditions: list[BranchCondition] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_branches(cls, block: ConditionalBlock) -> ConditionalBlock:
-        if not block.branches:
+        if not block.branch_conditions:
             raise ValueError("Conditional blocks require at least one branch.")
 
-        default_branches = [branch for branch in block.branches if branch.is_default]
+        default_branches = [branch for branch in block.branch_conditions if branch.is_default]
         if len(default_branches) > 1:
             raise ValueError("Only one default branch is permitted per conditional block.")
 
@@ -4005,11 +4005,11 @@ class ConditionalBlock(Block):
     @property
     def ordered_branches(self) -> list[BranchCondition]:
         """Convenience accessor that returns branches in author-specified list order."""
-        return list(self.branches)
+        return list(self.branch_conditions)
 
     def get_default_branch(self) -> BranchCondition | None:
         """Return the default/else branch when configured."""
-        return next((branch for branch in self.branches if branch.is_default), None)
+        return next((branch for branch in self.branch_conditions if branch.is_default), None)
 
 
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
