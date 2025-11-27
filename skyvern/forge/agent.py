@@ -3414,6 +3414,7 @@ class ForgeAgent:
                 queued_seconds=queued_seconds,
                 task_status=status,
                 organization_id=task.organization_id,
+                failure_reason=failure_reason,
             )
 
         await save_task_logs(task.task_id)
