@@ -1660,6 +1660,7 @@
           "Browser Profiles"
         ],
         "summary": "Create a browser profile",
+        "description": "Create a browser profile from a persistent browser session or workflow run.",
         "operationId": "create_browser_profile_v1_browser_profiles_post",
         "parameters": [
           {
@@ -1693,7 +1694,7 @@
         },
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Successfully created browser profile",
             "content": {
               "application/json": {
                 "schema": {
@@ -1701,6 +1702,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request - missing source or source not found"
+          },
+          "409": {
+            "description": "Browser profile name already exists"
           },
           "422": {
             "description": "Validation Error",
@@ -1712,7 +1719,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "create_browser_profile",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from a workflow run with persist_browser_session=True\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from a workflow run with persist_browser_session=True\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
+              }
+            ]
+          }
+        ]
       },
       "get": {
         "tags": [
@@ -1755,7 +1777,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Successfully retrieved browser profiles",
             "content": {
               "application/json": {
                 "schema": {
@@ -1778,7 +1800,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "list_browser_profiles",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_profiles = await skyvern.browser_profiles.list_browser_profiles()\nprint(browser_profiles)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst browserProfiles = await skyvern.browserProfiles.listBrowserProfiles();\nconsole.log(browserProfiles);\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/browser_profiles/{profile_id}": {
@@ -1847,7 +1884,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "get_browser_profile",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_profile = await skyvern.browser_profiles.get_browser_profile(\"bp_123\")\nprint(browser_profile)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst browserProfile = await skyvern.browserProfiles.getBrowserProfile(\"bp_123\");\nconsole.log(browserProfile);\n"
+              }
+            ]
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -1907,7 +1959,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "delete_browser_profile",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.browser_profiles.delete_browser_profile(\"bp_123\")\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.browserProfiles.deleteBrowserProfile(\"bp_123\");\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/browser_sessions": {
