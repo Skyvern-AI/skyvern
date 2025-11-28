@@ -70,6 +70,7 @@
 
 .browser-stream > div {
   background: transparent !important;
+  aspect-ratio: 16/9 !important;
 }
 
 .browser-stream .control-button {
