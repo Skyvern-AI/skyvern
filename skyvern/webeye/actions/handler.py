@@ -724,6 +724,14 @@ async def handle_click_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
+    try:
+        await skyvern_element.scroll_into_view()
+    except Exception:
+        LOG.info(
+            "Failed to scroll into view, ignore it and continue executing",
+            element_id=skyvern_element.get_id(),
+        )
+
     if action.download:
         results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
 
