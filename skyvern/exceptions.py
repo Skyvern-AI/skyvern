@@ -197,6 +197,14 @@ class MissingValueForParameter(SkyvernHTTPException):
         )
 
 
+class WorkflowRunParameterPersistenceError(SkyvernException):
+    def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str, reason: str) -> None:
+        super().__init__(
+            f"Failed to persist workflow parameter '{parameter_key}' for workflow run {workflow_run_id} "
+            f"of workflow {workflow_id}. Reason: {reason}"
+        )
+
+
 class InvalidCredentialId(SkyvernHTTPException):
     def __init__(self, credential_id: str) -> None:
         super().__init__(
