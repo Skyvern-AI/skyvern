@@ -189,3 +189,4 @@ tmp/user_data_dir
 
 # Claude
 .claude
+chrome-profile/
