@@ -777,8 +777,8 @@ class LLMCallerNotFoundError(SkyvernException):
 
 
 class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str) -> None:
-        super().__init__(f"Browser session {browser_session_id} is already occupied")
+    def __init__(self, browser_session_id: str, runnable_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
 
 
 class BrowserSessionNotRenewable(SkyvernException):
