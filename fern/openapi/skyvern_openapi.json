@@ -5282,11 +5282,6 @@
             ],
             "title": "Description"
           },
-          "order": {
-            "type": "integer",
-            "minimum": 0,
-            "title": "Order"
-          },
           "is_default": {
             "type": "boolean",
             "title": "Is Default",
@@ -5294,9 +5289,6 @@
           }
         },
         "type": "object",
-        "required": [
-          "order"
-        ],
         "title": "BranchCondition",
         "description": "Represents a single conditional branch edge within a ConditionalBlock."
       },
@@ -5305,6 +5297,10 @@
           "criteria_type": {
             "type": "string",
             "title": "Criteria Type"
+          },
+          "expression": {
+            "type": "string",
+            "title": "Expression"
           },
           "description": {
             "anyOf": [
@@ -5320,7 +5316,8 @@
         },
         "type": "object",
         "required": [
-          "criteria_type"
+          "criteria_type",
+          "expression"
         ],
         "title": "BranchCriteria",
         "description": "Abstract interface describing how a branch condition should be evaluated."
@@ -5908,12 +5905,12 @@
             "title": "Disable Cache",
             "default": false
           },
-          "branches": {
+          "branch_conditions": {
             "items": {
               "$ref": "#/components/schemas/BranchCondition"
             },
             "type": "array",
-            "title": "Branches"
+            "title": "Branch Conditions"
           }
         },
         "type": "object",
@@ -5922,7 +5919,7 @@
           "output_parameter"
         ],
         "title": "ConditionalBlock",
-        "description": "Branching block that selects the next block label based on ordered conditions."
+        "description": "Branching block that selects the next block label based on list-ordered conditions."
       },
       "ContextParameter": {
         "properties": {
