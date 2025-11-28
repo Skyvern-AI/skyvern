@@ -115,13 +115,41 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, RunEngine, RunType
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile, ScriptStatus, WorkflowScript
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+
+
+def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
+    """
+    Serialize proxy_location for database storage.
+
+    Converts GeoTarget objects or dicts to JSON strings, passes through
+    ProxyLocation enum values as-is, and returns None for None.
+    """
+    result: str | None = None
+    if proxy_location is None:
+        result = None
+    elif isinstance(proxy_location, GeoTarget):
+        result = json.dumps(proxy_location.model_dump())
+    elif isinstance(proxy_location, dict):
+        result = json.dumps(proxy_location)
+    else:
+        # ProxyLocation enum - return the string value
+        result = str(proxy_location)
+
+    LOG.debug(
+        "Serializing proxy_location for DB",
+        input_type=type(proxy_location).__name__,
+        input_value=str(proxy_location),
+        serialized_value=result,
+    )
+    return result
+
 
 DB_CONNECT_ARGS: dict[str, Any] = {}
 
@@ -161,7 +189,7 @@ class AgentDB:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         organization_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         extracted_information_schema: dict[str, Any] | list | str | None = None,
         workflow_run_id: str | None = None,
         order: int | None = None,
@@ -194,7 +222,7 @@ class AgentDB:
                     data_extraction_goal=data_extraction_goal,
                     navigation_payload=navigation_payload,
                     organization_id=organization_id,
-                    proxy_location=proxy_location,
+                    proxy_location=_serialize_proxy_location(proxy_location),
                     extracted_information_schema=extracted_information_schema,
                     workflow_run_id=workflow_run_id,
                     order=order,
@@ -1390,7 +1418,7 @@ class AgentDB:
         workflow_definition: dict[str, Any],
         organization_id: str | None = None,
         description: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         webhook_callback_url: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
@@ -1415,7 +1443,7 @@ class AgentDB:
                 title=title,
                 description=description,
                 workflow_definition=workflow_definition,
-                proxy_location=proxy_location,
+                proxy_location=_serialize_proxy_location(proxy_location),
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
@@ -2259,7 +2287,7 @@ class AgentDB:
         organization_id: str,
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
@@ -2281,7 +2309,7 @@ class AgentDB:
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
                     browser_profile_id=browser_profile_id,
-                    proxy_location=proxy_location,
+                    proxy_location=_serialize_proxy_location(proxy_location),
                     status="created",
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
@@ -3565,7 +3593,7 @@ class AgentDB:
         prompt: str | None = None,
         url: str | None = None,
         organization_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         totp_identifier: str | None = None,
         totp_verification_url: str | None = None,
         webhook_callback_url: str | None = None,
@@ -3584,7 +3612,7 @@ class AgentDB:
                 workflow_permanent_id=workflow_permanent_id,
                 prompt=prompt,
                 url=url,
-                proxy_location=proxy_location,
+                proxy_location=_serialize_proxy_location(proxy_location),
                 totp_identifier=totp_identifier,
                 totp_verification_url=totp_verification_url,
                 webhook_callback_url=webhook_callback_url,
@@ -4190,7 +4218,7 @@ class AgentDB:
         runnable_type: str | None = None,
         runnable_id: str | None = None,
         timeout_minutes: int | None = None,
-        proxy_location: ProxyLocation | None = ProxyLocation.RESIDENTIAL,
+        proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         try:
@@ -4200,7 +4228,7 @@ class AgentDB:
                     runnable_type=runnable_type,
                     runnable_id=runnable_id,
                     timeout_minutes=timeout_minutes,
-                    proxy_location=proxy_location,
+                    proxy_location=_serialize_proxy_location(proxy_location),
                 )
                 session.add(browser_session)
                 await session.commit()

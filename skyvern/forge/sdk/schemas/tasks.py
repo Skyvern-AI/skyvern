@@ -18,7 +18,7 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.utils.url_validators import validate_url
 
 
@@ -69,7 +69,7 @@ class TaskBase(BaseModel):
             }
         ],
     )
-    proxy_location: ProxyLocation | None = Field(
+    proxy_location: ProxyLocationInput = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING,
     )

@@ -107,7 +107,13 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunResponseBase,
     WorkflowRunStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
+from skyvern.schemas.runs import (
+    ProxyLocationInput,
+    RunStatus,
+    RunType,
+    WorkflowRunRequest,
+    WorkflowRunResponse,
+)
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptStatus, WorkflowScript
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
@@ -528,7 +534,7 @@ class WorkflowService:
         workflow: Workflow,
         *,
         browser_session_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
     ) -> PersistentBrowserSession | None:
         if browser_session_id:  # the user has supplied an id, so no need to create one
             return None
@@ -1125,7 +1131,7 @@ class WorkflowService:
         title: str,
         workflow_definition: WorkflowDefinition,
         description: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
@@ -1176,7 +1182,7 @@ class WorkflowService:
         totp_identifier: str | None = None,
         totp_verification_url: str | None = None,
         webhook_callback_url: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         max_iterations: int | None = None,
@@ -3246,7 +3252,7 @@ class WorkflowService:
         self,
         organization: Organization,
         title: str,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         run_with: str | None = None,
