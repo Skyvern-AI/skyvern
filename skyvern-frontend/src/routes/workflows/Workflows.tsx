@@ -65,6 +65,7 @@ const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   ai_fallback: true,
   run_with: "agent",
   workflow_definition: {
+    version: 2,
     blocks: [],
     parameters: [],
   },

@@ -19,6 +19,7 @@ import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYaml
 type SaveData = {
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
+  workflowDefinitionVersion: number;
   title: string;
   settings: WorkflowSettings;
   workflow: WorkflowApiResponse;
@@ -139,6 +140,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
         workflow_definition: {
+          version: saveData.workflowDefinitionVersion,
           parameters: saveData.parameters,
           blocks: saveData.blocks,
         },

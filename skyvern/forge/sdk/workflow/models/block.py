@@ -26,7 +26,7 @@ from email_validator import EmailNotValidError, validate_email
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
@@ -49,7 +49,6 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.azure import AsyncAzureStorageClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -119,8 +118,15 @@ DEFAULT_MAX_STEPS_PER_ITERATION = 50
 
 
 class Block(BaseModel, abc.ABC):
+    """Base class for workflow nodes (see branching spec [[s-4bnl]] for metadata semantics)."""
+
     # Must be unique within workflow definition
-    label: str
+    label: str = Field(description="Author-facing identifier for a block; unique within a workflow.")
+    next_block_label: str | None = Field(
+        default=None,
+        description="Optional pointer to the next block label when constructing a DAG. "
+        "Defaults to sequential order when omitted.",
+    )
     block_type: BlockType
     output_parameter: OutputParameter
     continue_on_failure: bool = False
@@ -376,13 +382,7 @@ class Block(BaseModel, abc.ABC):
                 )
             else:
                 try:
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            workflow_run_id,
-                            properties={"organization_id": str(organization_id)},
-                        )
-                    )
+                    screenshot = await browser_state.take_fullpage_screenshot()
                 except Exception:
                     LOG.warning(
                         "Failed to take screenshot before executing the block, ignoring the exception",
@@ -686,13 +686,7 @@ class BaseTaskBlock(Block):
 
                 try:
                     # add screenshot artifact for the first task
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            workflow_run_id,
-                            properties={"organization_id": str(organization_id)},
-                        )
-                    )
+                    screenshot = await browser_state.take_fullpage_screenshot()
                     if screenshot:
                         await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                             workflow_run_block=workflow_run_block,
@@ -2327,7 +2321,7 @@ class FileUploadBlock(Block):
                 if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
                     raise AzureConfigurationError("Azure Storage is not configured")
 
-                azure_client = AsyncAzureStorageClient(
+                azure_client = app.AZURE_CLIENT_FACTORY.create_storage_client(
                     storage_account_name=actual_azure_storage_account_name,
                     storage_account_key=actual_azure_storage_account_key,
                 )
@@ -2866,7 +2860,9 @@ class FileParserBlock(Block):
             self.override_llm_key, default=app.LLM_API_HANDLER
         )
 
-        llm_response = await llm_api_handler(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
+        llm_response = await llm_api_handler(
+            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+        )
         return llm_response
 
     async def execute(
@@ -3081,7 +3077,9 @@ class PDFParserBlock(Block):
         llm_prompt = prompt_engine.load_prompt(
             "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
         )
-        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
+        llm_response = await app.LLM_API_HANDLER(
+            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+        )
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)
         return await self.build_block_result(
@@ -3821,6 +3819,199 @@ class HttpRequestBlock(Block):
             )
 
 
+class BranchEvaluationContext:
+    """Collection of runtime data that BranchCriteria evaluators can consume."""
+
+    def __init__(
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext | None = None,
+        block_label: str | None = None,
+    ) -> None:
+        self.workflow_run_context = workflow_run_context
+        self.block_label = block_label
+
+    def build_template_data(self) -> dict[str, Any]:
+        """Build Jinja template data mirroring block parameter rendering context."""
+        if self.workflow_run_context is None:
+            return {
+                "params": {},
+                "outputs": {},
+                "environment": {},
+                "env": {},
+                "llm": {},
+            }
+
+        ctx = self.workflow_run_context
+        template_data = ctx.values.copy()
+        if ctx.include_secrets_in_templates:
+            template_data.update(ctx.secrets)
+
+            credential_params: list[tuple[str, dict[str, Any]]] = []
+            for key, value in template_data.items():
+                if isinstance(value, dict) and "context" in value and "username" in value and "password" in value:
+                    credential_params.append((key, value))
+
+            for key, value in credential_params:
+                username_secret_id = value.get("username", "")
+                password_secret_id = value.get("password", "")
+                real_username = template_data.get(username_secret_id, "")
+                real_password = template_data.get(password_secret_id, "")
+                template_data[f"{key}_real_username"] = real_username
+                template_data[f"{key}_real_password"] = real_password
+
+        if self.block_label:
+            block_reference_data: dict[str, Any] = ctx.get_block_metadata(self.block_label)
+            if self.block_label in template_data:
+                current_value = template_data[self.block_label]
+                if isinstance(current_value, dict):
+                    block_reference_data.update(current_value)
+            template_data[self.block_label] = block_reference_data
+
+            if "current_index" in block_reference_data:
+                template_data["current_index"] = block_reference_data["current_index"]
+            if "current_item" in block_reference_data:
+                template_data["current_item"] = block_reference_data["current_item"]
+            if "current_value" in block_reference_data:
+                template_data["current_value"] = block_reference_data["current_value"]
+
+        template_data.setdefault("workflow_title", ctx.workflow_title)
+        template_data.setdefault("workflow_id", ctx.workflow_id)
+        template_data.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
+        template_data.setdefault("workflow_run_id", ctx.workflow_run_id)
+
+        template_data.setdefault("params", template_data.get("params", {}))
+        template_data.setdefault("outputs", template_data.get("outputs", {}))
+        template_data.setdefault("environment", template_data.get("environment", {}))
+        template_data.setdefault("env", template_data.get("environment"))
+        template_data.setdefault("llm", template_data.get("llm", {}))
+
+        return template_data
+
+
+class BranchCriteria(BaseModel, abc.ABC):
+    """Abstract interface describing how a branch condition should be evaluated."""
+
+    criteria_type: str
+    expression: str
+    description: str | None = None
+
+    @abc.abstractmethod
+    async def evaluate(self, context: BranchEvaluationContext) -> bool:
+        """Return True when the branch should execute."""
+        raise NotImplementedError
+
+    def requires_llm(self) -> bool:
+        """Whether the criteria relies on an LLM classification step."""
+        return False
+
+
+class JinjaBranchCriteria(BranchCriteria):
+    """Jinja2-templated branch criteria (only supported criteria type for now)."""
+
+    criteria_type: Literal["jinja2_template"] = "jinja2_template"
+
+    async def evaluate(self, context: BranchEvaluationContext) -> bool:
+        # Build the template context explicitly to avoid surprises in templates.
+        template_data = context.build_template_data()
+
+        try:
+            template = jinja_sandbox_env.from_string(self.expression)
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(
+                template=self.expression,
+                msg=str(exc),
+            ) from exc
+
+        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+            if missing := get_missing_variables(self.expression, template_data):
+                raise MissingJinjaVariables(template=self.expression, variables=missing)
+
+        try:
+            rendered = template.render(template_data)
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(
+                template=self.expression,
+                msg=str(exc),
+            ) from exc
+
+        return bool(rendered)
+
+
+class BranchCondition(BaseModel):
+    """Represents a single conditional branch edge within a ConditionalBlock."""
+
+    criteria: BranchCriteria | None = None
+    next_block_label: str | None = None
+    description: str | None = None
+    is_default: bool = False
+
+    @model_validator(mode="after")
+    def validate_condition(cls, condition: BranchCondition) -> BranchCondition:
+        if isinstance(condition.criteria, dict):
+            condition.criteria = JinjaBranchCriteria(**condition.criteria)
+        if condition.criteria is None and not condition.is_default:
+            raise ValueError("Branches without criteria must be marked as default.")
+        if condition.criteria is not None and not isinstance(condition.criteria, JinjaBranchCriteria):
+            raise ValueError("Only Jinja2 branch criteria are supported in this version.")
+        if condition.criteria is not None and condition.is_default:
+            raise ValueError("Default branches may not define criteria.")
+        return condition
+
+
+class ConditionalBlock(Block):
+    """Branching block that selects the next block label based on list-ordered conditions."""
+
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.CONDITIONAL] = BlockType.CONDITIONAL  # type: ignore
+
+    branch_conditions: list[BranchCondition] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_branches(cls, block: ConditionalBlock) -> ConditionalBlock:
+        if not block.branch_conditions:
+            raise ValueError("Conditional blocks require at least one branch.")
+
+        default_branches = [branch for branch in block.branch_conditions if branch.is_default]
+        if len(default_branches) > 1:
+            raise ValueError("Only one default branch is permitted per conditional block.")
+
+        return block
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,  # noqa: ARG002 - preserved for interface compatibility
+    ) -> list[PARAMETER_TYPE]:
+        # BranchCriteria subclasses will surface their parameter dependencies once implemented.
+        return []
+
+    async def execute(  # noqa: D401
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        """
+        Placeholder execute implementation.
+
+        Conditional block execution will be implemented alongside the DAG workflow
+        engine refactor (see branching workflow spec).
+        """
+        raise NotImplementedError("Conditional block execution is handled by the DAG engine.")
+
+    @property
+    def ordered_branches(self) -> list[BranchCondition]:
+        """Convenience accessor that returns branches in author-specified list order."""
+        return list(self.branch_conditions)
+
+    def get_default_branch(self) -> BranchCondition | None:
+        """Return the default/else branch when configured."""
+        return next((branch for branch in self.branch_conditions if branch.is_default), None)
+
+
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
     """
     Recursively get "all blocks" in a workflow definition.
@@ -3842,6 +4033,7 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
 
 
 BlockSubclasses = Union[
+    ConditionalBlock,
     ForLoopBlock,
     TaskBlock,
     CodeBlock,

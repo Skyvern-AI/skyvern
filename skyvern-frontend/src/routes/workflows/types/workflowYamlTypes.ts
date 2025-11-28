@@ -24,6 +24,7 @@ export type WorkflowCreateYAMLRequest = {
 };
 
 export type WorkflowDefinitionYAML = {
+  version?: number | null;
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
 };
@@ -144,6 +145,7 @@ export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
   label: string;
   continue_on_failure?: boolean;
+  next_block_label?: string | null;
 };
 
 export type TaskBlockYAML = BlockYAMLBase & {
