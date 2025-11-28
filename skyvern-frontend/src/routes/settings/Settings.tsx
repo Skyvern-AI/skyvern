@@ -18,6 +18,7 @@ import { getRuntimeApiKey } from "@/util/env";
 import { HiddenCopyableInput } from "@/components/ui/hidden-copyable-input";
 import { OnePasswordTokenForm } from "@/components/OnePasswordTokenForm";
 import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
+import { CustomCredentialServiceConfigForm } from "@/components/CustomCredentialServiceConfigForm";
 
 function Settings() {
   const { environment, organization, setEnvironment, setOrganization } =
@@ -95,6 +96,17 @@ function Settings() {
         </CardHeader>
         <CardContent className="p-8">
           <AzureClientSecretCredentialTokenForm />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-lg">Custom Credential Service</CardTitle>
+          <CardDescription>
+            Configure your custom HTTP API for credential management.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-8">
+          <CustomCredentialServiceConfigForm />
         </CardContent>
       </Card>
     </div>
