@@ -89,16 +89,6 @@ class ExfiltrationChannel(CdpChannel):
 
         self.on_event(messages)
 
-        if event_name in ("frame_navigated", "navigated_within_document"):
-            # optimistically re-apply exfiltration and decoration on navigation
-            # (these operations should be idempotent)
-            pages = self.browser_context.pages if self.browser_context else []
-            LOG.info(f"{self.class_name} re-applying exfiltration and decoration on navigation.", event_name=event_name)
-
-            for page in pages:
-                asyncio.create_task(self.exfiltrate(page))
-                asyncio.create_task(self.decorate(page))
-
     async def connect(self, cdp_url: str | None = None) -> t.Self:
         if self.browser and self.browser.is_connected() and self.cdp_session:
             return self
