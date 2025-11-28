@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class CredentialVaultType(StrEnum):
     BITWARDEN = "bitwarden"
     AZURE_VAULT = "azure_vault"
+    CUSTOM = "custom"
 
 
 class CredentialType(StrEnum):

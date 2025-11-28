@@ -24,9 +24,11 @@ from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
+from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialVaultService
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -68,6 +70,7 @@ class ForgeApp:
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
+    CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
     CREDENTIAL_VAULT_SERVICES: dict[str, CredentialVaultService | None]
     scrape_exclude: ScrapeExcludeFunc | None
     authentication_function: Callable[[str], Awaitable[Organization]] | None
@@ -190,9 +193,20 @@ def create_forge_app() -> ForgeApp:
         if settings.AZURE_CREDENTIAL_VAULT
         else None
     )
+    app.CUSTOM_CREDENTIAL_VAULT_SERVICE = (
+        CustomCredentialVaultService(
+            CustomCredentialAPIClient(
+                api_base_url=settings.CUSTOM_CREDENTIAL_API_BASE_URL,  # type: ignore
+                api_token=settings.CUSTOM_CREDENTIAL_API_TOKEN,  # type: ignore
+            )
+        )
+        if settings.CUSTOM_CREDENTIAL_API_BASE_URL and settings.CUSTOM_CREDENTIAL_API_TOKEN
+        else CustomCredentialVaultService()  # Create service without client for organization-based configuration
+    )
     app.CREDENTIAL_VAULT_SERVICES = {
         CredentialVaultType.BITWARDEN: app.BITWARDEN_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.AZURE_VAULT: app.AZURE_CREDENTIAL_VAULT_SERVICE,
+        CredentialVaultType.CUSTOM: app.CUSTOM_CREDENTIAL_VAULT_SERVICE,
     }
 
     app.scrape_exclude = None
