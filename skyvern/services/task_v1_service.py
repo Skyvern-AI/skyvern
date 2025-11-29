@@ -47,7 +47,7 @@ async def generate_task(user_prompt: str, organization: Organization) -> TaskGen
 
     llm_prompt = prompt_engine.load_prompt("generate-task", user_prompt=user_prompt)
     try:
-        llm_response = await app.LLM_API_HANDLER(
+        llm_response = await app.SECONDARY_LLM_API_HANDLER(
             prompt=llm_prompt, prompt_name="generate-task", organization_id=organization.organization_id
         )
         parsed_task_generation_obj = TaskGenerationBase.model_validate(llm_response)
