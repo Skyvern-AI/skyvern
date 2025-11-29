@@ -117,11 +117,6 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
     # Try as ProxyLocation enum
     try:
         result = ProxyLocation(value)
-        LOG.info(
-            "Deserialized proxy_location as ProxyLocation enum",
-            db_value=value,
-            result=str(result),
-        )
         return result
     except ValueError:
         # If all else fails, return as-is (shouldn't happen with valid data)
