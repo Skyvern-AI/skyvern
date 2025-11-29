@@ -653,6 +653,9 @@ class LLMAPIHandlerFactory:
             if llm_config.litellm_params:  # type: ignore
                 active_parameters.update(llm_config.litellm_params)  # type: ignore
 
+            if "timeout" not in active_parameters:
+                active_parameters["timeout"] = settings.LLM_CONFIG_TIMEOUT
+
             # Apply thinking budget optimization if settings are available
             if (
                 LLMAPIHandlerFactory._thinking_budget_settings
@@ -773,13 +776,11 @@ class LLMAPIHandlerFactory:
 
             t_llm_request = time.perf_counter()
             try:
-                # TODO (kerem): add a timeout to this call
                 # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
                 # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
                 response = await litellm.acompletion(
                     model=model_name,
                     messages=messages,
-                    timeout=settings.LLM_CONFIG_TIMEOUT,
                     drop_params=True,  # Drop unsupported parameters gracefully
                     **active_parameters,
                 )
