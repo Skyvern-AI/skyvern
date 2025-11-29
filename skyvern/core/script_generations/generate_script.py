@@ -1525,47 +1525,6 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
     return for_loop
 
 
-def _build_goto_statement_for_loop(block: dict[str, Any]) -> cst.SimpleStatementLine:
-    """Build a skyvern.goto statement for use within loops, handling current_value template."""
-    url_value = block.get("url", "")
-
-    # Handle {{current_value}} template by replacing it with the current_value variable
-    if url_value == "{{current_value}}":
-        url_expr = cst.Name("current_value")
-    else:
-        url_expr = _value(url_value)
-
-    args = [
-        cst.Arg(
-            keyword=cst.Name("url"),
-            value=url_expr,
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-        cst.Arg(
-            keyword=cst.Name("label"),
-            value=_value(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
-    ]
-
-    call = cst.Call(
-        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("goto")),
-        args=args,
-        whitespace_before_args=cst.ParenthesizedWhitespace(
-            indent=True,
-            last_line=cst.SimpleWhitespace(INDENT),
-        ),
-    )
-
-    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
-
-
 def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
     if not args:
         return
