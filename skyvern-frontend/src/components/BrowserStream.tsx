@@ -1,5 +1,5 @@
 import RFB from "@novnc/novnc/lib/rfb.js";
-import { ExitIcon, HandIcon } from "@radix-ui/react-icons";
+import { ExitIcon, HandIcon, InfoCircledIcon } from "@radix-ui/react-icons";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 
@@ -9,12 +9,28 @@ import type {
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
+import { Tip } from "@/components/Tip";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { AnimatedWave } from "@/components/AnimatedWave";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useClientIdStore } from "@/store/useClientIdStore";
+import {
+  useRecordingStore,
+  type MessageInExfiltratedEvent,
+} from "@/store/useRecordingStore";
+import { useSettingsStore } from "@/store/SettingsStore";
 import {
   environment,
   wssBaseUrl,
@@ -31,18 +47,34 @@ interface BrowserSession {
   completed_at?: string;
 }
 
-interface CommandTakeControl {
-  kind: "take-control";
+interface CommandBeginExfiltration {
+  kind: "begin-exfiltration";
 }
 
 interface CommandCedeControl {
   kind: "cede-control";
 }
 
-// a "Command" is an fire-n-forget out-message - it does not require a response
-type Command = CommandTakeControl | CommandCedeControl;
+interface CommandEndExfiltration {
+  kind: "end-exfiltration";
+}
 
-const messageInKinds = ["ask-for-clipboard", "copied-text"] as const;
+interface CommandTakeControl {
+  kind: "take-control";
+}
+
+// a "Command" is an fire-n-forget out-message - it does not require a response
+type Command =
+  | CommandBeginExfiltration
+  | CommandCedeControl
+  | CommandEndExfiltration
+  | CommandTakeControl;
+
+const messageInKinds = [
+  "ask-for-clipboard",
+  "copied-text",
+  "exfiltrated-event",
+] as const;
 
 type MessageInKind = (typeof messageInKinds)[number];
 
@@ -55,7 +87,10 @@ interface MessageInCopiedText {
   text: string;
 }
 
-type MessageIn = MessageInCopiedText | MessageInAskForClipboard;
+type MessageIn =
+  | MessageInCopiedText
+  | MessageInAskForClipboard
+  | MessageInExfiltratedEvent;
 
 interface MessageOutAskForClipboardResponse {
   kind: "ask-for-clipboard-response";
@@ -66,6 +101,7 @@ type MessageOut = MessageOutAskForClipboardResponse;
 
 type Props = {
   browserSessionId?: string;
+  exfiltrate?: boolean;
   interactive?: boolean;
   showControlButtons?: boolean;
   task?: {
@@ -82,6 +118,7 @@ type Props = {
 
 function BrowserStream({
   browserSessionId = undefined,
+  exfiltrate = false,
   interactive = true,
   showControlButtons = undefined,
   task = undefined,
@@ -175,6 +212,8 @@ function BrowserStream({
   const rfbRef = useRef<RFB | null>(null);
   const observerRef = useRef<MutationObserver | null>(null);
   const clientId = useClientIdStore((state) => state.clientId);
+  const recordingStore = useRecordingStore();
+  const settingsStore = useSettingsStore();
   const credentialGetter = useCredentialGetter();
 
   const getWebSocketParams = useCallback(async () => {
@@ -197,6 +236,15 @@ function BrowserStream({
   useEffect(() => {
     setIsReady(isVncConnected && isCanvasReady && hasBrowserSession);
   }, [hasBrowserSession, isCanvasReady, isVncConnected]);
+
+  // update global settings store about browser usage
+  useEffect(() => {
+    settingsStore.setIsUsingABrowser(isReady);
+    settingsStore.setBrowserSessionId(
+      isReady ? browserSessionId ?? null : null,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady, browserSessionId]);
 
   // effect for vnc disconnects only
   useEffect(() => {
@@ -417,8 +465,6 @@ function BrowserStream({
 
     const sendCommand = (command: Command) => {
       if (!messageSocket) {
-        console.warn("Cannot send command, as command socket is closed.");
-        console.warn(command);
         return;
       }
 
@@ -478,11 +524,58 @@ function BrowserStream({
     }
   }, [task, workflow]);
 
+  // effect for exfiltration
+  useEffect(() => {
+    const sendCommand = (command: Command) => {
+      if (!messageSocket) {
+        return;
+      }
+
+      messageSocket.send(JSON.stringify(command));
+    };
+
+    sendCommand({
+      kind: exfiltrate ? "begin-exfiltration" : "end-exfiltration",
+    });
+  }, [exfiltrate, messageSocket]);
+
   useEffect(() => {
     if (!interactive) {
       setUserIsControlling(false);
     }
   }, [interactive]);
+
+  // effect to ensure the recordingStore is reset when the component unmounts
+  useEffect(() => {
+    return () => {
+      recordingStore.reset();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // effect to ensure 'take-control' is sent on the rising edge of
+  // recordingStore.isRecording
+  useEffect(() => {
+    if (!recordingStore.isRecording) {
+      return;
+    }
+
+    if (!isMessageConnected) {
+      return;
+    }
+
+    const sendCommand = (command: Command) => {
+      if (!messageSocket) {
+        return;
+      }
+
+      messageSocket.send(JSON.stringify(command));
+    };
+
+    sendCommand({ kind: "take-control" });
+    setUserIsControlling(true);
+  }, [recordingStore.isRecording, isMessageConnected, messageSocket]);
+
   /**
    * TODO(jdo): could use zod or smth similar
    */
@@ -521,6 +614,25 @@ function BrowserStream({
             kind: "copied-text",
             text: data.text,
           };
+        }
+        break;
+      }
+      case "exfiltrated-event": {
+        if (
+          "event_name" in data &&
+          typeof data.event_name === "string" &&
+          "params" in data &&
+          typeof data.params === "object" &&
+          data.params !== null &&
+          "source" in data &&
+          typeof data.source === "string"
+        ) {
+          return {
+            kind: "exfiltrated-event",
+            event_name: data.event_name,
+            params: data.params,
+            source: data.source,
+          } as MessageInExfiltratedEvent;
         }
         break;
       }
@@ -604,6 +716,10 @@ function BrowserStream({
 
         break;
       }
+      case "exfiltrated-event": {
+        recordingStore.add(message);
+        break;
+      }
       default: {
         const _exhaustive: never = kind;
         return _exhaustive;
@@ -615,72 +731,137 @@ function BrowserStream({
     userIsControlling || (interactive && !showControlButtons);
 
   return (
-    <div
-      className={cn(
-        "browser-stream relative flex items-center justify-center",
-        {
-          "user-is-controlling": theUserIsControlling,
-        },
-      )}
-      ref={setCanvasContainerRef}
-    >
-      {isReady && isVisible && (
-        <div className="overlay z-10 flex items-center justify-center overflow-hidden">
-          {showControlButtons && (
-            <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
-              <Button
-                onClick={() => {
-                  setUserIsControlling(true);
-                }}
-                className={cn("control-button pointer-events-auto border", {
-                  hide: userIsControlling,
-                })}
-                size="sm"
-              >
-                <HandIcon className="mr-2 h-4 w-4" />
-                take control
-              </Button>
-              <Button
-                onClick={() => {
-                  setUserIsControlling(false);
-                }}
-                className={cn(
-                  "control-button pointer-events-auto absolute bottom-0 border",
-                  {
-                    hide: !userIsControlling,
-                  },
-                )}
-                size="sm"
-              >
-                <ExitIcon className="mr-2 h-4 w-4" />
-                stop controlling
-              </Button>
+    <>
+      <div
+        className={cn(
+          "browser-stream relative flex flex-col items-center justify-center",
+          {
+            "user-is-controlling": theUserIsControlling,
+          },
+        )}
+        ref={setCanvasContainerRef}
+      >
+        {isReady && isVisible && (
+          <div className="overlay z-10 flex items-center justify-center overflow-hidden">
+            {showControlButtons && (
+              <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
+                <Button
+                  onClick={() => {
+                    setUserIsControlling(true);
+                  }}
+                  className={cn("control-button pointer-events-auto border", {
+                    hide: userIsControlling,
+                  })}
+                  size="sm"
+                >
+                  <HandIcon className="mr-2 h-4 w-4" />
+                  take control
+                </Button>
+                <Button
+                  onClick={() => {
+                    setUserIsControlling(false);
+                  }}
+                  className={cn(
+                    "control-button pointer-events-auto absolute bottom-0 border",
+                    {
+                      hide: !userIsControlling,
+                    },
+                  )}
+                  size="sm"
+                >
+                  <ExitIcon className="mr-2 h-4 w-4" />
+                  stop controlling
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+        {recordingStore.isRecording && (
+          <>
+            <div className="pointer-events-none absolute flex aspect-video w-full items-center justify-center rounded-xl p-2 outline outline-8 outline-offset-[-2px] outline-red-500 animate-in fade-in">
+              <div className="relative h-full w-full">
+                <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2 text-red-500">
+                  <div className="truncate">Browser is recording</div>
+                  <Tip content="To finish the recording, press stop on the animated recording button in the workflow.">
+                    <div className="cursor-pointer">
+                      <InfoCircledIcon />
+                    </div>
+                  </Tip>
+                  <Dialog>
+                    <DialogTrigger asChild>
+                      <Button
+                        className="ml-auto cursor-pointer"
+                        size="sm"
+                        variant="destructive"
+                        style={{
+                          marginTop: "-0.5rem",
+                        }}
+                        onClick={(e) => {
+                          const hasEvents =
+                            recordingStore.pendingEvents.length > 0 ||
+                            recordingStore.compressedChunks.length > 0;
+                          if (!hasEvents) {
+                            e.preventDefault();
+                            recordingStore.setIsRecording(false);
+                          }
+                        }}
+                      >
+                        cancel
+                      </Button>
+                    </DialogTrigger>
+                    <DialogContent>
+                      <DialogHeader>
+                        <DialogTitle>Cancel recording?</DialogTitle>
+                        <DialogDescription>
+                          You have recorded events that will be lost if you
+                          cancel. Are you sure you want to cancel the recording?
+                        </DialogDescription>
+                      </DialogHeader>
+                      <DialogFooter>
+                        <DialogClose asChild>
+                          <Button variant="outline">Keep recording</Button>
+                        </DialogClose>
+                        <DialogClose asChild>
+                          <Button
+                            variant="destructive"
+                            onClick={() => {
+                              recordingStore.setIsRecording(false);
+                            }}
+                          >
+                            Cancel recording
+                          </Button>
+                        </DialogClose>
+                      </DialogFooter>
+                    </DialogContent>
+                  </Dialog>
+                </div>
+              </div>
             </div>
-          )}
-        </div>
-      )}
-      {!isReady && (
-        <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
-          {browserSessionId && !hasBrowserSession ? (
-            <div>This live browser session is no longer streaming.</div>
-          ) : (
-            <>
-              <RotateThrough interval={7 * 1000}>
-                <span>Hm, working on the connection...</span>
-                <span>Hang tight, we're almost there...</span>
-                <span>Just a moment...</span>
-                <span>Backpropagating...</span>
-                <span>Attention is all I need...</span>
-                <span>Consulting the manual...</span>
-                <span>Looking for the bat phone...</span>
-                <span>Where's Shu?...</span>
-              </RotateThrough>
-              <AnimatedWave text=".‧₊˚ ⋅ ? ✨ ?★ ‧₊˚ ⋅" />
-            </>
-          )}
-        </div>
-      )}
-    </div>
+          </>
+        )}
+        {!isReady && (
+          <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
+            {browserSessionId && !hasBrowserSession ? (
+              <div>This live browser session is no longer streaming.</div>
+            ) : (
+              <>
+                <RotateThrough interval={7 * 1000}>
+                  <span>Hm, working on the connection...</span>
+                  <span>Hang tight, we're almost there...</span>
+                  <span>Just a moment...</span>
+                  <span>Backpropagating...</span>
+                  <span>Attention is all I need...</span>
+                  <span>Consulting the manual...</span>
+                  <span>Looking for the bat phone...</span>
+                  <span>Where's Shu?...</span>
+                </RotateThrough>
+                <AnimatedWave text=".‧₊˚ ⋅ ? ✨ ?★ ‧₊˚ ⋅" />
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </>
   );
 }
 

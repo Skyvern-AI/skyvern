@@ -49,6 +49,7 @@ def resolve_template_name(use_case: str) -> str:
     tags=["Prompts"],
     description="Improve a prompt based on a specific use-case",
     summary="Improve prompt",
+    include_in_schema=False,
 )
 async def improve_prompt(
     request: ImprovePromptRequest,

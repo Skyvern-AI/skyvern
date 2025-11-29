@@ -2458,6 +2458,7 @@ function getLabelForWorkflowParameterType(type: WorkflowParameterValueType) {
 export {
   convert,
   convertEchoParameters,
+  convertToNode,
   createNode,
   generateNodeData,
   generateNodeLabel,

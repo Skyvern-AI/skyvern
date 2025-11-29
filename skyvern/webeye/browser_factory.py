@@ -41,7 +41,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
-from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -680,7 +680,7 @@ class BrowserState:
     async def check_and_fix_state(
         self,
         url: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         script_id: str | None = None,
@@ -886,7 +886,7 @@ class BrowserState:
     async def get_or_create_page(
         self,
         url: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         script_id: str | None = None,

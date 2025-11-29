@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, ReactNode } from "react";
+import { useState, useRef, useEffect, ReactNode, Fragment } from "react";
 
 export interface RadialMenuItem {
   id: string;
@@ -175,9 +175,8 @@ export function RadialMenu({
             : "scaleY(1)";
 
         return (
-          <>
+          <Fragment key={item.id}>
             <button
-              key={item.id}
               onClick={() => {
                 item.onClick();
                 setIsOpen(false);
@@ -225,7 +224,7 @@ export function RadialMenu({
                 </span>
               </div>
             )}
-          </>
+          </Fragment>
         );
       })}
     </div>

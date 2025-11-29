@@ -4,6 +4,14 @@
 
     window.__skyvern_create_mouse_follower = function () {
       // create the circle element
+      const existingCircle = document.getElementById(
+        "__skyvern_mouse_follower",
+      );
+
+      if (existingCircle) {
+        return false;
+      }
+
       const circle = document.createElement("div");
       window.__skyvern_decoration_mouse_follower = circle;
       circle.id = "__skyvern_mouse_follower";
@@ -18,9 +26,15 @@
       circle.style.zIndex = "999999";
       circle.style.willChange = "transform";
       document.body.appendChild(circle);
+
+      return true;
     };
 
-    window.__skyvern_create_mouse_follower();
+    const wasCreated = window.__skyvern_create_mouse_follower();
+
+    if (!wasCreated) {
+      return;
+    }
 
     let scale = 1;
     let targetScale = 1;

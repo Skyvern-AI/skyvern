@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
-from skyvern.schemas.runs import ProxyLocation, RunEngine
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
 
 
 class WorkflowStatus(StrEnum):
@@ -551,7 +551,7 @@ class WorkflowDefinitionYAML(BaseModel):
 class WorkflowCreateYAMLRequest(BaseModel):
     title: str
     description: str | None = None
-    proxy_location: ProxyLocation | None = None
+    proxy_location: ProxyLocation | GeoTarget | dict | None = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None

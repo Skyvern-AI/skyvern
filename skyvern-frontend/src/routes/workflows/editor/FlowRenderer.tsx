@@ -11,6 +11,7 @@ import { useOnChange } from "@/hooks/useOnChange";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
@@ -33,6 +34,7 @@ import {
   EdgeChange,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { nanoid } from "nanoid";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useBlocker } from "react-router-dom";
 import {
@@ -76,8 +78,10 @@ import {
 import "./reactFlowOverrideStyles.css";
 import {
   convertEchoParameters,
+  convertToNode,
   createNode,
   descendants,
+  generateNodeLabel,
   getAdditionalParametersForEmailBlock,
   getOrderedChildrenBlocks,
   getOutputParameterKey,
@@ -319,6 +323,13 @@ function FlowRenderer({
   const setGetSaveDataRef = useRef(workflowChangesStore.setGetSaveData);
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
   const saveWorkflow = useWorkflowSave({ status: "published" });
+  const recordedBlocks = useRecordedBlocksStore((state) => state.blocks);
+  const recordedInsertionPoint = useRecordedBlocksStore(
+    (state) => state.insertionPoint,
+  );
+  const clearRecordedBlocks = useRecordedBlocksStore(
+    (state) => state.clearRecordedBlocks,
+  );
   useShouldNotifyWhenClosingTab(workflowChangesStore.hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
     return (
@@ -571,6 +582,85 @@ function FlowRenderer({
 
     doLayout(nodes, edges);
   }
+
+  // effect to add new blocks that were generated from a browser recording
+  useEffect(() => {
+    if (!recordedBlocks || !recordedInsertionPoint) {
+      return;
+    }
+
+    const { previous, next, parent, connectingEdgeType } =
+      recordedInsertionPoint;
+
+    const newNodes: Array<AppNode> = [];
+    const newEdges: Array<Edge> = [];
+
+    let existingLabels = nodes
+      .filter(isWorkflowBlockNode)
+      .map((node) => node.data.label);
+
+    let prevNodeId = previous;
+
+    // convert each WorkflowBlock to an AppNode
+    recordedBlocks.forEach((block, index) => {
+      const id = nanoid();
+      const label = generateNodeLabel(existingLabels);
+      existingLabels = [...existingLabels, label];
+      const blockWithLabel = { ...block, label: block.label || label };
+
+      const node = convertToNode(
+        { id, parentId: parent },
+        blockWithLabel,
+        true,
+      );
+      newNodes.push(node);
+
+      // create edge from previous node to this one
+      if (prevNodeId) {
+        newEdges.push({
+          id: nanoid(),
+          type: "edgeWithAddButton",
+          source: prevNodeId,
+          target: id,
+          style: { strokeWidth: 2 },
+        });
+      }
+
+      // if this is the last block, connect to next
+      if (index === recordedBlocks.length - 1 && next) {
+        newEdges.push({
+          id: nanoid(),
+          type: connectingEdgeType,
+          source: id,
+          target: next,
+          style: { strokeWidth: 2 },
+        });
+      }
+
+      prevNodeId = id;
+    });
+
+    const editedEdges = previous
+      ? edges.filter((edge) => edge.source !== previous)
+      : edges;
+
+    const previousNode = nodes.find((node) => node.id === previous);
+    const previousNodeIndex = previousNode
+      ? nodes.indexOf(previousNode)
+      : nodes.length - 1;
+
+    const newNodesAfter = [
+      ...nodes.slice(0, previousNodeIndex + 1),
+      ...newNodes,
+      ...nodes.slice(previousNodeIndex + 1),
+    ];
+
+    workflowChangesStore.setHasChanges(true);
+    doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
+
+    clearRecordedBlocks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordedBlocks, recordedInsertionPoint]);
 
   const editorElementRef = useRef<HTMLDivElement>(null);
 

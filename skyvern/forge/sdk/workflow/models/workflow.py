@@ -10,7 +10,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
-from skyvern.schemas.runs import ProxyLocation, ScriptRunResponse
+from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
 from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.url_validators import validate_url
 
@@ -18,7 +18,7 @@ from skyvern.utils.url_validators import validate_url
 @deprecated("Use WorkflowRunRequest instead")
 class WorkflowRequestBody(BaseModel):
     data: dict[str, Any] | None = None
-    proxy_location: ProxyLocation | None = None
+    proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
@@ -77,7 +77,7 @@ class Workflow(BaseModel):
     is_saved_task: bool
     description: str | None = None
     workflow_definition: WorkflowDefinition
-    proxy_location: ProxyLocation | None = None
+    proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
@@ -142,7 +142,7 @@ class WorkflowRun(BaseModel):
     debug_session_id: str | None = None
     status: WorkflowRunStatus
     extra_http_headers: dict[str, str] | None = None
-    proxy_location: ProxyLocation | None = None
+    proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None
     totp_verification_url: str | None = None
@@ -186,7 +186,7 @@ class WorkflowRunResponseBase(BaseModel):
     workflow_run_id: str
     status: WorkflowRunStatus
     failure_reason: str | None = None
-    proxy_location: ProxyLocation | None = None
+    proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None
     totp_verification_url: str | None = None

@@ -1,4 +1,4 @@
-import { SquareIcon, PlusIcon } from "@radix-ui/react-icons";
+import { PlusIcon } from "@radix-ui/react-icons";
 import {
   BaseEdge,
   EdgeLabelRenderer,
@@ -8,12 +8,16 @@ import {
 } from "@xyflow/react";
 
 import { Button } from "@/components/ui/button";
-import { RadialMenu } from "@/components/RadialMenu";
-import { useIsSkyvernUser } from "@/hooks/useIsSkyvernUser";
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
+import { useSettingsStore } from "@/store/SettingsStore";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { REACT_FLOW_EDGE_Z_INDEX } from "../constants";
+import { WorkflowAddMenu } from "../WorkflowAddMenu";
+import { WorkflowAdderBusy } from "../WorkflowAdderBusy";
 
 function EdgeWithAddButton({
   source,
@@ -27,8 +31,6 @@ function EdgeWithAddButton({
   style = {},
   markerEnd,
 }: EdgeProps) {
-  const debugStore = useDebugStore();
-  const isSkyvernUser = useIsSkyvernUser();
   const nodes = useNodes();
   const [edgePath, labelX, labelY] = getBezierPath({
     sourceX,
@@ -38,14 +40,35 @@ function EdgeWithAddButton({
     targetY,
     targetPosition,
   });
+  const debugStore = useDebugStore();
+  const recordingStore = useRecordingStore();
+  const settingsStore = useSettingsStore();
+  const workflowStatePanel = useWorkflowPanelStore();
+  const setRecordedBlocks = useRecordedBlocksStore(
+    (state) => state.setRecordedBlocks,
+  );
   const setWorkflowPanelState = useWorkflowPanelStore(
     (state) => state.setWorkflowPanelState,
   );
+  const processRecordingMutation = useProcessRecordingMutation({
+    browserSessionId: settingsStore.browserSessionId,
+    onSuccess: (blocks) => {
+      setRecordedBlocks(blocks, {
+        previous: source,
+        next: target,
+        parent: sourceNode?.parentId,
+        connectingEdgeType: "edgeWithAddButton",
+      });
+    },
+  });
+
+  const isProcessing = processRecordingMutation.isPending;
+
   const sourceNode = nodes.find((node) => node.id === source);
 
-  const onAdd = () => {
+  const updateWorkflowPanelState = (active: boolean) => {
     setWorkflowPanelState({
-      active: true,
+      active,
       content: "nodeLibrary",
       data: {
         previous: source,
@@ -53,6 +76,25 @@ function EdgeWithAddButton({
         parent: sourceNode?.parentId,
       },
     });
+  };
+
+  const onAdd = () => updateWorkflowPanelState(true);
+
+  const onRecord = () => {
+    if (recordingStore.isRecording) {
+      recordingStore.setIsRecording(false);
+    } else {
+      recordingStore.setIsRecording(true);
+      updateWorkflowPanelState(false);
+    }
+  };
+
+  const onEndRecord = () => {
+    if (recordingStore.isRecording) {
+      recordingStore.setIsRecording(false);
+    }
+
+    processRecordingMutation.mutate();
   };
 
   const adder = (
@@ -64,6 +106,41 @@ function EdgeWithAddButton({
       <PlusIcon />
     </Button>
   );
+
+  const menu = (
+    <WorkflowAddMenu
+      buttonSize="25px"
+      gap={35}
+      radius="50px"
+      startAt={72.5}
+      onAdd={onAdd}
+      onRecord={onRecord}
+    >
+      {adder}
+    </WorkflowAddMenu>
+  );
+
+  const busy = (
+    <WorkflowAdderBusy
+      color={isProcessing ? "white" : "red"}
+      operation={isProcessing ? "processing" : "recording"}
+      size="small"
+      onComplete={() => {
+        onEndRecord();
+      }}
+    >
+      {adder}
+    </WorkflowAdderBusy>
+  );
+
+  const isBusy =
+    (isProcessing || recordingStore.isRecording) &&
+    debugStore.isDebugMode &&
+    settingsStore.isUsingABrowser &&
+    workflowStatePanel.workflowPanelState.data?.previous === source &&
+    workflowStatePanel.workflowPanelState.data?.next === target &&
+    workflowStatePanel.workflowPanelState.data?.parent ===
+      (sourceNode?.parentId || undefined);
 
   return (
     <>
@@ -81,38 +158,7 @@ function EdgeWithAddButton({
           }}
           className="nodrag nopan"
         >
-          {isSkyvernUser && debugStore.isDebugMode ? (
-            <RadialMenu
-              items={[
-                {
-                  id: "1",
-                  icon: <PlusIcon className="h-3 w-3" />,
-                  text: "Add Block",
-                  onClick: () => {
-                    onAdd();
-                  },
-                },
-                {
-                  id: "2",
-                  icon: <SquareIcon className="h-3 w-3" />,
-                  enabled: false,
-                  text: "Record Browser",
-                  onClick: () => {
-                    console.log("Record");
-                  },
-                },
-              ]}
-              buttonSize="25px"
-              radius="50px"
-              startAt={72.5}
-              gap={35}
-              rotateText={true}
-            >
-              {adder}
-            </RadialMenu>
-          ) : (
-            adder
-          )}
+          {isBusy ? busy : menu}
         </div>
       </EdgeLabelRenderer>
     </>
