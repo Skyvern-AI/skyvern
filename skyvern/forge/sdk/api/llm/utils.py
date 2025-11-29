@@ -143,6 +143,12 @@ def _coerce_response_to_dict(response: Any) -> dict[str, Any]:
     if isinstance(response, dict):
         return response
 
+    LOG.warning(
+        "Parsed LLM response is not a dict",
+        response_type=type(response).__name__,
+        response=response,
+    )
+
     if isinstance(response, list):
         first_dict = next((item for item in response if isinstance(item, dict)), None)
         LOG.warning(
@@ -156,11 +162,6 @@ def _coerce_response_to_dict(response: Any) -> dict[str, Any]:
 
         LOG.warning("List response contained no dict entries; returning empty dict")
         raise InvalidLLMResponseType("list")
-
-    LOG.warning(
-        "Parsed LLM response is not a dict; returning empty dict",
-        response_type=type(response).__name__,
-    )
 
     raise InvalidLLMResponseType(type(response).__name__)
 
