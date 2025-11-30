@@ -12,6 +12,8 @@ from typing import Any, Literal, cast
 
 import httpx
 import structlog
+from asyncpg.exceptions import NotNullViolationError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 import skyvern
 from skyvern import analytics
@@ -32,6 +34,7 @@ from skyvern.exceptions import (
     WorkflowNotFound,
     WorkflowNotFoundForWorkflowRun,
     WorkflowRunNotFound,
+    WorkflowRunParameterPersistenceError,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -107,7 +110,13 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunResponseBase,
     WorkflowRunStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
+from skyvern.schemas.runs import (
+    ProxyLocationInput,
+    RunStatus,
+    RunType,
+    WorkflowRunRequest,
+    WorkflowRunResponse,
+)
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptStatus, WorkflowScript
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
@@ -478,19 +487,35 @@ class WorkflowService:
                     request_body_value = workflow_request.data[workflow_parameter.key]
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                         await self._validate_credential_id(str(request_body_value), organization)
-                    await self.create_workflow_run_parameter(
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        workflow_parameter=workflow_parameter,
-                        value=request_body_value,
-                    )
+                    try:
+                        await self.create_workflow_run_parameter(
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            workflow_parameter=workflow_parameter,
+                            value=request_body_value,
+                        )
+                    except SQLAlchemyError as parameter_error:
+                        raise WorkflowRunParameterPersistenceError(
+                            parameter_key=workflow_parameter.key,
+                            workflow_id=workflow.workflow_permanent_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            reason=self._format_parameter_persistence_error(parameter_error),
+                        ) from parameter_error
                 elif workflow_parameter.default_value is not None:
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                         await self._validate_credential_id(str(workflow_parameter.default_value), organization)
-                    await self.create_workflow_run_parameter(
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        workflow_parameter=workflow_parameter,
-                        value=workflow_parameter.default_value,
-                    )
+                    try:
+                        await self.create_workflow_run_parameter(
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            workflow_parameter=workflow_parameter,
+                            value=workflow_parameter.default_value,
+                        )
+                    except SQLAlchemyError as parameter_error:
+                        raise WorkflowRunParameterPersistenceError(
+                            parameter_key=workflow_parameter.key,
+                            workflow_id=workflow.workflow_permanent_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            reason=self._format_parameter_persistence_error(parameter_error),
+                        ) from parameter_error
                 else:
                     raise MissingValueForParameter(
                         parameter_key=workflow_parameter.key,
@@ -522,13 +547,21 @@ class WorkflowService:
 
         return workflow_run
 
+    @staticmethod
+    def _format_parameter_persistence_error(error: SQLAlchemyError) -> str:
+        if isinstance(error, IntegrityError):
+            orig_error = getattr(error, "orig", None)
+            if isinstance(orig_error, NotNullViolationError):
+                return "value cannot be null"
+        return "database error while saving parameter value"
+
     async def auto_create_browser_session_if_needed(
         self,
         organization_id: str,
         workflow: Workflow,
         *,
         browser_session_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
     ) -> PersistentBrowserSession | None:
         if browser_session_id:  # the user has supplied an id, so no need to create one
             return None
@@ -1125,7 +1158,7 @@ class WorkflowService:
         title: str,
         workflow_definition: WorkflowDefinition,
         description: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
@@ -1176,7 +1209,7 @@ class WorkflowService:
         totp_identifier: str | None = None,
         totp_verification_url: str | None = None,
         webhook_callback_url: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         max_iterations: int | None = None,
@@ -3246,7 +3279,7 @@ class WorkflowService:
         self,
         organization: Organization,
         title: str,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         run_with: str | None = None,

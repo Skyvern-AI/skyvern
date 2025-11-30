@@ -37,7 +37,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, RunEngine, RunType, TaskRunRequest, TaskRunResponse
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     PARAMETER_YAML_TYPES,
@@ -150,7 +150,7 @@ async def initialize_task_v2(
     organization: Organization,
     user_prompt: str,
     user_url: str | None = None,
-    proxy_location: ProxyLocation | None = None,
+    proxy_location: ProxyLocationInput = None,
     totp_identifier: str | None = None,
     totp_verification_url: str | None = None,
     webhook_callback_url: str | None = None,
