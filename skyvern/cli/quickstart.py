@@ -9,23 +9,19 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Import console after skyvern.cli to ensure proper initialization
 from skyvern.cli.console import console
+from skyvern.cli.container import ContainerRuntimeFactory
 from skyvern.cli.init_command import init  # init is used directly
 from skyvern.cli.utils import start_services
 
 quickstart_app = typer.Typer(help="Quickstart command to set up and run Skyvern with one command.")
 
 
-def check_docker() -> bool:
-    """Check if Docker is installed and running."""
+def check_container_runtime() -> bool:
+    """Check if a container runtime (Docker or Podman) is available and running."""
     try:
-        result = subprocess.run(
-            ["docker", "info"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        return result.returncode == 0
-    except (FileNotFoundError, subprocess.SubprocessError):
+        runtime = ContainerRuntimeFactory.get_runtime()
+        return runtime.is_running()
+    except RuntimeError:
         return False
 
 
@@ -39,19 +35,21 @@ def quickstart(
     server_only: bool = typer.Option(False, "--server-only", help="Only start the server, not the UI"),
 ) -> None:
     """Quickstart command to set up and run Skyvern with one command."""
-    # Check Docker
-    with console.status("Checking Docker installation...") as status:
-        if not check_docker():
+    # Check container runtime
+    with console.status("Checking container runtime...") as status:
+        if not check_container_runtime():
             console.print(
                 Panel(
-                    "[bold red]Docker is not installed or not running.[/bold red]\n"
-                    "Please install Docker and start it before running quickstart.\n"
-                    "Get Docker from: [link]https://www.docker.com/get-started[/link]",
+                    "[bold red]No container runtime available.[/bold red]\n"
+                    "Please install and start Docker or Podman before running quickstart.\n"
+                    "Get Docker from: [link]https://www.docker.com/get-started[/link]\n"
+                    "Get Podman from: [link]https://podman.io/get-started[/link]",
                     border_style="red",
                 )
             )
             raise typer.Exit(1)
-        status.update("✅ Docker is installed and running")
+        runtime = ContainerRuntimeFactory.get_runtime()
+        status.update(f"✅ {runtime.display_name} is installed and running")
 
     # Run initialization
     console.print(Panel("[bold green]🚀 Starting Skyvern Quickstart[/bold green]", border_style="green"))
