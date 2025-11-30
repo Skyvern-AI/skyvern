@@ -340,6 +340,10 @@ class Settings(BaseSettings):
     # The Azure Key Vault name to store credentials
     AZURE_CREDENTIAL_VAULT: str | None = None
 
+    # Custom Credential Service Settings
+    CUSTOM_CREDENTIAL_API_BASE_URL: str | None = None
+    CUSTOM_CREDENTIAL_API_TOKEN: str | None = None
+
     # Skyvern Auth Bitwarden Settings
     SKYVERN_AUTH_BITWARDEN_CLIENT_ID: str | None = None
     SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET: str | None = None
