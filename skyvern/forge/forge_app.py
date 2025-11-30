@@ -11,6 +11,7 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.azure import AzureClientFactory
+from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
 from skyvern.forge.sdk.api.real_azure import RealAzureClientFactory
@@ -24,7 +25,6 @@ from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
-from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService

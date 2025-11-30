@@ -1,3 +1,4 @@
+import json
 import structlog
 from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
 
@@ -660,8 +661,8 @@ async def get_custom_credential_service_config(
         )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to get custom credential service configuration: {str(e)}",
-        )
+            detail=f"Failed to get custom credential service configuration: {e!s}",
+        ) from e
 
 
 @base_router.post(
@@ -694,7 +695,6 @@ async def update_custom_credential_service_config(
         )
 
         # Store the configuration as JSON in the token field
-        import json
         config_json = json.dumps(request.config.model_dump())
 
         # Create the new configuration
@@ -721,8 +721,8 @@ async def update_custom_credential_service_config(
         )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create or update custom credential service configuration: {str(e)}",
-        )
+            detail=f"Failed to create or update custom credential service configuration: {e!s}",
+        ) from e
 
 
 async def _get_credential_vault_service() -> CredentialVaultService:

@@ -73,7 +73,8 @@ export function CustomCredentialServiceConfigForm() {
     if (parsedConfig) {
       form.reset({ config: parsedConfig });
     }
-  }, [parsedConfig, form]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parsedConfig]);
 
   return (
     <div className="space-y-4">
@@ -204,7 +205,7 @@ export function CustomCredentialServiceConfigForm() {
             {parsedConfig && (
               <div className="mt-2">
                 <div><strong>Configured API URL:</strong> {parsedConfig.api_base_url}</div>
-                <div><strong>Token (masked):</strong> {parsedConfig.api_token.slice(0, 8)}...</div>
+                <div><strong>Token (masked):</strong> {parsedConfig.api_token.length > 8 ? `${parsedConfig.api_token.slice(0, 8)}...` : '********'}</div>
               </div>
             )}
           </div>
