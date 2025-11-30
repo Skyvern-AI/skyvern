@@ -15,6 +15,15 @@ from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidL
 LOG = structlog.get_logger()
 
 
+def is_image_message(message: dict[str, Any]) -> bool:
+    """Check if message contains an image."""
+    return (
+        message.get("role") == "user"
+        and isinstance(message.get("content"), list)
+        and any(item.get("type") == "image_url" for item in message["content"])
+    )
+
+
 async def llm_messages_builder(
     prompt: str,
     screenshots: list[bytes] | None = None,
