@@ -1337,7 +1337,7 @@ if settings.ENABLE_OLLAMA:
             LLMConfig(
                 f"ollama/{ollama_model_name}",
                 ["OLLAMA_SERVER_URL", "OLLAMA_MODEL"],
-                supports_vision=False,  # Ollama does not support vision yet
+                supports_vision=True,  # Ollama supports vision models (llava, qwen2-vl, etc.)
                 add_assistant_prefix=False,
                 litellm_params=LiteLLMParams(
                     api_base=settings.OLLAMA_SERVER_URL,
