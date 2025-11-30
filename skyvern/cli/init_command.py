@@ -14,6 +14,7 @@ from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .browser import setup_browser_config
 from .console import console
+from .container import ContainerRuntimeFactory
 from .database import setup_postgresql
 from .llm_setup import setup_llm_providers, update_or_add_env_var
 from .mcp import setup_local_organization, setup_mcp
@@ -80,13 +81,24 @@ def init(
         console.print("🌐 [bold blue]Setting Skyvern Base URL to: http://localhost:8000[/bold blue]")
         update_or_add_env_var("SKYVERN_BASE_URL", "http://localhost:8000")
 
+        # Get runtime info for user messages
+        try:
+            runtime = ContainerRuntimeFactory.get_runtime()
+            compose_cmd = " ".join(runtime.get_compose_command())
+            runtime_cmd = runtime.runtime_type.value
+        except RuntimeError:
+            compose_cmd = "docker compose"
+            runtime_cmd = "docker"
+
         console.print("\n[bold yellow]To run Skyvern you can either:[/bold yellow]")
         console.print("• [green]skyvern run server[/green]  (reuses the DB we just created)")
         console.print(
-            "• [cyan]docker compose up -d[/cyan]  (starts a new Postgres inside Compose; you may stop the first container with: [magenta]docker rm -f postgresql-container[/magenta])"
+            f"• [cyan]{compose_cmd} up -d[/cyan]  (starts a new Postgres inside Compose; "
+            f"you may stop the first container with: [magenta]{runtime_cmd} rm -f postgresql-container[/magenta])"
         )
         console.print(
-            "\n[italic]Only one Postgres container can run on the host's port 5432 at a time. If you switch to Docker Compose, remove the original with:[/italic] [magenta]docker rm -f postgresql-container[/magenta]"
+            f"\n[italic]Only one Postgres container can run on the host's port 5432 at a time. "
+            f"If you switch to Compose, remove the original with:[/italic] [magenta]{runtime_cmd} rm -f postgresql-container[/magenta]"
         )
     else:
         console.print(Panel("[bold purple]Cloud Deployment Setup[/bold purple]", border_style="purple"))
