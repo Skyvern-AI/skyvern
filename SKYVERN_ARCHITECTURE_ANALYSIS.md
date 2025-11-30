@@ -488,8 +488,9 @@ el.style.fontFamily = "Arial, sans-serif";
 
 ### 4.2 주의 사항
 
-1. **Ollama Vision 미지원**: 현재 `supports_vision=False`로 설정됨
-   - 수정 필요: `config_registry.py` 라인 1337
+1. ~~**Ollama Vision 미지원**~~: ~~현재 `supports_vision=False`로 설정됨~~
+   - **[해결됨 - 2025-11-30]** `config_registry.py` 라인 1340에서 `supports_vision=True`로 수정 완료
+   - 지원 모델: `llava`, `qwen2-vl`, `llama3.2-vision` 등
 
 2. **Chrome 프로필 동시 접근 불가**: 기존 Chrome이 실행 중이면 같은 프로필 사용 불가
    - 해결책: 프로필 복사 후 사용 또는 Chrome 종료 후 실행
