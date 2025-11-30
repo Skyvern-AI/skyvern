@@ -1,6 +1,7 @@
 import json
 import structlog
 
+from skyvern.exceptions import SkyvernException
 from skyvern.forge import app
 from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -13,6 +14,11 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 
 LOG = structlog.get_logger()
+
+
+class CustomCredentialConfigurationError(SkyvernException):
+    """Raised when custom credential service configuration is invalid or missing."""
+    pass
 
 
 class CustomCredentialVaultService(CredentialVaultService):
@@ -52,7 +58,9 @@ class CustomCredentialVaultService(CredentialVaultService):
             )
 
             if not auth_token:
-                raise Exception(f"Custom credential service not configured for organization {organization_id}")
+                raise CustomCredentialConfigurationError(
+                    f"Custom credential service not configured for organization {organization_id}"
+                )
 
             # Parse the stored configuration
             config_data = json.loads(auth_token.token)
@@ -64,18 +72,17 @@ class CustomCredentialVaultService(CredentialVaultService):
             )
 
         except json.JSONDecodeError as e:
-            LOG.error(
+            LOG.exception(
                 "Failed to parse custom credential service configuration",
                 organization_id=organization_id,
-                error=str(e),
             )
-            raise Exception(f"Invalid custom credential service configuration for organization {organization_id}")
+            raise CustomCredentialConfigurationError(
+                f"Invalid custom credential service configuration for organization {organization_id}"
+            ) from e
         except Exception as e:
-            LOG.error(
+            LOG.exception(
                 "Failed to get custom credential service configuration",
                 organization_id=organization_id,
-                error=str(e),
-                exc_info=True,
             )
             raise
 

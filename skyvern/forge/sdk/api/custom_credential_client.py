@@ -56,13 +56,18 @@ class CustomCredentialAPIClient:
                 "card_brand": credential.card_brand,
             }
         else:
-            raise ValueError(f"Unsupported credential type: {type(credential)}")
+            raise TypeError(f"Unsupported credential type: {type(credential)}")
 
     def _api_response_to_credential(self, credential_data: Dict[str, Any], name: str, item_id: str) -> CredentialItem:
         """Convert API response to Skyvern CredentialItem."""
         credential_type = credential_data.get("type")
 
         if credential_type == "password":
+            required_fields = ["username", "password"]
+            missing = [f for f in required_fields if f not in credential_data]
+            if missing:
+                raise ValueError(f"Missing required password fields from API: {missing}")
+
             credential = PasswordCredential(
                 username=credential_data["username"],
                 password=credential_data["password"],
@@ -76,6 +81,11 @@ class CustomCredentialAPIClient:
                 credential_type=CredentialType.PASSWORD,
             )
         elif credential_type == "credit_card":
+            required_fields = ["card_holder_name", "card_number", "card_exp_month", "card_exp_year", "card_cvv", "card_brand"]
+            missing = [f for f in required_fields if f not in credential_data]
+            if missing:
+                raise ValueError(f"Missing required credit card fields from API: {missing}")
+
             credential = CreditCardCredential(
                 card_holder_name=credential_data["card_holder_name"],
                 card_number=credential_data["card_number"],
@@ -162,7 +172,7 @@ class CustomCredentialAPIClient:
                 error=str(e),
                 exc_info=True,
             )
-            raise HttpException(500, f"Failed to create credential via custom API: {str(e)}")
+            raise HttpException(500, f"Failed to create credential via custom API: {e!s}") from e
 
     async def get_credential(self, credential_id: str, name: str) -> CredentialItem:
         """
@@ -215,7 +225,7 @@ class CustomCredentialAPIClient:
                 error=str(e),
                 exc_info=True,
             )
-            raise HttpException(500, f"Failed to retrieve credential via custom API: {str(e)}")
+            raise HttpException(500, f"Failed to retrieve credential via custom API: {e!s}") from e
 
     async def delete_credential(self, credential_id: str) -> None:
         """
@@ -259,4 +269,4 @@ class CustomCredentialAPIClient:
                 error=str(e),
                 exc_info=True,
             )
-            raise HttpException(500, f"Failed to delete credential via custom API: {str(e)}")
+            raise HttpException(500, f"Failed to delete credential via custom API: {e!s}") from e

@@ -22,7 +22,15 @@ export function useCustomCredentialServiceConfig() {
         return await client
           .get("/credentials/custom_credential/get")
           .then((response) => response.data.token)
-          .catch(() => null);
+          .catch((error) => {
+            // 404 likely means not configured yet - return null silently
+            if (error?.response?.status === 404) {
+              return null;
+            }
+            // Log other errors for debugging but still return null
+            console.warn("Failed to fetch custom credential service config:", error);
+            return null;
+          });
       },
     });
 
@@ -115,8 +123,8 @@ export function useCustomCredentialServiceConfig() {
           throw new Error('Connection timeout after 10 seconds');
         }
 
-        // Network errors, DNS failures, etc.
-        if (error instanceof TypeError && error.message.includes('fetch')) {
+        // Network errors typically manifest as TypeError with various messages
+        if (error instanceof TypeError) {
           throw new Error('Network error: Cannot reach the API server. Check the URL and network connectivity.');
         }
 
