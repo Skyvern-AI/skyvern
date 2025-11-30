@@ -766,7 +766,6 @@ async def run_task_v2_helper(
                     url=url,
                     cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
                     scrape_exclude=app.scrape_exclude,
-                    max_screenshot_number=settings.MAX_NUM_SCREENSHOTS,
                 )
                 if page is None:
                     page = await browser_state.get_working_page()
