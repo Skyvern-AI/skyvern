@@ -419,6 +419,14 @@ class LLMAPIHandlerFactory:
         return check_model
 
     @staticmethod
+    def is_github_copilot_endpoint() -> bool:
+        """Check if the OPENAI_COMPATIBLE endpoint is GitHub Copilot."""
+        return (
+            settings.OPENAI_COMPATIBLE_API_BASE is not None
+            and settings.OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
+        )
+
+    @staticmethod
     def get_override_llm_api_handler(override_llm_key: str | None, *, default: LLMAPIHandler) -> LLMAPIHandler:
         if not override_llm_key:
             return default
@@ -902,11 +910,7 @@ class LLMAPIHandlerFactory:
             return llm_caller.call
 
         # For GitHub Copilot via OPENAI_COMPATIBLE, use LLMCaller for custom header support
-        if (
-            llm_key == "OPENAI_COMPATIBLE"
-            and settings.OPENAI_COMPATIBLE_API_BASE
-            and settings.OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
-        ):
+        if llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
             return llm_caller.call
 
@@ -1367,11 +1371,7 @@ class LLMCaller:
                 base_url=settings.OPENROUTER_API_BASE,
                 http_client=ForgeAsyncHttpxClientWrapper(),
             )
-        elif (
-            self.llm_key == "OPENAI_COMPATIBLE"
-            and settings.OPENAI_COMPATIBLE_API_BASE
-            and settings.OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
-        ):
+        elif self.llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
             # For GitHub Copilot, use the actual model name (e.g., "claude-sonnet-4.5")
             self.llm_key = settings.OPENAI_COMPATIBLE_MODEL_NAME or self.llm_key
             self.openai_client = AsyncOpenAI(
@@ -1669,10 +1669,7 @@ class LLMCaller:
                 extra_headers["X-Title"] = "Skyvern"
 
             # Add Copilot-Vision-Request header for GitHub Copilot when there are images in the messages
-            if (
-                settings.OPENAI_COMPATIBLE_API_BASE
-                and settings.OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
-            ):
+            if LLMAPIHandlerFactory.is_github_copilot_endpoint():
                 # Check if any message contains images using the existing utility function
                 has_images = any(is_image_message(msg) for msg in messages)
 

@@ -1,7 +1,6 @@
 import json
 import string
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -18,7 +17,6 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -696,9 +694,6 @@ async def run_task_v2_helper(
             return workflow, workflow_run, task_v2
 
         LOG.info(f"Task v2 iteration i={i}", workflow_run_id=workflow_run_id, url=url)
-        task_type = ""
-        plan = ""
-        block: BlockTypeVar | None = None
         task_history_record: dict[str, Any] = {}
         context = skyvern_context.ensure_context()
 
@@ -771,33 +766,10 @@ async def run_task_v2_helper(
                     url=url,
                     cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
                     scrape_exclude=app.scrape_exclude,
-                    max_screenshot_number=3,  # Limit screenshots to reduce payload size
+                    max_screenshot_number=settings.MAX_NUM_SCREENSHOTS,
                 )
                 if page is None:
                     page = await browser_state.get_working_page()
-
-                # Save screenshot for streaming if available
-                if scraped_page and scraped_page.screenshots:
-                    try:
-                        streaming_screenshot_path = Path(
-                            f"{get_skyvern_temp_dir()}/{organization_id}/{workflow_run_id}.png"
-                        )
-                        streaming_screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(streaming_screenshot_path, "wb") as f:
-                            f.write(scraped_page.screenshots[0])
-                        LOG.debug(
-                            "Saved streaming screenshot for TaskV2",
-                            task_v2_id=task_v2_id,
-                            workflow_run_id=workflow_run_id,
-                            path=str(streaming_screenshot_path),
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to save streaming screenshot for TaskV2",
-                            task_v2_id=task_v2_id,
-                            workflow_run_id=workflow_run_id,
-                            exc_info=True,
-                        )
             except Exception:
                 LOG.exception(
                     "Failed to get browser state or scrape website in task v2 iteration", iteration=i, url=url
@@ -805,15 +777,13 @@ async def run_task_v2_helper(
                 continue
             current_url = current_url if current_url else str(await SkyvernFrame.get_url(frame=page) if page else url)
 
-            # Truncate task_history to reduce payload size (keep last 3 entries for context)
-            truncated_task_history = _truncate_task_history_for_completion_check(task_history, max_entries=3)
             task_v2_prompt = load_prompt_with_elements(
                 scraped_page,
                 prompt_engine,
                 "task_v2",
                 current_url=current_url,
                 user_goal=user_prompt,
-                task_history=truncated_task_history,
+                task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
                 enable_termination=bool(enable_task_v2_termination),
             )
@@ -1106,7 +1076,7 @@ async def run_task_v2_helper(
                 )
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
-                    task_history=truncated_task_history,  # Use truncated history to reduce payload
+                    task_history=task_history,
                     context=context,
                     screenshots=completion_screenshots,
                 )
@@ -1792,43 +1762,6 @@ async def update_task_v2_status_to_workflow_run_status(
     return task_v2
 
 
-def _truncate_extracted_data(
-    entry: dict,
-    max_extracted_data_size: int = 1000,
-) -> dict:
-    """Truncate extracted_data field in a single entry to reduce payload size."""
-    entry_copy = entry.copy()
-    if "extracted_data" in entry_copy:
-        data_str = str(entry_copy["extracted_data"])
-        if len(data_str) > max_extracted_data_size:
-            entry_copy["extracted_data"] = data_str[:max_extracted_data_size] + "... [truncated]"
-    return entry_copy
-
-
-def _truncate_task_history_for_completion_check(
-    task_history: list[dict],
-    max_entries: int = 5,
-    max_extracted_data_size: int = 1000,
-) -> list[dict]:
-    """Truncate task history to reduce payload size for completion checks."""
-    # Select entries to process
-    entries_to_process = task_history if len(task_history) <= max_entries else task_history[-max_entries:]
-
-    # Process all entries uniformly
-    result = [_truncate_extracted_data(entry, max_extracted_data_size) for entry in entries_to_process]
-
-    # Log only when truncation occurred
-    if len(task_history) > max_entries:
-        LOG.info(
-            "Truncated task history for completion check",
-            original_length=len(task_history),
-            truncated_length=len(result),
-            max_entries=max_entries,
-        )
-
-    return result
-
-
 def _get_extracted_data_from_block_result(
     block_result: BlockResult,
     task_type: str,
@@ -1914,12 +1847,10 @@ async def _summarize_task_v2(
         thought_scenario=ThoughtScenario.summarization,
     )
     # summarize the task v2 and format the output
-    # Truncate task_history to reduce payload size
-    truncated_task_history = _truncate_task_history_for_completion_check(task_history)
     task_v2_summary_prompt = prompt_engine.load_prompt(
         "task_v2_summary",
         user_goal=task_v2.prompt,
-        task_history=truncated_task_history,
+        task_history=task_history,
         extracted_information_schema=task_v2.extracted_information_schema,
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
