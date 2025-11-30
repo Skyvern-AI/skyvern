@@ -79,7 +79,7 @@ class CustomCredentialVaultService(CredentialVaultService):
             raise CustomCredentialConfigurationError(
                 f"Invalid custom credential service configuration for organization {organization_id}"
             ) from e
-        except Exception as e:
+        except Exception:
             LOG.exception(
                 "Failed to get custom credential service configuration",
                 organization_id=organization_id,

@@ -1,5 +1,5 @@
 import structlog
-from typing import Any, Dict
+from typing import Any
 
 from skyvern.exceptions import HttpException
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
@@ -28,14 +28,14 @@ class CustomCredentialAPIClient:
         self.api_base_url = api_base_url.rstrip("/")
         self.api_token = api_token
 
-    def _get_auth_headers(self) -> Dict[str, str]:
+    def _get_auth_headers(self) -> dict[str, str]:
         """Get headers for API authentication."""
         return {
             "Authorization": f"Bearer {self.api_token}",
             "Content-Type": "application/json",
         }
 
-    def _credential_to_api_payload(self, credential: PasswordCredential | CreditCardCredential) -> Dict[str, Any]:
+    def _credential_to_api_payload(self, credential: PasswordCredential | CreditCardCredential) -> dict[str, Any]:
         """Convert Skyvern credential to API payload format."""
         if isinstance(credential, PasswordCredential):
             return {
@@ -58,7 +58,7 @@ class CustomCredentialAPIClient:
         else:
             raise TypeError(f"Unsupported credential type: {type(credential)}")
 
-    def _api_response_to_credential(self, credential_data: Dict[str, Any], name: str, item_id: str) -> CredentialItem:
+    def _api_response_to_credential(self, credential_data: dict[str, Any], name: str, item_id: str) -> CredentialItem:
         """Convert API response to Skyvern CredentialItem."""
         credential_type = credential_data.get("type")
 

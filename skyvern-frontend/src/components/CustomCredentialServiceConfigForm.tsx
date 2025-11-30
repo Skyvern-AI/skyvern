@@ -73,8 +73,7 @@ export function CustomCredentialServiceConfigForm() {
     if (parsedConfig) {
       form.reset({ config: parsedConfig });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [parsedConfig]);
+  }, [parsedConfig, form]);
 
   return (
     <div className="space-y-4">
