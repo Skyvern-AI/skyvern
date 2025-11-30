@@ -164,17 +164,19 @@ async def run_task(
         data_extraction_schema = run_request.data_extraction_schema
         navigation_goal = run_request.prompt
         navigation_payload = None
-        task_generation = await task_v1_service.generate_task(
-            user_prompt=run_request.prompt,
-            organization=current_org,
-        )
-        url = url or task_generation.url
-        navigation_goal = task_generation.navigation_goal or run_request.prompt
-        if run_request.engine in CUA_ENGINES:
-            navigation_goal = run_request.prompt
-        navigation_payload = task_generation.navigation_payload
-        data_extraction_goal = task_generation.data_extraction_goal
-        data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
+        if not url:
+            task_generation = await task_v1_service.generate_task(
+                user_prompt=run_request.prompt,
+                organization=current_org,
+            )
+            # What if it's a SDK request with browser_session_id?
+            url = task_generation.url
+            navigation_goal = task_generation.navigation_goal or run_request.prompt
+            if run_request.engine in CUA_ENGINES:
+                navigation_goal = run_request.prompt
+            navigation_payload = task_generation.navigation_payload
+            data_extraction_goal = task_generation.data_extraction_goal
+            data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
 
         task_v1_request = TaskRequest(
             title=run_request.title,

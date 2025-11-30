@@ -115,13 +115,41 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, RunEngine, RunType
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile, ScriptStatus, WorkflowScript
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+
+
+def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
+    """
+    Serialize proxy_location for database storage.
+
+    Converts GeoTarget objects or dicts to JSON strings, passes through
+    ProxyLocation enum values as-is, and returns None for None.
+    """
+    result: str | None = None
+    if proxy_location is None:
+        result = None
+    elif isinstance(proxy_location, GeoTarget):
+        result = json.dumps(proxy_location.model_dump())
+    elif isinstance(proxy_location, dict):
+        result = json.dumps(proxy_location)
+    else:
+        # ProxyLocation enum - return the string value
+        result = str(proxy_location)
+
+    LOG.debug(
+        "Serializing proxy_location for DB",
+        input_type=type(proxy_location).__name__,
+        input_value=str(proxy_location),
+        serialized_value=result,
+    )
+    return result
+
 
 DB_CONNECT_ARGS: dict[str, Any] = {}
 
@@ -161,7 +189,7 @@ class AgentDB:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         organization_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         extracted_information_schema: dict[str, Any] | list | str | None = None,
         workflow_run_id: str | None = None,
         order: int | None = None,
@@ -194,7 +222,7 @@ class AgentDB:
                     data_extraction_goal=data_extraction_goal,
                     navigation_payload=navigation_payload,
                     organization_id=organization_id,
-                    proxy_location=proxy_location,
+                    proxy_location=_serialize_proxy_location(proxy_location),
                     extracted_information_schema=extracted_information_schema,
                     workflow_run_id=workflow_run_id,
                     order=order,
@@ -1390,7 +1418,7 @@ class AgentDB:
         workflow_definition: dict[str, Any],
         organization_id: str | None = None,
         description: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         webhook_callback_url: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
@@ -1415,7 +1443,7 @@ class AgentDB:
                 title=title,
                 description=description,
                 workflow_definition=workflow_definition,
-                proxy_location=proxy_location,
+                proxy_location=_serialize_proxy_location(proxy_location),
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
@@ -2259,7 +2287,7 @@ class AgentDB:
         organization_id: str,
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
@@ -2281,7 +2309,7 @@ class AgentDB:
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
                     browser_profile_id=browser_profile_id,
-                    proxy_location=proxy_location,
+                    proxy_location=_serialize_proxy_location(proxy_location),
                     status="created",
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
@@ -3343,16 +3371,12 @@ class AgentDB:
         valid_lifespan_minutes: int | None = None,
         otp_type: OTPType | None = None,
         workflow_run_id: str | None = None,
+        totp_identifier: str | None = None,
     ) -> list[TOTPCode]:
         """
         Return recent otp codes for an organization ordered by newest first with optional
         workflow_run_id filtering.
         """
-        all_null = and_(
-            TOTPCodeModel.task_id.is_(None),
-            TOTPCodeModel.workflow_id.is_(None),
-            TOTPCodeModel.workflow_run_id.is_(None),
-        )
         async with self.Session() as session:
             query = select(TOTPCodeModel).filter_by(organization_id=organization_id)
 
@@ -3365,7 +3389,9 @@ class AgentDB:
                 query = query.filter(TOTPCodeModel.otp_type == otp_type)
             if workflow_run_id is not None:
                 query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
-            query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc()).limit(limit)
+            if totp_identifier:
+                query = query.filter(TOTPCodeModel.totp_identifier == totp_identifier)
+            query = query.order_by(TOTPCodeModel.created_at.desc()).limit(limit)
             totp_codes = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]
 
@@ -3567,7 +3593,7 @@ class AgentDB:
         prompt: str | None = None,
         url: str | None = None,
         organization_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         totp_identifier: str | None = None,
         totp_verification_url: str | None = None,
         webhook_callback_url: str | None = None,
@@ -3586,7 +3612,7 @@ class AgentDB:
                 workflow_permanent_id=workflow_permanent_id,
                 prompt=prompt,
                 url=url,
-                proxy_location=proxy_location,
+                proxy_location=_serialize_proxy_location(proxy_location),
                 totp_identifier=totp_identifier,
                 totp_verification_url=totp_verification_url,
                 webhook_callback_url=webhook_callback_url,
@@ -4192,7 +4218,7 @@ class AgentDB:
         runnable_type: str | None = None,
         runnable_id: str | None = None,
         timeout_minutes: int | None = None,
-        proxy_location: ProxyLocation | None = ProxyLocation.RESIDENTIAL,
+        proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         try:
@@ -4202,7 +4228,7 @@ class AgentDB:
                     runnable_type=runnable_type,
                     runnable_id=runnable_id,
                     timeout_minutes=timeout_minutes,
-                    proxy_location=proxy_location,
+                    proxy_location=_serialize_proxy_location(proxy_location),
                 )
                 session.add(browser_session)
                 await session.commit()
@@ -4895,43 +4921,6 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def update_script(
-        self,
-        script_revision_id: str,
-        organization_id: str,
-        artifact_id: str | None = None,
-        run_id: str | None = None,
-        version: int | None = None,
-    ) -> Script:
-        try:
-            async with self.Session() as session:
-                get_script_query = (
-                    select(ScriptModel)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(script_revision_id=script_revision_id)
-                )
-                if script := (await session.scalars(get_script_query)).first():
-                    if artifact_id:
-                        script.artifact_id = artifact_id
-                    if run_id:
-                        script.run_id = run_id
-                    if version:
-                        script.version = version
-                    await session.commit()
-                    await session.refresh(script)
-                    return convert_to_script(script)
-                else:
-                    raise NotFoundError("Script not found")
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
-        except NotFoundError:
-            LOG.error("No script found to update", script_revision_id=script_revision_id)
-            raise
-        except Exception:
-            LOG.error("UnexpectedError", exc_info=True)
-            raise
-
     async def get_scripts(
         self,
         organization_id: str,
@@ -5282,7 +5271,7 @@ class AgentDB:
             workflow_script_model = (await session.scalars(query)).first()
             return WorkflowScript.model_validate(workflow_script_model) if workflow_script_model else None
 
-    async def get_workflow_scripts_by_cache_key_value(
+    async def get_workflow_script_by_cache_key_value(
         self,
         *,
         organization_id: str,
@@ -5291,51 +5280,35 @@ class AgentDB:
         workflow_run_id: str | None = None,
         cache_key: str | None = None,
         statuses: list[ScriptStatus] | None = None,
-    ) -> list[Script]:
-        """Get latest script versions linked to a workflow by a specific cache_key_value."""
+    ) -> Script | None:
+        """Get latest script version linked to a workflow by a specific cache_key_value."""
         try:
             async with self.Session() as session:
-                # Subquery: script_ids associated with this workflow + cache_key_value
-                ws_script_ids_subquery = (
-                    select(WorkflowScriptModel.script_id)
-                    .where(WorkflowScriptModel.organization_id == organization_id)
-                    .where(WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id)
-                    .where(WorkflowScriptModel.cache_key_value == cache_key_value)
-                    .where(WorkflowScriptModel.deleted_at.is_(None))
-                )
-                if workflow_run_id:
-                    ws_script_ids_subquery = ws_script_ids_subquery.where(
-                        WorkflowScriptModel.workflow_run_id == workflow_run_id
+                # Build the query: join workflow_scripts with scripts
+                query = (
+                    select(ScriptModel)
+                    .join(WorkflowScriptModel, ScriptModel.script_id == WorkflowScriptModel.script_id)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
                     )
+                )
+
+                if workflow_run_id:
+                    query = query.where(WorkflowScriptModel.workflow_run_id == workflow_run_id)
 
                 if cache_key is not None:
-                    ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.cache_key == cache_key)
+                    query = query.where(WorkflowScriptModel.cache_key == cache_key)
 
                 if statuses is not None and len(statuses) > 0:
-                    ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.status.in_(statuses))
+                    query = query.where(WorkflowScriptModel.status.in_(statuses))
 
-                # Latest version per script_id within the org and not deleted
-                latest_versions_subquery = (
-                    select(
-                        ScriptModel.script_id,
-                        func.max(ScriptModel.version).label("latest_version"),
-                    )
-                    .where(ScriptModel.organization_id == organization_id)
-                    .where(ScriptModel.deleted_at.is_(None))
-                    .where(ScriptModel.script_id.in_(ws_script_ids_subquery))
-                    .group_by(ScriptModel.script_id)
-                    .subquery()
-                )
+                query = query.order_by(ScriptModel.created_at.desc(), ScriptModel.version.desc()).limit(1)
 
-                query = select(ScriptModel).join(
-                    latest_versions_subquery,
-                    (ScriptModel.script_id == latest_versions_subquery.c.script_id)
-                    & (ScriptModel.version == latest_versions_subquery.c.latest_version),
-                )
-                query = query.order_by(ScriptModel.created_at.desc())
-
-                scripts = (await session.scalars(query)).all()
-                return [convert_to_script(script) for script in scripts]
+                script = (await session.scalars(query)).first()
+                return convert_to_script(script) if script else None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

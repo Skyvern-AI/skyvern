@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import random
@@ -92,7 +93,6 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
-    FileDownloadBlock,
     ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -501,7 +501,6 @@ class ForgeAgent:
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
             retry = False
 
-            download_detected = False
             if task_block and task_block.complete_on_download and task.workflow_run_id:
                 workflow_download_directory = get_path_for_workflow_download_directory(
                     context.run_id if context and context.run_id else task.workflow_run_id
@@ -539,7 +538,6 @@ class ForgeAgent:
                     )
                     list_files_after = list_files_after + browser_session_downloaded_files_after
                 if len(list_files_after) > len(list_files_before):
-                    download_detected = True
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
                     for file in files_to_rename:
                         if file.startswith("s3://"):
@@ -600,28 +598,6 @@ class ForgeAgent:
                         browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
-
-            if (
-                task_block
-                and isinstance(task_block, FileDownloadBlock)
-                and task_block.complete_on_download
-                and task.workflow_run_id
-                and not download_detected
-            ):
-                handled, fallback_last_step = await self._handle_file_download_verification_fallback(
-                    organization=organization,
-                    task=task,
-                    step=step,
-                    browser_state=browser_state,
-                    task_block=task_block,
-                    detailed_output=detailed_output,
-                    engine=engine,
-                    api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion,
-                    browser_session_id=browser_session_id,
-                )
-                if handled and fallback_last_step:
-                    return fallback_last_step, detailed_output, None
 
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
@@ -917,172 +893,6 @@ class ForgeAgent:
     @TraceManager.traced_async(
         ignore_inputs=["browser_state", "organization", "task_block", "cua_response", "llm_caller"]
     )
-    async def _handle_file_download_verification_fallback(
-        self,
-        *,
-        organization: Organization,
-        task: Task,
-        step: Step,
-        browser_state: BrowserState,
-        task_block: FileDownloadBlock,
-        detailed_output: DetailedAgentStepOutput | None,
-        engine: RunEngine,
-        api_key: str | None,
-        close_browser_on_completion: bool,
-        browser_session_id: str | None,
-    ) -> tuple[bool, Step | None]:
-        if detailed_output is None or detailed_output.scraped_page is None:
-            return False, None
-
-        try:
-            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-            use_termination_prompt = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "USE_TERMINATION_AWARE_COMPLETE_VERIFICATION",
-                distinct_id,
-                properties={"organization_id": task.organization_id},
-            )
-        except Exception as error:  # pragma: no cover - defensive logging
-            LOG.warning(
-                "Failed to check USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment; skipping download fallback verification",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-                error=str(error),
-            )
-            return False, None
-
-        if not use_termination_prompt:
-            return False, None
-
-        try:
-            page = await browser_state.get_working_page()
-            if page is None:
-                page = await browser_state.must_get_working_page()
-        except Exception:
-            LOG.warning(
-                "File download fallback verification could not fetch working page, skipping verification",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-                exc_info=True,
-            )
-            return False, None
-
-        try:
-            fallback_action = await self.check_user_goal_complete(
-                page=page,
-                scraped_page=detailed_output.scraped_page,
-                task=task,
-                step=step,
-                task_block=task_block,
-            )
-        except Exception:
-            LOG.warning(
-                "File download fallback verification failed, continuing with standard flow",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-                exc_info=True,
-            )
-            return False, None
-
-        if fallback_action is None:
-            LOG.info(
-                "File download fallback verification completed with continue status",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-            )
-            return False, None
-
-        LOG.info(
-            "File download fallback verification returned decisive action",
-            task_id=task.task_id,
-            workflow_run_id=task.workflow_run_id,
-            action_type=fallback_action.action_type if isinstance(fallback_action, Action) else "unknown",
-        )
-
-        if step.output is None:
-            step.output = AgentStepOutput(action_results=[], actions_and_results=[], errors=[])
-        if step.output.action_results is None:
-            step.output.action_results = []
-        if step.output.actions_and_results is None:
-            step.output.actions_and_results = []
-        if step.output.errors is None:
-            step.output.errors = []
-        if detailed_output.actions_and_results is None:
-            detailed_output.actions_and_results = []
-
-        persisted_action = cast(Action, fallback_action)
-        if isinstance(persisted_action, (CompleteAction, TerminateAction)):
-            persisted_action.organization_id = task.organization_id
-            persisted_action.workflow_run_id = task.workflow_run_id
-            persisted_action.task_id = task.task_id
-            persisted_action.step_id = step.step_id
-            persisted_action.step_order = step.order
-            persisted_action.action_order = len(step.output.actions_and_results)
-
-        action_results = await ActionHandler.handle_action(
-            detailed_output.scraped_page,
-            task,
-            step,
-            page,
-            persisted_action,
-        )
-        await self.record_artifacts_after_action(task, step, browser_state, engine)
-
-        step.output.action_results.extend(action_results)
-        step.output.actions_and_results.append((persisted_action, action_results))
-        detailed_output.actions_and_results.append((persisted_action, action_results))
-        if isinstance(persisted_action, DecisiveAction) and persisted_action.errors:
-            step.output.errors.extend(persisted_action.errors)
-
-        if isinstance(persisted_action, TerminateAction):
-            LOG.warning(
-                "File download fallback verification determined workflow should terminate",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-                reasoning=persisted_action.reasoning,
-            )
-            last_step = await self.update_step(step, output=step.output, is_last=True)
-            task_errors = None
-            if persisted_action.errors:
-                task_errors = [error.model_dump() for error in persisted_action.errors]
-            failure_reason = persisted_action.reasoning
-            if persisted_action.errors:
-                failure_reason = "; ".join(error.reasoning for error in persisted_action.errors)
-            updated_task = await self.update_task(
-                task,
-                status=TaskStatus.terminated,
-                failure_reason=failure_reason,
-                errors=task_errors,
-            )
-            await self.clean_up_task(
-                task=updated_task,
-                last_step=last_step,
-                api_key=api_key,
-                close_browser_on_completion=close_browser_on_completion,
-                browser_session_id=browser_session_id,
-            )
-            return True, last_step
-
-        LOG.info(
-            "File download fallback verification marked task as complete",
-            task_id=task.task_id,
-            workflow_run_id=task.workflow_run_id,
-        )
-        last_step = await self.update_step(step, output=step.output, is_last=True)
-        extracted_information = await self.get_extracted_information_for_task(task)
-        updated_task = await self.update_task(
-            task,
-            status=TaskStatus.completed,
-            extracted_information=extracted_information,
-        )
-        await self.clean_up_task(
-            task=updated_task,
-            last_step=last_step,
-            api_key=api_key,
-            close_browser_on_completion=close_browser_on_completion,
-            browser_session_id=browser_session_id,
-        )
-        return True, last_step
-
     async def agent_step(
         self,
         task: Task,
@@ -1578,7 +1388,6 @@ class ForgeAgent:
                         scraped_page=scraped_page,
                         task=task,
                         step=step,
-                        task_block=task_block,
                     )
                     if complete_action is not None:
                         LOG.info("User goal achieved, executing complete action")
@@ -1955,43 +1764,6 @@ class ForgeAgent:
 
         return actions
 
-    async def _should_skip_screenshot_annotations(self, task: Task, draw_boxes: bool) -> bool:
-        """
-        Check PostHog feature flag to determine if screenshot annotations should be skipped.
-
-        Args:
-            task: The task being executed
-            draw_boxes: Current value indicating if boxes should be drawn
-
-        Returns:
-            bool: True if annotations should be drawn, False if they should be skipped
-        """
-        if not draw_boxes:  # Only check if we were going to draw boxes
-            return draw_boxes
-
-        try:
-            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-            skip_annotations = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "SKIP_SCREENSHOT_ANNOTATIONS",
-                distinct_id,
-                properties={"organization_id": task.organization_id},
-            )
-            if skip_annotations:
-                LOG.info(
-                    "Skipping screenshot annotations per SKIP_SCREENSHOT_ANNOTATIONS feature flag",
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-                return False
-        except Exception:
-            LOG.warning(
-                "Failed to check SKIP_SCREENSHOT_ANNOTATIONS feature flag, using default behavior",
-                task_id=task.task_id,
-                exc_info=True,
-            )
-
-        return draw_boxes
-
     async def _speculate_next_step_plan(
         self,
         task: Task,
@@ -2217,14 +1989,7 @@ class ForgeAgent:
             )
 
     async def complete_verify(
-        self,
-        page: Page,
-        scraped_page: ScrapedPage,
-        task: Task,
-        step: Step,
-        task_block: BaseTaskBlock | None = None,
-        *,
-        use_termination_prompt: bool = False,
+        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteVerifyResult:
         LOG.info(
             "Checking if user goal is achieved after re-scraping the page",
@@ -2241,6 +2006,31 @@ class ForgeAgent:
         actions_and_results_str = ""
         if task.include_action_history_in_verification:
             actions_and_results_str = await self._get_action_results(task, current_step=step)
+
+        # Check if we should use the termination-aware prompt (experiment)
+        use_termination_prompt = False
+        try:
+            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+            use_termination_prompt = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "USE_TERMINATION_AWARE_COMPLETE_VERIFICATION",
+                distinct_id,
+                properties={"organization_id": task.organization_id, "task_url": task.url},
+            )
+            if use_termination_prompt:
+                LOG.info(
+                    "Experiment enabled: using termination-aware complete verification prompt for file download block",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    organization_id=task.organization_id,
+                    block_type="file_download",
+                )
+        except Exception as e:
+            LOG.warning(
+                "Failed to check USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment; using legacy behavior",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                error=str(e),
+            )
 
         # Select the appropriate template based on experiment
         template_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
@@ -2304,14 +2094,7 @@ class ForgeAgent:
         return CompleteVerifyResult.model_validate(verification_result)
 
     async def check_user_goal_complete(
-        self,
-        page: Page,
-        scraped_page: ScrapedPage,
-        task: Task,
-        step: Step,
-        task_block: BaseTaskBlock | None = None,
-        *,
-        use_termination_prompt: bool = False,
+        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteAction | TerminateAction | None:
         try:
             verification_result = await self.complete_verify(
@@ -2319,25 +2102,17 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
-                task_block=task_block,
-                use_termination_prompt=use_termination_prompt,
             )
 
             # Check if we should terminate instead of complete
+            # Note: This requires the USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment to be enabled
             if verification_result.is_terminate:
-                if use_termination_prompt:
-                    LOG.warning(
-                        "Periodic verification determined task should terminate (termination-aware experiment)",
-                        workflow_run_id=task.workflow_run_id,
-                        thoughts=verification_result.thoughts,
-                        status=verification_result.status if verification_result.status else "legacy",
-                    )
-                else:
-                    LOG.warning(
-                        "Periodic verification determined task should terminate",
-                        workflow_run_id=task.workflow_run_id,
-                        thoughts=verification_result.thoughts,
-                    )
+                LOG.warning(
+                    "Periodic verification determined task should terminate (termination-aware experiment)",
+                    workflow_run_id=task.workflow_run_id,
+                    thoughts=verification_result.thoughts,
+                    status=verification_result.status if verification_result.status else "legacy",
+                )
                 return TerminateAction(
                     reasoning=verification_result.thoughts,
                 )
@@ -2370,6 +2145,12 @@ class ForgeAgent:
         if not working_page:
             raise MissingBrowserStatePage()
 
+        try:
+            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info("Failed to wait for animation end, ignore it", exc_info=True)
+
         context = skyvern_context.ensure_context()
         scrolling_number = context.max_screenshot_scrolls
         if scrolling_number is None:
@@ -2381,11 +2162,6 @@ class ForgeAgent:
         try:
             screenshot = await browser_state.take_post_action_screenshot(
                 scrolling_number=scrolling_number,
-                use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "ENABLE_PLAYWRIGHT_FULLPAGE",
-                    task.workflow_run_id or task.task_id,
-                    properties={"organization_id": task.organization_id},
-                ),
             )
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
@@ -2493,9 +2269,6 @@ class ForgeAgent:
             max_screenshot_number = 1
             draw_boxes = False
             scroll = False
-
-        # Check PostHog feature flag to skip screenshot annotations
-        draw_boxes = await self._should_skip_screenshot_annotations(task, draw_boxes)
 
         return await scrape_website(
             browser_state,
@@ -2695,8 +2468,35 @@ class ForgeAgent:
 
         return scraped_page, extract_action_prompt, use_caching
 
+    @staticmethod
+    def _build_extract_action_cache_variant(
+        verification_code_check: bool,
+        has_magic_link_page: bool,
+        complete_criterion: str | None,
+    ) -> str:
+        """
+        Build a short-but-unique cache variant identifier so extract-action prompts that
+        differ meaningfully (OTP, magic link flows, complete criteria) do not reuse the
+        same Vertex cache object.
+        """
+        variant_parts: list[str] = []
+        if verification_code_check:
+            variant_parts.append("vc")
+        if has_magic_link_page:
+            variant_parts.append("ml")
+        if complete_criterion:
+            normalized = " ".join(complete_criterion.split())
+            digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:6]
+            variant_parts.append(f"cc{digest}")
+        return "-".join(variant_parts) if variant_parts else "std"
+
     async def _create_vertex_cache_for_task(
-        self, task: Task, static_prompt: str, context: SkyvernContext, llm_key_override: str | None
+        self,
+        task: Task,
+        static_prompt: str,
+        context: SkyvernContext,
+        llm_key_override: str | None,
+        prompt_variant: str | None = None,
     ) -> None:
         """
         Create a Vertex AI cache for the task's static prompt.
@@ -2707,9 +2507,9 @@ class ForgeAgent:
             task: The task to create cache for
             static_prompt: The static prompt content to cache
             context: The Skyvern context to store the cache name in
+            llm_key_override: Optional override when we explicitly pick an LLM key
+            prompt_variant: Cache variant identifier (std/vc/ml/etc.)
         """
-        # Early return if task doesn't have an llm_key
-        # This should not happen given the guard at the call site, but being defensive
         resolved_llm_key = llm_key_override or task.llm_key
 
         if not resolved_llm_key:
@@ -2719,17 +2519,20 @@ class ForgeAgent:
             )
             return
 
+        cache_variant = prompt_variant or "std"
+
         try:
             LOG.info(
                 "Attempting Vertex AI cache creation",
                 task_id=task.task_id,
                 llm_key=resolved_llm_key,
+                cache_variant=cache_variant,
             )
             cache_manager = get_cache_manager()
 
-            # Use llm_key as cache_key so all tasks with the same model share the same cache
-            # This maximizes cache reuse and reduces cache storage costs
-            cache_key = f"{EXTRACT_ACTION_CACHE_KEY_PREFIX}-{resolved_llm_key}"
+            variant_suffix = f"-{cache_variant}" if cache_variant else ""
+
+            cache_key = f"{EXTRACT_ACTION_CACHE_KEY_PREFIX}{variant_suffix}-{resolved_llm_key}"
 
             # Get the actual model name from LLM config to ensure correct format
             # (e.g., "gemini-2.5-flash" with decimal, not "gemini-2-5-flash")
@@ -2793,8 +2596,10 @@ class ForgeAgent:
                 ttl_seconds=3600,  # 1 hour
             )
 
-            # Store cache resource name in context
+            # Store cache metadata in context
             context.vertex_cache_name = cache_data["name"]
+            context.vertex_cache_key = cache_key
+            context.vertex_cache_variant = cache_variant
 
             LOG.info(
                 "Created Vertex AI cache for task",
@@ -2802,6 +2607,7 @@ class ForgeAgent:
                 cache_key=cache_key,
                 cache_name=cache_data["name"],
                 model_name=model_name,
+                cache_variant=cache_variant,
             )
         except Exception as e:
             LOG.warning(
@@ -2881,7 +2687,7 @@ class ForgeAgent:
 
         # Check if prompt caching is enabled for extract-action
         use_caching = False
-        prompt_caching_settings = LLMAPIHandlerFactory._prompt_caching_settings or {}
+        prompt_caching_settings = await self._get_prompt_caching_settings(context)
         effective_llm_key = task.llm_key
         if not effective_llm_key:
             handler_for_key = LLMAPIHandlerFactory.get_override_llm_api_handler(
@@ -2929,6 +2735,11 @@ class ForgeAgent:
                     "parse_select_feature_enabled": context.enable_parse_select_in_extract,
                     "has_magic_link_page": context.has_magic_link_page(task.task_id),
                 }
+                cache_variant = self._build_extract_action_cache_variant(
+                    verification_code_check=verification_code_check,
+                    has_magic_link_page=context.has_magic_link_page(task.task_id),
+                    complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
                     f"{template}-dynamic",
@@ -2946,7 +2757,13 @@ class ForgeAgent:
 
                 # Create Vertex AI cache for Gemini models
                 if effective_llm_key and "GEMINI" in effective_llm_key:
-                    await self._create_vertex_cache_for_task(task, static_prompt, context, effective_llm_key)
+                    await self._create_vertex_cache_for_task(
+                        task,
+                        static_prompt,
+                        context,
+                        effective_llm_key,
+                        prompt_variant=cache_variant,
+                    )
 
                 combined_prompt = f"{static_prompt.rstrip()}\n\n{dynamic_prompt.lstrip()}"
 
@@ -2954,6 +2771,7 @@ class ForgeAgent:
                     "Using cached prompt",
                     task_id=task.task_id,
                     prompt_name=EXTRACT_ACTION_PROMPT_NAME,
+                    cache_variant=cache_variant,
                 )
                 return combined_prompt, use_caching
 
@@ -2982,6 +2800,55 @@ class ForgeAgent:
         )
 
         return full_prompt, use_caching
+
+    async def _get_prompt_caching_settings(self, context: SkyvernContext) -> dict[str, bool]:
+        """
+        Resolve prompt caching settings for the current run.
+
+        We prefer explicit overrides via LLMAPIHandlerFactory.set_prompt_caching_settings(), which
+        are mostly used by scripts/tests. When no override exists, evaluate the PostHog experiment
+        once per context and cache the result on the context to avoid repeated lookups.
+        """
+        if LLMAPIHandlerFactory._prompt_caching_settings is not None:
+            return LLMAPIHandlerFactory._prompt_caching_settings
+
+        if context.prompt_caching_settings is not None:
+            return context.prompt_caching_settings
+
+        distinct_id = context.run_id or context.workflow_run_id or context.task_id
+        organization_id = context.organization_id
+        context.prompt_caching_settings = {}
+
+        if not distinct_id or not organization_id:
+            return context.prompt_caching_settings
+
+        try:
+            enabled = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "PROMPT_CACHING_OPTIMIZATION",
+                distinct_id,
+                properties={"organization_id": organization_id},
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Failed to evaluate prompt caching experiment; defaulting to disabled",
+                distinct_id=distinct_id,
+                organization_id=organization_id,
+                error=str(exc),
+            )
+            return context.prompt_caching_settings
+
+        if enabled:
+            context.prompt_caching_settings = {
+                EXTRACT_ACTION_PROMPT_NAME: True,
+                EXTRACT_ACTION_TEMPLATE: True,
+            }
+            LOG.info(
+                "Prompt caching optimization enabled",
+                distinct_id=distinct_id,
+                organization_id=organization_id,
+            )
+
+        return context.prompt_caching_settings
 
     def _should_process_totp(self, scraped_page: ScrapedPage | None) -> bool:
         """Detect TOTP pages by checking for multiple input fields or verification keywords."""
@@ -3252,13 +3119,7 @@ class ForgeAgent:
             browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
             if browser_state is not None and await browser_state.get_working_page() is not None:
                 try:
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            task.workflow_run_id or task.task_id,
-                            properties={"organization_id": task.organization_id},
-                        )
-                    )
+                    screenshot = await browser_state.take_fullpage_screenshot()
                     await app.ARTIFACT_MANAGER.create_artifact(
                         step=last_step,
                         artifact_type=ArtifactType.SCREENSHOT_FINAL,
@@ -3648,6 +3509,7 @@ class ForgeAgent:
                 queued_seconds=queued_seconds,
                 task_status=status,
                 organization_id=task.organization_id,
+                failure_reason=failure_reason,
             )
 
         await save_task_logs(task.task_id)
@@ -3694,7 +3556,6 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
-                task_block=task_block,
             ),
             name=f"verify_goal_{step.step_id}",
         )
@@ -4197,11 +4058,13 @@ class ForgeAgent:
     ) -> tuple[bool | None, Step | None, Step | None]:
         # Check if parallel verification should be used
         # Only use it when we have the required data AND when verification would normally happen
+        task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
         should_verify = (
             complete_verification
             and not step.is_goal_achieved()
             and not step.is_terminated()
             and not isinstance(task_block, ActionBlock)
+            and not task_completes_on_download
             and (task.navigation_goal or task.complete_criterion)
         )
 

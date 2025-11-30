@@ -378,13 +378,7 @@ async def _take_workflow_run_block_screenshot(
     if not browser_state:
         LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
     else:
-        screenshot = await browser_state.take_fullpage_screenshot(
-            use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "ENABLE_PLAYWRIGHT_FULLPAGE",
-                workflow_run_id,
-                properties={"organization_id": str(organization_id)},
-            )
-        )
+        screenshot = await browser_state.take_fullpage_screenshot()
         if screenshot:
             await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                 workflow_run_block=workflow_run_block,
@@ -945,7 +939,7 @@ async def _regenerate_script_block_after_ai_fallback(
         if not cache_key_value:
             cache_key_value = cache_key  # Fallback
 
-        existing_scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
+        existing_script = await app.DATABASE.get_workflow_script_by_cache_key_value(
             organization_id=organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=cache_key_value,
@@ -953,11 +947,11 @@ async def _regenerate_script_block_after_ai_fallback(
             statuses=[ScriptStatus.published],
         )
 
-        if not existing_scripts:
+        if not existing_script:
             LOG.error("No existing script found to regenerate", cache_key=cache_key, cache_key_value=cache_key_value)
             return
 
-        current_script = existing_scripts[0]
+        current_script = existing_script
         LOG.info(
             "Regenerating script block after AI fallback",
             script_id=current_script.script_id,
@@ -1200,7 +1194,7 @@ async def run_task(
     cache_key: str | None = None,
     engine: RunEngine = RunEngine.skyvern_v1,
     model: dict[str, Any] | None = None,
-) -> None:
+) -> dict[str, Any] | list | str | None:
     cache_key = cache_key or label
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
 
@@ -1219,7 +1213,7 @@ async def run_task(
         context = skyvern_context.ensure_context()
         context.prompt = prompt
         try:
-            await _run_cached_function(cached_fn)
+            output = await _run_cached_function(cached_fn)
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
@@ -1227,9 +1221,11 @@ async def run_task(
                     workflow_run_block_id,
                     BlockStatus.completed,
                     task_id=task_id,
+                    output=output,
                     step_id=step_id,
                     label=cache_key,
                 )
+            return output
 
         except Exception as e:
             LOG.exception("Failed to run task block. Falling back to AI run.")
@@ -1244,6 +1240,7 @@ async def run_task(
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
             )
+            return None
         finally:
             # clear the prompt in the RunContext
             context.prompt = None
@@ -1261,12 +1258,13 @@ async def run_task(
             engine=RunEngine.skyvern_v1,
             model=model,
         )
-        await task_block.execute_safe(
+        block_output = await task_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
             parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
+        return block_output.output_parameter_value
 
 
 async def download(

@@ -5,7 +5,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.config import settings
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.utils.url_validators import validate_url
 
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
@@ -40,7 +40,7 @@ class TaskV2(BaseModel):
     output: dict[str, Any] | list | str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    proxy_location: ProxyLocation | None = None
+    proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None
     extracted_information_schema: dict | list | str | None = None
@@ -149,7 +149,7 @@ class TaskV2Request(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    proxy_location: ProxyLocation | None = None
+    proxy_location: ProxyLocationInput = None
     publish_workflow: bool = False
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
