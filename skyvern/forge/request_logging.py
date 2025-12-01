@@ -18,6 +18,7 @@ LOG = structlog.get_logger()
 _SENSITIVE_HEADERS = {"authorization", "cookie", "x-api-key"}
 _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/credentials",
+    "POST /v1/credentials",
     "POST /v1/credentials/onepassword/create",
     "POST /v1/credentials/azure_credential/create",
 }
