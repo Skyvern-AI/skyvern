@@ -73,7 +73,7 @@ export function CustomCredentialServiceConfigForm() {
     if (parsedConfig) {
       form.reset({ config: parsedConfig });
     }
-  }, [parsedConfig, form]);
+  }, [parsedConfig, form.reset]);
 
   return (
     <div className="space-y-4">
