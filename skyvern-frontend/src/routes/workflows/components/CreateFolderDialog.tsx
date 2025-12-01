@@ -49,30 +49,30 @@ function CreateFolderDialog({ open, onOpenChange }: CreateFolderDialogProps) {
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Create New Folder</DialogTitle>
+          <DialogTitle>새 폴더 만들기</DialogTitle>
           <DialogDescription>
-            Create a folder to organize your workflows.
+            워크플로우를 정리할 폴더를 만드세요.
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit}>
           <div className="grid gap-4 py-4">
             <div className="grid gap-2">
-              <Label htmlFor="folder-title">Title</Label>
+              <Label htmlFor="folder-title">이름</Label>
               <Input
                 id="folder-title"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                placeholder="e.g., Production Workflows"
+                placeholder="예: 프로덕션 워크플로우"
                 autoFocus
               />
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="folder-description">Description (optional)</Label>
+              <Label htmlFor="folder-description">설명 (선택사항)</Label>
               <Textarea
                 id="folder-description"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
-                placeholder="Add a description..."
+                placeholder="설명을 입력하세요..."
                 rows={3}
               />
             </div>
@@ -83,13 +83,13 @@ function CreateFolderDialog({ open, onOpenChange }: CreateFolderDialogProps) {
               variant="outline"
               onClick={() => handleOpenChange(false)}
             >
-              Cancel
+              취소
             </Button>
             <Button
               type="submit"
               disabled={!title.trim() || createFolderMutation.isPending}
             >
-              Create Folder
+              폴더 만들기
             </Button>
           </DialogFooter>
         </form>

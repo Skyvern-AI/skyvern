@@ -76,11 +76,11 @@ function WorkflowFolderSelector({
         onCloseAutoFocus={(e) => e.preventDefault()}
       >
         <div className="border-b p-3">
-          <h4 className="mb-2 text-sm font-medium">Move to folder</h4>
+          <h4 className="mb-2 text-sm font-medium">폴더로 이동</h4>
           <div className="relative">
             <MagnifyingGlassIcon className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
             <Input
-              placeholder="Search folders..."
+              placeholder="폴더 검색..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               className="h-8 pl-8"
@@ -106,7 +106,7 @@ function WorkflowFolderSelector({
             >
               <div className="flex items-center gap-2">
                 <Cross2Icon className="h-4 w-4 text-red-400" />
-                <span>Remove from folder</span>
+                <span>폴더에서 제거</span>
               </div>
             </button>
           )}
@@ -129,7 +129,7 @@ function WorkflowFolderSelector({
             </>
           ) : folders.length === 0 ? (
             <div className="px-3 py-8 text-center text-sm text-slate-400">
-              No folders found
+              폴더가 없습니다
             </div>
           ) : (
             <>

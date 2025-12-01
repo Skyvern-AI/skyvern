@@ -61,7 +61,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
                         <Pencil1Icon className="h-4 w-4" />
                       </button>
                     </TooltipTrigger>
-                    <TooltipContent>Edit Folder</TooltipContent>
+                    <TooltipContent>폴더 편집</TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
                 <DeleteFolderButton
@@ -71,8 +71,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
               </div>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              {folder.workflow_count}{" "}
-              {folder.workflow_count === 1 ? "workflow" : "workflows"}
+              워크플로우 {folder.workflow_count}개
             </p>
           </div>
         </div>

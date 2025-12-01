@@ -72,14 +72,14 @@ function ImportWorkflowButton({
       });
       toast({
         variant: "success",
-        title: "Workflow imported",
-        description: "Successfully imported workflow",
+        title: "워크플로우 가져오기 완료",
+        description: "워크플로우를 성공적으로 가져왔습니다",
       });
     } catch (error) {
       toast({
         variant: "destructive",
-        title: "Error importing workflow",
-        description: getErrorMessage(error, "Failed to import workflow"),
+        title: "워크플로우 가져오기 오류",
+        description: getErrorMessage(error, "워크플로우 가져오기 실패"),
       });
     }
   };
@@ -105,13 +105,13 @@ function ImportWorkflowButton({
       onImportStart?.();
 
       toast({
-        title: "Import started",
-        description: `Importing ${file.name}...`,
+        title: "가져오기 시작",
+        description: `${file.name} 가져오는 중...`,
       });
     } catch (error) {
       toast({
-        title: "Import Failed",
-        description: getErrorMessage(error, "Failed to import PDF"),
+        title: "가져오기 실패",
+        description: getErrorMessage(error, "PDF 가져오기 실패"),
         variant: "destructive",
       });
     }
@@ -150,12 +150,12 @@ function ImportWorkflowButton({
             />
             <div className="flex h-full cursor-pointer items-center gap-2 rounded-md bg-secondary px-4 py-2 font-bold text-secondary-foreground hover:bg-secondary/90">
               <UploadIcon className="h-4 w-4" />
-              Import
+              가져오기
             </div>
           </Label>
         </TooltipTrigger>
         <TooltipContent>
-          Import a workflow from a YAML, JSON, or PDF file
+          YAML, JSON 또는 PDF 파일에서 워크플로우 가져오기
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>

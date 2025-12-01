@@ -59,9 +59,9 @@ function ViewAllFoldersDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-h-[90vh] max-w-4xl">
         <DialogHeader>
-          <DialogTitle>All Folders</DialogTitle>
+          <DialogTitle>전체 폴더</DialogTitle>
           <DialogDescription>
-            Browse and select from all folders. Scroll to load more.
+            모든 폴더를 찾아보고 선택하세요. 스크롤하여 더 불러옵니다.
           </DialogDescription>
         </DialogHeader>
 
@@ -69,7 +69,7 @@ function ViewAllFoldersDialog({
           <MagnifyingGlassIcon className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <Input
             type="text"
-            placeholder="Search folders..."
+            placeholder="폴더 검색..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="pl-10"
@@ -107,7 +107,7 @@ function ViewAllFoldersDialog({
             </div>
           ) : folders.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-slate-400">
-              <p>No folders found</p>
+              <p>폴더가 없습니다</p>
             </div>
           ) : (
             <>
@@ -125,14 +125,14 @@ function ViewAllFoldersDialog({
                 <div className="mt-4 flex items-center justify-center py-4">
                   <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
                   <span className="text-sm text-slate-400">
-                    Loading more folders...
+                    폴더 더 불러오는 중...
                   </span>
                 </div>
               )}
               {!hasNextPage && folders.length > 20 && (
                 <div className="mt-4 flex items-center justify-center py-4">
                   <span className="text-sm text-slate-400">
-                    All folders loaded
+                    모든 폴더 로드 완료
                   </span>
                 </div>
               )}
