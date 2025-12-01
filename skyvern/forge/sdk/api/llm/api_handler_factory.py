@@ -491,6 +491,7 @@ class LLMAPIHandlerFactory:
                     model=main_model_group,
                     messages=messages,
                     timeout=settings.LLM_CONFIG_TIMEOUT,
+                    drop_params=True,
                     **parameters,
                 )
                 return response, request_payload_json
