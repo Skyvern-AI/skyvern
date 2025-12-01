@@ -66,6 +66,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_script_file,
     convert_to_step,
     convert_to_task,
+    convert_to_task_v2,
     convert_to_workflow,
     convert_to_workflow_parameter,
     convert_to_workflow_run,
@@ -3524,7 +3525,7 @@ class AgentDB:
                     .filter_by(organization_id=organization_id)
                 )
             ).first():
-                return TaskV2.model_validate(task_v2)
+                return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
             return None
 
     async def delete_thoughts(self, task_v2_id: str, organization_id: str | None = None) -> None:
@@ -3551,7 +3552,7 @@ class AgentDB:
                     .filter_by(workflow_run_id=workflow_run_id)
                 )
             ).first():
-                return TaskV2.model_validate(task_v2)
+                return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
             return None
 
     async def get_thought(self, thought_id: str, organization_id: str | None = None) -> Thought | None:
@@ -3628,7 +3629,7 @@ class AgentDB:
             session.add(new_task_v2)
             await session.commit()
             await session.refresh(new_task_v2)
-            return TaskV2.model_validate(new_task_v2)
+            return convert_to_task_v2(new_task_v2, debug_enabled=self.debug_enabled)
 
     async def create_thought(
         self,
@@ -3784,7 +3785,7 @@ class AgentDB:
                     task_v2.webhook_failure_reason = webhook_failure_reason
                 await session.commit()
                 await session.refresh(task_v2)
-                return TaskV2.model_validate(task_v2)
+                return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
             raise NotFoundError(f"TaskV2 {task_v2_id} not found")
 
     async def create_workflow_run_block(
