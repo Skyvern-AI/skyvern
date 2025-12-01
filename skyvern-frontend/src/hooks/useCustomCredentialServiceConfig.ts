@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "./useCredentialGetter";
 import {
@@ -35,7 +36,7 @@ export function useCustomCredentialServiceConfig() {
     });
 
   // Parse the configuration from the stored token
-  const parsedConfig: CustomCredentialServiceConfig | null = (() => {
+  const parsedConfig: CustomCredentialServiceConfig | null = useMemo(() => {
     if (!customCredentialServiceAuthToken?.token) return null;
 
     try {
@@ -43,7 +44,7 @@ export function useCustomCredentialServiceConfig() {
     } catch {
       return null;
     }
-  })();
+  }, [customCredentialServiceAuthToken?.token]);
 
   const createOrUpdateConfigMutation = useMutation({
     mutationFn: async (data: CreateCustomCredentialServiceConfigRequest) => {
