@@ -128,11 +128,10 @@ function BrowserSessions() {
       <div className="space-y-5">
         <div className="flex items-center gap-2">
           <GlobeIcon className="size-6" />
-          <h1 className="text-2xl">Browsers</h1>
+          <h1 className="text-2xl">브라우저</h1>
         </div>
         <p className="text-slate-300">
-          Create your own live browsers to interact with websites, or run
-          workflows in.
+          웹사이트와 상호작용하거나 워크플로우를 실행할 수 있는 라이브 브라우저를 만드세요.
         </p>
       </div>
 
@@ -151,7 +150,7 @@ function BrowserSessions() {
               ) : (
                 <PlusIcon className="mr-2 h-4 w-4" />
               )}
-              Create
+              만들기
             </Button>
           </div>
         </div>
@@ -163,34 +162,34 @@ function BrowserSessions() {
                   ID
                 </TableHead>
                 <TableHead className="w-1/12 truncate text-slate-400">
-                  Open
+                  열림
                 </TableHead>
                 <TableHead className="w-1/6 truncate text-slate-400">
-                  <span className="mr-2">Occupied</span>
+                  <span className="mr-2">사용 중</span>
                   <HelpTooltip
                     className="inline"
-                    content="Browser is busy running a task or workflow"
+                    content="브라우저가 작업 또는 워크플로우를 실행 중입니다"
                   />
                 </TableHead>
                 <TableHead className="w-1/6 truncate text-slate-400">
-                  Started
+                  시작됨
                 </TableHead>
                 <TableHead className="w-1/6 truncate text-slate-400">
-                  Timeout
+                  타임아웃
                 </TableHead>
                 <TableHead className="w-1/2 truncate text-slate-400">
-                  CDP Url
+                  CDP URL
                 </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {isLoading ? (
                 <TableRow>
-                  <TableCell colSpan={6}>Loading...</TableCell>
+                  <TableCell colSpan={6}>로딩 중...</TableCell>
                 </TableRow>
               ) : browserSessions?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6}>No browser sessions found</TableCell>
+                  <TableCell colSpan={6}>브라우저 세션이 없습니다</TableCell>
                 </TableRow>
               ) : (
                 browserSessions?.map((browserSession) => {
@@ -202,7 +201,7 @@ function BrowserSessions() {
                   const ago = startedAtDate ? (
                     formatMs(Date.now() - startedAtDate.getTime()).ago
                   ) : (
-                    <span className="opacity-50">never</span>
+                    <span className="opacity-50">없음</span>
                   );
                   const cdpUrl = browserSession.browser_address ?? "-";
 
@@ -262,7 +261,7 @@ function BrowserSessions() {
           </Table>
           <div className="relative px-3 py-3">
             <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-              <span className="text-slate-400">Items per page</span>
+              <span className="text-slate-400">페이지당 항목 수</span>
               <select
                 className="h-9 rounded-md border border-slate-300 bg-background"
                 value={itemsPerPage}
@@ -323,15 +322,14 @@ function BrowserSessions() {
       >
         <DrawerContent className="bottom-2 right-0 top-2 mt-0 h-full w-96 rounded border-0 p-6">
           <DrawerHeader>
-            <DrawerTitle>Create Browser Session</DrawerTitle>
+            <DrawerTitle>브라우저 세션 만들기</DrawerTitle>
             <DrawerDescription>
-              Create a new browser session to interact with websites, or run
-              workflows in.
+              웹사이트와 상호작용하거나 워크플로우를 실행할 새 브라우저 세션을 만드세요.
               <div className="mt-8 flex flex-col gap-4">
                 <div className="space-y-2">
                   <div className="flex gap-2">
-                    <Label>Proxy Location</Label>
-                    <HelpTooltip content="Route Skyvern through one of our available proxies." />
+                    <Label>프록시 위치</Label>
+                    <HelpTooltip content="사용 가능한 프록시 중 하나를 통해 Skyvern을 라우팅합니다." />
                   </div>
                   <ProxySelector
                     value={sessionOptions.proxyLocation}
@@ -345,12 +343,12 @@ function BrowserSessions() {
                 </div>
                 <div className="space-y-2">
                   <div className="flex items-center gap-2">
-                    <Label>Timeout (Minutes)</Label>
-                    <HelpTooltip content="Duration to keep the browser session open. Automatically extends as it is used." />
+                    <Label>타임아웃 (분)</Label>
+                    <HelpTooltip content="브라우저 세션을 열어둘 시간입니다. 사용 시 자동으로 연장됩니다." />
                   </div>
                   <Input
                     value={sessionOptions.timeoutMinutes}
-                    placeholder="timeout (minutes)"
+                    placeholder="타임아웃 (분)"
                     onChange={(event) => {
                       const value =
                         event.target.value === ""
@@ -381,7 +379,7 @@ function BrowserSessions() {
                   ) : (
                     <PlusIcon className="mr-2 h-4 w-4" />
                   )}
-                  Create
+                  만들기
                 </Button>
               </div>
             </DrawerDescription>

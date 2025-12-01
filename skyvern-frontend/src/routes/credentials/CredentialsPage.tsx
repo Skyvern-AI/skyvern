@@ -19,7 +19,7 @@ import { CredentialsTotpTab } from "./CredentialsTotpTab";
 import { useSearchParams } from "react-router-dom";
 
 const subHeaderText =
-  "Securely store your passwords, credit cards, and manage incoming 2FA codes for your workflows.";
+  "비밀번호, 신용카드를 안전하게 저장하고 워크플로우에서 사용할 2FA 코드를 관리하세요.";
 
 const TAB_VALUES = ["passwords", "creditCards", "twoFactor"] as const;
 type TabValue = (typeof TAB_VALUES)[number];
@@ -49,13 +49,13 @@ function CredentialsPage() {
 
   return (
     <div className="space-y-5">
-      <h1 className="text-2xl">Credentials</h1>
+      <h1 className="text-2xl">인증 정보</h1>
       <div className="flex items-center justify-between">
         <div className="w-96 text-sm text-slate-300">{subHeaderText}</div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild>
             <Button>
-              <PlusIcon className="mr-2 size-6" /> Add
+              <PlusIcon className="mr-2 size-6" /> 추가
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent className="w-48">
@@ -67,7 +67,7 @@ function CredentialsPage() {
               className="cursor-pointer"
             >
               <KeyIcon className="mr-2 size-4" />
-              Password
+              비밀번호
             </DropdownMenuItem>
             <DropdownMenuItem
               onSelect={() => {
@@ -77,7 +77,7 @@ function CredentialsPage() {
               className="cursor-pointer"
             >
               <CardStackIcon className="mr-2 size-4" />
-              Credit Card
+              신용카드
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -88,9 +88,9 @@ function CredentialsPage() {
         onValueChange={handleTabChange}
       >
         <TabsList className="bg-slate-elevation1">
-          <TabsTrigger value="passwords">Passwords</TabsTrigger>
-          <TabsTrigger value="creditCards">Credit Cards</TabsTrigger>
-          <TabsTrigger value="twoFactor">2FA</TabsTrigger>
+          <TabsTrigger value="passwords">비밀번호</TabsTrigger>
+          <TabsTrigger value="creditCards">신용카드</TabsTrigger>
+          <TabsTrigger value="twoFactor">2단계 인증</TabsTrigger>
         </TabsList>
 
         <TabsContent value="passwords" className="space-y-4">

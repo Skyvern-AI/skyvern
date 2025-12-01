@@ -147,7 +147,7 @@ function RunHistory() {
   return (
     <div className="space-y-4">
       <header>
-        <h1 className="text-2xl">Run History</h1>
+        <h1 className="text-2xl">실행 기록</h1>
       </header>
       <div className="flex items-center justify-between gap-4">
         <TableSearchInput
@@ -158,7 +158,7 @@ function RunHistory() {
             params.set("page", "1");
             setSearchParams(params, { replace: true });
           }}
-          placeholder="Search runs by parameter..."
+          placeholder="파라미터로 실행 검색..."
           className="w-48 lg:w-72"
         />
         <StatusFilterDropdown
@@ -171,11 +171,11 @@ function RunHistory() {
           <TableHeader className="rounded-t-lg bg-slate-elevation2">
             <TableRow>
               <TableHead className="w-1/5 rounded-tl-lg text-slate-400">
-                Run ID
+                실행 ID
               </TableHead>
-              <TableHead className="w-1/5 text-slate-400">Detail</TableHead>
-              <TableHead className="w-1/5 text-slate-400">Status</TableHead>
-              <TableHead className="w-1/5 text-slate-400">Created At</TableHead>
+              <TableHead className="w-1/5 text-slate-400">상세</TableHead>
+              <TableHead className="w-1/5 text-slate-400">상태</TableHead>
+              <TableHead className="w-1/5 text-slate-400">생성일</TableHead>
               <TableHead className="w-1/5 rounded-tr-lg text-slate-400"></TableHead>
             </TableRow>
           </TableHeader>
@@ -191,7 +191,7 @@ function RunHistory() {
             ) : runs?.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={4}>
-                  <div className="text-center">No runs found</div>
+                  <div className="text-center">실행 기록이 없습니다</div>
                 </TableCell>
               </TableRow>
             ) : (
@@ -227,7 +227,7 @@ function RunHistory() {
                 const workflowTitle =
                   run.script_run === true ? (
                     <div className="flex items-center gap-2">
-                      <Tip content="Ran with code">
+                      <Tip content="코드로 실행됨">
                         <LightningBoltIcon className="text-[gold]" />
                       </Tip>
                       <span>{run.workflow_title ?? ""}</span>
@@ -293,8 +293,8 @@ function RunHistory() {
                               </TooltipTrigger>
                               <TooltipContent>
                                 {isExpanded
-                                  ? "Hide Parameters"
-                                  : "Show Parameters"}
+                                  ? "파라미터 숨기기"
+                                  : "파라미터 보기"}
                               </TooltipContent>
                             </Tooltip>
                           </TooltipProvider>
@@ -325,7 +325,7 @@ function RunHistory() {
         </Table>
         <div className="relative px-3 py-3">
           <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-            <span className="text-slate-400">Items per page</span>
+            <span className="text-slate-400">페이지당 항목 수</span>
             <select
               className="h-9 rounded-md border border-slate-300 bg-background px-3"
               value={itemsPerPage}
@@ -428,7 +428,7 @@ function WorkflowRunParametersInline({
   if (!run || !run.parameters || Object.keys(run.parameters).length === 0) {
     return (
       <div className="ml-8 py-4 text-sm text-slate-400">
-        No parameters for this run
+        이 실행에 대한 파라미터가 없습니다
       </div>
     );
   }

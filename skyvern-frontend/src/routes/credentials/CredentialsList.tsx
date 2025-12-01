@@ -9,8 +9,8 @@ type Props = {
 };
 
 const EMPTY_MESSAGE: Record<CredentialFilter, string> = {
-  password: "No password credentials stored yet.",
-  credit_card: "No credit cards stored yet.",
+  password: "저장된 비밀번호가 없습니다.",
+  credit_card: "저장된 신용카드가 없습니다.",
 };
 
 function CredentialsList({ filter }: Props = {}) {
@@ -44,7 +44,7 @@ function CredentialsList({ filter }: Props = {}) {
   if (filteredCredentials.length === 0) {
     return (
       <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-slate-300">
-        {filter ? EMPTY_MESSAGE[filter] : "No credentials stored yet."}
+        {filter ? EMPTY_MESSAGE[filter] : "저장된 인증 정보가 없습니다."}
       </div>
     );
   }
