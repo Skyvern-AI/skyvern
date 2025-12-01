@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.models import (
     ScriptModel,
     StepModel,
     TaskModel,
+    TaskV2Model,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunBlockModel,
@@ -36,6 +37,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     Organization,
     OrganizationAuthToken,
 )
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -202,6 +204,12 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         download_timeout=task_obj.download_timeout,
     )
     return task
+
+
+def convert_to_task_v2(task_v2_model: TaskV2Model, debug_enabled: bool = False) -> TaskV2:
+    task_v2_data = {column.name: getattr(task_v2_model, column.name) for column in TaskV2Model.__table__.columns}
+    task_v2_data["proxy_location"] = _deserialize_proxy_location(task_v2_model.proxy_location)
+    return TaskV2.model_validate(task_v2_data)
 
 
 def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
