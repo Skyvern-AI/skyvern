@@ -15,13 +15,13 @@ UI-TARS LLM Caller that follows the standard LLMCaller pattern.
 
 import base64
 from io import BytesIO
-from typing import Any, Dict
 
 import structlog
 from PIL import Image
 
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+from skyvern.forge.sdk.api.llm.utils import is_image_message
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 
@@ -31,15 +31,6 @@ LOG = structlog.get_logger()
 def _build_system_prompt(instruction: str, language: str = "English") -> str:
     """Build system prompt for UI-TARS using the prompt engine."""
     return prompt_engine.load_prompt("ui-tars-system-prompt", language=language, instruction=instruction)
-
-
-def _is_image_message(message: Dict[str, Any]) -> bool:
-    """Check if message contains an image."""
-    return (
-        message.get("role") == "user"
-        and isinstance(message.get("content"), list)
-        and any(item.get("type") == "image_url" for item in message["content"])
-    )
 
 
 class UITarsLLMCaller(LLMCaller):
@@ -114,7 +105,7 @@ class UITarsLLMCaller(LLMCaller):
         i = 1  # Start after system prompt (index 0)
         while i < len(self.message_history) and removed_count < images_to_remove:
             message = self.message_history[i]
-            if _is_image_message(message):
+            if is_image_message(message):
                 # Remove only the screenshot message, keep all assistant responses
                 self.message_history.pop(i)
                 removed_count += 1
@@ -131,7 +122,7 @@ class UITarsLLMCaller(LLMCaller):
         """Count existing image messages in the conversation history."""
         count = 0
         for message in self.message_history:
-            if _is_image_message(message):
+            if is_image_message(message):
                 count += 1
         return count
 
