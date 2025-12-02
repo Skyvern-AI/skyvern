@@ -110,7 +110,7 @@ class SkyvernPageRun:
         """Run a login task in the context of this page and wait for it to finish.
 
         Args:
-            credential_type: Type of credential store to use (e.g., bitwarden, onepassword).
+            credential_type: Type of credential store to use (e.g., skyvern, bitwarden, onepassword).
             url: URL to navigate to for login. If not provided, uses the current page URL.
             credential_id: ID of the credential to use.
             bitwarden_collection_id: Bitwarden collection ID containing the credentials.
