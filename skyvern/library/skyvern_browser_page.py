@@ -86,6 +86,7 @@ class SkyvernPageRun:
             browser_address=self._browser.browser_address,
             user_agent=user_agent,
         )
+        LOG.info("AI task is running, this may take a while", run_id=task_run.run_id)
 
         task_run = await self._wait_for_run_completion(task_run.run_id, timeout)
         return TaskRunResponse.model_validate(task_run.model_dump())
@@ -128,7 +129,7 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the login workflow execution results.
         """
 
-        LOG.info("AI login", prompt=prompt)
+        LOG.info("Starting AI login workflow", credential_type=credential_type)
 
         workflow_run = await self._browser.skyvern.login(
             credential_type=credential_type,
@@ -146,6 +147,7 @@ class SkyvernPageRun:
             browser_address=self._browser.browser_address,
             extra_http_headers=extra_http_headers,
         )
+        LOG.info("AI login workflow is running, this may take a while", run_id=workflow_run.run_id)
 
         workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
@@ -177,7 +179,7 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the workflow execution results.
         """
 
-        LOG.info("AI run workflow", workflow_id=workflow_id)
+        LOG.info("Starting AI workflow", workflow_id=workflow_id)
 
         workflow_run = await self._browser.skyvern.run_workflow(
             workflow_id=workflow_id,
@@ -190,6 +192,7 @@ class SkyvernPageRun:
             browser_session_id=self._browser.browser_session_id,
             browser_address=self._browser.browser_address,
         )
+        LOG.info("AI workflow is running, this may take a while", run_id=workflow_run.run_id)
 
         workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())

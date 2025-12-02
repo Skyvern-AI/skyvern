@@ -3,6 +3,7 @@ import os
 from typing import Any, overload
 
 import httpx
+import structlog
 from dotenv import load_dotenv
 from playwright.async_api import Playwright, async_playwright
 
@@ -15,6 +16,8 @@ from skyvern.library.embedded_server_factory import create_embedded_server
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunStatus
+
+LOG = structlog.get_logger()
 
 
 class Skyvern(AsyncSkyvern):
@@ -423,6 +426,7 @@ class Skyvern(AsyncSkyvern):
         """
         self._ensure_cloud_environment()
         browser_session = await self.get_browser_session(browser_session_id)
+        LOG.info("Connecting to existing cloud browser session", browser_session_id=browser_session.browser_session_id)
         return await self._connect_to_cloud_browser_session(browser_session)
 
     async def launch_cloud_browser(
@@ -449,6 +453,7 @@ class Skyvern(AsyncSkyvern):
             timeout=timeout,
             proxy_location=proxy_location,
         )
+        LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
         return await self._connect_to_cloud_browser_session(browser_session)
 
     async def use_cloud_browser(
@@ -478,10 +483,15 @@ class Skyvern(AsyncSkyvern):
             (s for s in browser_sessions if s.runnable_id is None), key=lambda s: s.started_at, default=None
         )
         if browser_session is None:
+            LOG.info("No existing cloud browser session found, launching a new session")
             browser_session = await self.create_browser_session(
                 timeout=timeout,
                 proxy_location=proxy_location,
             )
+            LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
+        else:
+            LOG.info("Reusing existing cloud browser session", browser_session_id=browser_session.browser_session_id)
+
         return await self._connect_to_cloud_browser_session(browser_session)
 
     def _ensure_cloud_environment(self) -> None:
