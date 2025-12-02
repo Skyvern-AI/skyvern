@@ -125,7 +125,7 @@ from skyvern.webeye.actions.parse_actions import (
     parse_ui_tars_actions,
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
-from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
 
