@@ -5,6 +5,7 @@ import { useMutation } from "@tanstack/react-query";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { BrowserSession } from "@/routes/workflows/types/browserSessionTypes";
+import { ProxyLocation } from "@/api/types";
 
 function useCreateBrowserSessionMutation() {
   const queryClient = useQueryClient();
@@ -16,7 +17,7 @@ function useCreateBrowserSessionMutation() {
       proxyLocation = null,
       timeout = null,
     }: {
-      proxyLocation: string | null;
+      proxyLocation: ProxyLocation | null;
       timeout: number | null;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");

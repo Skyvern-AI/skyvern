@@ -21,7 +21,7 @@ def get_pylon_email_hash(email: str = Query(...)) -> PylonHash:
     secret = settings.PYLON_IDENTITY_VERIFICATION_SECRET
 
     if not secret:
-        LOG.error("No Pylon identity verification secret", email=email)
+        LOG.warning("No Pylon identity verification secret", email=email)
         return PylonHash(hash=no_hash)
 
     try:

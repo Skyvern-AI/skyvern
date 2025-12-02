@@ -9,6 +9,7 @@ from openai import AsyncAzureOpenAI, AsyncOpenAI
 from skyvern.config import Settings
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
@@ -31,6 +32,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
 
 
@@ -91,11 +93,14 @@ def create_forge_app() -> ForgeApp:
     app.STORAGE = StorageFactory.get_storage()
     app.CACHE = CacheFactory.get_cache()
     app.ARTIFACT_MANAGER = ArtifactManager()
-    app.BROWSER_MANAGER = BrowserManager()
+    app.BROWSER_MANAGER = RealBrowserManager()
     app.EXPERIMENTATION_PROVIDER = NoOpExperimentationProvider()
 
     app.LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(settings.LLM_KEY)
-    app.OPENAI_CLIENT = AsyncOpenAI(api_key=settings.OPENAI_API_KEY or "")
+    app.OPENAI_CLIENT = AsyncOpenAI(
+        api_key=settings.OPENAI_API_KEY or "",
+        http_client=ForgeAsyncHttpxClientWrapper(),
+    )
     if settings.ENABLE_AZURE_CUA:
         app.OPENAI_CLIENT = AsyncAzureOpenAI(
             api_key=settings.AZURE_CUA_API_KEY,
@@ -113,6 +118,7 @@ def create_forge_app() -> ForgeApp:
         app.UI_TARS_CLIENT = AsyncOpenAI(
             api_key=settings.VOLCENGINE_API_KEY,
             base_url=settings.VOLCENGINE_API_BASE,
+            http_client=ForgeAsyncHttpxClientWrapper(),
         )
 
     app.SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
