@@ -5,11 +5,11 @@ import structlog
 from playwright.async_api import Page
 
 from skyvern.client import GetRunResponse
+from skyvern.client.core import RequestOptions
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
 from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
-from skyvern.client.core import RequestOptions
 
 if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
