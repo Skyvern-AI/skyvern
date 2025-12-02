@@ -588,19 +588,22 @@ class BaseTaskBlock(Block):
                 )
                 self.url = task_url_parameter_value
 
-        if (
-            self.totp_identifier
-            and workflow_run_context.has_parameter(self.totp_identifier)
-            and workflow_run_context.has_value(self.totp_identifier)
-        ):
-            totp_identifier_parameter_value = workflow_run_context.get_value(self.totp_identifier)
-            if totp_identifier_parameter_value:
-                LOG.info(
-                    "TOTP identifier is parameterized, using parameter value",
-                    totp_identifier_parameter_value=totp_identifier_parameter_value,
-                    totp_identifier_parameter_key=self.totp_identifier,
-                )
-                self.totp_identifier = totp_identifier_parameter_value
+        if self.totp_identifier:
+            if workflow_run_context.has_parameter(self.totp_identifier) and workflow_run_context.has_value(
+                self.totp_identifier
+            ):
+                totp_identifier_parameter_value = workflow_run_context.get_value(self.totp_identifier)
+                if totp_identifier_parameter_value:
+                    self.totp_identifier = totp_identifier_parameter_value
+        else:
+            for parameter in self.get_all_parameters(workflow_run_id):
+                parameter_key = getattr(parameter, "key", None)
+                if not parameter_key:
+                    continue
+                credential_totp_identifier = workflow_run_context.get_credential_totp_identifier(parameter_key)
+                if credential_totp_identifier:
+                    self.totp_identifier = credential_totp_identifier
+                    break
 
         if self.download_suffix and workflow_run_context.has_parameter(self.download_suffix):
             download_suffix_parameter_value = workflow_run_context.get_value(self.download_suffix)
