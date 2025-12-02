@@ -66,17 +66,17 @@ export function CustomCredentialServiceConfigForm() {
     if (parsedConfig) {
       form.reset({ config: parsedConfig });
     }
-  }, [parsedConfig, form.reset]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parsedConfig]);
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h3 className="text-lg font-medium">
-            Custom Credential Service
-          </h3>
+          <h3 className="text-lg font-medium">Custom Credential Service</h3>
           <p className="text-sm text-muted-foreground">
-            Configure your custom HTTP API for credential management. Your API should support the standard CRUD operations.
+            Configure your custom HTTP API for credential management. Your API
+            should support the standard CRUD operations.
           </p>
         </div>
         {customCredentialServiceAuthToken && (
@@ -100,7 +100,8 @@ export function CustomCredentialServiceConfigForm() {
               <FormItem>
                 <FormLabel>API Base URL</FormLabel>
                 <FormDescription>
-                  The base URL of your custom credential service API (e.g., https://credentials.company.com/api/v1)
+                  The base URL of your custom credential service API (e.g.,
+                  https://credentials.company.com/api/v1)
                 </FormDescription>
                 <div className="relative">
                   <FormControl>
@@ -125,7 +126,8 @@ export function CustomCredentialServiceConfigForm() {
               <FormItem>
                 <FormLabel>API Token</FormLabel>
                 <FormDescription>
-                  Bearer token for authenticating with your custom credential service
+                  Bearer token for authenticating with your custom credential
+                  service
                 </FormDescription>
                 <div className="relative">
                   <FormControl>
@@ -175,7 +177,9 @@ export function CustomCredentialServiceConfigForm() {
 
       {customCredentialServiceAuthToken && (
         <div className="rounded-md bg-muted p-4">
-          <h4 className="mb-2 text-sm font-medium">Configuration Information</h4>
+          <h4 className="mb-2 text-sm font-medium">
+            Configuration Information
+          </h4>
           <div className="space-y-1 text-sm text-muted-foreground">
             <div>ID: {customCredentialServiceAuthToken.id}</div>
             <div>Type: {customCredentialServiceAuthToken.token_type}</div>
@@ -187,8 +191,16 @@ export function CustomCredentialServiceConfigForm() {
             </div>
             {parsedConfig && (
               <div className="mt-2">
-                <div><strong>Configured API URL:</strong> {parsedConfig.api_base_url}</div>
-                <div><strong>Token (masked):</strong> {parsedConfig.api_token.length > 8 ? `${parsedConfig.api_token.slice(0, 8)}...` : '********'}</div>
+                <div>
+                  <strong>Configured API URL:</strong>{" "}
+                  {parsedConfig.api_base_url}
+                </div>
+                <div>
+                  <strong>Token (masked):</strong>{" "}
+                  {parsedConfig.api_token.length > 8
+                    ? `${parsedConfig.api_token.slice(0, 8)}...`
+                    : "********"}
+                </div>
               </div>
             )}
           </div>

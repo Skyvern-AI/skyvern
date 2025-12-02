@@ -29,7 +29,10 @@ export function useCustomCredentialServiceConfig() {
               return null;
             }
             // Log other errors for debugging but still return null
-            console.warn("Failed to fetch custom credential service config:", error);
+            console.warn(
+              "Failed to fetch custom credential service config:",
+              error,
+            );
             return null;
           });
       },
@@ -61,7 +64,8 @@ export function useCustomCredentialServiceConfig() {
       });
       toast({
         title: "Success",
-        description: "Custom credential service configuration updated successfully",
+        description:
+          "Custom credential service configuration updated successfully",
       });
     },
     onError: (error: unknown) => {
@@ -77,7 +81,6 @@ export function useCustomCredentialServiceConfig() {
       });
     },
   });
-
 
   return {
     customCredentialServiceAuthToken,
