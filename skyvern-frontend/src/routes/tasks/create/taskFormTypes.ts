@@ -15,7 +15,16 @@ const createNewTaskFormSchemaBase = z.object({
   totpIdentifier: z.string().or(z.null()),
   cdpAddress: z.string().or(z.null()),
   errorCodeMapping: z.string().or(z.null()),
-  proxyLocation: z.nativeEnum(ProxyLocation).or(z.null()),
+  proxyLocation: z
+    .union([
+      z.nativeEnum(ProxyLocation),
+      z.object({
+        country: z.string(),
+        subdivision: z.string().optional(),
+        city: z.string().optional(),
+      }),
+    ])
+    .nullable(),
   includeActionHistoryInVerification: z.boolean().or(z.null()).default(false),
   maxScreenshotScrolls: z.number().or(z.null()).default(null),
 });
