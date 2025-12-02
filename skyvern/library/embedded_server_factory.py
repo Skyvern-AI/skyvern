@@ -1,15 +1,9 @@
-from typing import Any
-
 import httpx
 from httpx import ASGITransport
 
-from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
-
 
 def create_embedded_server(
-    llm_config: LLMRouterConfig | LLMConfig | None = None,
-    settings_overrides: dict[str, Any] | None = None,
+    openai_api_key: str | None,
 ) -> httpx.AsyncClient:
     class EmbeddedServerTransport(httpx.AsyncBaseTransport):
         def __init__(self) -> None:
@@ -21,20 +15,8 @@ def create_embedded_server(
 
                 settings.BROWSER_LOGS_ENABLED = False
 
-                if llm_config:
-                    LLMConfigRegistry.register_config(
-                        "CUSTOM_LLM",
-                        llm_config,
-                    )
-                    settings.LLM_KEY = "CUSTOM_LLM"
-
-                # Apply custom settings overrides
-                if settings_overrides:
-                    for key, value in settings_overrides.items():
-                        if hasattr(settings, key):
-                            setattr(settings, key, value)
-                        else:
-                            raise ValueError(f"Invalid setting: {key}")
+                if openai_api_key:
+                    settings.OPENAI_API_KEY = openai_api_key
 
                 from skyvern.forge.api_app import create_api_app  # noqa: PLC0415
 
