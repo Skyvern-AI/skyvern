@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from playwright.async_api import Playwright, async_playwright
 
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
+from skyvern.client.core import RequestOptions
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
@@ -237,6 +238,7 @@ class Skyvern(AsyncSkyvern):
         include_action_history_in_verification: bool | None = None,
         max_screenshot_scrolls: int | None = None,
         browser_address: str | None = None,
+        request_options: RequestOptions | None = None,
     ) -> TaskRunResponse:
         task_run = await super().run_task(
             prompt=prompt,
@@ -258,6 +260,7 @@ class Skyvern(AsyncSkyvern):
             include_action_history_in_verification=include_action_history_in_verification,
             max_screenshot_scrolls=max_screenshot_scrolls,
             browser_address=browser_address,
+            request_options=request_options,
         )
 
         if wait_for_completion:
@@ -290,6 +293,7 @@ class Skyvern(AsyncSkyvern):
         run_with: str | None = None,
         wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
+        request_options: RequestOptions | None = None,
     ) -> WorkflowRunResponse:
         workflow_run = await super().run_workflow(
             workflow_id=workflow_id,
@@ -309,6 +313,7 @@ class Skyvern(AsyncSkyvern):
             browser_address=browser_address,
             ai_fallback=ai_fallback,
             run_with=run_with,
+            request_options=request_options,
         )
         if wait_for_completion:
             async with asyncio.timeout(timeout):
@@ -344,6 +349,7 @@ class Skyvern(AsyncSkyvern):
         azure_vault_totp_secret_key: str | None = None,
         wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
+        request_options: RequestOptions | None = None,
     ) -> WorkflowRunResponse:
         workflow_run = await super().login(
             credential_type=credential_type,
@@ -366,6 +372,7 @@ class Skyvern(AsyncSkyvern):
             azure_vault_username_key=azure_vault_username_key,
             azure_vault_password_key=azure_vault_password_key,
             azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+            request_options=request_options,
         )
         if wait_for_completion:
             async with asyncio.timeout(timeout):
