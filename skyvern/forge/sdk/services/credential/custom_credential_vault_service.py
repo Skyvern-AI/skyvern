@@ -202,21 +202,6 @@ class CustomCredentialVaultService(CredentialVaultService):
             )
             raise
 
-    async def post_delete_credential_item(self, item_id: str) -> None:
-        """
-        Optional hook for scheduling background cleanup tasks after credential deletion.
-        For the custom vault service, we don't need additional cleanup since deletion
-        is synchronous via the API.
-
-        Args:
-            item_id: ID of the credential item that was deleted
-        """
-        LOG.info(
-            "Post-delete hook called for custom credential vault",
-            item_id=item_id,
-        )
-        # No additional cleanup needed for custom vault service
-
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         """
         Retrieve the full credential data from the custom vault.
