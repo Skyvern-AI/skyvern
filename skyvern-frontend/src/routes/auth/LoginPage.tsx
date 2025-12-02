@@ -9,7 +9,7 @@ import { isSupabaseEnabled } from "@/api/supabase";
 
 export function LoginPage() {
   const navigate = useNavigate();
-  const { signIn, signUp, signInWithGoogle, signInWithGithub } = useSupabaseAuth();
+  const { signIn, signUp, signInWithGoogle, signInWithGithub, signInWithKakao } = useSupabaseAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isSignUp, setIsSignUp] = useState(false);
@@ -70,6 +70,16 @@ export function LoginPage() {
     setLoading(true);
     setError(null);
     const { error } = await signInWithGithub();
+    if (error) {
+      setError(error.message);
+      setLoading(false);
+    }
+  };
+
+  const handleKakaoSignIn = async () => {
+    setLoading(true);
+    setError(null);
+    const { error } = await signInWithKakao();
     if (error) {
       setError(error.message);
       setLoading(false);
@@ -175,6 +185,19 @@ export function LoginPage() {
                 <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
               </svg>
               GitHub로 계속하기
+            </Button>
+
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full bg-[#FEE500] text-[#000000] hover:bg-[#FDD800] border-[#FEE500]"
+              onClick={handleKakaoSignIn}
+              disabled={loading}
+            >
+              <svg className="mr-2 h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 3c5.799 0 10.5 3.664 10.5 8.185 0 4.52-4.701 8.184-10.5 8.184a13.5 13.5 0 0 1-1.727-.11l-4.408 2.883c-.501.265-.678.236-.472-.413l.892-3.678c-2.88-1.46-4.785-3.99-4.785-6.866C1.5 6.665 6.201 3 12 3zm5.907 8.06l1.47-1.424a.472.472 0 0 0-.656-.678l-1.928 1.866V9.282a.472.472 0 0 0-.944 0v2.557a.471.471 0 0 0 0 .222v2.218a.472.472 0 0 0 .944 0v-1.58l.478-.46 1.576 2.248a.473.473 0 0 0 .773-.544l-1.713-2.383zM8.355 9.282a.472.472 0 0 0-.944 0v4.997a.472.472 0 0 0 .944 0V9.282zm2.403 4.814a.47.47 0 0 1-.62.242.473.473 0 0 1-.24-.62l1.538-3.677a.694.694 0 0 1 1.28 0l1.54 3.677a.473.473 0 0 1-.862.378l-.353-.845h-1.93l-.353.845zm1.31-3.125l-.644 1.54h1.287l-.643-1.54zM6.474 13.807h1.727a.472.472 0 0 1 0 .944H5.529a.472.472 0 0 1-.472-.472V9.282a.472.472 0 0 1 .944 0v4.525h.473z"/>
+              </svg>
+              카카오로 계속하기
             </Button>
           </div>
 

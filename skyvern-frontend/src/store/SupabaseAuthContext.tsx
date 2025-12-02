@@ -11,6 +11,7 @@ interface AuthContextType {
   signOut: () => Promise<void>;
   signInWithGoogle: () => Promise<{ error: Error | null }>;
   signInWithGithub: () => Promise<{ error: Error | null }>;
+  signInWithKakao: () => Promise<{ error: Error | null }>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -92,6 +93,17 @@ export function SupabaseAuthProvider({ children }: { children: ReactNode }) {
     return { error };
   };
 
+  const signInWithKakao = async () => {
+    if (!supabase) return { error: new Error("Supabase not configured") };
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "kakao",
+      options: {
+        redirectTo: window.location.origin,
+      },
+    });
+    return { error };
+  };
+
   const value = {
     user,
     session,
@@ -101,6 +113,7 @@ export function SupabaseAuthProvider({ children }: { children: ReactNode }) {
     signOut,
     signInWithGoogle,
     signInWithGithub,
+    signInWithKakao,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
