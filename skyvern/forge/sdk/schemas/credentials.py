@@ -34,6 +34,11 @@ class PasswordCredentialResponse(BaseModel):
         description="Type of 2FA method used for this credential",
         examples=[TotpType.AUTHENTICATOR],
     )
+    totp_identifier: str | None = Field(
+        default=None,
+        description="Identifier (email or phone number) used to fetch TOTP codes",
+        examples=["user@example.com", "+14155550123"],
+    )
 
 
 class CreditCardCredentialResponse(BaseModel):
@@ -57,6 +62,11 @@ class PasswordCredential(BaseModel):
         TotpType.NONE,
         description="Type of 2FA method used for this credential",
         examples=[TotpType.AUTHENTICATOR],
+    )
+    totp_identifier: str | None = Field(
+        default=None,
+        description="Identifier (email or phone number) used to fetch TOTP codes",
+        examples=["user@example.com", "+14155550123"],
     )
 
 
@@ -154,6 +164,11 @@ class Credential(BaseModel):
         TotpType.NONE,
         description="Type of 2FA method used for this credential",
         examples=[TotpType.AUTHENTICATOR],
+    )
+    totp_identifier: str | None = Field(
+        default=None,
+        description="Identifier (email or phone number) used to fetch TOTP codes",
+        examples=["user@example.com", "+14155550123"],
     )
     card_last4: str | None = Field(..., description="For credit_card credentials: the last four digits of the card")
     card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")

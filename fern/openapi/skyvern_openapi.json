@@ -1660,6 +1660,7 @@
           "Browser Profiles"
         ],
         "summary": "Create a browser profile",
+        "description": "Create a browser profile from a persistent browser session or workflow run.",
         "operationId": "create_browser_profile_v1_browser_profiles_post",
         "parameters": [
           {
@@ -1693,7 +1694,7 @@
         },
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Successfully created browser profile",
             "content": {
               "application/json": {
                 "schema": {
@@ -1701,6 +1702,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request - missing source or source not found"
+          },
+          "409": {
+            "description": "Browser profile name already exists"
           },
           "422": {
             "description": "Validation Error",
@@ -1712,7 +1719,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "create_browser_profile",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from a workflow run with persist_browser_session=True\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from a workflow run with persist_browser_session=True\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
+              }
+            ]
+          }
+        ]
       },
       "get": {
         "tags": [
@@ -1755,7 +1777,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Successfully retrieved browser profiles",
             "content": {
               "application/json": {
                 "schema": {
@@ -1778,7 +1800,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "list_browser_profiles",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_profiles = await skyvern.browser_profiles.list_browser_profiles()\nprint(browser_profiles)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst browserProfiles = await skyvern.browserProfiles.listBrowserProfiles();\nconsole.log(browserProfiles);\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/browser_profiles/{profile_id}": {
@@ -1847,7 +1884,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "get_browser_profile",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_profile = await skyvern.browser_profiles.get_browser_profile(\"bp_123\")\nprint(browser_profile)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst browserProfile = await skyvern.browserProfiles.getBrowserProfile(\"bp_123\");\nconsole.log(browserProfile);\n"
+              }
+            ]
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -1907,7 +1959,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "delete_browser_profile",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.browser_profiles.delete_browser_profile(\"bp_123\")\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.browserProfiles.deleteBrowserProfile(\"bp_123\");\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/browser_sessions": {
@@ -2674,79 +2741,6 @@
             ]
           }
         ]
-      }
-    },
-    "/v1/prompts/improve": {
-      "post": {
-        "tags": [
-          "Prompts"
-        ],
-        "summary": "Improve prompt",
-        "description": "Improve a prompt based on a specific use-case",
-        "operationId": "improve_prompt_v1_prompts_improve_post",
-        "parameters": [
-          {
-            "name": "use-case",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "The use-case for prompt improvement",
-              "title": "Use-Case"
-            },
-            "description": "The use-case for prompt improvement"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ImprovePromptRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ImprovePromptResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
       }
     },
     "/v1/run/tasks/login": {
@@ -5215,11 +5209,6 @@
             ],
             "title": "Description"
           },
-          "order": {
-            "type": "integer",
-            "minimum": 0,
-            "title": "Order"
-          },
           "is_default": {
             "type": "boolean",
             "title": "Is Default",
@@ -5227,9 +5216,6 @@
           }
         },
         "type": "object",
-        "required": [
-          "order"
-        ],
         "title": "BranchCondition",
         "description": "Represents a single conditional branch edge within a ConditionalBlock."
       },
@@ -5238,6 +5224,10 @@
           "criteria_type": {
             "type": "string",
             "title": "Criteria Type"
+          },
+          "expression": {
+            "type": "string",
+            "title": "Expression"
           },
           "description": {
             "anyOf": [
@@ -5253,7 +5243,8 @@
         },
         "type": "object",
         "required": [
-          "criteria_type"
+          "criteria_type",
+          "expression"
         ],
         "title": "BranchCriteria",
         "description": "Abstract interface describing how a branch condition should be evaluated."
@@ -5841,12 +5832,12 @@
             "title": "Disable Cache",
             "default": false
           },
-          "branches": {
+          "branch_conditions": {
             "items": {
               "$ref": "#/components/schemas/BranchCondition"
             },
             "type": "array",
-            "title": "Branches"
+            "title": "Branch Conditions"
           }
         },
         "type": "object",
@@ -5855,7 +5846,7 @@
           "output_parameter"
         ],
         "title": "ConditionalBlock",
-        "description": "Branching block that selects the next block label based on ordered conditions."
+        "description": "Branching block that selects the next block label based on list-ordered conditions."
       },
       "ContextParameter": {
         "properties": {
@@ -8617,6 +8608,67 @@
         ],
         "title": "ForLoopBlockYAML"
       },
+      "GeoTarget": {
+        "properties": {
+          "country": {
+            "type": "string",
+            "maxLength": 2,
+            "minLength": 2,
+            "title": "Country",
+            "description": "ISO 3166-1 alpha-2 country code (e.g., 'US', 'GB', 'DE')",
+            "examples": [
+              "US",
+              "GB",
+              "DE",
+              "FR"
+            ]
+          },
+          "subdivision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 10
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subdivision",
+            "description": "ISO 3166-2 subdivision code without country prefix (e.g., 'CA' for California, 'NY' for New York)",
+            "examples": [
+              "CA",
+              "NY",
+              "TX",
+              "ENG"
+            ]
+          },
+          "city": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "City",
+            "description": "City name in English from GeoNames (e.g., 'New York', 'Los Angeles', 'London')",
+            "examples": [
+              "New York",
+              "Los Angeles",
+              "London",
+              "Berlin"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "country"
+        ],
+        "title": "GeoTarget",
+        "description": "Granular geographic targeting for proxy selection.\n\nSupports country, subdivision (state/region), and city level targeting.\nUses ISO 3166-1 alpha-2 for countries, ISO 3166-2 for subdivisions,\nand GeoNames English names for cities.\n\nExamples:\n    - {\"country\": \"US\"} - United States (same as RESIDENTIAL)\n    - {\"country\": \"US\", \"subdivision\": \"CA\"} - California, US\n    - {\"country\": \"US\", \"subdivision\": \"NY\", \"city\": \"New York\"} - New York City\n    - {\"country\": \"GB\", \"city\": \"London\"} - London, UK"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -9341,66 +9393,6 @@
           "body"
         ],
         "title": "HumanInteractionBlockYAML"
-      },
-      "ImprovePromptRequest": {
-        "properties": {
-          "context": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Context",
-            "description": "Additional context about the user's needs"
-          },
-          "prompt": {
-            "type": "string",
-            "minLength": 1,
-            "title": "Prompt",
-            "description": "The original prompt to improve"
-          }
-        },
-        "type": "object",
-        "required": [
-          "prompt"
-        ],
-        "title": "ImprovePromptRequest"
-      },
-      "ImprovePromptResponse": {
-        "properties": {
-          "error": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Error",
-            "description": "Error message if prompt improvement failed"
-          },
-          "improved": {
-            "type": "string",
-            "title": "Improved",
-            "description": "The improved version of the prompt"
-          },
-          "original": {
-            "type": "string",
-            "title": "Original",
-            "description": "The original prompt provided for improvement"
-          }
-        },
-        "type": "object",
-        "required": [
-          "improved",
-          "original"
-        ],
-        "title": "ImprovePromptResponse"
       },
       "InputOrSelectContext": {
         "properties": {
@@ -10922,6 +10914,22 @@
             "examples": [
               "authenticator"
             ]
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "Identifier (email or phone number) used to fetch TOTP codes",
+            "examples": [
+              "user@example.com",
+              "+14155550123"
+            ]
           }
         },
         "type": "object",
@@ -11306,6 +11314,22 @@
             "default": "none",
             "examples": [
               "authenticator"
+            ]
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "Identifier (email or phone number) used to fetch TOTP codes",
+            "examples": [
+              "user@example.com",
+              "+14155550123"
             ]
           }
         },
@@ -12758,10 +12782,18 @@
                 "$ref": "#/components/schemas/ProxyLocation"
               },
               {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n",
+            "title": "Proxy Location",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "data_extraction_schema": {
@@ -15165,9 +15197,17 @@
                 "$ref": "#/components/schemas/ProxyLocation"
               },
               {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Proxy Location"
           },
           "webhook_callback_url": {
             "anyOf": [
@@ -15379,9 +15419,17 @@
                 "$ref": "#/components/schemas/ProxyLocation"
               },
               {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Proxy Location"
           },
           "webhook_callback_url": {
             "anyOf": [
@@ -16503,10 +16551,18 @@
                 "$ref": "#/components/schemas/ProxyLocation"
               },
               {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n",
+            "title": "Proxy Location",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "webhook_url": {

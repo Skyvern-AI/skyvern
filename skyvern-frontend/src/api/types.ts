@@ -56,7 +56,17 @@ export const ProxyLocation = {
   None: "NONE",
 } as const;
 
-export type ProxyLocation = (typeof ProxyLocation)[keyof typeof ProxyLocation];
+export type LegacyProxyLocation =
+  (typeof ProxyLocation)[keyof typeof ProxyLocation];
+
+export type GeoTarget = {
+  country: string;
+  subdivision?: string;
+  city?: string;
+  isISP?: boolean;
+};
+
+export type ProxyLocation = LegacyProxyLocation | GeoTarget | null;
 
 export type ArtifactApiResponse = {
   created_at: string;

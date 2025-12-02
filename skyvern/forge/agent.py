@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import random
@@ -124,7 +125,7 @@ from skyvern.webeye.actions.parse_actions import (
     parse_ui_tars_actions,
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
-from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -1763,43 +1764,6 @@ class ForgeAgent:
 
         return actions
 
-    async def _should_skip_screenshot_annotations(self, task: Task, draw_boxes: bool) -> bool:
-        """
-        Check PostHog feature flag to determine if screenshot annotations should be skipped.
-
-        Args:
-            task: The task being executed
-            draw_boxes: Current value indicating if boxes should be drawn
-
-        Returns:
-            bool: True if annotations should be drawn, False if they should be skipped
-        """
-        if not draw_boxes:  # Only check if we were going to draw boxes
-            return draw_boxes
-
-        try:
-            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-            skip_annotations = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "SKIP_SCREENSHOT_ANNOTATIONS",
-                distinct_id,
-                properties={"organization_id": task.organization_id},
-            )
-            if skip_annotations:
-                LOG.info(
-                    "Skipping screenshot annotations per SKIP_SCREENSHOT_ANNOTATIONS feature flag",
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-                return False
-        except Exception:
-            LOG.warning(
-                "Failed to check SKIP_SCREENSHOT_ANNOTATIONS feature flag, using default behavior",
-                task_id=task.task_id,
-                exc_info=True,
-            )
-
-        return draw_boxes
-
     async def _speculate_next_step_plan(
         self,
         task: Task,
@@ -2306,9 +2270,6 @@ class ForgeAgent:
             draw_boxes = False
             scroll = False
 
-        # Check PostHog feature flag to skip screenshot annotations
-        draw_boxes = await self._should_skip_screenshot_annotations(task, draw_boxes)
-
         return await scrape_website(
             browser_state,
             task.url,
@@ -2534,8 +2495,35 @@ class ForgeAgent:
 
         return scraped_page, extract_action_prompt, use_caching
 
+    @staticmethod
+    def _build_extract_action_cache_variant(
+        verification_code_check: bool,
+        has_magic_link_page: bool,
+        complete_criterion: str | None,
+    ) -> str:
+        """
+        Build a short-but-unique cache variant identifier so extract-action prompts that
+        differ meaningfully (OTP, magic link flows, complete criteria) do not reuse the
+        same Vertex cache object.
+        """
+        variant_parts: list[str] = []
+        if verification_code_check:
+            variant_parts.append("vc")
+        if has_magic_link_page:
+            variant_parts.append("ml")
+        if complete_criterion:
+            normalized = " ".join(complete_criterion.split())
+            digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:6]
+            variant_parts.append(f"cc{digest}")
+        return "-".join(variant_parts) if variant_parts else "std"
+
     async def _create_vertex_cache_for_task(
-        self, task: Task, static_prompt: str, context: SkyvernContext, llm_key_override: str | None
+        self,
+        task: Task,
+        static_prompt: str,
+        context: SkyvernContext,
+        llm_key_override: str | None,
+        prompt_variant: str | None = None,
     ) -> None:
         """
         Create a Vertex AI cache for the task's static prompt.
@@ -2546,9 +2534,9 @@ class ForgeAgent:
             task: The task to create cache for
             static_prompt: The static prompt content to cache
             context: The Skyvern context to store the cache name in
+            llm_key_override: Optional override when we explicitly pick an LLM key
+            prompt_variant: Cache variant identifier (std/vc/ml/etc.)
         """
-        # Early return if task doesn't have an llm_key
-        # This should not happen given the guard at the call site, but being defensive
         resolved_llm_key = llm_key_override or task.llm_key
 
         if not resolved_llm_key:
@@ -2558,17 +2546,20 @@ class ForgeAgent:
             )
             return
 
+        cache_variant = prompt_variant or "std"
+
         try:
             LOG.info(
                 "Attempting Vertex AI cache creation",
                 task_id=task.task_id,
                 llm_key=resolved_llm_key,
+                cache_variant=cache_variant,
             )
             cache_manager = get_cache_manager()
 
-            # Use llm_key as cache_key so all tasks with the same model share the same cache
-            # This maximizes cache reuse and reduces cache storage costs
-            cache_key = f"{EXTRACT_ACTION_CACHE_KEY_PREFIX}-{resolved_llm_key}"
+            variant_suffix = f"-{cache_variant}" if cache_variant else ""
+
+            cache_key = f"{EXTRACT_ACTION_CACHE_KEY_PREFIX}{variant_suffix}-{resolved_llm_key}"
 
             # Get the actual model name from LLM config to ensure correct format
             # (e.g., "gemini-2.5-flash" with decimal, not "gemini-2-5-flash")
@@ -2632,8 +2623,10 @@ class ForgeAgent:
                 ttl_seconds=3600,  # 1 hour
             )
 
-            # Store cache resource name in context
+            # Store cache metadata in context
             context.vertex_cache_name = cache_data["name"]
+            context.vertex_cache_key = cache_key
+            context.vertex_cache_variant = cache_variant
 
             LOG.info(
                 "Created Vertex AI cache for task",
@@ -2641,6 +2634,7 @@ class ForgeAgent:
                 cache_key=cache_key,
                 cache_name=cache_data["name"],
                 model_name=model_name,
+                cache_variant=cache_variant,
             )
         except Exception as e:
             LOG.warning(
@@ -2720,7 +2714,7 @@ class ForgeAgent:
 
         # Check if prompt caching is enabled for extract-action
         use_caching = False
-        prompt_caching_settings = LLMAPIHandlerFactory._prompt_caching_settings or {}
+        prompt_caching_settings = await self._get_prompt_caching_settings(context)
         effective_llm_key = task.llm_key
         if not effective_llm_key:
             handler_for_key = LLMAPIHandlerFactory.get_override_llm_api_handler(
@@ -2768,6 +2762,11 @@ class ForgeAgent:
                     "parse_select_feature_enabled": context.enable_parse_select_in_extract,
                     "has_magic_link_page": context.has_magic_link_page(task.task_id),
                 }
+                cache_variant = self._build_extract_action_cache_variant(
+                    verification_code_check=verification_code_check,
+                    has_magic_link_page=context.has_magic_link_page(task.task_id),
+                    complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
                     f"{template}-dynamic",
@@ -2785,7 +2784,13 @@ class ForgeAgent:
 
                 # Create Vertex AI cache for Gemini models
                 if effective_llm_key and "GEMINI" in effective_llm_key:
-                    await self._create_vertex_cache_for_task(task, static_prompt, context, effective_llm_key)
+                    await self._create_vertex_cache_for_task(
+                        task,
+                        static_prompt,
+                        context,
+                        effective_llm_key,
+                        prompt_variant=cache_variant,
+                    )
 
                 combined_prompt = f"{static_prompt.rstrip()}\n\n{dynamic_prompt.lstrip()}"
 
@@ -2793,6 +2798,7 @@ class ForgeAgent:
                     "Using cached prompt",
                     task_id=task.task_id,
                     prompt_name=EXTRACT_ACTION_PROMPT_NAME,
+                    cache_variant=cache_variant,
                 )
                 return combined_prompt, use_caching
 
@@ -2821,6 +2827,55 @@ class ForgeAgent:
         )
 
         return full_prompt, use_caching
+
+    async def _get_prompt_caching_settings(self, context: SkyvernContext) -> dict[str, bool]:
+        """
+        Resolve prompt caching settings for the current run.
+
+        We prefer explicit overrides via LLMAPIHandlerFactory.set_prompt_caching_settings(), which
+        are mostly used by scripts/tests. When no override exists, evaluate the PostHog experiment
+        once per context and cache the result on the context to avoid repeated lookups.
+        """
+        if LLMAPIHandlerFactory._prompt_caching_settings is not None:
+            return LLMAPIHandlerFactory._prompt_caching_settings
+
+        if context.prompt_caching_settings is not None:
+            return context.prompt_caching_settings
+
+        distinct_id = context.run_id or context.workflow_run_id or context.task_id
+        organization_id = context.organization_id
+        context.prompt_caching_settings = {}
+
+        if not distinct_id or not organization_id:
+            return context.prompt_caching_settings
+
+        try:
+            enabled = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "PROMPT_CACHING_OPTIMIZATION",
+                distinct_id,
+                properties={"organization_id": organization_id},
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Failed to evaluate prompt caching experiment; defaulting to disabled",
+                distinct_id=distinct_id,
+                organization_id=organization_id,
+                error=str(exc),
+            )
+            return context.prompt_caching_settings
+
+        if enabled:
+            context.prompt_caching_settings = {
+                EXTRACT_ACTION_PROMPT_NAME: True,
+                EXTRACT_ACTION_TEMPLATE: True,
+            }
+            LOG.info(
+                "Prompt caching optimization enabled",
+                distinct_id=distinct_id,
+                organization_id=organization_id,
+            )
+
+        return context.prompt_caching_settings
 
     def _should_process_totp(self, scraped_page: ScrapedPage | None) -> bool:
         """Detect TOTP pages by checking for multiple input fields or verification keywords."""
@@ -3259,16 +3314,31 @@ class ForgeAgent:
         if screenshot_artifact:
             screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
 
-        first_step = await app.DATABASE.get_first_step(task_id=task.task_id, organization_id=task.organization_id)
-        if first_step:
-            recording_artifact = await app.DATABASE.get_artifact(
-                task_id=task.task_id,
-                step_id=first_step.step_id,
-                artifact_type=ArtifactType.RECORDING,
-                organization_id=task.organization_id,
-            )
-            if recording_artifact:
-                recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+        # Get recording url from browser session first,
+        # if not found, get the recording url from the first step
+        if task.browser_session_id:
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
+                        organization_id=task.organization_id,
+                        browser_session_id=task.browser_session_id,
+                    )
+                    # FIXME: we only support one recording for now
+                    recording_url = recordings[0].url if recordings else None
+            except asyncio.TimeoutError:
+                LOG.warning("Timeout getting recordings", browser_session_id=task.browser_session_id)
+
+        if recording_url is None:
+            first_step = await app.DATABASE.get_first_step(task_id=task.task_id, organization_id=task.organization_id)
+            if first_step:
+                recording_artifact = await app.DATABASE.get_artifact(
+                    task_id=task.task_id,
+                    step_id=first_step.step_id,
+                    artifact_type=ArtifactType.RECORDING,
+                    organization_id=task.organization_id,
+                )
+                if recording_artifact:
+                    recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
         latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
@@ -3481,6 +3551,7 @@ class ForgeAgent:
                 queued_seconds=queued_seconds,
                 task_status=status,
                 organization_id=task.organization_id,
+                failure_reason=failure_reason,
             )
 
         await save_task_logs(task.task_id)

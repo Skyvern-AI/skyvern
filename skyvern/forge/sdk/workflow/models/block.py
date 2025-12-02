@@ -49,7 +49,6 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.azure import AsyncAzureStorageClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -58,10 +57,12 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
@@ -92,7 +93,7 @@ from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileS
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
-from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -587,19 +588,22 @@ class BaseTaskBlock(Block):
                 )
                 self.url = task_url_parameter_value
 
-        if (
-            self.totp_identifier
-            and workflow_run_context.has_parameter(self.totp_identifier)
-            and workflow_run_context.has_value(self.totp_identifier)
-        ):
-            totp_identifier_parameter_value = workflow_run_context.get_value(self.totp_identifier)
-            if totp_identifier_parameter_value:
-                LOG.info(
-                    "TOTP identifier is parameterized, using parameter value",
-                    totp_identifier_parameter_value=totp_identifier_parameter_value,
-                    totp_identifier_parameter_key=self.totp_identifier,
-                )
-                self.totp_identifier = totp_identifier_parameter_value
+        if self.totp_identifier:
+            if workflow_run_context.has_parameter(self.totp_identifier) and workflow_run_context.has_value(
+                self.totp_identifier
+            ):
+                totp_identifier_parameter_value = workflow_run_context.get_value(self.totp_identifier)
+                if totp_identifier_parameter_value:
+                    self.totp_identifier = totp_identifier_parameter_value
+        else:
+            for parameter in self.get_all_parameters(workflow_run_id):
+                parameter_key = getattr(parameter, "key", None)
+                if not parameter_key:
+                    continue
+                credential_totp_identifier = workflow_run_context.get_credential_totp_identifier(parameter_key)
+                if credential_totp_identifier:
+                    self.totp_identifier = credential_totp_identifier
+                    break
 
         if self.download_suffix and workflow_run_context.has_parameter(self.download_suffix):
             download_suffix_parameter_value = workflow_run_context.get_value(self.download_suffix)
@@ -1823,9 +1827,16 @@ class TextPromptBlock(Block):
             )
         self.prompt = self.format_block_parameter_template_from_workflow_run_context(self.prompt, workflow_run_context)
 
-    async def send_prompt(self, prompt: str, parameter_values: dict[str, Any]) -> dict[str, Any]:
+    async def send_prompt(
+        self,
+        prompt: str,
+        parameter_values: dict[str, Any],
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> dict[str, Any]:
+        default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key or self.llm_key, default=app.LLM_API_HANDLER
+            self.override_llm_key or self.llm_key, default=default_llm_handler
         )
         if not self.json_schema:
             self.json_schema = {
@@ -1854,6 +1865,22 @@ class TextPromptBlock(Block):
         response = await llm_api_handler(prompt=prompt, prompt_name="text-prompt")
         LOG.info("TextPromptBlock: Received response from LLM", response=response)
         return response
+
+    async def _resolve_default_llm_handler(self, workflow_run_id: str, organization_id: str | None) -> LLMAPIHandler:
+        prompt_config_handler = await get_llm_handler_for_prompt_type("text-prompt", workflow_run_id, organization_id)
+        if prompt_config_handler:
+            return prompt_config_handler
+
+        secondary_handler = app.SECONDARY_LLM_API_HANDLER
+        if secondary_handler:
+            return secondary_handler
+
+        LOG.warning(
+            "Secondary LLM handler not configured; falling back to primary handler for TextPromptBlock",
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        return app.LLM_API_HANDLER
 
     async def execute(
         self,
@@ -1898,7 +1925,7 @@ class TextPromptBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
-        response = await self.send_prompt(self.prompt, parameter_values)
+        response = await self.send_prompt(self.prompt, parameter_values, workflow_run_id, organization_id)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
         return await self.build_block_result(
             success=True,
@@ -2322,7 +2349,7 @@ class FileUploadBlock(Block):
                 if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
                     raise AzureConfigurationError("Azure Storage is not configured")
 
-                azure_client = AsyncAzureStorageClient(
+                azure_client = app.AZURE_CLIENT_FACTORY.create_storage_client(
                     storage_account_name=actual_azure_storage_account_name,
                     storage_account_key=actual_azure_storage_account_key,
                 )
@@ -3820,19 +3847,81 @@ class HttpRequestBlock(Block):
             )
 
 
-class BranchEvaluationContext(BaseModel):
+class BranchEvaluationContext:
     """Collection of runtime data that BranchCriteria evaluators can consume."""
 
-    workflow_parameters: dict[str, Any] = Field(default_factory=dict)
-    block_outputs: dict[str, Any] = Field(default_factory=dict)
-    environment: dict[str, Any] | None = None
-    llm_results: dict[str, Any] | None = None
+    def __init__(
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext | None = None,
+        block_label: str | None = None,
+    ) -> None:
+        self.workflow_run_context = workflow_run_context
+        self.block_label = block_label
+
+    def build_template_data(self) -> dict[str, Any]:
+        """Build Jinja template data mirroring block parameter rendering context."""
+        if self.workflow_run_context is None:
+            return {
+                "params": {},
+                "outputs": {},
+                "environment": {},
+                "env": {},
+                "llm": {},
+            }
+
+        ctx = self.workflow_run_context
+        template_data = ctx.values.copy()
+        if ctx.include_secrets_in_templates:
+            template_data.update(ctx.secrets)
+
+            credential_params: list[tuple[str, dict[str, Any]]] = []
+            for key, value in template_data.items():
+                if isinstance(value, dict) and "context" in value and "username" in value and "password" in value:
+                    credential_params.append((key, value))
+
+            for key, value in credential_params:
+                username_secret_id = value.get("username", "")
+                password_secret_id = value.get("password", "")
+                real_username = template_data.get(username_secret_id, "")
+                real_password = template_data.get(password_secret_id, "")
+                template_data[f"{key}_real_username"] = real_username
+                template_data[f"{key}_real_password"] = real_password
+
+        if self.block_label:
+            block_reference_data: dict[str, Any] = ctx.get_block_metadata(self.block_label)
+            if self.block_label in template_data:
+                current_value = template_data[self.block_label]
+                if isinstance(current_value, dict):
+                    block_reference_data.update(current_value)
+            template_data[self.block_label] = block_reference_data
+
+            if "current_index" in block_reference_data:
+                template_data["current_index"] = block_reference_data["current_index"]
+            if "current_item" in block_reference_data:
+                template_data["current_item"] = block_reference_data["current_item"]
+            if "current_value" in block_reference_data:
+                template_data["current_value"] = block_reference_data["current_value"]
+
+        template_data.setdefault("workflow_title", ctx.workflow_title)
+        template_data.setdefault("workflow_id", ctx.workflow_id)
+        template_data.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
+        template_data.setdefault("workflow_run_id", ctx.workflow_run_id)
+
+        template_data.setdefault("params", template_data.get("params", {}))
+        template_data.setdefault("outputs", template_data.get("outputs", {}))
+        template_data.setdefault("environment", template_data.get("environment", {}))
+        template_data.setdefault("env", template_data.get("environment"))
+        template_data.setdefault("llm", template_data.get("llm", {}))
+
+        return template_data
 
 
 class BranchCriteria(BaseModel, abc.ABC):
     """Abstract interface describing how a branch condition should be evaluated."""
 
     criteria_type: str
+    expression: str
     description: str | None = None
 
     @abc.abstractmethod
@@ -3845,47 +3934,77 @@ class BranchCriteria(BaseModel, abc.ABC):
         return False
 
 
+class JinjaBranchCriteria(BranchCriteria):
+    """Jinja2-templated branch criteria (only supported criteria type for now)."""
+
+    criteria_type: Literal["jinja2_template"] = "jinja2_template"
+
+    async def evaluate(self, context: BranchEvaluationContext) -> bool:
+        # Build the template context explicitly to avoid surprises in templates.
+        template_data = context.build_template_data()
+
+        try:
+            template = jinja_sandbox_env.from_string(self.expression)
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(
+                template=self.expression,
+                msg=str(exc),
+            ) from exc
+
+        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+            if missing := get_missing_variables(self.expression, template_data):
+                raise MissingJinjaVariables(template=self.expression, variables=missing)
+
+        try:
+            rendered = template.render(template_data)
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(
+                template=self.expression,
+                msg=str(exc),
+            ) from exc
+
+        return bool(rendered)
+
+
 class BranchCondition(BaseModel):
     """Represents a single conditional branch edge within a ConditionalBlock."""
 
     criteria: BranchCriteria | None = None
     next_block_label: str | None = None
     description: str | None = None
-    order: int = Field(ge=0)
     is_default: bool = False
 
     @model_validator(mode="after")
     def validate_condition(cls, condition: BranchCondition) -> BranchCondition:
+        if isinstance(condition.criteria, dict):
+            condition.criteria = JinjaBranchCriteria(**condition.criteria)
         if condition.criteria is None and not condition.is_default:
             raise ValueError("Branches without criteria must be marked as default.")
+        if condition.criteria is not None and not isinstance(condition.criteria, JinjaBranchCriteria):
+            raise ValueError("Only Jinja2 branch criteria are supported in this version.")
         if condition.criteria is not None and condition.is_default:
             raise ValueError("Default branches may not define criteria.")
         return condition
 
 
 class ConditionalBlock(Block):
-    """Branching block that selects the next block label based on ordered conditions."""
+    """Branching block that selects the next block label based on list-ordered conditions."""
 
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.CONDITIONAL] = BlockType.CONDITIONAL  # type: ignore
 
-    branches: list[BranchCondition] = Field(default_factory=list)
+    branch_conditions: list[BranchCondition] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_branches(cls, block: ConditionalBlock) -> ConditionalBlock:
-        if not block.branches:
+        if not block.branch_conditions:
             raise ValueError("Conditional blocks require at least one branch.")
 
-        orders = [branch.order for branch in block.branches]
-        if len(orders) != len(set(orders)):
-            raise ValueError("Branch order must be unique within a conditional block.")
-
-        default_branches = [branch for branch in block.branches if branch.is_default]
+        default_branches = [branch for branch in block.branch_conditions if branch.is_default]
         if len(default_branches) > 1:
             raise ValueError("Only one default branch is permitted per conditional block.")
 
-        block.branches = sorted(block.branches, key=lambda branch: branch.order)
         return block
 
     def get_all_parameters(
@@ -3913,12 +4032,12 @@ class ConditionalBlock(Block):
 
     @property
     def ordered_branches(self) -> list[BranchCondition]:
-        """Convenience accessor that returns branches sorted by order."""
-        return list(self.branches)
+        """Convenience accessor that returns branches in author-specified list order."""
+        return list(self.branch_conditions)
 
     def get_default_branch(self) -> BranchCondition | None:
         """Return the default/else branch when configured."""
-        return next((branch for branch in self.branches if branch.is_default), None)
+        return next((branch for branch in self.branch_conditions if branch.is_default), None)
 
 
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
