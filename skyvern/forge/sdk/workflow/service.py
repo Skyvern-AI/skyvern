@@ -2220,13 +2220,28 @@ class WorkflowService:
             screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(screenshot_artifacts)
 
         recording_url = None
-        recording_artifact = await app.DATABASE.get_artifact_for_run(
-            run_id=task_v2.observer_cruise_id if task_v2 else workflow_run_id,
-            artifact_type=ArtifactType.RECORDING,
-            organization_id=organization_id,
-        )
-        if recording_artifact:
-            recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+        # Get recording url from browser session first,
+        # if not found, get the recording url from the artifacts
+        if workflow_run.browser_session_id:
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
+                        organization_id=workflow_run.organization_id,
+                        browser_session_id=workflow_run.browser_session_id,
+                    )
+                    # FIXME: we only support one recording for now
+                    recording_url = recordings[0].url if recordings else None
+            except asyncio.TimeoutError:
+                LOG.warning("Timeout getting recordings", browser_session_id=workflow_run.browser_session_id)
+
+        if recording_url is None:
+            recording_artifact = await app.DATABASE.get_artifact_for_run(
+                run_id=task_v2.observer_cruise_id if task_v2 else workflow_run_id,
+                artifact_type=ArtifactType.RECORDING,
+                organization_id=organization_id,
+            )
+            if recording_artifact:
+                recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         downloaded_files: list[FileInfo] = []
         downloaded_file_urls: list[str] | None = None
