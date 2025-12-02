@@ -141,7 +141,7 @@ class CustomCredentialAPIClient:
             )
 
             if not response:
-                raise HttpException(500, f"Empty response from custom credential API: {url}")
+                raise HttpException(500, url, "Empty response from custom credential API")
 
             # Extract credential ID from response
             credential_id = response.get("id")
@@ -151,7 +151,7 @@ class CustomCredentialAPIClient:
                     url=url,
                     response=response,
                 )
-                raise HttpException(500, "Invalid response format from custom credential API")
+                raise HttpException(500, url, "Invalid response format from custom credential API")
 
             LOG.info(
                 "Successfully created credential via custom API",
@@ -172,7 +172,7 @@ class CustomCredentialAPIClient:
                 error=str(e),
                 exc_info=True,
             )
-            raise HttpException(500, f"Failed to create credential via custom API: {e!s}") from e
+            raise HttpException(500, url, f"Failed to create credential via custom API: {e!s}") from e
 
     async def get_credential(self, credential_id: str, name: str) -> CredentialItem:
         """
@@ -205,7 +205,7 @@ class CustomCredentialAPIClient:
             )
 
             if not response:
-                raise HttpException(404, f"Credential not found in custom API: {credential_id}")
+                raise HttpException(404, url, f"Credential not found: {credential_id}")
 
             LOG.info(
                 "Successfully retrieved credential via custom API",
@@ -225,7 +225,7 @@ class CustomCredentialAPIClient:
                 error=str(e),
                 exc_info=True,
             )
-            raise HttpException(500, f"Failed to retrieve credential via custom API: {e!s}") from e
+            raise HttpException(500, url, f"Failed to retrieve credential via custom API: {e!s}") from e
 
     async def delete_credential(self, credential_id: str) -> None:
         """
@@ -269,4 +269,4 @@ class CustomCredentialAPIClient:
                 error=str(e),
                 exc_info=True,
             )
-            raise HttpException(500, f"Failed to delete credential via custom API: {e!s}") from e
+            raise HttpException(500, url, f"Failed to delete credential via custom API: {e!s}") from e
