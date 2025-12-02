@@ -2798,13 +2798,18 @@ class WorkflowService:
         )
         new_workflow_id: str | None = None
 
+        if workflow_permanent_id:
+            # Would return 404: WorkflowNotFound to the client if wpid does not match the organization
+            existing_latest_workflow = await self.get_workflow_by_permanent_id(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                exclude_deleted=False,
+            )
+        else:
+            existing_latest_workflow = None
+
         try:
-            if workflow_permanent_id:
-                existing_latest_workflow = await self.get_workflow_by_permanent_id(
-                    workflow_permanent_id=workflow_permanent_id,
-                    organization_id=organization_id,
-                    exclude_deleted=False,
-                )
+            if existing_latest_workflow:
                 existing_version = existing_latest_workflow.version
 
                 # NOTE: it's only potential, as it may be immediately deleted!
@@ -2821,7 +2826,7 @@ class WorkflowService:
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,
-                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
