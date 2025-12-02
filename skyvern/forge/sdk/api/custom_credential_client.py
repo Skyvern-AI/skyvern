@@ -1,14 +1,14 @@
-import structlog
 from typing import Any
+
+import structlog
 
 from skyvern.exceptions import HttpException
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
 from skyvern.forge.sdk.schemas.credentials import (
-    CreateCredentialRequest,
-    CreditCardCredential,
-    PasswordCredential,
     CredentialItem,
     CredentialType,
+    CreditCardCredential,
+    PasswordCredential,
 )
 
 LOG = structlog.get_logger()
