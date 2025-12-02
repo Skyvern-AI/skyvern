@@ -78,7 +78,8 @@ export function GeoTargetSelector({
     return (
       value.country === itemValue.country &&
       value.subdivision === itemValue.subdivision &&
-      value.city === itemValue.city
+      value.city === itemValue.city &&
+      Boolean(value.isISP) === Boolean(itemValue.isISP)
     );
   };
 
