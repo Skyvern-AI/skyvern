@@ -425,24 +425,49 @@ class Skyvern(AsyncSkyvern):
         browser_session = await self.get_browser_session(browser_session_id)
         return await self._connect_to_cloud_browser_session(browser_session)
 
-    async def launch_cloud_browser(self) -> SkyvernBrowser:
+    async def launch_cloud_browser(
+        self,
+        *,
+        timeout: int | None = None,
+        proxy_location: ProxyLocation | None = None,
+    ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
 
         This creates a new browser session in Skyvern's cloud infrastructure and connects to it.
+
+        Args:
+            timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
+                Must be between 5 and 1440. Defaults to 60.
+            proxy_location: Geographic proxy location to route the browser traffic through.
+                This is only available in Skyvern Cloud.
 
         Returns:
             SkyvernBrowser: A browser instance connected to the new cloud session.
         """
         self._ensure_cloud_environment()
-        browser_session = await self.create_browser_session()
+        browser_session = await self.create_browser_session(
+            timeout=timeout,
+            proxy_location=proxy_location,
+        )
         return await self._connect_to_cloud_browser_session(browser_session)
 
-    async def use_cloud_browser(self) -> SkyvernBrowser:
+    async def use_cloud_browser(
+        self,
+        *,
+        timeout: int | None = None,
+        proxy_location: ProxyLocation | None = None,
+    ) -> SkyvernBrowser:
         """Get or create a cloud browser session.
 
         This method attempts to reuse the most recent available cloud browser session.
         If no session exists, it creates a new one. This is useful for cost efficiency
         and session persistence.
+
+        Args:
+            timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
+                Must be between 5 and 1440. Defaults to 60. Only used when creating a new session.
+            proxy_location: Geographic proxy location to route the browser traffic through.
+                This is only available in Skyvern Cloud. Only used when creating a new session.
 
         Returns:
             SkyvernBrowser: A browser instance connected to an existing or new cloud session.
@@ -453,7 +478,10 @@ class Skyvern(AsyncSkyvern):
             (s for s in browser_sessions if s.runnable_id is None), key=lambda s: s.started_at, default=None
         )
         if browser_session is None:
-            browser_session = await self.create_browser_session()
+            browser_session = await self.create_browser_session(
+                timeout=timeout,
+                proxy_location=proxy_location,
+            )
         return await self._connect_to_cloud_browser_session(browser_session)
 
     def _ensure_cloud_environment(self) -> None:
