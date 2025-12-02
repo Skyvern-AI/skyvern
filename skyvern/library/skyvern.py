@@ -9,6 +9,7 @@ from playwright.async_api import Playwright, async_playwright
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
+from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
 from skyvern.library.embedded_server_factory import create_embedded_server
 from skyvern.library.skyvern_browser import SkyvernBrowser
@@ -106,15 +107,55 @@ class Skyvern(AsyncSkyvern):
     def __init__(
         self,
         *,
-        openai_api_key: str | None = None,
+        llm_config: LLMRouterConfig | LLMConfig | None = None,
+        settings: dict[str, Any] | None = None,
     ) -> None:
         """Embedded mode: Run Skyvern locally in-process.
 
-        To use this mode, run `skyvern quickstart` first.
+        Prerequisites:
+            Run `skyvern quickstart` first to set up your local environment and create a .env file.
 
         Args:
-            openai_api_key: Optional OpenAI API key override for LLM operations.
-                If not provided, the one from the .env file will be used.
+            llm_config: Optional custom LLM configuration (LLMConfig or LLMRouterConfig).
+                If provided, this will be registered as "CUSTOM_LLM" and used as the primary LLM,
+                overriding the LLM_KEY setting from your .env file.
+                If not provided, uses the LLM configured via LLM_KEY in your .env file.
+
+                Example 1 - Using environment variables (recommended):
+                    ```python
+                    from skyvern import Skyvern
+                    from skyvern.forge.sdk.api.llm.models import LLMConfig
+
+                    # Assumes OPENAI_API_KEY is set in your environment
+                    llm_config = LLMConfig(
+                        model_name="gpt-4o",
+                        required_env_vars=["OPENAI_API_KEY"],
+                        supports_vision=True,
+                        add_assistant_prefix=False,
+                    )
+                    skyvern = Skyvern(llm_config=llm_config)
+                    ```
+
+                Example 2 - Explicitly providing credentials:
+                    ```python
+                    from skyvern import Skyvern
+                    from skyvern.forge.sdk.api.llm.models import LLMConfig, LiteLLMParams
+
+                    llm_config = LLMConfig(
+                        model_name="gpt-4o",
+                        required_env_vars=[],  # No env vars required
+                        supports_vision=True,
+                        add_assistant_prefix=False,
+                        litellm_params=LiteLLMParams(
+                            api_base="https://api.openai.com/v1",
+                            api_key="sk-...",  # Your API key
+                        ),
+                    )
+                    skyvern = Skyvern(llm_config=llm_config)
+                    ```
+            settings: Optional dictionary of Skyvern settings to override.
+                These override the corresponding settings from your .env file.
+                Example: {"MAX_STEPS_PER_RUN": 100, "BROWSER_TYPE": "chromium-headful"}
         """
         ...
 
@@ -122,12 +163,13 @@ class Skyvern(AsyncSkyvern):
         self,
         *,
         environment: SkyvernEnvironment | None = None,
-        openai_api_key: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         timeout: float | None = None,
         follow_redirects: bool | None = True,
         httpx_client: httpx.AsyncClient | None = None,
+        llm_config: LLMRouterConfig | LLMConfig | None = None,
+        settings: dict[str, Any] | None = None,
     ):
         if environment is None:
             if httpx_client is not None:
@@ -147,7 +189,8 @@ class Skyvern(AsyncSkyvern):
                 timeout=timeout,
                 follow_redirects=follow_redirects,
                 httpx_client=create_embedded_server(
-                    openai_api_key=openai_api_key,
+                    llm_config=llm_config,
+                    settings_overrides=settings,
                 ),
             )
         else:
