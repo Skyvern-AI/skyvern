@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge import app
+from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
@@ -1100,7 +1101,11 @@ class LLMCaller:
         self.openai_client = None
         if self.llm_key.startswith("openrouter/"):
             self.llm_key = self.llm_key.replace("openrouter/", "")
-            self.openai_client = AsyncOpenAI(api_key=settings.OPENROUTER_API_KEY, base_url=settings.OPENROUTER_API_BASE)
+            self.openai_client = AsyncOpenAI(
+                api_key=settings.OPENROUTER_API_KEY,
+                base_url=settings.OPENROUTER_API_BASE,
+                http_client=ForgeAsyncHttpxClientWrapper(),
+            )
 
     def add_tool_result(self, tool_result: dict[str, Any]) -> None:
         self.current_tool_results.append(tool_result)
@@ -1513,7 +1518,8 @@ class LLMCaller:
         if isinstance(response, UITarsResponse):
             ui_tars_usage = response.usage
             return LLMCallStats(
-                llm_cost=0,  # TODO: calculate the cost according to the price: https://www.volcengine.com/docs/82379/1544106
+                llm_cost=0,
+                # TODO: calculate the cost according to the price: https://www.volcengine.com/docs/82379/1544106
                 input_tokens=ui_tars_usage.get("prompt_tokens", 0),
                 output_tokens=ui_tars_usage.get("completion_tokens", 0),
                 cached_tokens=0,  # only part of model support cached tokens
