@@ -2338,7 +2338,8 @@ async def chain_click(
                     locator=locator,
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_attr_id():
-                    await bound_locator.click(timeout=timeout)
+                    # click on (0, 0) to avoid playwright clicking on the wrong element by accident
+                    await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -2354,7 +2355,8 @@ async def chain_click(
                     locator=locator,
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_direct_parent():
-                    await bound_locator.click(timeout=timeout)
+                    # click on (0, 0) to avoid playwright clicking on the wrong element by accident
+                    await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
