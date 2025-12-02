@@ -1,4 +1,4 @@
-import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { CodeEditor } from "../components/CodeEditor";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { useActiveWorkflowRunItem } from "./useActiveWorkflowRunItem";
@@ -18,7 +18,7 @@ function WorkflowPostRunParameters() {
     useWorkflowRunTimelineQuery();
   const [activeItem] = useActiveWorkflowRunItem();
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+    useWorkflowRunWithWorkflowQuery();
   const parameters = workflowRun?.parameters ?? {};
 
   if (workflowRunIsLoading || workflowRunTimelineIsLoading) {

@@ -2,7 +2,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from skyvern.core.script_generations.skyvern_page import RunContext, SkyvernPage, script_run_context_manager
+from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage, script_run_context_manager
+from skyvern.core.script_generations.skyvern_page import RunContext, SkyvernPage
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
@@ -27,7 +28,7 @@ async def setup(
                 if parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                     parameters[key] = workflow_run_context.values[key]
         context.script_run_parameters.update(parameters)
-    skyvern_page = await SkyvernPage.create(browser_session_id=browser_session_id)
+    skyvern_page = await ScriptSkyvernPage.create(browser_session_id=browser_session_id)
     run_context = RunContext(
         parameters=parameters,
         page=skyvern_page,

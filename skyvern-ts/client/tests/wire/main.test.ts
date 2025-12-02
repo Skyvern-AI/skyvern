@@ -26,6 +26,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
@@ -90,6 +91,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
@@ -197,6 +199,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
@@ -211,6 +214,7 @@ describe("SkyvernClient", () => {
                 totp_url: "totp_url",
                 totp_identifier: "totp_identifier",
                 browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
                 extra_http_headers: { key: "value" },
                 browser_address: "browser_address",
@@ -261,6 +265,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
@@ -283,6 +288,7 @@ describe("SkyvernClient", () => {
                 totp_url: "totp_url",
                 totp_identifier: "totp_identifier",
                 browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
                 extra_http_headers: {
                     key: "value",
@@ -362,6 +368,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
@@ -414,6 +421,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
@@ -568,6 +576,8 @@ describe("SkyvernClient", () => {
                 cache_key: "cache_key",
                 run_sequentially: true,
                 sequential_key: "sequential_key",
+                folder_id: "folder_id",
+                import_error: "import_error",
                 created_at: "2024-01-15T09:30:00Z",
                 modified_at: "2024-01-15T09:30:00Z",
                 deleted_at: "2024-01-15T09:30:00Z",
@@ -582,6 +592,7 @@ describe("SkyvernClient", () => {
             only_workflows: true,
             search_key: "search_key",
             title: "title",
+            folder_id: "folder_id",
             template: true,
         });
         expect(response).toEqual([
@@ -637,6 +648,8 @@ describe("SkyvernClient", () => {
                 cache_key: "cache_key",
                 run_sequentially: true,
                 sequential_key: "sequential_key",
+                folder_id: "folder_id",
+                import_error: "import_error",
                 created_at: "2024-01-15T09:30:00Z",
                 modified_at: "2024-01-15T09:30:00Z",
                 deleted_at: "2024-01-15T09:30:00Z",
@@ -708,6 +721,8 @@ describe("SkyvernClient", () => {
             cache_key: "cache_key",
             run_sequentially: true,
             sequential_key: "sequential_key",
+            folder_id: "folder_id",
+            import_error: "import_error",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -721,7 +736,10 @@ describe("SkyvernClient", () => {
             .jsonBody(rawResponseBody)
             .build();
 
-        const response = await client.createWorkflow({});
+        const response = await client.createWorkflow({
+            folder_id: "folder_id",
+            body: {},
+        });
         expect(response).toEqual({
             workflow_id: "workflow_id",
             organization_id: "organization_id",
@@ -774,6 +792,8 @@ describe("SkyvernClient", () => {
             cache_key: "cache_key",
             run_sequentially: true,
             sequential_key: "sequential_key",
+            folder_id: "folder_id",
+            import_error: "import_error",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -795,7 +815,9 @@ describe("SkyvernClient", () => {
             .build();
 
         await expect(async () => {
-            return await client.createWorkflow({});
+            return await client.createWorkflow({
+                body: {},
+            });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
@@ -851,6 +873,8 @@ describe("SkyvernClient", () => {
             cache_key: "cache_key",
             run_sequentially: true,
             sequential_key: "sequential_key",
+            folder_id: "folder_id",
+            import_error: "import_error",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -917,6 +941,8 @@ describe("SkyvernClient", () => {
             cache_key: "cache_key",
             run_sequentially: true,
             sequential_key: "sequential_key",
+            folder_id: "folder_id",
+            import_error: "import_error",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -2057,6 +2083,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
@@ -2071,6 +2098,7 @@ describe("SkyvernClient", () => {
                 totp_url: "totp_url",
                 totp_identifier: "totp_identifier",
                 browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
                 extra_http_headers: { key: "value" },
                 browser_address: "browser_address",
@@ -2114,6 +2142,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
@@ -2136,6 +2165,7 @@ describe("SkyvernClient", () => {
                 totp_url: "totp_url",
                 totp_identifier: "totp_identifier",
                 browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
                 extra_http_headers: {
                     key: "value",
@@ -2433,12 +2463,11 @@ describe("SkyvernClient", () => {
     test("run_sdk_action (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { url: "url", action: { type: "ai_click" } };
-        const rawResponseBody = { workflow_run_id: "workflow_run_id", result: "result" };
+        const rawRequestBody = { url: "url", action: { type: "ai_act" } };
+        const rawResponseBody = { workflow_run_id: "workflow_run_id", result: { key: "value" } };
         server
             .mockEndpoint()
             .post("/v1/sdk/run_action")
-            .header("x-user-agent", "x-user-agent")
             .jsonBody(rawRequestBody)
             .respondWith()
             .statusCode(200)
@@ -2446,94 +2475,23 @@ describe("SkyvernClient", () => {
             .build();
 
         const response = await client.runSdkAction({
-            "x-user-agent": "x-user-agent",
             url: "url",
             action: {
-                type: "ai_click",
+                type: "ai_act",
             },
         });
         expect(response).toEqual({
             workflow_run_id: "workflow_run_id",
-            result: "result",
+            result: {
+                key: "value",
+            },
         });
     });
 
     test("run_sdk_action (2)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { url: "url", action: { type: "ai_click" } };
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .post("/v1/sdk/run_action")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(400)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.runSdkAction({
-                url: "url",
-                action: {
-                    type: "ai_click",
-                },
-            });
-        }).rejects.toThrow(Skyvern.BadRequestError);
-    });
-
-    test("run_sdk_action (3)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { url: "url", action: { type: "ai_click" } };
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .post("/v1/sdk/run_action")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(403)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.runSdkAction({
-                url: "url",
-                action: {
-                    type: "ai_click",
-                },
-            });
-        }).rejects.toThrow(Skyvern.ForbiddenError);
-    });
-
-    test("run_sdk_action (4)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { url: "url", action: { type: "ai_click" } };
-        const rawResponseBody = { key: "value" };
-        server
-            .mockEndpoint()
-            .post("/v1/sdk/run_action")
-            .jsonBody(rawRequestBody)
-            .respondWith()
-            .statusCode(404)
-            .jsonBody(rawResponseBody)
-            .build();
-
-        await expect(async () => {
-            return await client.runSdkAction({
-                url: "url",
-                action: {
-                    type: "ai_click",
-                },
-            });
-        }).rejects.toThrow(Skyvern.NotFoundError);
-    });
-
-    test("run_sdk_action (5)", async () => {
-        const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { url: "url", action: { type: "ai_click" } };
+        const rawRequestBody = { url: "url", action: { type: "ai_act" } };
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
@@ -2548,7 +2506,7 @@ describe("SkyvernClient", () => {
             return await client.runSdkAction({
                 url: "url",
                 action: {
-                    type: "ai_click",
+                    type: "ai_act",
                 },
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);

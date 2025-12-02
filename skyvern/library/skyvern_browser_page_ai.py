@@ -1,19 +1,24 @@
 from typing import TYPE_CHECKING, Any
 
+import structlog
 from playwright.async_api import Page
 
 from skyvern.client import (
-    SdkAction_AiAct,
-    SdkAction_AiClick,
-    SdkAction_AiInputText,
-    SdkAction_AiSelectOption,
-    SdkAction_Extract,
+    RunSdkActionRequestAction_AiAct,
+    RunSdkActionRequestAction_AiClick,
+    RunSdkActionRequestAction_AiInputText,
+    RunSdkActionRequestAction_AiSelectOption,
+    RunSdkActionRequestAction_AiUploadFile,
+    RunSdkActionRequestAction_Extract,
+    RunSdkActionRequestAction_LocateElement,
 )
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 
 if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
+
+LOG = structlog.get_logger()
 
 
 class SdkSkyvernPageAi(SkyvernPageAi):
@@ -29,20 +34,21 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
     async def ai_click(
         self,
-        selector: str,
+        selector: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
+    ) -> str | None:
         """Click an element using AI via API call."""
 
-        await self._browser.sdk.ensure_has_server()
-        response = await self._browser.client.run_sdk_action(
+        LOG.info("AI click", intention=intention, workflow_run_id=self._browser.workflow_run_id)
+
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
             browser_session_id=self._browser.browser_session_id,
             browser_address=self._browser.browser_address,
             workflow_run_id=self._browser.workflow_run_id,
-            action=SdkAction_AiClick(
+            action=RunSdkActionRequestAction_AiClick(
                 selector=selector,
                 intention=intention,
                 data=data,
@@ -55,7 +61,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     async def ai_input_text(
         self,
         selector: str | None,
-        value: str,
+        value: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         totp_identifier: str | None = None,
@@ -64,10 +70,11 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> str:
         """Input text into an element using AI via API call."""
 
-        await self._browser.sdk.ensure_has_server()
-        response = await self._browser.client.run_sdk_action(
+        LOG.info("AI input text", intention=intention, workflow_run_id=self._browser.workflow_run_id)
+
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
-            action=SdkAction_AiInputText(
+            action=RunSdkActionRequestAction_AiInputText(
                 selector=selector,
                 value=value,
                 intention=intention,
@@ -81,22 +88,23 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             workflow_run_id=self._browser.workflow_run_id,
         )
         self._browser.workflow_run_id = response.workflow_run_id
-        return response.result if response.result else value
+        return response.result if response.result else value or ""
 
     async def ai_select_option(
         self,
-        selector: str,
-        value: str,
+        selector: str | None,
+        value: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str:
         """Select an option from a dropdown using AI via API call."""
 
-        await self._browser.sdk.ensure_has_server()
-        response = await self._browser.client.run_sdk_action(
+        LOG.info("AI select option", intention=intention, workflow_run_id=self._browser.workflow_run_id)
+
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
-            action=SdkAction_AiSelectOption(
+            action=RunSdkActionRequestAction_AiSelectOption(
                 selector=selector,
                 value=value,
                 intention=intention,
@@ -108,17 +116,36 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             workflow_run_id=self._browser.workflow_run_id,
         )
         self._browser.workflow_run_id = response.workflow_run_id
-        return response.result if response.result else value
+        return response.result if response.result else value or ""
 
     async def ai_upload_file(
         self,
         selector: str | None,
-        files: str,
+        files: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        public_url_only: bool = False,
     ) -> str:
-        raise NotImplementedError("Upload is not supported yet")
+        """Upload a file using AI via API call."""
+
+        LOG.info("AI upload file", intention=intention, workflow_run_id=self._browser.workflow_run_id)
+
+        response = await self._browser.skyvern.run_sdk_action(
+            url=self._page.url,
+            action=RunSdkActionRequestAction_AiUploadFile(
+                selector=selector,
+                file_url=files,
+                intention=intention,
+                data=data,
+                timeout=timeout,
+            ),
+            browser_session_id=self._browser.browser_session_id,
+            browser_address=self._browser.browser_address,
+            workflow_run_id=self._browser.workflow_run_id,
+        )
+        self._browser.workflow_run_id = response.workflow_run_id
+        return response.result if response.result else files or ""
 
     async def ai_extract(
         self,
@@ -130,10 +157,11 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI via API call."""
 
-        await self._browser.sdk.ensure_has_server()
-        response = await self._browser.client.run_sdk_action(
+        LOG.info("AI extract", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
+
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
-            action=SdkAction_Extract(
+            action=RunSdkActionRequestAction_Extract(
                 prompt=prompt,
                 extract_schema=schema,
                 error_code_mapping=error_code_mapping,
@@ -153,10 +181,11 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> None:
         """Perform an action on the page using AI via API call."""
 
-        await self._browser.sdk.ensure_has_server()
-        response = await self._browser.client.run_sdk_action(
+        LOG.info("AI act", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
+
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
-            action=SdkAction_AiAct(
+            action=RunSdkActionRequestAction_AiAct(
                 intention=prompt,
             ),
             browser_session_id=self._browser.browser_session_id,
@@ -164,3 +193,35 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             workflow_run_id=self._browser.workflow_run_id,
         )
         self._browser.workflow_run_id = response.workflow_run_id
+
+    async def ai_locate_element(
+        self,
+        prompt: str,
+    ) -> str | None:
+        """Locate an element on the page using AI and return its XPath selector via API call.
+
+        Args:
+            prompt: Natural language description of the element to locate (e.g., 'find "download invoices" button')
+
+        Returns:
+            XPath selector string (e.g., 'xpath=//button[@id="download"]') or None if not found
+        """
+
+        LOG.info("AI locate element", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
+
+        response = await self._browser.skyvern.run_sdk_action(
+            url=self._page.url,
+            action=RunSdkActionRequestAction_LocateElement(
+                prompt=prompt,
+            ),
+            browser_session_id=self._browser.browser_session_id,
+            browser_address=self._browser.browser_address,
+            workflow_run_id=self._browser.workflow_run_id,
+        )
+        self._browser.workflow_run_id = response.workflow_run_id
+
+        # Return the XPath result directly
+        if response.result and isinstance(response.result, str):
+            return response.result
+
+        return None

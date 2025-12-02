@@ -17,6 +17,7 @@ import { errorMappingExampleValue } from "../types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
 import { placeholders, helpTooltips } from "../../helpContent";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { useRerender } from "@/hooks/useRerender";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
@@ -139,6 +140,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                 <HelpTooltip content={navigationGoalTooltip} />
               </div>
               <WorkflowBlockInputTextarea
+                aiImprove={AI_IMPROVE_CONFIGS.action.navigationGoal}
                 nodeId={id}
                 onChange={(value) => {
                   update({ navigationGoal: value });
@@ -269,12 +271,8 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={data.cacheActions}
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

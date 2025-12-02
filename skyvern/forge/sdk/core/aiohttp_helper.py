@@ -130,6 +130,7 @@ async def aiohttp_get_text(
 async def aiohttp_post(
     url: str,
     data: dict[str, Any] | None = None,
+    str_data: str | None = None,
     headers: dict[str, str] | None = None,
     cookies: dict[str, str] | None = None,
     retry: int = 0,
@@ -145,6 +146,7 @@ async def aiohttp_post(
                 async with session.post(
                     url,
                     # TODO: make sure to test this out
+                    data=str_data,
                     json=data,
                     headers=headers,
                     cookies=cookies,

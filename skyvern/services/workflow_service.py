@@ -130,6 +130,7 @@ async def get_workflow_run_response(
         app_url=app_url,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
+        browser_profile_id=workflow_run.browser_profile_id,
         run_request=WorkflowRunRequest(
             workflow_id=workflow_run.workflow_permanent_id,
             title=workflow_run_resp.workflow_title,
@@ -140,6 +141,7 @@ async def get_workflow_run_response(
             totp_identifier=workflow_run.totp_identifier,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             browser_address=workflow_run.browser_address,
+            browser_profile_id=workflow_run.browser_profile_id,
             # TODO: add browser session id
         ),
         errors=workflow_run_resp.errors,

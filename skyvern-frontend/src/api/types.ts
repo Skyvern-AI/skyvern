@@ -1,3 +1,5 @@
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+
 export const ArtifactType = {
   Recording: "recording",
   ActionScreenshot: "screenshot_action",
@@ -54,7 +56,17 @@ export const ProxyLocation = {
   None: "NONE",
 } as const;
 
-export type ProxyLocation = (typeof ProxyLocation)[keyof typeof ProxyLocation];
+export type LegacyProxyLocation =
+  (typeof ProxyLocation)[keyof typeof ProxyLocation];
+
+export type GeoTarget = {
+  country: string;
+  subdivision?: string;
+  city?: string;
+  isISP?: boolean;
+};
+
+export type ProxyLocation = LegacyProxyLocation | GeoTarget | null;
 
 export type ArtifactApiResponse = {
   created_at: string;
@@ -372,6 +384,32 @@ export type WorkflowRunStatusApiResponse = {
   workflow_title: string | null;
   browser_session_id: string | null;
   max_screenshot_scrolls: number | null;
+};
+
+export type WorkflowRunStatusApiResponseWithWorkflow = {
+  workflow_id: string;
+  workflow_run_id: string;
+  status: Status;
+  proxy_location: ProxyLocation | null;
+  webhook_callback_url: string | null;
+  extra_http_headers: Record<string, string> | null;
+  created_at: string;
+  finished_at: string;
+  modified_at: string;
+  parameters: Record<string, unknown>;
+  screenshot_urls: Array<string> | null;
+  recording_url: string | null;
+  outputs: Record<string, unknown> | null;
+  failure_reason: string | null;
+  webhook_failure_reason: string | null;
+  downloaded_file_urls: Array<string> | null;
+  total_steps: number | null;
+  total_cost: number | null;
+  task_v2: TaskV2 | null;
+  workflow_title: string | null;
+  browser_session_id: string | null;
+  max_screenshot_scrolls: number | null;
+  workflow: WorkflowApiResponse;
 };
 
 export type TaskGenerationApiResponse = {

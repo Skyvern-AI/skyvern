@@ -1,11 +1,11 @@
-import { RunEngine } from "@/api/types";
+import { ProxyLocation, RunEngine } from "@/api/types";
 import { WorkflowBlockType } from "./workflowTypes";
 import { WorkflowModel } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
   description?: string | null;
-  proxy_location?: string | null;
+  proxy_location?: ProxyLocation | null;
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
   model?: WorkflowModel | null;
@@ -20,9 +20,11 @@ export type WorkflowCreateYAMLRequest = {
   ai_fallback?: boolean;
   run_sequentially?: boolean;
   sequential_key?: string | null;
+  folder_id?: string | null;
 };
 
 export type WorkflowDefinitionYAML = {
+  version?: number | null;
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
 };
@@ -143,6 +145,7 @@ export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
   label: string;
   continue_on_failure?: boolean;
+  next_block_label?: string | null;
 };
 
 export type TaskBlockYAML = BlockYAMLBase & {
@@ -160,7 +163,6 @@ export type TaskBlockYAML = BlockYAMLBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
@@ -212,7 +214,6 @@ export type ActionBlockYAML = BlockYAMLBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache: boolean;
   engine: RunEngine | null;
 };
@@ -230,7 +231,6 @@ export type NavigationBlockYAML = BlockYAMLBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
@@ -248,7 +248,6 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   max_retries?: number;
   max_steps_per_run?: number | null;
   parameter_keys?: Array<string> | null;
-  cache_actions: boolean;
   disable_cache: boolean;
   engine: RunEngine | null;
 };
@@ -264,7 +263,6 @@ export type LoginBlockYAML = BlockYAMLBase & {
   parameter_keys?: Array<string> | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
@@ -288,7 +286,6 @@ export type FileDownloadBlockYAML = BlockYAMLBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache: boolean;
   engine: RunEngine | null;
   download_timeout?: number | null;

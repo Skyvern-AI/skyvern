@@ -1,3 +1,4 @@
+import { AxiosError } from "axios";
 import { useEffect, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
@@ -7,6 +8,7 @@ import {
   type SwitchBarNavigationOption,
 } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
+import { Status404 } from "@/components/Status404";
 import {
   Dialog,
   DialogClose,
@@ -30,10 +32,9 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link, Outlet, useParams, useSearchParams } from "react-router-dom";
-import { statusIsFinalized, statusIsRunningOrQueued } from "../tasks/types";
-import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
-import { useWorkflowRunQuery } from "./hooks/useWorkflowRunQuery";
+import { Link, Outlet, useSearchParams } from "react-router-dom";
+import { statusIsCancellable, statusIsFinalized } from "../tasks/types";
+import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
 import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
@@ -43,6 +44,7 @@ import { cn } from "@/util/utils";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
+import { useFirstParam } from "@/hooks/useFirstParam";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
@@ -54,23 +56,22 @@ function WorkflowRun() {
   const embed = searchParams.get("embed");
   const isEmbedded = embed === "true";
   const active = searchParams.get("active");
-  const { workflowRunId, workflowPermanentId } = useParams();
+  const workflowRunId = useFirstParam("workflowRunId", "runId");
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
   const queryClient = useQueryClient();
-
-  const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
-    workflowPermanentId,
-  });
-
-  const cacheKey = workflow?.cache_key ?? "";
 
   const {
     data: workflowRun,
     isLoading: workflowRunIsLoading,
     isFetched,
-  } = useWorkflowRunQuery();
+    error,
+  } = useWorkflowRunWithWorkflowQuery();
 
+  const status = (error as AxiosError | undefined)?.response?.status;
+  const workflow = workflowRun?.workflow;
+  const workflowPermanentId = workflow?.workflow_permanent_id;
+  const cacheKey = workflow?.cache_key ?? "";
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
 
   const [hasPublishedCode, setHasPublishedCode] = useState(false);
@@ -141,8 +142,8 @@ function WorkflowRun() {
     },
   });
 
-  const workflowRunIsRunningOrQueued =
-    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const workflowRunIsCancellable =
+    workflowRun && statusIsCancellable(workflowRun);
 
   const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
   const selection = findActiveItem(
@@ -155,7 +156,7 @@ function WorkflowRun() {
     workflowRun?.proxy_location ?? ProxyLocation.Residential;
   const maxScreenshotScrolls = workflowRun?.max_screenshot_scrolls ?? null;
 
-  const title = workflowIsLoading ? (
+  const title = workflowRunIsLoading ? (
     <Skeleton className="h-9 w-48" />
   ) : (
     <h1 className="text-3xl">
@@ -292,6 +293,10 @@ function WorkflowRun() {
     },
   ];
 
+  if (status === 404) {
+    return <Status404 />;
+  }
+
   return (
     <div className="space-y-8">
       {!isEmbedded && (
@@ -357,7 +362,7 @@ function WorkflowRun() {
                 Edit
               </Link>
             </Button>
-            {workflowRunIsRunningOrQueued && (
+            {workflowRunIsCancellable && (
               <Dialog>
                 <DialogTrigger asChild>
                   <Button variant="destructive">Cancel</Button>

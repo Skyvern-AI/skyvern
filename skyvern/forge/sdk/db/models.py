@@ -28,9 +28,11 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_credit_card_data_parameter_id,
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
+    generate_browser_profile_id,
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
+    generate_folder_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
@@ -217,6 +219,28 @@ class ArtifactModel(Base):
     )
 
 
+class FolderModel(Base):
+    __tablename__ = "folders"
+    __table_args__ = (
+        Index("folder_organization_id_idx", "organization_id"),
+        Index("folder_organization_title_idx", "organization_id", "title"),
+    )
+
+    folder_id = Column(String, primary_key=True, default=generate_folder_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id", ondelete="CASCADE"), nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class WorkflowModel(Base):
     __tablename__ = "workflows"
     __table_args__ = (
@@ -229,6 +253,7 @@ class WorkflowModel(Base):
         Index("permanent_id_version_idx", "workflow_permanent_id", "version"),
         Index("organization_id_title_idx", "organization_id", "title"),
         Index("workflow_oid_status_idx", "organization_id", "status"),
+        Index("workflow_folder_id_idx", "folder_id"),
     )
 
     workflow_id = Column(String, primary_key=True, default=generate_workflow_id)
@@ -251,6 +276,8 @@ class WorkflowModel(Base):
     cache_key = Column(String, nullable=True)
     run_sequentially = Column(Boolean, nullable=True)
     sequential_key = Column(String, nullable=True)
+    folder_id = Column(String, ForeignKey("folders.folder_id", ondelete="SET NULL"), nullable=True)
+    import_error = Column(String, nullable=True)  # Error message if import failed
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -277,6 +304,7 @@ class WorkflowRunModel(Base):
     parent_workflow_run_id = Column(String, nullable=True, index=True)
     organization_id = Column(String, nullable=False, index=True)
     browser_session_id = Column(String, nullable=True, index=True)
+    browser_profile_id = Column(String, nullable=True, index=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
     proxy_location = Column(String)
@@ -289,7 +317,7 @@ class WorkflowRunModel(Base):
     browser_address = Column(String, nullable=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
-    depends_on_workflow_run_id = Column(String, nullable=True)
+    depends_on_workflow_run_id = Column(String, nullable=True, index=True)
     sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     debug_session_id: Column = Column(String, nullable=True)
@@ -765,6 +793,15 @@ class ThoughtModel(Base):
 
 class PersistentBrowserSessionModel(Base):
     __tablename__ = "persistent_browser_sessions"
+    __table_args__ = (
+        Index(
+            "idx_persistent_browser_sessions_org_created_started_completed",
+            "organization_id",
+            "created_at",
+            "started_at",
+            "completed_at",
+        ),
+    )
 
     persistent_browser_session_id = Column(String, primary_key=True, default=generate_persistent_browser_session_id)
     organization_id = Column(String, nullable=False, index=True)
@@ -780,6 +817,23 @@ class PersistentBrowserSessionModel(Base):
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class BrowserProfileModel(Base):
+    __tablename__ = "browser_profiles"
+    __table_args__ = (
+        Index("idx_browser_profiles_org", "organization_id"),
+        Index("idx_browser_profiles_org_name", "organization_id", "name"),
+        UniqueConstraint("organization_id", "name", name="uc_org_browser_profile_name"),
+    )
+
+    browser_profile_id = Column(String, primary_key=True, default=generate_browser_profile_id)
+    organization_id = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
 

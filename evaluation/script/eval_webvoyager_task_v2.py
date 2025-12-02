@@ -7,6 +7,7 @@ import typer
 from dotenv import load_dotenv
 
 from evaluation.core import Evaluator, SkyvernClient
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 load_dotenv()
@@ -109,6 +110,8 @@ def main(
     record_json_path: str = typer.Option(..., "--record-json", help="record json path for evaluation run"),
     output_csv_path: str = typer.Option("output.csv", "--output-path", help="output csv path for evaluation run"),
 ) -> None:
+    start_forge_app()
+
     asyncio.run(
         run_eval(base_url=base_url, cred=cred, record_json_path=record_json_path, output_csv_path=output_csv_path)
     )

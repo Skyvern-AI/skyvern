@@ -37,6 +37,7 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 import { DisableCache } from "../DisableCache";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const { blockLabel: urlBlockLabel } = useParams();
@@ -136,6 +137,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                 />
               </div>
               <WorkflowBlockInputTextarea
+                aiImprove={AI_IMPROVE_CONFIGS.navigation.navigationGoal}
                 nodeId={id}
                 onChange={(value) => {
                   update({ navigationGoal: value });
@@ -184,6 +186,9 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                       Complete if...
                     </Label>
                     <WorkflowBlockInputTextarea
+                      aiImprove={
+                        AI_IMPROVE_CONFIGS.navigation.completeCriterion
+                      }
                       nodeId={id}
                       onChange={(value) => {
                         update({ completeCriterion: value });
@@ -328,12 +333,8 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={data.cacheActions}
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

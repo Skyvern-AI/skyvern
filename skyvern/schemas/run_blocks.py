@@ -30,6 +30,10 @@ class LoginRequest(BaseModel):
         description="ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`",
         examples=["pbs_123456"],
     )
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="ID of a browser profile to reuse for this run",
+    )
     browser_address: str | None = Field(
         default=None,
         description="The CDP address for the task.",

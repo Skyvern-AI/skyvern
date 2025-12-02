@@ -154,6 +154,7 @@ def parse_action(
                 index=index,
             ),
             input_or_select_context=input_or_select_context,
+            download=action.get("download", False),
         )
 
     if action_type == ActionType.CHECKBOX:

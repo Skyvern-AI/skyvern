@@ -46,7 +46,9 @@ function WorkflowRunParameters() {
 
   const header = (
     <header className="space-y-5">
-      <h1 className="text-3xl">Parameters</h1>
+      <h1 className="text-3xl">
+        Parameters{workflow?.title ? ` - ${workflow.title}` : ""}
+      </h1>
       <h2 className="text-lg text-slate-400">
         Fill the placeholder values that you have linked throughout your
         workflow.

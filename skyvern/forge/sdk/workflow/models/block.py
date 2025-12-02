@@ -26,7 +26,7 @@ from email_validator import EmailNotValidError, validate_email
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
@@ -49,7 +49,6 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.azure import AsyncAzureStorageClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -58,10 +57,12 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
@@ -92,7 +93,7 @@ from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileS
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
-from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -113,10 +114,21 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.timed_out: BlockStatus.timed_out,
 }
 
+# ForLoop constants
+DEFAULT_MAX_LOOP_ITERATIONS = 100
+DEFAULT_MAX_STEPS_PER_ITERATION = 50
+
 
 class Block(BaseModel, abc.ABC):
+    """Base class for workflow nodes (see branching spec [[s-4bnl]] for metadata semantics)."""
+
     # Must be unique within workflow definition
-    label: str
+    label: str = Field(description="Author-facing identifier for a block; unique within a workflow.")
+    next_block_label: str | None = Field(
+        default=None,
+        description="Optional pointer to the next block label when constructing a DAG. "
+        "Defaults to sequential order when omitted.",
+    )
     block_type: BlockType
     output_parameter: OutputParameter
     continue_on_failure: bool = False
@@ -363,16 +375,16 @@ class Block(BaseModel, abc.ABC):
             # create a screenshot
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
             if not browser_state:
-                LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
+                LOG.warning(
+                    "No browser state found when creating workflow_run_block",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    browser_session_id=browser_session_id,
+                    block_label=self.label,
+                )
             else:
                 try:
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            workflow_run_id,
-                            properties={"organization_id": str(organization_id)},
-                        )
-                    )
+                    screenshot = await browser_state.take_fullpage_screenshot()
                 except Exception:
                     LOG.warning(
                         "Failed to take screenshot before executing the block, ignoring the exception",
@@ -448,7 +460,6 @@ class BaseTaskBlock(Block):
     download_suffix: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
     download_timeout: float | None = None  # minutes
@@ -577,19 +588,22 @@ class BaseTaskBlock(Block):
                 )
                 self.url = task_url_parameter_value
 
-        if (
-            self.totp_identifier
-            and workflow_run_context.has_parameter(self.totp_identifier)
-            and workflow_run_context.has_value(self.totp_identifier)
-        ):
-            totp_identifier_parameter_value = workflow_run_context.get_value(self.totp_identifier)
-            if totp_identifier_parameter_value:
-                LOG.info(
-                    "TOTP identifier is parameterized, using parameter value",
-                    totp_identifier_parameter_value=totp_identifier_parameter_value,
-                    totp_identifier_parameter_key=self.totp_identifier,
-                )
-                self.totp_identifier = totp_identifier_parameter_value
+        if self.totp_identifier:
+            if workflow_run_context.has_parameter(self.totp_identifier) and workflow_run_context.has_value(
+                self.totp_identifier
+            ):
+                totp_identifier_parameter_value = workflow_run_context.get_value(self.totp_identifier)
+                if totp_identifier_parameter_value:
+                    self.totp_identifier = totp_identifier_parameter_value
+        else:
+            for parameter in self.get_all_parameters(workflow_run_id):
+                parameter_key = getattr(parameter, "key", None)
+                if not parameter_key:
+                    continue
+                credential_totp_identifier = workflow_run_context.get_credential_totp_identifier(parameter_key)
+                if credential_totp_identifier:
+                    self.totp_identifier = credential_totp_identifier
+                    break
 
         if self.download_suffix and workflow_run_context.has_parameter(self.download_suffix):
             download_suffix_parameter_value = workflow_run_context.get_value(self.download_suffix)
@@ -645,7 +659,10 @@ class BaseTaskBlock(Block):
                 # the first task block will create the browser state and do the navigation
                 try:
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                        workflow_run=workflow_run, url=self.url, browser_session_id=browser_session_id
+                        workflow_run=workflow_run,
+                        url=self.url,
+                        browser_session_id=browser_session_id,
+                        browser_profile_id=workflow_run.browser_profile_id,
                     )
                     working_page = await browser_state.get_working_page()
                     if not working_page:
@@ -674,13 +691,7 @@ class BaseTaskBlock(Block):
 
                 try:
                     # add screenshot artifact for the first task
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            workflow_run_id,
-                            properties={"organization_id": str(organization_id)},
-                        )
-                    )
+                    screenshot = await browser_state.take_fullpage_screenshot()
                     if screenshot:
                         await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                             workflow_run_block=workflow_run_block,
@@ -1260,6 +1271,27 @@ class ForLoopBlock(Block):
         current_block: BlockTypeVar | None = None
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
+            # Check max_iterations limit
+            if loop_idx >= DEFAULT_MAX_LOOP_ITERATIONS:
+                LOG.info(
+                    f"ForLoopBlock: Reached max_iterations limit ({DEFAULT_MAX_LOOP_ITERATIONS}), stopping loop",
+                    workflow_run_id=workflow_run_id,
+                    loop_idx=loop_idx,
+                    max_iterations=DEFAULT_MAX_LOOP_ITERATIONS,
+                )
+                failure_block_result = await self.build_block_result(
+                    success=False,
+                    status=BlockStatus.failed,
+                    failure_reason=f"Reached max_loop_iterations limit of {DEFAULT_MAX_LOOP_ITERATIONS}",
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                block_outputs.append(failure_block_result)
+                return LoopBlockExecutedResult(
+                    outputs_with_loop_values=outputs_with_loop_values,
+                    block_outputs=block_outputs,
+                    last_block=current_block,
+                )
             LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value)
             # context parameter has been deprecated. However, it's still used by task v2 - we should migrate away from it.
             context_parameters_with_value = self.get_loop_block_context_parameters(workflow_run_id, loop_over_value)
@@ -1267,6 +1299,16 @@ class ForLoopBlock(Block):
                 workflow_run_context.set_value(context_parameter.key, context_parameter.value)
 
             each_loop_output_values: list[dict[str, Any]] = []
+
+            # Track steps for current iteration
+            iteration_step_count = 0
+            LOG.info(
+                f"ForLoopBlock: Starting iteration {loop_idx} with max_steps_per_iteration={DEFAULT_MAX_STEPS_PER_ITERATION}",
+                workflow_run_id=workflow_run_id,
+                loop_idx=loop_idx,
+                max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
+            )
+
             for block_idx, loop_block in enumerate(self.loop_blocks):
                 metadata: BlockMetadata = {
                     "current_index": loop_idx,
@@ -1324,6 +1366,37 @@ class ForLoopBlock(Block):
                     )
                 loop_block = original_loop_block
                 block_outputs.append(block_output)
+
+                # Check max_steps_per_iteration limit after each block execution
+                iteration_step_count += 1  # Count each block execution as a step
+                if iteration_step_count >= DEFAULT_MAX_STEPS_PER_ITERATION:
+                    LOG.info(
+                        f"ForLoopBlock: Reached max_steps_per_iteration limit ({DEFAULT_MAX_STEPS_PER_ITERATION}) in iteration {loop_idx}, stopping iteration",
+                        workflow_run_id=workflow_run_id,
+                        loop_idx=loop_idx,
+                        max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
+                        iteration_step_count=iteration_step_count,
+                    )
+                    # Create a failure block result for this iteration
+                    failure_block_result = await self.build_block_result(
+                        success=False,
+                        status=BlockStatus.failed,
+                        failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                    block_outputs.append(failure_block_result)
+                    # If continue_on_failure is False, stop the entire loop
+                    if not self.continue_on_failure:
+                        outputs_with_loop_values.append(each_loop_output_values)
+                        return LoopBlockExecutedResult(
+                            outputs_with_loop_values=outputs_with_loop_values,
+                            block_outputs=block_outputs,
+                            last_block=current_block,
+                        )
+                    # If continue_on_failure is True, break out of the block loop for this iteration
+                    break
+
                 if block_output.status == BlockStatus.canceled:
                     LOG.info(
                         f"ForLoopBlock: Block with type {loop_block.block_type} at index {block_idx} during loop {loop_idx} was canceled for workflow run {workflow_run_id}, canceling for loop",
@@ -1586,6 +1659,7 @@ async def wrapper():
                     workflow_run=workflow_run,
                     url=None,  # Code block doesn't need to navigate to a URL initially
                     browser_session_id=browser_session_id,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
                 # Ensure the browser state has a working page
                 await browser_state.check_and_fix_state(
@@ -1595,6 +1669,7 @@ async def wrapper():
                     organization_id=workflow_run.organization_id,
                     extra_http_headers=workflow_run.extra_http_headers,
                     browser_address=workflow_run.browser_address,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
             except Exception as e:
                 LOG.exception(
@@ -1729,15 +1804,12 @@ async def wrapper():
         )
 
 
-DEFAULT_TEXT_PROMPT_LLM_KEY = settings.PROMPT_BLOCK_LLM_KEY or settings.LLM_KEY
-
-
 class TextPromptBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.TEXT_PROMPT] = BlockType.TEXT_PROMPT  # type: ignore
 
-    llm_key: str = DEFAULT_TEXT_PROMPT_LLM_KEY
+    llm_key: str | None = None
     prompt: str
     parameters: list[PARAMETER_TYPE] = []
     json_schema: dict[str, Any] | None = None
@@ -1749,14 +1821,23 @@ class TextPromptBlock(Block):
         return self.parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.llm_key = self.format_block_parameter_template_from_workflow_run_context(
-            self.llm_key, workflow_run_context
-        )
+        if self.llm_key:
+            self.llm_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.llm_key, workflow_run_context
+            )
         self.prompt = self.format_block_parameter_template_from_workflow_run_context(self.prompt, workflow_run_context)
 
-    async def send_prompt(self, prompt: str, parameter_values: dict[str, Any]) -> dict[str, Any]:
-        llm_key = self.llm_key or DEFAULT_TEXT_PROMPT_LLM_KEY
-        llm_api_handler = LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
+    async def send_prompt(
+        self,
+        prompt: str,
+        parameter_values: dict[str, Any],
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> dict[str, Any]:
+        default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            self.override_llm_key or self.llm_key, default=default_llm_handler
+        )
         if not self.json_schema:
             self.json_schema = {
                 "type": "object",
@@ -1784,6 +1865,22 @@ class TextPromptBlock(Block):
         response = await llm_api_handler(prompt=prompt, prompt_name="text-prompt")
         LOG.info("TextPromptBlock: Received response from LLM", response=response)
         return response
+
+    async def _resolve_default_llm_handler(self, workflow_run_id: str, organization_id: str | None) -> LLMAPIHandler:
+        prompt_config_handler = await get_llm_handler_for_prompt_type("text-prompt", workflow_run_id, organization_id)
+        if prompt_config_handler:
+            return prompt_config_handler
+
+        secondary_handler = app.SECONDARY_LLM_API_HANDLER
+        if secondary_handler:
+            return secondary_handler
+
+        LOG.warning(
+            "Secondary LLM handler not configured; falling back to primary handler for TextPromptBlock",
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        return app.LLM_API_HANDLER
 
     async def execute(
         self,
@@ -1828,7 +1925,7 @@ class TextPromptBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
-        response = await self.send_prompt(self.prompt, parameter_values)
+        response = await self.send_prompt(self.prompt, parameter_values, workflow_run_id, organization_id)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
         return await self.build_block_result(
             success=True,
@@ -2252,7 +2349,7 @@ class FileUploadBlock(Block):
                 if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
                     raise AzureConfigurationError("Azure Storage is not configured")
 
-                azure_client = AsyncAzureStorageClient(
+                azure_client = app.AZURE_CLIENT_FACTORY.create_storage_client(
                     storage_account_name=actual_azure_storage_account_name,
                     storage_account_key=actual_azure_storage_account_key,
                 )
@@ -2791,7 +2888,9 @@ class FileParserBlock(Block):
             self.override_llm_key, default=app.LLM_API_HANDLER
         )
 
-        llm_response = await llm_api_handler(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
+        llm_response = await llm_api_handler(
+            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+        )
         return llm_response
 
     async def execute(
@@ -3006,7 +3105,9 @@ class PDFParserBlock(Block):
         llm_prompt = prompt_engine.load_prompt(
             "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
         )
-        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
+        llm_response = await app.LLM_API_HANDLER(
+            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+        )
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)
         return await self.build_block_result(
@@ -3426,8 +3527,17 @@ class TaskV2Block(Block):
         from skyvern.services import task_v2_service  # noqa: PLC0415
 
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        # Simple template resolution - no complex dynamic resolution to prevent recursion
         try:
             self.format_potential_template_parameters(workflow_run_context)
+
+            # Use the resolved values directly
+            resolved_prompt = self.prompt
+            resolved_url = self.url
+            resolved_totp_identifier = self.totp_identifier
+            resolved_totp_verification_url = self.totp_verification_url
+
         except Exception as e:
             output_reason = f"Failed to format jinja template: {str(e)}"
             await self.record_output_parameter_value(
@@ -3442,14 +3552,14 @@ class TaskV2Block(Block):
                 organization_id=organization_id,
             )
 
-        if not self.url:
+        if not resolved_url:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
             if browser_state:
                 page = await browser_state.get_working_page()
                 if page:
                     current_url = await SkyvernFrame.get_url(frame=page)
                     if current_url != "about:blank":
-                        self.url = current_url
+                        resolved_url = current_url
 
         if not organization_id:
             raise ValueError("Running TaskV2Block requires organization_id")
@@ -3463,12 +3573,12 @@ class TaskV2Block(Block):
         try:
             task_v2 = await task_v2_service.initialize_task_v2(
                 organization=organization,
-                user_prompt=self.prompt,
-                user_url=self.url,
+                user_prompt=resolved_prompt,
+                user_url=resolved_url,
                 parent_workflow_run_id=workflow_run_id,
                 proxy_location=workflow_run.proxy_location,
-                totp_identifier=self.totp_identifier,
-                totp_verification_url=self.totp_verification_url,
+                totp_identifier=resolved_totp_identifier,
+                totp_verification_url=resolved_totp_verification_url,
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             )
             await app.DATABASE.update_task_v2(
@@ -3737,6 +3847,199 @@ class HttpRequestBlock(Block):
             )
 
 
+class BranchEvaluationContext:
+    """Collection of runtime data that BranchCriteria evaluators can consume."""
+
+    def __init__(
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext | None = None,
+        block_label: str | None = None,
+    ) -> None:
+        self.workflow_run_context = workflow_run_context
+        self.block_label = block_label
+
+    def build_template_data(self) -> dict[str, Any]:
+        """Build Jinja template data mirroring block parameter rendering context."""
+        if self.workflow_run_context is None:
+            return {
+                "params": {},
+                "outputs": {},
+                "environment": {},
+                "env": {},
+                "llm": {},
+            }
+
+        ctx = self.workflow_run_context
+        template_data = ctx.values.copy()
+        if ctx.include_secrets_in_templates:
+            template_data.update(ctx.secrets)
+
+            credential_params: list[tuple[str, dict[str, Any]]] = []
+            for key, value in template_data.items():
+                if isinstance(value, dict) and "context" in value and "username" in value and "password" in value:
+                    credential_params.append((key, value))
+
+            for key, value in credential_params:
+                username_secret_id = value.get("username", "")
+                password_secret_id = value.get("password", "")
+                real_username = template_data.get(username_secret_id, "")
+                real_password = template_data.get(password_secret_id, "")
+                template_data[f"{key}_real_username"] = real_username
+                template_data[f"{key}_real_password"] = real_password
+
+        if self.block_label:
+            block_reference_data: dict[str, Any] = ctx.get_block_metadata(self.block_label)
+            if self.block_label in template_data:
+                current_value = template_data[self.block_label]
+                if isinstance(current_value, dict):
+                    block_reference_data.update(current_value)
+            template_data[self.block_label] = block_reference_data
+
+            if "current_index" in block_reference_data:
+                template_data["current_index"] = block_reference_data["current_index"]
+            if "current_item" in block_reference_data:
+                template_data["current_item"] = block_reference_data["current_item"]
+            if "current_value" in block_reference_data:
+                template_data["current_value"] = block_reference_data["current_value"]
+
+        template_data.setdefault("workflow_title", ctx.workflow_title)
+        template_data.setdefault("workflow_id", ctx.workflow_id)
+        template_data.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
+        template_data.setdefault("workflow_run_id", ctx.workflow_run_id)
+
+        template_data.setdefault("params", template_data.get("params", {}))
+        template_data.setdefault("outputs", template_data.get("outputs", {}))
+        template_data.setdefault("environment", template_data.get("environment", {}))
+        template_data.setdefault("env", template_data.get("environment"))
+        template_data.setdefault("llm", template_data.get("llm", {}))
+
+        return template_data
+
+
+class BranchCriteria(BaseModel, abc.ABC):
+    """Abstract interface describing how a branch condition should be evaluated."""
+
+    criteria_type: str
+    expression: str
+    description: str | None = None
+
+    @abc.abstractmethod
+    async def evaluate(self, context: BranchEvaluationContext) -> bool:
+        """Return True when the branch should execute."""
+        raise NotImplementedError
+
+    def requires_llm(self) -> bool:
+        """Whether the criteria relies on an LLM classification step."""
+        return False
+
+
+class JinjaBranchCriteria(BranchCriteria):
+    """Jinja2-templated branch criteria (only supported criteria type for now)."""
+
+    criteria_type: Literal["jinja2_template"] = "jinja2_template"
+
+    async def evaluate(self, context: BranchEvaluationContext) -> bool:
+        # Build the template context explicitly to avoid surprises in templates.
+        template_data = context.build_template_data()
+
+        try:
+            template = jinja_sandbox_env.from_string(self.expression)
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(
+                template=self.expression,
+                msg=str(exc),
+            ) from exc
+
+        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+            if missing := get_missing_variables(self.expression, template_data):
+                raise MissingJinjaVariables(template=self.expression, variables=missing)
+
+        try:
+            rendered = template.render(template_data)
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(
+                template=self.expression,
+                msg=str(exc),
+            ) from exc
+
+        return bool(rendered)
+
+
+class BranchCondition(BaseModel):
+    """Represents a single conditional branch edge within a ConditionalBlock."""
+
+    criteria: BranchCriteria | None = None
+    next_block_label: str | None = None
+    description: str | None = None
+    is_default: bool = False
+
+    @model_validator(mode="after")
+    def validate_condition(cls, condition: BranchCondition) -> BranchCondition:
+        if isinstance(condition.criteria, dict):
+            condition.criteria = JinjaBranchCriteria(**condition.criteria)
+        if condition.criteria is None and not condition.is_default:
+            raise ValueError("Branches without criteria must be marked as default.")
+        if condition.criteria is not None and not isinstance(condition.criteria, JinjaBranchCriteria):
+            raise ValueError("Only Jinja2 branch criteria are supported in this version.")
+        if condition.criteria is not None and condition.is_default:
+            raise ValueError("Default branches may not define criteria.")
+        return condition
+
+
+class ConditionalBlock(Block):
+    """Branching block that selects the next block label based on list-ordered conditions."""
+
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.CONDITIONAL] = BlockType.CONDITIONAL  # type: ignore
+
+    branch_conditions: list[BranchCondition] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_branches(cls, block: ConditionalBlock) -> ConditionalBlock:
+        if not block.branch_conditions:
+            raise ValueError("Conditional blocks require at least one branch.")
+
+        default_branches = [branch for branch in block.branch_conditions if branch.is_default]
+        if len(default_branches) > 1:
+            raise ValueError("Only one default branch is permitted per conditional block.")
+
+        return block
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,  # noqa: ARG002 - preserved for interface compatibility
+    ) -> list[PARAMETER_TYPE]:
+        # BranchCriteria subclasses will surface their parameter dependencies once implemented.
+        return []
+
+    async def execute(  # noqa: D401
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        """
+        Placeholder execute implementation.
+
+        Conditional block execution will be implemented alongside the DAG workflow
+        engine refactor (see branching workflow spec).
+        """
+        raise NotImplementedError("Conditional block execution is handled by the DAG engine.")
+
+    @property
+    def ordered_branches(self) -> list[BranchCondition]:
+        """Convenience accessor that returns branches in author-specified list order."""
+        return list(self.branch_conditions)
+
+    def get_default_branch(self) -> BranchCondition | None:
+        """Return the default/else branch when configured."""
+        return next((branch for branch in self.branch_conditions if branch.is_default), None)
+
+
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
     """
     Recursively get "all blocks" in a workflow definition.
@@ -3758,6 +4061,7 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
 
 
 BlockSubclasses = Union[
+    ConditionalBlock,
     ForLoopBlock,
     TaskBlock,
     CodeBlock,

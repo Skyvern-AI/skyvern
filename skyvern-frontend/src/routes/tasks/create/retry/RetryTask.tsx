@@ -1,9 +1,9 @@
-import { useParams } from "react-router-dom";
 import { useTaskQuery } from "../../detail/hooks/useTaskQuery";
 import { CreateNewTaskForm } from "../CreateNewTaskForm";
+import { useFirstParam } from "@/hooks/useFirstParam";
 
 function RetryTask() {
-  const { taskId } = useParams();
+  const taskId = useFirstParam("taskId", "runId");
   const { data: task, isLoading } = useTaskQuery({ id: taskId });
 
   if (isLoading) {

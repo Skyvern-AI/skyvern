@@ -94,6 +94,19 @@ async def send_totp_code(
         workflow_id=data.workflow_id,
         workflow_run_id=data.workflow_run_id,
     )
+    # validate task_id, workflow_id, workflow_run_id are valid ids in db if provided
+    if data.task_id:
+        task = await app.DATABASE.get_task(data.task_id, curr_org.organization_id)
+        if not task:
+            raise HTTPException(status_code=400, detail=f"Invalid task id: {data.task_id}")
+    if data.workflow_id:
+        workflow = await app.DATABASE.get_workflow(data.workflow_id, curr_org.organization_id)
+        if not workflow:
+            raise HTTPException(status_code=400, detail=f"Invalid workflow id: {data.workflow_id}")
+    if data.workflow_run_id:
+        workflow_run = await app.DATABASE.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
+        if not workflow_run:
+            raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
     content = data.content.strip()
     otp_value: OTPValue | None = OTPValue(value=content, type=OTPType.TOTP)
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
@@ -165,21 +178,14 @@ async def get_totp_codes(
         description="Maximum number of codes to return.",
     ),
 ) -> list[TOTPCode]:
-    if totp_identifier:
-        codes = await app.DATABASE.get_otp_codes(
-            organization_id=curr_org.organization_id,
-            totp_identifier=totp_identifier,
-            otp_type=otp_type,
-            workflow_run_id=workflow_run_id,
-            limit=limit,
-        )
-    else:
-        codes = await app.DATABASE.get_recent_otp_codes(
-            organization_id=curr_org.organization_id,
-            limit=limit,
-            otp_type=otp_type,
-            workflow_run_id=workflow_run_id,
-        )
+    codes = await app.DATABASE.get_recent_otp_codes(
+        organization_id=curr_org.organization_id,
+        limit=limit,
+        valid_lifespan_minutes=None,
+        otp_type=otp_type,
+        workflow_run_id=workflow_run_id,
+        totp_identifier=totp_identifier,
+    )
 
     return codes
 

@@ -4,16 +4,19 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .run_sdk_action_response_result import RunSdkActionResponseResult
 
 
 class RunSdkActionResponse(UniversalBaseModel):
+    """
+    Response from running an SDK action.
+    """
+
     workflow_run_id: str = pydantic.Field()
     """
     The workflow run ID used for this action
     """
 
-    result: typing.Optional[RunSdkActionResponseResult] = pydantic.Field(default=None)
+    result: typing.Optional[typing.Optional[typing.Any]] = pydantic.Field(default=None)
     """
     The result from the action (e.g., selector, value, extracted data)
     """

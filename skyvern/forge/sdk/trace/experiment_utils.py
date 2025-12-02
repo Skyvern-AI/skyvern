@@ -66,7 +66,7 @@ async def collect_experiment_metadata(
             "LLM_NAME",
             "LLM_SECONDARY_NAME",
             # Add more experiment flags as needed
-            "PROMPT_CACHING_ENABLED",
+            "PROMPT_CACHING_OPTIMIZATION",
             "THINKING_BUDGET_OPTIMIZATION",
         ]
 

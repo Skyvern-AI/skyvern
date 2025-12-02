@@ -7,6 +7,7 @@ from importlib import import_module
 
 if typing.TYPE_CHECKING:
     from .act_action import ActAction
+    from .act_action_data import ActActionData
     from .action import Action
     from .action_block import ActionBlock
     from .action_block_data_schema import ActionBlockDataSchema
@@ -41,9 +42,11 @@ if typing.TYPE_CHECKING:
     from .bitwarden_sensitive_information_parameter import BitwardenSensitiveInformationParameter
     from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
     from .block_type import BlockType
+    from .browser_profile import BrowserProfile
     from .browser_session_response import BrowserSessionResponse
     from .click_action import ClickAction
     from .click_action_data import ClickActionData
+    from .click_context import ClickContext
     from .code_block import CodeBlock
     from .code_block_parameters_item import (
         CodeBlockParametersItem,
@@ -134,6 +137,7 @@ if typing.TYPE_CHECKING:
     from .file_type import FileType
     from .file_upload_block import FileUploadBlock
     from .file_upload_block_yaml import FileUploadBlockYaml
+    from .folder import Folder
     from .for_loop_block import ForLoopBlock
     from .for_loop_block_loop_blocks_item import (
         ForLoopBlockLoopBlocksItem,
@@ -241,9 +245,11 @@ if typing.TYPE_CHECKING:
         HumanInteractionBlockParametersItem_Workflow,
     )
     from .human_interaction_block_yaml import HumanInteractionBlockYaml
+    from .improve_prompt_response import ImprovePromptResponse
     from .input_or_select_context import InputOrSelectContext
     from .input_text_action import InputTextAction
     from .input_text_action_data import InputTextActionData
+    from .locate_element_action import LocateElementAction
     from .login_block import LoginBlock
     from .login_block_data_schema import LoginBlockDataSchema
     from .login_block_parameters_item import (
@@ -290,20 +296,21 @@ if typing.TYPE_CHECKING:
     from .pdf_parser_block_yaml import PdfParserBlockYaml
     from .proxy_location import ProxyLocation
     from .run_engine import RunEngine
+    from .run_sdk_action_request_action import (
+        RunSdkActionRequestAction,
+        RunSdkActionRequestAction_AiAct,
+        RunSdkActionRequestAction_AiClick,
+        RunSdkActionRequestAction_AiInputText,
+        RunSdkActionRequestAction_AiSelectOption,
+        RunSdkActionRequestAction_AiUploadFile,
+        RunSdkActionRequestAction_Extract,
+        RunSdkActionRequestAction_LocateElement,
+    )
     from .run_sdk_action_response import RunSdkActionResponse
-    from .run_sdk_action_response_result import RunSdkActionResponseResult
     from .run_status import RunStatus
     from .script import Script
     from .script_file_create import ScriptFileCreate
     from .script_run_response import ScriptRunResponse
-    from .sdk_action import (
-        SdkAction,
-        SdkAction_AiAct,
-        SdkAction_AiClick,
-        SdkAction_AiInputText,
-        SdkAction_AiSelectOption,
-        SdkAction_Extract,
-    )
     from .select_option import SelectOption
     from .select_option_action import SelectOptionAction
     from .select_option_action_data import SelectOptionActionData
@@ -356,6 +363,8 @@ if typing.TYPE_CHECKING:
     from .thought_type import ThoughtType
     from .totp_code import TotpCode
     from .totp_type import TotpType
+    from .upload_file_action import UploadFileAction
+    from .upload_file_action_data import UploadFileActionData
     from .upload_to_s3block import UploadToS3Block
     from .upload_to_s3block_yaml import UploadToS3BlockYaml
     from .url_block import UrlBlock
@@ -508,6 +517,7 @@ if typing.TYPE_CHECKING:
     from .workflow_status import WorkflowStatus
 _dynamic_imports: typing.Dict[str, str] = {
     "ActAction": ".act_action",
+    "ActActionData": ".act_action_data",
     "Action": ".action",
     "ActionBlock": ".action_block",
     "ActionBlockDataSchema": ".action_block_data_schema",
@@ -540,9 +550,11 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BitwardenSensitiveInformationParameter": ".bitwarden_sensitive_information_parameter",
     "BitwardenSensitiveInformationParameterYaml": ".bitwarden_sensitive_information_parameter_yaml",
     "BlockType": ".block_type",
+    "BrowserProfile": ".browser_profile",
     "BrowserSessionResponse": ".browser_session_response",
     "ClickAction": ".click_action",
     "ClickActionData": ".click_action_data",
+    "ClickContext": ".click_context",
     "CodeBlock": ".code_block",
     "CodeBlockParametersItem": ".code_block_parameters_item",
     "CodeBlockParametersItem_AwsSecret": ".code_block_parameters_item",
@@ -625,6 +637,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "FileType": ".file_type",
     "FileUploadBlock": ".file_upload_block",
     "FileUploadBlockYaml": ".file_upload_block_yaml",
+    "Folder": ".folder",
     "ForLoopBlock": ".for_loop_block",
     "ForLoopBlockLoopBlocksItem": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Action": ".for_loop_block_loop_blocks_item",
@@ -720,9 +733,11 @@ _dynamic_imports: typing.Dict[str, str] = {
     "HumanInteractionBlockParametersItem_Output": ".human_interaction_block_parameters_item",
     "HumanInteractionBlockParametersItem_Workflow": ".human_interaction_block_parameters_item",
     "HumanInteractionBlockYaml": ".human_interaction_block_yaml",
+    "ImprovePromptResponse": ".improve_prompt_response",
     "InputOrSelectContext": ".input_or_select_context",
     "InputTextAction": ".input_text_action",
     "InputTextActionData": ".input_text_action_data",
+    "LocateElementAction": ".locate_element_action",
     "LoginBlock": ".login_block",
     "LoginBlockDataSchema": ".login_block_data_schema",
     "LoginBlockParametersItem": ".login_block_parameters_item",
@@ -765,18 +780,19 @@ _dynamic_imports: typing.Dict[str, str] = {
     "PdfParserBlockYaml": ".pdf_parser_block_yaml",
     "ProxyLocation": ".proxy_location",
     "RunEngine": ".run_engine",
+    "RunSdkActionRequestAction": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_AiAct": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_AiClick": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_AiInputText": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_AiSelectOption": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_AiUploadFile": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_Extract": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_LocateElement": ".run_sdk_action_request_action",
     "RunSdkActionResponse": ".run_sdk_action_response",
-    "RunSdkActionResponseResult": ".run_sdk_action_response_result",
     "RunStatus": ".run_status",
     "Script": ".script",
     "ScriptFileCreate": ".script_file_create",
     "ScriptRunResponse": ".script_run_response",
-    "SdkAction": ".sdk_action",
-    "SdkAction_AiAct": ".sdk_action",
-    "SdkAction_AiClick": ".sdk_action",
-    "SdkAction_AiInputText": ".sdk_action",
-    "SdkAction_AiSelectOption": ".sdk_action",
-    "SdkAction_Extract": ".sdk_action",
     "SelectOption": ".select_option",
     "SelectOptionAction": ".select_option_action",
     "SelectOptionActionData": ".select_option_action_data",
@@ -825,6 +841,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ThoughtType": ".thought_type",
     "TotpCode": ".totp_code",
     "TotpType": ".totp_type",
+    "UploadFileAction": ".upload_file_action",
+    "UploadFileActionData": ".upload_file_action_data",
     "UploadToS3Block": ".upload_to_s3block",
     "UploadToS3BlockYaml": ".upload_to_s3block_yaml",
     "UrlBlock": ".url_block",
@@ -987,6 +1005,7 @@ def __dir__():
 
 __all__ = [
     "ActAction",
+    "ActActionData",
     "Action",
     "ActionBlock",
     "ActionBlockDataSchema",
@@ -1019,9 +1038,11 @@ __all__ = [
     "BitwardenSensitiveInformationParameter",
     "BitwardenSensitiveInformationParameterYaml",
     "BlockType",
+    "BrowserProfile",
     "BrowserSessionResponse",
     "ClickAction",
     "ClickActionData",
+    "ClickContext",
     "CodeBlock",
     "CodeBlockParametersItem",
     "CodeBlockParametersItem_AwsSecret",
@@ -1104,6 +1125,7 @@ __all__ = [
     "FileType",
     "FileUploadBlock",
     "FileUploadBlockYaml",
+    "Folder",
     "ForLoopBlock",
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
@@ -1199,9 +1221,11 @@ __all__ = [
     "HumanInteractionBlockParametersItem_Output",
     "HumanInteractionBlockParametersItem_Workflow",
     "HumanInteractionBlockYaml",
+    "ImprovePromptResponse",
     "InputOrSelectContext",
     "InputTextAction",
     "InputTextActionData",
+    "LocateElementAction",
     "LoginBlock",
     "LoginBlockDataSchema",
     "LoginBlockParametersItem",
@@ -1244,18 +1268,19 @@ __all__ = [
     "PdfParserBlockYaml",
     "ProxyLocation",
     "RunEngine",
+    "RunSdkActionRequestAction",
+    "RunSdkActionRequestAction_AiAct",
+    "RunSdkActionRequestAction_AiClick",
+    "RunSdkActionRequestAction_AiInputText",
+    "RunSdkActionRequestAction_AiSelectOption",
+    "RunSdkActionRequestAction_AiUploadFile",
+    "RunSdkActionRequestAction_Extract",
+    "RunSdkActionRequestAction_LocateElement",
     "RunSdkActionResponse",
-    "RunSdkActionResponseResult",
     "RunStatus",
     "Script",
     "ScriptFileCreate",
     "ScriptRunResponse",
-    "SdkAction",
-    "SdkAction_AiAct",
-    "SdkAction_AiClick",
-    "SdkAction_AiInputText",
-    "SdkAction_AiSelectOption",
-    "SdkAction_Extract",
     "SelectOption",
     "SelectOptionAction",
     "SelectOptionActionData",
@@ -1304,6 +1329,8 @@ __all__ = [
     "ThoughtType",
     "TotpCode",
     "TotpType",
+    "UploadFileAction",
+    "UploadFileActionData",
     "UploadToS3Block",
     "UploadToS3BlockYaml",
     "UrlBlock",

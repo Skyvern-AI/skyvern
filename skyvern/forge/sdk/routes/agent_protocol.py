@@ -1,9 +1,22 @@
+import asyncio
 from enum import Enum
 from typing import Annotated, Any
 
 import structlog
 import yaml
-from fastapi import BackgroundTasks, Depends, Header, HTTPException, Path, Query, Request, Response, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    Body,
+    Depends,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse
 
 from skyvern import analytics
@@ -84,6 +97,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunWithWorkflowResponse,
 )
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
+from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
     CUA_ENGINES,
     BlockRunRequest,
@@ -150,17 +164,19 @@ async def run_task(
         data_extraction_schema = run_request.data_extraction_schema
         navigation_goal = run_request.prompt
         navigation_payload = None
-        task_generation = await task_v1_service.generate_task(
-            user_prompt=run_request.prompt,
-            organization=current_org,
-        )
-        url = url or task_generation.url
-        navigation_goal = task_generation.navigation_goal or run_request.prompt
-        if run_request.engine in CUA_ENGINES:
-            navigation_goal = run_request.prompt
-        navigation_payload = task_generation.navigation_payload
-        data_extraction_goal = task_generation.data_extraction_goal
-        data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
+        if not url:
+            task_generation = await task_v1_service.generate_task(
+                user_prompt=run_request.prompt,
+                organization=current_org,
+            )
+            # What if it's a SDK request with browser_session_id?
+            url = task_generation.url
+            navigation_goal = task_generation.navigation_goal or run_request.prompt
+            if run_request.engine in CUA_ENGINES:
+                navigation_goal = run_request.prompt
+            navigation_payload = task_generation.navigation_payload
+            data_extraction_goal = task_generation.data_extraction_goal
+            data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
 
         task_v1_request = TaskRequest(
             title=run_request.title,
@@ -334,6 +350,7 @@ async def run_workflow(
         totp_identifier=workflow_run_request.totp_identifier,
         totp_verification_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
+        browser_profile_id=workflow_run_request.browser_profile_id,
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         extra_http_headers=workflow_run_request.extra_http_headers,
         browser_address=workflow_run_request.browser_address,
@@ -410,7 +427,7 @@ async def get_run(
     run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
     if not run_response:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Task run not found {run_id}",
         )
     return run_response
@@ -469,6 +486,7 @@ async def cancel_run(
 )
 async def create_workflow_legacy(
     request: Request,
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create-legacy")
@@ -480,6 +498,9 @@ async def create_workflow_legacy(
 
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+        # Override folder_id if provided as query parameter
+        if folder_id is not None:
+            workflow_create_request.folder_id = folder_id
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org, request=workflow_create_request
         )
@@ -520,6 +541,7 @@ async def create_workflow_legacy(
 )
 async def create_workflow(
     data: WorkflowRequest,
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create")
@@ -534,6 +556,9 @@ async def create_workflow(
                 status_code=422,
                 detail="Invalid workflow definition. Workflow should be provided in either yaml or json format.",
             )
+        # Override folder_id if provided as query parameter
+        if folder_id is not None:
+            workflow_definition.folder_id = folder_id
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
@@ -604,6 +629,22 @@ async def create_workflow_from_prompt(
     return workflow.model_dump(by_alias=True)
 
 
+async def _validate_file_size(file: UploadFile) -> UploadFile:
+    try:
+        file.file.seek(0, 2)  # Move the pointer to the end of the file
+        size = file.file.tell()  # Get the current position of the pointer, which represents the file size
+        file.file.seek(0)  # Reset the pointer back to the beginning
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not determine file size.") from e
+
+    if size > app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE / 1024 / 1024} MB)",
+        )
+    return file
+
+
 @legacy_base_router.post(
     "/workflows/import-pdf",
     response_model=dict[str, Any],
@@ -636,13 +677,99 @@ async def create_workflow_from_prompt(
     include_in_schema=False,
 )
 async def import_workflow_from_pdf(
-    file: UploadFile,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = Depends(_validate_file_size),
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
     analytics.capture("skyvern-oss-workflow-import-pdf")
 
-    return await pdf_import_service.import_workflow_from_pdf(file, current_org)
+    # Read file and validate early (before creating import record)
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    try:
+        file_contents = await file.read()
+        file_name = file.filename
+    finally:
+        # Release underlying SpooledTemporaryFile ASAP
+        await file.close()
+
+    # Extract text in executor to avoid blocking event loop (1-2 seconds)
+    try:
+        sop_text = await asyncio.to_thread(
+            pdf_import_service.extract_text_from_pdf,
+            file_contents,
+            file_name,
+        )
+    except HTTPException:
+        # Re-raise validation errors immediately
+        raise
+
+    # Validation passed! Create empty workflow v1 with status='importing'
+    empty_workflow = await app.DATABASE.create_workflow(
+        title=f"Importing {file_name}",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=current_org.organization_id,
+        status=WorkflowStatus.importing,
+        folder_id=folder_id,
+    )
+
+    # Process PDF import in background (LLM call is the slow part)
+    async def process_pdf_import() -> None:
+        try:
+            # Create workflow from extracted text (LLM processing)
+            result = await pdf_import_service.create_workflow_from_sop_text(sop_text, current_org)
+
+            # Create v2 with real content
+            await app.WORKFLOW_SERVICE.create_workflow_from_request(
+                organization=current_org,
+                request=WorkflowCreateYAMLRequest.model_validate(result),
+                workflow_permanent_id=empty_workflow.workflow_permanent_id,
+            )
+
+            # Update v1 status to published (v1 won't show in list since v2 is latest version)
+            await app.DATABASE.update_workflow(
+                workflow_id=empty_workflow.workflow_id,
+                organization_id=current_org.organization_id,
+                status=WorkflowStatus.published,
+            )
+
+            LOG.info(
+                "Workflow import completed",
+                workflow_permanent_id=empty_workflow.workflow_permanent_id,
+                organization_id=current_org.organization_id,
+            )
+        except Exception as e:
+            # Log full error server-side for debugging
+            LOG.exception(
+                "Workflow import failed",
+                workflow_permanent_id=empty_workflow.workflow_permanent_id,
+                error=str(e),
+                organization_id=current_org.organization_id,
+            )
+
+            # Provide sanitized user-facing error message (don't expose internal details/PII)
+            sanitized_error = "Import failed. Please verify the PDF content and try again."
+
+            # Mark v1 as import_failed with sanitized error
+            await app.DATABASE.update_workflow(
+                workflow_id=empty_workflow.workflow_id,
+                organization_id=current_org.organization_id,
+                status=WorkflowStatus.import_failed,
+                import_error=sanitized_error,
+            )
+
+    background_tasks.add_task(process_pdf_import)
+
+    return {
+        "workflow_permanent_id": empty_workflow.workflow_permanent_id,
+        "status": "importing",
+        "file_name": file.filename,
+        "organization_id": current_org.organization_id,
+        "created_at": empty_workflow.created_at.isoformat(),
+    }
 
 
 @legacy_base_router.put(
@@ -817,6 +944,251 @@ async def delete_workflow(
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
 
 
+################# Folder Endpoints #################
+@legacy_base_router.post("/folders", response_model=Folder, tags=["agent"])
+@legacy_base_router.post("/folders/", response_model=Folder, include_in_schema=False)
+@base_router.post(
+    "/folders",
+    response_model=Folder,
+    tags=["Workflows"],
+    description="Create a new folder to organize workflows",
+    summary="Create folder",
+    responses={
+        200: {"description": "Successfully created folder"},
+        400: {"description": "Invalid request"},
+    },
+)
+@base_router.post("/folders/", response_model=Folder, include_in_schema=False)
+async def create_folder(
+    data: FolderCreate,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Folder:
+    analytics.capture("skyvern-oss-folder-create")
+    folder_model = await app.DATABASE.create_folder(
+        organization_id=current_org.organization_id,
+        title=data.title,
+        description=data.description,
+    )
+    workflow_count = await app.DATABASE.get_folder_workflow_count(
+        folder_id=folder_model.folder_id,
+        organization_id=current_org.organization_id,
+    )
+    return Folder(
+        folder_id=folder_model.folder_id,
+        organization_id=folder_model.organization_id,
+        title=folder_model.title,
+        description=folder_model.description,
+        workflow_count=workflow_count,
+        created_at=folder_model.created_at,
+        modified_at=folder_model.modified_at,
+    )
+
+
+@legacy_base_router.get("/folders/{folder_id}", response_model=Folder, tags=["agent"])
+@legacy_base_router.get("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
+@base_router.get(
+    "/folders/{folder_id}",
+    response_model=Folder,
+    tags=["Workflows"],
+    description="Get a specific folder by ID",
+    summary="Get folder",
+    responses={
+        200: {"description": "Successfully retrieved folder"},
+        404: {"description": "Folder not found"},
+    },
+)
+@base_router.get("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
+async def get_folder(
+    folder_id: str = Path(..., description="Folder ID", examples=["fld_123"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Folder:
+    folder = await app.DATABASE.get_folder(
+        folder_id=folder_id,
+        organization_id=current_org.organization_id,
+    )
+    if not folder:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
+
+    workflow_count = await app.DATABASE.get_folder_workflow_count(
+        folder_id=folder.folder_id,
+        organization_id=current_org.organization_id,
+    )
+
+    return Folder(
+        folder_id=folder.folder_id,
+        organization_id=folder.organization_id,
+        title=folder.title,
+        description=folder.description,
+        workflow_count=workflow_count,
+        created_at=folder.created_at,
+        modified_at=folder.modified_at,
+    )
+
+
+@legacy_base_router.get("/folders", response_model=list[Folder], tags=["agent"])
+@legacy_base_router.get("/folders/", response_model=list[Folder], include_in_schema=False)
+@base_router.get(
+    "/folders",
+    response_model=list[Folder],
+    tags=["Workflows"],
+    description="Get all folders for the organization",
+    summary="Get folders",
+    responses={
+        200: {"description": "Successfully retrieved folders"},
+    },
+)
+@base_router.get("/folders/", response_model=list[Folder], include_in_schema=False)
+async def get_folders(
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
+    search: str | None = Query(None, description="Search folders by title or description"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[Folder]:
+    folders = await app.DATABASE.get_folders(
+        organization_id=current_org.organization_id,
+        page=page,
+        page_size=page_size,
+        search_query=search,
+    )
+
+    # Get workflow counts for all folders in a single query
+    if folders:
+        folder_ids = [folder.folder_id for folder in folders]
+        workflow_counts = await app.DATABASE.get_folder_workflow_counts_batch(
+            folder_ids=folder_ids,
+            organization_id=current_org.organization_id,
+        )
+    else:
+        workflow_counts = {}
+
+    # Build result with workflow counts
+    result = []
+    for folder in folders:
+        result.append(
+            Folder(
+                folder_id=folder.folder_id,
+                organization_id=folder.organization_id,
+                title=folder.title,
+                description=folder.description,
+                workflow_count=workflow_counts.get(folder.folder_id, 0),
+                created_at=folder.created_at,
+                modified_at=folder.modified_at,
+            )
+        )
+
+    return result
+
+
+@legacy_base_router.put("/folders/{folder_id}", response_model=Folder, tags=["agent"])
+@legacy_base_router.put("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
+@base_router.put(
+    "/folders/{folder_id}",
+    response_model=Folder,
+    tags=["Workflows"],
+    description="Update a folder's title or description",
+    summary="Update folder",
+    responses={
+        200: {"description": "Successfully updated folder"},
+        404: {"description": "Folder not found"},
+    },
+)
+@base_router.put("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
+async def update_folder(
+    folder_id: str = Path(..., description="Folder ID", examples=["fld_123"]),
+    data: FolderUpdate = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Folder:
+    folder = await app.DATABASE.update_folder(
+        folder_id=folder_id,
+        organization_id=current_org.organization_id,
+        title=data.title,
+        description=data.description,
+    )
+    if not folder:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
+
+    workflow_count = await app.DATABASE.get_folder_workflow_count(
+        folder_id=folder.folder_id,
+        organization_id=current_org.organization_id,
+    )
+
+    return Folder(
+        folder_id=folder.folder_id,
+        organization_id=folder.organization_id,
+        title=folder.title,
+        description=folder.description,
+        workflow_count=workflow_count,
+        created_at=folder.created_at,
+        modified_at=folder.modified_at,
+    )
+
+
+@legacy_base_router.delete("/folders/{folder_id}", tags=["agent"])
+@legacy_base_router.delete("/folders/{folder_id}/", include_in_schema=False)
+@base_router.delete(
+    "/folders/{folder_id}",
+    tags=["Workflows"],
+    description="Delete a folder. Optionally delete all workflows in the folder.",
+    summary="Delete folder",
+    responses={
+        200: {"description": "Successfully deleted folder"},
+        404: {"description": "Folder not found"},
+    },
+)
+@base_router.delete("/folders/{folder_id}/", include_in_schema=False)
+async def delete_folder(
+    folder_id: str = Path(..., description="Folder ID", examples=["fld_123"]),
+    delete_workflows: bool = Query(False, description="If true, also delete all workflows in this folder"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict:
+    analytics.capture("skyvern-oss-folder-delete")
+    success = await app.DATABASE.soft_delete_folder(
+        folder_id=folder_id,
+        organization_id=current_org.organization_id,
+        delete_workflows=delete_workflows,
+    )
+    if not success:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
+
+    return {"status": "deleted", "folder_id": folder_id, "workflows_deleted": delete_workflows}
+
+
+@legacy_base_router.put("/workflows/{workflow_permanent_id}/folder", response_model=Workflow, tags=["agent"])
+@legacy_base_router.put("/workflows/{workflow_permanent_id}/folder/", response_model=Workflow, include_in_schema=False)
+@base_router.put(
+    "/workflows/{workflow_permanent_id}/folder",
+    response_model=Workflow,
+    tags=["Workflows"],
+    description="Update a workflow's folder assignment for the latest version",
+    summary="Update workflow folder",
+    responses={
+        200: {"description": "Successfully updated workflow folder"},
+        404: {"description": "Workflow not found"},
+        400: {"description": "Folder not found"},
+    },
+)
+@base_router.put("/workflows/{workflow_permanent_id}/folder/", response_model=Workflow, include_in_schema=False)
+async def update_workflow_folder(
+    workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
+    data: UpdateWorkflowFolderRequest = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Workflow:
+    try:
+        workflow = await app.DATABASE.update_workflow_folder(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=current_org.organization_id,
+            folder_id=data.folder_id,
+        )
+        if not workflow:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Workflow {workflow_permanent_id} not found"
+            )
+
+        return workflow
+    except ValueError as e:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
 @legacy_base_router.post(
     "/utilities/curl-to-http",
     tags=["Utilities"],
@@ -896,7 +1268,7 @@ async def get_artifact(
     )
     if not artifact:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
     if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
@@ -1027,7 +1399,7 @@ async def get_run_timeline(
     run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
     if not run_response:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Run not found {run_id}",
         )
 
@@ -1040,13 +1412,13 @@ async def get_run_timeline(
         task_v2 = await app.DATABASE.get_task_v2(task_v2_id=run_id, organization_id=current_org.organization_id)
         if not task_v2:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
+                status_code=http_status.HTTP_404_NOT_FOUND,
                 detail=f"Task v2 not found {run_id}",
             )
 
         if not task_v2.workflow_run_id:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=http_status.HTTP_400_BAD_REQUEST,
                 detail=f"Task v2 {run_id} has no associated workflow run",
             )
 
@@ -1054,7 +1426,7 @@ async def get_run_timeline(
 
     # Timeline not available for other run types
     raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
+        status_code=http_status.HTTP_400_BAD_REQUEST,
         detail=f"Timeline not available for run type {run_response.run_type}",
     )
 
@@ -1149,7 +1521,7 @@ async def webhook(
             payload=payload,
         )
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="Missing webhook signature or timestamp",
         )
 
@@ -1270,14 +1642,12 @@ async def cancel_task(
     task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
     if not task_obj:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Task not found {task_id}",
         )
     task = await app.agent.update_task(task_obj, status=TaskStatus.canceled)
-    # get latest step
-    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
     # retry the webhook
-    await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=x_api_key)
+    await app.agent.execute_task_webhook(task=task, api_key=x_api_key)
 
 
 async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api_key: str | None = None) -> None:
@@ -1288,7 +1658,7 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
 
     if not workflow_run:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Workflow run not found {workflow_run_id}",
         )
 
@@ -1324,7 +1694,7 @@ async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> 
 
     if not workflow_run:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Workflow run not found {workflow_run_id}",
         )
 
@@ -1398,7 +1768,7 @@ async def retry_webhook(
     task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
     if not task_obj:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Task not found {task_id}",
         )
 
@@ -1408,7 +1778,7 @@ async def retry_webhook(
         return await app.agent.build_task_response(task=task_obj)
 
     # retry the webhook
-    await app.agent.execute_task_webhook(task=task_obj, last_step=latest_step, api_key=x_api_key)
+    await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key)
 
     return await app.agent.build_task_response(task=task_obj, last_step=latest_step)
 
@@ -1452,7 +1822,7 @@ async def get_tasks(
     analytics.capture("skyvern-oss-agent-tasks-get")
     if only_standalone_tasks and workflow_run_id:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="only_standalone_tasks and workflow_run_id cannot be used together",
         )
     tasks = await app.DATABASE.get_tasks(
@@ -1487,6 +1857,10 @@ async def get_runs(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    search_key: str | None = Query(
+        None,
+        description="Search runs by parameter key, parameter description, or run parameter value.",
+    ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-get")
 
@@ -1494,7 +1868,9 @@ async def get_runs(
     if page > 10:
         return []
 
-    runs = await app.DATABASE.get_all_runs(current_org.organization_id, page=page, page_size=page_size, status=status)
+    runs = await app.DATABASE.get_all_runs(
+        current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
+    )
     return ORJSONResponse([run.model_dump() for run in runs])
 
 
@@ -1560,7 +1936,7 @@ async def get_artifacts(
 
     if entity_type not in entity_type_to_param:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid entity_type: {entity_type}",
         )
 
@@ -1828,7 +2204,7 @@ async def get_workflow_and_run_from_workflow_run_id(
 
     if not workflow:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Workflow run not found {workflow_run_id}",
         )
 
@@ -1926,9 +2302,11 @@ async def get_workflows(
     only_workflows: bool = Query(False),
     search_key: str | None = Query(
         None,
-        description="Unified search across workflow title and parameter metadata (key, description, default_value).",
+        description="Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).",
     ),
     title: str = Query("", deprecated=True, description="Deprecated: use search_key instead."),
+    folder_id: str | None = Query(None, description="Filter workflows by folder ID"),
+    status: Annotated[list[WorkflowStatus] | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> list[Workflow]:
@@ -1936,8 +2314,8 @@ async def get_workflows(
     Get all workflows with the latest version for the organization.
 
     Search semantics:
-    - If `search_key` is provided, its value is used as a unified search term for both
-      `workflows.title` and workflow parameter metadata (key, description, and default_value for
+    - If `search_key` is provided, its value is used as a unified search term for
+      `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for
       `WorkflowParameterModel`).
     - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
     - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
@@ -1946,6 +2324,9 @@ async def get_workflows(
 
     # Determine the effective search term: prioritize search_key, fallback to title
     effective_search = search_key or (title if title else None)
+
+    # Default to published and draft if no status filter provided
+    effective_statuses = status if status else [WorkflowStatus.published, WorkflowStatus.draft]
 
     if template:
         global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
@@ -1956,13 +2337,13 @@ async def get_workflows(
             page=page,
             page_size=page_size,
             search_key=effective_search or "",
-            statuses=[WorkflowStatus.published, WorkflowStatus.draft],
+            statuses=effective_statuses,
         )
         return workflows
 
     if only_saved_tasks and only_workflows:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="only_saved_tasks and only_workflows cannot be used together",
         )
 
@@ -1973,7 +2354,8 @@ async def get_workflows(
         only_saved_tasks=only_saved_tasks,
         only_workflows=only_workflows,
         search_key=effective_search,
-        statuses=[WorkflowStatus.published, WorkflowStatus.draft],
+        folder_id=folder_id,
+        statuses=effective_statuses,
     )
 
 
@@ -2182,22 +2564,6 @@ async def get_api_keys(
     return GetOrganizationAPIKeysResponse(api_keys=api_keys)
 
 
-async def _validate_file_size(file: UploadFile) -> UploadFile:
-    try:
-        file.file.seek(0, 2)  # Move the pointer to the end of the file
-        size = file.file.tell()  # Get the current position of the pointer, which represents the file size
-        file.file.seek(0)  # Reset the pointer back to the beginning
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Could not determine file size.") from e
-
-    if size > app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE / 1024 / 1024} MB)",
-        )
-    return file
-
-
 @legacy_base_router.post(
     "/upload_file",
     tags=["server"],
@@ -2311,6 +2677,59 @@ async def get_task_v2(
     return task_v2.model_dump(by_alias=True)
 
 
+async def _flatten_workflow_run_timeline_recursive(
+    timeline: WorkflowRunTimeline,
+    organization_id: str,
+) -> list[WorkflowRunTimeline]:
+    """
+    Recursively flatten a timeline item and its children, handling TaskV2 blocks.
+
+    TaskV2 blocks are replaced with their internal workflow run blocks.
+    Other blocks (like ForLoop) are kept with their children recursively processed.
+    """
+    result = []
+
+    # Check if this is a TaskV2 block that needs to be flattened
+    if timeline.block and timeline.block.block_type == BlockType.TaskV2:
+        if timeline.block.block_workflow_run_id:
+            # Recursively flatten the TaskV2's internal workflow run
+            nested_timeline = await _flatten_workflow_run_timeline(
+                organization_id=organization_id,
+                workflow_run_id=timeline.block.block_workflow_run_id,
+            )
+            result.extend(nested_timeline)
+        else:
+            LOG.warning(
+                "Block workflow run id is not set for task_v2 block",
+                workflow_run_block_id=timeline.block.workflow_run_block_id if timeline.block else None,
+                organization_id=organization_id,
+            )
+            result.append(timeline)
+    else:
+        # For non-TaskV2 blocks, process children recursively to handle nested TaskV2 blocks
+        new_children = []
+        if timeline.children:
+            for child in timeline.children:
+                child_results = await _flatten_workflow_run_timeline_recursive(
+                    timeline=child,
+                    organization_id=organization_id,
+                )
+                new_children.extend(child_results)
+
+        # Create a new timeline with processed children
+        processed_timeline = WorkflowRunTimeline(
+            type=timeline.type,
+            block=timeline.block,
+            thought=timeline.thought,
+            children=new_children,
+            created_at=timeline.created_at,
+            modified_at=timeline.modified_at,
+        )
+        result.append(processed_timeline)
+
+    return result
+
+
 async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: str) -> list[WorkflowRunTimeline]:
     """
     Get the timeline workflow runs including the nested workflow runs in a flattened list
@@ -2326,29 +2745,18 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
-    # loop through the run block timeline, find the task_v2 blocks, flatten the timeline for task_v2
+
+    # Recursively flatten the timeline, handling TaskV2 blocks at any nesting level
     final_workflow_run_block_timeline = []
     for timeline in workflow_run_block_timeline:
         if not timeline.block:
             continue
-        if timeline.block.block_type != BlockType.TaskV2:
-            # flatten the timeline for task_v2
-            final_workflow_run_block_timeline.append(timeline)
-            continue
-        if not timeline.block.block_workflow_run_id:
-            LOG.warning(
-                "Block workflow run id is not set for task_v2 block",
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                task_v2_id=task_v2_obj.observer_cruise_id if task_v2_obj else None,
-            )
-            continue
-        # in the future if we want to nested taskv2 shows up as a nested block, we should not flatten the timeline
-        workflow_blocks = await _flatten_workflow_run_timeline(
+
+        flattened = await _flatten_workflow_run_timeline_recursive(
+            timeline=timeline,
             organization_id=organization_id,
-            workflow_run_id=timeline.block.block_workflow_run_id,
         )
-        final_workflow_run_block_timeline.extend(workflow_blocks)
+        final_workflow_run_block_timeline.extend(flattened)
 
     if task_v2_obj and task_v2_obj.observer_cruise_id:
         thought_timeline = await task_v2_service.get_thought_timelines(

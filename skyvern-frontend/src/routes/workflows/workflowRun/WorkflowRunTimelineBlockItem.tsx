@@ -144,7 +144,10 @@ function WorkflowRunTimelineBlockItem({
             <div className="flex flex-col items-end gap-[1px]">
               <div className="flex gap-1 self-start rounded bg-slate-elevation5 px-2 py-1">
                 {showDiagnosticLink ? (
-                  <Link to={`/tasks/${block.task_id}/diagnostics`}>
+                  <Link
+                    to={`/tasks/${block.task_id}/diagnostics`}
+                    onClick={(event) => event.stopPropagation()}
+                  >
                     <div className="flex gap-1">
                       <ExternalLinkIcon className="size-4" />
                       <span className="text-xs">Diagnostics</span>

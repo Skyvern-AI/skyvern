@@ -37,6 +37,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -113,6 +114,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
             </div>
 
             <WorkflowBlockInputTextarea
+              aiImprove={AI_IMPROVE_CONFIGS.extraction.dataExtractionGoal}
               nodeId={id}
               onChange={(value) => {
                 if (!editable) {
@@ -232,12 +234,8 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={data.cacheActions}
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

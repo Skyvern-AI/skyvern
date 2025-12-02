@@ -31,6 +31,8 @@ export interface WorkflowRunResponse {
     app_url?: string;
     /** ID of the Skyvern persistent browser session used for this run */
     browser_session_id?: string;
+    /** ID of the browser profile used for this run */
+    browser_profile_id?: string;
     /** The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot */
     max_screenshot_scrolls?: number;
     /** The script run result */

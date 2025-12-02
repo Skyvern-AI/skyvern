@@ -24,10 +24,10 @@ from .types.credential_response import CredentialResponse
 from .types.get_run_response import GetRunResponse
 from .types.proxy_location import ProxyLocation
 from .types.run_engine import RunEngine
+from .types.run_sdk_action_request_action import RunSdkActionRequestAction
 from .types.run_sdk_action_response import RunSdkActionResponse
 from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
-from .types.sdk_action import SdkAction
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 from .types.skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
 from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
@@ -37,6 +37,7 @@ from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .types.workflow_run_response import WorkflowRunResponse
 from .types.workflow_run_timeline import WorkflowRunTimeline
+from .types.workflow_status import WorkflowStatus
 
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
@@ -255,6 +256,7 @@ class RawSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
@@ -321,6 +323,9 @@ class RawSkyvern:
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this workflow run
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -359,6 +364,7 @@ class RawSkyvern:
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
                 "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "extra_http_headers": extra_http_headers,
                 "browser_address": browser_address,
@@ -532,6 +538,8 @@ class RawSkyvern:
         only_workflows: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
+        folder_id: typing.Optional[str] = None,
+        status: typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]] = None,
         template: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[typing.List[Workflow]]:
@@ -539,8 +547,8 @@ class RawSkyvern:
         Get all workflows with the latest version for the organization.
 
         Search semantics:
-        - If `search_key` is provided, its value is used as a unified search term for both
-          `workflows.title` and workflow parameter metadata (key, description, and default_value for
+        - If `search_key` is provided, its value is used as a unified search term for
+          `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for
           `WorkflowParameterModel`).
         - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
         - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
@@ -556,10 +564,15 @@ class RawSkyvern:
         only_workflows : typing.Optional[bool]
 
         search_key : typing.Optional[str]
-            Unified search across workflow title and parameter metadata (key, description, default_value).
+            Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
 
         title : typing.Optional[str]
             Deprecated: use search_key instead.
+
+        folder_id : typing.Optional[str]
+            Filter workflows by folder ID
+
+        status : typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]]
 
         template : typing.Optional[bool]
 
@@ -581,6 +594,8 @@ class RawSkyvern:
                 "only_workflows": only_workflows,
                 "search_key": search_key,
                 "title": title,
+                "folder_id": folder_id,
+                "status": status,
                 "template": template,
             },
             request_options=request_options,
@@ -614,6 +629,7 @@ class RawSkyvern:
     def create_workflow(
         self,
         *,
+        folder_id: typing.Optional[str] = None,
         json_definition: typing.Optional[WorkflowCreateYamlRequest] = OMIT,
         yaml_definition: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -623,6 +639,9 @@ class RawSkyvern:
 
         Parameters
         ----------
+        folder_id : typing.Optional[str]
+            Optional folder ID to assign the workflow to
+
         json_definition : typing.Optional[WorkflowCreateYamlRequest]
             Workflow definition in JSON format
 
@@ -640,6 +659,9 @@ class RawSkyvern:
         _response = self._client_wrapper.httpx_client.request(
             "v1/workflows",
             method="POST",
+            params={
+                "folder_id": folder_id,
+            },
             json={
                 "json_definition": convert_and_respect_annotation_metadata(
                     object_=json_definition, annotation=WorkflowCreateYamlRequest, direction="write"
@@ -1661,6 +1683,7 @@ class RawSkyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
@@ -1703,6 +1726,9 @@ class RawSkyvern:
 
         browser_session_id : typing.Optional[str]
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
 
         browser_address : typing.Optional[str]
             The CDP address for the task.
@@ -1760,6 +1786,7 @@ class RawSkyvern:
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
                 "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
@@ -2058,8 +2085,7 @@ class RawSkyvern:
         self,
         *,
         url: str,
-        action: SdkAction,
-        user_agent: typing.Optional[str] = None,
+        action: RunSdkActionRequestAction,
         browser_session_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
@@ -2073,10 +2099,8 @@ class RawSkyvern:
         url : str
             The URL where the action should be executed
 
-        action : SdkAction
+        action : RunSdkActionRequestAction
             The action to execute with its specific parameters
-
-        user_agent : typing.Optional[str]
 
         browser_session_id : typing.Optional[str]
             The browser session ID
@@ -2093,7 +2117,7 @@ class RawSkyvern:
         Returns
         -------
         HttpResponse[RunSdkActionResponse]
-            Successfully executed SDK action
+            Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
             "v1/sdk/run_action",
@@ -2104,12 +2128,11 @@ class RawSkyvern:
                 "browser_address": browser_address,
                 "workflow_run_id": workflow_run_id,
                 "action": convert_and_respect_annotation_metadata(
-                    object_=action, annotation=SdkAction, direction="write"
+                    object_=action, annotation=RunSdkActionRequestAction, direction="write"
                 ),
             },
             headers={
                 "content-type": "application/json",
-                "x-user-agent": str(user_agent) if user_agent is not None else None,
             },
             request_options=request_options,
             omit=OMIT,
@@ -2124,39 +2147,6 @@ class RawSkyvern:
                     ),
                 )
                 return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 403:
-                raise ForbiddenError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     headers=dict(_response.headers),
@@ -2387,6 +2377,7 @@ class AsyncRawSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
@@ -2453,6 +2444,9 @@ class AsyncRawSkyvern:
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this workflow run
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -2491,6 +2485,7 @@ class AsyncRawSkyvern:
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
                 "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "extra_http_headers": extra_http_headers,
                 "browser_address": browser_address,
@@ -2664,6 +2659,8 @@ class AsyncRawSkyvern:
         only_workflows: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
+        folder_id: typing.Optional[str] = None,
+        status: typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]] = None,
         template: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[typing.List[Workflow]]:
@@ -2671,8 +2668,8 @@ class AsyncRawSkyvern:
         Get all workflows with the latest version for the organization.
 
         Search semantics:
-        - If `search_key` is provided, its value is used as a unified search term for both
-          `workflows.title` and workflow parameter metadata (key, description, and default_value for
+        - If `search_key` is provided, its value is used as a unified search term for
+          `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for
           `WorkflowParameterModel`).
         - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
         - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
@@ -2688,10 +2685,15 @@ class AsyncRawSkyvern:
         only_workflows : typing.Optional[bool]
 
         search_key : typing.Optional[str]
-            Unified search across workflow title and parameter metadata (key, description, default_value).
+            Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
 
         title : typing.Optional[str]
             Deprecated: use search_key instead.
+
+        folder_id : typing.Optional[str]
+            Filter workflows by folder ID
+
+        status : typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]]
 
         template : typing.Optional[bool]
 
@@ -2713,6 +2715,8 @@ class AsyncRawSkyvern:
                 "only_workflows": only_workflows,
                 "search_key": search_key,
                 "title": title,
+                "folder_id": folder_id,
+                "status": status,
                 "template": template,
             },
             request_options=request_options,
@@ -2746,6 +2750,7 @@ class AsyncRawSkyvern:
     async def create_workflow(
         self,
         *,
+        folder_id: typing.Optional[str] = None,
         json_definition: typing.Optional[WorkflowCreateYamlRequest] = OMIT,
         yaml_definition: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -2755,6 +2760,9 @@ class AsyncRawSkyvern:
 
         Parameters
         ----------
+        folder_id : typing.Optional[str]
+            Optional folder ID to assign the workflow to
+
         json_definition : typing.Optional[WorkflowCreateYamlRequest]
             Workflow definition in JSON format
 
@@ -2772,6 +2780,9 @@ class AsyncRawSkyvern:
         _response = await self._client_wrapper.httpx_client.request(
             "v1/workflows",
             method="POST",
+            params={
+                "folder_id": folder_id,
+            },
             json={
                 "json_definition": convert_and_respect_annotation_metadata(
                     object_=json_definition, annotation=WorkflowCreateYamlRequest, direction="write"
@@ -3793,6 +3804,7 @@ class AsyncRawSkyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
@@ -3835,6 +3847,9 @@ class AsyncRawSkyvern:
 
         browser_session_id : typing.Optional[str]
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
 
         browser_address : typing.Optional[str]
             The CDP address for the task.
@@ -3892,6 +3907,7 @@ class AsyncRawSkyvern:
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
                 "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
@@ -4190,8 +4206,7 @@ class AsyncRawSkyvern:
         self,
         *,
         url: str,
-        action: SdkAction,
-        user_agent: typing.Optional[str] = None,
+        action: RunSdkActionRequestAction,
         browser_session_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
@@ -4205,10 +4220,8 @@ class AsyncRawSkyvern:
         url : str
             The URL where the action should be executed
 
-        action : SdkAction
+        action : RunSdkActionRequestAction
             The action to execute with its specific parameters
-
-        user_agent : typing.Optional[str]
 
         browser_session_id : typing.Optional[str]
             The browser session ID
@@ -4225,7 +4238,7 @@ class AsyncRawSkyvern:
         Returns
         -------
         AsyncHttpResponse[RunSdkActionResponse]
-            Successfully executed SDK action
+            Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
             "v1/sdk/run_action",
@@ -4236,12 +4249,11 @@ class AsyncRawSkyvern:
                 "browser_address": browser_address,
                 "workflow_run_id": workflow_run_id,
                 "action": convert_and_respect_annotation_metadata(
-                    object_=action, annotation=SdkAction, direction="write"
+                    object_=action, annotation=RunSdkActionRequestAction, direction="write"
                 ),
             },
             headers={
                 "content-type": "application/json",
-                "x-user-agent": str(user_agent) if user_agent is not None else None,
             },
             request_options=request_options,
             omit=OMIT,
@@ -4256,39 +4268,6 @@ class AsyncRawSkyvern:
                     ),
                 )
                 return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 403:
-                raise ForbiddenError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     headers=dict(_response.headers),

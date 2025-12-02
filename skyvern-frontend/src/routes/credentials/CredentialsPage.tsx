@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { CardStackIcon, PlusIcon } from "@radix-ui/react-icons";
 import {
@@ -16,13 +16,36 @@ import {
 import { KeyIcon } from "@/components/icons/KeyIcon";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CredentialsTotpTab } from "./CredentialsTotpTab";
+import { useSearchParams } from "react-router-dom";
 
 const subHeaderText =
   "Securely store your passwords, credit cards, and manage incoming 2FA codes for your workflows.";
 
+const TAB_VALUES = ["passwords", "creditCards", "twoFactor"] as const;
+type TabValue = (typeof TAB_VALUES)[number];
+const DEFAULT_TAB: TabValue = "passwords";
+
 function CredentialsPage() {
   const { setIsOpen, setType } = useCredentialModalState();
-  const [activeTab, setActiveTab] = useState("passwords");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tabParam = searchParams.get("tab");
+  const matchedTab = TAB_VALUES.find((tab) => tab === tabParam);
+  const activeTab: TabValue = matchedTab ?? DEFAULT_TAB;
+
+  useEffect(() => {
+    if (tabParam && !matchedTab) {
+      const params = new URLSearchParams(searchParams);
+      params.set("tab", DEFAULT_TAB);
+      setSearchParams(params, { replace: true });
+    }
+  }, [tabParam, matchedTab, searchParams, setSearchParams]);
+
+  function handleTabChange(value: string) {
+    const nextTab = TAB_VALUES.find((tab) => tab === value) ?? DEFAULT_TAB;
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", nextTab);
+    setSearchParams(params, { replace: true });
+  }
 
   return (
     <div className="space-y-5">
@@ -60,9 +83,9 @@ function CredentialsPage() {
         </DropdownMenu>
       </div>
       <Tabs
-        defaultValue="passwords"
+        value={activeTab}
         className="space-y-4"
-        onValueChange={setActiveTab}
+        onValueChange={handleTabChange}
       >
         <TabsList className="bg-slate-elevation1">
           <TabsTrigger value="passwords">Passwords</TabsTrigger>
