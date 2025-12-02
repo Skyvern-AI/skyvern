@@ -793,6 +793,15 @@ class ThoughtModel(Base):
 
 class PersistentBrowserSessionModel(Base):
     __tablename__ = "persistent_browser_sessions"
+    __table_args__ = (
+        Index(
+            "idx_persistent_browser_sessions_org_created_started_completed",
+            "organization_id",
+            "created_at",
+            "started_at",
+            "completed_at",
+        ),
+    )
 
     persistent_browser_session_id = Column(String, primary_key=True, default=generate_persistent_browser_session_id)
     organization_id = Column(String, nullable=False, index=True)
