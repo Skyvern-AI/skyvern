@@ -26,7 +26,7 @@ from skyvern.webeye.actions.actions import (
     SolveCaptchaAction,
 )
 from skyvern.webeye.actions.handler import ActionHandler, handle_complete_action
-from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 
 LOG = structlog.get_logger()

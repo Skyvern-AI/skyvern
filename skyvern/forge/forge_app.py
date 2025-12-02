@@ -32,6 +32,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
 
 
@@ -92,7 +93,7 @@ def create_forge_app() -> ForgeApp:
     app.STORAGE = StorageFactory.get_storage()
     app.CACHE = CacheFactory.get_cache()
     app.ARTIFACT_MANAGER = ArtifactManager()
-    app.BROWSER_MANAGER = BrowserManager()
+    app.BROWSER_MANAGER = RealBrowserManager()
     app.EXPERIMENTATION_PROVIDER = NoOpExperimentationProvider()
 
     app.LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(settings.LLM_KEY)
