@@ -244,7 +244,7 @@ function RunWorkflowForm({
     defaultValues: {
       ...initialValues,
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
-      proxyLocation: initialSettings.proxyLocation,
+      proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
@@ -342,7 +342,7 @@ function RunWorkflowForm({
     form.reset({
       ...initialValues,
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
-      proxyLocation: initialSettings.proxyLocation,
+      proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,

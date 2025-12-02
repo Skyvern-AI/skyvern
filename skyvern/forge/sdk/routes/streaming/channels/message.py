@@ -275,6 +275,9 @@ class MessageChannel:
             except RuntimeError as ex:
                 if "not connected" in str(ex).lower():
                     break
+            except WebSocketDisconnect:
+                LOG.warning(f"{self.class_name} Disconnected while receiving message from channel", **self.identity)
+                break
             except Exception:
                 LOG.exception(f"{self.class_name} Failed to receive message from message channel", **self.identity)
                 break
