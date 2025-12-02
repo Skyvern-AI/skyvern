@@ -17,7 +17,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     is_final_status,
 )
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
-from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
 
