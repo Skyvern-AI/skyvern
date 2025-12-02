@@ -10914,6 +10914,22 @@
             "examples": [
               "authenticator"
             ]
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "Identifier (email or phone number) used to fetch TOTP codes",
+            "examples": [
+              "user@example.com",
+              "+14155550123"
+            ]
           }
         },
         "type": "object",
@@ -11298,6 +11314,22 @@
             "default": "none",
             "examples": [
               "authenticator"
+            ]
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "Identifier (email or phone number) used to fetch TOTP codes",
+            "examples": [
+              "user@example.com",
+              "+14155550123"
             ]
           }
         },
