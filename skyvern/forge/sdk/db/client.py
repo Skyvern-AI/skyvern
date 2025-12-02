@@ -4515,6 +4515,7 @@ class AgentDB:
         totp_type: str,
         card_last4: str | None,
         card_brand: str | None,
+        totp_identifier: str | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = CredentialModel(
@@ -4525,6 +4526,7 @@ class AgentDB:
                 credential_type=credential_type,
                 username=username,
                 totp_type=totp_type,
+                totp_identifier=totp_identifier,
                 card_last4=card_last4,
                 card_brand=card_brand,
             )
