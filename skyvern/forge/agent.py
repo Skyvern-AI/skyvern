@@ -2352,6 +2352,33 @@ class ForgeAgent:
 
         # If we don't have pre-scraped data, scrape normally
         if scraped_page is None:
+            # Scroll back to last hovered element position BEFORE scraping
+            # This ensures the element is visible in the screenshot taken during scraping
+            if context and context.last_hovered_element_page_y is not None:
+                try:
+                    working_page = await browser_state.must_get_working_page()
+                    # Get viewport height to center the element
+                    viewport_height = await working_page.evaluate("window.innerHeight")
+                    # Calculate scroll position to center the element in viewport
+                    target_scroll_y = context.last_hovered_element_page_y - (viewport_height / 2)
+                    target_scroll_y = max(0, target_scroll_y)  # Don't scroll to negative
+
+                    LOG.info(
+                        "Scrolling back to last hovered element position before scraping",
+                        element_id=context.last_hovered_element_id,
+                        absolute_page_y=context.last_hovered_element_page_y,
+                        target_scroll_y=target_scroll_y,
+                    )
+                    await working_page.evaluate(f"window.scrollTo(0, {target_scroll_y})")
+                    # Small delay to let the scroll settle
+                    await asyncio.sleep(0.3)
+
+                    # Clear the saved position after scrolling back
+                    context.last_hovered_element_page_y = None
+                    context.last_hovered_element_id = None
+                except Exception:
+                    LOG.warning("Failed to scroll back to hovered element position before scraping", exc_info=True)
+
             # Check PostHog for speed optimizations BEFORE scraping
             # This decision will be used in both:
             # 1. SVG conversion skip (in agent_functions.py cleanup)

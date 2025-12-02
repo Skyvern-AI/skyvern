@@ -2016,6 +2016,31 @@ async def handle_hover_action(
         await skyvern_element.hover_to_reveal()
         await skyvern_element.get_locator().scroll_into_view_if_needed()
         await skyvern_element.get_locator().hover(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+
+        # Save the absolute page position of the hovered element
+        # This allows us to scroll back to this position after re-scraping
+        try:
+            bounding_box = await skyvern_element.get_locator().bounding_box(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+            if bounding_box:
+                # Get current scroll position
+                scroll_y = await page.evaluate("window.scrollY")
+                # Calculate absolute page Y = viewport Y + scroll offset
+                absolute_page_y = bounding_box["y"] + scroll_y
+
+                context = skyvern_context.current()
+                if context:
+                    context.last_hovered_element_page_y = absolute_page_y
+                    context.last_hovered_element_id = action.element_id
+                    LOG.info(
+                        "Saved hovered element absolute position",
+                        element_id=action.element_id,
+                        viewport_y=bounding_box["y"],
+                        scroll_y=scroll_y,
+                        absolute_page_y=absolute_page_y,
+                    )
+        except Exception:
+            LOG.warning("Failed to save hovered element position", exc_info=True)
+
         if action.hold_seconds and action.hold_seconds > 0:
             await asyncio.sleep(action.hold_seconds)
         return [ActionSuccess()]
