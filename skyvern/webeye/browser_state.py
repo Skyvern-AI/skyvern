@@ -9,6 +9,7 @@ from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc
+from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 
 
 class BrowserState(Protocol):
@@ -68,3 +69,18 @@ class BrowserState(Protocol):
     async def take_fullpage_screenshot(self, file_path: str | None = None) -> bytes: ...
 
     async def take_post_action_screenshot(self, scrolling_number: int, file_path: str | None = None) -> bytes: ...
+
+    async def scrape_website(
+        self,
+        url: str,
+        cleanup_element_tree: CleanupElementTreeFunc,
+        num_retry: int = 0,
+        max_retries: int = settings.MAX_SCRAPING_RETRIES,
+        scrape_exclude: ScrapeExcludeFunc | None = None,
+        take_screenshots: bool = True,
+        draw_boxes: bool = True,
+        max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
+        scroll: bool = True,
+        support_empty_page: bool = False,
+        wait_seconds: float = 0,
+    ) -> ScrapedPage: ...
