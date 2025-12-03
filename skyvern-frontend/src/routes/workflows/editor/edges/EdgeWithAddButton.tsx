@@ -131,9 +131,7 @@ function EdgeWithAddButton({
   const menu = (
     <WorkflowAddMenu
       buttonSize="25px"
-      gap={35}
-      radius="50px"
-      startAt={72.5}
+      radius="40px"
       onAdd={onAdd}
       onRecord={onRecord}
     >
