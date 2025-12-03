@@ -5180,7 +5180,62 @@
           "criteria": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/BranchCriteria"
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/JinjaBranchCriteria"
+                  }
+                ],
+                "discriminator": {
+                  "propertyName": "criteria_type",
+                  "mapping": {
+                    "jinja2_template": "#/components/schemas/JinjaBranchCriteria"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Criteria"
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "is_default": {
+            "type": "boolean",
+            "title": "Is Default",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "BranchCondition",
+        "description": "Represents a single conditional branch edge within a ConditionalBlock."
+      },
+      "BranchConditionYAML": {
+        "properties": {
+          "criteria": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BranchCriteriaYAML"
               },
               {
                 "type": "null"
@@ -5216,14 +5271,15 @@
           }
         },
         "type": "object",
-        "title": "BranchCondition",
-        "description": "Represents a single conditional branch edge within a ConditionalBlock."
+        "title": "BranchConditionYAML"
       },
-      "BranchCriteria": {
+      "BranchCriteriaYAML": {
         "properties": {
           "criteria_type": {
             "type": "string",
-            "title": "Criteria Type"
+            "const": "jinja2_template",
+            "title": "Criteria Type",
+            "default": "jinja2_template"
           },
           "expression": {
             "type": "string",
@@ -5243,11 +5299,9 @@
         },
         "type": "object",
         "required": [
-          "criteria_type",
           "expression"
         ],
-        "title": "BranchCriteria",
-        "description": "Abstract interface describing how a branch condition should be evaluated."
+        "title": "BranchCriteriaYAML"
       },
       "BrowserProfile": {
         "properties": {
@@ -5847,6 +5901,62 @@
         ],
         "title": "ConditionalBlock",
         "description": "Branching block that selects the next block label based on list-ordered conditions."
+      },
+      "ConditionalBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "conditional",
+            "title": "Block Type",
+            "default": "conditional"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "branch_conditions": {
+            "items": {
+              "$ref": "#/components/schemas/BranchConditionYAML"
+            },
+            "type": "array",
+            "title": "Branch Conditions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "ConditionalBlockYAML"
       },
       "ContextParameter": {
         "properties": {
@@ -8573,6 +8683,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ConditionalBlockYAML"
                 }
               ]
             },
@@ -9567,6 +9680,37 @@
         "type": "object",
         "title": "InputTextAction",
         "description": "Input text action parameters."
+      },
+      "JinjaBranchCriteria": {
+        "properties": {
+          "criteria_type": {
+            "type": "string",
+            "const": "jinja2_template",
+            "title": "Criteria Type",
+            "default": "jinja2_template"
+          },
+          "expression": {
+            "type": "string",
+            "title": "Expression"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "expression"
+        ],
+        "title": "JinjaBranchCriteria",
+        "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
       },
       "LocateElementAction": {
         "properties": {
@@ -15879,6 +16023,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ConditionalBlockYAML"
                 }
               ],
               "discriminator": {
@@ -15886,6 +16033,7 @@
                 "mapping": {
                   "action": "#/components/schemas/ActionBlockYAML",
                   "code": "#/components/schemas/CodeBlockYAML",
+                  "conditional": "#/components/schemas/ConditionalBlockYAML",
                   "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
                   "extraction": "#/components/schemas/ExtractionBlockYAML",
                   "file_download": "#/components/schemas/FileDownloadBlockYAML",
