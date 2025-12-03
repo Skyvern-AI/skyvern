@@ -14,6 +14,7 @@ import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { ModelSelector } from "@/components/ModelSelector";
+import { useRecordingStore } from "@/store/useRecordingStore";
 
 function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
   const { editable, label } = data;
@@ -27,9 +28,14 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<PDFParserNode["data"]>({ id, editable });
+  const recordingStore = useRecordingStore();
 
   return (
-    <div>
+    <div
+      className={cn({
+        "pointer-events-none opacity-50": recordingStore.isRecording,
+      })}
+    >
       <Handle
         type="source"
         position={Position.Bottom}

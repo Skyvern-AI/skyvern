@@ -1362,13 +1362,15 @@ function Workspace({
                           "mr-16": !blockLabel,
                         })}
                       >
-                        {showPowerButton && (
+                        {!recordingStore.isRecording && showPowerButton && (
                           <PowerButton onClick={() => cycle()} />
                         )}
-                        <ReloadButton
-                          isReloading={isReloading}
-                          onClick={() => reload()}
-                        />
+                        {!recordingStore.isRecording && (
+                          <ReloadButton
+                            isReloading={isReloading}
+                            onClick={() => reload()}
+                          />
+                        )}
                       </div>
                     </footer>
                   </div>

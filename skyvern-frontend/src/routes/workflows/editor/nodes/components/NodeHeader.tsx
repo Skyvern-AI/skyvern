@@ -30,6 +30,7 @@ import {
 import { getInitialValues } from "@/routes/workflows/utils";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
 import {
@@ -169,6 +170,7 @@ function NodeHeader({
   } = useParams();
   const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
+  const recordingStore = useRecordingStore();
   const { closeWorkflowPanel } = useWorkflowPanelStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -203,6 +205,8 @@ function NodeHeader({
 
   const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
+
+  const isRecording = recordingStore.isRecording;
 
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
@@ -590,7 +594,8 @@ function NodeHeader({
                     "pointer-events-none fill-gray-500 text-gray-500":
                       workflowRunIsRunningOrQueued ||
                       !workflowPermanentId ||
-                      debugSession === undefined,
+                      debugSession === undefined ||
+                      isRecording,
                   })}
                   onClick={() => {
                     handleOnPlay();
