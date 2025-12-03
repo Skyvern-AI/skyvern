@@ -137,6 +137,8 @@ navigation:
         contents:
           - page: Introduction
             path: browser-sessions/introduction.mdx
+          - page: Browser Profiles
+            path: browser-sessions/browser-profiles.mdx
       - section: Observability
         contents:
           - page: Overview
