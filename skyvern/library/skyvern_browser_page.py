@@ -5,6 +5,7 @@ import structlog
 from playwright.async_api import Page
 
 from skyvern.client import GetRunResponse
+from skyvern.client.core import RequestOptions
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
@@ -85,9 +86,12 @@ class SkyvernPageRun:
             browser_session_id=self._browser.browser_session_id,
             browser_address=self._browser.browser_address,
             user_agent=user_agent,
+            request_options=RequestOptions(additional_headers={"X-User-Agent": "skyvern-sdk"}),
         )
+        LOG.info("AI task is running, this may take a while", run_id=task_run.run_id)
 
         task_run = await self._wait_for_run_completion(task_run.run_id, timeout)
+        LOG.info("AI task finished", run_id=task_run.run_id, status=task_run.status)
         return TaskRunResponse.model_validate(task_run.model_dump())
 
     async def login(
@@ -110,7 +114,7 @@ class SkyvernPageRun:
         """Run a login task in the context of this page and wait for it to finish.
 
         Args:
-            credential_type: Type of credential store to use (e.g., bitwarden, onepassword).
+            credential_type: Type of credential store to use (e.g., skyvern, bitwarden, onepassword).
             url: URL to navigate to for login. If not provided, uses the current page URL.
             credential_id: ID of the credential to use.
             bitwarden_collection_id: Bitwarden collection ID containing the credentials.
@@ -128,7 +132,7 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the login workflow execution results.
         """
 
-        LOG.info("AI login", prompt=prompt)
+        LOG.info("Starting AI login workflow", credential_type=credential_type)
 
         workflow_run = await self._browser.skyvern.login(
             credential_type=credential_type,
@@ -145,9 +149,12 @@ class SkyvernPageRun:
             browser_session_id=self._browser.browser_session_id,
             browser_address=self._browser.browser_address,
             extra_http_headers=extra_http_headers,
+            request_options=RequestOptions(additional_headers={"X-User-Agent": "skyvern-sdk"}),
         )
+        LOG.info("AI login workflow is running, this may take a while", run_id=workflow_run.run_id)
 
         workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
+        LOG.info("AI login workflow finished", run_id=workflow_run.run_id, status=workflow_run.status)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
     async def workflow(
@@ -177,7 +184,7 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the workflow execution results.
         """
 
-        LOG.info("AI run workflow", workflow_id=workflow_id)
+        LOG.info("Starting AI workflow", workflow_id=workflow_id)
 
         workflow_run = await self._browser.skyvern.run_workflow(
             workflow_id=workflow_id,
@@ -189,9 +196,12 @@ class SkyvernPageRun:
             totp_identifier=totp_identifier,
             browser_session_id=self._browser.browser_session_id,
             browser_address=self._browser.browser_address,
+            request_options=RequestOptions(additional_headers={"X-User-Agent": "skyvern-sdk"}),
         )
+        LOG.info("AI workflow is running, this may take a while", run_id=workflow_run.run_id)
 
         workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
+        LOG.info("AI workflow finished", run_id=workflow_run.run_id, status=workflow_run.status)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
     async def _wait_for_run_completion(self, run_id: str, timeout: float) -> GetRunResponse:
