@@ -3,10 +3,12 @@ import os
 from typing import Any, overload
 
 import httpx
+import structlog
 from dotenv import load_dotenv
 from playwright.async_api import Playwright, async_playwright
 
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
+from skyvern.client.core import RequestOptions
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
@@ -15,6 +17,8 @@ from skyvern.library.embedded_server_factory import create_embedded_server
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunStatus
+
+LOG = structlog.get_logger()
 
 
 class Skyvern(AsyncSkyvern):
@@ -230,10 +234,11 @@ class Skyvern(AsyncSkyvern):
         browser_session_id: str | None = None,
         user_agent: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        publish_workflow: bool | None = None,
+        publish_workflow: bool = False,
         include_action_history_in_verification: bool | None = None,
         max_screenshot_scrolls: int | None = None,
         browser_address: str | None = None,
+        request_options: RequestOptions | None = None,
     ) -> TaskRunResponse:
         task_run = await super().run_task(
             prompt=prompt,
@@ -255,6 +260,7 @@ class Skyvern(AsyncSkyvern):
             include_action_history_in_verification=include_action_history_in_verification,
             max_screenshot_scrolls=max_screenshot_scrolls,
             browser_address=browser_address,
+            request_options=request_options,
         )
 
         if wait_for_completion:
@@ -287,6 +293,7 @@ class Skyvern(AsyncSkyvern):
         run_with: str | None = None,
         wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
+        request_options: RequestOptions | None = None,
     ) -> WorkflowRunResponse:
         workflow_run = await super().run_workflow(
             workflow_id=workflow_id,
@@ -306,6 +313,7 @@ class Skyvern(AsyncSkyvern):
             browser_address=browser_address,
             ai_fallback=ai_fallback,
             run_with=run_with,
+            request_options=request_options,
         )
         if wait_for_completion:
             async with asyncio.timeout(timeout):
@@ -341,6 +349,7 @@ class Skyvern(AsyncSkyvern):
         azure_vault_totp_secret_key: str | None = None,
         wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
+        request_options: RequestOptions | None = None,
     ) -> WorkflowRunResponse:
         workflow_run = await super().login(
             credential_type=credential_type,
@@ -363,6 +372,7 @@ class Skyvern(AsyncSkyvern):
             azure_vault_username_key=azure_vault_username_key,
             azure_vault_password_key=azure_vault_password_key,
             azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+            request_options=request_options,
         )
         if wait_for_completion:
             async with asyncio.timeout(timeout):
@@ -373,7 +383,13 @@ class Skyvern(AsyncSkyvern):
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
-    async def launch_local_browser(self, *, headless: bool = False, port: int = DEFAULT_CDP_PORT) -> SkyvernBrowser:
+    async def launch_local_browser(
+        self,
+        *,
+        headless: bool = False,
+        port: int = DEFAULT_CDP_PORT,
+        args: list[str] | None = None,
+    ) -> SkyvernBrowser:
         """Launch a new local Chromium browser with Chrome DevTools Protocol (CDP) enabled.
 
         This method launches a browser on your local machine with remote debugging enabled,
@@ -382,15 +398,17 @@ class Skyvern(AsyncSkyvern):
         Args:
             headless: Whether to run the browser in headless mode. Defaults to False.
             port: The port number for the CDP endpoint. Defaults to DEFAULT_CDP_PORT.
+            args: Additional command-line arguments to pass to Chromium. Defaults to None.
+                Example: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"]
 
         Returns:
             SkyvernBrowser: A browser instance with Skyvern capabilities.
         """
         playwright = await self._get_playwright()
-        browser = await playwright.chromium.launch(
-            headless=headless,
-            args=[f"--remote-debugging-port={port}"],
-        )
+        launch_args = [f"--remote-debugging-port={port}"]
+        if args:
+            launch_args.extend(args)
+        browser = await playwright.chromium.launch(headless=headless, args=launch_args)
         browser_address = f"http://localhost:{port}"
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
         return SkyvernBrowser(self, browser_context, browser_address=browser_address)
@@ -423,26 +441,53 @@ class Skyvern(AsyncSkyvern):
         """
         self._ensure_cloud_environment()
         browser_session = await self.get_browser_session(browser_session_id)
+        LOG.info("Connecting to existing cloud browser session", browser_session_id=browser_session.browser_session_id)
         return await self._connect_to_cloud_browser_session(browser_session)
 
-    async def launch_cloud_browser(self) -> SkyvernBrowser:
+    async def launch_cloud_browser(
+        self,
+        *,
+        timeout: int | None = None,
+        proxy_location: ProxyLocation | None = None,
+    ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
 
         This creates a new browser session in Skyvern's cloud infrastructure and connects to it.
+
+        Args:
+            timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
+                Must be between 5 and 1440. Defaults to 60.
+            proxy_location: Geographic proxy location to route the browser traffic through.
+                This is only available in Skyvern Cloud.
 
         Returns:
             SkyvernBrowser: A browser instance connected to the new cloud session.
         """
         self._ensure_cloud_environment()
-        browser_session = await self.create_browser_session()
+        browser_session = await self.create_browser_session(
+            timeout=timeout,
+            proxy_location=proxy_location,
+        )
+        LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
         return await self._connect_to_cloud_browser_session(browser_session)
 
-    async def use_cloud_browser(self) -> SkyvernBrowser:
+    async def use_cloud_browser(
+        self,
+        *,
+        timeout: int | None = None,
+        proxy_location: ProxyLocation | None = None,
+    ) -> SkyvernBrowser:
         """Get or create a cloud browser session.
 
         This method attempts to reuse the most recent available cloud browser session.
         If no session exists, it creates a new one. This is useful for cost efficiency
         and session persistence.
+
+        Args:
+            timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
+                Must be between 5 and 1440. Defaults to 60. Only used when creating a new session.
+            proxy_location: Geographic proxy location to route the browser traffic through.
+                This is only available in Skyvern Cloud. Only used when creating a new session.
 
         Returns:
             SkyvernBrowser: A browser instance connected to an existing or new cloud session.
@@ -453,7 +498,15 @@ class Skyvern(AsyncSkyvern):
             (s for s in browser_sessions if s.runnable_id is None), key=lambda s: s.started_at, default=None
         )
         if browser_session is None:
-            browser_session = await self.create_browser_session()
+            LOG.info("No existing cloud browser session found, launching a new session")
+            browser_session = await self.create_browser_session(
+                timeout=timeout,
+                proxy_location=proxy_location,
+            )
+            LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
+        else:
+            LOG.info("Reusing existing cloud browser session", browser_session_id=browser_session.browser_session_id)
+
         return await self._connect_to_cloud_browser_session(browser_session)
 
     def _ensure_cloud_environment(self) -> None:

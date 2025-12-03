@@ -133,10 +133,14 @@ navigation:
             path: credentials/totp.mdx
           - page: Bitwarden
             path: credentials/bitwarden.mdx
+          - page: Custom Credential Service
+            path: credentials/custom-credential-service.mdx
       - section: Browser Sessions (Beta)
         contents:
           - page: Introduction
             path: browser-sessions/introduction.mdx
+          - page: Browser Profiles
+            path: browser-sessions/browser-profiles.mdx
       - section: Observability
         contents:
           - page: Overview
