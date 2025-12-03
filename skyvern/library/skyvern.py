@@ -383,7 +383,13 @@ class Skyvern(AsyncSkyvern):
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
-    async def launch_local_browser(self, *, headless: bool = False, port: int = DEFAULT_CDP_PORT) -> SkyvernBrowser:
+    async def launch_local_browser(
+        self,
+        *,
+        headless: bool = False,
+        port: int = DEFAULT_CDP_PORT,
+        args: list[str] | None = None,
+    ) -> SkyvernBrowser:
         """Launch a new local Chromium browser with Chrome DevTools Protocol (CDP) enabled.
 
         This method launches a browser on your local machine with remote debugging enabled,
@@ -392,15 +398,17 @@ class Skyvern(AsyncSkyvern):
         Args:
             headless: Whether to run the browser in headless mode. Defaults to False.
             port: The port number for the CDP endpoint. Defaults to DEFAULT_CDP_PORT.
+            args: Additional command-line arguments to pass to Chromium. Defaults to None.
+                Example: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"]
 
         Returns:
             SkyvernBrowser: A browser instance with Skyvern capabilities.
         """
         playwright = await self._get_playwright()
-        browser = await playwright.chromium.launch(
-            headless=headless,
-            args=[f"--remote-debugging-port={port}"],
-        )
+        launch_args = [f"--remote-debugging-port={port}"]
+        if args:
+            launch_args.extend(args)
+        browser = await playwright.chromium.launch(headless=headless, args=launch_args)
         browser_address = f"http://localhost:{port}"
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
         return SkyvernBrowser(self, browser_context, browser_address=browser_address)
