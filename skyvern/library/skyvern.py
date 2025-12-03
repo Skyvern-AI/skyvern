@@ -234,7 +234,7 @@ class Skyvern(AsyncSkyvern):
         browser_session_id: str | None = None,
         user_agent: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        publish_workflow: bool | None = False,
+        publish_workflow: bool = False,
         include_action_history_in_verification: bool | None = None,
         max_screenshot_scrolls: int | None = None,
         browser_address: str | None = None,
