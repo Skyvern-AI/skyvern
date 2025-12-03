@@ -23,7 +23,6 @@ from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILE
 from skyvern.exceptions import (
     BlockNotFound,
     BrowserProfileNotFound,
-    BrowserSessionAlreadyOccupiedError,
     BrowserSessionNotFound,
     CannotUpdateWorkflowDueToCodeCache,
     FailedToSendWebhook,
@@ -415,26 +414,6 @@ class WorkflowService:
         if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
             workflow_request.webhook_callback_url = workflow.webhook_callback_url
 
-        if workflow_request.browser_session_id:
-            persistent_browser_session = await app.DATABASE.get_persistent_browser_session(
-                workflow_request.browser_session_id, organization.organization_id
-            )
-            if persistent_browser_session is None:
-                LOG.warning(
-                    "Failed to create workflow run, browser sesssion not found",
-                    browser_session_id=workflow_request.browser_session_id,
-                )
-                raise BrowserSessionNotFound(workflow_request.browser_session_id)
-
-            if persistent_browser_session.runnable_id:
-                LOG.warning(
-                    "Failed to create workflow run, browser session is already occupied",
-                    browser_session_id=workflow_request.browser_session_id,
-                )
-                raise BrowserSessionAlreadyOccupiedError(
-                    workflow_request.browser_session_id, persistent_browser_session.runnable_id
-                )
-
         # Create the workflow run and set skyvern context
         workflow_run = await self.create_workflow_run(
             workflow_request=workflow_request,
@@ -536,14 +515,6 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
             )
             raise e
-
-        if workflow_request.browser_session_id:
-            await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
-                browser_session_id=workflow_request.browser_session_id,
-                runnable_type="workflow_run",
-                runnable_id=workflow_run.workflow_run_id,
-                organization_id=organization.organization_id,
-            )
 
         return workflow_run
 
@@ -692,6 +663,34 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 browser_session_id=browser_session_id,
             )
+
+        if browser_session_id:
+            try:
+                await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                    browser_session_id=browser_session_id,
+                    runnable_type="workflow_run",
+                    runnable_id=workflow_run_id,
+                    organization_id=organization.organization_id,
+                )
+            except Exception as e:
+                LOG.exception(
+                    "Failed to begin browser session for workflow run",
+                    browser_session_id=browser_session_id,
+                    workflow_run_id=workflow_run_id,
+                )
+                failure_reason = f"Failed to begin browser session for workflow run: {str(e)}"
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=failure_reason,
+                )
+                await self.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    api_key=api_key,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=close_browser_on_completion,
+                )
+                return workflow_run
 
         # Check if there's a related workflow script that should be used instead
         workflow_script, _ = await workflow_script_service.get_workflow_script(workflow, workflow_run, block_labels)

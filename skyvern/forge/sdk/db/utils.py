@@ -359,6 +359,7 @@ def convert_to_workflow_run(
         workflow_id=workflow_run_model.workflow_id,
         organization_id=workflow_run_model.organization_id,
         browser_session_id=workflow_run_model.browser_session_id,
+        debug_session_id=workflow_run_model.debug_session_id,
         browser_profile_id=workflow_run_model.browser_profile_id,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
