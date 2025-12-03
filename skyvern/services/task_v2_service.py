@@ -55,7 +55,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
-from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
 

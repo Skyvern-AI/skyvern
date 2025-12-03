@@ -72,9 +72,11 @@ dependencies = [
 cloud = [
     "ddtrace>=2.3.2,<3",
     "stripe>=9.7.0,<10",
+    "temporalio[opentelemetry]>=1.6.0,<2",
     "temporalio>=1.6.0,<2",
     "dramatiq[asyncio]>=1.18.0,<2",
     "redis>=5.0.3,<6",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.38.0,<2",
 ]
 dev = [
     "isort>=5.13.2",
@@ -195,9 +197,9 @@ skyvern = "skyvern.cli.commands:cli_app"
 norecursedirs = ["eval"]
 
 [tool.codeflash]
-# All paths are relative to this pyproject.toml's directory.                                                                                                                                                                                                                                                                 
-module-root = "skyvern"                                                                                                                                                                                                                                                                                                      
-tests-root = "codeflash-tests"                                                                                                                                                                                                                                                                                                         
-test-framework = "pytest"                                                                                                                                                                                                                                                                                                    
-ignore-paths = ["skyvern/client"]                                                                                                                                                                                                                                                                                                         
+# All paths are relative to this pyproject.toml's directory.
+module-root = "skyvern"
+tests-root = "codeflash-tests"
+test-framework = "pytest"
+ignore-paths = ["skyvern/client"]
 formatter-cmds = ["ruff check --exit-zero --fix $file", "ruff format $file"]

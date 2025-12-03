@@ -56,7 +56,17 @@ export const ProxyLocation = {
   None: "NONE",
 } as const;
 
-export type ProxyLocation = (typeof ProxyLocation)[keyof typeof ProxyLocation];
+export type LegacyProxyLocation =
+  (typeof ProxyLocation)[keyof typeof ProxyLocation];
+
+export type GeoTarget = {
+  country: string;
+  subdivision?: string;
+  city?: string;
+  isISP?: boolean;
+};
+
+export type ProxyLocation = LegacyProxyLocation | GeoTarget | null;
 
 export type ArtifactApiResponse = {
   created_at: string;
@@ -225,6 +235,29 @@ export interface CreateAzureClientSecretCredentialRequest {
 
 export interface AzureClientSecretCredentialResponse {
   token: AzureOrganizationAuthToken;
+}
+
+export interface CustomCredentialServiceConfig {
+  api_base_url: string;
+  api_token: string;
+}
+
+export interface CustomCredentialServiceOrganizationAuthToken {
+  id: string;
+  organization_id: string;
+  token: string; // JSON string containing CustomCredentialServiceConfig
+  created_at: string;
+  modified_at: string;
+  token_type: string;
+  valid: boolean;
+}
+
+export interface CreateCustomCredentialServiceConfigRequest {
+  config: CustomCredentialServiceConfig;
+}
+
+export interface CustomCredentialServiceConfigResponse {
+  token: CustomCredentialServiceOrganizationAuthToken;
 }
 
 // TODO complete this

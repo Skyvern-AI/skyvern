@@ -173,6 +173,7 @@ class WorkflowRunContext:
         self._aws_client = aws_client
         self.organization_id: str | None = None
         self.include_secrets_in_templates: bool = False
+        self.credential_totp_identifiers: dict[str, str] = {}
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
@@ -295,6 +296,10 @@ class WorkflowRunContext:
         credential_item = await credential_service.get_credential_item(db_credential)
         credential = credential_item.credential
 
+        credential_totp_identifier = getattr(credential, "totp_identifier", None)
+        if credential_totp_identifier:
+            self.credential_totp_identifiers[parameter.key] = credential_totp_identifier
+
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {
             "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
@@ -318,6 +323,9 @@ class WorkflowRunContext:
             totp_secret_value = self.totp_secret_value_key(totp_secret_id)
             self.secrets[totp_secret_value] = parse_totp_secret(credential.totp)
             self.values[parameter.key]["totp"] = totp_secret_id
+
+    def get_credential_totp_identifier(self, parameter_key: str) -> str | None:
+        return self.credential_totp_identifiers.get(parameter_key)
 
     async def register_secret_workflow_parameter_value(
         self,

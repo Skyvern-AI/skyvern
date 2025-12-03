@@ -125,7 +125,7 @@ from skyvern.webeye.actions.parse_actions import (
     parse_ui_tars_actions,
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
-from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -3287,16 +3287,31 @@ class ForgeAgent:
         if screenshot_artifact:
             screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
 
-        first_step = await app.DATABASE.get_first_step(task_id=task.task_id, organization_id=task.organization_id)
-        if first_step:
-            recording_artifact = await app.DATABASE.get_artifact(
-                task_id=task.task_id,
-                step_id=first_step.step_id,
-                artifact_type=ArtifactType.RECORDING,
-                organization_id=task.organization_id,
-            )
-            if recording_artifact:
-                recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+        # Get recording url from browser session first,
+        # if not found, get the recording url from the first step
+        if task.browser_session_id:
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
+                        organization_id=task.organization_id,
+                        browser_session_id=task.browser_session_id,
+                    )
+                    # FIXME: we only support one recording for now
+                    recording_url = recordings[0].url if recordings else None
+            except asyncio.TimeoutError:
+                LOG.warning("Timeout getting recordings", browser_session_id=task.browser_session_id)
+
+        if recording_url is None:
+            first_step = await app.DATABASE.get_first_step(task_id=task.task_id, organization_id=task.organization_id)
+            if first_step:
+                recording_artifact = await app.DATABASE.get_artifact(
+                    task_id=task.task_id,
+                    step_id=first_step.step_id,
+                    artifact_type=ArtifactType.RECORDING,
+                    organization_id=task.organization_id,
+                )
+                if recording_artifact:
+                    recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
         latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(

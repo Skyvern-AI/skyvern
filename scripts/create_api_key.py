@@ -3,7 +3,8 @@ from datetime import timedelta
 
 import typer
 
-from skyvern.forge.app import DATABASE
+from skyvern.forge import app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.core import security
 from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken, OrganizationAuthTokenType
 
@@ -20,7 +21,7 @@ async def create_org_api_token(org_id: str) -> OrganizationAuthToken:
         The API token created for the specified org_id.
     """
     # get the organization
-    organization = await DATABASE.get_organization(org_id)
+    organization = await app.DATABASE.get_organization(org_id)
     if not organization:
         raise Exception(f"Organization id {org_id} not found")
 
@@ -30,7 +31,7 @@ async def create_org_api_token(org_id: str) -> OrganizationAuthToken:
         expires_delta=API_KEY_LIFETIME,
     )
     # generate OrganizationAutoToken
-    org_auth_token = await DATABASE.create_org_auth_token(
+    org_auth_token = await app.DATABASE.create_org_auth_token(
         organization_id=org_id,
         token=api_key,
         token_type=OrganizationAuthTokenType.api,
@@ -40,6 +41,7 @@ async def create_org_api_token(org_id: str) -> OrganizationAuthToken:
 
 
 def main(org_id: str) -> None:
+    start_forge_app()
     asyncio.run(create_org_api_token(org_id))
 
 

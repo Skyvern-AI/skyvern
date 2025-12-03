@@ -9,7 +9,9 @@ from openai import AsyncAzureOpenAI, AsyncOpenAI
 from skyvern.config import Settings
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.azure import AzureClientFactory
+from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
 from skyvern.forge.sdk.api.real_azure import RealAzureClientFactory
@@ -26,11 +28,13 @@ from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential,
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialVaultService
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
 
 
@@ -67,6 +71,7 @@ class ForgeApp:
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
+    CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
     CREDENTIAL_VAULT_SERVICES: dict[str, CredentialVaultService | None]
     scrape_exclude: ScrapeExcludeFunc | None
     authentication_function: Callable[[str], Awaitable[Organization]] | None
@@ -91,11 +96,14 @@ def create_forge_app() -> ForgeApp:
     app.STORAGE = StorageFactory.get_storage()
     app.CACHE = CacheFactory.get_cache()
     app.ARTIFACT_MANAGER = ArtifactManager()
-    app.BROWSER_MANAGER = BrowserManager()
+    app.BROWSER_MANAGER = RealBrowserManager()
     app.EXPERIMENTATION_PROVIDER = NoOpExperimentationProvider()
 
     app.LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(settings.LLM_KEY)
-    app.OPENAI_CLIENT = AsyncOpenAI(api_key=settings.OPENAI_API_KEY or "")
+    app.OPENAI_CLIENT = AsyncOpenAI(
+        api_key=settings.OPENAI_API_KEY or "",
+        http_client=ForgeAsyncHttpxClientWrapper(),
+    )
     if settings.ENABLE_AZURE_CUA:
         app.OPENAI_CLIENT = AsyncAzureOpenAI(
             api_key=settings.AZURE_CUA_API_KEY,
@@ -113,6 +121,7 @@ def create_forge_app() -> ForgeApp:
         app.UI_TARS_CLIENT = AsyncOpenAI(
             api_key=settings.VOLCENGINE_API_KEY,
             base_url=settings.VOLCENGINE_API_BASE,
+            http_client=ForgeAsyncHttpxClientWrapper(),
         )
 
     app.SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
@@ -185,9 +194,20 @@ def create_forge_app() -> ForgeApp:
         if settings.AZURE_CREDENTIAL_VAULT
         else None
     )
+    app.CUSTOM_CREDENTIAL_VAULT_SERVICE = (
+        CustomCredentialVaultService(
+            CustomCredentialAPIClient(
+                api_base_url=settings.CUSTOM_CREDENTIAL_API_BASE_URL,  # type: ignore
+                api_token=settings.CUSTOM_CREDENTIAL_API_TOKEN,  # type: ignore
+            )
+        )
+        if settings.CUSTOM_CREDENTIAL_API_BASE_URL and settings.CUSTOM_CREDENTIAL_API_TOKEN
+        else CustomCredentialVaultService()  # Create service without client for organization-based configuration
+    )
     app.CREDENTIAL_VAULT_SERVICES = {
         CredentialVaultType.BITWARDEN: app.BITWARDEN_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.AZURE_VAULT: app.AZURE_CREDENTIAL_VAULT_SERVICE,
+        CredentialVaultType.CUSTOM: app.CUSTOM_CREDENTIAL_VAULT_SERVICE,
     }
 
     app.scrape_exclude = None

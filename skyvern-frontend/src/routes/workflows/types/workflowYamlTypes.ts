@@ -1,11 +1,11 @@
-import { RunEngine } from "@/api/types";
+import { ProxyLocation, RunEngine } from "@/api/types";
 import { WorkflowBlockType } from "./workflowTypes";
 import { WorkflowModel } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
   description?: string | null;
-  proxy_location?: string | null;
+  proxy_location?: ProxyLocation | null;
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
   model?: WorkflowModel | null;

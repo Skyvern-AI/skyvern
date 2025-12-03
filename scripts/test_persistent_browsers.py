@@ -7,6 +7,7 @@ import requests
 from dotenv import load_dotenv
 
 from skyvern.forge import app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.schemas.tasks import TaskRequest
 
 # Skip tests if network access is not available
@@ -283,6 +284,8 @@ def print_help() -> None:
 
 
 async def main() -> None:
+    start_forge_app()
+
     print("Browser Sessions Testing CLI")
     print("Type 'help' for available commands")
 
