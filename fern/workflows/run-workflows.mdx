@@ -14,4 +14,14 @@ Find the API doc [here](/api-reference/api-reference/workflows/run-workflow)
 
 ### Parameters
 
+#### proxy_location
+
+`proxy_location` works the same way it does for Task runs:
+
+- Defaults to `RESIDENTIAL` (random US residential proxy)
+- Accepts any country preset like `RESIDENTIAL_GB` or the ISP pool `RESIDENTIAL_ISP`
+- Accepts a GeoTarget object for granular state/city runs (e.g., `{"country": "US", "subdivision": "NY", "city": "Brooklyn"}`)
+
+Each run can override whatever is saved on the workflow definition. See [Proxy & Geo Targeting](/running-tasks/proxy-location) for the full option list and sample payloads.
+
 ### Webhook
