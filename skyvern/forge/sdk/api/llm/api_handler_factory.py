@@ -406,10 +406,13 @@ class LLMAPIHandlerFactory:
                 return llm_request_json
 
             # Inject context caching system message when available
+            # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts
+            # (e.g., check-user-goal) with the extract-action schema
             try:
-                context_cached_static_prompt = getattr(context, "cached_static_prompt", None)
                 if (
-                    context_cached_static_prompt
+                    context
+                    and context.cached_static_prompt
+                    and prompt_name == EXTRACT_ACTION_PROMPT_NAME  # Only inject for extract-actions
                     and isinstance(llm_config, LLMConfig)
                     and isinstance(llm_config.model_name, str)
                 ):
@@ -426,7 +429,7 @@ class LLMAPIHandlerFactory:
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": context_cached_static_prompt,
+                                    "text": context.cached_static_prompt,
                                 }
                             ],
                         }
@@ -789,10 +792,13 @@ class LLMAPIHandlerFactory:
             messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
 
             # Inject context caching system message when available
+            # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts
+            # (e.g., check-user-goal) with the extract-action schema
             try:
-                context_cached_static_prompt = getattr(context, "cached_static_prompt", None)
                 if (
-                    context_cached_static_prompt
+                    context
+                    and context.cached_static_prompt
+                    and prompt_name == EXTRACT_ACTION_PROMPT_NAME  # Only inject for extract-actions
                     and isinstance(llm_config, LLMConfig)
                     and isinstance(llm_config.model_name, str)
                 ):
@@ -809,7 +815,7 @@ class LLMAPIHandlerFactory:
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": context_cached_static_prompt,
+                                    "text": context.cached_static_prompt,
                                 }
                             ],
                         }
