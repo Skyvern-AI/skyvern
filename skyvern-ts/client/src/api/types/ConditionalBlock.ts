@@ -2,7 +2,10 @@
 
 import type * as Skyvern from "../index.js";
 
-export interface ForLoopBlock {
+/**
+ * Branching block that selects the next block label based on list-ordered conditions.
+ */
+export interface ConditionalBlock {
     /** Author-facing identifier for a block; unique within a workflow. */
     label: string;
     /** Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted. */
@@ -11,8 +14,5 @@ export interface ForLoopBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
-    loop_blocks: Skyvern.ForLoopBlockLoopBlocksItem[];
-    loop_over?: Skyvern.ForLoopBlockLoopOver;
-    loop_variable_reference?: string;
-    complete_if_empty?: boolean;
+    branch_conditions?: Skyvern.BranchCondition[];
 }

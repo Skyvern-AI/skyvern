@@ -3,6 +3,7 @@
 import type * as Skyvern from "../index.js";
 
 export interface WorkflowDefinitionYaml {
+    version?: number;
     parameters: Skyvern.WorkflowDefinitionYamlParametersItem[];
     blocks: Skyvern.WorkflowDefinitionYamlBlocksItem[];
 }
