@@ -9,7 +9,16 @@ from .run_engine import RunEngine
 
 
 class ExtractionBlockYaml(UniversalBaseModel):
-    label: str
+    label: str = pydantic.Field()
+    """
+    Author-facing identifier; must be unique per workflow.
+    """
+
+    next_block_label: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]].
+    """
+
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     data_extraction_goal: str
@@ -20,7 +29,6 @@ class ExtractionBlockYaml(UniversalBaseModel):
     max_retries: typing.Optional[int] = None
     max_steps_per_run: typing.Optional[int] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:

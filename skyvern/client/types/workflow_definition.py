@@ -11,6 +11,7 @@ from .workflow_definition_parameters_item import WorkflowDefinitionParametersIte
 
 
 class WorkflowDefinition(UniversalBaseModel):
+    version: typing.Optional[int] = None
     parameters: typing.List[WorkflowDefinitionParametersItem]
     blocks: typing.List[WorkflowDefinitionBlocksItem]
 

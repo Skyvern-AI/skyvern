@@ -6,21 +6,14 @@ import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 
 
-class ImprovePromptResponse(UniversalBaseModel):
-    error: typing.Optional[str] = pydantic.Field(default=None)
+class BranchCriteria(UniversalBaseModel):
     """
-    Error message if prompt improvement failed
-    """
-
-    improved: str = pydantic.Field()
-    """
-    The improved version of the prompt
+    Abstract interface describing how a branch condition should be evaluated.
     """
 
-    original: str = pydantic.Field()
-    """
-    The original prompt provided for improvement
-    """
+    criteria_type: str
+    expression: str
+    description: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

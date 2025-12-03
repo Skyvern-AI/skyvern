@@ -8,7 +8,16 @@ from .run_engine import RunEngine
 
 
 class FileDownloadBlockYaml(UniversalBaseModel):
-    label: str
+    label: str = pydantic.Field()
+    """
+    Author-facing identifier; must be unique per workflow.
+    """
+
+    next_block_label: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]].
+    """
+
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     navigation_goal: str
@@ -22,7 +31,6 @@ class FileDownloadBlockYaml(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
 

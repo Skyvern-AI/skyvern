@@ -13,7 +13,16 @@ from .validation_block_parameters_item import ValidationBlockParametersItem
 
 
 class ValidationBlock(UniversalBaseModel):
-    label: str
+    label: str = pydantic.Field()
+    """
+    Author-facing identifier for a block; unique within a workflow.
+    """
+
+    next_block_label: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted.
+    """
+
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
@@ -35,7 +44,6 @@ class ValidationBlock(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None

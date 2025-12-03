@@ -6,7 +6,7 @@
  *         include_deleted: true
  *     }
  */
-export interface ListBrowserProfilesV1BrowserProfilesGetRequest {
+export interface ListBrowserProfilesRequest {
     /** Include deleted browser profiles */
     include_deleted?: boolean;
 }

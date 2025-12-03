@@ -18,6 +18,7 @@ from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
 class WorkflowDefinitionYamlBlocksItem_Action(UniversalBaseModel):
     block_type: typing.Literal["action"] = "action"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: typing.Optional[str] = None
@@ -31,7 +32,6 @@ class WorkflowDefinitionYamlBlocksItem_Action(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
@@ -47,6 +47,7 @@ class WorkflowDefinitionYamlBlocksItem_Action(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_Code(UniversalBaseModel):
     block_type: typing.Literal["code"] = "code"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     code: str
@@ -65,6 +66,7 @@ class WorkflowDefinitionYamlBlocksItem_Code(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_DownloadToS3(UniversalBaseModel):
     block_type: typing.Literal["download_to_s3"] = "download_to_s3"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: str
@@ -82,6 +84,7 @@ class WorkflowDefinitionYamlBlocksItem_DownloadToS3(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_Extraction(UniversalBaseModel):
     block_type: typing.Literal["extraction"] = "extraction"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     data_extraction_goal: str
@@ -92,7 +95,6 @@ class WorkflowDefinitionYamlBlocksItem_Extraction(UniversalBaseModel):
     max_retries: typing.Optional[int] = None
     max_steps_per_run: typing.Optional[int] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
@@ -108,6 +110,7 @@ class WorkflowDefinitionYamlBlocksItem_Extraction(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_FileDownload(UniversalBaseModel):
     block_type: typing.Literal["file_download"] = "file_download"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     navigation_goal: str
@@ -121,7 +124,6 @@ class WorkflowDefinitionYamlBlocksItem_FileDownload(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
 
@@ -138,6 +140,7 @@ class WorkflowDefinitionYamlBlocksItem_FileDownload(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_FileUpload(UniversalBaseModel):
     block_type: typing.Literal["file_upload"] = "file_upload"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     storage_type: typing.Optional[FileStorageType] = None
@@ -164,6 +167,7 @@ class WorkflowDefinitionYamlBlocksItem_FileUpload(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_FileUrlParser(UniversalBaseModel):
     block_type: typing.Literal["file_url_parser"] = "file_url_parser"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str
@@ -183,6 +187,7 @@ class WorkflowDefinitionYamlBlocksItem_FileUrlParser(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_ForLoop(UniversalBaseModel):
     block_type: typing.Literal["for_loop"] = "for_loop"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     loop_blocks: typing.List["ForLoopBlockYamlLoopBlocksItem"]
@@ -207,6 +212,7 @@ from .for_loop_block_yaml_loop_blocks_item import ForLoopBlockYamlLoopBlocksItem
 class WorkflowDefinitionYamlBlocksItem_GotoUrl(UniversalBaseModel):
     block_type: typing.Literal["goto_url"] = "goto_url"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: str
@@ -224,6 +230,7 @@ class WorkflowDefinitionYamlBlocksItem_GotoUrl(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_HttpRequest(UniversalBaseModel):
     block_type: typing.Literal["http_request"] = "http_request"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     method: typing.Optional[str] = None
@@ -247,6 +254,7 @@ class WorkflowDefinitionYamlBlocksItem_HttpRequest(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_HumanInteraction(UniversalBaseModel):
     block_type: typing.Literal["human_interaction"] = "human_interaction"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     instructions: typing.Optional[str] = None
@@ -271,6 +279,7 @@ class WorkflowDefinitionYamlBlocksItem_HumanInteraction(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_Login(UniversalBaseModel):
     block_type: typing.Literal["login"] = "login"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: typing.Optional[str] = None
@@ -283,7 +292,6 @@ class WorkflowDefinitionYamlBlocksItem_Login(UniversalBaseModel):
     parameter_keys: typing.Optional[typing.List[str]] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
@@ -302,6 +310,7 @@ class WorkflowDefinitionYamlBlocksItem_Login(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_Navigation(UniversalBaseModel):
     block_type: typing.Literal["navigation"] = "navigation"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     navigation_goal: str
@@ -316,7 +325,6 @@ class WorkflowDefinitionYamlBlocksItem_Navigation(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
@@ -336,6 +344,7 @@ class WorkflowDefinitionYamlBlocksItem_Navigation(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_PdfParser(UniversalBaseModel):
     block_type: typing.Literal["pdf_parser"] = "pdf_parser"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str
@@ -354,6 +363,7 @@ class WorkflowDefinitionYamlBlocksItem_PdfParser(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_SendEmail(UniversalBaseModel):
     block_type: typing.Literal["send_email"] = "send_email"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     smtp_host_secret_parameter_key: str
@@ -379,6 +389,7 @@ class WorkflowDefinitionYamlBlocksItem_SendEmail(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_Task(UniversalBaseModel):
     block_type: typing.Literal["task"] = "task"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: typing.Optional[str] = None
@@ -395,7 +406,6 @@ class WorkflowDefinitionYamlBlocksItem_Task(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
@@ -415,6 +425,7 @@ class WorkflowDefinitionYamlBlocksItem_Task(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_TaskV2(UniversalBaseModel):
     block_type: typing.Literal["task_v2"] = "task_v2"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     prompt: str
@@ -438,6 +449,7 @@ class WorkflowDefinitionYamlBlocksItem_TaskV2(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_TextPrompt(UniversalBaseModel):
     block_type: typing.Literal["text_prompt"] = "text_prompt"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     llm_key: typing.Optional[str] = None
@@ -458,6 +470,7 @@ class WorkflowDefinitionYamlBlocksItem_TextPrompt(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_UploadToS3(UniversalBaseModel):
     block_type: typing.Literal["upload_to_s3"] = "upload_to_s3"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     path: typing.Optional[str] = None
@@ -475,6 +488,7 @@ class WorkflowDefinitionYamlBlocksItem_UploadToS3(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_Validation(UniversalBaseModel):
     block_type: typing.Literal["validation"] = "validation"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     complete_criterion: typing.Optional[str] = None
@@ -496,6 +510,7 @@ class WorkflowDefinitionYamlBlocksItem_Validation(UniversalBaseModel):
 class WorkflowDefinitionYamlBlocksItem_Wait(UniversalBaseModel):
     block_type: typing.Literal["wait"] = "wait"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     wait_sec: typing.Optional[int] = None
