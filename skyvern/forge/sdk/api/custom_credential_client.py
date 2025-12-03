@@ -81,7 +81,14 @@ class CustomCredentialAPIClient:
                 credential_type=CredentialType.PASSWORD,
             )
         elif credential_type == "credit_card":
-            required_fields = ["card_holder_name", "card_number", "card_exp_month", "card_exp_year", "card_cvv", "card_brand"]
+            required_fields = [
+                "card_holder_name",
+                "card_number",
+                "card_exp_month",
+                "card_exp_year",
+                "card_cvv",
+                "card_brand",
+            ]
             missing = [f for f in required_fields if f not in credential_data]
             if missing:
                 raise ValueError(f"Missing required credit card fields from API: {missing}")

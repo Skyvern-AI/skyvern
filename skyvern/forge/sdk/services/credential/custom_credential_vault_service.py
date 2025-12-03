@@ -20,6 +20,7 @@ LOG = structlog.get_logger()
 class CustomCredentialConfigurationError(SkyvernException):
     """Raised when custom credential service configuration is invalid or missing."""
 
+
 class CustomCredentialVaultService(CredentialVaultService):
     """Custom credential vault service that uses HTTP API for storing credentials."""
 
