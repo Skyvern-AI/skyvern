@@ -42,6 +42,8 @@ if typing.TYPE_CHECKING:
     from .bitwarden_sensitive_information_parameter import BitwardenSensitiveInformationParameter
     from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
     from .block_type import BlockType
+    from .branch_condition import BranchCondition
+    from .branch_criteria import BranchCriteria
     from .browser_profile import BrowserProfile
     from .browser_session_response import BrowserSessionResponse
     from .click_action import ClickAction
@@ -63,6 +65,7 @@ if typing.TYPE_CHECKING:
         CodeBlockParametersItem_Workflow,
     )
     from .code_block_yaml import CodeBlockYaml
+    from .conditional_block import ConditionalBlock
     from .context_parameter import ContextParameter
     from .context_parameter_source import (
         ContextParameterSource,
@@ -143,6 +146,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockLoopBlocksItem,
         ForLoopBlockLoopBlocksItem_Action,
         ForLoopBlockLoopBlocksItem_Code,
+        ForLoopBlockLoopBlocksItem_Conditional,
         ForLoopBlockLoopBlocksItem_DownloadToS3,
         ForLoopBlockLoopBlocksItem_Extraction,
         ForLoopBlockLoopBlocksItem_FileDownload,
@@ -202,6 +206,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockYamlLoopBlocksItem_Validation,
         ForLoopBlockYamlLoopBlocksItem_Wait,
     )
+    from .geo_target import GeoTarget
     from .get_run_response import (
         GetRunResponse,
         GetRunResponse_AnthropicCua,
@@ -245,7 +250,6 @@ if typing.TYPE_CHECKING:
         HumanInteractionBlockParametersItem_Workflow,
     )
     from .human_interaction_block_yaml import HumanInteractionBlockYaml
-    from .improve_prompt_response import ImprovePromptResponse
     from .input_or_select_context import InputOrSelectContext
     from .input_text_action import InputTextAction
     from .input_text_action_data import InputTextActionData
@@ -338,6 +342,7 @@ if typing.TYPE_CHECKING:
     from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
     from .task_run_request import TaskRunRequest
     from .task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
+    from .task_run_request_proxy_location import TaskRunRequestProxyLocation
     from .task_run_response import TaskRunResponse
     from .task_run_response_output import TaskRunResponseOutput
     from .task_v2block import TaskV2Block
@@ -422,11 +427,13 @@ if typing.TYPE_CHECKING:
     from .wait_block_yaml import WaitBlockYaml
     from .workflow import Workflow
     from .workflow_create_yaml_request import WorkflowCreateYamlRequest
+    from .workflow_create_yaml_request_proxy_location import WorkflowCreateYamlRequestProxyLocation
     from .workflow_definition import WorkflowDefinition
     from .workflow_definition_blocks_item import (
         WorkflowDefinitionBlocksItem,
         WorkflowDefinitionBlocksItem_Action,
         WorkflowDefinitionBlocksItem_Code,
+        WorkflowDefinitionBlocksItem_Conditional,
         WorkflowDefinitionBlocksItem_DownloadToS3,
         WorkflowDefinitionBlocksItem_Extraction,
         WorkflowDefinitionBlocksItem_FileDownload,
@@ -504,12 +511,14 @@ if typing.TYPE_CHECKING:
     from .workflow_parameter_type import WorkflowParameterType
     from .workflow_parameter_yaml import WorkflowParameterYaml
     from .workflow_parameter_yaml_default_value import WorkflowParameterYamlDefaultValue
+    from .workflow_proxy_location import WorkflowProxyLocation
     from .workflow_request import WorkflowRequest
     from .workflow_run_block import WorkflowRunBlock
     from .workflow_run_block_data_schema import WorkflowRunBlockDataSchema
     from .workflow_run_block_navigation_payload import WorkflowRunBlockNavigationPayload
     from .workflow_run_block_output import WorkflowRunBlockOutput
     from .workflow_run_request import WorkflowRunRequest
+    from .workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
     from .workflow_run_response import WorkflowRunResponse
     from .workflow_run_response_output import WorkflowRunResponseOutput
     from .workflow_run_timeline import WorkflowRunTimeline
@@ -550,6 +559,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BitwardenSensitiveInformationParameter": ".bitwarden_sensitive_information_parameter",
     "BitwardenSensitiveInformationParameterYaml": ".bitwarden_sensitive_information_parameter_yaml",
     "BlockType": ".block_type",
+    "BranchCondition": ".branch_condition",
+    "BranchCriteria": ".branch_criteria",
     "BrowserProfile": ".browser_profile",
     "BrowserSessionResponse": ".browser_session_response",
     "ClickAction": ".click_action",
@@ -569,6 +580,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "CodeBlockParametersItem_Output": ".code_block_parameters_item",
     "CodeBlockParametersItem_Workflow": ".code_block_parameters_item",
     "CodeBlockYaml": ".code_block_yaml",
+    "ConditionalBlock": ".conditional_block",
     "ContextParameter": ".context_parameter",
     "ContextParameterSource": ".context_parameter_source",
     "ContextParameterSource_AwsSecret": ".context_parameter_source",
@@ -642,6 +654,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockLoopBlocksItem": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Action": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Code": ".for_loop_block_loop_blocks_item",
+    "ForLoopBlockLoopBlocksItem_Conditional": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_DownloadToS3": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Extraction": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_FileDownload": ".for_loop_block_loop_blocks_item",
@@ -696,6 +709,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockYamlLoopBlocksItem_UploadToS3": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Validation": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Wait": ".for_loop_block_yaml_loop_blocks_item",
+    "GeoTarget": ".geo_target",
     "GetRunResponse": ".get_run_response",
     "GetRunResponse_AnthropicCua": ".get_run_response",
     "GetRunResponse_OpenaiCua": ".get_run_response",
@@ -733,7 +747,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "HumanInteractionBlockParametersItem_Output": ".human_interaction_block_parameters_item",
     "HumanInteractionBlockParametersItem_Workflow": ".human_interaction_block_parameters_item",
     "HumanInteractionBlockYaml": ".human_interaction_block_yaml",
-    "ImprovePromptResponse": ".improve_prompt_response",
     "InputOrSelectContext": ".input_or_select_context",
     "InputTextAction": ".input_text_action",
     "InputTextActionData": ".input_text_action_data",
@@ -818,6 +831,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "TaskBlockYamlDataSchema": ".task_block_yaml_data_schema",
     "TaskRunRequest": ".task_run_request",
     "TaskRunRequestDataExtractionSchema": ".task_run_request_data_extraction_schema",
+    "TaskRunRequestProxyLocation": ".task_run_request_proxy_location",
     "TaskRunResponse": ".task_run_response",
     "TaskRunResponseOutput": ".task_run_response_output",
     "TaskV2Block": ".task_v2block",
@@ -894,10 +908,12 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WaitBlockYaml": ".wait_block_yaml",
     "Workflow": ".workflow",
     "WorkflowCreateYamlRequest": ".workflow_create_yaml_request",
+    "WorkflowCreateYamlRequestProxyLocation": ".workflow_create_yaml_request_proxy_location",
     "WorkflowDefinition": ".workflow_definition",
     "WorkflowDefinitionBlocksItem": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_Action": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_Code": ".workflow_definition_blocks_item",
+    "WorkflowDefinitionBlocksItem_Conditional": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_DownloadToS3": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_Extraction": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_FileDownload": ".workflow_definition_blocks_item",
@@ -968,12 +984,14 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowParameterType": ".workflow_parameter_type",
     "WorkflowParameterYaml": ".workflow_parameter_yaml",
     "WorkflowParameterYamlDefaultValue": ".workflow_parameter_yaml_default_value",
+    "WorkflowProxyLocation": ".workflow_proxy_location",
     "WorkflowRequest": ".workflow_request",
     "WorkflowRunBlock": ".workflow_run_block",
     "WorkflowRunBlockDataSchema": ".workflow_run_block_data_schema",
     "WorkflowRunBlockNavigationPayload": ".workflow_run_block_navigation_payload",
     "WorkflowRunBlockOutput": ".workflow_run_block_output",
     "WorkflowRunRequest": ".workflow_run_request",
+    "WorkflowRunRequestProxyLocation": ".workflow_run_request_proxy_location",
     "WorkflowRunResponse": ".workflow_run_response",
     "WorkflowRunResponseOutput": ".workflow_run_response_output",
     "WorkflowRunTimeline": ".workflow_run_timeline",
@@ -1038,6 +1056,8 @@ __all__ = [
     "BitwardenSensitiveInformationParameter",
     "BitwardenSensitiveInformationParameterYaml",
     "BlockType",
+    "BranchCondition",
+    "BranchCriteria",
     "BrowserProfile",
     "BrowserSessionResponse",
     "ClickAction",
@@ -1057,6 +1077,7 @@ __all__ = [
     "CodeBlockParametersItem_Output",
     "CodeBlockParametersItem_Workflow",
     "CodeBlockYaml",
+    "ConditionalBlock",
     "ContextParameter",
     "ContextParameterSource",
     "ContextParameterSource_AwsSecret",
@@ -1130,6 +1151,7 @@ __all__ = [
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
     "ForLoopBlockLoopBlocksItem_Code",
+    "ForLoopBlockLoopBlocksItem_Conditional",
     "ForLoopBlockLoopBlocksItem_DownloadToS3",
     "ForLoopBlockLoopBlocksItem_Extraction",
     "ForLoopBlockLoopBlocksItem_FileDownload",
@@ -1184,6 +1206,7 @@ __all__ = [
     "ForLoopBlockYamlLoopBlocksItem_UploadToS3",
     "ForLoopBlockYamlLoopBlocksItem_Validation",
     "ForLoopBlockYamlLoopBlocksItem_Wait",
+    "GeoTarget",
     "GetRunResponse",
     "GetRunResponse_AnthropicCua",
     "GetRunResponse_OpenaiCua",
@@ -1221,7 +1244,6 @@ __all__ = [
     "HumanInteractionBlockParametersItem_Output",
     "HumanInteractionBlockParametersItem_Workflow",
     "HumanInteractionBlockYaml",
-    "ImprovePromptResponse",
     "InputOrSelectContext",
     "InputTextAction",
     "InputTextActionData",
@@ -1306,6 +1328,7 @@ __all__ = [
     "TaskBlockYamlDataSchema",
     "TaskRunRequest",
     "TaskRunRequestDataExtractionSchema",
+    "TaskRunRequestProxyLocation",
     "TaskRunResponse",
     "TaskRunResponseOutput",
     "TaskV2Block",
@@ -1382,10 +1405,12 @@ __all__ = [
     "WaitBlockYaml",
     "Workflow",
     "WorkflowCreateYamlRequest",
+    "WorkflowCreateYamlRequestProxyLocation",
     "WorkflowDefinition",
     "WorkflowDefinitionBlocksItem",
     "WorkflowDefinitionBlocksItem_Action",
     "WorkflowDefinitionBlocksItem_Code",
+    "WorkflowDefinitionBlocksItem_Conditional",
     "WorkflowDefinitionBlocksItem_DownloadToS3",
     "WorkflowDefinitionBlocksItem_Extraction",
     "WorkflowDefinitionBlocksItem_FileDownload",
@@ -1456,12 +1481,14 @@ __all__ = [
     "WorkflowParameterType",
     "WorkflowParameterYaml",
     "WorkflowParameterYamlDefaultValue",
+    "WorkflowProxyLocation",
     "WorkflowRequest",
     "WorkflowRunBlock",
     "WorkflowRunBlockDataSchema",
     "WorkflowRunBlockNavigationPayload",
     "WorkflowRunBlockOutput",
     "WorkflowRunRequest",
+    "WorkflowRunRequestProxyLocation",
     "WorkflowRunResponse",
     "WorkflowRunResponseOutput",
     "WorkflowRunTimeline",

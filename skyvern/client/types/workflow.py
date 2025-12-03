@@ -7,8 +7,8 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel, update_forward_refs
-from .proxy_location import ProxyLocation
 from .workflow_definition import WorkflowDefinition
+from .workflow_proxy_location import WorkflowProxyLocation
 from .workflow_status import WorkflowStatus
 
 
@@ -21,7 +21,7 @@ class Workflow(UniversalBaseModel):
     is_saved_task: bool
     description: typing.Optional[str] = None
     workflow_definition: WorkflowDefinition
-    proxy_location: typing.Optional[ProxyLocation] = None
+    proxy_location: typing.Optional[WorkflowProxyLocation] = None
     webhook_callback_url: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
