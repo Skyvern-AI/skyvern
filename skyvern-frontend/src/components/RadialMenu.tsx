@@ -99,38 +99,24 @@ export function RadialMenu({
   const radiusValue = radius || `${calculatedRadius}px`;
   const numRadius = parseFloat(radiusValue);
   const visibleItems = items.filter((item) => !item.hidden);
-  const padSize = numRadius * 2.75;
+  const padSizeVertical = numRadius * 2;
+  const padSizeHorizontal = padSizeVertical * 4;
 
   return (
     <div
       ref={dom.root}
       className="relative z-[1000000]"
-      onMouseLeave={(e) => {
-        // only close if we're leaving the entire component area
-        const rect = dom.root.current?.getBoundingClientRect();
-        if (!rect) return;
-
-        const { clientX, clientY } = e;
-        const padding = padSize / 2;
-        const centerX = rect.left + rect.width / 2;
-        const centerY = rect.top + rect.height / 2;
-
-        // if mouse is outside the pad area, we deactivate
-        const distance = Math.sqrt(
-          Math.pow(clientX - centerX, 2) + Math.pow(clientY - centerY, 2),
-        );
-
-        if (distance > padding) {
-          setIsOpen(false);
-        }
+      onMouseLeave={() => {
+        setIsOpen(false);
       }}
     >
       {/* a pad (buffer) to increase the deactivation area when leaving the component */}
       <div
         className="absolute left-1/2 top-1/2 z-10"
         style={{
-          width: `${padSize}px`,
-          height: `${padSize}px`,
+          width: `${padSizeHorizontal}px`,
+          height: `${padSizeVertical}px`,
+          pointerEvents: isOpen ? "auto" : "none",
           transform: "translate(-50%, -50%)",
         }}
       />
@@ -199,16 +185,20 @@ export function RadialMenu({
             {item.text && (
               <div
                 key={`${item.id}-text`}
-                className="absolute left-1/2 top-1/2 z-30 whitespace-nowrap rounded bg-white px-2 py-1 text-xs text-gray-700 shadow-md transition-all duration-300 ease-out"
+                onClick={() => {
+                  item.onClick();
+                  setIsOpen(false);
+                }}
+                className="absolute left-1/2 top-1/2 z-30 cursor-pointer whitespace-nowrap rounded bg-white px-2 py-1 text-xs text-gray-700 shadow-md transition-all duration-300 ease-out"
                 style={{
                   transform: isOpen
                     ? rotateText
                       ? `translate(0%, -50%) translate(${x + textX}px, ${y + textY}px) rotate(${angleDegrees}deg) scale(1)`
                       : `translate(0%, -50%) translate(${x + textX}px, ${y + textY}px) scale(1)`
-                    : "translate(0%, -50%) translate(0, 0) scale(0.5)",
+                    : `translate(0%, -50%) translate(0, 0) scale(0.5) rotate(${angleDegrees}deg)`,
                   opacity: isOpen ? (isEnabled ? 1 : 0.5) : 0,
                   transformOrigin: "left center",
-                  pointerEvents: "none",
+                  pointerEvents: isOpen ? "auto" : "none",
                   transitionDelay: isOpen ? `${index * 50}ms` : "0ms",
                 }}
               >
@@ -217,7 +207,7 @@ export function RadialMenu({
                     display: "inline-block",
                     transform: textTransform,
                     opacity: isEnabled ? 1 : 0.5,
-                    cursor: isEnabled ? "default" : "not-allowed",
+                    cursor: isEnabled ? "pointer" : "not-allowed",
                   }}
                 >
                   {item.text}
