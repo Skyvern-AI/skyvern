@@ -863,22 +863,6 @@ function FlowRenderer({
             }
 
             onNodesChange(changes);
-
-            // NOTE: should no longer be needed (woot!) - delete if true (want real-world testing first)
-            // // only allow one update in _this_ render cycle
-            // if (onNodesChangeTimeoutRef.current === null) {
-            //   onNodesChange(changes);
-            //   onNodesChangeTimeoutRef.current = setTimeout(() => {
-            //     onNodesChangeTimeoutRef.current = null;
-            //   }, 0);
-            // } else {
-            //   // if we have an update in this render cycle already, then to
-            //   // prevent max recursion errors, defer the update to next render
-            //   // cycle
-            //   nextTick().then(() => {
-            //     onNodesChange(changes);
-            //   });
-            // }
           }}
           onEdgesChange={onEdgesChange}
           nodeTypes={nodeTypes}
