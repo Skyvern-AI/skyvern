@@ -126,7 +126,7 @@ from skyvern.webeye.actions.parse_actions import (
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
+from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -2274,10 +2274,9 @@ class ForgeAgent:
             draw_boxes = False
             scroll = False
 
-        return await scrape_website(
-            browser_state,
-            task.url,
-            app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step),
+        return await browser_state.scrape_website(
+            url=task.url,
+            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step),
             scrape_exclude=app.scrape_exclude,
             max_screenshot_number=max_screenshot_number,
             draw_boxes=draw_boxes,

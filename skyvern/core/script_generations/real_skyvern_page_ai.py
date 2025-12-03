@@ -34,7 +34,7 @@ from skyvern.webeye.actions.handler import (
     handle_upload_file_action,
 )
 from skyvern.webeye.actions.parse_actions import parse_actions
-from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 jinja_sandbox_env = SandboxedEnvironment()
 

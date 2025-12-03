@@ -56,7 +56,7 @@ from skyvern.schemas.workflows import (
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -682,10 +682,9 @@ async def run_task_v2_helper(
                 )
         else:
             try:
-                scraped_page = await scrape_website(
-                    browser_state,
-                    url,
-                    app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                scraped_page = await browser_state.scrape_website(
+                    url=url,
+                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
                     scrape_exclude=app.scrape_exclude,
                 )
                 if page is None:
@@ -908,10 +907,9 @@ async def run_task_v2_helper(
                     browser_session_id=browser_session_id,
                     browser_profile_id=workflow_run.browser_profile_id,
                 )
-                scraped_page = await scrape_website(
-                    browser_state,
-                    url,
-                    app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                scraped_page = await browser_state.scrape_website(
+                    url=url,
+                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
                     scrape_exclude=app.scrape_exclude,
                 )
                 completion_screenshots = scraped_page.screenshots
