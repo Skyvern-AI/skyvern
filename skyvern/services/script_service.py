@@ -61,7 +61,7 @@ from skyvern.schemas.scripts import (
     ScriptStatus,
 )
 from skyvern.schemas.workflows import BlockStatus, BlockType, FileStorageType, FileType
-from skyvern.webeye.scraper.scraper import ElementTreeFormat
+from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
