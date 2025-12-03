@@ -95,7 +95,6 @@ skyvern = Skyvern(api_key="YOUR_API_KEY")
 workflow_run = await skyvern.run_workflow(
     workflow_id="wf_abc",
     browser_profile_id="bp_123",
-    proxy_location="NONE",
 )
 print(workflow_run.run_id)
 ```
