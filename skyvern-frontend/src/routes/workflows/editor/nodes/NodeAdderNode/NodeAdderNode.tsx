@@ -7,6 +7,7 @@ import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { cn } from "@/util/utils";
 
 import type { NodeAdderNode } from "./types";
 import { WorkflowAddMenu } from "../../WorkflowAddMenu";
@@ -29,8 +30,8 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   const processRecordingMutation = useProcessRecordingMutation({
     browserSessionId: settingsStore.browserSessionId,
-    onSuccess: (blocks) => {
-      setRecordedBlocks(blocks, {
+    onSuccess: (result) => {
+      setRecordedBlocks(result, {
         previous,
         next: id,
         parent: parentId,
@@ -40,6 +41,17 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   });
 
   const isProcessing = processRecordingMutation.isPending;
+
+  const isBusy =
+    (isProcessing || recordingStore.isRecording) &&
+    debugStore.isDebugMode &&
+    settingsStore.isUsingABrowser &&
+    workflowStatePanel.workflowPanelState.data?.previous === previous &&
+    workflowStatePanel.workflowPanelState.data?.next === id &&
+    workflowStatePanel.workflowPanelState.data?.parent ===
+      (parentId || undefined);
+
+  const isDisabled = !isBusy && recordingStore.isRecording;
 
   const updateWorkflowPanelState = (active: boolean) => {
     const previous = edges.find((edge) => edge.target === id)?.source;
@@ -57,6 +69,10 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   };
 
   const onAdd = () => {
+    if (isDisabled) {
+      return;
+    }
+
     updateWorkflowPanelState(true);
   };
 
@@ -79,7 +95,9 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   const adder = (
     <div
-      className={"rounded-full bg-slate-50 p-2"}
+      className={cn("rounded-full bg-slate-50 p-2", {
+        "cursor-not-allowed bg-[grey]": isDisabled,
+      })}
       onClick={() => {
         onAdd();
       }}
@@ -106,15 +124,6 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     </WorkflowAddMenu>
   );
 
-  const isBusy =
-    (isProcessing || recordingStore.isRecording) &&
-    debugStore.isDebugMode &&
-    settingsStore.isUsingABrowser &&
-    workflowStatePanel.workflowPanelState.data?.previous === previous &&
-    workflowStatePanel.workflowPanelState.data?.next === id &&
-    workflowStatePanel.workflowPanelState.data?.parent ===
-      (parentId || undefined);
-
   return (
     <div>
       <Handle
@@ -129,7 +138,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
         id="b"
         className="opacity-0"
       />
-      {isBusy ? busy : menu}
+      {isBusy ? busy : isDisabled ? adder : menu}
     </div>
   );
 }

@@ -3,7 +3,10 @@
 import type * as Skyvern from "../index.js";
 
 export interface ActionBlock {
+    /** Author-facing identifier for a block; unique within a workflow. */
     label: string;
+    /** Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted. */
+    next_block_label?: string;
     output_parameter: Skyvern.OutputParameter;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
@@ -25,7 +28,6 @@ export interface ActionBlock {
     download_suffix?: string;
     totp_verification_url?: string;
     totp_identifier?: string;
-    cache_actions?: boolean;
     complete_verification?: boolean;
     include_action_history_in_verification?: boolean;
     download_timeout?: number;

@@ -83,6 +83,8 @@ navigation:
             path: running-tasks/cancel-runs.mdx
           - page: Webhooks FAQ
             path: running-tasks/webhooks-faq.mdx
+          - page: Proxy & Geo Targeting
+            path: running-tasks/proxy-location.mdx
           - page: Advanced Settings for tasks
             hidden: true
             path: running-tasks/advanced-features.mdx
@@ -131,10 +133,14 @@ navigation:
             path: credentials/totp.mdx
           - page: Bitwarden
             path: credentials/bitwarden.mdx
+          - page: Custom Credential Service
+            path: credentials/custom-credential-service.mdx
       - section: Browser Sessions (Beta)
         contents:
           - page: Introduction
             path: browser-sessions/introduction.mdx
+          - page: Browser Profiles
+            path: browser-sessions/browser-profiles.mdx
       - section: Observability
         contents:
           - page: Overview

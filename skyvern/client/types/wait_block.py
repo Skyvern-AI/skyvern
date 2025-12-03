@@ -11,7 +11,16 @@ from .wait_block_parameters_item import WaitBlockParametersItem
 
 
 class WaitBlock(UniversalBaseModel):
-    label: str
+    label: str = pydantic.Field()
+    """
+    Author-facing identifier for a block; unique within a workflow.
+    """
+
+    next_block_label: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted.
+    """
+
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None

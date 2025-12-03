@@ -341,6 +341,7 @@ describe("Workflows", () => {
             is_saved_task: true,
             description: "description",
             workflow_definition: {
+                version: 1,
                 parameters: [
                     {
                         parameter_type: "aws_secret",
@@ -405,6 +406,7 @@ describe("Workflows", () => {
             is_saved_task: true,
             description: "description",
             workflow_definition: {
+                version: 1,
                 parameters: [
                     {
                         parameter_type: "aws_secret",

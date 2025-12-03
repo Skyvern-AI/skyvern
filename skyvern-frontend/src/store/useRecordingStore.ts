@@ -81,6 +81,7 @@ export interface MessageInExfiltratedCdpEvent {
   event_name: string;
   params: ExfiltratedEventCdpParams;
   source: "cdp";
+  timestamp: number;
 }
 
 export interface MessageInExfiltratedConsoleEvent {
@@ -88,6 +89,7 @@ export interface MessageInExfiltratedConsoleEvent {
   event_name: string;
   params: ExfiltratedEventConsoleParams;
   source: "console";
+  timestamp: number;
 }
 
 export type MessageInExfiltratedEvent =
@@ -105,6 +107,11 @@ interface RecordingStore {
    * Each chunk contains up to CHUNK_SIZE events.
    */
   compressedChunks: string[];
+  /**
+   * The number of events to show the user. This elides noisy events, like
+   * `mousemove`.
+   */
+  exposedEventCount: number;
   /**
    * Buffer of events not yet compressed into a chunk.
    */
@@ -194,8 +201,25 @@ async function compressEventsToB64(jsonString: string): Promise<string> {
   return btoa(binary);
 }
 
+const isExposedEvent = (event: MessageInExfiltratedEvent): boolean => {
+  const exposedConsoleEventTypes = new Set(["focus", "click", "keypress"]);
+
+  if (event.source === "console") {
+    if (exposedConsoleEventTypes.has(event.params.type)) {
+      return true;
+    }
+  }
+
+  if (event.source === "cdp") {
+    return true;
+  }
+
+  return false;
+};
+
 export const useRecordingStore = create<RecordingStore>((set, get) => ({
   compressedChunks: [],
+  exposedEventCount: 0,
   pendingEvents: [],
   isCompressing: false,
   isRecording: false,
@@ -203,6 +227,10 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   add: (event) => {
     const state = get();
     const newPendingEvents = [...state.pendingEvents, event];
+
+    if (isExposedEvent(event)) {
+      set({ exposedEventCount: state.exposedEventCount + 1 });
+    }
 
     if (newPendingEvents.length >= CHUNK_SIZE && !state.isCompressing) {
       const eventsToCompress = newPendingEvents.slice(0, CHUNK_SIZE);
@@ -241,6 +269,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   reset: () =>
     set({
       compressedChunks: [],
+      exposedEventCount: 0,
       pendingEvents: [],
       isCompressing: false,
       isRecording: false,

@@ -10,4 +10,6 @@ export interface PasswordCredentialResponse {
     username: string;
     /** Type of 2FA method used for this credential */
     totp_type?: Skyvern.TotpType;
+    /** Identifier (email or phone number) used to fetch TOTP codes */
+    totp_identifier?: string;
 }

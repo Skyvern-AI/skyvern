@@ -14,7 +14,7 @@ import base64
 from datetime import datetime
 
 import structlog
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
@@ -156,8 +156,8 @@ async def workflow_run_streaming(
     try:
         organization = await get_current_org(x_api_key=apikey, authorization=token)
         organization_id = organization.organization_id
-    except Exception:
-        LOG.exception(
+    except HTTPException:
+        LOG.warning(
             "WofklowRun Streaming: Error while getting organization",
             workflow_run_id=workflow_run_id,
             token=token,
