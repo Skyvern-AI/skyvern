@@ -91,6 +91,7 @@ class SkyvernPageRun:
         LOG.info("AI task is running, this may take a while", run_id=task_run.run_id)
 
         task_run = await self._wait_for_run_completion(task_run.run_id, timeout)
+        LOG.info("AI task finished", run_id=task_run.run_id, status=task_run.status)
         return TaskRunResponse.model_validate(task_run.model_dump())
 
     async def login(
@@ -153,6 +154,7 @@ class SkyvernPageRun:
         LOG.info("AI login workflow is running, this may take a while", run_id=workflow_run.run_id)
 
         workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
+        LOG.info("AI login workflow finished", run_id=workflow_run.run_id, status=workflow_run.status)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
     async def workflow(
@@ -199,6 +201,7 @@ class SkyvernPageRun:
         LOG.info("AI workflow is running, this may take a while", run_id=workflow_run.run_id)
 
         workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
+        LOG.info("AI workflow finished", run_id=workflow_run.run_id, status=workflow_run.status)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
     async def _wait_for_run_completion(self, run_id: str, timeout: float) -> GetRunResponse:
