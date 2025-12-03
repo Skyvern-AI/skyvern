@@ -18,6 +18,7 @@ import {
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
+import { useRecordingStore } from "@/store/useRecordingStore";
 
 function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
   const { editable, label } = data;
@@ -30,9 +31,14 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const update = useUpdate<FileUploadNode["data"]>({ id, editable });
+  const recordingStore = useRecordingStore();
 
   return (
-    <div>
+    <div
+      className={cn({
+        "pointer-events-none opacity-50": recordingStore.isRecording,
+      })}
+    >
       <Handle
         type="source"
         position={Position.Bottom}

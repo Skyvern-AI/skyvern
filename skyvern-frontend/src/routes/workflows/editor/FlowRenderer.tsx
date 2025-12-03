@@ -324,6 +324,9 @@ function FlowRenderer({
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
   const saveWorkflow = useWorkflowSave({ status: "published" });
   const recordedBlocks = useRecordedBlocksStore((state) => state.blocks);
+  const recordedParameters = useRecordedBlocksStore(
+    (state) => state.parameters,
+  );
   const recordedInsertionPoint = useRecordedBlocksStore(
     (state) => state.insertionPoint,
   );
@@ -583,7 +586,8 @@ function FlowRenderer({
     doLayout(nodes, edges);
   }
 
-  // effect to add new blocks that were generated from a browser recording
+  // effect to add new blocks that were generated from a browser recording,
+  // along with any new parameters
   useEffect(() => {
     if (!recordedBlocks || !recordedInsertionPoint) {
       return;
@@ -657,6 +661,30 @@ function FlowRenderer({
 
     workflowChangesStore.setHasChanges(true);
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
+
+    const newParameters = Array<ParametersState[number]>();
+
+    for (const newParameter of recordedParameters ?? []) {
+      const exists = parameters.some((param) => param.key === newParameter.key);
+
+      if (!exists) {
+        newParameters.push({
+          key: newParameter.key,
+          parameterType: "workflow",
+          dataType: newParameter.workflow_parameter_type,
+          description: newParameter.description ?? null,
+          defaultValue: newParameter.default_value ?? "",
+        });
+      }
+    }
+
+    if (newParameters.length > 0) {
+      const workflowParametersStore = useWorkflowParametersStore.getState();
+      workflowParametersStore.setParameters([
+        ...workflowParametersStore.parameters,
+        ...newParameters,
+      ]);
+    }
 
     clearRecordedBlocks();
     // eslint-disable-next-line react-hooks/exhaustive-deps
