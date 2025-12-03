@@ -3969,7 +3969,7 @@ class JinjaBranchCriteria(BranchCriteria):
 class BranchCondition(BaseModel):
     """Represents a single conditional branch edge within a ConditionalBlock."""
 
-    criteria: BranchCriteria | None = None
+    criteria: BranchCriteriaTypeVar | None = None
     next_block_label: str | None = None
     description: str | None = None
     is_default: bool = False
@@ -4085,3 +4085,7 @@ BlockSubclasses = Union[
     HttpRequestBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
+
+
+BranchCriteriaSubclasses = Union[JinjaBranchCriteria]
+BranchCriteriaTypeVar = Annotated[BranchCriteriaSubclasses, Field(discriminator="criteria_type")]
