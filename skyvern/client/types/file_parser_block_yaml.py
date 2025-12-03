@@ -8,7 +8,16 @@ from .file_type import FileType
 
 
 class FileParserBlockYaml(UniversalBaseModel):
-    label: str
+    label: str = pydantic.Field()
+    """
+    Author-facing identifier; must be unique per workflow.
+    """
+
+    next_block_label: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]].
+    """
+
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str

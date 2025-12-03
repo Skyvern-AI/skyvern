@@ -4,7 +4,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .proxy_location import ProxyLocation
+from .workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
 
 
 class WorkflowRunRequest(UniversalBaseModel):
@@ -23,7 +23,7 @@ class WorkflowRunRequest(UniversalBaseModel):
     The title for this workflow run
     """
 
-    proxy_location: typing.Optional[ProxyLocation] = pydantic.Field(default=None)
+    proxy_location: typing.Optional[WorkflowRunRequestProxyLocation] = pydantic.Field(default=None)
     """
     
     Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
@@ -48,6 +48,7 @@ class WorkflowRunRequest(UniversalBaseModel):
     - US-FL: Florida
     - US-WA: Washington
     - NONE: No proxy
+     Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
     """
 
     webhook_url: typing.Optional[str] = pydantic.Field(default=None)

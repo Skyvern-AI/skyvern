@@ -6,7 +6,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel, update_forward_refs
-from .proxy_location import ProxyLocation
+from .workflow_create_yaml_request_proxy_location import WorkflowCreateYamlRequestProxyLocation
 from .workflow_definition_yaml import WorkflowDefinitionYaml
 from .workflow_status import WorkflowStatus
 
@@ -14,7 +14,7 @@ from .workflow_status import WorkflowStatus
 class WorkflowCreateYamlRequest(UniversalBaseModel):
     title: str
     description: typing.Optional[str] = None
-    proxy_location: typing.Optional[ProxyLocation] = None
+    proxy_location: typing.Optional[WorkflowCreateYamlRequestProxyLocation] = None
     webhook_callback_url: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None

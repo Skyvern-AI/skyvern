@@ -18,6 +18,7 @@ from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
 class ForLoopBlockYamlLoopBlocksItem_Task(UniversalBaseModel):
     block_type: typing.Literal["task"] = "task"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: typing.Optional[str] = None
@@ -34,7 +35,6 @@ class ForLoopBlockYamlLoopBlocksItem_Task(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
@@ -54,6 +54,7 @@ class ForLoopBlockYamlLoopBlocksItem_Task(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_ForLoop(UniversalBaseModel):
     block_type: typing.Literal["for_loop"] = "for_loop"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     loop_blocks: typing.List["ForLoopBlockYamlLoopBlocksItem"]
@@ -77,6 +78,7 @@ from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
 class ForLoopBlockYamlLoopBlocksItem_Code(UniversalBaseModel):
     block_type: typing.Literal["code"] = "code"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     code: str
@@ -95,6 +97,7 @@ class ForLoopBlockYamlLoopBlocksItem_Code(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_TextPrompt(UniversalBaseModel):
     block_type: typing.Literal["text_prompt"] = "text_prompt"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     llm_key: typing.Optional[str] = None
@@ -115,6 +118,7 @@ class ForLoopBlockYamlLoopBlocksItem_TextPrompt(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_DownloadToS3(UniversalBaseModel):
     block_type: typing.Literal["download_to_s3"] = "download_to_s3"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: str
@@ -132,6 +136,7 @@ class ForLoopBlockYamlLoopBlocksItem_DownloadToS3(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_UploadToS3(UniversalBaseModel):
     block_type: typing.Literal["upload_to_s3"] = "upload_to_s3"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     path: typing.Optional[str] = None
@@ -149,6 +154,7 @@ class ForLoopBlockYamlLoopBlocksItem_UploadToS3(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_FileUpload(UniversalBaseModel):
     block_type: typing.Literal["file_upload"] = "file_upload"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     storage_type: typing.Optional[FileStorageType] = None
@@ -175,6 +181,7 @@ class ForLoopBlockYamlLoopBlocksItem_FileUpload(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_SendEmail(UniversalBaseModel):
     block_type: typing.Literal["send_email"] = "send_email"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     smtp_host_secret_parameter_key: str
@@ -200,6 +207,7 @@ class ForLoopBlockYamlLoopBlocksItem_SendEmail(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_FileUrlParser(UniversalBaseModel):
     block_type: typing.Literal["file_url_parser"] = "file_url_parser"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str
@@ -219,6 +227,7 @@ class ForLoopBlockYamlLoopBlocksItem_FileUrlParser(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Validation(UniversalBaseModel):
     block_type: typing.Literal["validation"] = "validation"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     complete_criterion: typing.Optional[str] = None
@@ -240,6 +249,7 @@ class ForLoopBlockYamlLoopBlocksItem_Validation(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Action(UniversalBaseModel):
     block_type: typing.Literal["action"] = "action"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: typing.Optional[str] = None
@@ -253,7 +263,6 @@ class ForLoopBlockYamlLoopBlocksItem_Action(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
@@ -269,6 +278,7 @@ class ForLoopBlockYamlLoopBlocksItem_Action(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Navigation(UniversalBaseModel):
     block_type: typing.Literal["navigation"] = "navigation"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     navigation_goal: str
@@ -283,7 +293,6 @@ class ForLoopBlockYamlLoopBlocksItem_Navigation(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
@@ -303,6 +312,7 @@ class ForLoopBlockYamlLoopBlocksItem_Navigation(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Extraction(UniversalBaseModel):
     block_type: typing.Literal["extraction"] = "extraction"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     data_extraction_goal: str
@@ -313,7 +323,6 @@ class ForLoopBlockYamlLoopBlocksItem_Extraction(UniversalBaseModel):
     max_retries: typing.Optional[int] = None
     max_steps_per_run: typing.Optional[int] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
@@ -329,6 +338,7 @@ class ForLoopBlockYamlLoopBlocksItem_Extraction(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Login(UniversalBaseModel):
     block_type: typing.Literal["login"] = "login"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: typing.Optional[str] = None
@@ -341,7 +351,6 @@ class ForLoopBlockYamlLoopBlocksItem_Login(UniversalBaseModel):
     parameter_keys: typing.Optional[typing.List[str]] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
@@ -360,6 +369,7 @@ class ForLoopBlockYamlLoopBlocksItem_Login(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Wait(UniversalBaseModel):
     block_type: typing.Literal["wait"] = "wait"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     wait_sec: typing.Optional[int] = None
@@ -377,6 +387,7 @@ class ForLoopBlockYamlLoopBlocksItem_Wait(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_HumanInteraction(UniversalBaseModel):
     block_type: typing.Literal["human_interaction"] = "human_interaction"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     instructions: typing.Optional[str] = None
@@ -401,6 +412,7 @@ class ForLoopBlockYamlLoopBlocksItem_HumanInteraction(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_FileDownload(UniversalBaseModel):
     block_type: typing.Literal["file_download"] = "file_download"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     navigation_goal: str
@@ -414,7 +426,6 @@ class ForLoopBlockYamlLoopBlocksItem_FileDownload(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     disable_cache: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
 
@@ -431,6 +442,7 @@ class ForLoopBlockYamlLoopBlocksItem_FileDownload(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_GotoUrl(UniversalBaseModel):
     block_type: typing.Literal["goto_url"] = "goto_url"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: str
@@ -448,6 +460,7 @@ class ForLoopBlockYamlLoopBlocksItem_GotoUrl(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_PdfParser(UniversalBaseModel):
     block_type: typing.Literal["pdf_parser"] = "pdf_parser"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str
@@ -466,6 +479,7 @@ class ForLoopBlockYamlLoopBlocksItem_PdfParser(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_TaskV2(UniversalBaseModel):
     block_type: typing.Literal["task_v2"] = "task_v2"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     prompt: str
@@ -489,6 +503,7 @@ class ForLoopBlockYamlLoopBlocksItem_TaskV2(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_HttpRequest(UniversalBaseModel):
     block_type: typing.Literal["http_request"] = "http_request"
     label: str
+    next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     method: typing.Optional[str] = None
