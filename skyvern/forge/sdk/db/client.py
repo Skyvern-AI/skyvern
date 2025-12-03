@@ -910,7 +910,7 @@ class AgentDB:
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: Literal["api", "onepassword_service_account"],
+        token_type: Literal["api", "onepassword_service_account", "custom_credential_service"],
     ) -> OrganizationAuthToken | None: ...
 
     @overload
@@ -923,7 +923,9 @@ class AgentDB:
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: Literal["api", "onepassword_service_account", "azure_client_secret_credential"],
+        token_type: Literal[
+            "api", "onepassword_service_account", "azure_client_secret_credential", "custom_credential_service"
+        ],
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | None:
         try:
             async with self.Session() as session:
