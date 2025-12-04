@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import importlib.util
+import json
 import os
 import uuid
 from dataclasses import dataclass
@@ -17,9 +18,11 @@ from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
-from skyvern.core.script_generations.skyvern_page import script_run_context_manager
-from skyvern.exceptions import ScriptNotFound, ScriptTerminationException, WorkflowRunNotFound
+from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
+from skyvern.errors.errors import UserDefinedError
+from skyvern.exceptions import ScriptNotFound, ScriptTerminationException, StepTerminationError, WorkflowRunNotFound
 from skyvern.forge import app
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
@@ -58,6 +61,7 @@ from skyvern.schemas.scripts import (
     ScriptStatus,
 )
 from skyvern.schemas.workflows import BlockStatus, BlockType, FileStorageType, FileType
+from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
@@ -378,13 +382,7 @@ async def _take_workflow_run_block_screenshot(
     if not browser_state:
         LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
     else:
-        screenshot = await browser_state.take_fullpage_screenshot(
-            use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "ENABLE_PLAYWRIGHT_FULLPAGE",
-                workflow_run_id,
-                properties={"organization_id": str(organization_id)},
-            )
-        )
+        screenshot = await browser_state.take_fullpage_screenshot()
         if screenshot:
             await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                 workflow_run_block=workflow_run_block,
@@ -399,6 +397,7 @@ async def _create_workflow_block_run_and_task(
     schema: dict[str, Any] | list | str | None = None,
     url: str | None = None,
     label: str | None = None,
+    model: dict[str, Any] | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Create a workflow block run and optionally a task if workflow_run_id is available in context.
@@ -449,6 +448,7 @@ async def _create_workflow_block_run_and_task(
                 status="running",
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
+                model=model,
             )
 
             task_id = task.task_id
@@ -612,6 +612,30 @@ async def _update_workflow_block(
 
             task_output = TaskOutput.from_task(updated_task, downloaded_files)
             final_output = task_output.model_dump()
+            step_for_billing: Step | None = None
+            if step_id:
+                step_for_billing = await app.DATABASE.get_step(
+                    step_id=step_id,
+                    organization_id=context.organization_id,
+                )
+            if step_for_billing:
+                try:
+                    if not ai_fallback_triggered:
+                        await app.AGENT_FUNCTION.post_cache_step_execution(
+                            updated_task,
+                            step_for_billing,
+                        )
+                except StepTerminationError as billing_error:
+                    LOG.warning(
+                        "Cached step billing failed; marking workflow block as failed.",
+                        organization_id=context.organization_id,
+                        task_id=task_id,
+                        step_id=step_id,
+                        error=str(billing_error),
+                    )
+                    status = BlockStatus.failed
+                    failure_reason = str(billing_error)
+                    final_output = None
         else:
             final_output = None
 
@@ -644,6 +668,90 @@ async def _update_workflow_block(
 async def _run_cached_function(cached_fn: Callable) -> Any:
     run_context = script_run_context_manager.ensure_run_context()
     return await cached_fn(page=run_context.page, context=run_context)
+
+
+async def _detect_user_defined_errors(
+    task: Task,
+    step: Step,
+    workflow_run_id: str,
+    error_code_mapping: dict[str, str],
+    prompt: str | None = None,
+) -> list[UserDefinedError]:
+    """
+    Detect user-defined errors using LLM when error_code_mapping is provided.
+    Returns a list of UserDefinedError objects if any errors are detected.
+    """
+    try:
+        run_context = script_run_context_manager.ensure_run_context()
+        skyvern_page = run_context.page
+        scraped_page = await skyvern_page.scraped_page.refresh()
+        skyvern_page.scraped_page = scraped_page
+        current_url = scraped_page.url
+
+        # Build element tree
+        element_tree_format = ElementTreeFormat.HTML
+        elements = scraped_page.build_element_tree(element_tree_format)
+
+        screenshots = scraped_page.screenshots
+
+        # Build the prompt using the surface-user-defined-errors template
+        context = skyvern_context.current()
+        tz_info = datetime.now().astimezone().tzinfo
+        if context and context.tz_info:
+            tz_info = context.tz_info
+        prompt_name = "surface-user-defined-errors"
+        error_detection_prompt = prompt_engine.load_prompt(
+            prompt_name,
+            error_code_mapping_str=json.dumps(error_code_mapping),
+            navigation_goal=prompt or task.navigation_goal or "",
+            navigation_payload_str=json.dumps(task.navigation_payload or {}),
+            elements=elements,
+            current_url=current_url,
+            action_history=[],
+            local_datetime=datetime.now(tz_info).isoformat(),
+            reasoning=None,
+        )
+
+        # Call LLM to detect errors
+        json_response = await app.EXTRACTION_LLM_API_HANDLER(
+            prompt=error_detection_prompt,
+            screenshots=screenshots,
+            step=step,
+            prompt_name=prompt_name,
+        )
+
+        # Parse the response and extract errors
+        errors_list = json_response.get("errors", [])
+        user_defined_errors = []
+
+        for error_dict in errors_list:
+            try:
+                user_defined_error = UserDefinedError.model_validate(error_dict)
+                user_defined_errors.append(user_defined_error)
+            except Exception:
+                LOG.warning(
+                    "Failed to validate user-defined error",
+                    error_dict=error_dict,
+                )
+
+        LOG.info(
+            "Detected user-defined errors",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            error_count=len(user_defined_errors),
+            errors=[e.error_code for e in user_defined_errors],
+        )
+
+        return user_defined_errors
+
+    except Exception as e:
+        LOG.exception(
+            "Failed to detect user-defined errors",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            error=str(e),
+        )
+        return []
 
 
 async def _fallback_to_ai_run(
@@ -726,13 +834,51 @@ async def _fallback_to_ai_run(
                 workflow_permanent_id=workflow_permanent_id,
                 workflow_run_id=workflow_run_id,
             )
+
+            # If error_code_mapping is provided, detect user-defined errors using LLM
+            detected_errors: list[UserDefinedError] = []
+            if error_code_mapping:
+                LOG.info(
+                    "Error code mapping provided, detecting user-defined errors",
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                )
+                detected_errors = await _detect_user_defined_errors(
+                    task=task,
+                    step=previous_step,
+                    workflow_run_id=workflow_run_id,
+                    error_code_mapping=error_code_mapping,
+                    prompt=prompt,
+                )
+
+                # Update task errors if any errors were detected
+                if detected_errors:
+                    task_errors = task.errors or []
+                    task_errors.extend([error.model_dump() for error in detected_errors])
+                    await app.DATABASE.update_task(
+                        task_id=task_id,
+                        organization_id=organization_id,
+                        errors=task_errors,
+                    )
+                    LOG.info(
+                        "Updated task with detected user-defined errors",
+                        task_id=task_id,
+                        error_codes=[e.error_code for e in detected_errors],
+                    )
+
+            # Update workflow block with failure reason (include detected errors if any)
+            task_failure_reason = str(error)
+            if detected_errors:
+                error_codes = [e.error_code for e in detected_errors]
+                task_failure_reason = f"{task_failure_reason}. Detected errors: {', '.join(error_codes)}"
+
             if workflow_run_block_id:
                 await _update_workflow_block(
                     workflow_run_block_id,
                     BlockStatus.failed,
                     task_id=task_id,
                     task_status=TaskStatus.failed,
-                    failure_reason=str(error),
+                    failure_reason=task_failure_reason,
                     step_id=script_step_id,
                     step_status=StepStatus.failed,
                     label=cache_key,
@@ -819,6 +965,7 @@ async def _fallback_to_ai_run(
                 BlockStatus(task.status.value),
                 failure_reason=failure_reason,
                 label=cache_key,
+                ai_fallback_triggered=True,
             )
 
         # 5. After successful AI execution, regenerate the script block and create new version
@@ -918,7 +1065,7 @@ async def _regenerate_script_block_after_ai_fallback(
         if not cache_key_value:
             cache_key_value = cache_key  # Fallback
 
-        existing_scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
+        existing_script = await app.DATABASE.get_workflow_script_by_cache_key_value(
             organization_id=organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=cache_key_value,
@@ -926,11 +1073,11 @@ async def _regenerate_script_block_after_ai_fallback(
             statuses=[ScriptStatus.published],
         )
 
-        if not existing_scripts:
+        if not existing_script:
             LOG.error("No existing script found to regenerate", cache_key=cache_key, cache_key_value=cache_key_value)
             return
 
-        current_script = existing_scripts[0]
+        current_script = existing_script
         LOG.info(
             "Regenerating script block after AI fallback",
             script_id=current_script.script_id,
@@ -1173,7 +1320,8 @@ async def run_task(
     cache_key: str | None = None,
     engine: RunEngine = RunEngine.skyvern_v1,
     model: dict[str, Any] | None = None,
-) -> None:
+    error_code_mapping: dict[str, str] | None = None,
+) -> dict[str, Any] | list | str | None:
     cache_key = cache_key or label
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
 
@@ -1185,13 +1333,14 @@ async def run_task(
             prompt=prompt,
             url=url,
             label=cache_key,
+            model=model,
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
         try:
-            await _run_cached_function(cached_fn)
+            output = await _run_cached_function(cached_fn)
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
@@ -1199,9 +1348,11 @@ async def run_task(
                     workflow_run_block_id,
                     BlockStatus.completed,
                     task_id=task_id,
+                    output=output,
                     step_id=step_id,
                     label=cache_key,
                 )
+            return output
 
         except Exception as e:
             LOG.exception("Failed to run task block. Falling back to AI run.")
@@ -1215,7 +1366,9 @@ async def run_task(
                 totp_url=totp_url,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
+                error_code_mapping=error_code_mapping,
             )
+            return None
         finally:
             # clear the prompt in the RunContext
             context.prompt = None
@@ -1231,13 +1384,15 @@ async def run_task(
             totp_verification_url=totp_url,
             include_action_history_in_verification=True,
             engine=RunEngine.skyvern_v1,
+            model=model,
         )
-        await task_block.execute_safe(
+        block_output = await task_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
             parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
+        return block_output.output_parameter_value
 
 
 async def download(
@@ -1250,6 +1405,8 @@ async def download(
     totp_url: str | None = None,
     label: str | None = None,
     cache_key: str | None = None,
+    model: dict[str, Any] | None = None,
+    error_code_mapping: dict[str, str] | None = None,
 ) -> None:
     cache_key = cache_key or label
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
@@ -1261,6 +1418,7 @@ async def download(
             prompt=prompt,
             url=url,
             label=cache_key,
+            model=model,
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -1291,6 +1449,7 @@ async def download(
                 complete_on_download=complete_on_download,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
+                error_code_mapping=error_code_mapping,
             )
         finally:
             context.prompt = None
@@ -1307,6 +1466,7 @@ async def download(
             totp_verification_url=totp_url,
             include_action_history_in_verification=True,
             engine=RunEngine.skyvern_v1,
+            model=model,
         )
         await file_download_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
@@ -1325,6 +1485,8 @@ async def action(
     totp_url: str | None = None,
     label: str | None = None,
     cache_key: str | None = None,
+    model: dict[str, Any] | None = None,
+    error_code_mapping: dict[str, str] | None = None,
 ) -> None:
     context: skyvern_context.SkyvernContext | None
     cache_key = cache_key or label
@@ -1336,6 +1498,7 @@ async def action(
             prompt=prompt,
             url=url,
             label=cache_key,
+            model=model,
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -1367,6 +1530,7 @@ async def action(
                 totp_url=totp_url,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
+                error_code_mapping=error_code_mapping,
             )
         finally:
             context.prompt = None
@@ -1381,6 +1545,7 @@ async def action(
             max_steps_per_run=max_steps,
             totp_identifier=totp_identifier,
             totp_verification_url=totp_url,
+            model=model,
         )
         await action_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
@@ -1398,6 +1563,8 @@ async def login(
     totp_url: str | None = None,
     label: str | None = None,
     cache_key: str | None = None,
+    model: dict[str, Any] | None = None,
+    error_code_mapping: dict[str, str] | None = None,
 ) -> None:
     context: skyvern_context.SkyvernContext | None
     cache_key = cache_key or label
@@ -1410,8 +1577,14 @@ async def login(
             prompt=prompt,
             url=url,
             label=cache_key,
+            model=model,
         )
         prompt = _render_template_with_label(prompt, cache_key)
+        if totp_url:
+            totp_url = _render_template_with_label(totp_url, cache_key)
+        if totp_identifier:
+            totp_identifier = _render_template_with_label(totp_identifier, cache_key)
+
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1440,6 +1613,7 @@ async def login(
                 totp_url=totp_url,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
+                error_code_mapping=error_code_mapping,
             )
         finally:
             context.prompt = None
@@ -1453,6 +1627,7 @@ async def login(
             max_steps_per_run=max_steps,
             totp_identifier=totp_identifier,
             totp_verification_url=totp_url,
+            model=model,
         )
         await login_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
@@ -1469,6 +1644,7 @@ async def extract(
     max_steps: int | None = None,
     label: str | None = None,
     cache_key: str | None = None,
+    model: dict[str, Any] | None = None,
 ) -> dict[str, Any] | list | str | None:
     output: dict[str, Any] | list | str | None = None
 
@@ -1483,6 +1659,7 @@ async def extract(
             schema=schema,
             url=url,
             label=cache_key,
+            model=model,
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -1528,6 +1705,7 @@ async def extract(
             max_steps_per_run=max_steps,
             data_schema=schema,
             output_parameter=block_validation_output.output_parameter,
+            model=model,
         )
         block_result = await extraction_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
@@ -1543,6 +1721,7 @@ async def validate(
     terminate_criterion: str | None = None,
     error_code_mapping: dict[str, str] | None = None,
     label: str | None = None,
+    model: dict[str, Any] | None = None,
 ) -> None:
     """Validate function that behaves like a ValidationBlock"""
     if not complete_criterion and not terminate_criterion:
@@ -1557,6 +1736,7 @@ async def validate(
         terminate_criterion=terminate_criterion,
         error_code_mapping=error_code_mapping,
         max_steps_per_run=2,
+        model=model,
     )
     result = await validation_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
@@ -1902,6 +2082,7 @@ async def parse_file(
     schema: dict[str, Any] | None = None,
     label: str | None = None,
     parameters: list[str] | None = None,
+    model: dict[str, Any] | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     file_url = _render_template_with_label(file_url, label)
@@ -1912,6 +2093,7 @@ async def parse_file(
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,
+        model=model,
     )
     await file_parser_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
@@ -1983,6 +2165,7 @@ async def prompt(
     schema: dict[str, Any] | None = None,
     label: str | None = None,
     parameters: list[str] | None = None,
+    model: dict[str, Any] | None = None,
 ) -> dict[str, Any] | list | str | None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     prompt = _render_template_with_label(prompt, label)
@@ -1992,6 +2175,7 @@ async def prompt(
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,
+        model=model,
     )
     result = await prompt_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,

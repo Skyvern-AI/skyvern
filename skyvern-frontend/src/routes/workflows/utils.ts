@@ -12,31 +12,24 @@ export const getInitialValues = (
     ? location.state.data
     : workflowParameters?.reduce(
         (acc, curr) => {
-          if (curr.workflow_parameter_type === "json") {
-            if (typeof curr.default_value === "string") {
-              acc[curr.key] = curr.default_value;
+          const hasDefaultValue =
+            curr.default_value !== null && curr.default_value !== undefined;
+          if (hasDefaultValue) {
+            // Handle JSON parameters
+            if (curr.workflow_parameter_type === "json") {
+              if (typeof curr.default_value === "string") {
+                acc[curr.key] = curr.default_value;
+              } else {
+                acc[curr.key] = JSON.stringify(curr.default_value, null, 2);
+              }
               return acc;
             }
-            if (curr.default_value) {
-              acc[curr.key] = JSON.stringify(curr.default_value, null, 2);
+            if (curr.workflow_parameter_type === "boolean") {
+              // Backend stores as strings, convert to boolean for frontend
+              acc[curr.key] =
+                curr.default_value === "true" || curr.default_value === true;
               return acc;
             }
-          }
-          if (
-            curr.default_value &&
-            curr.workflow_parameter_type === "boolean"
-          ) {
-            acc[curr.key] = Boolean(curr.default_value);
-            return acc;
-          }
-          if (
-            curr.default_value === null &&
-            curr.workflow_parameter_type === "string"
-          ) {
-            acc[curr.key] = "";
-            return acc;
-          }
-          if (curr.default_value) {
             acc[curr.key] = curr.default_value;
             return acc;
           }

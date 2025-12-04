@@ -37,6 +37,7 @@ import { useRerender } from "@/hooks/useRerender";
 import { BROWSER_DOWNLOAD_TIMEOUT_SECONDS } from "@/api/types";
 
 import { DisableCache } from "../DisableCache";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -132,6 +133,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                 <HelpTooltip content={navigationGoalTooltip} />
               </div>
               <WorkflowBlockInputTextarea
+                aiImprove={AI_IMPROVE_CONFIGS.fileDownload.navigationGoal}
                 nodeId={id}
                 onChange={(value) => {
                   update({ navigationGoal: value });
@@ -297,12 +299,8 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={data.cacheActions}
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

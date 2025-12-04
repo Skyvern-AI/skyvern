@@ -25,6 +25,8 @@ export interface LoginRequest {
     totp_url?: string;
     /** ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456` */
     browser_session_id?: string;
+    /** ID of a browser profile to reuse for this run */
+    browser_profile_id?: string;
     /** The CDP address for the task. */
     browser_address?: string;
     /** Additional HTTP headers to include in requests */

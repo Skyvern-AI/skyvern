@@ -1049,7 +1049,8 @@ if settings.ENABLE_NOVITA:
 # NOTE: If you want to specify a location, make sure the model is available in the target location.
 # If you want to use the global location, you must set the VERTEX_PROJECT_ID environment variable.
 # See documentation: https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations#united-states
-if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
+# Support both explicit service account credentials and Google Cloud Workload Identity (metadata server fallback)
+if settings.ENABLE_VERTEX_AI:
     api_base: str | None = None
     if settings.VERTEX_LOCATION == "global" and settings.VERTEX_PROJECT_ID:
         api_base = f"https://aiplatform.googleapis.com/v1/projects/{settings.VERTEX_PROJECT_ID}/locations/global/publishers/google/models"
@@ -1058,18 +1059,18 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_PRO",
         LLMConfig(
             "vertex_ai/gemini-2.5-pro",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-pro" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1077,18 +1078,18 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_PRO_PREVIEW",
         LLMConfig(
             "vertex_ai/gemini-2.5-pro-preview-05-06",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-pro-preview-05-06" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1096,18 +1097,18 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_FLASH_DEPRECATED",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1115,18 +1116,18 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_FLASH_LITE_DEPRECATED",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-lite",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-lite" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1134,18 +1135,18 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_FLASH_PREVIEW",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-preview-05-20",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-preview-05-20" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1153,18 +1154,18 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_FLASH_PREVIEW_04_17",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-preview-04-17",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-preview-04-17" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1172,18 +1173,18 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-preview-05-20",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-preview-05-20" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1191,18 +1192,37 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_FLASH",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.0_PRO",
+        LLMConfig(
+            "vertex_ai/gemini-3-pro-preview",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3-pro-preview" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1210,18 +1230,18 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_FLASH_LITE",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-lite",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-lite" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1230,18 +1250,18 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_FLASH_PREVIEW_09_2025",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-preview-09-2025",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-preview-09-2025" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1249,18 +1269,18 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_2.5_FLASH_LITE_PREVIEW_09_2025",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-lite-preview-09-2025",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-lite-preview-09-2025" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking={
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1268,14 +1288,14 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_FLASH_2_0",
         LLMConfig(
             "vertex_ai/gemini-2.0-flash-001",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=8192,
             litellm_params=LiteLLMParams(
                 api_base=f"{api_base}/gemini-2.0-flash-001" if api_base else None,
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 vertex_location=settings.VERTEX_LOCATION,
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1283,13 +1303,13 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_PRO",
         LLMConfig(
             "vertex_ai/gemini-1.5-pro",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=8192,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 vertex_location=settings.VERTEX_LOCATION,  # WARN: this model don't support global
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -1297,13 +1317,13 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         "VERTEX_GEMINI_FLASH",
         LLMConfig(
             "vertex_ai/gemini-1.5-flash",
-            ["VERTEX_CREDENTIALS"],
+            [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=8192,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
                 vertex_location=settings.VERTEX_LOCATION,  # WARN: this model don't support global
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )

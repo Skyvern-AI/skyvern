@@ -36,6 +36,7 @@ import {
 import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { cn } from "@/util/utils";
@@ -56,9 +57,11 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
   const reactFlowInstance = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
+  const recordingStore = useRecordingStore();
   const script = blockScriptStore.scripts.__start_block__;
   const rerender = useRerender({ prefix: "accordion" });
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
+  const isRecording = recordingStore.isRecording;
 
   const makeStartSettings = (data: StartNode["data"]): StartSettings => {
     return {
@@ -279,7 +282,12 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                               className="ml-auto"
                               checked={data.runSequentially}
                               onCheckedChange={(value) => {
-                                update({ runSequentially: value });
+                                update({
+                                  runSequentially: value,
+                                  sequentialKey: value
+                                    ? data.sequentialKey
+                                    : null,
+                                });
                               }}
                             />
                           </div>
@@ -391,7 +399,11 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
   }
 
   return (
-    <div>
+    <div
+      className={cn({
+        "pointer-events-none opacity-50": isRecording,
+      })}
+    >
       <Handle
         type="source"
         position={Position.Bottom}

@@ -6,6 +6,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
+import { NoticeMe } from "@/components/NoticeMe";
 import { StatusBadge } from "@/components/StatusBadge";
 import { toast } from "@/components/ui/use-toast";
 import { useLogging } from "@/hooks/useLogging";
@@ -29,6 +30,7 @@ import {
 import { getInitialValues } from "@/routes/workflows/utils";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
 import {
@@ -168,6 +170,7 @@ function NodeHeader({
   } = useParams();
   const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
+  const recordingStore = useRecordingStore();
   const { closeWorkflowPanel } = useWorkflowPanelStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -202,6 +205,8 @@ function NodeHeader({
 
   const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
+
+  const isRecording = recordingStore.isRecording;
 
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
@@ -531,24 +536,26 @@ function NodeHeader({
                 <span className="text-xs text-slate-400">
                   {transmutations.blockTitle}
                 </span>
-                <MicroDropdown
-                  selections={[
-                    transmutations.self,
-                    ...transmutations.others.map((t) => t.label),
-                  ]}
-                  selected={transmutations.self}
-                  onChange={(label) => {
-                    const transmutation = transmutations.others.find(
-                      (t) => t.label === label,
-                    );
+                <NoticeMe trigger="viewport">
+                  <MicroDropdown
+                    selections={[
+                      transmutations.self,
+                      ...transmutations.others.map((t) => t.label),
+                    ]}
+                    selected={transmutations.self}
+                    onChange={(label) => {
+                      const transmutation = transmutations.others.find(
+                        (t) => t.label === label,
+                      );
 
-                    if (!transmutation) {
-                      return;
-                    }
+                      if (!transmutation) {
+                        return;
+                      }
 
-                    transmuteNodeCallback(nodeId, transmutation.nodeName);
-                  }}
-                />
+                      transmuteNodeCallback(nodeId, transmutation.nodeName);
+                    }}
+                  />
+                </NoticeMe>
               </div>
             ) : (
               <span className="text-xs text-slate-400">{blockTitle}</span>
@@ -587,7 +594,8 @@ function NodeHeader({
                     "pointer-events-none fill-gray-500 text-gray-500":
                       workflowRunIsRunningOrQueued ||
                       !workflowPermanentId ||
-                      debugSession === undefined,
+                      debugSession === undefined ||
+                      isRecording,
                   })}
                   onClick={() => {
                     handleOnPlay();

@@ -84,6 +84,9 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["folders"],
+      });
       onSuccessfullyDeleted?.();
     },
     onError: (error: AxiosError) => {

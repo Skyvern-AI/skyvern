@@ -8,8 +8,15 @@ import pytest
 from skyvern import config
 from skyvern.config import Settings
 from skyvern.forge import app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.api.llm import api_handler_factory, config_registry
 from skyvern.forge.sdk.settings_manager import SettingsManager
+
+
+@pytest.fixture(scope="module", autouse=True)
+def setup_forge_app():
+    start_forge_app()
+    yield
 
 
 class DummyResponse(dict):

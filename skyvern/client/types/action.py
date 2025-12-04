@@ -7,6 +7,7 @@ import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .action_status import ActionStatus
 from .action_type import ActionType
+from .click_context import ClickContext
 from .input_or_select_context import InputOrSelectContext
 from .select_option import SelectOption
 from .user_defined_error import UserDefinedError
@@ -44,6 +45,7 @@ class Action(UniversalBaseModel):
     option: typing.Optional[SelectOption] = None
     is_checked: typing.Optional[bool] = None
     verified: typing.Optional[bool] = None
+    click_context: typing.Optional[ClickContext] = None
     totp_timing_info: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     created_at: typing.Optional[dt.datetime] = None
     modified_at: typing.Optional[dt.datetime] = None

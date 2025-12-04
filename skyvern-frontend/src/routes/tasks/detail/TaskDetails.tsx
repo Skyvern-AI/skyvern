@@ -1,3 +1,4 @@
+import { AxiosError } from "axios";
 import { getClient } from "@/api/AxiosClient";
 import { useState } from "react";
 import {
@@ -6,6 +7,7 @@ import {
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
+import { Status404 } from "@/components/Status404";
 import { StatusBadge } from "@/components/StatusBadge";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
@@ -33,10 +35,12 @@ import { type ApiCommandOptions } from "@/util/apiCommands";
 import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, Outlet, useParams } from "react-router-dom";
+import { Link, Outlet } from "react-router-dom";
 import { statusIsFinalized } from "../types";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
+import { useFirstParam } from "@/hooks/useFirstParam";
+import * as env from "@/util/env";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -52,7 +56,7 @@ function createTaskRequestObject(values: TaskApiResponse) {
 }
 
 function TaskDetails() {
-  const { taskId } = useParams();
+  const taskId = useFirstParam("taskId", "runId");
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
@@ -62,7 +66,7 @@ function TaskDetails() {
     isLoading: taskIsLoading,
     isError: taskIsError,
     error: taskError,
-  } = useTaskQuery({ id: taskId });
+  } = useTaskQuery({ id: taskId ?? undefined });
 
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useQuery<WorkflowRunStatusApiResponse>({
@@ -132,6 +136,12 @@ function TaskDetails() {
   const [replayOpen, setReplayOpen] = useState(false);
 
   if (taskIsError) {
+    const status = (taskError as AxiosError | undefined)?.response?.status;
+
+    if (status === 404) {
+      return <Status404 />;
+    }
+
     return <div>Error: {taskError?.message}</div>;
   }
 
@@ -294,7 +304,11 @@ function TaskDetails() {
             workflow &&
             workflowRun && (
               <Link
-                to={`/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`}
+                to={
+                  env.useNewRunsUrl
+                    ? `/runs/${workflowRun.workflow_run_id}`
+                    : `/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`
+                }
               >
                 {workflow.title}
               </Link>

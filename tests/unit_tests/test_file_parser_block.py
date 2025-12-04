@@ -6,8 +6,16 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from skyvern.forge import app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.workflow.models.block import FileParserBlock, FileType
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+
+
+@pytest.fixture(scope="module", autouse=True)
+def setup_forge_app():
+    start_forge_app()
+    yield
 
 
 class TestFileParserBlock:
@@ -172,7 +180,7 @@ class TestFileParserBlock:
         # Mock the LLM response
         mock_response = {"extracted_data": {"names": ["John", "Jane"], "total_count": 2}}
 
-        with patch("skyvern.forge.sdk.workflow.models.block.app.LLM_API_HANDLER") as mock_llm:
+        with patch.object(object.__getattribute__(app, "_inst"), "LLM_API_HANDLER") as mock_llm:
             mock_llm.return_value = mock_response
 
             with patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt") as mock_prompt:
@@ -190,7 +198,7 @@ class TestFileParserBlock:
         # Mock the LLM response
         mock_response = {"output": {"summary": "Extracted data from file"}}
 
-        with patch("skyvern.forge.sdk.workflow.models.block.app.LLM_API_HANDLER") as mock_llm:
+        with patch.object(object.__getattribute__(app, "_inst"), "LLM_API_HANDLER") as mock_llm:
             mock_llm.return_value = mock_response
 
             with patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt") as mock_prompt:

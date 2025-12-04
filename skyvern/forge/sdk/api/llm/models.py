@@ -18,6 +18,8 @@ class LiteLLMParams(TypedDict, total=False):
     vertex_credentials: str | None
     vertex_location: str | None
     thinking: dict[str, Any] | None
+    service_tier: str | None
+    timeout: float | None
 
 
 @dataclass(frozen=True)
@@ -101,7 +103,8 @@ class LLMAPIHandler(Protocol):
         use_message_history: bool = False,
         raw_response: bool = False,
         window_dimension: Resolution | None = None,
-    ) -> Awaitable[dict[str, Any]]: ...
+        force_dict: bool = True,
+    ) -> Awaitable[dict[str, Any] | Any]: ...
 
 
 async def dummy_llm_api_handler(
@@ -118,5 +121,6 @@ async def dummy_llm_api_handler(
     use_message_history: bool = False,
     raw_response: bool = False,
     window_dimension: Resolution | None = None,
-) -> dict[str, Any]:
+    force_dict: bool = True,
+) -> dict[str, Any] | Any:
     raise NotImplementedError("Your LLM provider is not configured. Please configure it in the .env file.")

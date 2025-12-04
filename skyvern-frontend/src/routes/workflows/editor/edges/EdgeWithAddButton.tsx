@@ -1,5 +1,3 @@
-import { Button } from "@/components/ui/button";
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { PlusIcon } from "@radix-ui/react-icons";
 import {
   BaseEdge,
@@ -8,7 +6,19 @@ import {
   getBezierPath,
   useNodes,
 } from "@xyflow/react";
+
+import { Button } from "@/components/ui/button";
+import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
+import { useDebugStore } from "@/store/useDebugStore";
+import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
+import { useSettingsStore } from "@/store/SettingsStore";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { cn } from "@/util/utils";
+
 import { REACT_FLOW_EDGE_Z_INDEX } from "../constants";
+import { WorkflowAddMenu } from "../WorkflowAddMenu";
+import { WorkflowAdderBusy } from "../WorkflowAdderBusy";
 
 function EdgeWithAddButton({
   source,
@@ -31,10 +41,116 @@ function EdgeWithAddButton({
     targetY,
     targetPosition,
   });
+  const debugStore = useDebugStore();
+  const recordingStore = useRecordingStore();
+  const settingsStore = useSettingsStore();
+  const workflowStatePanel = useWorkflowPanelStore();
+  const setRecordedBlocks = useRecordedBlocksStore(
+    (state) => state.setRecordedBlocks,
+  );
   const setWorkflowPanelState = useWorkflowPanelStore(
     (state) => state.setWorkflowPanelState,
   );
+  const processRecordingMutation = useProcessRecordingMutation({
+    browserSessionId: settingsStore.browserSessionId,
+    onSuccess: (result) => {
+      setRecordedBlocks(result, {
+        previous: source,
+        next: target,
+        parent: sourceNode?.parentId,
+        connectingEdgeType: "edgeWithAddButton",
+      });
+    },
+  });
+
+  const isProcessing = processRecordingMutation.isPending;
+
   const sourceNode = nodes.find((node) => node.id === source);
+
+  const isBusy =
+    (isProcessing || recordingStore.isRecording) &&
+    debugStore.isDebugMode &&
+    settingsStore.isUsingABrowser &&
+    workflowStatePanel.workflowPanelState.data?.previous === source &&
+    workflowStatePanel.workflowPanelState.data?.next === target &&
+    workflowStatePanel.workflowPanelState.data?.parent ===
+      (sourceNode?.parentId || undefined);
+
+  const isDisabled = !isBusy && recordingStore.isRecording;
+
+  const updateWorkflowPanelState = (active: boolean) => {
+    setWorkflowPanelState({
+      active,
+      content: "nodeLibrary",
+      data: {
+        previous: source,
+        next: target,
+        parent: sourceNode?.parentId,
+      },
+    });
+  };
+
+  const onAdd = () => {
+    if (isDisabled) {
+      return;
+    }
+
+    updateWorkflowPanelState(true);
+  };
+
+  const onRecord = () => {
+    if (recordingStore.isRecording) {
+      recordingStore.setIsRecording(false);
+    } else {
+      recordingStore.setIsRecording(true);
+      updateWorkflowPanelState(false);
+    }
+  };
+
+  const onEndRecord = () => {
+    if (recordingStore.isRecording) {
+      recordingStore.setIsRecording(false);
+    }
+
+    processRecordingMutation.mutate();
+  };
+
+  const adder = (
+    <Button
+      size="icon"
+      className={cn("h-4 w-4 rounded-full transition-all hover:scale-150", {
+        "cursor-not-allowed bg-[grey] hover:scale-100 hover:bg-[grey] active:bg-[grey]":
+          isDisabled,
+      })}
+      onClick={() => onAdd()}
+    >
+      <PlusIcon />
+    </Button>
+  );
+
+  const menu = (
+    <WorkflowAddMenu
+      buttonSize="25px"
+      radius="40px"
+      onAdd={onAdd}
+      onRecord={onRecord}
+    >
+      {adder}
+    </WorkflowAddMenu>
+  );
+
+  const busy = (
+    <WorkflowAdderBusy
+      color={isProcessing ? "white" : "red"}
+      operation={isProcessing ? "processing" : "recording"}
+      size="small"
+      onComplete={() => {
+        onEndRecord();
+      }}
+    >
+      {adder}
+    </WorkflowAdderBusy>
+  );
 
   return (
     <>
@@ -52,23 +168,7 @@ function EdgeWithAddButton({
           }}
           className="nodrag nopan"
         >
-          <Button
-            size="icon"
-            className="h-4 w-4 rounded-full transition-all hover:scale-150"
-            onClick={() => {
-              setWorkflowPanelState({
-                active: true,
-                content: "nodeLibrary",
-                data: {
-                  previous: source,
-                  next: target,
-                  parent: sourceNode?.parentId,
-                },
-              });
-            }}
-          >
-            <PlusIcon />
-          </Button>
+          {isBusy ? busy : isDisabled ? adder : menu}
         </div>
       </EdgeLabelRenderer>
     </>

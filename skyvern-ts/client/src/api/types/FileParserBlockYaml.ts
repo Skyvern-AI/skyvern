@@ -3,7 +3,10 @@
 import type * as Skyvern from "../index.js";
 
 export interface FileParserBlockYaml {
+    /** Author-facing identifier; must be unique per workflow. */
     label: string;
+    /** Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]. */
+    next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     file_url: string;

@@ -29,6 +29,7 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { WorkflowRunStream } from "@/routes/workflows/workflowRun/WorkflowRunStream";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSidebarStore } from "@/store/SidebarStore";
 
 import { AnimatedWave } from "@/components/AnimatedWave";
@@ -238,6 +239,7 @@ function Workspace({
   const queryClient = useQueryClient();
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
   const blockScriptStore = useBlockScriptStore();
+  const recordingStore = useRecordingStore();
   const cacheKey = workflow?.cache_key ?? "";
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
@@ -1339,6 +1341,7 @@ function Workspace({
                   <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
                     <div key={reloadKey} className="w-full flex-1">
                       <BrowserStream
+                        exfiltrate={recordingStore.isRecording}
                         interactive={true}
                         browserSessionId={
                           activeDebugSession?.browser_session_id
@@ -1359,13 +1362,15 @@ function Workspace({
                           "mr-16": !blockLabel,
                         })}
                       >
-                        {showPowerButton && (
+                        {!recordingStore.isRecording && showPowerButton && (
                           <PowerButton onClick={() => cycle()} />
                         )}
-                        <ReloadButton
-                          isReloading={isReloading}
-                          onClick={() => reload()}
-                        />
+                        {!recordingStore.isRecording && (
+                          <ReloadButton
+                            isReloading={isReloading}
+                            onClick={() => reload()}
+                          />
+                        )}
                       </div>
                     </footer>
                   </div>

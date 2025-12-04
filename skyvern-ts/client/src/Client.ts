@@ -2,6 +2,7 @@
 
 import * as Skyvern from "./api/index.js";
 import { Scripts } from "./api/resources/scripts/client/Client.js";
+import { Workflows } from "./api/resources/workflows/client/Client.js";
 import type { BaseClientOptions, BaseRequestOptions } from "./BaseClient.js";
 import { mergeHeaders, mergeOnlyDefinedHeaders } from "./core/headers.js";
 import * as core from "./core/index.js";
@@ -16,6 +17,7 @@ export declare namespace SkyvernClient {
 
 export class SkyvernClient {
     protected readonly _options: SkyvernClient.Options;
+    protected _workflows: Workflows | undefined;
     protected _scripts: Scripts | undefined;
 
     constructor(_options: SkyvernClient.Options = {}) {
@@ -26,14 +28,18 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "0.2.21",
-                    "User-Agent": "@skyvern/client/0.2.21",
+                    "X-Fern-SDK-Version": "1.0.2",
+                    "User-Agent": "@skyvern/client/1.0.2",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
                 _options?.headers,
             ),
         };
+    }
+
+    public get workflows(): Workflows {
+        return (this._workflows ??= new Workflows(this._options));
     }
 
     public get scripts(): Scripts {
@@ -382,8 +388,8 @@ export class SkyvernClient {
      * Get all workflows with the latest version for the organization.
      *
      * Search semantics:
-     * - If `search_key` is provided, its value is used as a unified search term for both
-     *   `workflows.title` and workflow parameter metadata (key, description, and default_value for
+     * - If `search_key` is provided, its value is used as a unified search term for
+     *   `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for
      *   `WorkflowParameterModel`).
      * - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
      * - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
@@ -401,6 +407,7 @@ export class SkyvernClient {
      *         only_workflows: true,
      *         search_key: "search_key",
      *         title: "title",
+     *         folder_id: "folder_id",
      *         template: true
      *     })
      */
@@ -422,6 +429,8 @@ export class SkyvernClient {
             only_workflows: onlyWorkflows,
             search_key: searchKey,
             title,
+            folder_id: folderId,
+            status,
             template,
         } = request;
         const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
@@ -447,6 +456,18 @@ export class SkyvernClient {
 
         if (title != null) {
             _queryParams.title = title;
+        }
+
+        if (folderId != null) {
+            _queryParams.folder_id = folderId;
+        }
+
+        if (status != null) {
+            if (Array.isArray(status)) {
+                _queryParams.status = status.map((item) => item);
+            } else {
+                _queryParams.status = status;
+            }
         }
 
         if (template != null) {
@@ -509,25 +530,34 @@ export class SkyvernClient {
     /**
      * Create a new workflow
      *
-     * @param {Skyvern.WorkflowRequest} request
+     * @param {Skyvern.CreateWorkflowRequest} request
      * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
      *
      * @throws {@link Skyvern.UnprocessableEntityError}
      *
      * @example
-     *     await client.createWorkflow({})
+     *     await client.createWorkflow({
+     *         folder_id: "folder_id",
+     *         body: {}
+     *     })
      */
     public createWorkflow(
-        request: Skyvern.WorkflowRequest,
+        request: Skyvern.CreateWorkflowRequest,
         requestOptions?: SkyvernClient.RequestOptions,
     ): core.HttpResponsePromise<Skyvern.Workflow> {
         return core.HttpResponsePromise.fromPromise(this.__createWorkflow(request, requestOptions));
     }
 
     private async __createWorkflow(
-        request: Skyvern.WorkflowRequest,
+        request: Skyvern.CreateWorkflowRequest,
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.Workflow>> {
+        const { folder_id: folderId, body: _body } = request;
+        const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
+        if (folderId != null) {
+            _queryParams.folder_id = folderId;
+        }
+
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
             mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
@@ -543,9 +573,9 @@ export class SkyvernClient {
             method: "POST",
             headers: _headers,
             contentType: "application/json",
-            queryParameters: requestOptions?.queryParams,
+            queryParameters: { ..._queryParams, ...requestOptions?.queryParams },
             requestType: "json",
-            body: request,
+            body: _body,
             timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
             maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
             abortSignal: requestOptions?.abortSignal,
@@ -1058,6 +1088,335 @@ export class SkyvernClient {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /v1/runs/{run_id}/timeline.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Get all browser profiles for the organization
+     *
+     * @param {Skyvern.ListBrowserProfilesRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.listBrowserProfiles({
+     *         include_deleted: true
+     *     })
+     */
+    public listBrowserProfiles(
+        request: Skyvern.ListBrowserProfilesRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.BrowserProfile[]> {
+        return core.HttpResponsePromise.fromPromise(this.__listBrowserProfiles(request, requestOptions));
+    }
+
+    private async __listBrowserProfiles(
+        request: Skyvern.ListBrowserProfilesRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.BrowserProfile[]>> {
+        const { include_deleted: includeDeleted } = request;
+        const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
+        if (includeDeleted != null) {
+            _queryParams.include_deleted = includeDeleted.toString();
+        }
+
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "v1/browser_profiles",
+            ),
+            method: "GET",
+            headers: _headers,
+            queryParameters: { ..._queryParams, ...requestOptions?.queryParams },
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.BrowserProfile[], rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /v1/browser_profiles.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Create a browser profile from a persistent browser session or workflow run.
+     *
+     * @param {Skyvern.CreateBrowserProfileRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.BadRequestError}
+     * @throws {@link Skyvern.ConflictError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.createBrowserProfile({
+     *         name: "name"
+     *     })
+     */
+    public createBrowserProfile(
+        request: Skyvern.CreateBrowserProfileRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.BrowserProfile> {
+        return core.HttpResponsePromise.fromPromise(this.__createBrowserProfile(request, requestOptions));
+    }
+
+    private async __createBrowserProfile(
+        request: Skyvern.CreateBrowserProfileRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.BrowserProfile>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "v1/browser_profiles",
+            ),
+            method: "POST",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.BrowserProfile, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 400:
+                    throw new Skyvern.BadRequestError(_response.error.body as unknown, _response.rawResponse);
+                case 409:
+                    throw new Skyvern.ConflictError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/browser_profiles.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Get a specific browser profile by ID
+     *
+     * @param {string} profileId - The ID of the browser profile. browser_profile_id starts with `bp_`
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.getBrowserProfile("bp_123456")
+     */
+    public getBrowserProfile(
+        profileId: string,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.BrowserProfile> {
+        return core.HttpResponsePromise.fromPromise(this.__getBrowserProfile(profileId, requestOptions));
+    }
+
+    private async __getBrowserProfile(
+        profileId: string,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.BrowserProfile>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/browser_profiles/${core.url.encodePathParam(profileId)}`,
+            ),
+            method: "GET",
+            headers: _headers,
+            queryParameters: requestOptions?.queryParams,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.BrowserProfile, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling GET /v1/browser_profiles/{profile_id}.",
+                );
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Delete a browser profile (soft delete)
+     *
+     * @param {string} profileId - The ID of the browser profile to delete. browser_profile_id starts with `bp_`
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.deleteBrowserProfile("bp_123456")
+     */
+    public deleteBrowserProfile(
+        profileId: string,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<void> {
+        return core.HttpResponsePromise.fromPromise(this.__deleteBrowserProfile(profileId, requestOptions));
+    }
+
+    private async __deleteBrowserProfile(
+        profileId: string,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<void>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/browser_profiles/${core.url.encodePathParam(profileId)}`,
+            ),
+            method: "DELETE",
+            headers: _headers,
+            queryParameters: requestOptions?.queryParams,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: undefined, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling DELETE /v1/browser_profiles/{profile_id}.",
+                );
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,
@@ -2209,17 +2568,13 @@ export class SkyvernClient {
      * @param {Skyvern.RunSdkActionRequest} request
      * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
      *
-     * @throws {@link Skyvern.BadRequestError}
-     * @throws {@link Skyvern.ForbiddenError}
-     * @throws {@link Skyvern.NotFoundError}
      * @throws {@link Skyvern.UnprocessableEntityError}
      *
      * @example
      *     await client.runSdkAction({
-     *         "x-user-agent": "x-user-agent",
      *         url: "url",
      *         action: {
-     *             type: "ai_click"
+     *             type: "ai_act"
      *         }
      *     })
      */
@@ -2234,13 +2589,9 @@ export class SkyvernClient {
         request: Skyvern.RunSdkActionRequest,
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.RunSdkActionResponse>> {
-        const { "x-user-agent": userAgent, ..._body } = request;
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-user-agent": userAgent != null ? userAgent : undefined,
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -2255,7 +2606,7 @@ export class SkyvernClient {
             contentType: "application/json",
             queryParameters: requestOptions?.queryParams,
             requestType: "json",
-            body: _body,
+            body: request,
             timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
             maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
             abortSignal: requestOptions?.abortSignal,
@@ -2266,12 +2617,6 @@ export class SkyvernClient {
 
         if (_response.error.reason === "status-code") {
             switch (_response.error.statusCode) {
-                case 400:
-                    throw new Skyvern.BadRequestError(_response.error.body as unknown, _response.rawResponse);
-                case 403:
-                    throw new Skyvern.ForbiddenError(_response.error.body as unknown, _response.rawResponse);
-                case 404:
-                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
                 case 422:
                     throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
                 default:

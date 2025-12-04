@@ -3,9 +3,10 @@ from typing import Any
 import structlog
 from fastapi import Depends, HTTPException, status
 
-from skyvern import SkyvernPage
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
+from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.forge import app
+from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes.routers import base_router
@@ -14,6 +15,7 @@ from skyvern.forge.sdk.schemas.sdk_actions import (
     RunSdkActionRequest,
     RunSdkActionResponse,
 )
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRequestBody,
@@ -95,8 +97,8 @@ async def run_sdk_action(
     task = await app.DATABASE.create_task(
         organization_id=organization_id,
         url=action_request.url,
-        navigation_goal=action.intention,
-        navigation_payload=action.data,
+        navigation_goal=action.get_navigation_goal(),
+        navigation_payload=action.get_navigation_payload(),
         data_extraction_goal=None,
         title=f"SDK Action Task: {action_request.action.type}",
         workflow_run_id=workflow_run.workflow_run_id,
@@ -145,7 +147,7 @@ async def run_sdk_action(
     )
     result: Any | None = None
     try:
-        scraped_page = await SkyvernPage.create_scraped_page(browser_session_id=browser_session_id)
+        scraped_page = await ScriptSkyvernPage.create_scraped_page(browser_session_id=browser_session_id)
         page = await scraped_page._browser_state.must_get_working_page()
         page_ai = RealSkyvernPageAi(scraped_page, page)
 
@@ -174,6 +176,16 @@ async def run_sdk_action(
                 data=action.data,
                 timeout=action.timeout,
             )
+        elif action.type == "ai_upload_file":
+            if action.file_url and not validate_download_url(action.file_url):
+                raise HTTPException(status_code=400, detail="Unsupported file url")
+            result = await page_ai.ai_upload_file(
+                selector=action.selector,
+                files=action.file_url,
+                intention=action.intention,
+                data=action.data,
+                timeout=action.timeout,
+            )
         elif action.type == "ai_act":
             await page_ai.ai_act(
                 prompt=action.intention,
@@ -188,6 +200,30 @@ async def run_sdk_action(
                 data=action.data,
             )
             result = extract_result
+        elif action.type == "locate_element":
+            xpath_result = await page_ai.ai_locate_element(
+                prompt=action.prompt,
+            )
+            result = xpath_result
+        await app.DATABASE.update_task(
+            task_id=task.task_id,
+            organization_id=organization_id,
+            status=TaskStatus.completed,
+        )
+    except Exception as e:
+        await app.DATABASE.update_task(
+            task_id=task.task_id,
+            organization_id=organization_id,
+            status=TaskStatus.failed,
+            failure_reason=str(e),
+        )
+        LOG.error(
+            "SDK action failed",
+            action_type=action.type,
+            error=str(e),
+            exc_info=True,
+        )
+        raise
     finally:
         skyvern_context.reset()
 

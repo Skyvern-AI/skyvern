@@ -8,6 +8,7 @@ const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
   workflow_definition: {
+    version: 2,
     blocks: [],
     parameters: [],
   },

@@ -34,6 +34,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -114,6 +115,7 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
               ) : null}
             </div>
             <WorkflowBlockInputTextarea
+              aiImprove={AI_IMPROVE_CONFIGS.validation.completeCriterion}
               nodeId={id}
               onChange={(value) => {
                 update({ completeCriterion: value });
@@ -125,6 +127,7 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
           <div className="space-y-2">
             <Label className="text-xs text-slate-300">Terminate if...</Label>
             <WorkflowBlockInputTextarea
+              aiImprove={AI_IMPROVE_CONFIGS.validation.terminateCriterion}
               nodeId={id}
               onChange={(value) => {
                 update({ terminateCriterion: value });
@@ -236,9 +239,6 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
                   <DisableCache
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

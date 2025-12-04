@@ -42,7 +42,7 @@ from skyvern.webeye.actions.actions import (
     VerificationCodeAction,
     WaitAction,
 )
-from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 LOG = structlog.get_logger()
 
@@ -154,6 +154,7 @@ def parse_action(
                 index=index,
             ),
             input_or_select_context=input_or_select_context,
+            download=action.get("download", False),
         )
 
     if action_type == ActionType.CHECKBOX:

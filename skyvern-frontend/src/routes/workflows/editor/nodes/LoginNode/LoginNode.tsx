@@ -36,6 +36,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
   const blockScriptStore = useBlockScriptStore();
@@ -127,6 +128,7 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                 />
               </div>
               <WorkflowBlockInputTextarea
+                aiImprove={AI_IMPROVE_CONFIGS.login.navigationGoal}
                 nodeId={id}
                 onChange={(value) => {
                   update({ navigationGoal: value });
@@ -187,6 +189,7 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                       Complete if...
                     </Label>
                     <WorkflowBlockInputTextarea
+                      aiImprove={AI_IMPROVE_CONFIGS.login.completeCriterion}
                       nodeId={id}
                       onChange={(value) => {
                         update({ completeCriterion: value });
@@ -294,12 +297,8 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={data.cacheActions}
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

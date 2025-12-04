@@ -27,6 +27,7 @@ from skyvern.forge.sdk.db.models import (
     CredentialModel,
     CredentialParameterModel,
     DebugSessionModel,
+    FolderModel,
     OnePasswordCredentialParameterModel,
     OrganizationAuthTokenModel,
     OrganizationBitwardenCollectionModel,
@@ -65,6 +66,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_script_file,
     convert_to_step,
     convert_to_task,
+    convert_to_task_v2,
     convert_to_workflow,
     convert_to_workflow_parameter,
     convert_to_workflow_run,
@@ -114,13 +116,41 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, RunEngine, RunType
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile, ScriptStatus, WorkflowScript
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+
+
+def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
+    """
+    Serialize proxy_location for database storage.
+
+    Converts GeoTarget objects or dicts to JSON strings, passes through
+    ProxyLocation enum values as-is, and returns None for None.
+    """
+    result: str | None = None
+    if proxy_location is None:
+        result = None
+    elif isinstance(proxy_location, GeoTarget):
+        result = json.dumps(proxy_location.model_dump())
+    elif isinstance(proxy_location, dict):
+        result = json.dumps(proxy_location)
+    else:
+        # ProxyLocation enum - return the string value
+        result = str(proxy_location)
+
+    LOG.debug(
+        "Serializing proxy_location for DB",
+        input_type=type(proxy_location).__name__,
+        input_value=str(proxy_location),
+        serialized_value=result,
+    )
+    return result
+
 
 DB_CONNECT_ARGS: dict[str, Any] = {}
 
@@ -160,7 +190,7 @@ class AgentDB:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         organization_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         extracted_information_schema: dict[str, Any] | list | str | None = None,
         workflow_run_id: str | None = None,
         order: int | None = None,
@@ -193,7 +223,7 @@ class AgentDB:
                     data_extraction_goal=data_extraction_goal,
                     navigation_payload=navigation_payload,
                     organization_id=organization_id,
-                    proxy_location=proxy_location,
+                    proxy_location=_serialize_proxy_location(proxy_location),
                     extracted_information_schema=extracted_information_schema,
                     workflow_run_id=workflow_run_id,
                     order=order,
@@ -531,6 +561,7 @@ class AgentDB:
                         select(StepModel)
                         .filter_by(task_id=task_id)
                         .filter_by(organization_id=organization_id)
+                        .filter(StepModel.status != StepStatus.canceled)
                         .order_by(StepModel.order.desc())
                         .order_by(StepModel.retry_index.desc())
                     )
@@ -879,7 +910,7 @@ class AgentDB:
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: Literal["api", "onepassword_service_account"],
+        token_type: Literal["api", "onepassword_service_account", "custom_credential_service"],
     ) -> OrganizationAuthToken | None: ...
 
     @overload
@@ -892,7 +923,9 @@ class AgentDB:
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: Literal["api", "onepassword_service_account", "azure_client_secret_credential"],
+        token_type: Literal[
+            "api", "onepassword_service_account", "azure_client_secret_credential", "custom_credential_service"
+        ],
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | None:
         try:
             async with self.Session() as session:
@@ -1388,7 +1421,7 @@ class AgentDB:
         workflow_definition: dict[str, Any],
         organization_id: str | None = None,
         description: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         webhook_callback_url: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
@@ -1405,6 +1438,7 @@ class AgentDB:
         cache_key: str | None = None,
         run_sequentially: bool = False,
         sequential_key: str | None = None,
+        folder_id: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1412,7 +1446,7 @@ class AgentDB:
                 title=title,
                 description=description,
                 workflow_definition=workflow_definition,
-                proxy_location=proxy_location,
+                proxy_location=_serialize_proxy_location(proxy_location),
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
@@ -1427,12 +1461,30 @@ class AgentDB:
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
+                folder_id=folder_id,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
             if version:
                 workflow.version = version
             session.add(workflow)
+
+            # Update folder's modified_at if folder_id is provided
+            if folder_id:
+                # Validate folder exists and belongs to the same organization
+                folder_stmt = (
+                    select(FolderModel)
+                    .where(FolderModel.folder_id == folder_id)
+                    .where(FolderModel.organization_id == organization_id)
+                    .where(FolderModel.deleted_at.is_(None))
+                )
+                folder_model = await session.scalar(folder_stmt)
+                if not folder_model:
+                    raise ValueError(
+                        f"Folder {folder_id} not found or does not belong to organization {organization_id}"
+                    )
+                folder_model.modified_at = datetime.utcnow()
+
             await session.commit()
             await session.refresh(workflow)
             return convert_to_workflow(workflow, self.debug_enabled)
@@ -1507,13 +1559,14 @@ class AgentDB:
 
             if exclude_deleted:
                 get_workflow_query = get_workflow_query.filter(WorkflowModel.deleted_at.is_(None))
-            if organization_id:
-                get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
 
             get_workflow_query = get_workflow_query.join(
                 WorkflowRunModel,
                 WorkflowRunModel.workflow_id == WorkflowModel.workflow_id,
             )
+
+            if organization_id:
+                get_workflow_query = get_workflow_query.filter(WorkflowRunModel.organization_id == organization_id)
 
             get_workflow_query = get_workflow_query.filter(WorkflowRunModel.workflow_run_id == workflow_run_id)
             async with self.Session() as session:
@@ -1605,14 +1658,15 @@ class AgentDB:
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
         search_key: str | None = None,
+        folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
 
         Search semantics:
-        - If `search_key` is provided, its value is used as a unified search term for both
-          `workflows.title` and workflow parameter metadata (key, description, and default_value).
+        - If `search_key` is provided, its value is used as a unified search term for
+          `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value).
         - If `search_key` is not provided, no search filtering is applied.
         - Parameter metadata search excludes soft-deleted parameter rows across parameter tables.
         """
@@ -1635,11 +1689,19 @@ class AgentDB:
                     )
                     .subquery()
                 )
-                main_query = select(WorkflowModel).join(
-                    subquery,
-                    (WorkflowModel.organization_id == subquery.c.organization_id)
-                    & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
-                    & (WorkflowModel.version == subquery.c.max_version),
+                main_query = (
+                    select(WorkflowModel)
+                    .join(
+                        subquery,
+                        (WorkflowModel.organization_id == subquery.c.organization_id)
+                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                        & (WorkflowModel.version == subquery.c.max_version),
+                    )
+                    .outerjoin(
+                        FolderModel,
+                        (WorkflowModel.folder_id == FolderModel.folder_id)
+                        & (FolderModel.organization_id == WorkflowModel.organization_id),
+                    )
                 )
                 if only_saved_tasks:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(True))
@@ -1647,9 +1709,12 @@ class AgentDB:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(False))
                 if statuses:
                     main_query = main_query.where(WorkflowModel.status.in_(statuses))
+                if folder_id:
+                    main_query = main_query.where(WorkflowModel.folder_id == folder_id)
                 if search_key:
                     search_like = f"%{search_key}%"
                     title_like = WorkflowModel.title.ilike(search_like)
+                    folder_title_like = FolderModel.title.ilike(search_like)
 
                     parameter_filters = [
                         # WorkflowParameterModel
@@ -1771,7 +1836,7 @@ class AgentDB:
                             )
                         ),
                     ]
-                    main_query = main_query.where(or_(title_like, or_(*parameter_filters)))
+                    main_query = main_query.where(or_(title_like, folder_title_like, or_(*parameter_filters)))
                 main_query = (
                     main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )
@@ -1791,6 +1856,8 @@ class AgentDB:
         version: int | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
+        status: str | None = None,
+        import_error: str | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1812,6 +1879,10 @@ class AgentDB:
                         workflow.run_with = run_with
                     if cache_key is not None:
                         workflow.cache_key = cache_key
+                    if status is not None:
+                        workflow.status = status
+                    if import_error is not None:
+                        workflow.import_error = import_error
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)
@@ -1846,13 +1917,380 @@ class AgentDB:
             await session.execute(update_deleted_at_query)
             await session.commit()
 
+    async def create_folder(
+        self,
+        organization_id: str,
+        title: str,
+        description: str | None = None,
+    ) -> FolderModel:
+        """Create a new folder."""
+        try:
+            async with self.Session() as session:
+                folder = FolderModel(
+                    organization_id=organization_id,
+                    title=title,
+                    description=description,
+                )
+                session.add(folder)
+                await session.commit()
+                await session.refresh(folder)
+                return folder
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in create_folder", exc_info=True)
+            raise
+
+    async def get_folders(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        search_query: str | None = None,
+    ) -> list[FolderModel]:
+        """Get all folders for an organization with pagination and optional search."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    select(FolderModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter(FolderModel.deleted_at.is_(None))
+                )
+
+                if search_query:
+                    search_pattern = f"%{search_query}%"
+                    stmt = stmt.filter(
+                        or_(
+                            FolderModel.title.ilike(search_pattern),
+                            FolderModel.description.ilike(search_pattern),
+                        )
+                    )
+
+                stmt = stmt.order_by(FolderModel.modified_at.desc())
+                stmt = stmt.offset((page - 1) * page_size).limit(page_size)
+
+                result = await session.execute(stmt)
+                return list(result.scalars().all())
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_folders", exc_info=True)
+            raise
+
+    async def get_folder(
+        self,
+        folder_id: str,
+        organization_id: str,
+    ) -> FolderModel | None:
+        """Get a folder by ID."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    select(FolderModel)
+                    .filter_by(folder_id=folder_id, organization_id=organization_id)
+                    .filter(FolderModel.deleted_at.is_(None))
+                )
+                result = await session.execute(stmt)
+                return result.scalar_one_or_none()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_folder", exc_info=True)
+            raise
+
+    async def update_folder(
+        self,
+        folder_id: str,
+        organization_id: str,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> FolderModel | None:
+        """Update a folder's title or description."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    select(FolderModel)
+                    .filter_by(folder_id=folder_id, organization_id=organization_id)
+                    .filter(FolderModel.deleted_at.is_(None))
+                )
+                result = await session.execute(stmt)
+                folder = result.scalar_one_or_none()
+                if not folder:
+                    return None
+
+                if title is not None:
+                    folder.title = title
+                if description is not None:
+                    folder.description = description
+
+                folder.modified_at = datetime.utcnow()
+                await session.commit()
+                await session.refresh(folder)
+                return folder
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in update_folder", exc_info=True)
+            raise
+
+    async def get_workflow_permanent_ids_in_folder(
+        self,
+        folder_id: str,
+        organization_id: str,
+    ) -> list[str]:
+        """Get workflow permanent IDs (latest versions only) in a folder."""
+        try:
+            async with self.Session() as session:
+                # Subquery to get the latest version for each workflow
+                subquery = (
+                    select(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                        func.max(WorkflowModel.version).label("max_version"),
+                    )
+                    .where(WorkflowModel.organization_id == organization_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .group_by(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                    )
+                    .subquery()
+                )
+
+                # Get workflow_permanent_ids where the latest version is in this folder
+                stmt = (
+                    select(WorkflowModel.workflow_permanent_id)
+                    .join(
+                        subquery,
+                        (WorkflowModel.organization_id == subquery.c.organization_id)
+                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                        & (WorkflowModel.version == subquery.c.max_version),
+                    )
+                    .where(WorkflowModel.folder_id == folder_id)
+                )
+                result = await session.execute(stmt)
+                return list(result.scalars().all())
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_workflow_permanent_ids_in_folder", exc_info=True)
+            raise
+
+    async def soft_delete_folder(
+        self,
+        folder_id: str,
+        organization_id: str,
+        delete_workflows: bool = False,
+    ) -> bool:
+        """Soft delete a folder. Optionally delete all workflows in the folder."""
+        try:
+            async with self.Session() as session:
+                # Check if folder exists
+                folder_stmt = (
+                    select(FolderModel)
+                    .filter_by(folder_id=folder_id, organization_id=organization_id)
+                    .filter(FolderModel.deleted_at.is_(None))
+                )
+                folder_result = await session.execute(folder_stmt)
+                folder = folder_result.scalar_one_or_none()
+                if not folder:
+                    return False
+
+                # If delete_workflows is True, delete all workflows in the folder
+                if delete_workflows:
+                    # Get workflow permanent IDs in the folder (inline logic)
+                    subquery = (
+                        select(
+                            WorkflowModel.organization_id,
+                            WorkflowModel.workflow_permanent_id,
+                            func.max(WorkflowModel.version).label("max_version"),
+                        )
+                        .where(WorkflowModel.organization_id == organization_id)
+                        .where(WorkflowModel.deleted_at.is_(None))
+                        .group_by(
+                            WorkflowModel.organization_id,
+                            WorkflowModel.workflow_permanent_id,
+                        )
+                        .subquery()
+                    )
+
+                    workflow_permanent_ids_stmt = (
+                        select(WorkflowModel.workflow_permanent_id)
+                        .join(
+                            subquery,
+                            (WorkflowModel.organization_id == subquery.c.organization_id)
+                            & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                            & (WorkflowModel.version == subquery.c.max_version),
+                        )
+                        .where(WorkflowModel.folder_id == folder_id)
+                    )
+                    result = await session.execute(workflow_permanent_ids_stmt)
+                    workflow_permanent_ids = list(result.scalars().all())
+
+                    # Soft delete all workflows with these permanent IDs in a single bulk update
+                    if workflow_permanent_ids:
+                        update_workflows_query = (
+                            update(WorkflowModel)
+                            .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
+                            .where(WorkflowModel.organization_id == organization_id)
+                            .where(WorkflowModel.deleted_at.is_(None))
+                            .values(deleted_at=datetime.utcnow())
+                        )
+                        await session.execute(update_workflows_query)
+                else:
+                    # Just remove folder_id from all workflows in this folder
+                    update_workflows_query = (
+                        update(WorkflowModel)
+                        .where(WorkflowModel.folder_id == folder_id)
+                        .where(WorkflowModel.organization_id == organization_id)
+                        .values(folder_id=None, modified_at=datetime.utcnow())
+                    )
+                    await session.execute(update_workflows_query)
+
+                # Soft delete the folder
+                folder.deleted_at = datetime.utcnow()
+                await session.commit()
+                return True
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in soft_delete_folder", exc_info=True)
+            raise
+
+    async def get_folder_workflow_count(
+        self,
+        folder_id: str,
+        organization_id: str,
+    ) -> int:
+        """Get the count of workflows (latest versions only) in a folder."""
+        try:
+            async with self.Session() as session:
+                # Subquery to get the latest version for each workflow (same pattern as get_workflows_by_organization_id)
+                subquery = (
+                    select(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                        func.max(WorkflowModel.version).label("max_version"),
+                    )
+                    .where(WorkflowModel.organization_id == organization_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .group_by(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                    )
+                    .subquery()
+                )
+
+                # Count workflows where the latest version is in this folder
+                stmt = (
+                    select(func.count(WorkflowModel.workflow_permanent_id))
+                    .join(
+                        subquery,
+                        (WorkflowModel.organization_id == subquery.c.organization_id)
+                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                        & (WorkflowModel.version == subquery.c.max_version),
+                    )
+                    .where(WorkflowModel.folder_id == folder_id)
+                )
+                result = await session.execute(stmt)
+                return result.scalar_one()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_folder_workflow_count", exc_info=True)
+            raise
+
+    async def get_folder_workflow_counts_batch(
+        self,
+        folder_ids: list[str],
+        organization_id: str,
+    ) -> dict[str, int]:
+        """Get workflow counts for multiple folders in a single query."""
+        try:
+            async with self.Session() as session:
+                # Subquery to get the latest version for each workflow
+                subquery = (
+                    select(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                        func.max(WorkflowModel.version).label("max_version"),
+                    )
+                    .where(WorkflowModel.organization_id == organization_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .group_by(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                    )
+                    .subquery()
+                )
+
+                # Count workflows grouped by folder_id
+                stmt = (
+                    select(
+                        WorkflowModel.folder_id,
+                        func.count(WorkflowModel.workflow_permanent_id).label("count"),
+                    )
+                    .join(
+                        subquery,
+                        (WorkflowModel.organization_id == subquery.c.organization_id)
+                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                        & (WorkflowModel.version == subquery.c.max_version),
+                    )
+                    .where(WorkflowModel.folder_id.in_(folder_ids))
+                    .group_by(WorkflowModel.folder_id)
+                )
+                result = await session.execute(stmt)
+                rows = result.all()
+
+                # Convert to dict, defaulting to 0 for folders with no workflows
+                return {row.folder_id: row.count for row in rows}
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_folder_workflow_counts_batch", exc_info=True)
+            raise
+
+    async def update_workflow_folder(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+        folder_id: str | None,
+    ) -> Workflow | None:
+        """Update folder assignment for the latest version of a workflow."""
+        try:
+            # Get the latest version of the workflow
+            latest_workflow = await self.get_workflow_by_permanent_id(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+
+            if not latest_workflow:
+                return None
+
+            async with self.Session() as session:
+                # Validate folder exists in-org if folder_id is provided
+                if folder_id:
+                    stmt = (
+                        select(FolderModel.folder_id)
+                        .where(FolderModel.folder_id == folder_id)
+                        .where(FolderModel.organization_id == organization_id)
+                        .where(FolderModel.deleted_at.is_(None))
+                    )
+                    if (await session.scalar(stmt)) is None:
+                        raise ValueError(f"Folder {folder_id} not found")
+
+                workflow_model = await session.get(WorkflowModel, latest_workflow.workflow_id)
+                if workflow_model:
+                    workflow_model.folder_id = folder_id
+                    workflow_model.modified_at = datetime.utcnow()
+
+                    # Update folder's modified_at in the same transaction
+                    if folder_id:
+                        folder_model = await session.get(FolderModel, folder_id)
+                        if folder_model:
+                            folder_model.modified_at = datetime.utcnow()
+
+                    await session.commit()
+                    await session.refresh(workflow_model)
+
+                    return convert_to_workflow(workflow_model, self.debug_enabled)
+                return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in update_workflow_folder", exc_info=True)
+            raise
+
     async def create_workflow_run(
         self,
         workflow_permanent_id: str,
         workflow_id: str,
         organization_id: str,
         browser_session_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        browser_profile_id: str | None = None,
+        proxy_location: ProxyLocationInput = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
@@ -1873,7 +2311,8 @@ class AgentDB:
                     workflow_id=workflow_id,
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
-                    proxy_location=proxy_location,
+                    browser_profile_id=browser_profile_id,
+                    proxy_location=_serialize_proxy_location(proxy_location),
                     status="created",
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
@@ -1972,6 +2411,7 @@ class AgentDB:
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
         include_debugger_runs: bool = False,
+        search_key: str | None = None,
     ) -> list[WorkflowRun | Task]:
         try:
             async with self.Session() as session:
@@ -1990,6 +2430,28 @@ class AgentDB:
 
                 if not include_debugger_runs:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.debug_session_id.is_(None))
+
+                if search_key:
+                    key_like = f"%{search_key}%"
+                    param_exists = exists(
+                        select(1)
+                        .select_from(WorkflowRunParameterModel)
+                        .join(
+                            WorkflowParameterModel,
+                            WorkflowParameterModel.workflow_parameter_id
+                            == WorkflowRunParameterModel.workflow_parameter_id,
+                        )
+                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                        .where(WorkflowParameterModel.deleted_at.is_(None))
+                        .where(
+                            or_(
+                                WorkflowParameterModel.key.ilike(key_like),
+                                WorkflowParameterModel.description.ilike(key_like),
+                                WorkflowRunParameterModel.value.ilike(key_like),
+                            )
+                        )
+                    )
+                    workflow_run_query = workflow_run_query.where(param_exists)
 
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
@@ -2056,6 +2518,7 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
+                query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
                 if organization_id:
                     query = query.filter_by(organization_id=organization_id)
                 query = query.filter_by(status=WorkflowRunStatus.queued)
@@ -2096,6 +2559,7 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
+                query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
                 if organization_id:
                     query = query.filter_by(organization_id=organization_id)
                 query = query.filter_by(status=WorkflowRunStatus.running)
@@ -2107,6 +2571,61 @@ class AgentDB:
                 query = query.order_by(WorkflowRunModel.started_at.desc())
                 workflow_run = (await session.scalars(query)).first()
                 return convert_to_workflow_run(workflow_run) if workflow_run else None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_last_workflow_run_for_browser_session(
+        self,
+        browser_session_id: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRun | None:
+        try:
+            async with self.Session() as session:
+                # check if there's a queued run
+                query = select(WorkflowRunModel).filter_by(browser_session_id=browser_session_id)
+                if organization_id:
+                    query = query.filter_by(organization_id=organization_id)
+
+                queue_query = query.filter_by(status=WorkflowRunStatus.queued)
+                queue_query = queue_query.order_by(WorkflowRunModel.modified_at.desc())
+                workflow_run = (await session.scalars(queue_query)).first()
+                if workflow_run:
+                    return convert_to_workflow_run(workflow_run)
+
+                # check if there's a running run
+                running_query = query.filter_by(status=WorkflowRunStatus.running)
+                running_query = running_query.filter(WorkflowRunModel.started_at.isnot(None))
+                running_query = running_query.order_by(WorkflowRunModel.started_at.desc())
+                workflow_run = (await session.scalars(running_query)).first()
+                if workflow_run:
+                    return convert_to_workflow_run(workflow_run)
+                return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_workflows_depending_on(
+        self,
+        workflow_run_id: str,
+    ) -> list[WorkflowRun]:
+        """
+        Get all workflow runs that depend on the given workflow_run_id.
+
+        Used to find workflows that should be signaled when a workflow completes,
+        for sequential workflow dependency handling.
+
+        Args:
+            workflow_run_id: The workflow_run_id to find dependents for
+
+        Returns:
+            List of WorkflowRun objects that have depends_on_workflow_run_id set to workflow_run_id
+        """
+        try:
+            async with self.Session() as session:
+                query = select(WorkflowRunModel).filter_by(depends_on_workflow_run_id=workflow_run_id)
+                workflow_runs = (await session.scalars(query)).all()
+                return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -2884,30 +3403,30 @@ class AgentDB:
         self,
         organization_id: str,
         limit: int = 50,
-        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+        valid_lifespan_minutes: int | None = None,
         otp_type: OTPType | None = None,
         workflow_run_id: str | None = None,
+        totp_identifier: str | None = None,
     ) -> list[TOTPCode]:
         """
         Return recent otp codes for an organization ordered by newest first with optional
         workflow_run_id filtering.
         """
-        all_null = and_(
-            TOTPCodeModel.task_id.is_(None),
-            TOTPCodeModel.workflow_id.is_(None),
-            TOTPCodeModel.workflow_run_id.is_(None),
-        )
         async with self.Session() as session:
-            query = (
-                select(TOTPCodeModel)
-                .filter_by(organization_id=organization_id)
-                .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
-            )
+            query = select(TOTPCodeModel).filter_by(organization_id=organization_id)
+
+            if valid_lifespan_minutes is not None:
+                query = query.filter(
+                    TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes)
+                )
+
             if otp_type:
                 query = query.filter(TOTPCodeModel.otp_type == otp_type)
             if workflow_run_id is not None:
                 query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
-            query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc()).limit(limit)
+            if totp_identifier:
+                query = query.filter(TOTPCodeModel.totp_identifier == totp_identifier)
+            query = query.order_by(TOTPCodeModel.created_at.desc()).limit(limit)
             totp_codes = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]
 
@@ -3040,7 +3559,7 @@ class AgentDB:
                     .filter_by(organization_id=organization_id)
                 )
             ).first():
-                return TaskV2.model_validate(task_v2)
+                return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
             return None
 
     async def delete_thoughts(self, task_v2_id: str, organization_id: str | None = None) -> None:
@@ -3067,7 +3586,7 @@ class AgentDB:
                     .filter_by(workflow_run_id=workflow_run_id)
                 )
             ).first():
-                return TaskV2.model_validate(task_v2)
+                return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
             return None
 
     async def get_thought(self, thought_id: str, organization_id: str | None = None) -> Thought | None:
@@ -3109,7 +3628,7 @@ class AgentDB:
         prompt: str | None = None,
         url: str | None = None,
         organization_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         totp_identifier: str | None = None,
         totp_verification_url: str | None = None,
         webhook_callback_url: str | None = None,
@@ -3128,7 +3647,7 @@ class AgentDB:
                 workflow_permanent_id=workflow_permanent_id,
                 prompt=prompt,
                 url=url,
-                proxy_location=proxy_location,
+                proxy_location=_serialize_proxy_location(proxy_location),
                 totp_identifier=totp_identifier,
                 totp_verification_url=totp_verification_url,
                 webhook_callback_url=webhook_callback_url,
@@ -3144,7 +3663,7 @@ class AgentDB:
             session.add(new_task_v2)
             await session.commit()
             await session.refresh(new_task_v2)
-            return TaskV2.model_validate(new_task_v2)
+            return convert_to_task_v2(new_task_v2, debug_enabled=self.debug_enabled)
 
     async def create_thought(
         self,
@@ -3300,7 +3819,7 @@ class AgentDB:
                     task_v2.webhook_failure_reason = webhook_failure_reason
                 await session.commit()
                 await session.refresh(task_v2)
-                return TaskV2.model_validate(task_v2)
+                return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
             raise NotFoundError(f"TaskV2 {task_v2_id} not found")
 
     async def create_workflow_run_block(
@@ -3734,7 +4253,7 @@ class AgentDB:
         runnable_type: str | None = None,
         runnable_id: str | None = None,
         timeout_minutes: int | None = None,
-        proxy_location: ProxyLocation | None = ProxyLocation.RESIDENTIAL,
+        proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         try:
@@ -3744,7 +4263,7 @@ class AgentDB:
                     runnable_type=runnable_type,
                     runnable_id=runnable_id,
                     timeout_minutes=timeout_minutes,
-                    proxy_location=proxy_location,
+                    proxy_location=_serialize_proxy_location(proxy_location),
                 )
                 session.add(browser_session)
                 await session.commit()
@@ -4030,6 +4549,7 @@ class AgentDB:
         totp_type: str,
         card_last4: str | None,
         card_brand: str | None,
+        totp_identifier: str | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = CredentialModel(
@@ -4040,6 +4560,7 @@ class AgentDB:
                 credential_type=credential_type,
                 username=username,
                 totp_type=totp_type,
+                totp_identifier=totp_identifier,
                 card_last4=card_last4,
                 card_brand=card_brand,
             )
@@ -4437,43 +4958,6 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def update_script(
-        self,
-        script_revision_id: str,
-        organization_id: str,
-        artifact_id: str | None = None,
-        run_id: str | None = None,
-        version: int | None = None,
-    ) -> Script:
-        try:
-            async with self.Session() as session:
-                get_script_query = (
-                    select(ScriptModel)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(script_revision_id=script_revision_id)
-                )
-                if script := (await session.scalars(get_script_query)).first():
-                    if artifact_id:
-                        script.artifact_id = artifact_id
-                    if run_id:
-                        script.run_id = run_id
-                    if version:
-                        script.version = version
-                    await session.commit()
-                    await session.refresh(script)
-                    return convert_to_script(script)
-                else:
-                    raise NotFoundError("Script not found")
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
-        except NotFoundError:
-            LOG.error("No script found to update", script_revision_id=script_revision_id)
-            raise
-        except Exception:
-            LOG.error("UnexpectedError", exc_info=True)
-            raise
-
     async def get_scripts(
         self,
         organization_id: str,
@@ -4824,7 +5308,7 @@ class AgentDB:
             workflow_script_model = (await session.scalars(query)).first()
             return WorkflowScript.model_validate(workflow_script_model) if workflow_script_model else None
 
-    async def get_workflow_scripts_by_cache_key_value(
+    async def get_workflow_script_by_cache_key_value(
         self,
         *,
         organization_id: str,
@@ -4833,51 +5317,35 @@ class AgentDB:
         workflow_run_id: str | None = None,
         cache_key: str | None = None,
         statuses: list[ScriptStatus] | None = None,
-    ) -> list[Script]:
-        """Get latest script versions linked to a workflow by a specific cache_key_value."""
+    ) -> Script | None:
+        """Get latest script version linked to a workflow by a specific cache_key_value."""
         try:
             async with self.Session() as session:
-                # Subquery: script_ids associated with this workflow + cache_key_value
-                ws_script_ids_subquery = (
-                    select(WorkflowScriptModel.script_id)
-                    .where(WorkflowScriptModel.organization_id == organization_id)
-                    .where(WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id)
-                    .where(WorkflowScriptModel.cache_key_value == cache_key_value)
-                    .where(WorkflowScriptModel.deleted_at.is_(None))
-                )
-                if workflow_run_id:
-                    ws_script_ids_subquery = ws_script_ids_subquery.where(
-                        WorkflowScriptModel.workflow_run_id == workflow_run_id
+                # Build the query: join workflow_scripts with scripts
+                query = (
+                    select(ScriptModel)
+                    .join(WorkflowScriptModel, ScriptModel.script_id == WorkflowScriptModel.script_id)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
                     )
+                )
+
+                if workflow_run_id:
+                    query = query.where(WorkflowScriptModel.workflow_run_id == workflow_run_id)
 
                 if cache_key is not None:
-                    ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.cache_key == cache_key)
+                    query = query.where(WorkflowScriptModel.cache_key == cache_key)
 
                 if statuses is not None and len(statuses) > 0:
-                    ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.status.in_(statuses))
+                    query = query.where(WorkflowScriptModel.status.in_(statuses))
 
-                # Latest version per script_id within the org and not deleted
-                latest_versions_subquery = (
-                    select(
-                        ScriptModel.script_id,
-                        func.max(ScriptModel.version).label("latest_version"),
-                    )
-                    .where(ScriptModel.organization_id == organization_id)
-                    .where(ScriptModel.deleted_at.is_(None))
-                    .where(ScriptModel.script_id.in_(ws_script_ids_subquery))
-                    .group_by(ScriptModel.script_id)
-                    .subquery()
-                )
+                query = query.order_by(ScriptModel.created_at.desc(), ScriptModel.version.desc()).limit(1)
 
-                query = select(ScriptModel).join(
-                    latest_versions_subquery,
-                    (ScriptModel.script_id == latest_versions_subquery.c.script_id)
-                    & (ScriptModel.version == latest_versions_subquery.c.latest_version),
-                )
-                query = query.order_by(ScriptModel.created_at.desc())
-
-                scripts = (await session.scalars(query)).all()
-                return [convert_to_script(script) for script in scripts]
+                script = (await session.scalars(query)).first()
+                return convert_to_script(script) if script else None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

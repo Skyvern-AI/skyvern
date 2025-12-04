@@ -80,6 +80,36 @@ class CreateAzureClientSecretCredentialRequest(BaseModel):
     credential: AzureClientSecretCredential
 
 
+class CustomCredentialServiceConfig(BaseModel):
+    """Configuration for custom credential service."""
+
+    api_base_url: str = Field(
+        ...,
+        description="Base URL for the custom credential API",
+        examples=["https://credentials.company.com/api/v1/credentials"],
+    )
+    api_token: str = Field(
+        ...,
+        description="API token for authenticating with the custom credential service",
+        examples=["your_api_token_here"],
+    )
+
+
+class CustomCredentialServiceConfigResponse(BaseModel):
+    """Response model for custom credential service operations."""
+
+    token: OrganizationAuthToken = Field(
+        ...,
+        description="The created or updated custom credential service configuration",
+    )
+
+
+class CreateCustomCredentialServiceConfigRequest(BaseModel):
+    """Request model for creating or updating custom credential service configuration."""
+
+    config: CustomCredentialServiceConfig
+
+
 class GetOrganizationsResponse(BaseModel):
     organizations: list[Organization]
 

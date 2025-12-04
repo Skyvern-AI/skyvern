@@ -12,8 +12,10 @@ class SdkActionType(str, Enum):
     AI_CLICK = "ai_click"
     AI_INPUT_TEXT = "ai_input_text"
     AI_SELECT_OPTION = "ai_select_option"
+    AI_UPLOAD_FILE = "ai_upload_file"
     AI_ACT = "ai_act"
     EXTRACT = "extract"
+    LOCATE_ELEMENT = "locate_element"
 
 
 # Base action class
@@ -22,16 +24,28 @@ class SdkActionBase(BaseModel):
 
     type: str = Field(..., description="The type of action")
 
+    def get_navigation_goal(self) -> str | None:
+        return None
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return None
+
 
 # Specific action types
 class ClickAction(SdkActionBase):
     """Click action parameters."""
 
     type: Literal["ai_click"] = "ai_click"
-    selector: str = Field(default="", description="CSS selector for the element")
+    selector: str | None = Field(default="", description="CSS selector for the element")
     intention: str = Field(default="", description="The intention or goal of the click")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
     timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.intention
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return self.data if isinstance(self.data, dict) else None
 
 
 class InputTextAction(SdkActionBase):
@@ -39,23 +53,58 @@ class InputTextAction(SdkActionBase):
 
     type: Literal["ai_input_text"] = "ai_input_text"
     selector: str | None = Field(default="", description="CSS selector for the element")
-    value: str = Field(default="", description="Value to input")
+    value: str | None = Field(default="", description="Value to input")
     intention: str = Field(default="", description="The intention or goal of the input")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
     totp_identifier: str | None = Field(None, description="TOTP identifier for input_text actions")
     totp_url: str | None = Field(None, description="TOTP URL for input_text actions")
     timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
 
+    def get_navigation_goal(self) -> str | None:
+        return self.intention
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return self.data if isinstance(self.data, dict) else None
+
 
 class SelectOptionAction(SdkActionBase):
     """Select option action parameters."""
 
     type: Literal["ai_select_option"] = "ai_select_option"
-    selector: str = Field(default="", description="CSS selector for the element")
-    value: str = Field(default="", description="Value to select")
+    selector: str | None = Field(default="", description="CSS selector for the element")
+    value: str | None = Field(default="", description="Value to select")
     intention: str = Field(default="", description="The intention or goal of the selection")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
     timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.intention
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return self.data if isinstance(self.data, dict) else None
+
+
+class UploadFileAction(SdkActionBase):
+    """Upload file action parameters."""
+
+    type: Literal["ai_upload_file"] = "ai_upload_file"
+    selector: str | None = Field(default="", description="CSS selector for the element")
+    file_url: str | None = Field(default="", description="File URL for upload")
+    intention: str = Field(default="", description="The intention or goal of the upload")
+    data: str | dict[str, Any] | None = Field(None, description="Additional context data")
+    timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.intention
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        if self.data and not isinstance(self.data, dict):
+            return None
+
+        data = self.data or {}
+        if "files" not in data:
+            data["files"] = self.file_url
+        return data
 
 
 class ActAction(SdkActionBase):
@@ -64,6 +113,12 @@ class ActAction(SdkActionBase):
     type: Literal["ai_act"] = "ai_act"
     intention: str = Field(default="", description="Natural language prompt for the action")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.intention
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return self.data if isinstance(self.data, dict) else None
 
 
 class ExtractAction(SdkActionBase):
@@ -76,10 +131,37 @@ class ExtractAction(SdkActionBase):
     intention: str | None = Field(None, description="The intention or goal of the extraction")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
 
+    def get_navigation_goal(self) -> str | None:
+        return self.intention
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return self.data if isinstance(self.data, dict) else None
+
+
+class LocateElementAction(SdkActionBase):
+    """Locate element action parameters."""
+
+    type: Literal["locate_element"] = "locate_element"
+    prompt: str = Field(default="", description="Natural language prompt to locate an element")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.prompt
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return None
+
 
 # Discriminated union of all action types
 SdkAction = Annotated[
-    Union[ClickAction, InputTextAction, SelectOptionAction, ActAction, ExtractAction],
+    Union[
+        ClickAction,
+        InputTextAction,
+        SelectOptionAction,
+        UploadFileAction,
+        ActAction,
+        ExtractAction,
+        LocateElementAction,
+    ],
     Field(discriminator="type"),
 ]
 

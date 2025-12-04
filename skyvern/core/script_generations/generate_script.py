@@ -335,6 +335,8 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
     elif method == "select_option":
         option = act.get("option", {})
         value = option.get("value")
+        label = option.get("label")
+        value = value or label
         if value:
             if act.get("field_name"):
                 option_value = cst.Subscript(
@@ -431,6 +433,21 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                     comma=cst.Comma(),
                 )
             )
+    action_context = act.get("input_or_select_context")
+    if action_context and action_context.get("date_format") and method in ["type", "fill", "select_option"]:
+        date_format_value = action_context.get("date_format")
+        data = {"date_format": date_format_value}
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("data"),
+                value=_value(data),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     intention = act.get("intention") or act.get("reasoning") or ""
     if intention and method not in ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT:
         args.extend(
@@ -481,7 +498,6 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
     name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
     body_stmts: list[cst.BaseStatement] = []
-    is_extraction_block = block.get("block_type") == "extraction"
 
     if block.get("url"):
         body_stmts.append(cst.parse_statement(f"await page.goto({repr(block['url'])})"))
@@ -491,7 +507,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
             continue
 
         # For extraction blocks, assign extract action results to output variable
-        assign_to_output = is_extraction_block and act["action_type"] == "extract"
+        assign_to_output = act["action_type"] == "extract"
         body_stmts.append(_action_to_stmt(act, block, assign_to_output=assign_to_output))
 
     # add complete action
@@ -501,7 +517,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
         body_stmts.append(_action_to_stmt(complete_action, block))
 
     # For extraction blocks, add return output statement if we have actions
-    if is_extraction_block and any(
+    if any(
         act["action_type"] == "extract"
         for act in actions
         if act["action_type"] not in [ActionType.COMPLETE, ActionType.TERMINATE, ActionType.NULL_ACTION]
@@ -532,12 +548,18 @@ def _build_task_v2_block_fn(block: dict[str, Any], child_blocks: list[dict[str, 
     body_stmts: list[cst.BaseStatement] = []
 
     # Add calls to child workflow sub-tasks
+    has_extract_block = False
     for child_block in child_blocks:
-        stmt = _build_block_statement(child_block)
+        is_extract_block = child_block.get("block_type") == "extraction"
+        if is_extract_block:
+            has_extract_block = True
+        stmt = _build_block_statement(child_block, assign_output=is_extract_block)
         body_stmts.append(stmt)
 
     if not body_stmts:
         body_stmts.append(cst.parse_statement("return None"))
+    elif has_extract_block:
+        body_stmts.append(cst.parse_statement("return output"))
 
     return FunctionDef(
         name=Name(name),
@@ -656,16 +678,30 @@ def _build_action_statement(
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
-        cst.Arg(
-            keyword=cst.Name("label"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
     ]
-
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    if block.get("label"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block.get("label")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                ),
+                comma=cst.Comma(),
+            )
+        )
+    _mark_last_arg_as_comma(args)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("action")),
         args=args,
@@ -696,7 +732,10 @@ def _build_login_statement(
 
 
 def _build_extract_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    assign_output: bool = True,
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.extract statement."""
     args = [
@@ -716,15 +755,30 @@ def _build_extract_statement(
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
-        cst.Arg(
-            keyword=cst.Name("label"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
     ]
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    if block.get("label"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block_title),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                ),
+                comma=cst.Comma(),
+            )
+        )
+    _mark_last_arg_as_comma(args)
 
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("extract")),
@@ -735,7 +789,17 @@ def _build_extract_statement(
         ),
     )
 
-    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+    if assign_output:
+        return cst.SimpleStatementLine(
+            [
+                cst.Assign(
+                    targets=[cst.AssignTarget(target=cst.Name("output"))],
+                    value=cst.Await(call),
+                )
+            ]
+        )
+    else:
+        return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
 def _build_navigate_statement(
@@ -858,6 +922,18 @@ def _build_validate_statement(
             cst.Arg(
                 keyword=cst.Name("error_code_mapping"),
                 value=_value(block.get("error_code_mapping")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1097,6 +1173,18 @@ def _build_pdf_parser_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
             )
         )
 
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("label") is not None:
         args.append(
             cst.Arg(
@@ -1148,6 +1236,18 @@ def _build_file_url_parser_statement(block: dict[str, Any]) -> cst.SimpleStateme
             cst.Arg(
                 keyword=cst.Name("schema"),
                 value=_value(block.get("json_schema")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1302,6 +1402,18 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
             )
         )
 
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("label") is not None:
         args.append(
             cst.Arg(
@@ -1314,7 +1426,7 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
             )
         )
 
-    if block.get("parameters") is not None:
+    if block.get("parameters"):
         parameters = block.get("parameters", [])
         parameter_list = [parameter["key"] for parameter in parameters]
         args.append(
@@ -1323,10 +1435,12 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
                 value=_value(parameter_list),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
                 ),
             )
         )
 
+    _mark_last_arg_as_comma(args)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("prompt")),
         args=args,
@@ -1510,6 +1624,31 @@ def __build_base_task_statement(
                 ),
             )
         )
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    # Add error_code_mapping if it exists
+    if block.get("error_code_mapping") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("error_code_mapping"),
+                value=_value(block.get("error_code_mapping")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("block_type") == "task_v2":
         args.append(
             cst.Arg(
@@ -1539,7 +1678,9 @@ def __build_base_task_statement(
 # --------------------------------------------------------------------- #
 
 
-def _build_block_statement(block: dict[str, Any], data_variable_name: str | None = None) -> cst.SimpleStatementLine:
+def _build_block_statement(
+    block: dict[str, Any], data_variable_name: str | None = None, assign_output: bool = False
+) -> cst.SimpleStatementLine:
     """Build a block statement."""
     block_type = block.get("block_type")
     block_title = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
@@ -1555,7 +1696,7 @@ def _build_block_statement(block: dict[str, Any], data_variable_name: str | None
         elif block_type == "login":
             stmt = _build_login_statement(block_title, block, data_variable_name)
         elif block_type == "extraction":
-            stmt = _build_extract_statement(block_title, block, data_variable_name)
+            stmt = _build_extract_statement(block_title, block, data_variable_name, assign_output)
         elif block_type == "navigation":
             stmt = _build_navigate_statement(block_title, block, data_variable_name)
     elif block_type == "validation":
@@ -1600,7 +1741,7 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
     ]
 
     for block in blocks:
-        stmt = _build_block_statement(block)
+        stmt = _build_block_statement(block, assign_output=False)
         body.append(stmt)
 
     params = cst.Parameters(

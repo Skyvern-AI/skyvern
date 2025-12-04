@@ -94,12 +94,15 @@ async def login(
     label = "login"
     yaml_parameters = []
     parameter_key = "credential"
+    resolved_totp_identifier = login_request.totp_identifier
     if login_request.credential_type == CredentialType.skyvern:
         if not login_request.credential_id:
             raise HTTPException(status_code=400, detail="credential_id is required to login with Skyvern credential")
         credential = await app.DATABASE.get_credential(login_request.credential_id, organization.organization_id)
         if not credential:
             raise HTTPException(status_code=404, detail=f"Credential {login_request.credential_id} not found")
+        if not resolved_totp_identifier:
+            resolved_totp_identifier = credential.totp_identifier
 
         yaml_parameters = [
             WorkflowParameterYAML(
@@ -169,7 +172,7 @@ async def login(
         max_steps_per_run=10,
         parameter_keys=[parameter_key],
         totp_verification_url=totp_verification_url,
-        totp_identifier=login_request.totp_identifier,
+        totp_identifier=resolved_totp_identifier,
     )
     yaml_blocks = [login_block_yaml]
     workflow_definition_yaml = WorkflowDefinitionYAML(
@@ -198,9 +201,10 @@ async def login(
     legacy_workflow_request = WorkflowRequestBody(
         proxy_location=login_request.proxy_location,
         webhook_callback_url=webhook_url,
-        totp_identifier=login_request.totp_identifier,
+        totp_identifier=resolved_totp_identifier,
         totp_verification_url=totp_verification_url,
         browser_session_id=login_request.browser_session_id,
+        browser_profile_id=login_request.browser_profile_id,
         browser_address=login_request.browser_address,
         max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
         extra_http_headers=login_request.extra_http_headers,
@@ -234,10 +238,12 @@ async def login(
             proxy_location=login_request.proxy_location,
             webhook_url=webhook_url,
             totp_url=totp_verification_url,
-            totp_identifier=login_request.totp_identifier,
+            totp_identifier=resolved_totp_identifier,
             browser_session_id=login_request.browser_session_id,
+            browser_profile_id=login_request.browser_profile_id,
             max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
         ),
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         browser_session_id=login_request.browser_session_id,
+        browser_profile_id=login_request.browser_profile_id,
     )

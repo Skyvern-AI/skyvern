@@ -1,3 +1,5 @@
+import json
+
 import structlog
 from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
 
@@ -31,8 +33,10 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredentialResponse,
     CreateAzureClientSecretCredentialRequest,
+    CreateCustomCredentialServiceConfigRequest,
     CreateOnePasswordTokenRequest,
     CreateOnePasswordTokenResponse,
+    CustomCredentialServiceConfigResponse,
     Organization,
 )
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCreate
@@ -94,6 +98,19 @@ async def send_totp_code(
         workflow_id=data.workflow_id,
         workflow_run_id=data.workflow_run_id,
     )
+    # validate task_id, workflow_id, workflow_run_id are valid ids in db if provided
+    if data.task_id:
+        task = await app.DATABASE.get_task(data.task_id, curr_org.organization_id)
+        if not task:
+            raise HTTPException(status_code=400, detail=f"Invalid task id: {data.task_id}")
+    if data.workflow_id:
+        workflow = await app.DATABASE.get_workflow(data.workflow_id, curr_org.organization_id)
+        if not workflow:
+            raise HTTPException(status_code=400, detail=f"Invalid workflow id: {data.workflow_id}")
+    if data.workflow_run_id:
+        workflow_run = await app.DATABASE.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
+        if not workflow_run:
+            raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
     content = data.content.strip()
     otp_value: OTPValue | None = OTPValue(value=content, type=OTPType.TOTP)
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
@@ -165,21 +182,14 @@ async def get_totp_codes(
         description="Maximum number of codes to return.",
     ),
 ) -> list[TOTPCode]:
-    if totp_identifier:
-        codes = await app.DATABASE.get_otp_codes(
-            organization_id=curr_org.organization_id,
-            totp_identifier=totp_identifier,
-            otp_type=otp_type,
-            workflow_run_id=workflow_run_id,
-            limit=limit,
-        )
-    else:
-        codes = await app.DATABASE.get_recent_otp_codes(
-            organization_id=curr_org.organization_id,
-            limit=limit,
-            otp_type=otp_type,
-            workflow_run_id=workflow_run_id,
-        )
+    codes = await app.DATABASE.get_recent_otp_codes(
+        organization_id=curr_org.organization_id,
+        limit=limit,
+        valid_lifespan_minutes=None,
+        otp_type=otp_type,
+        workflow_run_id=workflow_run_id,
+        totp_identifier=totp_identifier,
+    )
 
     return codes
 
@@ -610,6 +620,112 @@ async def update_azure_client_secret_credential(
         )
 
 
+@base_router.get(
+    "/credentials/custom_credential/get",
+    response_model=CustomCredentialServiceConfigResponse,
+    summary="Get Custom Credential Service Configuration",
+    description="Retrieves the current custom credential service configuration for the organization.",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/custom_credential/get/",
+    response_model=CustomCredentialServiceConfigResponse,
+    include_in_schema=False,
+)
+async def get_custom_credential_service_config(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CustomCredentialServiceConfigResponse:
+    """
+    Get the current custom credential service configuration for the organization.
+    """
+    try:
+        auth_token = await app.DATABASE.get_valid_org_auth_token(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.custom_credential_service.value,
+        )
+        if not auth_token:
+            raise HTTPException(
+                status_code=404,
+                detail="No custom credential service configuration found for this organization",
+            )
+
+        return CustomCredentialServiceConfigResponse(token=auth_token)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOG.error(
+            "Failed to get custom credential service configuration",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get custom credential service configuration: {e!s}",
+        ) from e
+
+
+@base_router.post(
+    "/credentials/custom_credential/create",
+    response_model=CustomCredentialServiceConfigResponse,
+    summary="Create or update Custom Credential Service Configuration",
+    description="Creates or updates a custom credential service configuration for the current organization. Only one valid configuration is allowed per organization.",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/credentials/custom_credential/create/",
+    response_model=CustomCredentialServiceConfigResponse,
+    include_in_schema=False,
+)
+async def update_custom_credential_service_config(
+    request: CreateCustomCredentialServiceConfigRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CustomCredentialServiceConfigResponse:
+    """
+    Create or update a custom credential service configuration for the current organization.
+
+    This endpoint ensures only one valid custom credential service configuration exists per organization.
+    If a valid configuration already exists, it will be invalidated before creating the new one.
+    """
+    try:
+        # Invalidate any existing valid custom credential service configuration for this organization
+        await app.DATABASE.invalidate_org_auth_tokens(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.custom_credential_service,
+        )
+
+        # Store the configuration as JSON in the token field
+        config_json = json.dumps(request.config.model_dump())
+
+        # Create the new configuration
+        auth_token = await app.DATABASE.create_org_auth_token(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.custom_credential_service,
+            token=config_json,
+        )
+
+        LOG.info(
+            "Created or updated custom credential service configuration",
+            organization_id=current_org.organization_id,
+            token_id=auth_token.id,
+        )
+
+        return CustomCredentialServiceConfigResponse(token=auth_token)
+
+    except Exception as e:
+        LOG.error(
+            "Failed to create or update custom credential service configuration",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create or update custom credential service configuration: {e!s}",
+        ) from e
+
+
 async def _get_credential_vault_service() -> CredentialVaultService:
     if settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.BITWARDEN:
         return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
@@ -617,6 +733,10 @@ async def _get_credential_vault_service() -> CredentialVaultService:
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Azure Vault credential is not supported")
         return app.AZURE_CREDENTIAL_VAULT_SERVICE
+    elif settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.CUSTOM:
+        if not app.CUSTOM_CREDENTIAL_VAULT_SERVICE:
+            raise HTTPException(status_code=400, detail="Custom credential vault is not supported")
+        return app.CUSTOM_CREDENTIAL_VAULT_SERVICE
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
 

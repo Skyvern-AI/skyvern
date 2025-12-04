@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.models import (
     ScriptModel,
     StepModel,
     TaskModel,
+    TaskV2Model,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunBlockModel,
@@ -36,6 +37,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     Organization,
     OrganizationAuthToken,
 )
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -55,7 +57,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, ScriptRunResponse
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, ScriptRunResponse
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
@@ -84,6 +86,45 @@ from skyvern.webeye.actions.actions import (
 )
 
 LOG = structlog.get_logger()
+
+
+def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
+    """
+    Deserialize proxy_location from database storage.
+
+    Handles:
+    - None -> None
+    - ProxyLocation enum string (e.g., "RESIDENTIAL") -> ProxyLocation enum
+    - JSON string (e.g., '{"country": "US", ...}') -> GeoTarget object
+    """
+    if value is None:
+        return None
+
+    result: ProxyLocationInput = None
+
+    # Try to parse as JSON first (for GeoTarget)
+    if value.startswith("{"):
+        try:
+            data = json.loads(value)
+            result = GeoTarget.model_validate(data)
+            LOG.info(
+                "Deserialized proxy_location as GeoTarget",
+                db_value=value,
+                result=str(result),
+            )
+            return result
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Try as ProxyLocation enum
+    try:
+        result = ProxyLocation(value)
+        return result
+    except ValueError:
+        # If all else fails, return as-is (shouldn't happen with valid data)
+        LOG.warning("Failed to deserialize proxy_location", db_value=value)
+        return None
+
 
 # Mapping of action types to their corresponding action classes
 ACTION_TYPE_TO_CLASS = {
@@ -142,7 +183,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         extracted_information=task_obj.extracted_information,
         failure_reason=task_obj.failure_reason,
         organization_id=task_obj.organization_id,
-        proxy_location=(ProxyLocation(task_obj.proxy_location) if task_obj.proxy_location else None),
+        proxy_location=_deserialize_proxy_location(task_obj.proxy_location),
         extracted_information_schema=task_obj.extracted_information_schema,
         extra_http_headers=task_obj.extra_http_headers,
         workflow_run_id=task_obj.workflow_run_id,
@@ -163,6 +204,15 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         download_timeout=task_obj.download_timeout,
     )
     return task
+
+
+def convert_to_task_v2(task_v2_model: TaskV2Model, debug_enabled: bool = False) -> TaskV2:
+    if debug_enabled:
+        LOG.debug("Converting TaskV2Model to TaskV2", observer_cruise_id=task_v2_model.observer_cruise_id)
+    task_v2_data = {column.name: getattr(task_v2_model, column.name) for column in TaskV2Model.__table__.columns}
+    #  Deserialize proxy_location FIRST (string → GeoTarget), otherwise model_validate will fail for city/state proxy selections
+    task_v2_data["proxy_location"] = _deserialize_proxy_location(task_v2_model.proxy_location)
+    return TaskV2.model_validate(task_v2_data)
 
 
 def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
@@ -272,7 +322,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         totp_identifier=workflow_model.totp_identifier,
         persist_browser_session=workflow_model.persist_browser_session,
         model=workflow_model.model,
-        proxy_location=(ProxyLocation(workflow_model.proxy_location) if workflow_model.proxy_location else None),
+        proxy_location=_deserialize_proxy_location(workflow_model.proxy_location),
         max_screenshot_scrolls=workflow_model.max_screenshot_scrolling_times,
         version=workflow_model.version,
         is_saved_task=workflow_model.is_saved_task,
@@ -288,6 +338,8 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         cache_key=workflow_model.cache_key,
         run_sequentially=workflow_model.run_sequentially,
         sequential_key=workflow_model.sequential_key,
+        folder_id=workflow_model.folder_id,
+        import_error=workflow_model.import_error,
     )
 
 
@@ -307,11 +359,11 @@ def convert_to_workflow_run(
         workflow_id=workflow_run_model.workflow_id,
         organization_id=workflow_run_model.organization_id,
         browser_session_id=workflow_run_model.browser_session_id,
+        debug_session_id=workflow_run_model.debug_session_id,
+        browser_profile_id=workflow_run_model.browser_profile_id,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
-        proxy_location=(
-            ProxyLocation(workflow_run_model.proxy_location) if workflow_run_model.proxy_location else None
-        ),
+        proxy_location=_deserialize_proxy_location(workflow_run_model.proxy_location),
         webhook_callback_url=workflow_run_model.webhook_callback_url,
         webhook_failure_reason=workflow_run_model.webhook_failure_reason,
         totp_verification_url=workflow_run_model.totp_verification_url,
