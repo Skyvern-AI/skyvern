@@ -71,6 +71,7 @@ class Step(BaseModel):
     reasoning_token_count: int | None = None
     cached_token_count: int | None = None
     step_cost: float = 0
+    created_by: str | None = None
     is_speculative: bool = False
     speculative_original_status: StepStatus | None = None
     speculative_llm_metadata: SpeculativeLLMMetadata | None = None

@@ -257,6 +257,7 @@ class AgentDB:
         retry_index: int,
         organization_id: str | None = None,
         status: StepStatus = StepStatus.created,
+        created_by: str | None = None,
     ) -> Step:
         try:
             async with self.Session() as session:
@@ -266,6 +267,7 @@ class AgentDB:
                     retry_index=retry_index,
                     status=status,
                     organization_id=organization_id,
+                    created_by=created_by,
                 )
                 session.add(new_step)
                 await session.commit()
@@ -595,6 +597,7 @@ class AgentDB:
         incremental_output_tokens: int | None = None,
         incremental_reasoning_tokens: int | None = None,
         incremental_cached_tokens: int | None = None,
+        created_by: str | None = None,
     ) -> Step:
         try:
             async with self.Session() as session:
@@ -627,6 +630,8 @@ class AgentDB:
                         step.reasoning_token_count = incremental_reasoning_tokens + (step.reasoning_token_count or 0)
                     if incremental_cached_tokens is not None:
                         step.cached_token_count = incremental_cached_tokens + (step.cached_token_count or 0)
+                    if created_by is not None:
+                        step.created_by = created_by
 
                     await session.commit()
                     updated_step = await self.get_step(step_id, organization_id)
