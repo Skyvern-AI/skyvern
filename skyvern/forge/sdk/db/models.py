@@ -801,6 +801,12 @@ class PersistentBrowserSessionModel(Base):
             "started_at",
             "completed_at",
         ),
+        Index(
+            "idx_persistent_browser_sessions_org_status_created",
+            "organization_id",
+            "status",
+            desc("created_at"),
+        ),
     )
 
     persistent_browser_session_id = Column(String, primary_key=True, default=generate_persistent_browser_session_id)
