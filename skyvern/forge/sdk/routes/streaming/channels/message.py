@@ -122,6 +122,7 @@ class MessageOutExfiltratedEvent(Message):
     # TODO(jdo): improve typing for params
     params: dict = dataclasses.field(default_factory=dict)
     source: ExfiltratedEventSource = ExfiltratedEventSource.NOT_SPECIFIED
+    timestamp: float = dataclasses.field(default_factory=lambda: 0.0)  # seconds since epoch
 
 
 @dataclasses.dataclass
@@ -433,6 +434,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                             event_name=event.event_name,
                             params=event.params,
                             source=t.cast(ExfiltratedEventSource, event.source or ExfiltratedEventSource.NOT_SPECIFIED),
+                            timestamp=event.timestamp,
                         )
 
                         message_channel.send_nowait(messages=[message_out_exfiltrated_event])

@@ -1,5 +1,7 @@
 (function () {
+  console.log("[SYS] exfiltration: evaluated");
   if (!window.__skyvern_exfiltration_initialized) {
+    console.log("[SYS] exfiltration: initializing");
     window.__skyvern_exfiltration_initialized = true;
 
     [
@@ -55,6 +57,10 @@
           const getElementText = (element) => {
             const textSources = [];
 
+            if (!element.getAttribute) {
+              return textSources;
+            }
+
             if (element.getAttribute("aria-label")) {
               textSources.push(element.getAttribute("aria-label"));
             }
@@ -96,6 +102,52 @@
             return textSources.length > 0 ? textSources : [];
           };
 
+          const skyId = e.target?.dataset?.skyId || null;
+
+          if (!skyId && e.target?.tagName !== "HTML") {
+            console.log("[SYS] exfiltration: target element has no skyId.");
+
+            if (window.__skyvern_generateUniqueId && e.target?.dataset) {
+              const newSkyId = window.__skyvern_generateUniqueId();
+              e.target.dataset.skyId = newSkyId;
+              console.log(
+                `[SYS] exfiltration: assigned new skyId to target element: ${newSkyId}`,
+              );
+            } else {
+              console.log(
+                "[SYS] exfiltration: cannot assign skyId, generator not found.",
+              );
+
+              const info = {
+                tagName: e.target?.tagName,
+                target: e.target,
+                targetType: typeof e.target,
+                eventType,
+                id: e.target?.id,
+                className: e.target?.className,
+                value: e.target?.value,
+                text: getElementText(e.target),
+                labels: getAssociatedLabels(e.target),
+                skyId: e.target?.dataset?.skyId,
+              };
+
+              try {
+                const infoS = JSON.stringify(info, null, 2);
+                console.log(
+                  `[SYS] exfiltration: target element info: ${infoS}`,
+                );
+              } catch (err) {
+                console.log(
+                  "[SYS] exfiltration: target element info: [unserializable]",
+                );
+              }
+            }
+          }
+
+          const classText = String(
+            e.target.classList?.value ?? e.target.getAttribute("class") ?? "",
+          );
+
           const eventData = {
             url: window.location.href,
             type: eventType,
@@ -103,10 +155,13 @@
             target: {
               tagName: e.target?.tagName,
               id: e.target?.id,
-              className: e.target?.className,
+              isHtml: e.target instanceof HTMLElement,
+              isSvg: e.target instanceof SVGElement,
+              className: classText,
               value: e.target?.value,
               text: getElementText(e.target),
               labels: getAssociatedLabels(e.target),
+              skyId: e.target?.dataset?.skyId,
             },
             inputValue: ["input", "focus", "blur"].includes(eventType)
               ? e.target?.value
