@@ -2951,6 +2951,7 @@ class WorkflowService:
             "next_block_label": block_yaml.next_block_label,
             "output_parameter": output_parameter,
             "continue_on_failure": block_yaml.continue_on_failure,
+            "next_iteration_on_failure": block_yaml.next_iteration_on_failure,
             "model": block_yaml.model,
         }
 

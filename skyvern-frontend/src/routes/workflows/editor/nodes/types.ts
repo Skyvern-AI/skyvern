@@ -5,6 +5,7 @@ export type NodeBaseData = {
   debuggable: boolean;
   label: string;
   continueOnFailure: boolean;
+  nextIterationOnFailure?: boolean;
   editable: boolean;
   model: WorkflowModel | null;
   showCode?: boolean;
