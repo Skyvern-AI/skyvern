@@ -11,6 +11,7 @@ export interface WaitBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    next_loop_on_failure?: boolean;
     wait_sec: number;
     parameters?: Skyvern.WaitBlockParametersItem[];
 }

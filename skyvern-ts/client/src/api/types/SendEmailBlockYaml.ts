@@ -7,6 +7,7 @@ export interface SendEmailBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     smtp_host_secret_parameter_key: string;
     smtp_port_secret_parameter_key: string;
     smtp_username_secret_parameter_key: string;

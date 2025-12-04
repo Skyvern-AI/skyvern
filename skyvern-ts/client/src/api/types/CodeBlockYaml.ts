@@ -7,6 +7,7 @@ export interface CodeBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     code: string;
     parameter_keys?: string[];
 }

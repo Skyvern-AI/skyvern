@@ -2106,7 +2106,7 @@ class RawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
-    def file_download(
+    def download_files(
         self,
         *,
         navigation_goal: str,
@@ -2123,7 +2123,6 @@ class RawSkyvern:
         download_suffix: typing.Optional[str] = OMIT,
         download_timeout: typing.Optional[float] = OMIT,
         max_steps_per_run: typing.Optional[int] = OMIT,
-        parameter_keys: typing.Optional[typing.Sequence[str]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[WorkflowRunResponse]:
         """
@@ -2173,9 +2172,6 @@ class RawSkyvern:
         max_steps_per_run : typing.Optional[int]
             Maximum number of steps to execute
 
-        parameter_keys : typing.Optional[typing.Sequence[str]]
-            List of parameter keys to use in the workflow
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -2185,7 +2181,7 @@ class RawSkyvern:
             Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
-            "v1/run/tasks/file_download",
+            "v1/run/tasks/download_files",
             method="POST",
             json={
                 "url": url,
@@ -2202,7 +2198,6 @@ class RawSkyvern:
                 "download_suffix": download_suffix,
                 "download_timeout": download_timeout,
                 "max_steps_per_run": max_steps_per_run,
-                "parameter_keys": parameter_keys,
             },
             headers={
                 "content-type": "application/json",
@@ -4627,7 +4622,7 @@ class AsyncRawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
-    async def file_download(
+    async def download_files(
         self,
         *,
         navigation_goal: str,
@@ -4644,7 +4639,6 @@ class AsyncRawSkyvern:
         download_suffix: typing.Optional[str] = OMIT,
         download_timeout: typing.Optional[float] = OMIT,
         max_steps_per_run: typing.Optional[int] = OMIT,
-        parameter_keys: typing.Optional[typing.Sequence[str]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[WorkflowRunResponse]:
         """
@@ -4694,9 +4688,6 @@ class AsyncRawSkyvern:
         max_steps_per_run : typing.Optional[int]
             Maximum number of steps to execute
 
-        parameter_keys : typing.Optional[typing.Sequence[str]]
-            List of parameter keys to use in the workflow
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -4706,7 +4697,7 @@ class AsyncRawSkyvern:
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
-            "v1/run/tasks/file_download",
+            "v1/run/tasks/download_files",
             method="POST",
             json={
                 "url": url,
@@ -4723,7 +4714,6 @@ class AsyncRawSkyvern:
                 "download_suffix": download_suffix,
                 "download_timeout": download_timeout,
                 "max_steps_per_run": max_steps_per_run,
-                "parameter_keys": parameter_keys,
             },
             headers={
                 "content-type": "application/json",

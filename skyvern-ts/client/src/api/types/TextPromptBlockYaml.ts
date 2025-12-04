@@ -7,6 +7,7 @@ export interface TextPromptBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     llm_key?: string;
     prompt: string;
     parameter_keys?: string[];

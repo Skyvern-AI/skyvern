@@ -7,6 +7,7 @@ export interface ValidationBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     complete_criterion?: string;
     terminate_criterion?: string;
     error_code_mapping?: Record<string, string | undefined>;

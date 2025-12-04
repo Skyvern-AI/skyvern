@@ -19,6 +19,7 @@ class WaitBlockYaml(UniversalBaseModel):
 
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     wait_sec: typing.Optional[int] = None
 
     if IS_PYDANTIC_V2:

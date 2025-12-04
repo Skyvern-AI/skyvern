@@ -20,6 +20,7 @@ class ConditionalBlockYaml(UniversalBaseModel):
 
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     branch_conditions: typing.Optional[typing.List[BranchConditionYaml]] = None
 
     if IS_PYDANTIC_V2:

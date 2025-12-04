@@ -157,15 +157,14 @@ class SkyvernPageRun:
         LOG.info("AI login workflow finished", run_id=workflow_run.run_id, status=workflow_run.status)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
-    async def file_download(
+    async def download_files(
         self,
-        navigation_goal: str,
+        prompt: str,
         *,
         url: str | None = None,
         download_suffix: str | None = None,
         download_timeout: float | None = None,
         max_steps_per_run: int | None = None,
-        parameter_keys: list[str] | None = None,
         webhook_url: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
@@ -175,12 +174,11 @@ class SkyvernPageRun:
         """Run a file download task in the context of this page and wait for it to finish.
 
         Args:
-            navigation_goal: Instructions for navigating to and downloading the file.
+            prompt: Instructions for navigating to and downloading the file.
             url: URL to navigate to for file download. If not provided, uses the current page URL.
             download_suffix: Suffix or complete filename for the downloaded file.
             download_timeout: Timeout in seconds for the download operation.
             max_steps_per_run: Maximum number of steps to execute.
-            parameter_keys: List of parameter keys to use in the workflow.
             webhook_url: URL to receive webhook notifications about download progress.
             totp_identifier: Identifier for TOTP authentication.
             totp_url: URL to fetch TOTP codes from.
@@ -191,15 +189,14 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the file download workflow execution results.
         """
 
-        LOG.info("Starting AI file download workflow", navigation_goal=navigation_goal)
+        LOG.info("Starting AI file download workflow", navigation_goal=prompt)
 
-        workflow_run = await self._browser.skyvern.file_download(
-            navigation_goal=navigation_goal,
+        workflow_run = await self._browser.skyvern.download_files(
+            navigation_goal=prompt,
             url=url or self._get_page_url(),
             download_suffix=download_suffix,
             download_timeout=download_timeout,
             max_steps_per_run=max_steps_per_run,
-            parameter_keys=parameter_keys,
             webhook_url=webhook_url,
             totp_identifier=totp_identifier,
             totp_url=totp_url,
