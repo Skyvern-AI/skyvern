@@ -1525,7 +1525,7 @@ class Skyvern:
         )
         return _response.data
 
-    def file_download(
+    def download_files(
         self,
         *,
         navigation_goal: str,
@@ -1542,7 +1542,6 @@ class Skyvern:
         download_suffix: typing.Optional[str] = OMIT,
         download_timeout: typing.Optional[float] = OMIT,
         max_steps_per_run: typing.Optional[int] = OMIT,
-        parameter_keys: typing.Optional[typing.Sequence[str]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -1592,9 +1591,6 @@ class Skyvern:
         max_steps_per_run : typing.Optional[int]
             Maximum number of steps to execute
 
-        parameter_keys : typing.Optional[typing.Sequence[str]]
-            List of parameter keys to use in the workflow
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -1610,11 +1606,11 @@ class Skyvern:
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
-        client.file_download(
+        client.download_files(
             navigation_goal="navigation_goal",
         )
         """
-        _response = self._raw_client.file_download(
+        _response = self._raw_client.download_files(
             navigation_goal=navigation_goal,
             url=url,
             webhook_url=webhook_url,
@@ -1629,7 +1625,6 @@ class Skyvern:
             download_suffix=download_suffix,
             download_timeout=download_timeout,
             max_steps_per_run=max_steps_per_run,
-            parameter_keys=parameter_keys,
             request_options=request_options,
         )
         return _response.data
@@ -3585,7 +3580,6 @@ class AsyncSkyvern:
         download_suffix: typing.Optional[str] = OMIT,
         download_timeout: typing.Optional[float] = OMIT,
         max_steps_per_run: typing.Optional[int] = OMIT,
-        parameter_keys: typing.Optional[typing.Sequence[str]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -3635,9 +3629,6 @@ class AsyncSkyvern:
         max_steps_per_run : typing.Optional[int]
             Maximum number of steps to execute
 
-        parameter_keys : typing.Optional[typing.Sequence[str]]
-            List of parameter keys to use in the workflow
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -3658,7 +3649,7 @@ class AsyncSkyvern:
 
 
         async def main() -> None:
-            await client.file_download(
+            await client.download_files(
                 navigation_goal="navigation_goal",
             )
 
@@ -3680,7 +3671,6 @@ class AsyncSkyvern:
             download_suffix=download_suffix,
             download_timeout=download_timeout,
             max_steps_per_run=max_steps_per_run,
-            parameter_keys=parameter_keys,
             request_options=request_options,
         )
         return _response.data

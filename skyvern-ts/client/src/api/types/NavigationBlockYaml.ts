@@ -9,6 +9,7 @@ export interface NavigationBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     navigation_goal: string;
     url?: string;
     title?: string;

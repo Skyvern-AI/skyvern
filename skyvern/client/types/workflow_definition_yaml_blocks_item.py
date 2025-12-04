@@ -22,6 +22,7 @@ class WorkflowDefinitionYamlBlocksItem_Action(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
     engine: typing.Optional[RunEngine] = None
@@ -51,6 +52,7 @@ class WorkflowDefinitionYamlBlocksItem_Code(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     code: str
     parameter_keys: typing.Optional[typing.List[str]] = None
 
@@ -70,6 +72,7 @@ class WorkflowDefinitionYamlBlocksItem_Conditional(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     branch_conditions: typing.Optional[typing.List[BranchConditionYaml]] = None
 
     if IS_PYDANTIC_V2:
@@ -88,6 +91,7 @@ class WorkflowDefinitionYamlBlocksItem_DownloadToS3(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     url: str
 
     if IS_PYDANTIC_V2:
@@ -106,6 +110,7 @@ class WorkflowDefinitionYamlBlocksItem_Extraction(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     data_extraction_goal: str
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -132,6 +137,7 @@ class WorkflowDefinitionYamlBlocksItem_FileDownload(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     navigation_goal: str
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -162,6 +168,7 @@ class WorkflowDefinitionYamlBlocksItem_FileUpload(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
     aws_access_key_id: typing.Optional[str] = None
@@ -189,6 +196,7 @@ class WorkflowDefinitionYamlBlocksItem_FileUrlParser(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     file_type: FileType
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
@@ -209,6 +217,7 @@ class WorkflowDefinitionYamlBlocksItem_ForLoop(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     loop_blocks: typing.List["ForLoopBlockYamlLoopBlocksItem"]
     loop_over_parameter_key: typing.Optional[str] = None
     loop_variable_reference: typing.Optional[str] = None
@@ -234,6 +243,7 @@ class WorkflowDefinitionYamlBlocksItem_GotoUrl(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     url: str
 
     if IS_PYDANTIC_V2:
@@ -252,6 +262,7 @@ class WorkflowDefinitionYamlBlocksItem_HttpRequest(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     method: typing.Optional[str] = None
     url: typing.Optional[str] = None
     headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
@@ -276,6 +287,7 @@ class WorkflowDefinitionYamlBlocksItem_HumanInteraction(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
     negative_descriptor: typing.Optional[str] = None
@@ -301,6 +313,7 @@ class WorkflowDefinitionYamlBlocksItem_Login(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
     engine: typing.Optional[RunEngine] = None
@@ -332,6 +345,7 @@ class WorkflowDefinitionYamlBlocksItem_Navigation(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     navigation_goal: str
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -366,6 +380,7 @@ class WorkflowDefinitionYamlBlocksItem_PdfParser(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
 
@@ -385,6 +400,7 @@ class WorkflowDefinitionYamlBlocksItem_SendEmail(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     smtp_host_secret_parameter_key: str
     smtp_port_secret_parameter_key: str
     smtp_username_secret_parameter_key: str
@@ -411,6 +427,7 @@ class WorkflowDefinitionYamlBlocksItem_Task(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
     engine: typing.Optional[RunEngine] = None
@@ -447,6 +464,7 @@ class WorkflowDefinitionYamlBlocksItem_TaskV2(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     prompt: str
     url: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
@@ -471,6 +489,7 @@ class WorkflowDefinitionYamlBlocksItem_TextPrompt(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     llm_key: typing.Optional[str] = None
     prompt: str
     parameter_keys: typing.Optional[typing.List[str]] = None
@@ -492,6 +511,7 @@ class WorkflowDefinitionYamlBlocksItem_UploadToS3(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
@@ -510,6 +530,7 @@ class WorkflowDefinitionYamlBlocksItem_Validation(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
@@ -532,6 +553,7 @@ class WorkflowDefinitionYamlBlocksItem_Wait(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     wait_sec: typing.Optional[int] = None
 
     if IS_PYDANTIC_V2:

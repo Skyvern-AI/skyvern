@@ -7,6 +7,7 @@ export interface HttpRequestBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     method?: string;
     url?: string;
     headers?: Record<string, string | undefined>;

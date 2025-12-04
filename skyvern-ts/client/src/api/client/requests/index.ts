@@ -4,6 +4,7 @@ export type { CreateCredentialRequest } from "./CreateCredentialRequest.js";
 export type { CreateScriptRequest } from "./CreateScriptRequest.js";
 export type { CreateWorkflowRequest } from "./CreateWorkflowRequest.js";
 export type { DeployScriptRequest } from "./DeployScriptRequest.js";
+export type { DownloadFilesRequest } from "./DownloadFilesRequest.js";
 export type { GetCredentialsRequest } from "./GetCredentialsRequest.js";
 export type { GetRunArtifactsRequest } from "./GetRunArtifactsRequest.js";
 export type { GetScriptsRequest } from "./GetScriptsRequest.js";

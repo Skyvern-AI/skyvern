@@ -11,6 +11,7 @@ export interface ForLoopBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    next_loop_on_failure?: boolean;
     loop_blocks: Skyvern.ForLoopBlockLoopBlocksItem[];
     loop_over?: Skyvern.ForLoopBlockLoopOver;
     loop_variable_reference?: string;
