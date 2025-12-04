@@ -8,6 +8,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm
 
 from .console import console
+from .container import ContainerRuntimeFactory
 
 
 def command_exists(command: str) -> bool:
@@ -49,21 +50,31 @@ def create_database_and_user() -> None:
     console.print("✅ [bold green]Database and user created successfully.[/bold green]")
 
 
-def is_docker_running() -> bool:
-    if not command_exists("docker"):
+def is_container_runtime_running() -> bool:
+    """Check if a container runtime (Docker or Podman) is available and running."""
+    try:
+        runtime = ContainerRuntimeFactory.get_runtime()
+        return runtime.is_running()
+    except RuntimeError:
         return False
-    _, code = run_command("docker info", check=False)
-    return code == 0
 
 
-def is_postgres_running_in_docker() -> bool:
-    _, code = run_command("docker ps | grep -q postgresql-container", check=False)
-    return code == 0
+def is_postgres_running_in_container() -> bool:
+    """Check if the PostgreSQL container is running."""
+    try:
+        runtime = ContainerRuntimeFactory.get_runtime()
+        return runtime.is_container_running("postgresql-container")
+    except RuntimeError:
+        return False
 
 
 def is_postgres_container_exists() -> bool:
-    _, code = run_command("docker ps -a | grep -q postgresql-container", check=False)
-    return code == 0
+    """Check if the PostgreSQL container exists (running or stopped)."""
+    try:
+        runtime = ContainerRuntimeFactory.get_runtime()
+        return runtime.container_exists("postgresql-container")
+    except RuntimeError:
+        return False
 
 
 def setup_postgresql(no_postgres: bool = False) -> None:
@@ -85,14 +96,17 @@ def setup_postgresql(no_postgres: bool = False) -> None:
         )
         return
 
-    if not is_docker_running():
+    if not is_container_runtime_running():
         console.print(
-            "[red]Docker is not running or not installed. Please install or start Docker and try again.[/red]"
+            "[red]No container runtime available. Please install and start Docker or Podman and try again.[/red]"
         )
         raise SystemExit(1)
 
-    if is_postgres_running_in_docker():
-        console.print("🐳 [green]PostgreSQL is already running in a Docker container.[/green]")
+    runtime = ContainerRuntimeFactory.get_runtime()
+    runtime_name = runtime.display_name
+
+    if is_postgres_running_in_container():
+        console.print(f"🐳 [green]PostgreSQL is already running in a {runtime_name} container.[/green]")
     else:
         if not no_postgres:
             start_postgres = Confirm.ask(
@@ -106,16 +120,19 @@ def setup_postgresql(no_postgres: bool = False) -> None:
                 )
                 return
 
-        console.print("🚀 [bold green]Attempting to install PostgreSQL via Docker...[/bold green]")
+        console.print(f"🚀 [bold green]Attempting to install PostgreSQL via {runtime_name}...[/bold green]")
         if not is_postgres_container_exists():
             with console.status("[bold blue]Pulling and starting PostgreSQL container...[/bold blue]"):
-                run_command(
-                    "docker run --name postgresql-container -e POSTGRES_HOST_AUTH_METHOD=trust -d -p 5432:5432 postgres:14"
+                runtime.run_container(
+                    image="postgres:14",
+                    name="postgresql-container",
+                    ports={"5432": "5432"},
+                    environment={"POSTGRES_HOST_AUTH_METHOD": "trust"},
                 )
-            console.print("✅ [green]PostgreSQL has been installed and started using Docker.[/green]")
+            console.print(f"✅ [green]PostgreSQL has been installed and started using {runtime_name}.[/green]")
         else:
             with console.status("[bold blue]Starting existing PostgreSQL container...[/bold blue]"):
-                run_command("docker start postgresql-container")
+                runtime.start_container("postgresql-container")
             console.print("✅ [green]Existing PostgreSQL container started.[/green]")
 
         with Progress(
@@ -127,24 +144,27 @@ def setup_postgresql(no_postgres: bool = False) -> None:
         console.print("✅ [green]PostgreSQL container ready.[/green]")
 
     with console.status("[bold green]Checking database user...[/bold green]"):
-        _, code = run_command(
-            'docker exec postgresql-container psql -U postgres -c "\\du" | grep -q skyvern', check=False
+        result = runtime.exec_in_container(
+            "postgresql-container",
+            ["psql", "-U", "postgres", "-c", "\\du"],
         )
-        if code == 0:
+        if result.success and "skyvern" in result.stdout:
             console.print("✅ [green]Database user exists.[/green]")
         else:
             console.print("🚀 [bold green]Creating database user...[/bold green]")
-            run_command("docker exec postgresql-container createuser -U postgres skyvern")
+            runtime.exec_in_container("postgresql-container", ["createuser", "-U", "postgres", "skyvern"])
             console.print("✅ [green]Database user created.[/green]")
 
     with console.status("[bold green]Checking database...[/bold green]"):
-        _, code = run_command(
-            "docker exec postgresql-container psql -U postgres -lqt | cut -d | -f 1 | grep -qw skyvern",
-            check=False,
+        result = runtime.exec_in_container(
+            "postgresql-container",
+            ["psql", "-U", "postgres", "-lqt"],
         )
-        if code == 0:
+        if result.success and "skyvern" in result.stdout:
             console.print("✅ [green]Database exists.[/green]")
         else:
             console.print("🚀 [bold green]Creating database...[/bold green]")
-            run_command("docker exec postgresql-container createdb -U postgres skyvern -O skyvern")
+            runtime.exec_in_container(
+                "postgresql-container", ["createdb", "-U", "postgres", "skyvern", "-O", "skyvern"]
+            )
             console.print("✅ [green]Database and user created successfully.[/green]")

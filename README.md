@@ -238,7 +238,13 @@ skyvern stop server
 
 ## Docker Compose setup
 
-1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
+> **Note:** Skyvern also supports Podman as an alternative container runtime.
+> If you have Podman installed instead of Docker, commands will automatically
+> use Podman. For compose operations, ensure `podman-compose` is installed.
+> You can force a specific runtime by setting `SKYVERN_CONTAINER_RUNTIME=docker`
+> or `SKYVERN_CONTAINER_RUNTIME=podman`.
+
+1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [Podman](https://podman.io/) installed and running on your machine
 1. Make sure you don't have postgres running locally (Run `docker ps` to check)
 1. Clone the repository and navigate to the root directory
 1. Run `skyvern init llm` to generate a `.env` file. This will be copied into the Docker image.
