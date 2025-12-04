@@ -8,6 +8,7 @@ import pydantic
 import typing_extensions
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel, update_forward_refs
 from ..core.serialization import FieldMetadata
+from .branch_condition_yaml import BranchConditionYaml
 from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from .file_storage_type import FileStorageType
 from .file_type import FileType
@@ -524,6 +525,24 @@ class ForLoopBlockYamlLoopBlocksItem_HttpRequest(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class ForLoopBlockYamlLoopBlocksItem_Conditional(UniversalBaseModel):
+    block_type: typing.Literal["conditional"] = "conditional"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    branch_conditions: typing.Optional[typing.List[BranchConditionYaml]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 ForLoopBlockYamlLoopBlocksItem = typing.Union[
     ForLoopBlockYamlLoopBlocksItem_Task,
     ForLoopBlockYamlLoopBlocksItem_ForLoop,
@@ -546,5 +565,6 @@ ForLoopBlockYamlLoopBlocksItem = typing.Union[
     ForLoopBlockYamlLoopBlocksItem_PdfParser,
     ForLoopBlockYamlLoopBlocksItem_TaskV2,
     ForLoopBlockYamlLoopBlocksItem_HttpRequest,
+    ForLoopBlockYamlLoopBlocksItem_Conditional,
 ]
 update_forward_refs(ForLoopBlockYamlLoopBlocksItem_ForLoop)

@@ -4,16 +4,14 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .branch_criteria_yaml import BranchCriteriaYaml
 
 
-class BranchCriteria(UniversalBaseModel):
-    """
-    Abstract interface describing how a branch condition should be evaluated.
-    """
-
-    criteria_type: str
-    expression: str
+class BranchConditionYaml(UniversalBaseModel):
+    criteria: typing.Optional[BranchCriteriaYaml] = None
+    next_block_label: typing.Optional[str] = None
     description: typing.Optional[str] = None
+    is_default: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
