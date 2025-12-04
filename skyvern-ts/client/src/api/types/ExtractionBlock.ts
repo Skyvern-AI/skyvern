@@ -11,6 +11,7 @@ export interface ExtractionBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    next_loop_on_failure?: boolean;
     task_type?: string;
     url?: string;
     title?: string;

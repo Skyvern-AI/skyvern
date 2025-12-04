@@ -11,6 +11,7 @@ export interface FileUploadBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    next_loop_on_failure?: boolean;
     storage_type?: Skyvern.FileStorageType;
     s3_bucket?: string;
     aws_access_key_id?: string;

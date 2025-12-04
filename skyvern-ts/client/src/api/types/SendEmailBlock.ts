@@ -11,6 +11,7 @@ export interface SendEmailBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    next_loop_on_failure?: boolean;
     smtp_host: Skyvern.AwsSecretParameter;
     smtp_port: Skyvern.AwsSecretParameter;
     smtp_username: Skyvern.AwsSecretParameter;

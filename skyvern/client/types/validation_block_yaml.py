@@ -19,6 +19,7 @@ class ValidationBlockYaml(UniversalBaseModel):
 
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None

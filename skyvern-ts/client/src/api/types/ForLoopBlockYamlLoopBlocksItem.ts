@@ -23,7 +23,8 @@ export type ForLoopBlockYamlLoopBlocksItem =
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.GotoUrl
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.PdfParser
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.TaskV2
-    | Skyvern.ForLoopBlockYamlLoopBlocksItem.HttpRequest;
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.HttpRequest
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.Conditional;
 
 export namespace ForLoopBlockYamlLoopBlocksItem {
     export interface Task extends Skyvern.TaskBlockYaml {
@@ -108,5 +109,9 @@ export namespace ForLoopBlockYamlLoopBlocksItem {
 
     export interface HttpRequest extends Skyvern.HttpRequestBlockYaml {
         block_type: "http_request";
+    }
+
+    export interface Conditional extends Skyvern.ConditionalBlockYaml {
+        block_type: "conditional";
     }
 }

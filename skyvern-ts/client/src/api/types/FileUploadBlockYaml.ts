@@ -9,6 +9,7 @@ export interface FileUploadBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     storage_type?: Skyvern.FileStorageType;
     s3_bucket?: string;
     aws_access_key_id?: string;

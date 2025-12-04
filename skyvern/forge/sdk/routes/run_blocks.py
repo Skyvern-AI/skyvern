@@ -8,8 +8,8 @@ from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.routes.code_samples import (
-    FILE_DOWNLOAD_CODE_SAMPLE_PYTHON,
-    FILE_DOWNLOAD_CODE_SAMPLE_TS,
+    DOWNLOAD_FILES_CODE_SAMPLE_PYTHON,
+    DOWNLOAD_FILES_CODE_SAMPLE_TS,
     LOGIN_CODE_SAMPLE_BITWARDEN_PYTHON,
     LOGIN_CODE_SAMPLE_BITWARDEN_TS,
     LOGIN_CODE_SAMPLE_ONEPASSWORD_PYTHON,
@@ -22,7 +22,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody
-from skyvern.schemas.run_blocks import BaseRunBlockRequest, CredentialType, FileDownloadRequest, LoginRequest
+from skyvern.schemas.run_blocks import BaseRunBlockRequest, CredentialType, DownloadFilesRequest, LoginRequest
 from skyvern.schemas.runs import ProxyLocation, RunType, WorkflowRunRequest, WorkflowRunResponse
 from skyvern.schemas.workflows import (
     AzureVaultCredentialParameterYAML,
@@ -283,16 +283,16 @@ async def login(
 
 
 @base_router.post(
-    "/run/tasks/file_download",
+    "/run/tasks/download_files",
     tags=["Agent"],
     response_model=WorkflowRunResponse,
     openapi_extra={
-        "x-fern-sdk-method-name": "file_download",
+        "x-fern-sdk-method-name": "download_files",
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {"sdk": "python", "code": FILE_DOWNLOAD_CODE_SAMPLE_PYTHON},
-                    {"sdk": "typescript", "code": FILE_DOWNLOAD_CODE_SAMPLE_TS},
+                    {"sdk": "python", "code": DOWNLOAD_FILES_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": DOWNLOAD_FILES_CODE_SAMPLE_TS},
                 ]
             }
         ],
@@ -300,24 +300,24 @@ async def login(
     description="Download a file from a website by navigating and clicking download buttons",
     summary="File Download Task",
 )
-async def file_download(
+async def download_files(
     request: Request,
     background_tasks: BackgroundTasks,
-    file_download_request: FileDownloadRequest,
+    download_files_request: DownloadFilesRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
-    url = _validate_url(file_download_request.url)
-    totp_verification_url = _validate_url(file_download_request.totp_url)
-    webhook_url = _validate_url(file_download_request.webhook_url)
+    url = _validate_url(download_files_request.url)
+    totp_verification_url = _validate_url(download_files_request.totp_url)
+    webhook_url = _validate_url(download_files_request.webhook_url)
 
     # 1. create empty workflow
     new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
         organization,
         "File Download",
-        proxy_location=file_download_request.proxy_location,
-        max_screenshot_scrolling_times=file_download_request.max_screenshot_scrolling_times,
-        extra_http_headers=file_download_request.extra_http_headers,
+        proxy_location=download_files_request.proxy_location,
+        max_screenshot_scrolling_times=download_files_request.max_screenshot_scrolling_times,
+        extra_http_headers=download_files_request.extra_http_headers,
         status=WorkflowStatus.auto_generated,
     )
 
@@ -327,13 +327,13 @@ async def file_download(
         label=label,
         title=label,
         url=url,
-        navigation_goal=file_download_request.navigation_goal,
-        max_steps_per_run=file_download_request.max_steps_per_run or 10,
-        parameter_keys=file_download_request.parameter_keys or [],
+        navigation_goal=download_files_request.navigation_goal,
+        max_steps_per_run=download_files_request.max_steps_per_run or 10,
+        parameter_keys=[],
         totp_verification_url=totp_verification_url,
-        totp_identifier=file_download_request.totp_identifier,
-        download_suffix=file_download_request.download_suffix,
-        download_timeout=file_download_request.download_timeout,
+        totp_identifier=download_files_request.totp_identifier,
+        download_suffix=download_files_request.download_suffix,
+        download_timeout=download_files_request.download_timeout,
     )
     yaml_blocks = [file_download_block_yaml]
     workflow_definition_yaml = WorkflowDefinitionYAML(
@@ -343,10 +343,10 @@ async def file_download(
     workflow_create_request = WorkflowCreateYAMLRequest(
         title=new_workflow.title,
         description=new_workflow.description,
-        proxy_location=file_download_request.proxy_location or ProxyLocation.RESIDENTIAL,
+        proxy_location=download_files_request.proxy_location or ProxyLocation.RESIDENTIAL,
         workflow_definition=workflow_definition_yaml,
         status=new_workflow.status,
-        max_screenshot_scrolls=file_download_request.max_screenshot_scrolling_times,
+        max_screenshot_scrolls=download_files_request.max_screenshot_scrolling_times,
     )
     workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
         organization=organization,
@@ -363,9 +363,9 @@ async def file_download(
         new_workflow=new_workflow,
         workflow_id=workflow_id,
         organization=organization,
-        run_block_request=file_download_request,
+        run_block_request=download_files_request,
         webhook_url=webhook_url,
         totp_verification_url=totp_verification_url,
-        totp_identifier=file_download_request.totp_identifier,
+        totp_identifier=download_files_request.totp_identifier,
         x_api_key=x_api_key,
     )

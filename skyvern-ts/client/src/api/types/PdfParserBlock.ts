@@ -15,6 +15,7 @@ export interface PdfParserBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    next_loop_on_failure?: boolean;
     file_url: string;
     json_schema?: Record<string, unknown>;
 }

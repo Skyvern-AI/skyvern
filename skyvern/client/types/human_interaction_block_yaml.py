@@ -19,6 +19,7 @@ class HumanInteractionBlockYaml(UniversalBaseModel):
 
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
     negative_descriptor: typing.Optional[str] = None

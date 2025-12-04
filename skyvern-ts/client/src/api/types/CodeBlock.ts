@@ -11,6 +11,7 @@ export interface CodeBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    next_loop_on_failure?: boolean;
     code: string;
     parameters?: Skyvern.CodeBlockParametersItem[];
 }

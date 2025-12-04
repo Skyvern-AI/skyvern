@@ -20,6 +20,7 @@ class LoginBlockYaml(UniversalBaseModel):
 
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
     engine: typing.Optional[RunEngine] = None

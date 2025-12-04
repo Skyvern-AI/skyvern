@@ -7,5 +7,6 @@ export interface DownloadToS3BlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     url: string;
 }

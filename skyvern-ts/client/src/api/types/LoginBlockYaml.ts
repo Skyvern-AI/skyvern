@@ -9,6 +9,7 @@ export interface LoginBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     url?: string;
     title?: string;
     engine?: Skyvern.RunEngine;

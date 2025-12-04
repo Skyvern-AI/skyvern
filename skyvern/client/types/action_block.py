@@ -27,6 +27,7 @@ class ActionBlock(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None

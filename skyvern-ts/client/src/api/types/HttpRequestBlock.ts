@@ -11,6 +11,7 @@ export interface HttpRequestBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    next_loop_on_failure?: boolean;
     method?: string;
     url?: string;
     headers?: Record<string, string | undefined>;
