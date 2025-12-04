@@ -528,6 +528,7 @@ export type PasswordCredential = {
   password: string;
   totp: string | null;
   totp_type: "authenticator" | "email" | "text" | "none";
+  totp_identifier?: string | null;
 };
 
 export type CreditCardCredential = {
