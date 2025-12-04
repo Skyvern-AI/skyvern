@@ -142,6 +142,7 @@ class StepModel(Base):
     cached_token_count = Column(Integer, default=0)
     step_cost = Column(Numeric, default=0)
     finished_at = Column(DateTime, nullable=True)
+    created_by = Column(String, nullable=True)
 
 
 class OrganizationModel(Base):

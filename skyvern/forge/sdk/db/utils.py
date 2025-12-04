@@ -234,6 +234,7 @@ def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
         reasoning_token_count=step_model.reasoning_token_count,
         cached_token_count=step_model.cached_token_count,
         step_cost=step_model.step_cost,
+        created_by=step_model.created_by,
     )
 
 
