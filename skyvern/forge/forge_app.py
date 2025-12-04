@@ -32,6 +32,7 @@ from skyvern.forge.sdk.services.credential.custom_credential_vault_service impor
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.services.browser_recording.service import BrowserSessionRecordingService
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager
@@ -69,6 +70,7 @@ class ForgeApp:
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
+    BROWSER_SESSION_RECORDING_SERVICE: BrowserSessionRecordingService
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
     CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
@@ -177,6 +179,7 @@ def create_forge_app() -> ForgeApp:
     app.WORKFLOW_SERVICE = WorkflowService()
     app.AGENT_FUNCTION = AgentFunction()
     app.PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=app.DATABASE)
+    app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
     app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = BitwardenCredentialVaultService()

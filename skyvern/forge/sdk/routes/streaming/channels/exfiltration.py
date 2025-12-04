@@ -14,6 +14,7 @@ import asyncio
 import dataclasses
 import enum
 import json
+import time
 import typing as t
 
 import structlog
@@ -39,6 +40,7 @@ class ExfiltratedEvent:
     # TODO(jdo): improve typing for params
     params: dict = dataclasses.field(default_factory=dict)
     source: ExfiltratedEventSource = ExfiltratedEventSource.NOT_SPECIFIED
+    timestamp: float = dataclasses.field(default_factory=lambda: time.time())  # seconds since epoch
 
 
 OnExfiltrationEvent = t.Callable[[list[ExfiltratedEvent]], None]
@@ -68,6 +70,7 @@ class ExfiltrationChannel(CdpChannel):
                         event_name="user_interaction",
                         params=event_data,
                         source=ExfiltratedEventSource.CONSOLE,
+                        timestamp=time.time(),
                     ),
                 ]
 
@@ -84,20 +87,25 @@ class ExfiltrationChannel(CdpChannel):
                 event_name=event_name,
                 params=params,
                 source=ExfiltratedEventSource.CDP,
+                timestamp=time.time(),
             ),
         ]
 
         self.on_event(messages)
 
-        if event_name in ("frame_navigated", "navigated_within_document"):
-            # optimistically re-apply exfiltration and decoration on navigation
-            # (these operations should be idempotent)
-            pages = self.browser_context.pages if self.browser_context else []
-            LOG.info(f"{self.class_name} re-applying exfiltration and decoration on navigation.", event_name=event_name)
+    async def adorn(self, page: Page) -> t.Self:
+        """Add a mouse-following follower to the page."""
+        if page.url.startswith("devtools:"):
+            return self
 
-            for page in pages:
-                asyncio.create_task(self.exfiltrate(page))
-                asyncio.create_task(self.decorate(page))
+        LOG.info(f"{self.class_name} adorning page.", url=page.url)
+
+        (await page.evaluate(self.js("adorn")),)
+        (await page.add_init_script(self.js("adorn")),)
+
+        LOG.info(f"{self.class_name} adornment complete on page.", url=page.url)
+
+        return self
 
     async def connect(self, cdp_url: str | None = None) -> t.Self:
         if self.browser and self.browser.is_connected() and self.cdp_session:
@@ -121,12 +129,18 @@ class ExfiltrationChannel(CdpChannel):
     async def exfiltrate(self, page: Page) -> t.Self:
         """
         Track user interactions and send to console for CDP to capture.
+
+        Uses add_init_script to ensure the exfiltration script is re-injected
+        on every navigation (including address bar navigations).
         """
+        if page.url.startswith("devtools:"):
+            return self
 
         LOG.info(f"{self.class_name} setting up exfiltration on new page.", url=page.url)
 
         page.on("console", self._handle_console_event)
 
+        await page.add_init_script(self.js("exfiltrate"))
         await page.evaluate(self.js("exfiltrate"))
 
         LOG.info(f"{self.class_name} setup complete on page.", url=page.url)
@@ -135,8 +149,12 @@ class ExfiltrationChannel(CdpChannel):
 
     async def decorate(self, page: Page) -> t.Self:
         """Add a mouse-following follower to the page."""
+        if page.url.startswith("devtools:"):
+            return self
+
         LOG.info(f"{self.class_name} adding decoration to page.", url=page.url)
 
+        await page.add_init_script(self.js("decorate"))
         await page.evaluate(self.js("decorate"))
 
         LOG.info(f"{self.class_name} decoration setup complete on page.", url=page.url)
@@ -145,8 +163,12 @@ class ExfiltrationChannel(CdpChannel):
 
     async def undecorate(self, page: Page) -> t.Self:
         """Remove the mouse-following follower from the page."""
+        if page.url.startswith("devtools:"):
+            return self
+
         LOG.info(f"{self.class_name} removing decoration from page.", url=page.url)
 
+        await page.add_init_script(self.js("undecorate"))
         await page.evaluate(self.js("undecorate"))
 
         LOG.info(f"{self.class_name} decoration removed from page.", url=page.url)
@@ -174,10 +196,35 @@ class ExfiltrationChannel(CdpChannel):
         cdp_session.on("Target.targetCreated", lambda params: self._handle_cdp_event("target_created", params))
         cdp_session.on("Target.targetDestroyed", lambda params: self._handle_cdp_event("target_destroyed", params))
         cdp_session.on("Target.targetInfoChanged", lambda params: self._handle_cdp_event("target_info_changed", params))
-        cdp_session.on("Page.frameNavigated", lambda params: self._handle_cdp_event("frame_navigated", params))
         cdp_session.on(
-            "Page.navigatedWithinDocument", lambda params: self._handle_cdp_event("navigated_within_document", params)
+            "Page.frameRequestedNavigation",
+            lambda params: self._handle_cdp_event("nav:frame_requested_navigation", params),
         )
+        cdp_session.on(
+            "Page.frameStartedNavigating", lambda params: self._handle_cdp_event("nav:frame_started_navigating", params)
+        )
+        cdp_session.on("Page.frameNavigated", lambda params: self._handle_cdp_event("nav:frame_navigated", params))
+        cdp_session.on(
+            "Page.navigatedWithinDocument",
+            lambda params: self._handle_cdp_event("nav:navigated_within_document", params),
+        )
+
+        return self
+
+    async def enable_adornment(self) -> t.Self:
+        browser_context = self.browser_context
+
+        if not browser_context:
+            LOG.error(f"{self.class_name} no browser context to enable adornment.")
+            return self
+
+        tasks: list[asyncio.Task] = []
+        for page in browser_context.pages:
+            tasks.append(asyncio.create_task(self.adorn(page)))
+
+        await asyncio.gather(*tasks)
+
+        browser_context.on("page", lambda page: asyncio.create_task(self.adorn(page)))
 
         return self
 
@@ -214,6 +261,8 @@ class ExfiltrationChannel(CdpChannel):
 
         await self.enable_cdp_events()
 
+        await self.enable_adornment()
+
         self.enable_console_events()
 
         self.enable_decoration()
@@ -236,7 +285,10 @@ class ExfiltrationChannel(CdpChannel):
         pages = self.browser_context.pages if self.browser_context else []
 
         for page in pages:
-            page.remove_listener("console", self._handle_console_event)
+            try:
+                page.remove_listener("console", self._handle_console_event)
+            except KeyError:
+                pass  # listener not found
             await self.undecorate(page)
 
         LOG.info(f"{self.class_name} stopped.")
