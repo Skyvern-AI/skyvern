@@ -2836,6 +2836,83 @@
         ]
       }
     },
+    "/v1/run/tasks/file_download": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "File Download Task",
+        "description": "Download a file from a website by navigating and clicking download buttons",
+        "operationId": "file_download_v1_run_tasks_file_download_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FileDownloadRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "file_download",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.file_download(\n    url=\"https://example.com/downloads\",\n    navigation_goal=\"Navigate to the downloads page and click the 'Download PDF' button\",\n    download_suffix=\"report.pdf\"\n)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.fileDownload({\n    url: \"https://example.com/downloads\",\n    navigation_goal: \"Navigate to the downloads page and click the 'Download PDF' button\",\n    download_suffix: \"report.pdf\"\n});\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
     "/v1/scripts": {
       "post": {
         "tags": [
@@ -7618,6 +7695,200 @@
         ],
         "title": "FileDownloadBlockYAML"
       },
+      "FileDownloadRequest": {
+        "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url",
+            "description": "Website URL"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url",
+            "description": "Webhook URL to send status updates"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Proxy location to use"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url",
+            "description": "TOTP URL to fetch one-time passwords"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id",
+            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`",
+            "examples": [
+              "pbs_123456"
+            ]
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of a browser profile to reuse for this run"
+          },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "The CDP address for the task.",
+            "examples": [
+              "http://127.0.0.1:9222",
+              "ws://127.0.0.1:9222/devtools/browser/1234567890"
+            ]
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers",
+            "description": "Additional HTTP headers to include in requests"
+          },
+          "max_screenshot_scrolling_times": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolling Times",
+            "description": "Maximum number of times to scroll for screenshots"
+          },
+          "navigation_goal": {
+            "type": "string",
+            "title": "Navigation Goal",
+            "description": "Instructions for navigating to and downloading the file"
+          },
+          "download_suffix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Suffix",
+            "description": "Suffix or complete filename for the downloaded file"
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout",
+            "description": "Timeout in seconds for the download operation"
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run",
+            "description": "Maximum number of steps to execute"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys",
+            "description": "List of parameter keys to use in the workflow"
+          }
+        },
+        "type": "object",
+        "required": [
+          "navigation_goal"
+        ],
+        "title": "FileDownloadRequest"
+      },
       "FileEncoding": {
         "type": "string",
         "enum": [
@@ -10204,10 +10475,6 @@
       },
       "LoginRequest": {
         "properties": {
-          "credential_type": {
-            "$ref": "#/components/schemas/skyvern__schemas__run_blocks__CredentialType",
-            "description": "Where to get the credential from"
-          },
           "url": {
             "anyOf": [
               {
@@ -10218,19 +10485,7 @@
               }
             ],
             "title": "Url",
-            "description": "Website url"
-          },
-          "prompt": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prompt",
-            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
+            "description": "Website URL"
           },
           "webhook_url": {
             "anyOf": [
@@ -10242,7 +10497,7 @@
               }
             ],
             "title": "Webhook Url",
-            "description": "Webhook URL to send login status updates"
+            "description": "Webhook URL to send status updates"
           },
           "proxy_location": {
             "anyOf": [
@@ -10348,6 +10603,22 @@
             ],
             "title": "Max Screenshot Scrolling Times",
             "description": "Maximum number of times to scroll for screenshots"
+          },
+          "credential_type": {
+            "$ref": "#/components/schemas/skyvern__schemas__run_blocks__CredentialType",
+            "description": "Where to get the credential from"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
           },
           "credential_id": {
             "anyOf": [
