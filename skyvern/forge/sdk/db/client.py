@@ -4159,10 +4159,7 @@ class AgentDB:
             async with self.Session() as session:
                 open_first = case(
                     (
-                        and_(
-                            PersistentBrowserSessionModel.started_at.is_not(None),
-                            PersistentBrowserSessionModel.completed_at.is_(None),
-                        ),
+                        PersistentBrowserSessionModel.status == "running",
                         0,  # open
                     ),
                     else_=1,  # not open
@@ -4173,7 +4170,7 @@ class AgentDB:
                     .filter_by(organization_id=organization_id)
                     .filter_by(deleted_at=None)
                     .filter(
-                        PersistentBrowserSessionModel.created_at > datetime.utcnow() - timedelta(hours=lookback_hours)
+                        PersistentBrowserSessionModel.created_at > (datetime.utcnow() - timedelta(hours=lookback_hours))
                     )
                     .order_by(
                         open_first.asc(),  # open sessions first
