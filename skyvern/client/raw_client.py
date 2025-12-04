@@ -4627,7 +4627,7 @@ class AsyncRawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
-    async def file_download(
+    async def download_files(
         self,
         *,
         navigation_goal: str,
@@ -4706,7 +4706,7 @@ class AsyncRawSkyvern:
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
-            "v1/run/tasks/file_download",
+            "v1/run/tasks/download_files",
             method="POST",
             json={
                 "url": url,

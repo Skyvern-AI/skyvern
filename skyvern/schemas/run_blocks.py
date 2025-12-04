@@ -74,9 +74,8 @@ class LoginRequest(BaseRunBlockRequest):
     azure_vault_totp_secret_key: str | None = Field(default=None, description="Azure Vault TOTP secret key")
 
 
-class FileDownloadRequest(BaseRunBlockRequest):
+class DownloadFilesRequest(BaseRunBlockRequest):
     navigation_goal: str = Field(..., description="Instructions for navigating to and downloading the file")
     download_suffix: str | None = Field(default=None, description="Suffix or complete filename for the downloaded file")
     download_timeout: float | None = Field(default=None, description="Timeout in seconds for the download operation")
     max_steps_per_run: int | None = Field(default=None, description="Maximum number of steps to execute")
-    parameter_keys: list[str] | None = Field(default=None, description="List of parameter keys to use in the workflow")

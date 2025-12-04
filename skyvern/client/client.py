@@ -3568,7 +3568,7 @@ class AsyncSkyvern:
         )
         return _response.data
 
-    async def file_download(
+    async def download_files(
         self,
         *,
         navigation_goal: str,
@@ -3665,7 +3665,7 @@ class AsyncSkyvern:
 
         asyncio.run(main())
         """
-        _response = await self._raw_client.file_download(
+        _response = await self._raw_client.download_files(
             navigation_goal=navigation_goal,
             url=url,
             webhook_url=webhook_url,
