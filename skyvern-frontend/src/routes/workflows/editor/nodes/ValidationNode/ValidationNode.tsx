@@ -218,15 +218,15 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
                   </div>
                   <BlockExecutionOptions
                     continueOnFailure={data.continueOnFailure}
-                    nextIterationOnFailure={data.nextIterationOnFailure}
+                    nextLoopOnFailure={data.nextLoopOnFailure}
                     editable={editable}
                     isInsideForLoop={isInsideForLoop}
                     blockType="validation"
                     onContinueOnFailureChange={(checked) => {
                       update({ continueOnFailure: checked });
                     }}
-                    onNextIterationOnFailureChange={(checked) => {
-                      update({ nextIterationOnFailure: checked });
+                    onNextLoopOnFailureChange={(checked) => {
+                      update({ nextLoopOnFailure: checked });
                     }}
                   />
                   <DisableCache

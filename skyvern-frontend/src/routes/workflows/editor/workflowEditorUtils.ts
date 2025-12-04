@@ -223,7 +223,7 @@ function convertToNode(
     debuggable: debuggableWorkflowBlockTypes.has(block.block_type),
     label: block.label,
     continueOnFailure: block.continue_on_failure,
-    nextIterationOnFailure: block.next_iteration_on_failure,
+    nextLoopOnFailure: block.next_loop_on_failure,
     editable,
     model: block.model,
   };
@@ -490,7 +490,7 @@ function convertToNode(
           loopValue: block.loop_over?.key ?? "",
           loopVariableReference: loopVariableReference,
           completeIfEmpty: block.complete_if_empty,
-          nextIterationOnFailure: block.next_iteration_on_failure,
+          nextLoopOnFailure: block.next_loop_on_failure,
         },
       };
     }
@@ -1075,7 +1075,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
   const base = {
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
-    next_iteration_on_failure: node.data.nextIterationOnFailure,
+    next_loop_on_failure: node.data.nextLoopOnFailure,
     model: node.data.model,
   };
   switch (node.type) {
@@ -1425,7 +1425,7 @@ function getOrderedChildrenBlocks(
         block_type: "for_loop",
         label: currentNode.data.label,
         continue_on_failure: currentNode.data.continueOnFailure,
-        next_iteration_on_failure: currentNode.data.nextIterationOnFailure,
+        next_loop_on_failure: currentNode.data.nextLoopOnFailure,
         loop_blocks: loopChildren,
         loop_variable_reference: currentNode.data.loopVariableReference,
         complete_if_empty: currentNode.data.completeIfEmpty,
@@ -1456,7 +1456,7 @@ function getWorkflowBlocksUtil(
           block_type: "for_loop",
           label: node.data.label,
           continue_on_failure: node.data.continueOnFailure,
-          next_iteration_on_failure: node.data.nextIterationOnFailure,
+          next_loop_on_failure: node.data.nextLoopOnFailure,
           loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
           loop_variable_reference: node.data.loopVariableReference,
           complete_if_empty: node.data.completeIfEmpty,
@@ -1957,7 +1957,7 @@ function convertBlocksToBlockYAML(
     const base = {
       label: block.label,
       continue_on_failure: block.continue_on_failure,
-      next_iteration_on_failure: block.next_iteration_on_failure,
+      next_loop_on_failure: block.next_loop_on_failure,
       next_block_label: block.next_block_label,
     };
     switch (block.block_type) {

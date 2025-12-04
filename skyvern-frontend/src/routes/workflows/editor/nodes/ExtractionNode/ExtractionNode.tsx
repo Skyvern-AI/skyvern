@@ -215,15 +215,15 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                   </div>
                   <BlockExecutionOptions
                     continueOnFailure={data.continueOnFailure}
-                    nextIterationOnFailure={data.nextIterationOnFailure}
+                    nextLoopOnFailure={data.nextLoopOnFailure}
                     editable={editable}
                     isInsideForLoop={isInsideForLoop}
                     blockType="extraction"
                     onContinueOnFailureChange={(checked) => {
                       update({ continueOnFailure: checked });
                     }}
-                    onNextIterationOnFailureChange={(checked) => {
-                      update({ nextIterationOnFailure: checked });
+                    onNextLoopOnFailureChange={(checked) => {
+                      update({ nextLoopOnFailure: checked });
                     }}
                   />
                   <DisableCache
