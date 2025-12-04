@@ -3493,6 +3493,13 @@ class TaskV2Block(Block):
     max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
     max_steps: int = settings.MAX_STEPS_PER_TASK_V2
 
+    def _resolve_totp_identifier(self, workflow_run_context: WorkflowRunContext) -> str | None:
+        if self.totp_identifier:
+            return self.totp_identifier
+        if workflow_run_context.credential_totp_identifiers:
+            return next(iter(workflow_run_context.credential_totp_identifiers.values()), None)
+        return None
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -3535,7 +3542,7 @@ class TaskV2Block(Block):
             # Use the resolved values directly
             resolved_prompt = self.prompt
             resolved_url = self.url
-            resolved_totp_identifier = self.totp_identifier
+            resolved_totp_identifier = self._resolve_totp_identifier(workflow_run_context)
             resolved_totp_verification_url = self.totp_verification_url
 
         except Exception as e:
