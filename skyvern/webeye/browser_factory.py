@@ -18,7 +18,7 @@ from urllib.parse import parse_qsl, urlparse
 
 import psutil
 import structlog
-from playwright.async_api import BrowserContext, ConsoleMessage, Download, Page, Playwright
+from playwright.async_api import Browser, BrowserContext, ConsoleMessage, Download, Page, Playwright
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -32,7 +32,6 @@ from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 
 LOG = structlog.get_logger()
-
 
 BrowserCleanupFunc = Callable[[], None] | None
 
@@ -146,6 +145,23 @@ def initialize_download_dir() -> str:
     return get_download_dir(
         context.run_id if context and context.run_id else context.workflow_run_id or context.task_id
     )
+
+
+async def _apply_download_behaviour(browser: Browser) -> None:
+    context = ensure_context()
+    download_dir = get_download_dir(
+        context.run_id if context and context.run_id else context.workflow_run_id or context.task_id
+    )
+    cdp_session = await browser.new_browser_cdp_session()
+    await cdp_session.send(
+        "Browser.setDownloadBehavior",
+        {
+            "behavior": "allow",
+            "downloadPath": download_dir,
+        },
+    )
+
+    LOG.info("setDownloadBehavior applied", download_dir=download_dir)
 
 
 class BrowserContextCreator(Protocol):
@@ -401,6 +417,7 @@ async def _create_headless_chromium(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            apply_download_behaviour=True,
         )
 
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
@@ -436,6 +453,7 @@ async def _create_headful_chromium(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            apply_download_behaviour=True,
         )
 
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
@@ -499,6 +517,7 @@ async def _create_cdp_connection_browser(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            apply_download_behaviour=True,
         )
 
     browser_type = settings.BROWSER_TYPE
@@ -555,6 +574,7 @@ async def _connect_to_cdp_browser(
     playwright: Playwright,
     remote_browser_url: str,
     extra_http_headers: dict[str, str] | None = None,
+    apply_download_behaviour: bool = False,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     browser_args = BrowserContextFactory.build_browser_args(extra_http_headers=extra_http_headers)
 
@@ -564,6 +584,9 @@ async def _connect_to_cdp_browser(
 
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
     browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
+
+    if apply_download_behaviour:
+        await _apply_download_behaviour(browser)
 
     contexts = browser.contexts
     browser_context = None
