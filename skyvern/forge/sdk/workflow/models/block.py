@@ -135,6 +135,10 @@ class Block(BaseModel, abc.ABC):
     model: dict[str, Any] | None = None
     disable_cache: bool = False
 
+    # Only valid for blocks inside a for loop block
+    # Whether to continue to the next iteration when the block fails
+    next_iteration_on_failure: bool = False
+
     @property
     def override_llm_key(self) -> str | None:
         """
@@ -1386,15 +1390,15 @@ class ForLoopBlock(Block):
                         organization_id=organization_id,
                     )
                     block_outputs.append(failure_block_result)
-                    # If continue_on_failure is False, stop the entire loop
-                    if not self.continue_on_failure:
+                    # If next_iteration_on_failure is False, stop the entire loop
+                    if not self.next_iteration_on_failure:
                         outputs_with_loop_values.append(each_loop_output_values)
                         return LoopBlockExecutedResult(
                             outputs_with_loop_values=outputs_with_loop_values,
                             block_outputs=block_outputs,
                             last_block=current_block,
                         )
-                    # If continue_on_failure is True, break out of the block loop for this iteration
+                    # If next_iteration_on_failure is True, break out of the block loop for this iteration
                     break
 
                 if block_output.status == BlockStatus.canceled:
@@ -1412,7 +1416,12 @@ class ForLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if not block_output.success and not loop_block.continue_on_failure:
+                if (
+                    not block_output.success
+                    and not loop_block.continue_on_failure
+                    and not loop_block.next_iteration_on_failure
+                    and not self.next_iteration_on_failure
+                ):
                     LOG.info(
                         f"ForLoopBlock: Encountered a failure processing block {block_idx} during loop {loop_idx}, terminating early",
                         block_outputs=block_outputs,
@@ -1421,6 +1430,8 @@ class ForLoopBlock(Block):
                         loop_over_value=loop_over_value,
                         loop_block_continue_on_failure=loop_block.continue_on_failure,
                         failure_reason=block_output.failure_reason,
+                        next_iteration_on_failure=loop_block.next_iteration_on_failure
+                        or self.next_iteration_on_failure,
                     )
                     outputs_with_loop_values.append(each_loop_output_values)
                     return LoopBlockExecutedResult(
@@ -1428,6 +1439,21 @@ class ForLoopBlock(Block):
                         block_outputs=block_outputs,
                         last_block=current_block,
                     )
+
+                if block_output.success or loop_block.continue_on_failure:
+                    continue
+
+                if loop_block.next_iteration_on_failure or self.next_iteration_on_failure:
+                    LOG.info(
+                        f"ForLoopBlock: Block {block_idx} during loop {loop_idx} failed but will continue to next iteration",
+                        block_outputs=block_outputs,
+                        loop_idx=loop_idx,
+                        block_idx=block_idx,
+                        loop_over_value=loop_over_value,
+                        loop_block_next_iteration_on_failure=loop_block.next_iteration_on_failure
+                        or self.next_iteration_on_failure,
+                    )
+                    break
 
             outputs_with_loop_values.append(each_loop_output_values)
 
