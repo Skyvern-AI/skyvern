@@ -163,6 +163,25 @@ class RunSdkActionRequestAction_LocateElement(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class RunSdkActionRequestAction_Validate(UniversalBaseModel):
+    """
+    The action to execute with its specific parameters
+    """
+
+    type: typing.Literal["validate"] = "validate"
+    prompt: str
+    model: typing.Optional[typing.Dict[str, typing.Any]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class RunSdkActionRequestAction_Prompt(UniversalBaseModel):
     """
     The action to execute with its specific parameters
@@ -191,5 +210,6 @@ RunSdkActionRequestAction = typing.Union[
     RunSdkActionRequestAction_AiUploadFile,
     RunSdkActionRequestAction_Extract,
     RunSdkActionRequestAction_LocateElement,
+    RunSdkActionRequestAction_Validate,
     RunSdkActionRequestAction_Prompt,
 ]
