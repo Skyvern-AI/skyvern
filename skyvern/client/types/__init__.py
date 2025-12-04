@@ -43,7 +43,9 @@ if typing.TYPE_CHECKING:
     from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
     from .block_type import BlockType
     from .branch_condition import BranchCondition
-    from .branch_criteria import BranchCriteria
+    from .branch_condition_criteria import BranchConditionCriteria, BranchConditionCriteria_Jinja2Template
+    from .branch_condition_yaml import BranchConditionYaml
+    from .branch_criteria_yaml import BranchCriteriaYaml
     from .browser_profile import BrowserProfile
     from .browser_session_response import BrowserSessionResponse
     from .click_action import ClickAction
@@ -66,6 +68,7 @@ if typing.TYPE_CHECKING:
     )
     from .code_block_yaml import CodeBlockYaml
     from .conditional_block import ConditionalBlock
+    from .conditional_block_yaml import ConditionalBlockYaml
     from .context_parameter import ContextParameter
     from .context_parameter_source import (
         ContextParameterSource,
@@ -186,6 +189,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockYamlLoopBlocksItem,
         ForLoopBlockYamlLoopBlocksItem_Action,
         ForLoopBlockYamlLoopBlocksItem_Code,
+        ForLoopBlockYamlLoopBlocksItem_Conditional,
         ForLoopBlockYamlLoopBlocksItem_DownloadToS3,
         ForLoopBlockYamlLoopBlocksItem_Extraction,
         ForLoopBlockYamlLoopBlocksItem_FileDownload,
@@ -253,6 +257,7 @@ if typing.TYPE_CHECKING:
     from .input_or_select_context import InputOrSelectContext
     from .input_text_action import InputTextAction
     from .input_text_action_data import InputTextActionData
+    from .jinja_branch_criteria import JinjaBranchCriteria
     from .locate_element_action import LocateElementAction
     from .login_block import LoginBlock
     from .login_block_data_schema import LoginBlockDataSchema
@@ -473,6 +478,7 @@ if typing.TYPE_CHECKING:
         WorkflowDefinitionYamlBlocksItem,
         WorkflowDefinitionYamlBlocksItem_Action,
         WorkflowDefinitionYamlBlocksItem_Code,
+        WorkflowDefinitionYamlBlocksItem_Conditional,
         WorkflowDefinitionYamlBlocksItem_DownloadToS3,
         WorkflowDefinitionYamlBlocksItem_Extraction,
         WorkflowDefinitionYamlBlocksItem_FileDownload,
@@ -560,7 +566,10 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BitwardenSensitiveInformationParameterYaml": ".bitwarden_sensitive_information_parameter_yaml",
     "BlockType": ".block_type",
     "BranchCondition": ".branch_condition",
-    "BranchCriteria": ".branch_criteria",
+    "BranchConditionCriteria": ".branch_condition_criteria",
+    "BranchConditionCriteria_Jinja2Template": ".branch_condition_criteria",
+    "BranchConditionYaml": ".branch_condition_yaml",
+    "BranchCriteriaYaml": ".branch_criteria_yaml",
     "BrowserProfile": ".browser_profile",
     "BrowserSessionResponse": ".browser_session_response",
     "ClickAction": ".click_action",
@@ -581,6 +590,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "CodeBlockParametersItem_Workflow": ".code_block_parameters_item",
     "CodeBlockYaml": ".code_block_yaml",
     "ConditionalBlock": ".conditional_block",
+    "ConditionalBlockYaml": ".conditional_block_yaml",
     "ContextParameter": ".context_parameter",
     "ContextParameterSource": ".context_parameter_source",
     "ContextParameterSource_AwsSecret": ".context_parameter_source",
@@ -690,6 +700,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockYamlLoopBlocksItem": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Action": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Code": ".for_loop_block_yaml_loop_blocks_item",
+    "ForLoopBlockYamlLoopBlocksItem_Conditional": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_DownloadToS3": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Extraction": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_FileDownload": ".for_loop_block_yaml_loop_blocks_item",
@@ -750,6 +761,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "InputOrSelectContext": ".input_or_select_context",
     "InputTextAction": ".input_text_action",
     "InputTextActionData": ".input_text_action_data",
+    "JinjaBranchCriteria": ".jinja_branch_criteria",
     "LocateElementAction": ".locate_element_action",
     "LoginBlock": ".login_block",
     "LoginBlockDataSchema": ".login_block_data_schema",
@@ -949,6 +961,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowDefinitionYamlBlocksItem": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_Action": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_Code": ".workflow_definition_yaml_blocks_item",
+    "WorkflowDefinitionYamlBlocksItem_Conditional": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_DownloadToS3": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_Extraction": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_FileDownload": ".workflow_definition_yaml_blocks_item",
@@ -1057,7 +1070,10 @@ __all__ = [
     "BitwardenSensitiveInformationParameterYaml",
     "BlockType",
     "BranchCondition",
-    "BranchCriteria",
+    "BranchConditionCriteria",
+    "BranchConditionCriteria_Jinja2Template",
+    "BranchConditionYaml",
+    "BranchCriteriaYaml",
     "BrowserProfile",
     "BrowserSessionResponse",
     "ClickAction",
@@ -1078,6 +1094,7 @@ __all__ = [
     "CodeBlockParametersItem_Workflow",
     "CodeBlockYaml",
     "ConditionalBlock",
+    "ConditionalBlockYaml",
     "ContextParameter",
     "ContextParameterSource",
     "ContextParameterSource_AwsSecret",
@@ -1187,6 +1204,7 @@ __all__ = [
     "ForLoopBlockYamlLoopBlocksItem",
     "ForLoopBlockYamlLoopBlocksItem_Action",
     "ForLoopBlockYamlLoopBlocksItem_Code",
+    "ForLoopBlockYamlLoopBlocksItem_Conditional",
     "ForLoopBlockYamlLoopBlocksItem_DownloadToS3",
     "ForLoopBlockYamlLoopBlocksItem_Extraction",
     "ForLoopBlockYamlLoopBlocksItem_FileDownload",
@@ -1247,6 +1265,7 @@ __all__ = [
     "InputOrSelectContext",
     "InputTextAction",
     "InputTextActionData",
+    "JinjaBranchCriteria",
     "LocateElementAction",
     "LoginBlock",
     "LoginBlockDataSchema",
@@ -1446,6 +1465,7 @@ __all__ = [
     "WorkflowDefinitionYamlBlocksItem",
     "WorkflowDefinitionYamlBlocksItem_Action",
     "WorkflowDefinitionYamlBlocksItem_Code",
+    "WorkflowDefinitionYamlBlocksItem_Conditional",
     "WorkflowDefinitionYamlBlocksItem_DownloadToS3",
     "WorkflowDefinitionYamlBlocksItem_Extraction",
     "WorkflowDefinitionYamlBlocksItem_FileDownload",

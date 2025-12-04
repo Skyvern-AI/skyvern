@@ -8,6 +8,7 @@ import pydantic
 import typing_extensions
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel, update_forward_refs
 from ..core.serialization import FieldMetadata
+from .branch_condition_yaml import BranchConditionYaml
 from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from .file_storage_type import FileStorageType
 from .file_type import FileType
@@ -52,6 +53,24 @@ class WorkflowDefinitionYamlBlocksItem_Code(UniversalBaseModel):
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     code: str
     parameter_keys: typing.Optional[typing.List[str]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class WorkflowDefinitionYamlBlocksItem_Conditional(UniversalBaseModel):
+    block_type: typing.Literal["conditional"] = "conditional"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    branch_conditions: typing.Optional[typing.List[BranchConditionYaml]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -528,6 +547,7 @@ class WorkflowDefinitionYamlBlocksItem_Wait(UniversalBaseModel):
 WorkflowDefinitionYamlBlocksItem = typing.Union[
     WorkflowDefinitionYamlBlocksItem_Action,
     WorkflowDefinitionYamlBlocksItem_Code,
+    WorkflowDefinitionYamlBlocksItem_Conditional,
     WorkflowDefinitionYamlBlocksItem_DownloadToS3,
     WorkflowDefinitionYamlBlocksItem_Extraction,
     WorkflowDefinitionYamlBlocksItem_FileDownload,

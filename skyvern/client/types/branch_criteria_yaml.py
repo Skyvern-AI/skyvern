@@ -4,18 +4,12 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .branch_condition_criteria import BranchConditionCriteria
 
 
-class BranchCondition(UniversalBaseModel):
-    """
-    Represents a single conditional branch edge within a ConditionalBlock.
-    """
-
-    criteria: typing.Optional[BranchConditionCriteria] = None
-    next_block_label: typing.Optional[str] = None
+class BranchCriteriaYaml(UniversalBaseModel):
+    criteria_type: typing.Optional[typing.Literal["jinja2_template"]] = None
+    expression: str
     description: typing.Optional[str] = None
-    is_default: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
