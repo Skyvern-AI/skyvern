@@ -10,7 +10,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Switch } from "@/components/ui/switch";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useState } from "react";
 import { dataSchemaExampleValue } from "../types";
@@ -20,7 +19,10 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { AppNode } from "..";
-import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
+import {
+  getAvailableOutputParameterKeys,
+  isNodeInsideForLoop,
+} from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
@@ -37,6 +39,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
+import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
@@ -58,6 +61,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const rerender = useRerender({ prefix: "accordian" });
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<ExtractionNode["data"]>({ id, editable });
+  const isInsideForLoop = isNodeInsideForLoop(nodes, id);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -209,30 +213,19 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                       }}
                     />
                   </div>
-                  <Separator />
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Continue on Failure
-                      </Label>
-                      <HelpTooltip
-                        content={
-                          helpTooltips["extraction"]["continueOnFailure"]
-                        }
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={data.continueOnFailure}
-                        onCheckedChange={(checked) => {
-                          if (!editable) {
-                            return;
-                          }
-                          update({ continueOnFailure: checked });
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <BlockExecutionOptions
+                    continueOnFailure={data.continueOnFailure}
+                    nextIterationOnFailure={data.nextIterationOnFailure}
+                    editable={editable}
+                    isInsideForLoop={isInsideForLoop}
+                    blockType="extraction"
+                    onContinueOnFailureChange={(checked) => {
+                      update({ continueOnFailure: checked });
+                    }}
+                    onNextIterationOnFailureChange={(checked) => {
+                      update({ nextIterationOnFailure: checked });
+                    }}
+                  />
                   <DisableCache
                     disableCache={data.disableCache}
                     editable={editable}

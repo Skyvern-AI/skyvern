@@ -145,6 +145,7 @@ export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
   label: string;
   continue_on_failure?: boolean;
+  next_iteration_on_failure?: boolean;
   next_block_label?: string | null;
 };
 

@@ -223,6 +223,7 @@ function convertToNode(
     debuggable: debuggableWorkflowBlockTypes.has(block.block_type),
     label: block.label,
     continueOnFailure: block.continue_on_failure,
+    nextIterationOnFailure: block.next_iteration_on_failure,
     editable,
     model: block.model,
   };
@@ -489,6 +490,7 @@ function convertToNode(
           loopValue: block.loop_over?.key ?? "",
           loopVariableReference: loopVariableReference,
           completeIfEmpty: block.complete_if_empty,
+          nextIterationOnFailure: block.next_iteration_on_failure,
         },
       };
     }
@@ -1073,6 +1075,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
   const base = {
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
+    next_iteration_on_failure: node.data.nextIterationOnFailure,
     model: node.data.model,
   };
   switch (node.type) {
@@ -1422,6 +1425,7 @@ function getOrderedChildrenBlocks(
         block_type: "for_loop",
         label: currentNode.data.label,
         continue_on_failure: currentNode.data.continueOnFailure,
+        next_iteration_on_failure: currentNode.data.nextIterationOnFailure,
         loop_blocks: loopChildren,
         loop_variable_reference: currentNode.data.loopVariableReference,
         complete_if_empty: currentNode.data.completeIfEmpty,
@@ -1452,6 +1456,7 @@ function getWorkflowBlocksUtil(
           block_type: "for_loop",
           label: node.data.label,
           continue_on_failure: node.data.continueOnFailure,
+          next_iteration_on_failure: node.data.nextIterationOnFailure,
           loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
           loop_variable_reference: node.data.loopVariableReference,
           complete_if_empty: node.data.completeIfEmpty,
@@ -1952,6 +1957,7 @@ function convertBlocksToBlockYAML(
     const base = {
       label: block.label,
       continue_on_failure: block.continue_on_failure,
+      next_iteration_on_failure: block.next_iteration_on_failure,
       next_block_label: block.next_block_label,
     };
     switch (block.block_type) {
@@ -2455,6 +2461,23 @@ function getLabelForWorkflowParameterType(type: WorkflowParameterValueType) {
   return type;
 }
 
+/**
+ * Check if a node is inside a for loop block
+ * @param nodes - Array of all nodes in the workflow
+ * @param nodeId - ID of the node to check
+ * @returns true if the node is inside a for loop block, false otherwise
+ */
+function isNodeInsideForLoop(nodes: Array<AppNode>, nodeId: string): boolean {
+  const currentNode = nodes.find((n) => n.id === nodeId);
+  if (!currentNode) {
+    return false;
+  }
+  const parentNode = currentNode.parentId
+    ? nodes.find((n) => n.id === currentNode.parentId)
+    : null;
+  return parentNode?.type === "loop";
+}
+
 export {
   convert,
   convertEchoParameters,
@@ -2479,6 +2502,7 @@ export {
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   getWorkflowBlocks,
   getWorkflowErrors,
+  isNodeInsideForLoop,
   isOutputParameterKey,
   layout,
 };

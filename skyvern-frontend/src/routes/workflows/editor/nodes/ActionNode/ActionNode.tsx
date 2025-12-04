@@ -23,7 +23,10 @@ import { useRerender } from "@/hooks/useRerender";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { AppNode } from "..";
-import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
+import {
+  getAvailableOutputParameterKeys,
+  isNodeInsideForLoop,
+} from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
@@ -37,6 +40,7 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 import { DisableCache } from "../DisableCache";
+import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -64,6 +68,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const update = useUpdate<ActionNode["data"]>({ id, editable });
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+  const isInsideForLoop = isNodeInsideForLoop(nodes, id);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -248,28 +253,19 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                       </div>
                     )}
                   </div>
-                  <Separator />
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Continue on Failure
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["action"]["continueOnFailure"]}
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={data.continueOnFailure}
-                        onCheckedChange={(checked) => {
-                          if (!editable) {
-                            return;
-                          }
-                          update({ continueOnFailure: checked });
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <BlockExecutionOptions
+                    continueOnFailure={data.continueOnFailure}
+                    nextIterationOnFailure={data.nextIterationOnFailure}
+                    editable={editable}
+                    isInsideForLoop={isInsideForLoop}
+                    blockType="action"
+                    onContinueOnFailureChange={(checked) => {
+                      update({ continueOnFailure: checked });
+                    }}
+                    onNextIterationOnFailureChange={(checked) => {
+                      update({ nextIterationOnFailure: checked });
+                    }}
+                  />
                   <DisableCache
                     disableCache={data.disableCache}
                     editable={editable}

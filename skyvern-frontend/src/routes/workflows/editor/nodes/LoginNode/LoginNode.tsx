@@ -11,7 +11,6 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -22,7 +21,10 @@ import { errorMappingExampleValue } from "../types";
 import type { LoginNode } from "./types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
-import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
+import {
+  getAvailableOutputParameterKeys,
+  isNodeInsideForLoop,
+} from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { LoginBlockCredentialSelector } from "./LoginBlockCredentialSelector";
 import { RunEngineSelector } from "@/components/EngineSelector";
@@ -36,6 +38,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
+import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
@@ -56,6 +59,7 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<LoginNode["data"]>({ id, editable });
+  const isInsideForLoop = isNodeInsideForLoop(nodes, id);
 
   // Manage flippable facing state
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -277,25 +281,19 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                       </div>
                     )}
                   </div>
-                  <Separator />
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Continue on Failure
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["login"]["continueOnFailure"]}
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={data.continueOnFailure}
-                        onCheckedChange={(checked) => {
-                          update({ continueOnFailure: checked });
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <BlockExecutionOptions
+                    continueOnFailure={data.continueOnFailure}
+                    nextIterationOnFailure={data.nextIterationOnFailure}
+                    editable={editable}
+                    isInsideForLoop={isInsideForLoop}
+                    blockType="login"
+                    onContinueOnFailureChange={(checked) => {
+                      update({ continueOnFailure: checked });
+                    }}
+                    onNextIterationOnFailureChange={(checked) => {
+                      update({ nextIterationOnFailure: checked });
+                    }}
+                  />
                   <DisableCache
                     disableCache={data.disableCache}
                     editable={editable}
