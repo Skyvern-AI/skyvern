@@ -15,6 +15,7 @@ import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
+import { useRecordingStore } from "@/store/useRecordingStore";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const nodes = useNodes<AppNode>();
@@ -34,6 +35,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const update = useUpdate<LoopNode["data"]>({ id, editable });
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const children = nodes.filter((node) => node.parentId === id);
+  const recordingStore = useRecordingStore();
 
   const furthestDownChild: Node | null = children.reduce(
     (acc, child) => {
@@ -56,7 +58,11 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const loopNodeWidth = getLoopNodeWidth(node, nodes);
 
   return (
-    <div>
+    <div
+      className={cn({
+        "pointer-events-none opacity-50": recordingStore.isRecording,
+      })}
+    >
       <Handle
         type="source"
         position={Position.Bottom}
@@ -151,6 +157,26 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                       Continue on Failure
                     </Label>
                     <HelpTooltip content="When checked, the loop will continue executing even if one of its iterations fails" />
+                  </div>
+                </div>
+                <div className="flex justify-between">
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      checked={data.nextIterationOnFailure ?? false}
+                      disabled={!data.editable}
+                      onCheckedChange={(checked) => {
+                        update({
+                          nextIterationOnFailure:
+                            checked === "indeterminate" ? false : checked,
+                        });
+                      }}
+                    />
+                    <Label className="text-xs text-slate-300">
+                      Next Loop on Failure
+                    </Label>
+                    <HelpTooltip
+                      content={helpTooltips["loop"]["nextIterationOnFailure"]}
+                    />
                   </div>
                 </div>
               </div>

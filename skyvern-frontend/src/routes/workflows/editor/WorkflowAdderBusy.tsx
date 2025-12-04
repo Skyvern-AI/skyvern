@@ -6,7 +6,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useRecordingStore, CHUNK_SIZE } from "@/store/useRecordingStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
 
 import "./WorkflowAdderBusy.css";
@@ -45,10 +45,7 @@ function WorkflowAdderBusy({
   const [shouldBump, setShouldBump] = useState(false);
   const bumpTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const prevCountRef = useRef(0);
-
-  const eventCount =
-    recordingStore.pendingEvents.length +
-    recordingStore.compressedChunks.length * CHUNK_SIZE;
+  const eventCount = recordingStore.exposedEventCount;
 
   // effect for bump animation when count changes
   useEffect(() => {

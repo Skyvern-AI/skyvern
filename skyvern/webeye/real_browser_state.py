@@ -20,6 +20,8 @@ from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.scraper import scraper
+from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -377,6 +379,35 @@ class RealBrowserState(BrowserState):
         except Exception as e:
             LOG.exception(f"Error while reload url: {repr(e)}")
             raise FailedToReloadPage(url=page.url, error_message=repr(e))
+
+    async def scrape_website(
+        self,
+        url: str,
+        cleanup_element_tree: CleanupElementTreeFunc,
+        num_retry: int = 0,
+        max_retries: int = settings.MAX_SCRAPING_RETRIES,
+        scrape_exclude: ScrapeExcludeFunc | None = None,
+        take_screenshots: bool = True,
+        draw_boxes: bool = True,
+        max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
+        scroll: bool = True,
+        support_empty_page: bool = False,
+        wait_seconds: float = 0,
+    ) -> ScrapedPage:
+        return await scraper.scrape_website(
+            browser_state=self,
+            url=url,
+            cleanup_element_tree=cleanup_element_tree,
+            num_retry=num_retry,
+            max_retries=max_retries,
+            scrape_exclude=scrape_exclude,
+            take_screenshots=take_screenshots,
+            draw_boxes=draw_boxes,
+            max_screenshot_number=max_screenshot_number,
+            scroll=scroll,
+            support_empty_page=support_empty_page,
+            wait_seconds=wait_seconds,
+        )
 
     async def close(self, close_browser_on_completion: bool = True) -> None:
         LOG.info("Closing browser state")

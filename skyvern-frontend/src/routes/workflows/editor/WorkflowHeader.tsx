@@ -26,6 +26,7 @@ import { useCreateWorkflowMutation } from "../hooks/useCreateWorkflowMutation";
 import { convert } from "./workflowEditorUtils";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
@@ -82,6 +83,7 @@ function WorkflowHeader({
   const createWorkflowMutation = useCreateWorkflowMutation();
   const { data: workflowRun } = useWorkflowRunQuery();
   const debugStore = useDebugStore();
+  const recordingStore = useRecordingStore();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const [chosenCacheKeyValue, setChosenCacheKeyValue] = useState<string | null>(
@@ -105,8 +107,10 @@ function WorkflowHeader({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheKeyValue]);
 
+  const isRecording = recordingStore.isRecording;
+
   const shouldShowCacheControls =
-    !isGeneratingCode && (cacheKeyValues?.total_count ?? 0) > 0;
+    !isRecording && !isGeneratingCode && (cacheKeyValues?.total_count ?? 0) > 0;
 
   if (!globalWorkflows) {
     return null; // this should be loaded already by some other components
@@ -124,7 +128,7 @@ function WorkflowHeader({
     >
       <div className="flex h-full items-center">
         <EditableNodeTitle
-          editable={true}
+          editable={!isRecording}
           onChange={(newTitle) => {
             setTitle(newTitle);
             workflowChangesStore.setHasChanges(true);
@@ -247,7 +251,7 @@ function WorkflowHeader({
                     size="icon"
                     variant={debugStore.isDebugMode ? "default" : "tertiary"}
                     className="size-10 min-w-[2.5rem]"
-                    disabled={workflowRunIsRunningOrQueued}
+                    disabled={workflowRunIsRunningOrQueued || isRecording}
                     onClick={() => {
                       if (debugStore.isDebugMode) {
                         navigate(`/workflows/${workflowPermanentId}/edit`);
@@ -277,7 +281,7 @@ function WorkflowHeader({
                     size="icon"
                     variant="tertiary"
                     className="size-10 min-w-[2.5rem]"
-                    disabled={isGlobalWorkflow}
+                    disabled={isGlobalWorkflow || isRecording}
                     onClick={() => {
                       onSave();
                     }}
@@ -297,6 +301,7 @@ function WorkflowHeader({
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
+                      disabled={isRecording}
                       size="icon"
                       variant="tertiary"
                       className="size-10 min-w-[2.5rem]"
@@ -311,7 +316,12 @@ function WorkflowHeader({
                 </Tooltip>
               </TooltipProvider>
             )}
-            <Button variant="tertiary" size="lg" onClick={onParametersClick}>
+            <Button
+              disabled={isRecording}
+              variant="tertiary"
+              size="lg"
+              onClick={onParametersClick}
+            >
               <span className="mr-2">Parameters</span>
               {parametersPanelOpen ? (
                 <ChevronUpIcon className="h-6 w-6" />
@@ -320,6 +330,7 @@ function WorkflowHeader({
               )}
             </Button>
             <Button
+              disabled={isRecording}
               size="lg"
               onClick={() => {
                 onRun?.();
