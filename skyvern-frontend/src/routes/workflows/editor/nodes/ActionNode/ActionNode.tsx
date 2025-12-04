@@ -255,15 +255,15 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                   </div>
                   <BlockExecutionOptions
                     continueOnFailure={data.continueOnFailure}
-                    nextIterationOnFailure={data.nextIterationOnFailure}
+                    nextLoopOnFailure={data.nextLoopOnFailure}
                     editable={editable}
                     isInsideForLoop={isInsideForLoop}
                     blockType="action"
                     onContinueOnFailureChange={(checked) => {
                       update({ continueOnFailure: checked });
                     }}
-                    onNextIterationOnFailureChange={(checked) => {
-                      update({ nextIterationOnFailure: checked });
+                    onNextLoopOnFailureChange={(checked) => {
+                      update({ nextLoopOnFailure: checked });
                     }}
                   />
                   <DisableCache

@@ -283,15 +283,15 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                   </div>
                   <BlockExecutionOptions
                     continueOnFailure={data.continueOnFailure}
-                    nextIterationOnFailure={data.nextIterationOnFailure}
+                    nextLoopOnFailure={data.nextLoopOnFailure}
                     editable={editable}
                     isInsideForLoop={isInsideForLoop}
                     blockType="login"
                     onContinueOnFailureChange={(checked) => {
                       update({ continueOnFailure: checked });
                     }}
-                    onNextIterationOnFailureChange={(checked) => {
-                      update({ nextIterationOnFailure: checked });
+                    onNextLoopOnFailureChange={(checked) => {
+                      update({ nextLoopOnFailure: checked });
                     }}
                   />
                   <DisableCache

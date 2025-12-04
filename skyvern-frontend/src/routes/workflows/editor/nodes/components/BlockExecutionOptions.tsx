@@ -6,39 +6,39 @@ import { helpTooltips } from "../../helpContent";
 
 interface BlockExecutionOptionsProps {
   continueOnFailure: boolean;
-  nextIterationOnFailure?: boolean;
+  nextLoopOnFailure?: boolean;
   includeActionHistoryInVerification?: boolean;
   editable: boolean;
   isInsideForLoop: boolean;
   blockType: string;
   onContinueOnFailureChange: (checked: boolean) => void;
-  onNextIterationOnFailureChange: (checked: boolean) => void;
+  onNextLoopOnFailureChange: (checked: boolean) => void;
   onIncludeActionHistoryInVerificationChange?: (checked: boolean) => void;
   showOptions?: {
     continueOnFailure?: boolean;
-    nextIterationOnFailure?: boolean;
+    nextLoopOnFailure?: boolean;
     includeActionHistoryInVerification?: boolean;
   };
 }
 
 export function BlockExecutionOptions({
   continueOnFailure,
-  nextIterationOnFailure = false,
+  nextLoopOnFailure = false,
   includeActionHistoryInVerification = false,
   editable,
   isInsideForLoop,
   blockType,
   onContinueOnFailureChange,
-  onNextIterationOnFailureChange,
+  onNextLoopOnFailureChange,
   onIncludeActionHistoryInVerificationChange,
   showOptions = {
     continueOnFailure: true,
-    nextIterationOnFailure: true,
+    nextLoopOnFailure: true,
     includeActionHistoryInVerification: false,
   },
 }: BlockExecutionOptionsProps) {
   const showContinueOnFailure = showOptions.continueOnFailure ?? true;
-  const showNextIterationOnFailure = showOptions.nextIterationOnFailure ?? true;
+  const showNextLoopOnFailure = showOptions.nextLoopOnFailure ?? true;
   const showIncludeActionHistory =
     showOptions.includeActionHistoryInVerification ?? false;
 
@@ -101,7 +101,7 @@ export function BlockExecutionOptions({
           </div>
         </div>
       )}
-      {showNextIterationOnFailure && isInsideForLoop && (
+      {showNextLoopOnFailure && isInsideForLoop && (
         <div className="flex items-center justify-between">
           <div className="flex gap-2">
             <Label className="text-xs font-normal text-slate-300">
@@ -110,19 +110,19 @@ export function BlockExecutionOptions({
             <HelpTooltip
               content={
                 helpTooltips[blockType as keyof typeof helpTooltips]?.[
-                  "nextIterationOnFailure"
-                ] || helpTooltips["task"]["nextIterationOnFailure"]
+                  "nextLoopOnFailure"
+                ] || helpTooltips["task"]["nextLoopOnFailure"]
               }
             />
           </div>
           <div className="w-52">
             <Switch
-              checked={nextIterationOnFailure}
+              checked={nextLoopOnFailure}
               onCheckedChange={(checked) => {
                 if (!editable) {
                   return;
                 }
-                onNextIterationOnFailureChange(checked);
+                onNextLoopOnFailureChange(checked);
               }}
             />
           </div>

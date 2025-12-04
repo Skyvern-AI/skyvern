@@ -162,11 +162,11 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 <div className="flex justify-between">
                   <div className="flex items-center gap-2">
                     <Checkbox
-                      checked={data.nextIterationOnFailure ?? false}
+                      checked={data.nextLoopOnFailure ?? false}
                       disabled={!data.editable}
                       onCheckedChange={(checked) => {
                         update({
-                          nextIterationOnFailure:
+                          nextLoopOnFailure:
                             checked === "indeterminate" ? false : checked,
                         });
                       }}
@@ -175,7 +175,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                       Next Loop on Failure
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["loop"]["nextIterationOnFailure"]}
+                      content={helpTooltips["loop"]["nextLoopOnFailure"]}
                     />
                   </div>
                 </div>

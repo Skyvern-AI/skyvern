@@ -310,7 +310,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                   </div>
                   <BlockExecutionOptions
                     continueOnFailure={data.continueOnFailure}
-                    nextIterationOnFailure={data.nextIterationOnFailure}
+                    nextLoopOnFailure={data.nextLoopOnFailure}
                     includeActionHistoryInVerification={
                       data.includeActionHistoryInVerification
                     }
@@ -319,14 +319,14 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     blockType="task"
                     showOptions={{
                       continueOnFailure: true,
-                      nextIterationOnFailure: true,
+                      nextLoopOnFailure: true,
                       includeActionHistoryInVerification: true,
                     }}
                     onContinueOnFailureChange={(checked) => {
                       update({ continueOnFailure: checked });
                     }}
-                    onNextIterationOnFailureChange={(checked) => {
-                      update({ nextIterationOnFailure: checked });
+                    onNextLoopOnFailureChange={(checked) => {
+                      update({ nextLoopOnFailure: checked });
                     }}
                     onIncludeActionHistoryInVerificationChange={(checked) => {
                       update({

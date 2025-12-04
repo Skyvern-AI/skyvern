@@ -287,7 +287,7 @@ export type WorkflowBlockBase = {
   block_type: WorkflowBlockType;
   output_parameter: OutputParameter;
   continue_on_failure: boolean;
-  next_iteration_on_failure?: boolean;
+  next_loop_on_failure?: boolean;
   model: WorkflowModel | null;
   next_block_label?: string | null;
 };

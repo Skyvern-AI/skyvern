@@ -7,7 +7,7 @@ export type LoopNodeData = NodeBaseData & {
   loopVariableReference: string;
   completeIfEmpty: boolean;
   continueOnFailure: boolean;
-  nextIterationOnFailure?: boolean;
+  nextLoopOnFailure?: boolean;
 };
 
 export type LoopNode = Node<LoopNodeData, "loop">;
@@ -20,7 +20,7 @@ export const loopNodeDefaultData: LoopNodeData = {
   loopVariableReference: "",
   completeIfEmpty: false,
   continueOnFailure: false,
-  nextIterationOnFailure: false,
+  nextLoopOnFailure: false,
   model: null,
 } as const;
 
