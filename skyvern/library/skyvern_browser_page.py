@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from playwright.async_api import Page
 
-from skyvern.client import GetRunResponse
+from skyvern.client import GetRunResponse, SkyvernEnvironment
 from skyvern.client.core import RequestOptions
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
@@ -18,6 +18,10 @@ from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import RunEngine, RunStatus, TaskRunResponse
 
 LOG = structlog.get_logger()
+
+
+def _get_app_url_for_run(run_id: str) -> str:
+    return f"https://app.skyvern.com/runs/{run_id}"
 
 
 class SkyvernPageRun:
@@ -88,7 +92,10 @@ class SkyvernPageRun:
             user_agent=user_agent,
             request_options=RequestOptions(additional_headers={"X-User-Agent": "skyvern-sdk"}),
         )
-        LOG.info("AI task is running, this may take a while", run_id=task_run.run_id)
+        if self._browser.skyvern.environment == SkyvernEnvironment.CLOUD:
+            LOG.info("AI task is running, this may take a while", url=_get_app_url_for_run(task_run.run_id))
+        else:
+            LOG.info("AI task is running, this may take a while", run_id=task_run.run_id)
 
         task_run = await self._wait_for_run_completion(task_run.run_id, timeout)
         LOG.info("AI task finished", run_id=task_run.run_id, status=task_run.status)
@@ -151,7 +158,12 @@ class SkyvernPageRun:
             extra_http_headers=extra_http_headers,
             request_options=RequestOptions(additional_headers={"X-User-Agent": "skyvern-sdk"}),
         )
-        LOG.info("AI login workflow is running, this may take a while", run_id=workflow_run.run_id)
+        if self._browser.skyvern.environment == SkyvernEnvironment.CLOUD:
+            LOG.info(
+                "AI login workflow is running, this may take a while", url=_get_app_url_for_run(workflow_run.run_id)
+            )
+        else:
+            LOG.info("AI login workflow is running, this may take a while", run_id=workflow_run.run_id)
 
         workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
         LOG.info("AI login workflow finished", run_id=workflow_run.run_id, status=workflow_run.status)
@@ -198,7 +210,10 @@ class SkyvernPageRun:
             browser_address=self._browser.browser_address,
             request_options=RequestOptions(additional_headers={"X-User-Agent": "skyvern-sdk"}),
         )
-        LOG.info("AI workflow is running, this may take a while", run_id=workflow_run.run_id)
+        if self._browser.skyvern.environment == SkyvernEnvironment.CLOUD:
+            LOG.info("AI workflow is running, this may take a while", url=_get_app_url_for_run(workflow_run.run_id))
+        else:
+            LOG.info("AI workflow is running, this may take a while", run_id=workflow_run.run_id)
 
         workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
         LOG.info("AI workflow finished", run_id=workflow_run.run_id, status=workflow_run.status)
