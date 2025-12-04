@@ -398,6 +398,7 @@ async def _create_workflow_block_run_and_task(
     url: str | None = None,
     label: str | None = None,
     model: dict[str, Any] | None = None,
+    created_by: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Create a workflow block run and optionally a task if workflow_run_id is available in context.
@@ -460,6 +461,7 @@ async def _create_workflow_block_run_and_task(
                 retry_index=0,
                 organization_id=organization_id,
                 status=StepStatus.running,
+                created_by=created_by,
             )
             step_id = step.step_id
             # reset the action order to 0
@@ -1334,6 +1336,7 @@ async def run_task(
             url=url,
             label=cache_key,
             model=model,
+            created_by="script",
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -1419,6 +1422,7 @@ async def download(
             url=url,
             label=cache_key,
             model=model,
+            created_by="script",
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -1499,6 +1503,7 @@ async def action(
             url=url,
             label=cache_key,
             model=model,
+            created_by="script",
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -1578,6 +1583,7 @@ async def login(
             url=url,
             label=cache_key,
             model=model,
+            created_by="script",
         )
         prompt = _render_template_with_label(prompt, cache_key)
         if totp_url:
@@ -1660,6 +1666,7 @@ async def extract(
             url=url,
             label=cache_key,
             model=model,
+            created_by="script",
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
