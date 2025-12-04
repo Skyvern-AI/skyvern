@@ -1580,6 +1580,11 @@ async def login(
             model=model,
         )
         prompt = _render_template_with_label(prompt, cache_key)
+        if totp_url:
+            totp_url = _render_template_with_label(totp_url, cache_key)
+        if totp_identifier:
+            totp_identifier = _render_template_with_label(totp_identifier, cache_key)
+
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
