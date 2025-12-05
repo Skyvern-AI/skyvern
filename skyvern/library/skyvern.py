@@ -1,5 +1,7 @@
 import asyncio
 import os
+import pathlib
+import tempfile
 from typing import Any, overload
 
 import httpx
@@ -389,6 +391,7 @@ class Skyvern(AsyncSkyvern):
         headless: bool = False,
         port: int = DEFAULT_CDP_PORT,
         args: list[str] | None = None,
+        user_data_dir: str | None = None,
     ) -> SkyvernBrowser:
         """Launch a new local Chromium browser with Chrome DevTools Protocol (CDP) enabled.
 
@@ -404,13 +407,26 @@ class Skyvern(AsyncSkyvern):
         Returns:
             SkyvernBrowser: A browser instance with Skyvern capabilities.
         """
+
         playwright = await self._get_playwright()
-        launch_args = [f"--remote-debugging-port={port}"]
+
+        if user_data_dir:
+            user_data_path = pathlib.Path(user_data_dir)
+        else:
+            user_data_path = pathlib.Path(tempfile.gettempdir()) / "skyvern-browser"
+
+        launch_args = [
+            f"--remote-debugging-port={port}",
+        ]
         if args:
             launch_args.extend(args)
-        browser = await playwright.chromium.launch(headless=headless, args=launch_args)
+
+        browser_context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_path),
+            headless=headless,
+            args=launch_args,
+        )
         browser_address = f"http://localhost:{port}"
-        browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
         return SkyvernBrowser(self, browser_context, browser_address=browser_address)
 
     async def connect_to_browser_over_cdp(self, cdp_url: str) -> SkyvernBrowser:
