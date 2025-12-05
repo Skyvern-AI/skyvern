@@ -1,8 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Literal, Optional, Protocol, TypedDict
 
-from litellm import AllowedFailsPolicy
-
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -49,6 +47,16 @@ class LLMConfig(LLMConfigBase):
 
 
 @dataclass(frozen=True)
+class LLMAllowedFailsPolicy:
+    bad_request_error_allowed_fails: int | None = None
+    authentication_error_allowed_fails: int | None = None
+    timeout_error_allowed_fails: int | None = None
+    rate_limit_error_allowed_fails: int | None = None
+    content_policy_violation_error_allowed_fails: int | None = None
+    internal_server_error_allowed_fails: int | None = None
+
+
+@dataclass(frozen=True)
 class LLMRouterModelConfig:
     model_name: str
     # https://litellm.vercel.app/docs/routing
@@ -79,7 +87,7 @@ class LLMRouterConfig(LLMConfigBase):
     set_verbose: bool = False
     disable_cooldowns: bool | None = None
     allowed_fails: int | None = None
-    allowed_fails_policy: AllowedFailsPolicy | None = None
+    allowed_fails_policy: LLMAllowedFailsPolicy | None = None
     cooldown_time: float | None = None
     max_tokens: int | None = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
     max_completion_tokens: int | None = None
