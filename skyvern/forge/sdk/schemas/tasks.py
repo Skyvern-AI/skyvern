@@ -397,9 +397,16 @@ class TaskOutput(BaseModel):
     errors: list[dict[str, Any]] = []
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None  # For backward compatibility
+    task_screenshots: list[str] | None = None
+    workflow_screenshots: list[str] | None = None
 
     @staticmethod
-    def from_task(task: Task, downloaded_files: list[FileInfo] | None = None) -> TaskOutput:
+    def from_task(
+        task: Task,
+        downloaded_files: list[FileInfo] | None = None,
+        task_screenshots: list[str] | None = None,
+        workflow_screenshots: list[str] | None = None,
+    ) -> TaskOutput:
         # For backward compatibility, extract just the URLs from FileInfo objects
         downloaded_file_urls = [file_info.url for file_info in downloaded_files] if downloaded_files else None
 
@@ -411,6 +418,8 @@ class TaskOutput(BaseModel):
             errors=task.errors,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
+            task_screenshots=task_screenshots,
+            workflow_screenshots=workflow_screenshots,
         )
 
 

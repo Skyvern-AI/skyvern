@@ -37,7 +37,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -2162,6 +2162,111 @@ class WorkflowService:
     async def get_tasks_by_workflow_run_id(self, workflow_run_id: str) -> list[Task]:
         return await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
 
+    async def get_recent_task_screenshot_urls(
+        self,
+        *,
+        organization_id: str | None,
+        task_id: str | None = None,
+        task_v2_id: str | None = None,
+        limit: int = 3,
+    ) -> list[str]:
+        """Return the latest action/final screenshot URLs for a task (v1 or v2)."""
+
+        artifact_types = [ArtifactType.SCREENSHOT_ACTION, ArtifactType.SCREENSHOT_FINAL]
+
+        artifacts: list[Artifact] = []
+        if task_id:
+            artifacts = (
+                await app.DATABASE.get_latest_n_artifacts(
+                    task_id=task_id,
+                    artifact_types=artifact_types,
+                    organization_id=organization_id,
+                    n=limit,
+                )
+                or []
+            )
+        elif task_v2_id:
+            action_artifacts = await app.DATABASE.get_artifacts_by_entity_id(
+                organization_id=organization_id,
+                artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                task_v2_id=task_v2_id,
+                limit=limit,
+            )
+            final_artifacts = await app.DATABASE.get_artifacts_by_entity_id(
+                organization_id=organization_id,
+                artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                task_v2_id=task_v2_id,
+                limit=limit,
+            )
+            artifacts = sorted(
+                (action_artifacts or []) + (final_artifacts or []),
+                key=lambda artifact: artifact.created_at,
+                reverse=True,
+            )[:limit]
+
+        if not artifacts:
+            return []
+
+        return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
+
+    async def get_recent_workflow_screenshot_urls(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        limit: int = 3,
+        workflow_run_tasks: list[Task] | None = None,
+    ) -> list[str]:
+        """Return latest screenshots across recent tasks in a workflow run."""
+
+        screenshot_artifacts: list[Artifact] = []
+        seen_artifact_ids: set[str] = set()
+
+        if workflow_run_tasks is None:
+            workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
+
+        for task in workflow_run_tasks[::-1]:
+            artifact = await app.DATABASE.get_latest_artifact(
+                task_id=task.task_id,
+                artifact_types=[ArtifactType.SCREENSHOT_ACTION, ArtifactType.SCREENSHOT_FINAL],
+                organization_id=organization_id,
+            )
+            if artifact:
+                screenshot_artifacts.append(artifact)
+                seen_artifact_ids.add(artifact.artifact_id)
+            if len(screenshot_artifacts) >= limit:
+                break
+
+        if len(screenshot_artifacts) < limit:
+            action_artifacts = await app.DATABASE.get_artifacts_by_entity_id(
+                organization_id=organization_id,
+                artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                workflow_run_id=workflow_run_id,
+                limit=limit,
+            )
+            final_artifacts = await app.DATABASE.get_artifacts_by_entity_id(
+                organization_id=organization_id,
+                artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                workflow_run_id=workflow_run_id,
+                limit=limit,
+            )
+            # Support runs that may not have Task rows (e.g., task_v2-only executions)
+            for artifact in sorted(
+                (action_artifacts or []) + (final_artifacts or []),
+                key=lambda artifact: artifact.created_at,
+                reverse=True,
+            ):
+                if artifact.artifact_id in seen_artifact_ids:
+                    continue
+                screenshot_artifacts.append(artifact)
+                seen_artifact_ids.add(artifact.artifact_id)
+                if len(screenshot_artifacts) >= limit:
+                    break
+
+        if not screenshot_artifacts:
+            return []
+
+        return await app.ARTIFACT_MANAGER.get_share_links(screenshot_artifacts) or []
+
     async def build_workflow_run_status_response_by_workflow_id(
         self,
         workflow_run_id: str,
@@ -2199,24 +2304,12 @@ class WorkflowService:
             organization_id=organization_id,
         )
         workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
-        screenshot_artifacts = []
-        screenshot_urls: list[str] | None = None
-        # get the last screenshot for the last 3 tasks of the workflow run
-        for task in workflow_run_tasks[::-1]:
-            screenshot_artifact = await app.DATABASE.get_latest_artifact(
-                task_id=task.task_id,
-                artifact_types=[
-                    ArtifactType.SCREENSHOT_ACTION,
-                    ArtifactType.SCREENSHOT_FINAL,
-                ],
-                organization_id=organization_id,
-            )
-            if screenshot_artifact:
-                screenshot_artifacts.append(screenshot_artifact)
-            if len(screenshot_artifacts) >= 3:
-                break
-        if screenshot_artifacts:
-            screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(screenshot_artifacts)
+        screenshot_urls: list[str] | None = await self.get_recent_workflow_screenshot_urls(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_run_tasks=workflow_run_tasks,
+        )
+        screenshot_urls = screenshot_urls or None
 
         recording_url = None
         # Get recording url from browser session first,

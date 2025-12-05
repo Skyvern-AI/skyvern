@@ -612,7 +612,21 @@ async def _update_workflow_block(
             except asyncio.TimeoutError:
                 LOG.warning("Timeout getting downloaded files", task_id=task_id)
 
-            task_output = TaskOutput.from_task(updated_task, downloaded_files)
+            task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                organization_id=context.organization_id,
+                task_id=task_id,
+            )
+            workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                workflow_run_id=context.workflow_run_id,
+                organization_id=context.organization_id,
+            )
+
+            task_output = TaskOutput.from_task(
+                updated_task,
+                downloaded_files,
+                task_screenshots=task_screenshots,
+                workflow_screenshots=workflow_screenshots,
+            )
             final_output = task_output.model_dump()
             step_for_billing: Step | None = None
             if step_id:
