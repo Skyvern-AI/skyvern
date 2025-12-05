@@ -18,7 +18,7 @@ class SkyvernBrowser(BrowserContext):
 
     Example:
         ```python
-            skyvern = Skyvern()
+            skyvern = Skyvern.local()
             browser = await skyvern.launch_local_browser()
 
             # Get or create the working page
@@ -32,7 +32,6 @@ class SkyvernBrowser(BrowserContext):
         _browser_context: The underlying Playwright BrowserContext.
         _browser_session_id: Optional session ID for persistent browser sessions.
         _browser_address: Optional address for remote browser connections.
-        _client: The AsyncSkyvern client for API communication.
     """
 
     def __init__(
