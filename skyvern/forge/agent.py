@@ -2993,6 +2993,23 @@ class ForgeAgent:
                 final_navigation_payload = (
                     final_navigation_payload + "\n" + str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
                 )
+            elif isinstance(final_navigation_payload, list):
+                verification_code_dict = str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
+                if verification_code_dict not in final_navigation_payload:
+                    final_navigation_payload.append(verification_code_dict)
+                else:
+                    LOG.warning(
+                        "Verification code already exists in navigation payload",
+                        final_navigation_payload=final_navigation_payload,
+                    )
+
+            elif final_navigation_payload is None:
+                final_navigation_payload = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
+            else:
+                LOG.warning(
+                    "Didn't add verification code to navigation payload",
+                    final_navigation_payload=final_navigation_payload,
+                )
             if expire_verification_code:
                 current_context.totp_codes.pop(task.task_id)
 
