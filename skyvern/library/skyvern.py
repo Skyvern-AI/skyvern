@@ -3,6 +3,7 @@ import os
 import pathlib
 import tempfile
 from typing import Any, overload
+from typing import Any
 
 import httpx
 import structlog
@@ -15,7 +16,6 @@ from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
-from skyvern.library.embedded_server_factory import create_embedded_server
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunStatus
@@ -33,11 +33,21 @@ class Skyvern(AsyncSkyvern):
     Example:
         ```python
 
-        # Initialize with remote environment and API key
-        skyvern = Skyvern(environment=SkyvernEnvironment.CLOUD, api_key="your-api-key")
+        # Remote mode: Connect to Skyvern Cloud (API key required)
+        skyvern = Skyvern(api_key="your-api-key")
 
-        # Or in embedded mode (run `skyvern quickstart` first):
-        skyvern = Skyvern()
+        # Or connect to a self-hosted instance
+        skyvern = Skyvern(
+            api_key="your-api-key",
+            environment=SkyvernEnvironment.PRODUCTION,
+            base_url="https://your-instance.com"
+        )
+
+        # Local/embedded mode (run `skyvern quickstart` first):
+        skyvern = Skyvern.local()
+
+        # Local mode with in-memory database (great for testing)
+        skyvern = Skyvern.local()
 
         # Launch a local browser
         browser = await skyvern.launch_local_browser(headless=False)
@@ -81,12 +91,11 @@ class Skyvern(AsyncSkyvern):
         ```
     """
 
-    @overload
     def __init__(
         self,
         *,
-        environment: SkyvernEnvironment,
         api_key: str,
+        environment: SkyvernEnvironment = SkyvernEnvironment.CLOUD,
         base_url: str | None = None,
         timeout: float | None = None,
         follow_redirects: bool | None = True,
@@ -95,11 +104,11 @@ class Skyvern(AsyncSkyvern):
         """Remote mode: Connect to Skyvern Cloud or self-hosted instance.
 
         Args:
-            environment: The Skyvern environment to connect to. Use SkyvernEnvironment.CLOUD
-                for Skyvern Cloud or SkyvernEnvironment.PRODUCTION/STAGING for self-hosted
-                instances.
             api_key: API key for authenticating with Skyvern.
                 Can be found on the settings page: https://app.skyvern.com/settings
+            environment: The Skyvern environment to connect to. Use SkyvernEnvironment.CLOUD
+                for Skyvern Cloud or SkyvernEnvironment.PRODUCTION/STAGING for self-hosted
+                instances. Defaults to SkyvernEnvironment.CLOUD.
             base_url: Override the base URL for the Skyvern API. If not provided, uses the default URL for
                 the specified environment.
             timeout: Timeout in seconds for API requests. If not provided, uses the default timeout.
@@ -107,19 +116,30 @@ class Skyvern(AsyncSkyvern):
             httpx_client: Custom httpx AsyncClient for making API requests.
                 If not provided, a default client will be created.
         """
-        ...
+        super().__init__(
+            base_url=base_url,
+            environment=environment,
+            api_key=api_key,
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            httpx_client=httpx_client,
+        )
 
-    @overload
-    def __init__(
-        self,
+        self._environment = environment
+        self._api_key: str | None = api_key
+        self._playwright: Playwright | None = None
+
+    @classmethod
+    def local(
+        cls,
         *,
         llm_config: LLMRouterConfig | LLMConfig | None = None,
         settings: dict[str, Any] | None = None,
-    ) -> None:
-        """Embedded mode: Run Skyvern locally in-process.
+    ) -> "Skyvern":
+        """Local/embedded mode: Run Skyvern locally in-process.
 
         Prerequisites:
-            Run `skyvern quickstart` first to set up your local environment and create a .env file.
+            Run `skyvern quickstart` first to set up your local environment and create a .env file
 
         Args:
             llm_config: Optional custom LLM configuration (LLMConfig or LLMRouterConfig).
@@ -127,95 +147,82 @@ class Skyvern(AsyncSkyvern):
                 overriding the LLM_KEY setting from your .env file.
                 If not provided, uses the LLM configured via LLM_KEY in your .env file.
 
-                Example 1 - Using environment variables (recommended):
+                Example 1 - Using .env configuration (simplest, recommended):
+                    ```python
+                    from skyvern import Skyvern
+
+                    # Uses LLM_KEY and other settings from your .env file
+                    # Created by running `skyvern quickstart`
+                    skyvern = Skyvern.local()
+                    ```
+
+                Example 2 - Custom LLM with environment variables:
                     ```python
                     from skyvern import Skyvern
                     from skyvern.forge.sdk.api.llm.models import LLMConfig
 
                     # Assumes OPENAI_API_KEY is set in your environment
-                    llm_config = LLMConfig(
-                        model_name="gpt-4o",
-                        required_env_vars=["OPENAI_API_KEY"],
-                        supports_vision=True,
-                        add_assistant_prefix=False,
+                    skyvern = Skyvern.local(
+                        llm_config=LLMConfig(
+                            model_name="gpt-4o",
+                            required_env_vars=["OPENAI_API_KEY"],
+                            supports_vision=True,
+                            add_assistant_prefix=False,
+                        )
                     )
-                    skyvern = Skyvern(llm_config=llm_config)
                     ```
 
-                Example 2 - Explicitly providing credentials:
+                Example 3 - Explicitly providing credentials:
                     ```python
                     from skyvern import Skyvern
                     from skyvern.forge.sdk.api.llm.models import LLMConfig, LiteLLMParams
 
-                    llm_config = LLMConfig(
-                        model_name="gpt-4o",
-                        required_env_vars=[],  # No env vars required
-                        supports_vision=True,
-                        add_assistant_prefix=False,
-                        litellm_params=LiteLLMParams(
-                            api_base="https://api.openai.com/v1",
-                            api_key="sk-...",  # Your API key
-                        ),
+                    skyvern = Skyvern.local(
+                        llm_config=LLMConfig(
+                            model_name="gpt-4o",
+                            required_env_vars=[],  # No env vars required
+                            supports_vision=True,
+                            add_assistant_prefix=False,
+                            litellm_params=LiteLLMParams(
+                                api_base="https://api.openai.com/v1",
+                                api_key="sk-...",  # Your API key
+                            ),
+                        )
                     )
-                    skyvern = Skyvern(llm_config=llm_config)
                     ```
             settings: Optional dictionary of Skyvern settings to override.
                 These override the corresponding settings from your .env file.
                 Example: {"MAX_STEPS_PER_RUN": 100, "BROWSER_TYPE": "chromium-headful"}
+
+        Returns:
+            Skyvern: A Skyvern instance running in local/embedded mode.
         """
-        ...
+        from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
 
-    def __init__(
-        self,
-        *,
-        environment: SkyvernEnvironment | None = None,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        timeout: float | None = None,
-        follow_redirects: bool | None = True,
-        httpx_client: httpx.AsyncClient | None = None,
-        llm_config: LLMRouterConfig | LLMConfig | None = None,
-        settings: dict[str, Any] | None = None,
-    ):
-        if environment is None:
-            if httpx_client is not None:
-                raise ValueError("httpx_client is not supported in embedded mode")
+        if not os.path.exists(".env"):
+            raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
 
-            if not os.path.exists(".env"):
-                raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
+        load_dotenv(".env")
+        api_key = os.getenv("SKYVERN_API_KEY")
+        if not api_key:
+            raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
 
-            load_dotenv(".env")
-            api_key = os.getenv("SKYVERN_API_KEY")
-            if not api_key:
-                raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
+        obj = cls.__new__(cls)
 
-            super().__init__(
-                environment=SkyvernEnvironment.LOCAL,
-                api_key=api_key,
-                timeout=timeout,
-                follow_redirects=follow_redirects,
-                httpx_client=create_embedded_server(
-                    llm_config=llm_config,
-                    settings_overrides=settings,
-                ),
-            )
-        else:
-            if not api_key:
-                raise ValueError(f"Missing api_key for {environment.name}")
+        AsyncSkyvern.__init__(
+            obj,
+            environment=SkyvernEnvironment.LOCAL,
+            httpx_client=create_embedded_server(
+                llm_config=llm_config,
+                settings_overrides=settings,
+            ),
+        )
 
-            super().__init__(
-                base_url=base_url,
-                environment=environment,
-                api_key=api_key,
-                timeout=timeout,
-                follow_redirects=follow_redirects,
-                httpx_client=httpx_client,
-            )
+        obj._environment = SkyvernEnvironment.LOCAL
+        obj._api_key = None
+        obj._playwright = None
 
-        self._environment = environment
-        self._api_key = api_key
-
-        self._playwright: Playwright | None = None
+        return obj
 
     async def run_task(
         self,
