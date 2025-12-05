@@ -1227,6 +1227,7 @@ class AgentDB:
         workflow_run_block_id: str | None = None,
         thought_id: str | None = None,
         task_v2_id: str | None = None,
+        limit: int | None = None,
     ) -> list[Artifact]:
         try:
             async with self.Session() as session:
@@ -1254,6 +1255,9 @@ class AgentDB:
                     )
 
                 query = query.order_by(ArtifactModel.created_at.desc())
+
+                if limit is not None:
+                    query = query.limit(limit)
 
                 artifacts = (await session.scalars(query)).all()
                 LOG.debug("Artifacts fetched", count=len(artifacts))
@@ -1286,6 +1290,7 @@ class AgentDB:
             workflow_run_block_id=workflow_run_block_id,
             thought_id=thought_id,
             task_v2_id=task_v2_id,
+            limit=1,
         )
         return artifacts[0] if artifacts else None
 
