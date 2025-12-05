@@ -16,6 +16,7 @@ from starlette_context.plugins.base import Plugin
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
+from skyvern.forge.forge_app import ForgeApp
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.request_logging import log_raw_request_middleware
 from skyvern.forge.sdk.core import skyvern_context
@@ -79,7 +80,10 @@ def create_api_app() -> FastAPI:
     """
 
     forge_app_instance = start_forge_app()
+    return create_fast_api_app(forge_app_instance)
 
+
+def create_fast_api_app(forge_app_instance: ForgeApp) -> FastAPI:
     fastapi_app = FastAPI(lifespan=lifespan)
 
     # Add CORS middleware

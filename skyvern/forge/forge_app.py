@@ -84,7 +84,7 @@ class ForgeApp:
     agent: ForgeAgent
 
 
-def create_forge_app() -> ForgeApp:
+def create_forge_app(db: AgentDB | None = None) -> ForgeApp:
     """Create and initialize a ForgeApp instance with all services"""
     settings: Settings = SettingsManager.get_settings()
 
@@ -92,7 +92,7 @@ def create_forge_app() -> ForgeApp:
 
     app.SETTINGS_MANAGER = settings
 
-    app.DATABASE = AgentDB(settings.DATABASE_STRING, debug_enabled=settings.DEBUG_MODE)
+    app.DATABASE = db if db else AgentDB(settings.DATABASE_STRING, debug_enabled=settings.DEBUG_MODE)
     if settings.SKYVERN_STORAGE_TYPE == "s3":
         StorageFactory.set_storage(S3Storage())
     app.STORAGE = StorageFactory.get_storage()
