@@ -91,6 +91,7 @@ See the [Browser Sessions](/browser-sessions/introduction) section to see how to
 **Just With Python Code**
 ```python
 from skyvern import Skyvern
+import asyncio
 
 # The path to your Chrome browser. This example path is for Mac.
 browser_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -99,9 +100,9 @@ skyvern = Skyvern(
 	api_key="YOUR_API_KEY",
 	browser_path=browser_path,
 )
-task = await skyvern.run_task(
+asyncio.run(skyvern.run_task(
 	prompt="Find the top post on hackernews today",
-)
+))
 ```
 
 **With Skyvern Service**
@@ -114,14 +115,15 @@ BROWSER_TYPE=cdp-connect
 Restart your Skyvern service `skyvern run server` and run the task through UI or code:
 ```python
 from skyvern import Skyvern
+import asyncio
 
 skyvern = Skyvern(
 	base_url="http://localhost:8000",
 	api_key="YOUR_API_KEY",
 )
-task = await skyvern.run_task(
+asyncio.run(skyvern.run_task(
 	prompt="Find the top post on hackernews today",
-)
+))
 ```
 
 ### Get Consistent Output Schema
@@ -130,9 +132,10 @@ You can do it by adding the `data_extraction_schema` parameter to your task.
 For example, if you want to get the title, URL, and points of the top post on Hacker News today, you can add the following to your task:
 ```python
 from skyvern import Skyvern
+import asyncio
 
 skyvern = Skyvern()
-task = await skyvern.run_task(
+asyncio.run(skyvern.run_task(
     prompt="Find the top post on hackernews today",
     data_extraction_schema={
         "type": "object",
@@ -151,20 +154,21 @@ task = await skyvern.run_task(
             }
         }
     }
-)
+))
 ```
 
 ### Wait Until Task Is Done
 When you are sending a run task request the Skyvern service, you can set the `wait_for_completion` to `True` and wait until the task is done.
 ```python
 from skyvern import Skyvern
+import asyncio
 
 skyvern = Skyvern()
-task = await skyvern.run_task(
+task = asyncio.run(skyvern.run_task(
     prompt="Find the top post on hackernews today",
     # the request will be hanging until the task is done
     wait_for_completion=True,
-)
+))
 print(task.output)
 ```
 
@@ -172,11 +176,12 @@ print(task.output)
 Instead of waiting, you can also set the `webhook_url` in the run task request and get the result in your webhook whenever it's done.
 ```python
 from skyvern import Skyvern
+import asyncio
 
 skyvern = Skyvern()
-task = await skyvern.run_task(
+asyncio.run(skyvern.run_task(
     prompt="Find the top post on hackernews today",
     webhook_url="https://your-webhook-url.com",
-)
+))
 ```
 You can also use the [GET RUN API](/api-reference/api-reference/agent/get-run) to get the current status of the task.
