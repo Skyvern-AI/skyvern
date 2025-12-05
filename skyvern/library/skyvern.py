@@ -35,20 +35,10 @@ class Skyvern(AsyncSkyvern):
         # Remote mode: Connect to Skyvern Cloud (API key required)
         skyvern = Skyvern(api_key="your-api-key")
 
-        # Or connect to a self-hosted instance
-        skyvern = Skyvern(
-            api_key="your-api-key",
-            environment=SkyvernEnvironment.PRODUCTION,
-            base_url="https://your-instance.com"
-        )
-
         # Local/embedded mode (run `skyvern quickstart` first):
         skyvern = Skyvern.local()
 
-        # Local mode with in-memory database (great for testing)
-        skyvern = Skyvern.local()
-
-        # Launch a local browser
+        # Launch a local browser (works only in local environment)
         browser = await skyvern.launch_local_browser(headless=False)
         page = await browser.get_working_page()
 
