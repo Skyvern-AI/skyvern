@@ -59,7 +59,7 @@ def quickstart(
     try:
         # Initialize Skyvern
         console.print("\n[bold blue]Initializing Skyvern...[/bold blue]")
-        init(no_postgres=no_postgres)
+        run_local = init(no_postgres=no_postgres)
 
         # Skip browser installation if requested
         if not skip_browser_install:
@@ -76,8 +76,9 @@ def quickstart(
             console.print("⏭️ [yellow]Skipping Chromium installation as requested.[/yellow]")
 
         # Start services
-        console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
-        asyncio.run(start_services(server_only=server_only))
+        if run_local:
+            console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
+            asyncio.run(start_services(server_only=server_only))
 
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Quickstart process interrupted by user.[/bold yellow]")
