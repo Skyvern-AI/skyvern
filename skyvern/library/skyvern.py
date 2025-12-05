@@ -22,6 +22,10 @@ from skyvern.schemas.runs import ProxyLocation, RunEngine, RunStatus
 LOG = structlog.get_logger()
 
 
+def _get_browser_session_url(browser_session_id: str) -> str:
+    return f"https://app.skyvern.com/browser-session/{browser_session_id}"
+
+
 class Skyvern(AsyncSkyvern):
     """Main entry point for the Skyvern SDK.
 
@@ -212,6 +216,11 @@ class Skyvern(AsyncSkyvern):
         obj._playwright = None
 
         return obj
+
+    @property
+    def environment(self) -> SkyvernEnvironment | None:
+        """Get the current Skyvern environment (CLOUD, STAGING, LOCAL, or None for embedded mode)."""
+        return self._environment
 
     async def run_task(
         self,
@@ -453,7 +462,15 @@ class Skyvern(AsyncSkyvern):
         """
         self._ensure_cloud_environment()
         browser_session = await self.get_browser_session(browser_session_id)
-        LOG.info("Connecting to existing cloud browser session", browser_session_id=browser_session.browser_session_id)
+        if self._environment == SkyvernEnvironment.CLOUD:
+            LOG.info(
+                "Connecting to existing cloud browser session",
+                url=_get_browser_session_url(browser_session.browser_session_id),
+            )
+        else:
+            LOG.info(
+                "Connecting to existing cloud browser session", browser_session_id=browser_session.browser_session_id
+            )
         return await self._connect_to_cloud_browser_session(browser_session)
 
     async def launch_cloud_browser(
@@ -480,7 +497,13 @@ class Skyvern(AsyncSkyvern):
             timeout=timeout,
             proxy_location=proxy_location,
         )
-        LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
+        if self._environment == SkyvernEnvironment.CLOUD:
+            LOG.info(
+                "Launched new cloud browser session",
+                url=_get_browser_session_url(browser_session.browser_session_id),
+            )
+        else:
+            LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
         return await self._connect_to_cloud_browser_session(browser_session)
 
     async def use_cloud_browser(
@@ -515,9 +538,23 @@ class Skyvern(AsyncSkyvern):
                 timeout=timeout,
                 proxy_location=proxy_location,
             )
-            LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
+            if self._environment == SkyvernEnvironment.CLOUD:
+                LOG.info(
+                    "Launched new cloud browser session",
+                    url=_get_browser_session_url(browser_session.browser_session_id),
+                )
+            else:
+                LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
         else:
-            LOG.info("Reusing existing cloud browser session", browser_session_id=browser_session.browser_session_id)
+            if self._environment == SkyvernEnvironment.CLOUD:
+                LOG.info(
+                    "Reusing existing cloud browser session",
+                    url=_get_browser_session_url(browser_session.browser_session_id),
+                )
+            else:
+                LOG.info(
+                    "Reusing existing cloud browser session", browser_session_id=browser_session.browser_session_id
+                )
 
         return await self._connect_to_cloud_browser_session(browser_session)
 
