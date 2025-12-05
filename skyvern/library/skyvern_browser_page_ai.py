@@ -11,6 +11,7 @@ from skyvern.client import (
     RunSdkActionRequestAction_AiUploadFile,
     RunSdkActionRequestAction_Extract,
     RunSdkActionRequestAction_LocateElement,
+    RunSdkActionRequestAction_Prompt,
 )
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
@@ -225,3 +226,33 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             return response.result
 
         return None
+
+    async def ai_prompt(
+        self,
+        prompt: str,
+        schema: dict[str, Any] | None = None,
+        llm_key: str | None = None,
+    ) -> dict[str, Any] | list | str | None:
+        """Send a prompt to the LLM and get a response based on the provided schema via API call"""
+
+        LOG.info(
+            "AI prompt",
+            prompt=prompt,
+            llm_key=llm_key,
+            workflow_run_id=self._browser.workflow_run_id,
+        )
+
+        response = await self._browser.skyvern.run_sdk_action(
+            url=self._page.url,
+            action=RunSdkActionRequestAction_Prompt(
+                prompt=prompt,
+                schema=schema,
+                llm_key=llm_key,
+            ),
+            browser_session_id=self._browser.browser_session_id,
+            browser_address=self._browser.browser_address,
+            workflow_run_id=self._browser.workflow_run_id,
+        )
+        self._browser.workflow_run_id = response.workflow_run_id
+
+        return response.result if response.result is not None else None

@@ -2187,6 +2187,7 @@ async def prompt(
     label: str | None = None,
     parameters: list[str] | None = None,
     model: dict[str, Any] | None = None,
+    llm_key: str | None = None,
 ) -> dict[str, Any] | list | str | None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     prompt = _render_template_with_label(prompt, label)
@@ -2197,6 +2198,7 @@ async def prompt(
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,
         model=model,
+        llm_key=llm_key,
     )
     result = await prompt_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,

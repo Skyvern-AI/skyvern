@@ -684,6 +684,48 @@ class SkyvernPage(Page):
         data = kwargs.pop("data", None)
         return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
 
+    async def prompt(
+        self,
+        prompt: str,
+        schema: dict[str, Any] | None = None,
+        llm_key: str | None = None,
+    ) -> dict[str, Any] | list | str | None:
+        """Send a prompt to the LLM and get a response based on the provided schema.
+
+        This method allows you to interact with the LLM directly without requiring page context.
+        It's useful for making decisions, generating text, or processing information using AI.
+
+        Args:
+            prompt: The prompt to send to the LLM
+            schema: Optional JSON schema to structure the response. If provided, the LLM response
+                   will be validated against this schema.
+            llm_key: Optional LLM key to use for this specific prompt (e.g., "ANTHROPIC/CLAUDE_3_5_SONNET")
+
+        Returns:
+            LLM response structured according to the schema if provided, or unstructured response otherwise.
+
+        Examples:
+            ```python
+            # Simple unstructured prompt
+            response = await page.prompt("What is 2 + 2?")
+            # Returns: {'llm_response': '2 + 2 equals 4.'}
+
+            # Structured prompt with schema
+            response = await page.prompt(
+                "What is 2 + 2?",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "result_number": {"type": "int"},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+                    }
+                }
+            )
+            # Returns: {'result_number': 4, 'confidence': 1}
+            ```
+        """
+        return await self._ai.ai_prompt(prompt=prompt, schema=schema, llm_key=llm_key)
+
     @overload
     def locator(
         self,

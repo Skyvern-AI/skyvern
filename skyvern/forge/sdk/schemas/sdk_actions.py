@@ -16,6 +16,7 @@ class SdkActionType(str, Enum):
     AI_ACT = "ai_act"
     EXTRACT = "extract"
     LOCATE_ELEMENT = "locate_element"
+    PROMPT = "prompt"
 
 
 # Base action class
@@ -151,6 +152,21 @@ class LocateElementAction(SdkActionBase):
         return None
 
 
+class PromptAction(SdkActionBase):
+    """Prompt action parameters."""
+
+    type: Literal["prompt"] = "prompt"
+    prompt: str = Field(..., description="The prompt to send to the LLM")
+    schema: dict[str, Any] | None = Field(None, description="Optional JSON schema to structure the response")
+    llm_key: str | None = Field(None, description="Optional LLM key to use for this specific prompt")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.prompt
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return None
+
+
 # Discriminated union of all action types
 SdkAction = Annotated[
     Union[
@@ -161,6 +177,7 @@ SdkAction = Annotated[
         ActAction,
         ExtractAction,
         LocateElementAction,
+        PromptAction,
     ],
     Field(discriminator="type"),
 ]
