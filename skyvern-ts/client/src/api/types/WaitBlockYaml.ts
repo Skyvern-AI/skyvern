@@ -7,5 +7,6 @@ export interface WaitBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     wait_sec?: number;
 }

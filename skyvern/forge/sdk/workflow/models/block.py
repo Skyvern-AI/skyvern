@@ -135,6 +135,10 @@ class Block(BaseModel, abc.ABC):
     model: dict[str, Any] | None = None
     disable_cache: bool = False
 
+    # Only valid for blocks inside a for loop block
+    # Whether to continue to the next iteration when the block fails
+    next_loop_on_failure: bool = False
+
     @property
     def override_llm_key(self) -> str | None:
         """
@@ -806,7 +810,21 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_output = TaskOutput.from_task(updated_task, downloaded_files)
+                task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                    organization_id=workflow_run.organization_id,
+                    task_id=updated_task.task_id,
+                )
+                workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                )
+
+                task_output = TaskOutput.from_task(
+                    updated_task,
+                    downloaded_files,
+                    task_screenshots=task_screenshots,
+                    workflow_screenshots=workflow_screenshots,
+                )
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
                 return await self.build_block_result(
@@ -867,7 +885,21 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_output = TaskOutput.from_task(updated_task, downloaded_files)
+                task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                    organization_id=workflow_run.organization_id,
+                    task_id=updated_task.task_id,
+                )
+                workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                )
+
+                task_output = TaskOutput.from_task(
+                    updated_task,
+                    downloaded_files,
+                    task_screenshots=task_screenshots,
+                    workflow_screenshots=workflow_screenshots,
+                )
                 LOG.warning(
                     f"Task failed with status {updated_task.status}{retry_message}",
                     task_id=updated_task.task_id,
@@ -1386,15 +1418,15 @@ class ForLoopBlock(Block):
                         organization_id=organization_id,
                     )
                     block_outputs.append(failure_block_result)
-                    # If continue_on_failure is False, stop the entire loop
-                    if not self.continue_on_failure:
+                    # If next_loop_on_failure is False, stop the entire loop
+                    if not self.next_loop_on_failure:
                         outputs_with_loop_values.append(each_loop_output_values)
                         return LoopBlockExecutedResult(
                             outputs_with_loop_values=outputs_with_loop_values,
                             block_outputs=block_outputs,
                             last_block=current_block,
                         )
-                    # If continue_on_failure is True, break out of the block loop for this iteration
+                    # If next_loop_on_failure is True, break out of the block loop for this iteration
                     break
 
                 if block_output.status == BlockStatus.canceled:
@@ -1412,7 +1444,12 @@ class ForLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if not block_output.success and not loop_block.continue_on_failure:
+                if (
+                    not block_output.success
+                    and not loop_block.continue_on_failure
+                    and not loop_block.next_loop_on_failure
+                    and not self.next_loop_on_failure
+                ):
                     LOG.info(
                         f"ForLoopBlock: Encountered a failure processing block {block_idx} during loop {loop_idx}, terminating early",
                         block_outputs=block_outputs,
@@ -1421,6 +1458,7 @@ class ForLoopBlock(Block):
                         loop_over_value=loop_over_value,
                         loop_block_continue_on_failure=loop_block.continue_on_failure,
                         failure_reason=block_output.failure_reason,
+                        next_loop_on_failure=loop_block.next_loop_on_failure or self.next_loop_on_failure,
                     )
                     outputs_with_loop_values.append(each_loop_output_values)
                     return LoopBlockExecutedResult(
@@ -1428,6 +1466,20 @@ class ForLoopBlock(Block):
                         block_outputs=block_outputs,
                         last_block=current_block,
                     )
+
+                if block_output.success or loop_block.continue_on_failure:
+                    continue
+
+                if loop_block.next_loop_on_failure or self.next_loop_on_failure:
+                    LOG.info(
+                        f"ForLoopBlock: Block {block_idx} during loop {loop_idx} failed but will continue to next iteration",
+                        block_outputs=block_outputs,
+                        loop_idx=loop_idx,
+                        block_idx=block_idx,
+                        loop_over_value=loop_over_value,
+                        loop_block_next_loop_on_failure=loop_block.next_loop_on_failure or self.next_loop_on_failure,
+                    )
+                    break
 
             outputs_with_loop_values.append(each_loop_output_values)
 
@@ -3493,6 +3545,13 @@ class TaskV2Block(Block):
     max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
     max_steps: int = settings.MAX_STEPS_PER_TASK_V2
 
+    def _resolve_totp_identifier(self, workflow_run_context: WorkflowRunContext) -> str | None:
+        if self.totp_identifier:
+            return self.totp_identifier
+        if workflow_run_context.credential_totp_identifiers:
+            return next(iter(workflow_run_context.credential_totp_identifiers.values()), None)
+        return None
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -3535,7 +3594,7 @@ class TaskV2Block(Block):
             # Use the resolved values directly
             resolved_prompt = self.prompt
             resolved_url = self.url
-            resolved_totp_identifier = self.totp_identifier
+            resolved_totp_identifier = self._resolve_totp_identifier(workflow_run_context)
             resolved_totp_verification_url = self.totp_verification_url
 
         except Exception as e:
@@ -3637,12 +3696,23 @@ class TaskV2Block(Block):
 
         # If continue_on_failure is True, we treat the block as successful even if the task failed
         # This allows the workflow to continue execution despite this block's failure
+        task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+            organization_id=organization_id,
+            task_v2_id=task_v2.observer_cruise_id,
+        )
+        workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+
         task_v2_output = {
             "task_id": task_v2.observer_cruise_id,
             "status": task_v2.status,
             "summary": task_v2.summary,
             "extracted_information": result_dict,
             "failure_reason": failure_reason,
+            "task_screenshots": task_screenshots,
+            "workflow_screenshots": workflow_screenshots,
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, task_v2_output)
         return await self.build_block_result(

@@ -947,6 +947,12 @@ class ForgeAgent:
                 reuse_speculative_llm_response = json_response is not None
                 speculative_llm_metadata = speculative_plan.llm_metadata
                 prompt_name = speculative_plan.prompt_name
+                await self._persist_scrape_artifacts(
+                    task=task,
+                    step=step,
+                    scraped_page=scraped_page,
+                    context=context,
+                )
             else:
                 (
                     scraped_page,
@@ -2371,10 +2377,11 @@ class ForgeAgent:
         use_caching = False
 
         if persist_artifacts:
-            await app.ARTIFACT_MANAGER.create_artifact(
+            await self._persist_scrape_artifacts(
+                task=task,
                 step=step,
-                artifact_type=ArtifactType.HTML_SCRAPE,
-                data=scraped_page.html.encode(),
+                scraped_page=scraped_page,
+                context=context,
             )
         LOG.info(
             "Scraped website",
@@ -2383,54 +2390,6 @@ class ForgeAgent:
             num_elements=len(scraped_page.elements),
             url=task.url,
         )
-        # TODO: we only use HTML element for now, introduce a way to switch in the future
-        enable_speed_optimizations = getattr(context, "enable_speed_optimizations", False)
-        element_tree_format = ElementTreeFormat.HTML
-
-        # OPTIMIZATION: Use economy tree (skip SVGs) when ENABLE_SPEED_OPTIMIZATIONS is enabled
-        # Economy tree removes all SVG elements from the DOM tree sent to LLM
-        # - SVGs are decorative (icons, logos, graphics) - not needed for action planning
-        # - Even for charts/graphs: LLM sees them in screenshots, not SVG code
-        # - Saves ~8s per SVG x ~15 SVGs = ~120s per workflow (30% speedup!)
-        #
-        # RETRY STRATEGY: Use economy tree on first attempt only
-        # - retry_index 0: Use economy tree (fast, no SVGs)
-        # - retry_index 1+: Use regular tree (SVGs loaded from existing 4-week cache)
-        # Note: SVG conversions are already cached globally with 4-week TTL, so retries are fast
-        #
-        # COORDINATION: The enable_speed_optimizations decision is made ONCE before scraping
-        # and stored in context. Both SVG conversion skip (agent_functions.py) and tree
-        # selection (here) use the SAME value, ensuring perfect coordination.
-        element_tree_in_prompt: str = ""
-
-        # Use the speed optimization decision from context (set before scraping)
-        enable_speed_optimizations = context.enable_speed_optimizations if context else False
-
-        if not enable_speed_optimizations:
-            # Optimization disabled - use regular tree always
-            element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
-        elif step.retry_index == 0:
-            # First attempt - use economy tree (fast, no SVG conversion)
-            # Note: SVG conversion was already skipped in cleanup_element_tree_func
-            # based on the same context.enable_speed_optimizations value
-            element_tree_in_prompt = scraped_page.build_economy_elements_tree(element_tree_format)
-            LOG.info(
-                "Speed optimization: Using economy element tree (skipping SVGs)",
-                step_order=step.order,
-                step_retry=step.retry_index,
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-            )
-        else:
-            # Retry 1+ - use regular tree (SVGs will be loaded from existing 4-week cache)
-            element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
-            LOG.info(
-                "Speed optimization: Using regular tree on retry (SVGs from global cache)",
-                step_order=step.order,
-                step_retry=step.retry_index,
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-            )
         extract_action_prompt = ""
         prompt_name = EXTRACT_ACTION_PROMPT_NAME  # Default; overwritten below for non-CUA engines
         if engine not in CUA_ENGINES:
@@ -2443,34 +2402,100 @@ class ForgeAgent:
                 expire_verification_code=True,
             )
 
-        if persist_artifacts:
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
-                data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode(),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
-                data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode(),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
-                data=json.dumps(scraped_page.element_tree, indent=2).encode(),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
-                data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode(),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
-                data=element_tree_in_prompt.encode(),
-            )
-
         return scraped_page, extract_action_prompt, use_caching, prompt_name
+
+    async def _persist_scrape_artifacts(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        context: SkyvernContext | None,
+    ) -> None:
+        """
+        Persist the core scrape artifacts (HTML + element metadata) for a step.
+        This is used both for regular runs and when adopting a speculative plan.
+        """
+
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.HTML_SCRAPE,
+            data=scraped_page.html.encode(),
+        )
+
+        element_tree_format = ElementTreeFormat.HTML
+        element_tree_in_prompt = self._build_element_tree_for_prompt(
+            scraped_page=scraped_page,
+            step=step,
+            task=task,
+            context=context,
+            element_tree_format=element_tree_format,
+        )
+
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+            data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode(),
+        )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+            data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode(),
+        )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
+            data=json.dumps(scraped_page.element_tree, indent=2).encode(),
+        )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+            data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode(),
+        )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+            data=element_tree_in_prompt.encode(),
+        )
+
+    def _build_element_tree_for_prompt(
+        self,
+        *,
+        scraped_page: ScrapedPage,
+        step: Step,
+        task: Task,
+        context: SkyvernContext | None,
+        element_tree_format: ElementTreeFormat,
+    ) -> str:
+        """
+        Determine which element tree representation should be captured for the prompt/artifacts.
+        Mirrors the previous inline logic so that speculative runs can reuse it.
+        """
+
+        enable_speed_optimizations = context.enable_speed_optimizations if context else False
+        if not enable_speed_optimizations:
+            return scraped_page.build_element_tree(element_tree_format)
+
+        if step.retry_index == 0:
+            element_tree_in_prompt = scraped_page.build_economy_elements_tree(element_tree_format)
+            LOG.info(
+                "Speed optimization: Using economy element tree (skipping SVGs)",
+                step_order=step.order,
+                step_retry=step.retry_index,
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+            return element_tree_in_prompt
+
+        element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
+        LOG.info(
+            "Speed optimization: Using regular tree on retry (SVGs from global cache)",
+            step_order=step.order,
+            step_retry=step.retry_index,
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        return element_tree_in_prompt
 
     @staticmethod
     def _build_extract_action_cache_variant(
@@ -2992,6 +3017,23 @@ class ForgeAgent:
             ):
                 final_navigation_payload = (
                     final_navigation_payload + "\n" + str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
+                )
+            elif isinstance(final_navigation_payload, list):
+                verification_code_dict = str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
+                if verification_code_dict not in final_navigation_payload:
+                    final_navigation_payload.append(verification_code_dict)
+                else:
+                    LOG.warning(
+                        "Verification code already exists in navigation payload",
+                        final_navigation_payload=final_navigation_payload,
+                    )
+
+            elif final_navigation_payload is None:
+                final_navigation_payload = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
+            else:
+                LOG.warning(
+                    "Didn't add verification code to navigation payload",
+                    final_navigation_payload=final_navigation_payload,
                 )
             if expire_verification_code:
                 current_context.totp_codes.pop(task.task_id)

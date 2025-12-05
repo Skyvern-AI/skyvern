@@ -4,7 +4,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .branch_criteria import BranchCriteria
+from .branch_condition_criteria import BranchConditionCriteria
 
 
 class BranchCondition(UniversalBaseModel):
@@ -12,7 +12,7 @@ class BranchCondition(UniversalBaseModel):
     Represents a single conditional branch edge within a ConditionalBlock.
     """
 
-    criteria: typing.Optional[BranchCriteria] = None
+    criteria: typing.Optional[BranchConditionCriteria] = None
     next_block_label: typing.Optional[str] = None
     description: typing.Optional[str] = None
     is_default: typing.Optional[bool] = None

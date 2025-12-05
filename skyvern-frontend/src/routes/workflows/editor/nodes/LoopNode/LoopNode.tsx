@@ -159,6 +159,26 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                     <HelpTooltip content="When checked, the loop will continue executing even if one of its iterations fails" />
                   </div>
                 </div>
+                <div className="flex justify-between">
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      checked={data.nextLoopOnFailure ?? false}
+                      disabled={!data.editable}
+                      onCheckedChange={(checked) => {
+                        update({
+                          nextLoopOnFailure:
+                            checked === "indeterminate" ? false : checked,
+                        });
+                      }}
+                    />
+                    <Label className="text-xs text-slate-300">
+                      Next Loop on Failure
+                    </Label>
+                    <HelpTooltip
+                      content={helpTooltips["loop"]["nextLoopOnFailure"]}
+                    />
+                  </div>
+                </div>
               </div>
             </div>
           </div>

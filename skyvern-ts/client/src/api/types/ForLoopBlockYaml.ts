@@ -9,6 +9,7 @@ export interface ForLoopBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     loop_blocks: Skyvern.ForLoopBlockYamlLoopBlocksItem[];
     loop_over_parameter_key?: string;
     loop_variable_reference?: string;

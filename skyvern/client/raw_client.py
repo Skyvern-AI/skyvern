@@ -1951,7 +1951,6 @@ class RawSkyvern:
         *,
         credential_type: SkyvernSchemasRunBlocksCredentialType,
         url: typing.Optional[str] = OMIT,
-        prompt: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -1961,6 +1960,7 @@ class RawSkyvern:
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
         bitwarden_collection_id: typing.Optional[str] = OMIT,
         bitwarden_item_id: typing.Optional[str] = OMIT,
@@ -1981,13 +1981,10 @@ class RawSkyvern:
             Where to get the credential from
 
         url : typing.Optional[str]
-            Website url
-
-        prompt : typing.Optional[str]
-            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
+            Website URL
 
         webhook_url : typing.Optional[str]
-            Webhook URL to send login status updates
+            Webhook URL to send status updates
 
         proxy_location : typing.Optional[ProxyLocation]
             Proxy location to use
@@ -2012,6 +2009,9 @@ class RawSkyvern:
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
+
+        prompt : typing.Optional[str]
+            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
 
         credential_id : typing.Optional[str]
             ID of the Skyvern credential to use for login.
@@ -2052,9 +2052,7 @@ class RawSkyvern:
             "v1/run/tasks/login",
             method="POST",
             json={
-                "credential_type": credential_type,
                 "url": url,
-                "prompt": prompt,
                 "webhook_url": webhook_url,
                 "proxy_location": proxy_location,
                 "totp_identifier": totp_identifier,
@@ -2064,6 +2062,8 @@ class RawSkyvern:
                 "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
+                "credential_type": credential_type,
+                "prompt": prompt,
                 "credential_id": credential_id,
                 "bitwarden_collection_id": bitwarden_collection_id,
                 "bitwarden_item_id": bitwarden_item_id,
@@ -2073,6 +2073,131 @@ class RawSkyvern:
                 "azure_vault_username_key": azure_vault_username_key,
                 "azure_vault_password_key": azure_vault_password_key,
                 "azure_vault_totp_secret_key": azure_vault_totp_secret_key,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[WorkflowRunResponse]:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[WorkflowRunResponse]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/run/tasks/download_files",
+            method="POST",
+            json={
+                "url": url,
+                "webhook_url": webhook_url,
+                "proxy_location": proxy_location,
+                "totp_identifier": totp_identifier,
+                "totp_url": totp_url,
+                "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
+                "browser_address": browser_address,
+                "extra_http_headers": extra_http_headers,
+                "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
+                "navigation_goal": navigation_goal,
+                "download_suffix": download_suffix,
+                "download_timeout": download_timeout,
+                "max_steps_per_run": max_steps_per_run,
             },
             headers={
                 "content-type": "application/json",
@@ -4342,7 +4467,6 @@ class AsyncRawSkyvern:
         *,
         credential_type: SkyvernSchemasRunBlocksCredentialType,
         url: typing.Optional[str] = OMIT,
-        prompt: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -4352,6 +4476,7 @@ class AsyncRawSkyvern:
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
         bitwarden_collection_id: typing.Optional[str] = OMIT,
         bitwarden_item_id: typing.Optional[str] = OMIT,
@@ -4372,13 +4497,10 @@ class AsyncRawSkyvern:
             Where to get the credential from
 
         url : typing.Optional[str]
-            Website url
-
-        prompt : typing.Optional[str]
-            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
+            Website URL
 
         webhook_url : typing.Optional[str]
-            Webhook URL to send login status updates
+            Webhook URL to send status updates
 
         proxy_location : typing.Optional[ProxyLocation]
             Proxy location to use
@@ -4403,6 +4525,9 @@ class AsyncRawSkyvern:
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
+
+        prompt : typing.Optional[str]
+            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
 
         credential_id : typing.Optional[str]
             ID of the Skyvern credential to use for login.
@@ -4443,9 +4568,7 @@ class AsyncRawSkyvern:
             "v1/run/tasks/login",
             method="POST",
             json={
-                "credential_type": credential_type,
                 "url": url,
-                "prompt": prompt,
                 "webhook_url": webhook_url,
                 "proxy_location": proxy_location,
                 "totp_identifier": totp_identifier,
@@ -4455,6 +4578,8 @@ class AsyncRawSkyvern:
                 "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
+                "credential_type": credential_type,
+                "prompt": prompt,
                 "credential_id": credential_id,
                 "bitwarden_collection_id": bitwarden_collection_id,
                 "bitwarden_item_id": bitwarden_item_id,
@@ -4464,6 +4589,131 @@ class AsyncRawSkyvern:
                 "azure_vault_username_key": azure_vault_username_key,
                 "azure_vault_password_key": azure_vault_password_key,
                 "azure_vault_totp_secret_key": azure_vault_totp_secret_key,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[WorkflowRunResponse]:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[WorkflowRunResponse]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/run/tasks/download_files",
+            method="POST",
+            json={
+                "url": url,
+                "webhook_url": webhook_url,
+                "proxy_location": proxy_location,
+                "totp_identifier": totp_identifier,
+                "totp_url": totp_url,
+                "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
+                "browser_address": browser_address,
+                "extra_http_headers": extra_http_headers,
+                "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
+                "navigation_goal": navigation_goal,
+                "download_suffix": download_suffix,
+                "download_timeout": download_timeout,
+                "max_steps_per_run": max_steps_per_run,
             },
             headers={
                 "content-type": "application/json",

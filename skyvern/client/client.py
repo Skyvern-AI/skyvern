@@ -1391,7 +1391,6 @@ class Skyvern:
         *,
         credential_type: SkyvernSchemasRunBlocksCredentialType,
         url: typing.Optional[str] = OMIT,
-        prompt: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -1401,6 +1400,7 @@ class Skyvern:
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
         bitwarden_collection_id: typing.Optional[str] = OMIT,
         bitwarden_item_id: typing.Optional[str] = OMIT,
@@ -1421,13 +1421,10 @@ class Skyvern:
             Where to get the credential from
 
         url : typing.Optional[str]
-            Website url
-
-        prompt : typing.Optional[str]
-            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
+            Website URL
 
         webhook_url : typing.Optional[str]
-            Webhook URL to send login status updates
+            Webhook URL to send status updates
 
         proxy_location : typing.Optional[ProxyLocation]
             Proxy location to use
@@ -1452,6 +1449,9 @@ class Skyvern:
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
+
+        prompt : typing.Optional[str]
+            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
 
         credential_id : typing.Optional[str]
             ID of the Skyvern credential to use for login.
@@ -1502,7 +1502,6 @@ class Skyvern:
         _response = self._raw_client.login(
             credential_type=credential_type,
             url=url,
-            prompt=prompt,
             webhook_url=webhook_url,
             proxy_location=proxy_location,
             totp_identifier=totp_identifier,
@@ -1512,6 +1511,7 @@ class Skyvern:
             browser_address=browser_address,
             extra_http_headers=extra_http_headers,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            prompt=prompt,
             credential_id=credential_id,
             bitwarden_collection_id=bitwarden_collection_id,
             bitwarden_item_id=bitwarden_item_id,
@@ -1521,6 +1521,110 @@ class Skyvern:
             azure_vault_username_key=azure_vault_username_key,
             azure_vault_password_key=azure_vault_password_key,
             azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.download_files(
+            navigation_goal="navigation_goal",
+        )
+        """
+        _response = self._raw_client.download_files(
+            navigation_goal=navigation_goal,
+            url=url,
+            webhook_url=webhook_url,
+            proxy_location=proxy_location,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
+            browser_address=browser_address,
+            extra_http_headers=extra_http_headers,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            download_suffix=download_suffix,
+            download_timeout=download_timeout,
+            max_steps_per_run=max_steps_per_run,
             request_options=request_options,
         )
         return _response.data
@@ -3317,7 +3421,6 @@ class AsyncSkyvern:
         *,
         credential_type: SkyvernSchemasRunBlocksCredentialType,
         url: typing.Optional[str] = OMIT,
-        prompt: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -3327,6 +3430,7 @@ class AsyncSkyvern:
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
         bitwarden_collection_id: typing.Optional[str] = OMIT,
         bitwarden_item_id: typing.Optional[str] = OMIT,
@@ -3347,13 +3451,10 @@ class AsyncSkyvern:
             Where to get the credential from
 
         url : typing.Optional[str]
-            Website url
-
-        prompt : typing.Optional[str]
-            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
+            Website URL
 
         webhook_url : typing.Optional[str]
-            Webhook URL to send login status updates
+            Webhook URL to send status updates
 
         proxy_location : typing.Optional[ProxyLocation]
             Proxy location to use
@@ -3378,6 +3479,9 @@ class AsyncSkyvern:
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
+
+        prompt : typing.Optional[str]
+            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
 
         credential_id : typing.Optional[str]
             ID of the Skyvern credential to use for login.
@@ -3436,7 +3540,6 @@ class AsyncSkyvern:
         _response = await self._raw_client.login(
             credential_type=credential_type,
             url=url,
-            prompt=prompt,
             webhook_url=webhook_url,
             proxy_location=proxy_location,
             totp_identifier=totp_identifier,
@@ -3446,6 +3549,7 @@ class AsyncSkyvern:
             browser_address=browser_address,
             extra_http_headers=extra_http_headers,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            prompt=prompt,
             credential_id=credential_id,
             bitwarden_collection_id=bitwarden_collection_id,
             bitwarden_item_id=bitwarden_item_id,
@@ -3455,6 +3559,118 @@ class AsyncSkyvern:
             azure_vault_username_key=azure_vault_username_key,
             azure_vault_password_key=azure_vault_password_key,
             azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.download_files(
+                navigation_goal="navigation_goal",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.download_files(
+            navigation_goal=navigation_goal,
+            url=url,
+            webhook_url=webhook_url,
+            proxy_location=proxy_location,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
+            browser_address=browser_address,
+            extra_http_headers=extra_http_headers,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            download_suffix=download_suffix,
+            download_timeout=download_timeout,
+            max_steps_per_run=max_steps_per_run,
             request_options=request_options,
         )
         return _response.data

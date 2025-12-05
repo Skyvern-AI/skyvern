@@ -1,4 +1,6 @@
 (function () {
+  console.log("[SYS] undecorate: evaluated");
+
   const followers = document.querySelectorAll("#__skyvern_mouse_follower");
 
   for (const follower of followers) {

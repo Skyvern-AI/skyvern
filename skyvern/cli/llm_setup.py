@@ -1,3 +1,5 @@
+import os
+
 from dotenv import load_dotenv, set_key
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -51,6 +53,7 @@ def update_or_add_env_var(key: str, value: str) -> None:
 
     load_dotenv(env_path)
     set_key(env_path, key, value)
+    os.environ[key] = value
 
 
 def setup_llm_providers() -> None:

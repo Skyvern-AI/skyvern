@@ -11,6 +11,7 @@ export interface TaskV2Block {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    next_loop_on_failure?: boolean;
     prompt: string;
     url?: string;
     totp_verification_url?: string;

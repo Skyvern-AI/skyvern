@@ -257,6 +257,7 @@ class AgentDB:
         retry_index: int,
         organization_id: str | None = None,
         status: StepStatus = StepStatus.created,
+        created_by: str | None = None,
     ) -> Step:
         try:
             async with self.Session() as session:
@@ -266,6 +267,7 @@ class AgentDB:
                     retry_index=retry_index,
                     status=status,
                     organization_id=organization_id,
+                    created_by=created_by,
                 )
                 session.add(new_step)
                 await session.commit()
@@ -595,6 +597,7 @@ class AgentDB:
         incremental_output_tokens: int | None = None,
         incremental_reasoning_tokens: int | None = None,
         incremental_cached_tokens: int | None = None,
+        created_by: str | None = None,
     ) -> Step:
         try:
             async with self.Session() as session:
@@ -627,6 +630,8 @@ class AgentDB:
                         step.reasoning_token_count = incremental_reasoning_tokens + (step.reasoning_token_count or 0)
                     if incremental_cached_tokens is not None:
                         step.cached_token_count = incremental_cached_tokens + (step.cached_token_count or 0)
+                    if created_by is not None:
+                        step.created_by = created_by
 
                     await session.commit()
                     updated_step = await self.get_step(step_id, organization_id)
@@ -1222,6 +1227,7 @@ class AgentDB:
         workflow_run_block_id: str | None = None,
         thought_id: str | None = None,
         task_v2_id: str | None = None,
+        limit: int | None = None,
     ) -> list[Artifact]:
         try:
             async with self.Session() as session:
@@ -1249,6 +1255,9 @@ class AgentDB:
                     )
 
                 query = query.order_by(ArtifactModel.created_at.desc())
+
+                if limit is not None:
+                    query = query.limit(limit)
 
                 artifacts = (await session.scalars(query)).all()
                 LOG.debug("Artifacts fetched", count=len(artifacts))
@@ -1281,6 +1290,7 @@ class AgentDB:
             workflow_run_block_id=workflow_run_block_id,
             thought_id=thought_id,
             task_v2_id=task_v2_id,
+            limit=1,
         )
         return artifacts[0] if artifacts else None
 
@@ -4159,10 +4169,7 @@ class AgentDB:
             async with self.Session() as session:
                 open_first = case(
                     (
-                        and_(
-                            PersistentBrowserSessionModel.started_at.is_not(None),
-                            PersistentBrowserSessionModel.completed_at.is_(None),
-                        ),
+                        PersistentBrowserSessionModel.status == "running",
                         0,  # open
                     ),
                     else_=1,  # not open
@@ -4173,7 +4180,7 @@ class AgentDB:
                     .filter_by(organization_id=organization_id)
                     .filter_by(deleted_at=None)
                     .filter(
-                        PersistentBrowserSessionModel.created_at > datetime.utcnow() - timedelta(hours=lookback_hours)
+                        PersistentBrowserSessionModel.created_at > (datetime.utcnow() - timedelta(hours=lookback_hours))
                     )
                     .order_by(
                         open_first.asc(),  # open sessions first
@@ -4462,6 +4469,8 @@ class AgentDB:
                     )
                 ).first()
                 if persistent_browser_session:
+                    if persistent_browser_session.completed_at:
+                        return PersistentBrowserSession.model_validate(persistent_browser_session)
                     persistent_browser_session.completed_at = datetime.utcnow()
                     await session.commit()
                     await session.refresh(persistent_browser_session)

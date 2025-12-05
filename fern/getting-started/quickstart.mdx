@@ -50,7 +50,7 @@ You can also run browser tasks locally with Python code, with a little bit of se
         from skyvern import Skyvern
         import asyncio
         
-        skyvern = Skyvern()        
+        skyvern = Skyvern(api_key="YOUR_LOCAL_API_KEY")
         
         asyncio.run(skyvern.run_task(prompt="Find the top post on hackernews today"))
 	    ```

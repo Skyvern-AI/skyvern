@@ -206,6 +206,9 @@ class BlockYAML(BaseModel, abc.ABC):
     )
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
+    # Only valid for blocks inside a for loop block
+    # Whether to continue to the next iteration when the block fails
+    next_loop_on_failure: bool = False
 
     @field_validator("label")
     @classmethod
