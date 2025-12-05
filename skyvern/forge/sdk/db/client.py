@@ -4464,6 +4464,8 @@ class AgentDB:
                     )
                 ).first()
                 if persistent_browser_session:
+                    if persistent_browser_session.completed_at:
+                        return PersistentBrowserSession.model_validate(persistent_browser_session)
                     persistent_browser_session.completed_at = datetime.utcnow()
                     await session.commit()
                     await session.refresh(persistent_browser_session)
