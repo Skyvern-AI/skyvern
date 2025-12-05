@@ -231,14 +231,14 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         self,
         prompt: str,
         schema: dict[str, Any] | None = None,
-        llm_key: str | None = None,
+        model: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
-        """Send a prompt to the LLM and get a response based on the provided schema via API call"""
+        """Send a prompt to the LLM and get a response based on the provided schema via API call."""
 
         LOG.info(
             "AI prompt",
             prompt=prompt,
-            llm_key=llm_key,
+            model=model,
             workflow_run_id=self._browser.workflow_run_id,
         )
 
@@ -247,7 +247,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             action=RunSdkActionRequestAction_Prompt(
                 prompt=prompt,
                 schema=schema,
-                llm_key=llm_key,
+                model=model,
             ),
             browser_session_id=self._browser.browser_session_id,
             browser_address=self._browser.browser_address,

@@ -688,7 +688,7 @@ class SkyvernPage(Page):
         self,
         prompt: str,
         schema: dict[str, Any] | None = None,
-        llm_key: str | None = None,
+        model: dict[str, Any] | str | None = None,
     ) -> dict[str, Any] | list | str | None:
         """Send a prompt to the LLM and get a response based on the provided schema.
 
@@ -699,7 +699,9 @@ class SkyvernPage(Page):
             prompt: The prompt to send to the LLM
             schema: Optional JSON schema to structure the response. If provided, the LLM response
                    will be validated against this schema.
-            llm_key: Optional LLM key to use for this specific prompt (e.g., "ANTHROPIC/CLAUDE_3_5_SONNET")
+            model: Optional model configuration. Can be either:
+                   - A dict with model configuration (e.g., {"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048})
+                   - A string with just the model name (e.g., "gemini-2.5-flash-lite")
 
         Returns:
             LLM response structured according to the schema if provided, or unstructured response otherwise.
@@ -724,7 +726,13 @@ class SkyvernPage(Page):
             # Returns: {'result_number': 4, 'confidence': 1}
             ```
         """
-        return await self._ai.ai_prompt(prompt=prompt, schema=schema, llm_key=llm_key)
+        normalized_model: dict[str, Any] | None = None
+        if isinstance(model, str):
+            normalized_model = {"model_name": model}
+        elif model is not None:
+            normalized_model = model
+
+        return await self._ai.ai_prompt(prompt=prompt, schema=schema, model=normalized_model)
 
     @overload
     def locator(

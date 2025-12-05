@@ -83,7 +83,7 @@ class SkyvernPageAi(Protocol):
         self,
         prompt: str,
         schema: dict[str, Any] | None = None,
-        llm_key: str | None = None,
+        model: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         """Send a prompt to the LLM and get a response based on the provided schema."""
         ...

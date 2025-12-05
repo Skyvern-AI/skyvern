@@ -209,7 +209,7 @@ async def run_sdk_action(
             prompt_result = await page_ai.ai_prompt(
                 prompt=action.prompt,
                 schema=action.schema,
-                llm_key=action.llm_key,
+                model=action.model,
             )
             result = prompt_result
         await app.DATABASE.update_task(
