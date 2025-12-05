@@ -2,7 +2,6 @@ import asyncio
 import os
 import pathlib
 import tempfile
-from typing import Any, overload
 from typing import Any
 
 import httpx
