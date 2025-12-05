@@ -77,8 +77,14 @@ def quickstart(
 
         # Start services
         if run_local:
-            console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
-            asyncio.run(start_services(server_only=server_only))
+            start_now = typer.confirm("\nDo you want to start Skyvern services now?", default=True)
+            if start_now:
+                console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
+                asyncio.run(start_services(server_only=server_only))
+            else:
+                console.print(
+                    "\n[yellow]Skipping service startup. You can start services later with 'skyvern run all'[/yellow]"
+                )
 
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Quickstart process interrupted by user.[/bold yellow]")
