@@ -10,6 +10,7 @@ import structlog
 from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
+from litellm.types.router import AllowedFailsPolicy
 from litellm.utils import CustomStreamWrapper, ModelResponse
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
@@ -26,7 +27,13 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
-from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMConfig, LLMRouterConfig, dummy_llm_api_handler
+from skyvern.forge.sdk.api.llm.models import (
+    LLMAllowedFailsPolicy,
+    LLMAPIHandler,
+    LLMConfig,
+    LLMRouterConfig,
+    dummy_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, llm_messages_builder_with_history, parse_api_response
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -101,6 +108,20 @@ def _log_vertex_cache_hit_if_needed(
             cache_key=context.vertex_cache_key,
             cache_variant=context.vertex_cache_variant,
         )
+
+
+def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> AllowedFailsPolicy | None:
+    if policy is None:
+        return None
+
+    return AllowedFailsPolicy(
+        BadRequestErrorAllowedFails=policy.bad_request_error_allowed_fails,
+        AuthenticationErrorAllowedFails=policy.authentication_error_allowed_fails,
+        TimeoutErrorAllowedFails=policy.timeout_error_allowed_fails,
+        RateLimitErrorAllowedFails=policy.rate_limit_error_allowed_fails,
+        ContentPolicyViolationErrorAllowedFails=policy.content_policy_violation_error_allowed_fails,
+        InternalServerErrorAllowedFails=policy.internal_server_error_allowed_fails,
+    )
 
 
 class LLMAPIHandlerFactory:
@@ -310,7 +331,7 @@ class LLMAPIHandlerFactory:
             retry_after=llm_config.retry_delay_seconds,
             disable_cooldowns=llm_config.disable_cooldowns,
             allowed_fails=llm_config.allowed_fails,
-            allowed_fails_policy=llm_config.allowed_fails_policy,
+            allowed_fails_policy=_convert_allowed_fails_policy(llm_config.allowed_fails_policy),
             cooldown_time=llm_config.cooldown_time,
             set_verbose=(False if settings.is_cloud_environment() else llm_config.set_verbose),
             enable_pre_call_checks=True,
