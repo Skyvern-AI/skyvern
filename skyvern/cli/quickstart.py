@@ -9,7 +9,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Import console after skyvern.cli to ensure proper initialization
 from skyvern.cli.console import console
-from skyvern.cli.init_command import init  # init is used directly
+from skyvern.cli.init_command import init_env  # init is used directly
 from skyvern.cli.utils import start_services
 
 quickstart_app = typer.Typer(help="Quickstart command to set up and run Skyvern with one command.")
@@ -59,7 +59,7 @@ def quickstart(
     try:
         # Initialize Skyvern
         console.print("\n[bold blue]Initializing Skyvern...[/bold blue]")
-        run_local = init(no_postgres=no_postgres)
+        run_local = init_env(no_postgres=no_postgres)
 
         # Skip browser installation if requested
         if not skip_browser_install:

@@ -19,7 +19,7 @@ from .llm_setup import setup_llm_providers, update_or_add_env_var
 from .mcp import setup_local_organization, setup_mcp
 
 
-def init(
+def init_env(
     no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
 ) -> bool:
     """Interactive initialization command for Skyvern."""
