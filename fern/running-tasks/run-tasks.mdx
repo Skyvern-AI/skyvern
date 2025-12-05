@@ -131,7 +131,7 @@ For example, if you want to get the title, URL, and points of the top post on Ha
 ```python
 from skyvern import Skyvern
 
-skyvern = Skyvern()
+skyvern = Skyvern(api_key="YOUR_API_KEY")
 task = await skyvern.run_task(
     prompt="Find the top post on hackernews today",
     data_extraction_schema={
@@ -159,7 +159,7 @@ When you are sending a run task request the Skyvern service, you can set the `wa
 ```python
 from skyvern import Skyvern
 
-skyvern = Skyvern()
+skyvern = Skyvern(api_key="YOUR_API_KEY")
 task = await skyvern.run_task(
     prompt="Find the top post on hackernews today",
     # the request will be hanging until the task is done
@@ -173,7 +173,7 @@ Instead of waiting, you can also set the `webhook_url` in the run task request a
 ```python
 from skyvern import Skyvern
 
-skyvern = Skyvern()
+skyvern = Skyvern(api_key="YOUR_API_KEY")
 task = await skyvern.run_task(
     prompt="Find the top post on hackernews today",
     webhook_url="https://your-webhook-url.com",
