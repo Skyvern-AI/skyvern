@@ -25,7 +25,10 @@ import { errorMappingExampleValue } from "../types";
 import type { NavigationNode } from "./types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
-import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
+import {
+  getAvailableOutputParameterKeys,
+  isNodeInsideForLoop,
+} from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
@@ -37,6 +40,7 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 import { DisableCache } from "../DisableCache";
+import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
@@ -58,6 +62,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<NavigationNode["data"]>({ id, editable });
+  const isInsideForLoop = isNodeInsideForLoop(nodes, id);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -287,51 +292,32 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                       </div>
                     )}
                   </div>
-                  <Separator />
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Include Action History
-                      </Label>
-                      <HelpTooltip
-                        content={
-                          helpTooltips["navigation"][
-                            "includeActionHistoryInVerification"
-                          ]
-                        }
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={data.includeActionHistoryInVerification}
-                        onCheckedChange={(checked) => {
-                          update({
-                            includeActionHistoryInVerification: checked,
-                          });
-                        }}
-                      />
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Continue on Failure
-                      </Label>
-                      <HelpTooltip
-                        content={
-                          helpTooltips["navigation"]["continueOnFailure"]
-                        }
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={data.continueOnFailure}
-                        onCheckedChange={(checked) => {
-                          update({ continueOnFailure: checked });
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <BlockExecutionOptions
+                    continueOnFailure={data.continueOnFailure}
+                    nextLoopOnFailure={data.nextLoopOnFailure}
+                    includeActionHistoryInVerification={
+                      data.includeActionHistoryInVerification
+                    }
+                    editable={editable}
+                    isInsideForLoop={isInsideForLoop}
+                    blockType="navigation"
+                    showOptions={{
+                      continueOnFailure: true,
+                      nextLoopOnFailure: true,
+                      includeActionHistoryInVerification: true,
+                    }}
+                    onContinueOnFailureChange={(checked) => {
+                      update({ continueOnFailure: checked });
+                    }}
+                    onNextLoopOnFailureChange={(checked) => {
+                      update({ nextLoopOnFailure: checked });
+                    }}
+                    onIncludeActionHistoryInVerificationChange={(checked) => {
+                      update({
+                        includeActionHistoryInVerification: checked,
+                      });
+                    }}
+                  />
                   <DisableCache
                     disableCache={data.disableCache}
                     editable={editable}

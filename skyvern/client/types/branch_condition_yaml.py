@@ -4,23 +4,14 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .branch_criteria_yaml import BranchCriteriaYaml
 
 
-class ImprovePromptResponse(UniversalBaseModel):
-    error: typing.Optional[str] = pydantic.Field(default=None)
-    """
-    Error message if prompt improvement failed
-    """
-
-    improved: str = pydantic.Field()
-    """
-    The improved version of the prompt
-    """
-
-    original: str = pydantic.Field()
-    """
-    The original prompt provided for improvement
-    """
+class BranchConditionYaml(UniversalBaseModel):
+    criteria: typing.Optional[BranchCriteriaYaml] = None
+    next_block_label: typing.Optional[str] = None
+    description: typing.Optional[str] = None
+    is_default: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

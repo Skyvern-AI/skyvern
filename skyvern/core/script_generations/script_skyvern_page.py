@@ -27,7 +27,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.handler import ActionHandler, handle_complete_action
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 LOG = structlog.get_logger()
 
@@ -106,8 +106,7 @@ class ScriptSkyvernPage(SkyvernPage):
         # initialize browser state
         # TODO: add workflow_run_id or eventually script_id/script_run_id
         browser_state = await cls._get_or_create_browser_state(browser_session_id=browser_session_id)
-        return await scrape_website(
-            browser_state=browser_state,
+        return await browser_state.scrape_website(
             url="",
             cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
             scrape_exclude=app.scrape_exclude,

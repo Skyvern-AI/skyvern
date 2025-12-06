@@ -627,11 +627,14 @@ function BrowserStream({
           "source" in data &&
           typeof data.source === "string"
         ) {
+          const event = data as MessageInExfiltratedEvent;
+
           return {
             kind: "exfiltrated-event",
-            event_name: data.event_name,
-            params: data.params,
-            source: data.source,
+            event_name: event.event_name,
+            params: event.params,
+            source: event.source,
+            timestamp: event.timestamp,
           } as MessageInExfiltratedEvent;
         }
         break;
@@ -803,6 +806,7 @@ function BrowserStream({
                           if (!hasEvents) {
                             e.preventDefault();
                             recordingStore.setIsRecording(false);
+                            recordingStore.reset();
                           }
                         }}
                       >
@@ -826,6 +830,7 @@ function BrowserStream({
                             variant="destructive"
                             onClick={() => {
                               recordingStore.setIsRecording(false);
+                              recordingStore.reset();
                             }}
                           >
                             Cancel recording

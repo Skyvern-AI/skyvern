@@ -43,7 +43,7 @@ from skyvern.webeye.actions.actions import (
     VerificationCodeAction,
     WaitAction,
 )
-from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 LOG = structlog.get_logger()
 

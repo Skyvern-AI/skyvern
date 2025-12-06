@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-BlockMetadata = dict[str, str | int | float | bool | dict | list]
+BlockMetadata = dict[str, str | int | float | bool | dict | list | None]
 
 jinja_sandbox_env = SandboxedEnvironment()
 
@@ -296,7 +296,7 @@ class WorkflowRunContext:
         credential_item = await credential_service.get_credential_item(db_credential)
         credential = credential_item.credential
 
-        credential_totp_identifier = getattr(credential, "totp_identifier", None)
+        credential_totp_identifier = db_credential.totp_identifier or getattr(credential, "totp_identifier", None)
         if credential_totp_identifier:
             self.credential_totp_identifiers[parameter.key] = credential_totp_identifier
 

@@ -37,7 +37,7 @@ Laminar.initialize(disabled_instruments=set([Instruments.OPENAI]))
 # Configure LiteLLM to trace all LLM calls made by Skyvern
 litellm.callbacks = [LaminarLiteLLMCallback()]
 
-skyvern = Skyvern()
+skyvern = Skyvern(api_key="YOUR_API_KEY")
 
 async def main():
     task = await skyvern.run_task(

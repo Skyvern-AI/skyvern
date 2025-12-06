@@ -56,8 +56,8 @@ from skyvern.forge.sdk.api.files import (
     download_from_s3,
     get_path_for_workflow_download_directory,
 )
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
-from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
@@ -135,6 +135,10 @@ class Block(BaseModel, abc.ABC):
     model: dict[str, Any] | None = None
     disable_cache: bool = False
 
+    # Only valid for blocks inside a for loop block
+    # Whether to continue to the next iteration when the block fails
+    next_loop_on_failure: bool = False
+
     @property
     def override_llm_key(self) -> str | None:
         """
@@ -202,25 +206,50 @@ class Block(BaseModel, abc.ABC):
         )
 
     def format_block_parameter_template_from_workflow_run_context(
-        self, potential_template: str, workflow_run_context: WorkflowRunContext
+        self,
+        potential_template: str,
+        workflow_run_context: WorkflowRunContext,
+        *,
+        force_include_secrets: bool = False,
     ) -> str:
+        """
+        Format a template string using the workflow run context.
+
+        Security Note:
+        Real secret values are ONLY resolved for blocks that do NOT expose data to the LLM
+        (like HttpRequestBlock, CodeBlock), as determined by is_safe_block_for_secrets.
+        """
         if not potential_template:
             return potential_template
+
+        # Security: only allow real secret values for non-LLM blocks (HttpRequestBlock, CodeBlock)
+        is_safe_block_for_secrets = self.block_type in [BlockType.CODE, BlockType.HTTP_REQUEST]
 
         template = jinja_sandbox_env.from_string(potential_template)
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
-        if workflow_run_context.include_secrets_in_templates:
+
+        include_secrets = workflow_run_context.include_secrets_in_templates or force_include_secrets
+
+        # FORCE DISABLE if block is not safe (sends data to LLM)
+        if include_secrets and not is_safe_block_for_secrets:
+            include_secrets = False
+
+        if include_secrets:
             template_data.update(workflow_run_context.secrets)
 
             # Create easier-to-access entries for credentials
             # Look for credential parameters and create real_username/real_password entries
             # First collect all credential parameters to avoid modifying dict during iteration
             credential_params = []
-            for key, value in template_data.items():
+            for key, value in list(template_data.items()):
                 if isinstance(value, dict) and "context" in value and "username" in value and "password" in value:
                     credential_params.append((key, value))
+                elif is_safe_block_for_secrets and isinstance(value, str):
+                    secret_value = workflow_run_context.get_original_secret_value_or_none(value)
+                    if secret_value is not None:
+                        template_data[key] = secret_value
 
             # Now add the real_username/real_password entries
             for key, value in credential_params:
@@ -234,6 +263,17 @@ class Block(BaseModel, abc.ABC):
                 # Add easier-to-access entries
                 template_data[f"{key}_real_username"] = real_username
                 template_data[f"{key}_real_password"] = real_password
+
+                if is_safe_block_for_secrets:
+                    resolved_credential = value.copy()
+                    for credential_field, credential_placeholder in value.items():
+                        if credential_field == "context":
+                            continue
+                        secret_value = workflow_run_context.get_original_secret_value_or_none(credential_placeholder)
+                        if secret_value is not None:
+                            resolved_credential[credential_field] = secret_value
+                    resolved_credential.pop("context", None)
+                    template_data[key] = resolved_credential
 
         if self.label in template_data:
             current_value = template_data[self.label]
@@ -806,7 +846,21 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_output = TaskOutput.from_task(updated_task, downloaded_files)
+                task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                    organization_id=workflow_run.organization_id,
+                    task_id=updated_task.task_id,
+                )
+                workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                )
+
+                task_output = TaskOutput.from_task(
+                    updated_task,
+                    downloaded_files,
+                    task_screenshots=task_screenshots,
+                    workflow_screenshots=workflow_screenshots,
+                )
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
                 return await self.build_block_result(
@@ -867,7 +921,21 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_output = TaskOutput.from_task(updated_task, downloaded_files)
+                task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                    organization_id=workflow_run.organization_id,
+                    task_id=updated_task.task_id,
+                )
+                workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                )
+
+                task_output = TaskOutput.from_task(
+                    updated_task,
+                    downloaded_files,
+                    task_screenshots=task_screenshots,
+                    workflow_screenshots=workflow_screenshots,
+                )
                 LOG.warning(
                     f"Task failed with status {updated_task.status}{retry_message}",
                     task_id=updated_task.task_id,
@@ -1386,15 +1454,15 @@ class ForLoopBlock(Block):
                         organization_id=organization_id,
                     )
                     block_outputs.append(failure_block_result)
-                    # If continue_on_failure is False, stop the entire loop
-                    if not self.continue_on_failure:
+                    # If next_loop_on_failure is False, stop the entire loop
+                    if not self.next_loop_on_failure:
                         outputs_with_loop_values.append(each_loop_output_values)
                         return LoopBlockExecutedResult(
                             outputs_with_loop_values=outputs_with_loop_values,
                             block_outputs=block_outputs,
                             last_block=current_block,
                         )
-                    # If continue_on_failure is True, break out of the block loop for this iteration
+                    # If next_loop_on_failure is True, break out of the block loop for this iteration
                     break
 
                 if block_output.status == BlockStatus.canceled:
@@ -1412,7 +1480,12 @@ class ForLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if not block_output.success and not loop_block.continue_on_failure:
+                if (
+                    not block_output.success
+                    and not loop_block.continue_on_failure
+                    and not loop_block.next_loop_on_failure
+                    and not self.next_loop_on_failure
+                ):
                     LOG.info(
                         f"ForLoopBlock: Encountered a failure processing block {block_idx} during loop {loop_idx}, terminating early",
                         block_outputs=block_outputs,
@@ -1421,6 +1494,7 @@ class ForLoopBlock(Block):
                         loop_over_value=loop_over_value,
                         loop_block_continue_on_failure=loop_block.continue_on_failure,
                         failure_reason=block_output.failure_reason,
+                        next_loop_on_failure=loop_block.next_loop_on_failure or self.next_loop_on_failure,
                     )
                     outputs_with_loop_values.append(each_loop_output_values)
                     return LoopBlockExecutedResult(
@@ -1428,6 +1502,20 @@ class ForLoopBlock(Block):
                         block_outputs=block_outputs,
                         last_block=current_block,
                     )
+
+                if block_output.success or loop_block.continue_on_failure:
+                    continue
+
+                if loop_block.next_loop_on_failure or self.next_loop_on_failure:
+                    LOG.info(
+                        f"ForLoopBlock: Block {block_idx} during loop {loop_idx} failed but will continue to next iteration",
+                        block_outputs=block_outputs,
+                        loop_idx=loop_idx,
+                        block_idx=block_idx,
+                        loop_over_value=loop_over_value,
+                        loop_block_next_loop_on_failure=loop_block.next_loop_on_failure or self.next_loop_on_failure,
+                    )
+                    break
 
             outputs_with_loop_values.append(each_loop_output_values)
 
@@ -3493,6 +3581,13 @@ class TaskV2Block(Block):
     max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
     max_steps: int = settings.MAX_STEPS_PER_TASK_V2
 
+    def _resolve_totp_identifier(self, workflow_run_context: WorkflowRunContext) -> str | None:
+        if self.totp_identifier:
+            return self.totp_identifier
+        if workflow_run_context.credential_totp_identifiers:
+            return next(iter(workflow_run_context.credential_totp_identifiers.values()), None)
+        return None
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -3535,7 +3630,7 @@ class TaskV2Block(Block):
             # Use the resolved values directly
             resolved_prompt = self.prompt
             resolved_url = self.url
-            resolved_totp_identifier = self.totp_identifier
+            resolved_totp_identifier = self._resolve_totp_identifier(workflow_run_context)
             resolved_totp_verification_url = self.totp_verification_url
 
         except Exception as e:
@@ -3637,12 +3732,23 @@ class TaskV2Block(Block):
 
         # If continue_on_failure is True, we treat the block as successful even if the task failed
         # This allows the workflow to continue execution despite this block's failure
+        task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+            organization_id=organization_id,
+            task_v2_id=task_v2.observer_cruise_id,
+        )
+        workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+
         task_v2_output = {
             "task_id": task_v2.observer_cruise_id,
             "status": task_v2.status,
             "summary": task_v2.summary,
             "extracted_information": result_dict,
             "failure_reason": failure_reason,
+            "task_screenshots": task_screenshots,
+            "workflow_screenshots": workflow_screenshots,
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, task_v2_output)
         return await self.build_block_result(
@@ -3687,21 +3793,25 @@ class HttpRequestBlock(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         """Format template parameters in the block fields"""
+        template_kwargs = {"force_include_secrets": True}
+
         if self.url:
-            self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+            self.url = self.format_block_parameter_template_from_workflow_run_context(
+                self.url, workflow_run_context, **template_kwargs
+            )
 
         if self.body:
             # If body is provided as a template string, try to parse it as JSON
             for key, value in self.body.items():
                 if isinstance(value, str):
                     self.body[key] = self.format_block_parameter_template_from_workflow_run_context(
-                        value, workflow_run_context
+                        value, workflow_run_context, **template_kwargs
                     )
 
         if self.headers:
             for key, value in self.headers.items():
                 self.headers[key] = self.format_block_parameter_template_from_workflow_run_context(
-                    value, workflow_run_context
+                    value, workflow_run_context, **template_kwargs
                 )
 
     def validate_url(self, url: str) -> bool:
@@ -3934,6 +4044,40 @@ class BranchCriteria(BaseModel, abc.ABC):
         return False
 
 
+def _evaluate_truthy_string(value: str) -> bool:
+    """
+    Evaluate a string as a boolean, handling common truthy/falsy representations.
+
+    Truthy: "true", "True", "TRUE", "1", "yes", "y", "on", non-zero numbers
+    Falsy: "", "false", "False", "FALSE", "0", "no", "n", "off", "null", "None", whitespace-only
+
+    For other strings, use Python's default bool() behavior (non-empty = truthy).
+    """
+    if not value or not value.strip():
+        return False
+
+    normalized = value.strip().lower()
+
+    # Explicit falsy values
+    if normalized in ("false", "0", "no", "n", "off", "null", "none"):
+        return False
+
+    # Explicit truthy values
+    if normalized in ("true", "1", "yes", "y", "on"):
+        return True
+
+    # Try to parse as a number
+    try:
+        num = float(normalized)
+        return num != 0.0
+    except ValueError:
+        pass
+
+    # For any other non-empty string, consider it truthy
+    # This allows expressions like "{{ 'some text' }}" to be truthy
+    return True
+
+
 class JinjaBranchCriteria(BranchCriteria):
     """Jinja2-templated branch criteria (only supported criteria type for now)."""
 
@@ -3963,13 +4107,14 @@ class JinjaBranchCriteria(BranchCriteria):
                 msg=str(exc),
             ) from exc
 
-        return bool(rendered)
+        return _evaluate_truthy_string(rendered)
 
 
 class BranchCondition(BaseModel):
     """Represents a single conditional branch edge within a ConditionalBlock."""
 
-    criteria: BranchCriteria | None = None
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    criteria: BranchCriteriaTypeVar | None = None
     next_block_label: str | None = None
     description: str | None = None
     is_default: bool = False
@@ -4023,12 +4168,98 @@ class ConditionalBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         """
-        Placeholder execute implementation.
+        Evaluate conditional branches and determine next block to execute.
 
-        Conditional block execution will be implemented alongside the DAG workflow
-        engine refactor (see branching workflow spec).
+        Returns a BlockResult with branch metadata in the output_parameter_value.
         """
-        raise NotImplementedError("Conditional block execution is handled by the DAG engine.")
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+        evaluation_context = BranchEvaluationContext(
+            workflow_run_context=workflow_run_context,
+            block_label=self.label,
+        )
+
+        matched_branch = None
+        failure_reason: str | None = None
+
+        for idx, branch in enumerate(self.ordered_branches):
+            if branch.criteria is None:
+                continue
+            try:
+                if await branch.criteria.evaluate(evaluation_context):
+                    matched_branch = branch
+                    LOG.info(
+                        "Conditional branch matched",
+                        block_label=self.label,
+                        branch_index=idx,
+                        next_block_label=branch.next_block_label,
+                    )
+                    break
+            except Exception as exc:
+                failure_reason = f"Failed to evaluate branch {idx} for {self.label}: {str(exc)}"
+                LOG.error(
+                    "Failed to evaluate conditional branch",
+                    block_label=self.label,
+                    branch_index=idx,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                break
+
+        if matched_branch is None and failure_reason is None:
+            matched_branch = self.get_default_branch()
+
+        matched_index = self.ordered_branches.index(matched_branch) if matched_branch in self.ordered_branches else None
+        next_block_label = matched_branch.next_block_label if matched_branch else None
+
+        branch_metadata: BlockMetadata = {
+            "branch_taken": next_block_label,
+            "branch_index": matched_index,
+            "branch_description": matched_branch.description if matched_branch else None,
+            "criteria_type": matched_branch.criteria.criteria_type
+            if matched_branch and matched_branch.criteria
+            else None,
+            "criteria_expression": matched_branch.criteria.expression
+            if matched_branch and matched_branch.criteria
+            else None,
+            "next_block_label": next_block_label,
+        }
+
+        status = BlockStatus.completed
+        success = True
+
+        if failure_reason:
+            status = BlockStatus.failed
+            success = False
+        elif matched_branch is None:
+            failure_reason = "No conditional branch matched and no default branch configured"
+            status = BlockStatus.failed
+            success = False
+
+        if workflow_run_context:
+            workflow_run_context.update_block_metadata(self.label, branch_metadata)
+            try:
+                await self.record_output_parameter_value(
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    value=branch_metadata,
+                )
+            except Exception as exc:
+                LOG.warning(
+                    "Failed to record branch metadata as output parameter",
+                    workflow_run_id=workflow_run_id,
+                    block_label=self.label,
+                    error=str(exc),
+                )
+
+        block_result = await self.build_block_result(
+            success=success,
+            failure_reason=failure_reason,
+            output_parameter_value=branch_metadata,
+            status=status,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+        return block_result
 
     @property
     def ordered_branches(self) -> list[BranchCondition]:
@@ -4085,3 +4316,7 @@ BlockSubclasses = Union[
     HttpRequestBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
+
+
+BranchCriteriaSubclasses = Union[JinjaBranchCriteria]
+BranchCriteriaTypeVar = Annotated[BranchCriteriaSubclasses, Field(discriminator="criteria_type")]

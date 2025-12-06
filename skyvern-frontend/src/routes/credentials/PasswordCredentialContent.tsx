@@ -15,7 +15,7 @@ import {
   EyeOpenIcon,
   MobileIcon,
 } from "@radix-ui/react-icons";
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 type Props = {
@@ -25,6 +25,7 @@ type Props = {
     password: string;
     totp: string;
     totp_type: "authenticator" | "email" | "text" | "none";
+    totp_identifier: string;
   };
   onChange: (values: {
     name: string;
@@ -32,27 +33,80 @@ type Props = {
     password: string;
     totp: string;
     totp_type: "authenticator" | "email" | "text" | "none";
+    totp_identifier: string;
   }) => void;
 };
 
-function PasswordCredentialContent({
-  values: { name, username, password, totp, totp_type },
-  onChange,
-}: Props) {
+function PasswordCredentialContent({ values, onChange }: Props) {
+  const { name, username, password, totp, totp_type, totp_identifier } = values;
   const [totpMethod, setTotpMethod] = useState<
     "authenticator" | "email" | "text"
-  >("authenticator");
+  >(
+    totp_type === "email" || totp_type === "text" ? totp_type : "authenticator",
+  );
   const [showPassword, setShowPassword] = useState(false);
+  const prevUsernameRef = useRef(username);
+  const prevTotpMethodRef = useRef<typeof totpMethod>(totpMethod);
+  const totpIdentifierLabel =
+    totpMethod === "text"
+      ? "TOTP Identifier (Phone)"
+      : "TOTP Identifier (Username or Email)";
+  const totpIdentifierHelper =
+    totpMethod === "text"
+      ? "Phone number used to receive 2FA codes."
+      : "Email address used to receive 2FA codes.";
+
+  const updateValues = useCallback(
+    (updates: Partial<Props["values"]>): void => {
+      onChange({
+        name,
+        username,
+        password,
+        totp,
+        totp_type,
+        totp_identifier,
+        ...updates,
+      });
+    },
+    [name, onChange, password, totp, totp_identifier, totp_type, username],
+  );
+
+  useEffect(() => {
+    const prevUsername = prevUsernameRef.current;
+    const prevMethod = prevTotpMethodRef.current;
+
+    if (totpMethod === "email") {
+      const usernameChanged = username !== prevUsername;
+      const identifierBlank = totp_identifier.trim() === "";
+      const identifierMatchedPrevUsername = totp_identifier === prevUsername;
+      const methodChanged = prevMethod !== "email";
+
+      if (
+        identifierBlank ||
+        methodChanged ||
+        (usernameChanged && identifierMatchedPrevUsername)
+      ) {
+        updateValues({ totp_identifier: username });
+      }
+    }
+
+    if (totpMethod === "text" && prevMethod !== "text") {
+      const wasAutoFilled = totp_identifier === prevUsername;
+      if (wasAutoFilled || totp_identifier.trim() === "") {
+        updateValues({ totp_identifier: "" });
+      }
+    }
+
+    prevUsernameRef.current = username;
+    prevTotpMethodRef.current = totpMethod;
+  }, [totpMethod, totp_identifier, updateValues, username]);
 
   // Update totp_type when totpMethod changes
   const handleTotpMethodChange = (
     method: "authenticator" | "email" | "text",
   ) => {
     setTotpMethod(method);
-    onChange({
-      name,
-      username,
-      password,
+    updateValues({
       totp: method === "authenticator" ? totp : "",
       totp_type: method,
     });
@@ -69,33 +123,17 @@ function PasswordCredentialContent({
         </div>
         <Input
           value={name}
-          onChange={(e) =>
-            onChange({
-              name: e.target.value,
-              username,
-              password,
-              totp,
-              totp_type,
-            })
-          }
+          onChange={(e) => updateValues({ name: e.target.value })}
         />
       </div>
       <Separator />
       <div className="flex items-center gap-12">
         <div className="w-40 shrink-0">
-          <Label>Username or email</Label>
+          <Label>Username or Email</Label>
         </div>
         <Input
           value={username}
-          onChange={(e) =>
-            onChange({
-              name,
-              username: e.target.value,
-              password,
-              totp,
-              totp_type,
-            })
-          }
+          onChange={(e) => updateValues({ username: e.target.value })}
         />
       </div>
       <div className="flex items-center gap-12">
@@ -107,15 +145,7 @@ function PasswordCredentialContent({
             className="pr-9"
             type={showPassword ? "text" : "password"}
             value={password}
-            onChange={(e) =>
-              onChange({
-                name,
-                username,
-                totp,
-                password: e.target.value,
-                totp_type,
-              })
-            }
+            onChange={(e) => updateValues({ password: e.target.value })}
           />
           <div
             className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center"
@@ -183,27 +213,46 @@ function PasswordCredentialContent({
                 </div>
               </div>
               {(totpMethod === "text" || totpMethod === "email") && (
-                <p className="text-sm text-slate-400">
-                  <Link
-                    to="https://meetings.hubspot.com/skyvern/demo"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="underline underline-offset-2"
-                  >
-                    Contact us to set up two-factor authentication in workflows
-                  </Link>{" "}
-                  or{" "}
-                  <Link
-                    to="https://www.skyvern.com/docs/running-tasks/advanced-features#time-based-one-time-password-totp"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="underline underline-offset-2"
-                  >
-                    see our documentation on how to set up two-factor
-                    authentication in workflows
-                  </Link>{" "}
-                  to get started.
-                </p>
+                <>
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-12">
+                      <div className="w-40 shrink-0">
+                        <Label>{totpIdentifierLabel}</Label>
+                      </div>
+                      <Input
+                        value={totp_identifier}
+                        onChange={(e) =>
+                          updateValues({ totp_identifier: e.target.value })
+                        }
+                      />
+                    </div>
+                    <p className="mt-1 text-sm text-slate-400">
+                      {totpIdentifierHelper}
+                    </p>
+                  </div>
+                  <p className="text-sm text-slate-400">
+                    <Link
+                      to="https://meetings.hubspot.com/skyvern/demo"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline underline-offset-2"
+                    >
+                      Contact us to set up two-factor authentication in
+                      workflows
+                    </Link>{" "}
+                    or{" "}
+                    <Link
+                      to="https://www.skyvern.com/docs/running-tasks/advanced-features#time-based-one-time-password-totp"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline underline-offset-2"
+                    >
+                      see our documentation on how to set up two-factor
+                      authentication in workflows
+                    </Link>{" "}
+                    to get started.
+                  </p>
+                </>
               )}
               {totpMethod === "authenticator" && (
                 <div className="space-y-4">
@@ -215,15 +264,7 @@ function PasswordCredentialContent({
                     </div>
                     <Input
                       value={totp}
-                      onChange={(e) =>
-                        onChange({
-                          name,
-                          username,
-                          password,
-                          totp: e.target.value,
-                          totp_type,
-                        })
-                      }
+                      onChange={(e) => updateValues({ totp: e.target.value })}
                     />
                   </div>
                   <p className="text-sm text-slate-400">

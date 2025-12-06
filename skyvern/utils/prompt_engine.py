@@ -7,7 +7,7 @@ from skyvern.constants import DEFAULT_MAX_TOKENS
 from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.utils.token_counter import count_tokens
-from skyvern.webeye.scraper.scraper import ElementTreeBuilder
+from skyvern.webeye.scraper.scraped_page import ElementTreeBuilder
 
 LOG = structlog.get_logger()
 

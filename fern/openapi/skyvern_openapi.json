@@ -1310,11 +1310,11 @@
               }
             }
           },
-          "400": {
-            "description": "Folder not found"
-          },
           "404": {
             "description": "Workflow not found"
+          },
+          "400": {
+            "description": "Folder not found"
           },
           "422": {
             "description": "Validation Error",
@@ -1620,11 +1620,11 @@
               }
             }
           },
-          "400": {
-            "description": "Timeline not available for this run type"
-          },
           "404": {
             "description": "Run not found"
+          },
+          "400": {
+            "description": "Timeline not available for this run type"
           },
           "422": {
             "description": "Validation Error",
@@ -2266,11 +2266,11 @@
               }
             }
           },
-          "403": {
-            "description": "Unauthorized - Invalid or missing authentication"
-          },
           "404": {
             "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
           },
           "422": {
             "description": "Validation Error",
@@ -2830,6 +2830,83 @@
               {
                 "sdk": "typescript",
                 "code": "// Login with password saved in 1Password\nimport { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"onepassword\",\n    onepassword_vault_id: \"1PASSWORD VAULT ID\",\n    onepassword_item_id: \"1PASSWORD ITEM ID\"\n});\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/run/tasks/download_files": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "File Download Task",
+        "description": "Download a file from a website by navigating and clicking download buttons",
+        "operationId": "download_files_v1_run_tasks_download_files_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DownloadFilesRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "download_files",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.download_files(\n    url=\"https://example.com/downloads\",\n    navigation_goal=\"Navigate to the downloads page and click the 'Download PDF' button\",\n    download_suffix=\"report.pdf\"\n)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.downloadFiles({\n    url: \"https://example.com/downloads\",\n    navigation_goal: \"Navigate to the downloads page and click the 'Download PDF' button\",\n    download_suffix: \"report.pdf\"\n});\n"
               }
             ]
           }
@@ -3837,6 +3914,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -4121,6 +4203,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "url": {
             "anyOf": [
@@ -5180,7 +5267,62 @@
           "criteria": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/BranchCriteria"
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/JinjaBranchCriteria"
+                  }
+                ],
+                "discriminator": {
+                  "propertyName": "criteria_type",
+                  "mapping": {
+                    "jinja2_template": "#/components/schemas/JinjaBranchCriteria"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Criteria"
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "is_default": {
+            "type": "boolean",
+            "title": "Is Default",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "BranchCondition",
+        "description": "Represents a single conditional branch edge within a ConditionalBlock."
+      },
+      "BranchConditionYAML": {
+        "properties": {
+          "criteria": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BranchCriteriaYAML"
               },
               {
                 "type": "null"
@@ -5216,14 +5358,15 @@
           }
         },
         "type": "object",
-        "title": "BranchCondition",
-        "description": "Represents a single conditional branch edge within a ConditionalBlock."
+        "title": "BranchConditionYAML"
       },
-      "BranchCriteria": {
+      "BranchCriteriaYAML": {
         "properties": {
           "criteria_type": {
             "type": "string",
-            "title": "Criteria Type"
+            "const": "jinja2_template",
+            "title": "Criteria Type",
+            "default": "jinja2_template"
           },
           "expression": {
             "type": "string",
@@ -5243,11 +5386,9 @@
         },
         "type": "object",
         "required": [
-          "criteria_type",
           "expression"
         ],
-        "title": "BranchCriteria",
-        "description": "Abstract interface describing how a branch condition should be evaluated."
+        "title": "BranchCriteriaYAML"
       },
       "BrowserProfile": {
         "properties": {
@@ -5558,7 +5699,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -5641,6 +5782,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "code": {
@@ -5756,6 +5902,11 @@
             ],
             "title": "Model"
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "code": {
             "type": "string",
             "title": "Code"
@@ -5832,6 +5983,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "branch_conditions": {
             "items": {
               "$ref": "#/components/schemas/BranchCondition"
@@ -5847,6 +6003,67 @@
         ],
         "title": "ConditionalBlock",
         "description": "Branching block that selects the next block label based on list-ordered conditions."
+      },
+      "ConditionalBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "conditional",
+            "title": "Block Type",
+            "default": "conditional"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "branch_conditions": {
+            "items": {
+              "$ref": "#/components/schemas/BranchConditionYAML"
+            },
+            "type": "array",
+            "title": "Branch Conditions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "ConditionalBlockYAML"
       },
       "ContextParameter": {
         "properties": {
@@ -6036,8 +6253,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440,
-                "minimum": 5
+                "maximum": 1440.0,
+                "minimum": 5.0
               },
               {
                 "type": "null"
@@ -6434,6 +6651,185 @@
         "title": "DeployScriptRequest",
         "description": "Request model for deploying a script with updated files."
       },
+      "DownloadFilesRequest": {
+        "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url",
+            "description": "Website URL"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url",
+            "description": "Webhook URL to send status updates"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Proxy location to use"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url",
+            "description": "TOTP URL to fetch one-time passwords"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id",
+            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`",
+            "examples": [
+              "pbs_123456"
+            ]
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of a browser profile to reuse for this run"
+          },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "The CDP address for the task.",
+            "examples": [
+              "http://127.0.0.1:9222",
+              "ws://127.0.0.1:9222/devtools/browser/1234567890"
+            ]
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers",
+            "description": "Additional HTTP headers to include in requests"
+          },
+          "max_screenshot_scrolling_times": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolling Times",
+            "description": "Maximum number of times to scroll for screenshots"
+          },
+          "navigation_goal": {
+            "type": "string",
+            "title": "Navigation Goal",
+            "description": "Instructions for navigating to and downloading the file"
+          },
+          "download_suffix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Suffix",
+            "description": "Suffix or complete filename for the downloaded file"
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout",
+            "description": "Timeout in seconds for the download operation"
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run",
+            "description": "Maximum number of steps to execute"
+          }
+        },
+        "type": "object",
+        "required": [
+          "navigation_goal"
+        ],
+        "title": "DownloadFilesRequest"
+      },
       "DownloadToS3Block": {
         "properties": {
           "label": {
@@ -6482,6 +6878,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "url": {
@@ -6538,6 +6939,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "url": {
             "type": "string",
@@ -6681,6 +7087,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -6962,6 +7373,11 @@
             ],
             "title": "Model"
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "data_extraction_goal": {
             "type": "string",
             "title": "Data Extraction Goal"
@@ -7096,6 +7512,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -7382,6 +7803,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "navigation_goal": {
             "type": "string",
@@ -7692,6 +8118,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "file_url": {
             "type": "string",
             "title": "File Url"
@@ -7762,6 +8193,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "file_url": {
             "type": "string",
@@ -7856,6 +8292,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "storage_type": {
@@ -7999,6 +8440,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "storage_type": {
             "$ref": "#/components/schemas/FileStorageType",
@@ -8279,6 +8725,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "loop_blocks": {
             "items": {
               "oneOf": [
@@ -8508,6 +8959,11 @@
             ],
             "title": "Model"
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "loop_blocks": {
             "items": {
               "anyOf": [
@@ -8573,6 +9029,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ConditionalBlockYAML"
                 }
               ]
             },
@@ -8730,6 +9189,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "method": {
@@ -8892,6 +9356,11 @@
             ],
             "title": "Model"
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "method": {
             "type": "string",
             "title": "Method",
@@ -9013,6 +9482,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -9344,6 +9818,11 @@
             ],
             "title": "Model"
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "instructions": {
             "type": "string",
             "title": "Instructions",
@@ -9561,12 +10040,43 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
         "title": "InputTextAction",
         "description": "Input text action parameters."
+      },
+      "JinjaBranchCriteria": {
+        "properties": {
+          "criteria_type": {
+            "type": "string",
+            "const": "jinja2_template",
+            "title": "Criteria Type",
+            "default": "jinja2_template"
+          },
+          "expression": {
+            "type": "string",
+            "title": "Expression"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "expression"
+        ],
+        "title": "JinjaBranchCriteria",
+        "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
       },
       "LocateElementAction": {
         "properties": {
@@ -9635,6 +10145,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -9922,6 +10437,11 @@
             ],
             "title": "Model"
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "url": {
             "anyOf": [
               {
@@ -10060,10 +10580,6 @@
       },
       "LoginRequest": {
         "properties": {
-          "credential_type": {
-            "$ref": "#/components/schemas/skyvern__schemas__run_blocks__CredentialType",
-            "description": "Where to get the credential from"
-          },
           "url": {
             "anyOf": [
               {
@@ -10074,19 +10590,7 @@
               }
             ],
             "title": "Url",
-            "description": "Website url"
-          },
-          "prompt": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prompt",
-            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
+            "description": "Website URL"
           },
           "webhook_url": {
             "anyOf": [
@@ -10098,7 +10602,7 @@
               }
             ],
             "title": "Webhook Url",
-            "description": "Webhook URL to send login status updates"
+            "description": "Webhook URL to send status updates"
           },
           "proxy_location": {
             "anyOf": [
@@ -10204,6 +10708,22 @@
             ],
             "title": "Max Screenshot Scrolling Times",
             "description": "Maximum number of times to scroll for screenshots"
+          },
+          "credential_type": {
+            "$ref": "#/components/schemas/skyvern__schemas__run_blocks__CredentialType",
+            "description": "Where to get the credential from"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
           },
           "credential_id": {
             "anyOf": [
@@ -10371,6 +10891,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -10651,6 +11176,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "navigation_goal": {
             "type": "string",
@@ -11206,6 +11736,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "file_url": {
             "type": "string",
             "title": "File Url"
@@ -11273,6 +11808,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "file_url": {
             "type": "string",
@@ -11734,7 +12274,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -11789,6 +12329,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "smtp_host": {
@@ -11887,6 +12432,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "smtp_host_secret_parameter_key": {
             "type": "string",
@@ -12257,6 +12807,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -12541,6 +13096,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "url": {
             "anyOf": [
@@ -13325,6 +13885,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "prompt": {
             "type": "string",
             "title": "Prompt"
@@ -13422,6 +13987,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "prompt": {
             "type": "string",
@@ -13531,6 +14101,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "llm_key": {
@@ -13668,6 +14243,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "llm_key": {
             "anyOf": [
@@ -14044,7 +14624,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -14099,6 +14679,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "path": {
@@ -14161,6 +14746,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "path": {
             "anyOf": [
@@ -14228,6 +14818,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -14509,6 +15104,11 @@
             ],
             "title": "Model"
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "url": {
             "type": "string",
             "title": "Url"
@@ -14533,8 +15133,8 @@
           },
           "confidence_float": {
             "type": "number",
-            "maximum": 1,
-            "minimum": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
             "title": "Confidence Float"
           }
         },
@@ -14594,6 +15194,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -14881,6 +15486,11 @@
             ],
             "title": "Model"
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -15026,6 +15636,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "wait_sec": {
             "type": "integer",
             "title": "Wait Sec"
@@ -15138,6 +15753,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "wait_sec": {
             "type": "integer",
@@ -15879,6 +16499,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ConditionalBlockYAML"
                 }
               ],
               "discriminator": {
@@ -15886,6 +16509,7 @@
                 "mapping": {
                   "action": "#/components/schemas/ActionBlockYAML",
                   "code": "#/components/schemas/CodeBlockYAML",
+                  "conditional": "#/components/schemas/ConditionalBlockYAML",
                   "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
                   "extraction": "#/components/schemas/ExtractionBlockYAML",
                   "file_download": "#/components/schemas/FileDownloadBlockYAML",

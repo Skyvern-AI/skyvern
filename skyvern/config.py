@@ -281,6 +281,13 @@ class Settings(BaseSettings):
     AZURE_GPT5_NANO_API_BASE: str | None = None
     AZURE_GPT5_NANO_API_VERSION: str = "2025-04-01-preview"
 
+    # AZURE gpt-5.1
+    ENABLE_AZURE_GPT5_1: bool = False
+    AZURE_GPT5_1_DEPLOYMENT: str = "gpt-5.1"
+    AZURE_GPT5_1_API_KEY: str | None = None
+    AZURE_GPT5_1_API_BASE: str | None = None
+    AZURE_GPT5_1_API_VERSION: str = "2025-04-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
@@ -339,6 +346,10 @@ class Settings(BaseSettings):
     AZURE_CLIENT_SECRET: str | None = None
     # The Azure Key Vault name to store credentials
     AZURE_CREDENTIAL_VAULT: str | None = None
+
+    # Custom Credential Service Settings
+    CUSTOM_CREDENTIAL_API_BASE_URL: str | None = None
+    CUSTOM_CREDENTIAL_API_TOKEN: str | None = None
 
     # Skyvern Auth Bitwarden Settings
     SKYVERN_AUTH_BITWARDEN_CLIENT_ID: str | None = None

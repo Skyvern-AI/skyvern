@@ -19,9 +19,9 @@ from .llm_setup import setup_llm_providers, update_or_add_env_var
 from .mcp import setup_local_organization, setup_mcp
 
 
-def init(
+def init_env(
     no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
-) -> None:
+) -> bool:
     """Interactive initialization command for Skyvern."""
     console.print(
         Panel(
@@ -104,7 +104,7 @@ def init(
             api_key = Prompt.ask("Please re-enter your Skyvern API key", password=True)
             if not api_key:
                 console.print("[bold red]Error: API key cannot be empty. Aborting initialization.[/bold red]")
-                return
+                return False
         update_or_add_env_var("SKYVERN_BASE_URL", base_url)
 
     analytics_id_input = Prompt.ask("Please enter your email for analytics (press enter to skip)", default="")
@@ -133,6 +133,8 @@ def init(
         console.print("\n🎉 [bold green]Skyvern setup complete![/bold green]")
         console.print("[bold]To start using Skyvern, run:[/bold]")
         console.print(Padding("skyvern run server", (1, 4), style="reverse green"))
+
+    return run_local
 
 
 def init_browser() -> None:

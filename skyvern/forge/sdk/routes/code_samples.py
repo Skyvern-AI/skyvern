@@ -160,6 +160,24 @@ await skyvern.login({
     onepassword_item_id: "1PASSWORD ITEM ID"
 });
 """
+DOWNLOAD_FILES_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+await skyvern.download_files(
+    url="https://example.com/downloads",
+    navigation_goal="Navigate to the downloads page and click the 'Download PDF' button",
+    download_suffix="report.pdf"
+)
+"""
+DOWNLOAD_FILES_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+await skyvern.downloadFiles({
+    url: "https://example.com/downloads",
+    navigation_goal: "Navigate to the downloads page and click the 'Download PDF' button",
+    download_suffix: "report.pdf"
+});
+"""
 
 # Workflows
 CREATE_WORKFLOW_CODE_SAMPLE_CURL = """curl -X POST https://api.skyvern.com/v1/workflows \

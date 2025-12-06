@@ -27,7 +27,8 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.webeye.actions import handler_utils
-from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
+from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
+from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()

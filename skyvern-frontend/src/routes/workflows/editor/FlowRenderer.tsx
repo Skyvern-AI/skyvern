@@ -324,6 +324,9 @@ function FlowRenderer({
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
   const saveWorkflow = useWorkflowSave({ status: "published" });
   const recordedBlocks = useRecordedBlocksStore((state) => state.blocks);
+  const recordedParameters = useRecordedBlocksStore(
+    (state) => state.parameters,
+  );
   const recordedInsertionPoint = useRecordedBlocksStore(
     (state) => state.insertionPoint,
   );
@@ -583,7 +586,8 @@ function FlowRenderer({
     doLayout(nodes, edges);
   }
 
-  // effect to add new blocks that were generated from a browser recording
+  // effect to add new blocks that were generated from a browser recording,
+  // along with any new parameters
   useEffect(() => {
     if (!recordedBlocks || !recordedInsertionPoint) {
       return;
@@ -657,6 +661,30 @@ function FlowRenderer({
 
     workflowChangesStore.setHasChanges(true);
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
+
+    const newParameters = Array<ParametersState[number]>();
+
+    for (const newParameter of recordedParameters ?? []) {
+      const exists = parameters.some((param) => param.key === newParameter.key);
+
+      if (!exists) {
+        newParameters.push({
+          key: newParameter.key,
+          parameterType: "workflow",
+          dataType: newParameter.workflow_parameter_type,
+          description: newParameter.description ?? null,
+          defaultValue: newParameter.default_value ?? "",
+        });
+      }
+    }
+
+    if (newParameters.length > 0) {
+      const workflowParametersStore = useWorkflowParametersStore.getState();
+      workflowParametersStore.setParameters([
+        ...workflowParametersStore.parameters,
+        ...newParameters,
+      ]);
+    }
 
     clearRecordedBlocks();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -835,22 +863,6 @@ function FlowRenderer({
             }
 
             onNodesChange(changes);
-
-            // NOTE: should no longer be needed (woot!) - delete if true (want real-world testing first)
-            // // only allow one update in _this_ render cycle
-            // if (onNodesChangeTimeoutRef.current === null) {
-            //   onNodesChange(changes);
-            //   onNodesChangeTimeoutRef.current = setTimeout(() => {
-            //     onNodesChangeTimeoutRef.current = null;
-            //   }, 0);
-            // } else {
-            //   // if we have an update in this render cycle already, then to
-            //   // prevent max recursion errors, defer the update to next render
-            //   // cycle
-            //   nextTick().then(() => {
-            //     onNodesChange(changes);
-            //   });
-            // }
           }}
           onEdgesChange={onEdgesChange}
           nodeTypes={nodeTypes}

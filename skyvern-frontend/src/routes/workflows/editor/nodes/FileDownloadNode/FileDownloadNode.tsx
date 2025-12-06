@@ -11,7 +11,6 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -22,7 +21,10 @@ import { helpTooltips, placeholders } from "../../helpContent";
 import { errorMappingExampleValue } from "../types";
 import type { FileDownloadNode } from "./types";
 import { AppNode } from "..";
-import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
+import {
+  getAvailableOutputParameterKeys,
+  isNodeInsideForLoop,
+} from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
@@ -37,6 +39,7 @@ import { useRerender } from "@/hooks/useRerender";
 import { BROWSER_DOWNLOAD_TIMEOUT_SECONDS } from "@/api/types";
 
 import { DisableCache } from "../DisableCache";
+import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 const urlTooltip =
@@ -65,6 +68,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<FileDownloadNode["data"]>({ id, editable });
+  const isInsideForLoop = isNodeInsideForLoop(nodes, id);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -279,25 +283,19 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       </div>
                     )}
                   </div>
-                  <Separator />
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Continue on Failure
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["download"]["continueOnFailure"]}
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={data.continueOnFailure}
-                        onCheckedChange={(checked) => {
-                          update({ continueOnFailure: checked });
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <BlockExecutionOptions
+                    continueOnFailure={data.continueOnFailure}
+                    nextLoopOnFailure={data.nextLoopOnFailure}
+                    editable={editable}
+                    isInsideForLoop={isInsideForLoop}
+                    blockType="download"
+                    onContinueOnFailureChange={(checked) => {
+                      update({ continueOnFailure: checked });
+                    }}
+                    onNextLoopOnFailureChange={(checked) => {
+                      update({ nextLoopOnFailure: checked });
+                    }}
+                  />
                   <DisableCache
                     disableCache={data.disableCache}
                     editable={editable}

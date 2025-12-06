@@ -7,10 +7,6 @@ from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Set, 
 
 import pydantic
 
-from .datetime_utils import serialize_datetime
-from .serialization import convert_and_respect_annotation_metadata
-from typing_extensions import TypeAlias
-
 IS_PYDANTIC_V2 = pydantic.VERSION.startswith("2.")
 
 if IS_PYDANTIC_V2:
@@ -32,6 +28,9 @@ else:
     from pydantic.typing import is_literal_type as is_literal_type  # type: ignore[no-redef]
     from pydantic.typing import is_union as is_union  # type: ignore[no-redef]
 
+from .datetime_utils import serialize_datetime
+from .serialization import convert_and_respect_annotation_metadata
+from typing_extensions import TypeAlias
 
 T = TypeVar("T")
 Model = TypeVar("Model", bound=pydantic.BaseModel)
@@ -248,7 +247,7 @@ def _get_model_fields(model: Type["Model"]) -> Mapping[str, PydanticField]:
 def _get_field_default(field: PydanticField) -> Any:
     try:
         value = field.get_default()  # type: ignore[union-attr]
-    except Exception:
+    except:
         value = field.default
     if IS_PYDANTIC_V2:
         from pydantic_core import PydanticUndefined

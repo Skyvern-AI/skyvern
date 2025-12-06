@@ -11,6 +11,7 @@ from ..core.serialization import FieldMetadata
 from .action_block_data_schema import ActionBlockDataSchema
 from .action_block_parameters_item import ActionBlockParametersItem
 from .aws_secret_parameter import AwsSecretParameter
+from .branch_condition import BranchCondition
 from .code_block_parameters_item import CodeBlockParametersItem
 from .extraction_block_data_schema import ExtractionBlockDataSchema
 from .extraction_block_parameters_item import ExtractionBlockParametersItem
@@ -41,10 +42,12 @@ from .wait_block_parameters_item import WaitBlockParametersItem
 class WorkflowDefinitionBlocksItem_Action(UniversalBaseModel):
     block_type: typing.Literal["action"] = "action"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -62,7 +65,6 @@ class WorkflowDefinitionBlocksItem_Action(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -80,12 +82,35 @@ class WorkflowDefinitionBlocksItem_Action(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_Code(UniversalBaseModel):
     block_type: typing.Literal["code"] = "code"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     code: str
     parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class WorkflowDefinitionBlocksItem_Conditional(UniversalBaseModel):
+    block_type: typing.Literal["conditional"] = "conditional"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    output_parameter: OutputParameter
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    branch_conditions: typing.Optional[typing.List[BranchCondition]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -100,10 +125,12 @@ class WorkflowDefinitionBlocksItem_Code(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_DownloadToS3(UniversalBaseModel):
     block_type: typing.Literal["download_to_s3"] = "download_to_s3"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     url: str
 
     if IS_PYDANTIC_V2:
@@ -119,10 +146,12 @@ class WorkflowDefinitionBlocksItem_DownloadToS3(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_Extraction(UniversalBaseModel):
     block_type: typing.Literal["extraction"] = "extraction"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -140,7 +169,6 @@ class WorkflowDefinitionBlocksItem_Extraction(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -158,10 +186,12 @@ class WorkflowDefinitionBlocksItem_Extraction(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_FileDownload(UniversalBaseModel):
     block_type: typing.Literal["file_download"] = "file_download"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -179,7 +209,6 @@ class WorkflowDefinitionBlocksItem_FileDownload(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -197,10 +226,12 @@ class WorkflowDefinitionBlocksItem_FileDownload(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_FileUpload(UniversalBaseModel):
     block_type: typing.Literal["file_upload"] = "file_upload"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
     aws_access_key_id: typing.Optional[str] = None
@@ -224,10 +255,12 @@ class WorkflowDefinitionBlocksItem_FileUpload(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_FileUrlParser(UniversalBaseModel):
     block_type: typing.Literal["file_url_parser"] = "file_url_parser"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     file_type: FileType
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
@@ -245,10 +278,12 @@ class WorkflowDefinitionBlocksItem_FileUrlParser(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_ForLoop(UniversalBaseModel):
     block_type: typing.Literal["for_loop"] = "for_loop"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     loop_blocks: typing.List["ForLoopBlockLoopBlocksItem"]
     loop_over: typing.Optional[ForLoopBlockLoopOver] = None
     loop_variable_reference: typing.Optional[str] = None
@@ -271,10 +306,12 @@ from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa:
 class WorkflowDefinitionBlocksItem_GotoUrl(UniversalBaseModel):
     block_type: typing.Literal["goto_url"] = "goto_url"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: str
     title: typing.Optional[str] = None
@@ -292,7 +329,6 @@ class WorkflowDefinitionBlocksItem_GotoUrl(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -310,10 +346,12 @@ class WorkflowDefinitionBlocksItem_GotoUrl(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_HttpRequest(UniversalBaseModel):
     block_type: typing.Literal["http_request"] = "http_request"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     method: typing.Optional[str] = None
     url: typing.Optional[str] = None
     headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
@@ -335,10 +373,12 @@ class WorkflowDefinitionBlocksItem_HttpRequest(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_HumanInteraction(UniversalBaseModel):
     block_type: typing.Literal["human_interaction"] = "human_interaction"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -356,7 +396,6 @@ class WorkflowDefinitionBlocksItem_HumanInteraction(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -382,10 +421,12 @@ class WorkflowDefinitionBlocksItem_HumanInteraction(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_Login(UniversalBaseModel):
     block_type: typing.Literal["login"] = "login"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -403,7 +444,6 @@ class WorkflowDefinitionBlocksItem_Login(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -421,10 +461,12 @@ class WorkflowDefinitionBlocksItem_Login(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_Navigation(UniversalBaseModel):
     block_type: typing.Literal["navigation"] = "navigation"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -442,7 +484,6 @@ class WorkflowDefinitionBlocksItem_Navigation(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -460,10 +501,12 @@ class WorkflowDefinitionBlocksItem_Navigation(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_PdfParser(UniversalBaseModel):
     block_type: typing.Literal["pdf_parser"] = "pdf_parser"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
 
@@ -480,10 +523,12 @@ class WorkflowDefinitionBlocksItem_PdfParser(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_SendEmail(UniversalBaseModel):
     block_type: typing.Literal["send_email"] = "send_email"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     smtp_host: AwsSecretParameter
     smtp_port: AwsSecretParameter
     smtp_username: AwsSecretParameter
@@ -507,10 +552,12 @@ class WorkflowDefinitionBlocksItem_SendEmail(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_Task(UniversalBaseModel):
     block_type: typing.Literal["task"] = "task"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -528,7 +575,6 @@ class WorkflowDefinitionBlocksItem_Task(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -546,10 +592,12 @@ class WorkflowDefinitionBlocksItem_Task(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_TaskV2(UniversalBaseModel):
     block_type: typing.Literal["task_v2"] = "task_v2"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     prompt: str
     url: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
@@ -570,10 +618,12 @@ class WorkflowDefinitionBlocksItem_TaskV2(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_TextPrompt(UniversalBaseModel):
     block_type: typing.Literal["text_prompt"] = "text_prompt"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     llm_key: typing.Optional[str] = None
     prompt: str
     parameters: typing.Optional[typing.List[TextPromptBlockParametersItem]] = None
@@ -592,10 +642,12 @@ class WorkflowDefinitionBlocksItem_TextPrompt(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_UploadToS3(UniversalBaseModel):
     block_type: typing.Literal["upload_to_s3"] = "upload_to_s3"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
@@ -611,10 +663,12 @@ class WorkflowDefinitionBlocksItem_UploadToS3(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_Validation(UniversalBaseModel):
     block_type: typing.Literal["validation"] = "validation"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -632,7 +686,6 @@ class WorkflowDefinitionBlocksItem_Validation(UniversalBaseModel):
     download_suffix: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -650,10 +703,12 @@ class WorkflowDefinitionBlocksItem_Validation(UniversalBaseModel):
 class WorkflowDefinitionBlocksItem_Wait(UniversalBaseModel):
     block_type: typing.Literal["wait"] = "wait"
     label: str
+    next_block_label: typing.Optional[str] = None
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     wait_sec: int
     parameters: typing.Optional[typing.List[WaitBlockParametersItem]] = None
 
@@ -672,6 +727,7 @@ from .context_parameter import ContextParameter  # noqa: E402, F401, I001
 WorkflowDefinitionBlocksItem = typing.Union[
     WorkflowDefinitionBlocksItem_Action,
     WorkflowDefinitionBlocksItem_Code,
+    WorkflowDefinitionBlocksItem_Conditional,
     WorkflowDefinitionBlocksItem_DownloadToS3,
     WorkflowDefinitionBlocksItem_Extraction,
     WorkflowDefinitionBlocksItem_FileDownload,

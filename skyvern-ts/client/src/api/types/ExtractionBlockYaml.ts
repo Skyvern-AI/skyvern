@@ -3,9 +3,13 @@
 import type * as Skyvern from "../index.js";
 
 export interface ExtractionBlockYaml {
+    /** Author-facing identifier; must be unique per workflow. */
     label: string;
+    /** Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]. */
+    next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     data_extraction_goal: string;
     url?: string;
     title?: string;
@@ -14,7 +18,6 @@ export interface ExtractionBlockYaml {
     max_retries?: number;
     max_steps_per_run?: number;
     parameter_keys?: string[];
-    cache_actions?: boolean;
     disable_cache?: boolean;
 }
 

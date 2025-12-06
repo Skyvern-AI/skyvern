@@ -3,8 +3,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Type, TypeVar
 
 import structlog
-from litellm import ConfigDict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.errors.errors import UserDefinedError
 from skyvern.webeye.actions.action_types import ActionType

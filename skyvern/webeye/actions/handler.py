@@ -102,16 +102,14 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
-from skyvern.webeye.scraper.scraper import (
+from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
     ElementTreeFormat,
-    IncrementalScrapePage,
     ScrapedPage,
-    hash_element,
     json_to_html,
-    trim_element_tree,
 )
+from skyvern.webeye.scraper.scraper import IncrementalScrapePage, hash_element, trim_element_tree
 from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElement, SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
 

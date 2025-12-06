@@ -38,6 +38,8 @@ import { CurlImportDialog } from "./CurlImportDialog";
 import { QuickHeadersDialog } from "./QuickHeadersDialog";
 import { MethodBadge, UrlValidator, RequestPreview } from "./HttpUtils";
 import { useRerender } from "@/hooks/useRerender";
+import { useRecordingStore } from "@/store/useRecordingStore";
+import { cn } from "@/util/utils";
 
 const httpMethods = [
   "GET",
@@ -111,12 +113,17 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
   );
 
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+  const recordingStore = useRecordingStore();
 
   const showBodyEditor =
     data.method !== "GET" && data.method !== "HEAD" && data.method !== "DELETE";
 
   return (
-    <div>
+    <div
+      className={cn({
+        "pointer-events-none opacity-50": recordingStore.isRecording,
+      })}
+    >
       <Handle
         type="source"
         position={Position.Bottom}
@@ -390,6 +397,10 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
               <li>
                 Use "Quick Headers" in the headers section to add common
                 authentication and content headers
+              </li>
+              <li>
+                Pass a credential/secret parameter and reference it in headers
+                or body with {"{{ my_credential.password }}"}
               </li>
               <li>
                 The request will return response data including status, headers,

@@ -237,6 +237,29 @@ export interface AzureClientSecretCredentialResponse {
   token: AzureOrganizationAuthToken;
 }
 
+export interface CustomCredentialServiceConfig {
+  api_base_url: string;
+  api_token: string;
+}
+
+export interface CustomCredentialServiceOrganizationAuthToken {
+  id: string;
+  organization_id: string;
+  token: string; // JSON string containing CustomCredentialServiceConfig
+  created_at: string;
+  modified_at: string;
+  token_type: string;
+  valid: boolean;
+}
+
+export interface CreateCustomCredentialServiceConfigRequest {
+  config: CustomCredentialServiceConfig;
+}
+
+export interface CustomCredentialServiceConfigResponse {
+  token: CustomCredentialServiceOrganizationAuthToken;
+}
+
 // TODO complete this
 export const ActionTypes = {
   InputText: "input_text",
@@ -507,6 +530,7 @@ export type PasswordCredential = {
   password: string;
   totp: string | null;
   totp_type: "authenticator" | "email" | "text" | "none";
+  totp_identifier?: string | null;
 };
 
 export type CreditCardCredential = {

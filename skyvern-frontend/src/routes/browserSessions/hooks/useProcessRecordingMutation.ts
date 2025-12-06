@@ -1,28 +1,28 @@
+import { useParams } from "react-router-dom";
 import { useMutation } from "@tanstack/react-query";
 
-// import { getClient } from "@/api/AxiosClient";
+import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
-// import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-// import { type MessageInExfiltratedEvent } from "@/store/useRecordingStore";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import {
-  type ActionBlock,
-  type WorkflowBlock,
-} from "@/routes/workflows/types/workflowTypes";
+import { type WorkflowBlock } from "@/routes/workflows/types/workflowTypes";
+import { type WorkflowParameter } from "@/routes/workflows/types/workflowTypes";
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const FAIL_QUITE_NO_EVENTS = "FAIL-QUIET:NO-EVENTS" as const;
+const FAIL_QUIET_NO_EVENTS = "FAIL-QUIET:NO-EVENTS" as const;
 
 const useProcessRecordingMutation = ({
   browserSessionId,
   onSuccess,
 }: {
   browserSessionId: string | null;
-  onSuccess?: (workflowBlocks: Array<WorkflowBlock>) => void;
+  onSuccess?: (args: {
+    blocks: Array<WorkflowBlock>;
+    parameters: Array<WorkflowParameter>;
+  }) => void;
 }) => {
-  // const credentialGetter = useCredentialGetter();
+  const credentialGetter = useCredentialGetter();
   const recordingStore = useRecordingStore();
+  const { workflowPermanentId } = useParams();
 
   const processRecordingMutation = useMutation({
     mutationFn: async () => {
@@ -32,97 +32,64 @@ const useProcessRecordingMutation = ({
         );
       }
 
+      if (!workflowPermanentId) {
+        throw new Error(
+          "Cannot process recording without a valid workflow permanent ID.",
+        );
+      }
+
       const eventCount = recordingStore.getEventCount();
 
       if (eventCount === 0) {
-        throw new Error(FAIL_QUITE_NO_EVENTS);
+        throw new Error(FAIL_QUIET_NO_EVENTS);
       }
 
       // (this flushes any pending events)
       const compressedChunks = await recordingStore.getCompressedChunks();
 
       // TODO: Replace this mock with actual API call when endpoint is ready
-      // const client = await getClient(credentialGetter, "sans-api-v1");
-      // return client
-      //   .post<
-      //     { compressed_chunks: string[] },
-      //     { data: Array<WorkflowBlock> }
-      //   >(`/browser_sessions/${browserSessionId}/process_recording`, {
-      //     compressed_chunks: compressedChunks,
-      //   })
-      //   .then((response) => response.data);
-
-      // Mock response with 2-second delay
-      console.log(
-        `Processing ${eventCount} events in ${compressedChunks.length} compressed chunks`,
-      );
-      await sleep(2000);
-
-      // Return mock workflow blocks with two ActionBlocks
-      const mockWorkflowBlocks: Array<WorkflowBlock> = [
-        {
-          block_type: "action",
-          label: "action_1",
-          title: "Enter search term",
-          navigation_goal: "Enter 'foo' in the search field",
-          url: null,
-          error_code_mapping: null,
-          parameters: [],
-          engine: null,
-          continue_on_failure: false,
-          output_parameter: {
-            parameter_type: "output",
-            key: "action_1_output",
-            description: null,
-            output_parameter_id: "mock-output-1",
-            workflow_id: browserSessionId || "mock-workflow-id",
-            created_at: new Date().toISOString(),
-            modified_at: new Date().toISOString(),
-            deleted_at: null,
-          },
-          model: null,
-        } satisfies ActionBlock,
-        {
-          block_type: "action",
-          label: "action_2",
-          title: "Click search",
-          navigation_goal: "Click the search button",
-          url: null,
-          error_code_mapping: null,
-          parameters: [],
-          engine: null,
-          continue_on_failure: false,
-          output_parameter: {
-            parameter_type: "output",
-            key: "action_2_output",
-            description: null,
-            output_parameter_id: "mock-output-2",
-            workflow_id: browserSessionId || "mock-workflow-id",
-            created_at: new Date().toISOString(),
-            modified_at: new Date().toISOString(),
-            deleted_at: null,
-          },
-          model: null,
-        } satisfies ActionBlock,
-      ];
-      return mockWorkflowBlocks;
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return client
+        .post<
+          { compressed_chunks: string[] },
+          {
+            data: {
+              blocks: Array<WorkflowBlock>;
+              parameters: Array<WorkflowParameter>;
+            };
+          }
+        >(`/browser_sessions/${browserSessionId}/process_recording`, {
+          compressed_chunks: compressedChunks,
+          workflow_permanent_id: workflowPermanentId,
+        })
+        .then((response) => ({
+          blocks: response.data.blocks,
+          parameters: response.data.parameters,
+        }));
     },
-    onSuccess: (workflowBlocks) => {
-      // Clear events after successful flush
+    onSuccess: ({ blocks, parameters }) => {
       recordingStore.clear();
 
-      toast({
-        variant: "success",
-        title: "Recording Processed",
-        description: "The recording has been successfully processed.",
-      });
+      if (blocks && blocks.length > 0) {
+        toast({
+          variant: "success",
+          title: "Recording Processed",
+          description: "The recording has been successfully processed.",
+        });
 
-      if (workflowBlocks) {
-        onSuccess?.(workflowBlocks);
+        onSuccess?.({ blocks, parameters: parameters });
+
+        return;
       }
+
+      toast({
+        variant: "warning",
+        title: "Recording Processed (No Blocks)",
+        description: "No blocks could be created from the recording.",
+      });
     },
     onError: (error) => {
-      if (error instanceof Error && error.message === FAIL_QUITE_NO_EVENTS) {
+      if (error instanceof Error && error.message === FAIL_QUIET_NO_EVENTS) {
         return;
       }
 

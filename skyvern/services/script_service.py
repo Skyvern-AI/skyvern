@@ -61,7 +61,7 @@ from skyvern.schemas.scripts import (
     ScriptStatus,
 )
 from skyvern.schemas.workflows import BlockStatus, BlockType, FileStorageType, FileType
-from skyvern.webeye.scraper.scraper import ElementTreeFormat
+from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
@@ -398,6 +398,7 @@ async def _create_workflow_block_run_and_task(
     url: str | None = None,
     label: str | None = None,
     model: dict[str, Any] | None = None,
+    created_by: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Create a workflow block run and optionally a task if workflow_run_id is available in context.
@@ -460,6 +461,7 @@ async def _create_workflow_block_run_and_task(
                 retry_index=0,
                 organization_id=organization_id,
                 status=StepStatus.running,
+                created_by=created_by,
             )
             step_id = step.step_id
             # reset the action order to 0
@@ -610,7 +612,21 @@ async def _update_workflow_block(
             except asyncio.TimeoutError:
                 LOG.warning("Timeout getting downloaded files", task_id=task_id)
 
-            task_output = TaskOutput.from_task(updated_task, downloaded_files)
+            task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                organization_id=context.organization_id,
+                task_id=task_id,
+            )
+            workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                workflow_run_id=context.workflow_run_id,
+                organization_id=context.organization_id,
+            )
+
+            task_output = TaskOutput.from_task(
+                updated_task,
+                downloaded_files,
+                task_screenshots=task_screenshots,
+                workflow_screenshots=workflow_screenshots,
+            )
             final_output = task_output.model_dump()
             step_for_billing: Step | None = None
             if step_id:
@@ -1334,6 +1350,7 @@ async def run_task(
             url=url,
             label=cache_key,
             model=model,
+            created_by="script",
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -1419,6 +1436,7 @@ async def download(
             url=url,
             label=cache_key,
             model=model,
+            created_by="script",
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -1499,6 +1517,7 @@ async def action(
             url=url,
             label=cache_key,
             model=model,
+            created_by="script",
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
@@ -1578,8 +1597,14 @@ async def login(
             url=url,
             label=cache_key,
             model=model,
+            created_by="script",
         )
         prompt = _render_template_with_label(prompt, cache_key)
+        if totp_url:
+            totp_url = _render_template_with_label(totp_url, cache_key)
+        if totp_identifier:
+            totp_identifier = _render_template_with_label(totp_identifier, cache_key)
+
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1655,6 +1680,7 @@ async def extract(
             url=url,
             label=cache_key,
             model=model,
+            created_by="script",
         )
         prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext

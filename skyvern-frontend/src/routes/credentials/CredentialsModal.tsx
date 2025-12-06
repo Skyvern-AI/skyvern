@@ -28,6 +28,7 @@ const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   password: "",
   totp: "",
   totp_type: "none" as "none" | "authenticator" | "email" | "text",
+  totp_identifier: "",
 };
 
 const CREDIT_CARD_CREDENTIAL_INITIAL_VALUES = {
@@ -141,6 +142,7 @@ function CredentialsModal({ onCredentialCreated }: Props) {
       const username = passwordCredentialValues.username.trim();
       const password = passwordCredentialValues.password.trim();
       const totp = passwordCredentialValues.totp.trim();
+      const totpIdentifier = passwordCredentialValues.totp_identifier.trim();
 
       if (username === "" || password === "") {
         toast({
@@ -158,6 +160,7 @@ function CredentialsModal({ onCredentialCreated }: Props) {
           password,
           totp: totp === "" ? null : totp,
           totp_type: passwordCredentialValues.totp_type,
+          totp_identifier: totpIdentifier === "" ? null : totpIdentifier,
         },
       });
     } else if (type === CredentialModalTypes.CREDIT_CARD) {
