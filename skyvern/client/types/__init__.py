@@ -314,6 +314,7 @@ if typing.TYPE_CHECKING:
         RunSdkActionRequestAction_AiUploadFile,
         RunSdkActionRequestAction_Extract,
         RunSdkActionRequestAction_LocateElement,
+        RunSdkActionRequestAction_Prompt,
     )
     from .run_sdk_action_response import RunSdkActionResponse
     from .run_status import RunStatus
@@ -813,6 +814,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "RunSdkActionRequestAction_AiUploadFile": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_Extract": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_LocateElement": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_Prompt": ".run_sdk_action_request_action",
     "RunSdkActionResponse": ".run_sdk_action_response",
     "RunStatus": ".run_status",
     "Script": ".script",
@@ -1317,6 +1319,7 @@ __all__ = [
     "RunSdkActionRequestAction_AiUploadFile",
     "RunSdkActionRequestAction_Extract",
     "RunSdkActionRequestAction_LocateElement",
+    "RunSdkActionRequestAction_Prompt",
     "RunSdkActionResponse",
     "RunStatus",
     "Script",
