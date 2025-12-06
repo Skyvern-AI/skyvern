@@ -63,14 +63,14 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
               </button>
             </DialogTrigger>
           </TooltipTrigger>
-          <TooltipContent>Delete Folder</TooltipContent>
+          <TooltipContent>폴더 삭제</TooltipContent>
         </Tooltip>
       </TooltipProvider>
       <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
         <DialogHeader>
-          <DialogTitle>Delete Folder: {folderTitle}</DialogTitle>
+          <DialogTitle>폴더 삭제: {folderTitle}</DialogTitle>
           <DialogDescription>
-            Choose how you want to delete this folder.
+            이 폴더를 삭제하는 방법을 선택하세요.
           </DialogDescription>
         </DialogHeader>
         <RadioGroup
@@ -82,7 +82,7 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
           <div className="flex items-center space-x-2">
             <RadioGroupItem value="folder_only" id="folder_only" />
             <Label htmlFor="folder_only" className="font-normal">
-              Delete folder only (workflows will be unassigned)
+              폴더만 삭제 (워크플로우는 폴더 지정 해제됨)
             </Label>
           </div>
           <div className="flex items-center space-x-2">
@@ -91,13 +91,13 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
               id="folder_and_workflows"
             />
             <Label htmlFor="folder_and_workflows" className="font-normal">
-              Delete folder and all workflows inside it
+              폴더와 내부 워크플로우 모두 삭제
             </Label>
           </div>
         </RadioGroup>
         <DialogFooter>
           <DialogClose asChild>
-            <Button variant="secondary">Cancel</Button>
+            <Button variant="secondary">취소</Button>
           </DialogClose>
           <Button
             variant="destructive"
@@ -107,7 +107,7 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
             {isDeleteFolderPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
             )}
-            Delete
+            삭제
           </Button>
         </DialogFooter>
       </DialogContent>

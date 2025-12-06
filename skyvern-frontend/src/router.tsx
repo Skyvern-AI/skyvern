@@ -29,8 +29,14 @@ import { WorkflowRunCode } from "@/routes/workflows/workflowRun/WorkflowRunCode"
 import { DebugStoreProvider } from "@/store/DebugStoreContext";
 import { CredentialsPage } from "@/routes/credentials/CredentialsPage.tsx";
 import { RunRouter } from "@/routes/runs/RunRouter";
+import { LoginPage } from "@/routes/auth/LoginPage";
+import { AuthGuard } from "@/routes/auth/AuthGuard";
 
 const router = createBrowserRouter([
+  {
+    path: "/login",
+    element: <LoginPage />,
+  },
   {
     path: "browser-session/:browserSessionId",
     element: <BrowserSession />,
@@ -38,9 +44,11 @@ const router = createBrowserRouter([
   {
     path: "/",
     element: (
-      <DebugStoreProvider>
-        <RootLayout />
-      </DebugStoreProvider>
+      <AuthGuard>
+        <DebugStoreProvider>
+          <RootLayout />
+        </DebugStoreProvider>
+      </AuthGuard>
     ),
     children: [
       {
