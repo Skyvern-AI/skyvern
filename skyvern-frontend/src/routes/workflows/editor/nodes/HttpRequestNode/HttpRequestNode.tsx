@@ -399,6 +399,10 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                 authentication and content headers
               </li>
               <li>
+                Pass a credential/secret parameter and reference it in headers
+                or body with {"{{ my_credential.password }}"}
+              </li>
+              <li>
                 The request will return response data including status, headers,
                 and body
               </li>
