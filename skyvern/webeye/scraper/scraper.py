@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 from collections import defaultdict
+from typing import Any
 
 import structlog
 from playwright._impl._errors import TimeoutError
@@ -92,6 +93,14 @@ def load_js_script() -> str:
 JS_FUNCTION_DEFS = load_js_script()
 
 
+# function to convert JSON element to HTML
+def build_attribute(key: str, value: Any) -> str:
+    if isinstance(value, bool) or isinstance(value, int):
+        return f'{key}="{str(value).lower()}"'
+
+    return f'{key}="{str(value)}"' if value else key
+
+
 def clean_element_before_hashing(element: dict) -> dict:
     def clean_nested(element: dict) -> dict:
         element_cleaned = {key: value for key, value in element.items() if key not in {"id", "rect", "frame_index"}}
@@ -125,7 +134,7 @@ def build_element_dict(
 
     for element in elements:
         element_id: str = element.get("id", "")
-        # get_interactable_element_tree marks each interactable element with a unique_id attribute
+        # get_interactable_element_tree marks each interactable element with a SKYVERN_ID_ATTR attribute
         id_to_css_dict[element_id] = f"[{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
         id_to_frame_dict[element_id] = element["frame"]
@@ -409,16 +418,18 @@ async def add_frame_interactable_elements(
         # it will get stuck when we `frame.evaluate()` on an invisible iframe
         if not await frame_element.is_visible():
             return elements, element_tree
-        unique_id = await frame_element.get_attribute("unique_id")
-        if not unique_id:
+        skyvern_id = await frame_element.get_attribute(SKYVERN_ID_ATTR)
+        if not skyvern_id:
             LOG.info(
-                "No unique_id found for frame, skipping",
+                "No Skyvern id found for frame, skipping",
                 frame_index=frame_index,
+                attr=SKYVERN_ID_ATTR,
             )
             return elements, element_tree
     except Exception:
         LOG.warning(
-            "Unable to get unique_id from frame_element",
+            "Unable to get Skyvern id from frame_element",
+            attr=SKYVERN_ID_ATTR,
             exc_info=True,
         )
         return elements, element_tree
@@ -427,11 +438,11 @@ async def add_frame_interactable_elements(
     await skyvern_frame.safe_wait_for_animation_end()
 
     frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
-        frame_name=unique_id, frame_index=frame_index
+        frame_name=skyvern_id, frame_index=frame_index
     )
 
     for element in elements:
-        if element["id"] == unique_id:
+        if element["id"] == skyvern_id:
             element["children"] = frame_element_tree
 
     elements = elements + frame_elements
@@ -637,6 +648,9 @@ def _should_keep_unique_id(element: dict) -> bool:
     # case where we shouldn't keep unique_id
     # 1. no readonly attr and not disable attr and no interactable
     # 2. readonly=false and disable=false and interactable=false
+
+    if element.get("hoverOnly"):
+        return True
 
     attributes = element.get("attributes", {})
     if (
