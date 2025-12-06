@@ -206,25 +206,50 @@ class Block(BaseModel, abc.ABC):
         )
 
     def format_block_parameter_template_from_workflow_run_context(
-        self, potential_template: str, workflow_run_context: WorkflowRunContext
+        self,
+        potential_template: str,
+        workflow_run_context: WorkflowRunContext,
+        *,
+        force_include_secrets: bool = False,
     ) -> str:
+        """
+        Format a template string using the workflow run context.
+
+        Security Note:
+        Real secret values are ONLY resolved for blocks that do NOT expose data to the LLM
+        (like HttpRequestBlock, CodeBlock), as determined by is_safe_block_for_secrets.
+        """
         if not potential_template:
             return potential_template
+
+        # Security: only allow real secret values for non-LLM blocks (HttpRequestBlock, CodeBlock)
+        is_safe_block_for_secrets = self.block_type in [BlockType.CODE, BlockType.HTTP_REQUEST]
 
         template = jinja_sandbox_env.from_string(potential_template)
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
-        if workflow_run_context.include_secrets_in_templates:
+
+        include_secrets = workflow_run_context.include_secrets_in_templates or force_include_secrets
+
+        # FORCE DISABLE if block is not safe (sends data to LLM)
+        if include_secrets and not is_safe_block_for_secrets:
+            include_secrets = False
+
+        if include_secrets:
             template_data.update(workflow_run_context.secrets)
 
             # Create easier-to-access entries for credentials
             # Look for credential parameters and create real_username/real_password entries
             # First collect all credential parameters to avoid modifying dict during iteration
             credential_params = []
-            for key, value in template_data.items():
+            for key, value in list(template_data.items()):
                 if isinstance(value, dict) and "context" in value and "username" in value and "password" in value:
                     credential_params.append((key, value))
+                elif is_safe_block_for_secrets and isinstance(value, str):
+                    secret_value = workflow_run_context.get_original_secret_value_or_none(value)
+                    if secret_value is not None:
+                        template_data[key] = secret_value
 
             # Now add the real_username/real_password entries
             for key, value in credential_params:
@@ -238,6 +263,17 @@ class Block(BaseModel, abc.ABC):
                 # Add easier-to-access entries
                 template_data[f"{key}_real_username"] = real_username
                 template_data[f"{key}_real_password"] = real_password
+
+                if is_safe_block_for_secrets:
+                    resolved_credential = value.copy()
+                    for credential_field, credential_placeholder in value.items():
+                        if credential_field == "context":
+                            continue
+                        secret_value = workflow_run_context.get_original_secret_value_or_none(credential_placeholder)
+                        if secret_value is not None:
+                            resolved_credential[credential_field] = secret_value
+                    resolved_credential.pop("context", None)
+                    template_data[key] = resolved_credential
 
         if self.label in template_data:
             current_value = template_data[self.label]
@@ -3757,21 +3793,25 @@ class HttpRequestBlock(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         """Format template parameters in the block fields"""
+        template_kwargs = {"force_include_secrets": True}
+
         if self.url:
-            self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+            self.url = self.format_block_parameter_template_from_workflow_run_context(
+                self.url, workflow_run_context, **template_kwargs
+            )
 
         if self.body:
             # If body is provided as a template string, try to parse it as JSON
             for key, value in self.body.items():
                 if isinstance(value, str):
                     self.body[key] = self.format_block_parameter_template_from_workflow_run_context(
-                        value, workflow_run_context
+                        value, workflow_run_context, **template_kwargs
                     )
 
         if self.headers:
             for key, value in self.headers.items():
                 self.headers[key] = self.format_block_parameter_template_from_workflow_run_context(
-                    value, workflow_run_context
+                    value, workflow_run_context, **template_kwargs
                 )
 
     def validate_url(self, url: str) -> bool:
