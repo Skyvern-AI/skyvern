@@ -51,7 +51,7 @@ class Skyvern(AsyncSkyvern):
         page = await browser.get_working_page()
 
         # Execute AI-powered tasks
-        await page.run.run_task("Fill out the form and submit it")
+        await page.agent.run_task("Fill out the form and submit it")
         ```
 
     You can also mix AI-powered tasks with direct browser control in the same session:
@@ -72,7 +72,7 @@ class Skyvern(AsyncSkyvern):
         await page.goto("https://example.com")
 
         # Use AI to handle login
-        await page.run.login(
+        await page.agent.login(
             credential_type=CredentialType.skyvern,
             credential_id=credential.credential_id,
         )
