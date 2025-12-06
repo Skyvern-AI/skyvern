@@ -56,8 +56,8 @@ from skyvern.forge.sdk.api.files import (
     download_from_s3,
     get_path_for_workflow_download_directory,
 )
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
-from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request

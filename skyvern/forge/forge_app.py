@@ -12,8 +12,8 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
-from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
 from skyvern.forge.sdk.api.real_azure import RealAzureClientFactory
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage

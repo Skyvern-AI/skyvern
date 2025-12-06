@@ -5,8 +5,8 @@ import json
 import structlog
 
 from skyvern.forge import app
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
-from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
 
 LOG = structlog.get_logger()
 
