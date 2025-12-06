@@ -4044,6 +4044,40 @@ class BranchCriteria(BaseModel, abc.ABC):
         return False
 
 
+def _evaluate_truthy_string(value: str) -> bool:
+    """
+    Evaluate a string as a boolean, handling common truthy/falsy representations.
+
+    Truthy: "true", "True", "TRUE", "1", "yes", "y", "on", non-zero numbers
+    Falsy: "", "false", "False", "FALSE", "0", "no", "n", "off", "null", "None", whitespace-only
+
+    For other strings, use Python's default bool() behavior (non-empty = truthy).
+    """
+    if not value or not value.strip():
+        return False
+
+    normalized = value.strip().lower()
+
+    # Explicit falsy values
+    if normalized in ("false", "0", "no", "n", "off", "null", "none"):
+        return False
+
+    # Explicit truthy values
+    if normalized in ("true", "1", "yes", "y", "on"):
+        return True
+
+    # Try to parse as a number
+    try:
+        num = float(normalized)
+        return num != 0.0
+    except ValueError:
+        pass
+
+    # For any other non-empty string, consider it truthy
+    # This allows expressions like "{{ 'some text' }}" to be truthy
+    return True
+
+
 class JinjaBranchCriteria(BranchCriteria):
     """Jinja2-templated branch criteria (only supported criteria type for now)."""
 
@@ -4073,12 +4107,13 @@ class JinjaBranchCriteria(BranchCriteria):
                 msg=str(exc),
             ) from exc
 
-        return bool(rendered)
+        return _evaluate_truthy_string(rendered)
 
 
 class BranchCondition(BaseModel):
     """Represents a single conditional branch edge within a ConditionalBlock."""
 
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     criteria: BranchCriteriaTypeVar | None = None
     next_block_label: str | None = None
     description: str | None = None
@@ -4133,12 +4168,98 @@ class ConditionalBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         """
-        Placeholder execute implementation.
+        Evaluate conditional branches and determine next block to execute.
 
-        Conditional block execution will be implemented alongside the DAG workflow
-        engine refactor (see branching workflow spec).
+        Returns a BlockResult with branch metadata in the output_parameter_value.
         """
-        raise NotImplementedError("Conditional block execution is handled by the DAG engine.")
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+        evaluation_context = BranchEvaluationContext(
+            workflow_run_context=workflow_run_context,
+            block_label=self.label,
+        )
+
+        matched_branch = None
+        failure_reason: str | None = None
+
+        for idx, branch in enumerate(self.ordered_branches):
+            if branch.criteria is None:
+                continue
+            try:
+                if await branch.criteria.evaluate(evaluation_context):
+                    matched_branch = branch
+                    LOG.info(
+                        "Conditional branch matched",
+                        block_label=self.label,
+                        branch_index=idx,
+                        next_block_label=branch.next_block_label,
+                    )
+                    break
+            except Exception as exc:
+                failure_reason = f"Failed to evaluate branch {idx} for {self.label}: {str(exc)}"
+                LOG.error(
+                    "Failed to evaluate conditional branch",
+                    block_label=self.label,
+                    branch_index=idx,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                break
+
+        if matched_branch is None and failure_reason is None:
+            matched_branch = self.get_default_branch()
+
+        matched_index = self.ordered_branches.index(matched_branch) if matched_branch in self.ordered_branches else None
+        next_block_label = matched_branch.next_block_label if matched_branch else None
+
+        branch_metadata: BlockMetadata = {
+            "branch_taken": next_block_label,
+            "branch_index": matched_index,
+            "branch_description": matched_branch.description if matched_branch else None,
+            "criteria_type": matched_branch.criteria.criteria_type
+            if matched_branch and matched_branch.criteria
+            else None,
+            "criteria_expression": matched_branch.criteria.expression
+            if matched_branch and matched_branch.criteria
+            else None,
+            "next_block_label": next_block_label,
+        }
+
+        status = BlockStatus.completed
+        success = True
+
+        if failure_reason:
+            status = BlockStatus.failed
+            success = False
+        elif matched_branch is None:
+            failure_reason = "No conditional branch matched and no default branch configured"
+            status = BlockStatus.failed
+            success = False
+
+        if workflow_run_context:
+            workflow_run_context.update_block_metadata(self.label, branch_metadata)
+            try:
+                await self.record_output_parameter_value(
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    value=branch_metadata,
+                )
+            except Exception as exc:
+                LOG.warning(
+                    "Failed to record branch metadata as output parameter",
+                    workflow_run_id=workflow_run_id,
+                    block_label=self.label,
+                    error=str(exc),
+                )
+
+        block_result = await self.build_block_result(
+            success=success,
+            failure_reason=failure_reason,
+            output_parameter_value=branch_metadata,
+            status=status,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+        return block_result
 
     @property
     def ordered_branches(self) -> list[BranchCondition]:

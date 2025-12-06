@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-BlockMetadata = dict[str, str | int | float | bool | dict | list]
+BlockMetadata = dict[str, str | int | float | bool | dict | list | None]
 
 jinja_sandbox_env = SandboxedEnvironment()
 
