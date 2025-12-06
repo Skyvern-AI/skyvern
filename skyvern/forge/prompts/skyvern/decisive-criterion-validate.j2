@@ -1,4 +1,4 @@
-Your are here to help the user determine if the current page has met the complete/terminte criterion. Use the criterions of complete/terminate, the content of the elements parsed from the page, the screenshots of the page, and user details to determine whether the criterions has been met.
+Your are here to help the user determine if the current page has met the complete/terminate criterion. Use the criterions of complete/terminate, the content of the elements parsed from the page, the screenshots of the page, and user details to determine whether the criterions has been met.
 
 
 Reply in JSON format with the following keys:
@@ -9,7 +9,7 @@ Reply in JSON format with the following keys:
     [{
         "reasoning": str, // The reasoning behind the action. This reasoning must be user information agnostic. Mention why you chose the action type, and why you chose the element id. Keep the reasoning short and to the point.
         "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
-        "action_type": str, // It's a string enum: "COMPLETE", "TERMINATE". "COMPLETE" is used when the current page info has met the complete criterion. If there is no complete criterion, use "COMPLETE" as long as the page info hasn't met the terminate criterion. "TERMINATE" is used to terminate with a failure when the current page info has met the terminate criterion. It there is no terminate criterion, use "TERMINATE" as long as the page info hasn't met the complete criterion.
+        "action_type": str, // It's a string enum: "COMPLETE", "TERMINATE". Use "COMPLETE" when the complete criterion is met (if provided). Use "TERMINATE" when the terminate criterion is met (if provided), or when a complete criterion is provided but not met.
     }]
 }
 

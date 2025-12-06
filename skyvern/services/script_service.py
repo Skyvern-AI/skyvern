@@ -60,7 +60,7 @@ from skyvern.schemas.scripts import (
     ScriptFileCreate,
     ScriptStatus,
 )
-from skyvern.schemas.workflows import BlockStatus, BlockType, FileStorageType, FileType
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
@@ -1748,6 +1748,18 @@ async def validate(
     if not complete_criterion and not terminate_criterion:
         raise Exception("Both complete criterion and terminate criterion are empty")
 
+    result = await execute_validation(complete_criterion, terminate_criterion, error_code_mapping, label, model)
+    if result.status == BlockStatus.terminated:
+        raise ScriptTerminationException(result.failure_reason)
+
+
+async def execute_validation(
+    complete_criterion: str | None,
+    terminate_criterion: str | None,
+    error_code_mapping: dict[str, str] | None,
+    label: str | None = None,
+    model: dict[str, Any] | None = None,
+) -> BlockResult:
     block_validation_output = await _validate_and_get_output_parameter(label)
     validation_block = ValidationBlock(
         label=block_validation_output.label,
@@ -1765,8 +1777,7 @@ async def validate(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
-    if result.status == BlockStatus.terminated:
-        raise ScriptTerminationException(result.failure_reason)
+    return result
 
 
 async def wait(seconds: int, label: str | None = None) -> None:

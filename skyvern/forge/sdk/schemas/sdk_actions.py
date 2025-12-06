@@ -16,6 +16,7 @@ class SdkActionType(str, Enum):
     AI_ACT = "ai_act"
     EXTRACT = "extract"
     LOCATE_ELEMENT = "locate_element"
+    VALIDATE = "validate"
     PROMPT = "prompt"
 
 
@@ -152,6 +153,20 @@ class LocateElementAction(SdkActionBase):
         return None
 
 
+class ValidateAction(SdkActionBase):
+    """Validate action parameters."""
+
+    type: Literal["validate"] = "validate"
+    prompt: str = Field(..., description="Validation criteria or condition to check")
+    model: dict[str, Any] | None = Field(None, description="Optional model configuration")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.prompt
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return None
+
+
 class PromptAction(SdkActionBase):
     """Prompt action parameters."""
 
@@ -177,6 +192,7 @@ SdkAction = Annotated[
         ActAction,
         ExtractAction,
         LocateElementAction,
+        ValidateAction,
         PromptAction,
     ],
     Field(discriminator="type"),
