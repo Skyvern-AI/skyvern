@@ -6,7 +6,6 @@ from typing import Any
 
 import httpx
 import structlog
-from dotenv import load_dotenv
 from playwright.async_api import Playwright, async_playwright
 
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
@@ -128,6 +127,7 @@ class Skyvern(AsyncSkyvern):
         *,
         llm_config: LLMRouterConfig | LLMConfig | None = None,
         settings: dict[str, Any] | None = None,
+        use_in_memory_db: bool = True,
     ) -> "Skyvern":
         """Local/embedded mode: Run Skyvern locally in-process.
 
@@ -192,13 +192,18 @@ class Skyvern(AsyncSkyvern):
         """
         from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
 
-        if not os.path.exists(".env"):
-            raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
+        # Validate prerequisites based on configuration mode
+        if not use_in_memory_db and not os.path.exists(".env"):
+            raise ValueError(
+                "When use_in_memory_db=False, a .env file is required. "
+                "Please run `skyvern quickstart` to set up your local Skyvern environment."
+            )
 
-        load_dotenv(".env")
-        api_key = os.getenv("SKYVERN_API_KEY")
-        if not api_key:
-            raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
+        if not llm_config and not os.path.exists(".env"):
+            raise ValueError(
+                "LLM configuration is required. Either provide llm_config parameter or "
+                "run `skyvern quickstart` to configure LLM settings in .env file."
+            )
 
         obj = cls.__new__(cls)
 
@@ -208,6 +213,7 @@ class Skyvern(AsyncSkyvern):
             httpx_client=create_embedded_server(
                 llm_config=llm_config,
                 settings_overrides=settings,
+                use_in_memory_db=use_in_memory_db,
             ),
         )
 
