@@ -714,6 +714,12 @@ class WorkflowRunBlockModel(Base):
     positive_descriptor = Column(String, nullable=True)
     negative_descriptor = Column(String, nullable=True)
 
+    # conditional block
+    executed_branch_id = Column(String, nullable=True)
+    executed_branch_expression = Column(String, nullable=True)
+    executed_branch_result = Column(Boolean, nullable=True)
+    executed_branch_next_block = Column(String, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 

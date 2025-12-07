@@ -75,6 +75,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
+    PromptBranchCriteria,
     SendEmailBlock,
     TaskBlock,
     TaskV2Block,
@@ -946,6 +947,11 @@ class WorkflowService:
         while current_label:
             block = label_to_block.get(current_label)
             if not block:
+                LOG.error(
+                    "Unable to find block with label in workflow graph",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    current_label=current_label,
+                )
                 workflow_run = await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run.workflow_run_id,
                     failure_reason=f"Unable to find block with label {current_label}",
@@ -977,7 +983,7 @@ class WorkflowService:
                 break
 
             next_label = None
-            if isinstance(block, ConditionalBlock):
+            if block.block_type == BlockType.CONDITIONAL:
                 next_label = (branch_metadata or {}).get("next_block_label")
             else:
                 next_label = default_next_map.get(block.label)
@@ -3345,15 +3351,20 @@ class WorkflowService:
         elif block_yaml.block_type == BlockType.CONDITIONAL:
             branch_conditions = []
             for branch in block_yaml.branch_conditions:
-                branch_criteria = (
-                    JinjaBranchCriteria(
-                        criteria_type=branch.criteria.criteria_type,
-                        expression=branch.criteria.expression,
-                        description=branch.criteria.description,
-                    )
-                    if branch.criteria
-                    else None
-                )
+                branch_criteria = None
+                if branch.criteria:
+                    if branch.criteria.criteria_type == "prompt":
+                        branch_criteria = PromptBranchCriteria(
+                            criteria_type=branch.criteria.criteria_type,
+                            expression=branch.criteria.expression,
+                            description=branch.criteria.description,
+                        )
+                    else:
+                        branch_criteria = JinjaBranchCriteria(
+                            criteria_type=branch.criteria.criteria_type,
+                            expression=branch.criteria.expression,
+                            description=branch.criteria.description,
+                        )
 
                 branch_conditions.append(
                     BranchCondition(
