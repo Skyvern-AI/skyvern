@@ -8,8 +8,10 @@ from skyvern.core.script_generations.generate_script import ScriptBlockSource, g
 from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.workflow.models.block import get_all_blocks
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
 from skyvern.schemas.scripts import FileEncoding, Script, ScriptFileCreate, ScriptStatus
+from skyvern.schemas.workflows import BlockType
 from skyvern.services import script_service
 
 LOG = structlog.get_logger()
@@ -162,6 +164,27 @@ async def generate_workflow_script(
     cached_script: Script | None = None,
     updated_block_labels: set[str] | None = None,
 ) -> None:
+    # Disable script generation for workflows containing conditional blocks to avoid caching divergent paths.
+    try:
+        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+        has_conditional = any(block.block_type == BlockType.CONDITIONAL for block in all_blocks)
+    except Exception:
+        has_conditional = False
+        LOG.warning(
+            "Failed to inspect workflow blocks for conditional types; continuing with script generation",
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            exc_info=True,
+        )
+
+    if has_conditional:
+        LOG.info(
+            "Skipping script generation for workflow containing conditional blocks",
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+        )
+        return
+
     try:
         LOG.info(
             "Generating script for workflow",
