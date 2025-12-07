@@ -1,0 +1,11 @@
+You are evaluating conditional branches for a workflow. Return the results to tell me whether each natural language criterion is satisfied.
+
+Criteria (order matters; align outputs to these indices):
+{% for criterion in branch_criteria -%}
+- {{ criterion.index }}: {{ criterion.expression }}
+{% endfor %}
+
+Respond with JSON exactly in this shape:
+{
+  "branch_results": [true | false per criterion, in order]
+}

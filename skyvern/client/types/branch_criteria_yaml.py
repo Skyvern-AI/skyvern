@@ -7,7 +7,7 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 
 
 class BranchCriteriaYaml(UniversalBaseModel):
-    criteria_type: typing.Optional[typing.Literal["jinja2_template"]] = None
+    criteria_type: typing.Optional[typing.Literal["jinja2_template", "prompt"]] = None
     expression: str
     description: typing.Optional[str] = None
 
