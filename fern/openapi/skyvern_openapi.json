@@ -1310,11 +1310,11 @@
               }
             }
           },
-          "404": {
-            "description": "Workflow not found"
-          },
           "400": {
             "description": "Folder not found"
+          },
+          "404": {
+            "description": "Workflow not found"
           },
           "422": {
             "description": "Validation Error",
@@ -1620,11 +1620,11 @@
               }
             }
           },
-          "404": {
-            "description": "Run not found"
-          },
           "400": {
             "description": "Timeline not available for this run type"
+          },
+          "404": {
+            "description": "Run not found"
           },
           "422": {
             "description": "Validation Error",
@@ -2266,11 +2266,11 @@
               }
             }
           },
-          "404": {
-            "description": "Browser session not found"
-          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "404": {
+            "description": "Browser session not found"
           },
           "422": {
             "description": "Validation Error",
@@ -5264,6 +5264,10 @@
       },
       "BranchCondition": {
         "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
           "criteria": {
             "anyOf": [
               {
@@ -5699,7 +5703,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -6253,8 +6257,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440.0,
-                "minimum": 5.0
+                "maximum": 1440,
+                "minimum": 5
               },
               {
                 "type": "null"
@@ -10040,7 +10044,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -11880,6 +11884,53 @@
         "title": "PasswordCredentialResponse",
         "description": "Response model for password credentials, containing only the username."
       },
+      "PromptAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "prompt",
+            "title": "Type",
+            "default": "prompt"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "The prompt to send to the LLM"
+          },
+          "schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schema",
+            "description": "Optional JSON schema to structure the response"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Optional model configuration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "PromptAction",
+        "description": "Prompt action parameters."
+      },
       "ProxyLocation": {
         "type": "string",
         "enum": [
@@ -11987,6 +12038,9 @@
               },
               {
                 "$ref": "#/components/schemas/LocateElementAction"
+              },
+              {
+                "$ref": "#/components/schemas/PromptAction"
               }
             ],
             "title": "Action",
@@ -12000,7 +12054,8 @@
                 "ai_select_option": "#/components/schemas/SelectOptionAction",
                 "ai_upload_file": "#/components/schemas/UploadFileAction",
                 "extract": "#/components/schemas/ExtractAction",
-                "locate_element": "#/components/schemas/LocateElementAction"
+                "locate_element": "#/components/schemas/LocateElementAction",
+                "prompt": "#/components/schemas/PromptAction"
               }
             }
           }
@@ -12274,7 +12329,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -14624,7 +14679,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -15133,8 +15188,8 @@
           },
           "confidence_float": {
             "type": "number",
-            "maximum": 1.0,
-            "minimum": 0.0,
+            "maximum": 1,
+            "minimum": 0,
             "title": "Confidence Float"
           }
         },
