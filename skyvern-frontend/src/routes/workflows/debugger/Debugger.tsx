@@ -4,7 +4,10 @@ import { ReactFlowProvider } from "@xyflow/react";
 
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { WorkflowSettings } from "../types/workflowTypes";
-import { getElements } from "@/routes/workflows/editor/workflowEditorUtils";
+import {
+  getElements,
+  upgradeWorkflowBlocksV1toV2,
+} from "@/routes/workflows/editor/workflowEditorUtils";
 import { getInitialParameters } from "@/routes/workflows/editor/utils";
 import { Workspace } from "@/routes/workflows/editor/Workspace";
 import { useDebugSessionBlockOutputsQuery } from "../hooks/useDebugSessionBlockOutputsQuery";
@@ -52,6 +55,13 @@ function Debugger() {
     return null;
   }
 
+  // Auto-upgrade v1 workflows to v2 by assigning sequential next_block_label values
+  const workflowVersion = workflow.workflow_definition.version ?? 1;
+  const blocksToRender =
+    workflowVersion < 2
+      ? upgradeWorkflowBlocksV1toV2(workflow.workflow_definition.blocks)
+      : workflow.workflow_definition.blocks;
+
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
     proxyLocation: workflow.proxy_location,
@@ -68,11 +78,7 @@ function Debugger() {
     sequentialKey: workflow.sequential_key ?? null,
   };
 
-  const elements = getElements(
-    workflow.workflow_definition.blocks,
-    settings,
-    true,
-  );
+  const elements = getElements(blocksToRender, settings, true);
 
   return (
     <div className="relative flex h-screen w-full">

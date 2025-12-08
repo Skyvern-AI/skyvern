@@ -128,6 +128,7 @@ export type BlockYAML =
   | SendEmailBlockYAML
   | FileUrlParserBlockYAML
   | ForLoopBlockYAML
+  | ConditionalBlockYAML
   | ValidationBlockYAML
   | HumanInteractionBlockYAML
   | ActionBlockYAML
@@ -357,6 +358,25 @@ export type ForLoopBlockYAML = BlockYAMLBase & {
   loop_blocks: Array<BlockYAML>;
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
+};
+
+export type BranchCriteriaYAML = {
+  criteria_type: string;
+  expression: string;
+  description?: string | null;
+};
+
+export type BranchConditionYAML = {
+  id: string;
+  criteria: BranchCriteriaYAML | null;
+  next_block_label: string | null;
+  description?: string | null;
+  is_default: boolean;
+};
+
+export type ConditionalBlockYAML = BlockYAMLBase & {
+  block_type: "conditional";
+  branch_conditions: Array<BranchConditionYAML>;
 };
 
 export type PDFParserBlockYAML = BlockYAMLBase & {
