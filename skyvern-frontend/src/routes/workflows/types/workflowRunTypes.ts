@@ -48,6 +48,10 @@ export type WorkflowRunBlock = {
   body?: string | null;
   prompt?: string | null;
   wait_sec?: number | null;
+  executed_branch_id?: string | null;
+  executed_branch_expression?: string | null;
+  executed_branch_result?: boolean | null;
+  executed_branch_next_block?: string | null;
   created_at: string;
   modified_at: string;
   duration: number | null;

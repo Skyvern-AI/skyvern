@@ -192,6 +192,7 @@ export type Parameter =
 export type WorkflowBlock =
   | TaskBlock
   | ForLoopBlock
+  | ConditionalBlock
   | TextPromptBlock
   | CodeBlock
   | UploadToS3Block
@@ -215,6 +216,7 @@ export type WorkflowBlock =
 export const WorkflowBlockTypes = {
   Task: "task",
   ForLoop: "for_loop",
+  Conditional: "conditional",
   Code: "code",
   TextPrompt: "text_prompt",
   DownloadToS3: "download_to_s3",
@@ -290,6 +292,32 @@ export type WorkflowBlockBase = {
   next_loop_on_failure?: boolean;
   model: WorkflowModel | null;
   next_block_label?: string | null;
+};
+
+export const BranchCriteriaTypes = {
+  Jinja2Template: "jinja2_template",
+} as const;
+
+export type BranchCriteriaType =
+  (typeof BranchCriteriaTypes)[keyof typeof BranchCriteriaTypes];
+
+export type BranchCriteria = {
+  criteria_type: BranchCriteriaType;
+  expression: string;
+  description: string | null;
+};
+
+export type BranchCondition = {
+  id: string;
+  criteria: BranchCriteria | null;
+  next_block_label: string | null;
+  description: string | null;
+  is_default: boolean;
+};
+
+export type ConditionalBlock = WorkflowBlockBase & {
+  block_type: "conditional";
+  branch_conditions: Array<BranchCondition>;
 };
 
 export type TaskBlock = WorkflowBlockBase & {

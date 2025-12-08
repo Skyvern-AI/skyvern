@@ -309,9 +309,14 @@ function FlowRenderer({
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
   const flowIsConstrained = debugStore.isDebugMode;
 
+  // Track if this is the initial load to prevent false "unsaved changes" detection
+  const isInitialLoadRef = useRef(true);
+
   useEffect(() => {
     if (nodesInitialized) {
       setShouldConstrainPan(true);
+      // Mark initial load as complete after nodes are initialized
+      isInitialLoadRef.current = false;
     }
   }, [nodesInitialized]);
 
@@ -850,7 +855,10 @@ function FlowRenderer({
             if (dimensionChanges.length > 0) {
               doLayout(tempNodes, edges);
             }
+
+            // Only track changes after initial load is complete
             if (
+              !isInitialLoadRef.current &&
               changes.some((change) => {
                 return (
                   change.type === "add" ||
