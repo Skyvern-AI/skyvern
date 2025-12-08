@@ -13,13 +13,13 @@ LOG = structlog.get_logger()
 
 async def get_llm_config_by_prompt_type(distinct_id: str, organization_id: str | None = None) -> dict[str, str] | None:
     """Return PostHog-configured LLM mapping for each prompt type."""
-    llm_config_experiment = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
+    llm_config_experiment = await app.EXPERIMENTATION_PROVIDER.get_value(
         "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties={"organization_id": organization_id}
     )
     if llm_config_experiment in (False, "False") or not llm_config_experiment:
         return None
 
-    payload = await app.EXPERIMENTATION_PROVIDER.get_payload_cached(
+    payload = await app.EXPERIMENTATION_PROVIDER.get_payload(
         "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties={"organization_id": organization_id}
     )
     if not payload:
