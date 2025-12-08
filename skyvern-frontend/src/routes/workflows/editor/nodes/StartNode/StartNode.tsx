@@ -52,7 +52,7 @@ interface StartSettings {
   extraHttpHeaders: string | Record<string, unknown> | null;
 }
 
-function StartNode({ id, data }: NodeProps<StartNode>) {
+function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   const workflowSettingsStore = useWorkflowSettingsStore();
   const reactFlowInstance = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -62,6 +62,10 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
   const rerender = useRerender({ prefix: "accordion" });
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const isRecording = recordingStore.isRecording;
+
+  const parentNode = parentId ? reactFlowInstance.getNode(parentId) : null;
+  const isInsideConditional = parentNode?.type === "conditional";
+  const isInsideLoop = parentNode?.type === "loop";
 
   const makeStartSettings = (data: StartNode["data"]): StartSettings => {
     return {
@@ -410,18 +414,25 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
         id="a"
         className="opacity-0"
       />
-      <div className="w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 text-center">
+      <div className="w-[30rem] rounded-lg bg-slate-elevation4 px-6 py-4 text-center text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
         Start
-        <div className="mt-4 flex gap-3 rounded-md bg-slate-800 p-3">
-          <span className="rounded bg-slate-700 p-1 text-lg">💡</span>
-          <div className="space-y-1 text-left text-xs text-slate-400">
-            Use{" "}
-            <code className="text-white">
-              &#123;&#123;&nbsp;current_value&nbsp;&#125;&#125;
-            </code>{" "}
-            to get the current loop value for a given iteration.
+        {isInsideLoop && (
+          <div className="mt-4 flex gap-3 rounded-md bg-slate-800 p-3 normal-case tracking-normal">
+            <span className="rounded bg-slate-700 p-1 text-lg">💡</span>
+            <div className="space-y-1 text-left font-normal text-slate-400">
+              Use{" "}
+              <code className="text-white">
+                &#123;&#123;&nbsp;current_value&nbsp;&#125;&#125;
+              </code>{" "}
+              to get the current loop value for a given iteration.
+            </div>
           </div>
-        </div>
+        )}
+        {isInsideConditional && (
+          <div className="mt-4 rounded-md border border-dashed border-slate-500 p-4 text-center font-normal normal-case tracking-normal text-slate-300">
+            Start adding blocks to be executed for the selected condition
+          </div>
+        )}
       </div>
     </div>
   );

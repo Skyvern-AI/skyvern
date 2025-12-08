@@ -8,15 +8,19 @@ import {
 } from "@xyflow/react";
 
 import { Button } from "@/components/ui/button";
+import {
+  BranchContext,
+  useWorkflowPanelStore,
+} from "@/store/WorkflowPanelStore";
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { cn } from "@/util/utils";
 
 import { REACT_FLOW_EDGE_Z_INDEX } from "../constants";
+import type { NodeBaseData } from "../nodes/types";
 import { WorkflowAddMenu } from "../WorkflowAddMenu";
 import { WorkflowAdderBusy } from "../WorkflowAdderBusy";
 
@@ -78,14 +82,65 @@ function EdgeWithAddButton({
 
   const isDisabled = !isBusy && recordingStore.isRecording;
 
-  const updateWorkflowPanelState = (active: boolean) => {
+  const deriveBranchContext = (): BranchContext | undefined => {
+    if (
+      sourceNode &&
+      "data" in sourceNode &&
+      (sourceNode.data as NodeBaseData).conditionalBranchId &&
+      (sourceNode.data as NodeBaseData).conditionalNodeId
+    ) {
+      const sourceData = sourceNode.data as NodeBaseData;
+      return {
+        conditionalNodeId: sourceData.conditionalNodeId!,
+        conditionalLabel: sourceData.conditionalLabel ?? sourceData.label,
+        branchId: sourceData.conditionalBranchId!,
+        mergeLabel: sourceData.conditionalMergeLabel ?? null,
+      };
+    }
+
+    // If source node doesn't have branch context, check if it's inside a conditional block
+    // (e.g., StartNode or NodeAdderNode inside a conditional)
+    if (sourceNode?.parentId) {
+      const parentNode = nodes.find((n) => n.id === sourceNode.parentId);
+      if (parentNode?.type === "conditional" && "data" in parentNode) {
+        const conditionalData = parentNode.data as {
+          activeBranchId: string | null;
+          branches: Array<{ id: string }>;
+          label: string;
+          mergeLabel: string | null;
+        };
+        const activeBranchId = conditionalData.activeBranchId;
+        const activeBranch = conditionalData.branches?.find(
+          (b) => b.id === activeBranchId,
+        );
+
+        if (activeBranch) {
+          return {
+            conditionalNodeId: parentNode.id,
+            conditionalLabel: conditionalData.label,
+            branchId: activeBranch.id,
+            mergeLabel: conditionalData.mergeLabel ?? null,
+          };
+        }
+      }
+    }
+
+    return undefined;
+  };
+
+  const updateWorkflowPanelState = (
+    active: boolean,
+    branchContext?: BranchContext,
+  ) => {
     setWorkflowPanelState({
       active,
       content: "nodeLibrary",
       data: {
         previous: source,
         next: target,
-        parent: sourceNode?.parentId,
+        parent: branchContext?.conditionalNodeId ?? sourceNode?.parentId,
+        connectingEdgeType: "edgeWithAddButton",
+        branchContext,
       },
     });
   };
@@ -94,8 +149,8 @@ function EdgeWithAddButton({
     if (isDisabled) {
       return;
     }
-
-    updateWorkflowPanelState(true);
+    const branchContext = deriveBranchContext();
+    updateWorkflowPanelState(true, branchContext);
   };
 
   const onRecord = () => {

@@ -26,6 +26,7 @@ export type OtherStartNodeData = {
   editable: boolean;
   label: "__start_block__";
   showCode: boolean;
+  parentNodeType?: "loop" | "conditional";
 };
 
 export type StartNodeData = WorkflowStartNodeData | OtherStartNodeData;
