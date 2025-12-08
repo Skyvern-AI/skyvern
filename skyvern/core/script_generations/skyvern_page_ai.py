@@ -65,6 +65,14 @@ class SkyvernPageAi(Protocol):
         """Extract information from the page using AI."""
         ...
 
+    async def ai_validate(
+        self,
+        prompt: str,
+        model: dict[str, Any] | None = None,
+    ) -> bool:
+        """Validate the current page state using AI based on the given criteria."""
+        ...
+
     async def ai_act(
         self,
         prompt: str,
