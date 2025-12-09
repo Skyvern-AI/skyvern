@@ -5274,12 +5274,16 @@
                 "oneOf": [
                   {
                     "$ref": "#/components/schemas/JinjaBranchCriteria"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PromptBranchCriteria"
                   }
                 ],
                 "discriminator": {
                   "propertyName": "criteria_type",
                   "mapping": {
-                    "jinja2_template": "#/components/schemas/JinjaBranchCriteria"
+                    "jinja2_template": "#/components/schemas/JinjaBranchCriteria",
+                    "prompt": "#/components/schemas/PromptBranchCriteria"
                   }
                 }
               },
@@ -5368,7 +5372,10 @@
         "properties": {
           "criteria_type": {
             "type": "string",
-            "const": "jinja2_template",
+            "enum": [
+              "jinja2_template",
+              "prompt"
+            ],
             "title": "Criteria Type",
             "default": "jinja2_template"
           },
@@ -11931,6 +11938,37 @@
         "title": "PromptAction",
         "description": "Prompt action parameters."
       },
+      "PromptBranchCriteria": {
+        "properties": {
+          "criteria_type": {
+            "type": "string",
+            "const": "prompt",
+            "title": "Criteria Type",
+            "default": "prompt"
+          },
+          "expression": {
+            "type": "string",
+            "title": "Expression"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "expression"
+        ],
+        "title": "PromptBranchCriteria",
+        "description": "Natural language branch criteria."
+      },
       "ProxyLocation": {
         "type": "string",
         "enum": [
@@ -12040,6 +12078,9 @@
                 "$ref": "#/components/schemas/LocateElementAction"
               },
               {
+                "$ref": "#/components/schemas/ValidateAction"
+              },
+              {
                 "$ref": "#/components/schemas/PromptAction"
               }
             ],
@@ -12055,7 +12096,8 @@
                 "ai_upload_file": "#/components/schemas/UploadFileAction",
                 "extract": "#/components/schemas/ExtractAction",
                 "locate_element": "#/components/schemas/LocateElementAction",
-                "prompt": "#/components/schemas/PromptAction"
+                "prompt": "#/components/schemas/PromptAction",
+                "validate": "#/components/schemas/ValidateAction"
               }
             }
           }
@@ -15201,6 +15243,40 @@
         ],
         "title": "UserDefinedError"
       },
+      "ValidateAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "validate",
+            "title": "Type",
+            "default": "validate"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Validation criteria or condition to check"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Optional model configuration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "ValidateAction",
+        "description": "Validate action parameters."
+      },
       "ValidationBlock": {
         "properties": {
           "label": {
@@ -17176,6 +17252,50 @@
               }
             ],
             "title": "Negative Descriptor"
+          },
+          "executed_branch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Id"
+          },
+          "executed_branch_expression": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Expression"
+          },
+          "executed_branch_result": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Result"
+          },
+          "executed_branch_next_block": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Next Block"
           }
         },
         "type": "object",
