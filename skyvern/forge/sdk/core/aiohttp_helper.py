@@ -14,6 +14,8 @@ async def aiohttp_request(
     method: str,
     url: str,
     headers: dict[str, str] | None = None,
+    *,
+    body: dict[str, Any] | str | None = None,
     data: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
     cookies: dict[str, str] | None = None,
@@ -39,10 +41,17 @@ async def aiohttp_request(
 
         # Handle body based on content type and method
         if method.upper() != "GET":
+            # Explicit overrides first
             if json_data is not None:
                 request_kwargs["json"] = json_data
             elif data is not None:
                 request_kwargs["data"] = data
+            elif body is not None:
+                content_type = (headers or {}).get("Content-Type") or (headers or {}).get("content-type") or ""
+                if "application/x-www-form-urlencoded" in content_type.lower():
+                    request_kwargs["data"] = body
+                else:
+                    request_kwargs["json"] = body
 
         async with session.request(method.upper(), **request_kwargs) as response:
             response_headers = dict(response.headers)
