@@ -3,7 +3,6 @@ import datetime
 import sqlalchemy
 from sqlalchemy import (
     JSON,
-    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -868,11 +867,6 @@ class TaskRunModel(Base):
     url = Column(String, nullable=True)
     url_hash = Column(String, nullable=True)
     cached = Column(Boolean, nullable=False, default=False)
-    # Compute cost tracking fields
-    instance_type = Column(String, nullable=True)
-    vcpu_millicores = Column(Integer, nullable=True)
-    duration_ms = Column(BigInteger, nullable=True)
-    compute_cost = Column(Numeric, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 

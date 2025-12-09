@@ -253,12 +253,13 @@ class Block(BaseModel, abc.ABC):
             # First collect all credential parameters to avoid modifying dict during iteration
             credential_params = []
             for key, value in list(template_data.items()):
-                if isinstance(value, dict) and "context" in value and "username" in value and "password" in value:
-                    credential_params.append((key, value))
-                elif is_safe_block_for_secrets and isinstance(value, str):
-                    secret_value = workflow_run_context.get_original_secret_value_or_none(value)
-                    if secret_value is not None:
-                        template_data[key] = secret_value
+                if isinstance(value, dict) and "context" in value:
+                    # PASSWORD credential: has username and password
+                    if "username" in value and "password" in value:
+                        credential_params.append((key, value))
+                    # SECRET credential: has secret_value
+                    elif "secret_value" in value:
+                        credential_params.append((key, value))
 
             # Now add the real_username/real_password entries
             for key, value in credential_params:

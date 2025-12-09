@@ -4561,40 +4561,6 @@ class AgentDB:
                 task_run.url_hash = url_hash
             await session.commit()
 
-    async def update_job_run_compute_cost(
-        self,
-        organization_id: str,
-        run_id: str,
-        instance_type: str | None = None,
-        vcpu_millicores: int | None = None,
-        duration_ms: int | None = None,
-        compute_cost: float | None = None,
-    ) -> None:
-        """Update compute cost metrics for a job run."""
-        async with self.Session() as session:
-            task_run = (
-                await session.scalars(
-                    select(TaskRunModel).filter_by(run_id=run_id).filter_by(organization_id=organization_id)
-                )
-            ).first()
-            if not task_run:
-                LOG.warning(
-                    "TaskRun not found for compute cost update",
-                    run_id=run_id,
-                    organization_id=organization_id,
-                )
-                return
-
-            if instance_type is not None:
-                task_run.instance_type = instance_type
-            if vcpu_millicores is not None:
-                task_run.vcpu_millicores = vcpu_millicores
-            if duration_ms is not None:
-                task_run.duration_ms = duration_ms
-            if compute_cost is not None:
-                task_run.compute_cost = compute_cost
-            await session.commit()
-
     async def create_credential(
         self,
         organization_id: str,
