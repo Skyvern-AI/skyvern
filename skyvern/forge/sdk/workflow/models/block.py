@@ -3913,6 +3913,9 @@ class HttpRequestBlock(Block):
                 "url": self.url,
             }
 
+            # Mask secrets in output to prevent credential exposure in DB/UI
+            response_data = workflow_run_context.mask_secrets_in_data(response_data)
+
             LOG.info(
                 "HTTP request completed",
                 status_code=status_code,
