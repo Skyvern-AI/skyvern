@@ -2,7 +2,6 @@ import asyncio
 import copy
 import json
 from collections import defaultdict
-from typing import Any
 
 import structlog
 from playwright._impl._errors import TimeoutError
@@ -91,14 +90,6 @@ def load_js_script() -> str:
 
 
 JS_FUNCTION_DEFS = load_js_script()
-
-
-# function to convert JSON element to HTML
-def build_attribute(key: str, value: Any) -> str:
-    if isinstance(value, bool) or isinstance(value, int):
-        return f'{key}="{str(value).lower()}"'
-
-    return f'{key}="{str(value)}"' if value else key
 
 
 def clean_element_before_hashing(element: dict) -> dict:
@@ -328,6 +319,15 @@ async def scrape_web_unsafe(
         if token_count > DEFAULT_MAX_TOKENS:
             max_screenshot_number = min(max_screenshot_number, 1)
 
+        # get current x, y position of the page
+        x: int | None = None
+        y: int | None = None
+        try:
+            x, y = await skyvern_frame.get_scroll_x_y()
+            LOG.debug("Current x, y position of the page before scraping", x=x, y=y)
+        except Exception:
+            LOG.warning("Failed to get current x, y position of the page", exc_info=True)
+
         screenshots = await SkyvernFrame.take_split_screenshots(
             page=page,
             url=url,
@@ -335,6 +335,12 @@ async def scrape_web_unsafe(
             max_number=max_screenshot_number,
             scroll=scroll,
         )
+
+        # scroll back to the original x, y position of the page
+        if x is not None and y is not None:
+            await skyvern_frame.safe_scroll_to_x_y(x, y)
+            LOG.debug("Scrolled back to the original x, y position of the page after scraping", x=x, y=y)
+
     id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids = build_element_dict(
         elements
     )
