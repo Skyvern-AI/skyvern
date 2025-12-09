@@ -4573,6 +4573,7 @@ class AgentDB:
         card_last4: str | None,
         card_brand: str | None,
         totp_identifier: str | None = None,
+        secret_label: str | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = CredentialModel(
@@ -4586,6 +4587,7 @@ class AgentDB:
                 totp_identifier=totp_identifier,
                 card_last4=card_last4,
                 card_brand=card_brand,
+                secret_label=secret_label,
             )
             session.add(credential)
             await session.commit()

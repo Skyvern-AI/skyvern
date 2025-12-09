@@ -14,6 +14,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialVaultType,
     CreditCardCredential,
     PasswordCredential,
+    SecretCredential,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 
@@ -36,8 +37,14 @@ class AzureCredentialVaultService(CredentialVaultService):
         card_brand: str
         card_holder_name: str
 
+    class _SecretCredentialDataImage(BaseModel):
+        type: Literal["secret"]
+        secret_value: str
+        secret_label: str | None = None
+
     _CredentialDataImage = Annotated[
-        Union[_PasswordCredentialDataImage, _CreditCardCredentialDataImage], Field(discriminator="type")
+        Union[_PasswordCredentialDataImage, _CreditCardCredentialDataImage, _SecretCredentialDataImage],
+        Field(discriminator="type"),
     ]
 
     def __init__(self, client: AsyncAzureVaultClient, vault_name: str):
@@ -128,13 +135,20 @@ class AzureCredentialVaultService(CredentialVaultService):
                 name=db_credential.name,
                 credential_type=CredentialType.CREDIT_CARD,
             )
+        elif isinstance(data, AzureCredentialVaultService._SecretCredentialDataImage):
+            return CredentialItem(
+                item_id=db_credential.item_id,
+                credential=SecretCredential(secret_value=data.secret_value, secret_label=data.secret_label),
+                name=db_credential.name,
+                credential_type=CredentialType.SECRET,
+            )
         else:
             raise TypeError(f"Invalid credential type: {type(data)}")
 
     async def _create_azure_secret_item(
         self,
         organization_id: str,
-        credential: PasswordCredential | CreditCardCredential,
+        credential: PasswordCredential | CreditCardCredential | SecretCredential,
     ) -> str:
         if isinstance(credential, PasswordCredential):
             data = AzureCredentialVaultService._PasswordCredentialDataImage(
@@ -152,6 +166,12 @@ class AzureCredentialVaultService(CredentialVaultService):
                 card_exp_year=credential.card_exp_year,
                 card_brand=credential.card_brand,
                 card_holder_name=credential.card_holder_name,
+            )
+        elif isinstance(credential, SecretCredential):
+            data = AzureCredentialVaultService._SecretCredentialDataImage(
+                type="secret",
+                secret_value=credential.secret_value,
+                secret_label=credential.secret_label,
             )
         else:
             raise TypeError(f"Invalid credential type: {type(credential)}")

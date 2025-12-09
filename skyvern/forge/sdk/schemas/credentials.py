@@ -15,6 +15,7 @@ class CredentialType(StrEnum):
 
     PASSWORD = "password"
     CREDIT_CARD = "credit_card"
+    SECRET = "secret"
 
 
 class TotpType(StrEnum):
@@ -47,6 +48,12 @@ class CreditCardCredentialResponse(BaseModel):
 
     last_four: str = Field(..., description="Last four digits of the credit card number", examples=["1234"])
     brand: str = Field(..., description="Brand of the credit card", examples=["visa"])
+
+
+class SecretCredentialResponse(BaseModel):
+    """Response model for secret credentials."""
+
+    secret_label: str | None = Field(default=None, description="Optional label for the stored secret")
 
 
 class PasswordCredential(BaseModel):
@@ -115,13 +122,22 @@ class NonEmptyCreditCardCredential(CreditCardCredential):
     )
 
 
+class SecretCredential(BaseModel):
+    """Generic secret credential."""
+
+    secret_value: str = Field(..., min_length=1, description="The secret value", examples=["sk-abc123"])
+    secret_label: str | None = Field(default=None, description="Optional label describing the secret")
+
+
 class CredentialItem(BaseModel):
     """Model representing a credential item in the system."""
 
     item_id: str = Field(..., description="Unique identifier for the credential item", examples=["cred_1234567890"])
     name: str = Field(..., description="Name of the credential", examples=["Skyvern Login"])
     credential_type: CredentialType = Field(..., description="Type of the credential. Eg password, credit card, etc.")
-    credential: PasswordCredential | CreditCardCredential = Field(..., description="The actual credential data")
+    credential: PasswordCredential | CreditCardCredential | SecretCredential = Field(
+        ..., description="The actual credential data"
+    )
 
 
 class CreateCredentialRequest(BaseModel):
@@ -129,7 +145,7 @@ class CreateCredentialRequest(BaseModel):
 
     name: str = Field(..., description="Name of the credential", examples=["Amazon Login"])
     credential_type: CredentialType = Field(..., description="Type of credential to create")
-    credential: NonEmptyPasswordCredential | NonEmptyCreditCardCredential = Field(
+    credential: NonEmptyPasswordCredential | NonEmptyCreditCardCredential | SecretCredential = Field(
         ...,
         description="The credential data to store",
         examples=[{"username": "user@example.com", "password": "securepassword123"}],
@@ -140,7 +156,7 @@ class CredentialResponse(BaseModel):
     """Response model for credential operations."""
 
     credential_id: str = Field(..., description="Unique identifier for the credential", examples=["cred_1234567890"])
-    credential: PasswordCredentialResponse | CreditCardCredentialResponse = Field(
+    credential: PasswordCredentialResponse | CreditCardCredentialResponse | SecretCredentialResponse = Field(
         ..., description="The credential data"
     )
     credential_type: CredentialType = Field(..., description="Type of the credential")
@@ -173,6 +189,7 @@ class Credential(BaseModel):
     )
     card_last4: str | None = Field(..., description="For credit_card credentials: the last four digits of the card")
     card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")
+    secret_label: str | None = Field(default=None, description="For secret credentials: optional label")
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
