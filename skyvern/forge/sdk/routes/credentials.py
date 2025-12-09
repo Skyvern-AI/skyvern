@@ -29,6 +29,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialVaultType,
     CreditCardCredentialResponse,
     PasswordCredentialResponse,
+    SecretCredentialResponse,
 )
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredentialResponse,
@@ -261,6 +262,14 @@ async def create_credential(
             last_four=data.credential.card_number[-4:],
             brand=data.credential.card_brand,
         )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=data.credential_type,
+            name=data.name,
+        )
+    elif data.credential_type == CredentialType.SECRET:
+        credential_response = SecretCredentialResponse(secret_label=data.credential.secret_label)
         return CredentialResponse(
             credential=credential_response,
             credential_id=credential.credential_id,
@@ -758,6 +767,14 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             last_four=credential.card_last4 or "****",
             brand=credential.card_brand or "Card Brand",
         )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=credential.credential_type,
+            name=credential.name,
+        )
+    elif credential.credential_type == CredentialType.SECRET:
+        credential_response = SecretCredentialResponse(secret_label=credential.secret_label)
         return CredentialResponse(
             credential=credential_response,
             credential_id=credential.credential_id,

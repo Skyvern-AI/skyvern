@@ -901,6 +901,7 @@ class CredentialModel(Base):
     totp_identifier = Column(String, nullable=True, default=None)
     card_last4 = Column(String, nullable=True)
     card_brand = Column(String, nullable=True)
+    secret_label = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
