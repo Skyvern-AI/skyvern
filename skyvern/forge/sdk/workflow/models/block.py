@@ -3891,7 +3891,7 @@ class HttpRequestBlock(Block):
                 method=self.method,
                 url=self.url,
                 headers=self.headers,
-                json_data=self.body,
+                body=self.body,
                 timeout=self.timeout,
                 follow_redirects=self.follow_redirects,
             )
