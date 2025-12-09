@@ -18,11 +18,16 @@ from fastapi import (
 )
 from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse
+from pydantic import ValidationError
 
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
-from skyvern.exceptions import CannotUpdateWorkflowDueToCodeCache, MissingBrowserAddressError
+from skyvern.exceptions import (
+    CannotUpdateWorkflowDueToCodeCache,
+    MissingBrowserAddressError,
+    SkyvernHTTPException,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -826,6 +831,9 @@ async def update_workflow_legacy(
         ) from e
     except WorkflowParameterMissingRequiredValue as e:
         raise e
+    except (SkyvernHTTPException, ValidationError) as e:
+        # Bubble up well-formed client errors so they are not converted to 500s
+        raise e
     except Exception as e:
         LOG.exception(
             "Failed to update workflow",
@@ -896,6 +904,9 @@ async def update_workflow(
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
     except WorkflowParameterMissingRequiredValue as e:
+        raise e
+    except (SkyvernHTTPException, ValidationError) as e:
+        # Bubble up well-formed client errors so they are not converted to 500s
         raise e
     except Exception as e:
         LOG.exception(

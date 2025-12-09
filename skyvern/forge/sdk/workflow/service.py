@@ -3339,7 +3339,9 @@ class WorkflowService:
                     loop_over_parameter = parameters[trimmed_key]
 
             if loop_over_parameter is None and not block_yaml.loop_variable_reference:
-                raise Exception("Loop value parameter is required for for loop block")
+                raise InvalidWorkflowDefinition(
+                    f"For loop block '{block_yaml.label}' requires either loop_over_parameter_key or loop_variable_reference"
+                )
 
             return ForLoopBlock(
                 **base_kwargs,
@@ -3458,7 +3460,9 @@ class WorkflowService:
             )
 
             if not block_yaml.complete_criterion and not block_yaml.terminate_criterion:
-                raise Exception("Both complete criterion and terminate criterion are empty")
+                raise InvalidWorkflowDefinition(
+                    f"Validation block '{block_yaml.label}' requires at least one of complete_criterion or terminate_criterion"
+                )
 
             return ValidationBlock(
                 **base_kwargs,
@@ -3479,7 +3483,7 @@ class WorkflowService:
             )
 
             if not block_yaml.navigation_goal:
-                raise Exception("empty action instruction")
+                raise InvalidWorkflowDefinition(f"Action block '{block_yaml.label}' requires navigation_goal")
 
             return ActionBlock(
                 **base_kwargs,
