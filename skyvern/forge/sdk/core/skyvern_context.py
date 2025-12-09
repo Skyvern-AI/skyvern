@@ -67,11 +67,6 @@ class SkyvernContext:
     next_step_pre_scraped_data: dict[str, Any] | None = None
     speculative_plans: dict[str, Any] = field(default_factory=dict)
 
-    # Store absolute page position of last hovered element to scroll back after re-scraping
-    # This is the Y position relative to the entire page (not viewport)
-    last_hovered_element_page_y: float | None = None
-    last_hovered_element_id: str | None = None
-
     """
     Example output value:
     {"loop_value": "str", "output_parameter": "the key of the parameter", "output_value": Any}

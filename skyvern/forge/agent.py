@@ -2117,6 +2117,7 @@ class ForgeAgent:
         if not working_page:
             raise MissingBrowserStatePage()
 
+        skyvern_frame: SkyvernFrame | None = None
         try:
             skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
             await skyvern_frame.safe_wait_for_animation_end()
@@ -2132,9 +2133,22 @@ class ForgeAgent:
             scrolling_number = 0
 
         try:
+            # get current x, y position of the page
+            x: int | None = None
+            y: int | None = None
+            try:
+                x, y = await skyvern_frame.get_scroll_x_y() if skyvern_frame else (None, None)
+                LOG.debug("Current x, y position of the page before taking screenshot", x=x, y=y)
+            except Exception:
+                LOG.warning("Failed to get current x, y position of the page", exc_info=True)
+
             screenshot = await browser_state.take_post_action_screenshot(
                 scrolling_number=scrolling_number,
             )
+            # scroll back to the original x, y position of the page
+            if skyvern_frame and x is not None and y is not None:
+                await skyvern_frame.safe_scroll_to_x_y(x, y)
+                LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
                 artifact_type=ArtifactType.SCREENSHOT_ACTION,
@@ -2284,33 +2298,6 @@ class ForgeAgent:
 
         # If we don't have pre-scraped data, scrape normally
         if scraped_page is None:
-            # Scroll back to last hovered element position BEFORE scraping
-            # This ensures the element is visible in the screenshot taken during scraping
-            if context and context.last_hovered_element_page_y is not None:
-                try:
-                    working_page = await browser_state.must_get_working_page()
-                    # Get viewport height to center the element
-                    viewport_height = await working_page.evaluate("window.innerHeight")
-                    # Calculate scroll position to center the element in viewport
-                    target_scroll_y = context.last_hovered_element_page_y - (viewport_height / 2)
-                    target_scroll_y = max(0, target_scroll_y)  # Don't scroll to negative
-
-                    LOG.info(
-                        "Scrolling back to last hovered element position before scraping",
-                        element_id=context.last_hovered_element_id,
-                        absolute_page_y=context.last_hovered_element_page_y,
-                        target_scroll_y=target_scroll_y,
-                    )
-                    await working_page.evaluate(f"window.scrollTo(0, {target_scroll_y})")
-                    # Small delay to let the scroll settle
-                    await asyncio.sleep(0.3)
-
-                    # Clear the saved position after scrolling back
-                    context.last_hovered_element_page_y = None
-                    context.last_hovered_element_id = None
-                except Exception:
-                    LOG.warning("Failed to scroll back to hovered element position before scraping", exc_info=True)
-
             # Check PostHog for speed optimizations BEFORE scraping
             # This decision will be used in both:
             # 1. SVG conversion skip (in agent_functions.py cleanup)
