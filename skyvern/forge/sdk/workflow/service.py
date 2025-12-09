@@ -1326,7 +1326,6 @@ class WorkflowService:
         self,
         blocks: list[BlockTypeVar],
     ) -> tuple[str, dict[str, BlockTypeVar], dict[str, str | None]]:
-        # all_blocks = get_all_blocks(blocks)
         all_blocks = blocks
         label_to_block: dict[str, BlockTypeVar] = {}
         default_next_map: dict[str, str | None] = {}
