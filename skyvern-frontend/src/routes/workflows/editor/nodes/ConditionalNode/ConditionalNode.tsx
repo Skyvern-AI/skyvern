@@ -666,8 +666,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
                     </Label>
                     {!activeBranch.is_default && (
                       <HelpTooltip
-                        content={`Jinja: {{ y > 100 }}
-Natural language: y is greater than 100`}
+                        content={`Jinja: {{ y > 100 }}\nNatural language: y is greater than 100`}
                       />
                     )}
                   </div>
