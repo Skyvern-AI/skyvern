@@ -4,11 +4,13 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .branch_criteria_yaml_criteria_type import BranchCriteriaYamlCriteriaType
 
 
-class BranchCriteriaYaml(UniversalBaseModel):
-    criteria_type: typing.Optional[BranchCriteriaYamlCriteriaType] = None
+class PromptBranchCriteria(UniversalBaseModel):
+    """
+    Natural language branch criteria.
+    """
+
     expression: str
     description: typing.Optional[str] = None
 

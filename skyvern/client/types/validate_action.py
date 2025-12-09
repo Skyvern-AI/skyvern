@@ -4,13 +4,22 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .branch_criteria_yaml_criteria_type import BranchCriteriaYamlCriteriaType
 
 
-class BranchCriteriaYaml(UniversalBaseModel):
-    criteria_type: typing.Optional[BranchCriteriaYamlCriteriaType] = None
-    expression: str
-    description: typing.Optional[str] = None
+class ValidateAction(UniversalBaseModel):
+    """
+    Validate action parameters.
+    """
+
+    prompt: str = pydantic.Field()
+    """
+    Validation criteria or condition to check
+    """
+
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = pydantic.Field(default=None)
+    """
+    Optional model configuration
+    """
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

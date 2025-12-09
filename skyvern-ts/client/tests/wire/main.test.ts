@@ -1244,6 +1244,10 @@ describe("SkyvernClient", () => {
                     instructions: "instructions",
                     positive_descriptor: "positive_descriptor",
                     negative_descriptor: "negative_descriptor",
+                    executed_branch_id: "executed_branch_id",
+                    executed_branch_expression: "executed_branch_expression",
+                    executed_branch_result: true,
+                    executed_branch_next_block: "executed_branch_next_block",
                 },
                 thought: {
                     thought_id: "thought_id",
@@ -1331,6 +1335,10 @@ describe("SkyvernClient", () => {
                     instructions: "instructions",
                     positive_descriptor: "positive_descriptor",
                     negative_descriptor: "negative_descriptor",
+                    executed_branch_id: "executed_branch_id",
+                    executed_branch_expression: "executed_branch_expression",
+                    executed_branch_result: true,
+                    executed_branch_next_block: "executed_branch_next_block",
                 },
                 thought: {
                     thought_id: "thought_id",

@@ -1310,11 +1310,11 @@
               }
             }
           },
-          "400": {
-            "description": "Folder not found"
-          },
           "404": {
             "description": "Workflow not found"
+          },
+          "400": {
+            "description": "Folder not found"
           },
           "422": {
             "description": "Validation Error",
@@ -1620,11 +1620,11 @@
               }
             }
           },
-          "400": {
-            "description": "Timeline not available for this run type"
-          },
           "404": {
             "description": "Run not found"
+          },
+          "400": {
+            "description": "Timeline not available for this run type"
           },
           "422": {
             "description": "Validation Error",
@@ -2266,11 +2266,11 @@
               }
             }
           },
-          "403": {
-            "description": "Unauthorized - Invalid or missing authentication"
-          },
           "404": {
             "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
           },
           "422": {
             "description": "Validation Error",
@@ -5710,7 +5710,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -6264,8 +6264,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440,
-                "minimum": 5
+                "maximum": 1440.0,
+                "minimum": 5.0
               },
               {
                 "type": "null"
@@ -10051,7 +10051,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -12371,7 +12371,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -14721,7 +14721,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -15230,8 +15230,8 @@
           },
           "confidence_float": {
             "type": "number",
-            "maximum": 1,
-            "minimum": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
             "title": "Confidence Float"
           }
         },
