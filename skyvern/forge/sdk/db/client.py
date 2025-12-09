@@ -3911,6 +3911,11 @@ class AgentDB:
         instructions: str | None = None,
         positive_descriptor: str | None = None,
         negative_descriptor: str | None = None,
+        # conditional block
+        executed_branch_id: str | None = None,
+        executed_branch_expression: str | None = None,
+        executed_branch_result: bool | None = None,
+        executed_branch_next_block: str | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -3977,6 +3982,15 @@ class AgentDB:
                     workflow_run_block.positive_descriptor = positive_descriptor
                 if negative_descriptor:
                     workflow_run_block.negative_descriptor = negative_descriptor
+                # conditional block fields
+                if executed_branch_id:
+                    workflow_run_block.executed_branch_id = executed_branch_id
+                if executed_branch_expression is not None:
+                    workflow_run_block.executed_branch_expression = executed_branch_expression
+                if executed_branch_result is not None:
+                    workflow_run_block.executed_branch_result = executed_branch_result
+                if executed_branch_next_block is not None:
+                    workflow_run_block.executed_branch_next_block = executed_branch_next_block
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:

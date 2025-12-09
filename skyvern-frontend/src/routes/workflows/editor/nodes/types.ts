@@ -10,6 +10,14 @@ export type NodeBaseData = {
   model: WorkflowModel | null;
   showCode?: boolean;
   comparisonColor?: string;
+  /**
+   * Optional metadata used for conditional branches.
+   * These values are only set on nodes that live within a conditional block.
+   */
+  conditionalBranchId?: string | null;
+  conditionalLabel?: string | null;
+  conditionalNodeId?: string | null;
+  conditionalMergeLabel?: string | null;
 };
 
 export const errorMappingExampleValue = {
@@ -38,6 +46,7 @@ export const workflowBlockTitle: {
 } = {
   action: "Browser Action",
   code: "Code",
+  conditional: "Conditional",
   download_to_s3: "Download",
   extraction: "Extraction",
   file_download: "File Download",

@@ -262,7 +262,7 @@ class ForLoopBlockYAML(BlockYAML):
 
 
 class BranchCriteriaYAML(BaseModel):
-    criteria_type: Literal["jinja2_template"] = "jinja2_template"
+    criteria_type: Literal["jinja2_template", "prompt"] = "jinja2_template"
     expression: str
     description: str | None = None
 

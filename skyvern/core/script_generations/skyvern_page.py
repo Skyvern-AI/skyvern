@@ -705,6 +705,48 @@ class SkyvernPage(Page):
         data = kwargs.pop("data", None)
         return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
 
+    async def validate(
+        self,
+        prompt: str,
+        model: dict[str, Any] | str | None = None,
+    ) -> bool:
+        """Validate the current page state using AI.
+
+        Args:
+            prompt: Validation criteria or condition to check
+            model: Optional model configuration. Can be either:
+                   - A dict with model configuration (e.g., {"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048})
+                   - A string with just the model name (e.g., "gpt-4")
+
+        Returns:
+            bool: True if validation passes, False otherwise
+
+        Examples:
+            ```python
+            # Simple validation
+            is_valid = await page.validate("Check if the login was successful")
+
+            # Validation with specific model (as string)
+            is_valid = await page.validate(
+                "Check if the order was placed",
+                model="gemini-2.5-flash-lite"
+            )
+
+            # Validation with model config (as dict)
+            is_valid = await page.validate(
+                "Check if the payment completed",
+                model={"model_name": "gemini-2.5-flash-lite", "max_tokens": 1024}
+            )
+            ```
+        """
+        normalized_model: dict[str, Any] | None = None
+        if isinstance(model, str):
+            normalized_model = {"model_name": model}
+        elif model is not None:
+            normalized_model = model
+
+        return await self._ai.ai_validate(prompt=prompt, model=normalized_model)
+
     async def prompt(
         self,
         prompt: str,

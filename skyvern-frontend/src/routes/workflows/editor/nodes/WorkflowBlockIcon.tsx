@@ -17,6 +17,7 @@ import {
   UploadIcon,
 } from "@radix-ui/react-icons";
 import { ExtractIcon } from "@/components/icons/ExtractIcon";
+import { GitBranchIcon } from "@/components/icons/GitBranchIcon";
 import { RobotIcon } from "@/components/icons/RobotIcon";
 
 type Props = {
@@ -31,6 +32,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "code": {
       return <CodeIcon className={className} />;
+    }
+    case "conditional": {
+      return <GitBranchIcon className={className} />;
     }
     case "download_to_s3": {
       return <DownloadIcon className={className} />;

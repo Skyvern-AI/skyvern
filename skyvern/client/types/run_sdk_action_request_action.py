@@ -5,7 +5,9 @@ from __future__ import annotations
 import typing
 
 import pydantic
+import typing_extensions
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from ..core.serialization import FieldMetadata
 from .act_action_data import ActActionData
 from .click_action_data import ClickActionData
 from .extract_action_data import ExtractActionData
@@ -170,8 +172,29 @@ class RunSdkActionRequestAction_Prompt(UniversalBaseModel):
 
     type: typing.Literal["prompt"] = "prompt"
     prompt: str
-    schema: typing.Optional[typing.Dict[str, typing.Any]] = None
-    model: typing.Optional[typing.Dict[str, typing.Any]] = None
+    schema_: typing_extensions.Annotated[
+        typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]], FieldMetadata(alias="schema")
+    ] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class RunSdkActionRequestAction_Validate(UniversalBaseModel):
+    """
+    The action to execute with its specific parameters
+    """
+
+    type: typing.Literal["validate"] = "validate"
+    prompt: str
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -192,4 +215,5 @@ RunSdkActionRequestAction = typing.Union[
     RunSdkActionRequestAction_Extract,
     RunSdkActionRequestAction_LocateElement,
     RunSdkActionRequestAction_Prompt,
+    RunSdkActionRequestAction_Validate,
 ]

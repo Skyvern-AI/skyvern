@@ -6,6 +6,7 @@ import type * as Skyvern from "../index.js";
  * Represents a single conditional branch edge within a ConditionalBlock.
  */
 export interface BranchCondition {
+    id?: string;
     criteria?: Skyvern.BranchConditionCriteria;
     next_block_label?: string;
     description?: string;

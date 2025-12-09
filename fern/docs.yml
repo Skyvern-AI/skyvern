@@ -17,7 +17,6 @@ colors:
 analytics:
   posthog:
     api-key: ${POSTHOG_API_KEY}
-js: ./tracking.js
 layout:
   page-width: 1504px
   header-height: 75px
