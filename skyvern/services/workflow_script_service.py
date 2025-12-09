@@ -144,13 +144,14 @@ async def _load_cached_script_block_sources(
         if not code_str:
             continue
 
-        cached_blocks[script_block.script_block_label] = ScriptBlockSource(
-            label=script_block.script_block_label,
-            code=code_str,
-            run_signature=script_block.run_signature,
-            workflow_run_id=script_block.workflow_run_id,
-            workflow_run_block_id=script_block.workflow_run_block_id,
-        )
+            cached_blocks[script_block.script_block_label] = ScriptBlockSource(
+                label=script_block.script_block_label,
+                code=code_str,
+                run_signature=script_block.run_signature,
+                workflow_run_id=script_block.workflow_run_id,
+                workflow_run_block_id=script_block.workflow_run_block_id,
+                input_fields=script_block.input_fields,
+            )
 
     return cached_blocks
 

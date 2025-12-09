@@ -137,6 +137,7 @@ class ScriptBlock(BaseModel):
     run_signature: str | None = None  # The function call code to execute this block
     workflow_run_id: str | None = None
     workflow_run_block_id: str | None = None
+    input_fields: list[str] | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None

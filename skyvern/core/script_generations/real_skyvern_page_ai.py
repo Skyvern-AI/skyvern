@@ -11,6 +11,7 @@ from playwright.async_api import Page
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_PAGE_MAX_SCRAPING_RETRIES, SPECIAL_FIELD_VERIFICATION_CODE
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
+from skyvern.exceptions import WorkflowRunContextNotInitialized
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
@@ -204,6 +205,20 @@ class RealSkyvernPageAi(SkyvernPageAi):
             locator = self.page.locator(selector)
             await locator.click(timeout=timeout)
         return selector
+
+    async def input_text_with_secret_resolution(
+        self,
+        selector: str,
+        value: str,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str:
+        """Input text into an element identified by ``selector``."""
+        context = skyvern_context.ensure_context()
+        if context and context.workflow_run_id:
+            value = await _get_actual_value_of_parameter_if_secret(context.workflow_run_id, value)
+        locator = self.page.locator(selector)
+        await handler_utils.input_sequentially(locator, value, timeout=timeout)
+        return value
 
     async def ai_input_text(
         self,
@@ -807,6 +822,9 @@ async def _get_actual_value_of_parameter_if_secret(workflow_run_id: str, paramet
 
     This is only used for InputTextAction, UploadFileAction, and ClickAction (if it has a file_url).
     """
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    try:
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    except WorkflowRunContextNotInitialized:
+        return parameter
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
     return secret_value if secret_value is not None else parameter

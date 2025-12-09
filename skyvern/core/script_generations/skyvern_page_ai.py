@@ -18,6 +18,15 @@ class SkyvernPageAi(Protocol):
         """Click an element using AI to locate it based on intention."""
         ...
 
+    async def input_text_with_secret_resolution(
+        self,
+        selector: str,
+        value: str,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str:
+        """Input text into an element identified by ``selector``."""
+        ...
+
     async def ai_input_text(
         self,
         selector: str | None,
