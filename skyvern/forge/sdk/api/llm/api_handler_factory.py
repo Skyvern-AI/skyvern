@@ -49,6 +49,9 @@ LOG = structlog.get_logger()
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
 
+# Default thinking budget for extract-actions prompt (can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
+EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = 512
+
 
 @runtime_checkable
 class RouterWithModelList(Protocol):
@@ -379,6 +382,11 @@ class LLMAPIHandlerFactory:
                 new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     parameters, new_budget, llm_config, prompt_name
+                )
+            elif prompt_name == EXTRACT_ACTION_PROMPT_NAME:
+                # Apply default thinking budget for extract-actions (512) unless overridden by experiment
+                LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+                    parameters, EXTRACT_ACTION_DEFAULT_THINKING_BUDGET, llm_config, prompt_name
                 )
 
             context = skyvern_context.current()
@@ -779,6 +787,11 @@ class LLMAPIHandlerFactory:
                 new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     active_parameters, new_budget, llm_config, prompt_name
+                )
+            elif prompt_name == EXTRACT_ACTION_PROMPT_NAME:
+                # Apply default thinking budget for extract-actions (512) unless overridden by experiment
+                LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+                    active_parameters, EXTRACT_ACTION_DEFAULT_THINKING_BUDGET, llm_config, prompt_name
                 )
 
             context = skyvern_context.current()
