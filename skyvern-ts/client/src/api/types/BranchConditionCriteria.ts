@@ -2,10 +2,16 @@
 
 import type * as Skyvern from "../index.js";
 
-export type BranchConditionCriteria = Skyvern.BranchConditionCriteria.Jinja2Template;
+export type BranchConditionCriteria =
+    | Skyvern.BranchConditionCriteria.Jinja2Template
+    | Skyvern.BranchConditionCriteria.Prompt;
 
 export namespace BranchConditionCriteria {
     export interface Jinja2Template extends Skyvern.JinjaBranchCriteria {
         criteria_type: "jinja2_template";
+    }
+
+    export interface Prompt extends Skyvern.PromptBranchCriteria {
+        criteria_type: "prompt";
     }
 }

@@ -12,6 +12,7 @@ class BranchCondition(UniversalBaseModel):
     Represents a single conditional branch edge within a ConditionalBlock.
     """
 
+    id: typing.Optional[str] = None
     criteria: typing.Optional[BranchConditionCriteria] = None
     next_block_label: typing.Optional[str] = None
     description: typing.Optional[str] = None
