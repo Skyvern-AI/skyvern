@@ -173,6 +173,7 @@ class Block(BaseModel, abc.ABC):
             "Registered output parameter value",
             output_parameter_id=self.output_parameter.output_parameter_id,
             workflow_run_id=workflow_run_id,
+            output_parameter_value=value,
         )
 
     async def build_block_result(
@@ -3918,6 +3919,7 @@ class HttpRequestBlock(Block):
                 url=self.url,
                 method=self.method,
                 workflow_run_id=workflow_run_id,
+                response_data=response_data,
             )
 
             # Determine success based on status code
