@@ -1378,46 +1378,8 @@ class ForgeAgent:
                     properties={"task_url": task.url, "organization_id": task.organization_id},
                 )
 
-                # Check if parallel verification is enabled
-                distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                enable_parallel_verification = (
-                    await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                        "ENABLE_PARALLEL_USER_GOAL_CHECK",
-                        distinct_id,
-                        properties={"organization_id": task.organization_id, "task_url": task.url},
-                    )
-                    and not disable_user_goal_check
-                )
-
-                if not disable_user_goal_check and not enable_parallel_verification:
-                    # Standard synchronous verification
-                    working_page = await browser_state.must_get_working_page()
-                    complete_action = await self.check_user_goal_complete(
-                        page=working_page,
-                        scraped_page=scraped_page,
-                        task=task,
-                        step=step,
-                    )
-                    if complete_action is not None:
-                        LOG.info("User goal achieved, executing complete action")
-                        complete_action.organization_id = task.organization_id
-                        complete_action.workflow_run_id = task.workflow_run_id
-                        complete_action.task_id = task.task_id
-                        complete_action.step_id = step.step_id
-                        complete_action.step_order = step.order
-                        complete_action.action_order = len(detailed_agent_step_output.actions_and_results)
-                        complete_results = await ActionHandler.handle_action(
-                            scraped_page, task, step, working_page, complete_action
-                        )
-                        detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
-                        await self.record_artifacts_after_action(task, step, browser_state, engine)
-                elif not disable_user_goal_check and enable_parallel_verification:
-                    # Parallel verification enabled - defer check to handle_completed_step
-                    LOG.info(
-                        "Parallel verification enabled, deferring user goal check to handle_completed_step",
-                        step_id=step.step_id,
-                        task_id=task.task_id,
-                    )
+                # Parallel verification is always enabled (user goal check deferred to handle_completed_step)
+                enable_parallel_verification = not disable_user_goal_check
 
             # if the last action is complete and is successful, check if there's a data extraction goal
             # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
@@ -4136,48 +4098,28 @@ class ForgeAgent:
         )
 
         if should_verify and browser_state and scraped_page:
-            try:
-                disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "DISABLE_USER_GOAL_CHECK",
-                    task.workflow_run_id if task.workflow_run_id else task.task_id,
-                    properties={"task_url": task.url, "organization_id": task.organization_id},
-                )
+            disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "DISABLE_USER_GOAL_CHECK",
+                task.workflow_run_id if task.workflow_run_id else task.task_id,
+                properties={"task_url": task.url, "organization_id": task.organization_id},
+            )
 
-                if disable_user_goal_check:
-                    LOG.info(
-                        "User goal verification disabled via feature flag, skipping parallel verification",
-                        step_id=step.step_id,
-                        task_id=task.task_id,
-                    )
-                else:
-                    distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                    enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                        "ENABLE_PARALLEL_USER_GOAL_CHECK",
-                        distinct_id,
-                        properties={"organization_id": task.organization_id, "task_url": task.url},
-                    )
-
-                    if enable_parallel_verification:
-                        LOG.info(
-                            "Parallel verification enabled, using optimized flow",
-                            step_id=step.step_id,
-                            task_id=task.task_id,
-                        )
-                        return await self._handle_completed_step_with_parallel_verification(
-                            organization=organization,
-                            task=task,
-                            step=step,
-                            page=page,
-                            browser_state=browser_state,
-                            scraped_page=scraped_page,
-                            engine=engine,
-                            task_block=task_block,
-                        )
-            except Exception:
-                LOG.warning(
-                    "Failed to check parallel verification feature flag, using standard flow",
+            if disable_user_goal_check:
+                LOG.info(
+                    "User goal verification disabled via feature flag",
                     step_id=step.step_id,
-                    exc_info=True,
+                    task_id=task.task_id,
+                )
+            else:
+                return await self._handle_completed_step_with_parallel_verification(
+                    organization=organization,
+                    task=task,
+                    step=step,
+                    page=page,
+                    browser_state=browser_state,
+                    scraped_page=scraped_page,
+                    engine=engine,
+                    task_block=task_block,
                 )
 
         if step.is_goal_achieved():
