@@ -988,7 +988,7 @@ class LLMAPIHandlerFactory:
 
             _log_vertex_cache_hit_if_needed(context, prompt_name, model_name, cached_tokens)
 
-            if step:
+            if step and not is_speculative_step:
                 await app.DATABASE.update_step(
                     task_id=step.task_id,
                     step_id=step.step_id,
@@ -1010,27 +1010,32 @@ class LLMAPIHandlerFactory:
                     thought_cost=llm_cost,
                 )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
-            )
-
-            if context and len(context.hashed_href_map) > 0:
-                llm_content = json.dumps(parsed_response)
-                rendered_content = Template(llm_content).render(context.hashed_href_map)
-                parsed_response = json.loads(rendered_content)
+            parsed_response_json = json.dumps(parsed_response, indent=2)
+            if step and not is_speculative_step:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
-                    data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                    data=parsed_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
                     step=step,
                     task_v2=task_v2,
                     thought=thought,
                     ai_suggestion=ai_suggestion,
                 )
+
+            rendered_response_json = None
+            if context and len(context.hashed_href_map) > 0:
+                llm_content = json.dumps(parsed_response)
+                rendered_content = Template(llm_content).render(context.hashed_href_map)
+                parsed_response = json.loads(rendered_content)
+                rendered_response_json = json.dumps(parsed_response, indent=2)
+                if step and not is_speculative_step:
+                    await app.ARTIFACT_MANAGER.create_llm_artifact(
+                        data=rendered_response_json.encode("utf-8"),
+                        artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                        step=step,
+                        task_v2=task_v2,
+                        thought=thought,
+                        ai_suggestion=ai_suggestion,
+                    )
 
             # Track LLM API handler duration, token counts, and cost
             organization_id = organization_id or (
@@ -1052,6 +1057,23 @@ class LLMAPIHandlerFactory:
                 cached_tokens=cached_tokens if cached_tokens > 0 else None,
                 llm_cost=llm_cost if llm_cost > 0 else None,
             )
+
+            if step and is_speculative_step:
+                step.speculative_llm_metadata = SpeculativeLLMMetadata(
+                    prompt=llm_prompt_value,
+                    llm_request_json=llm_request_json,
+                    llm_response_json=llm_response_json,
+                    parsed_response_json=parsed_response_json,
+                    rendered_response_json=rendered_response_json,
+                    llm_key=llm_key,
+                    model=llm_config.model_name,
+                    duration_seconds=duration_seconds,
+                    input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                    output_tokens=completion_tokens if completion_tokens > 0 else None,
+                    reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+                    cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                    llm_cost=llm_cost if llm_cost > 0 else None,
+                )
 
             return parsed_response
 
