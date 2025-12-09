@@ -136,6 +136,7 @@ class ScriptSkyvernPage(SkyvernPage):
             ActionType.INPUT_TEXT: "⌨️",
             ActionType.UPLOAD_FILE: "📤",
             ActionType.DOWNLOAD_FILE: "📥",
+            ActionType.HOVER: "🖱️",
             ActionType.SELECT_OPTION: "🎯",
             ActionType.WAIT: "⏳",
             ActionType.SOLVE_CAPTCHA: "🔓",

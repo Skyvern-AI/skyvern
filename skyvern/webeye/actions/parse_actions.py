@@ -27,6 +27,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     DragAction,
     GotoUrlAction,
+    HoverAction,
     InputOrSelectContext,
     InputTextAction,
     KeypressAction,
@@ -165,6 +166,9 @@ def parse_action(
 
     if action_type == ActionType.WAIT:
         return WaitAction(**base_action_dict)
+
+    if action_type == ActionType.HOVER:
+        return HoverAction(**base_action_dict, hold_seconds=action.get("hold_seconds", 0) or 0)
 
     if action_type == ActionType.COMPLETE:
         return CompleteAction(

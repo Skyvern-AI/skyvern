@@ -501,6 +501,11 @@ class FailToClick(SkyvernException):
         super().__init__(f"Failed to click({anchor}). element_id={element_id}, error_msg={msg}")
 
 
+class FailToHover(SkyvernException):
+    def __init__(self, element_id: str, msg: str):
+        super().__init__(f"Failed to hover. element_id={element_id}, error_msg={msg}")
+
+
 class FailToSelectByLabel(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(f"Failed to select by label. element_id={element_id}")
