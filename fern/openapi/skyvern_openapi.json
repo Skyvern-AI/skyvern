@@ -1310,11 +1310,11 @@
               }
             }
           },
-          "400": {
-            "description": "Folder not found"
-          },
           "404": {
             "description": "Workflow not found"
+          },
+          "400": {
+            "description": "Folder not found"
           },
           "422": {
             "description": "Validation Error",
@@ -1620,11 +1620,11 @@
               }
             }
           },
-          "400": {
-            "description": "Timeline not available for this run type"
-          },
           "404": {
             "description": "Run not found"
+          },
+          "400": {
+            "description": "Timeline not available for this run type"
           },
           "422": {
             "description": "Validation Error",
@@ -2266,11 +2266,11 @@
               }
             }
           },
-          "403": {
-            "description": "Unauthorized - Invalid or missing authentication"
-          },
           "404": {
             "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
           },
           "422": {
             "description": "Validation Error",
@@ -5274,12 +5274,16 @@
                 "oneOf": [
                   {
                     "$ref": "#/components/schemas/JinjaBranchCriteria"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PromptBranchCriteria"
                   }
                 ],
                 "discriminator": {
                   "propertyName": "criteria_type",
                   "mapping": {
-                    "jinja2_template": "#/components/schemas/JinjaBranchCriteria"
+                    "jinja2_template": "#/components/schemas/JinjaBranchCriteria",
+                    "prompt": "#/components/schemas/PromptBranchCriteria"
                   }
                 }
               },
@@ -5368,7 +5372,10 @@
         "properties": {
           "criteria_type": {
             "type": "string",
-            "const": "jinja2_template",
+            "enum": [
+              "jinja2_template",
+              "prompt"
+            ],
             "title": "Criteria Type",
             "default": "jinja2_template"
           },
@@ -5703,7 +5710,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -6257,8 +6264,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440,
-                "minimum": 5
+                "maximum": 1440.0,
+                "minimum": 5.0
               },
               {
                 "type": "null"
@@ -10044,7 +10051,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -11931,6 +11938,37 @@
         "title": "PromptAction",
         "description": "Prompt action parameters."
       },
+      "PromptBranchCriteria": {
+        "properties": {
+          "criteria_type": {
+            "type": "string",
+            "const": "prompt",
+            "title": "Criteria Type",
+            "default": "prompt"
+          },
+          "expression": {
+            "type": "string",
+            "title": "Expression"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "expression"
+        ],
+        "title": "PromptBranchCriteria",
+        "description": "Natural language branch criteria."
+      },
       "ProxyLocation": {
         "type": "string",
         "enum": [
@@ -12040,6 +12078,9 @@
                 "$ref": "#/components/schemas/LocateElementAction"
               },
               {
+                "$ref": "#/components/schemas/ValidateAction"
+              },
+              {
                 "$ref": "#/components/schemas/PromptAction"
               }
             ],
@@ -12055,7 +12096,8 @@
                 "ai_upload_file": "#/components/schemas/UploadFileAction",
                 "extract": "#/components/schemas/ExtractAction",
                 "locate_element": "#/components/schemas/LocateElementAction",
-                "prompt": "#/components/schemas/PromptAction"
+                "prompt": "#/components/schemas/PromptAction",
+                "validate": "#/components/schemas/ValidateAction"
               }
             }
           }
@@ -12329,7 +12371,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -14679,7 +14721,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -15188,8 +15230,8 @@
           },
           "confidence_float": {
             "type": "number",
-            "maximum": 1,
-            "minimum": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
             "title": "Confidence Float"
           }
         },
@@ -15200,6 +15242,40 @@
           "confidence_float"
         ],
         "title": "UserDefinedError"
+      },
+      "ValidateAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "validate",
+            "title": "Type",
+            "default": "validate"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Validation criteria or condition to check"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Optional model configuration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "ValidateAction",
+        "description": "Validate action parameters."
       },
       "ValidationBlock": {
         "properties": {
@@ -17176,6 +17252,50 @@
               }
             ],
             "title": "Negative Descriptor"
+          },
+          "executed_branch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Id"
+          },
+          "executed_branch_expression": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Expression"
+          },
+          "executed_branch_result": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Result"
+          },
+          "executed_branch_next_block": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Next Block"
           }
         },
         "type": "object",

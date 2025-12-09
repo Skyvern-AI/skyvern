@@ -43,9 +43,14 @@ if typing.TYPE_CHECKING:
     from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
     from .block_type import BlockType
     from .branch_condition import BranchCondition
-    from .branch_condition_criteria import BranchConditionCriteria, BranchConditionCriteria_Jinja2Template
+    from .branch_condition_criteria import (
+        BranchConditionCriteria,
+        BranchConditionCriteria_Jinja2Template,
+        BranchConditionCriteria_Prompt,
+    )
     from .branch_condition_yaml import BranchConditionYaml
     from .branch_criteria_yaml import BranchCriteriaYaml
+    from .branch_criteria_yaml_criteria_type import BranchCriteriaYamlCriteriaType
     from .browser_profile import BrowserProfile
     from .browser_session_response import BrowserSessionResponse
     from .click_action import ClickAction
@@ -303,6 +308,8 @@ if typing.TYPE_CHECKING:
     from .password_credential_response import PasswordCredentialResponse
     from .pdf_parser_block import PdfParserBlock
     from .pdf_parser_block_yaml import PdfParserBlockYaml
+    from .prompt_action import PromptAction
+    from .prompt_branch_criteria import PromptBranchCriteria
     from .proxy_location import ProxyLocation
     from .run_engine import RunEngine
     from .run_sdk_action_request_action import (
@@ -314,8 +321,8 @@ if typing.TYPE_CHECKING:
         RunSdkActionRequestAction_AiUploadFile,
         RunSdkActionRequestAction_Extract,
         RunSdkActionRequestAction_LocateElement,
-        RunSdkActionRequestAction_Validate,
         RunSdkActionRequestAction_Prompt,
+        RunSdkActionRequestAction_Validate,
     )
     from .run_sdk_action_response import RunSdkActionResponse
     from .run_status import RunStatus
@@ -397,6 +404,7 @@ if typing.TYPE_CHECKING:
     )
     from .url_block_yaml import UrlBlockYaml
     from .user_defined_error import UserDefinedError
+    from .validate_action import ValidateAction
     from .validation_block import ValidationBlock
     from .validation_block_data_schema import ValidationBlockDataSchema
     from .validation_block_parameters_item import (
@@ -570,8 +578,10 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BranchCondition": ".branch_condition",
     "BranchConditionCriteria": ".branch_condition_criteria",
     "BranchConditionCriteria_Jinja2Template": ".branch_condition_criteria",
+    "BranchConditionCriteria_Prompt": ".branch_condition_criteria",
     "BranchConditionYaml": ".branch_condition_yaml",
     "BranchCriteriaYaml": ".branch_criteria_yaml",
+    "BranchCriteriaYamlCriteriaType": ".branch_criteria_yaml_criteria_type",
     "BrowserProfile": ".browser_profile",
     "BrowserSessionResponse": ".browser_session_response",
     "ClickAction": ".click_action",
@@ -805,6 +815,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "PasswordCredentialResponse": ".password_credential_response",
     "PdfParserBlock": ".pdf_parser_block",
     "PdfParserBlockYaml": ".pdf_parser_block_yaml",
+    "PromptAction": ".prompt_action",
+    "PromptBranchCriteria": ".prompt_branch_criteria",
     "ProxyLocation": ".proxy_location",
     "RunEngine": ".run_engine",
     "RunSdkActionRequestAction": ".run_sdk_action_request_action",
@@ -815,8 +827,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "RunSdkActionRequestAction_AiUploadFile": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_Extract": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_LocateElement": ".run_sdk_action_request_action",
-    "RunSdkActionRequestAction_Validate": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_Prompt": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_Validate": ".run_sdk_action_request_action",
     "RunSdkActionResponse": ".run_sdk_action_response",
     "RunStatus": ".run_status",
     "Script": ".script",
@@ -891,6 +903,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "UrlBlockParametersItem_Workflow": ".url_block_parameters_item",
     "UrlBlockYaml": ".url_block_yaml",
     "UserDefinedError": ".user_defined_error",
+    "ValidateAction": ".validate_action",
     "ValidationBlock": ".validation_block",
     "ValidationBlockDataSchema": ".validation_block_data_schema",
     "ValidationBlockParametersItem": ".validation_block_parameters_item",
@@ -1076,8 +1089,10 @@ __all__ = [
     "BranchCondition",
     "BranchConditionCriteria",
     "BranchConditionCriteria_Jinja2Template",
+    "BranchConditionCriteria_Prompt",
     "BranchConditionYaml",
     "BranchCriteriaYaml",
+    "BranchCriteriaYamlCriteriaType",
     "BrowserProfile",
     "BrowserSessionResponse",
     "ClickAction",
@@ -1311,6 +1326,8 @@ __all__ = [
     "PasswordCredentialResponse",
     "PdfParserBlock",
     "PdfParserBlockYaml",
+    "PromptAction",
+    "PromptBranchCriteria",
     "ProxyLocation",
     "RunEngine",
     "RunSdkActionRequestAction",
@@ -1321,8 +1338,8 @@ __all__ = [
     "RunSdkActionRequestAction_AiUploadFile",
     "RunSdkActionRequestAction_Extract",
     "RunSdkActionRequestAction_LocateElement",
-    "RunSdkActionRequestAction_Validate",
     "RunSdkActionRequestAction_Prompt",
+    "RunSdkActionRequestAction_Validate",
     "RunSdkActionResponse",
     "RunStatus",
     "Script",
@@ -1397,6 +1414,7 @@ __all__ = [
     "UrlBlockParametersItem_Workflow",
     "UrlBlockYaml",
     "UserDefinedError",
+    "ValidateAction",
     "ValidationBlock",
     "ValidationBlockDataSchema",
     "ValidationBlockParametersItem",

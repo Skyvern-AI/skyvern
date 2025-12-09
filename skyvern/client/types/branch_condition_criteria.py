@@ -23,4 +23,19 @@ class BranchConditionCriteria_Jinja2Template(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-BranchConditionCriteria = BranchConditionCriteria_Jinja2Template
+class BranchConditionCriteria_Prompt(UniversalBaseModel):
+    criteria_type: typing.Literal["prompt"] = "prompt"
+    expression: str
+    description: typing.Optional[str] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+BranchConditionCriteria = typing.Union[BranchConditionCriteria_Jinja2Template, BranchConditionCriteria_Prompt]
