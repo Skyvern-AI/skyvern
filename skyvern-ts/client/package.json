@@ -46,6 +46,9 @@
         "test:unit": "vitest --project unit",
         "test:wire": "vitest --project wire"
     },
+    "dependencies": {
+        "playwright": "^1.48.0"
+    },
     "devDependencies": {
         "webpack": "^5.97.1",
         "ts-loader": "^9.5.1",

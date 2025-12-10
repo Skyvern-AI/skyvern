@@ -182,17 +182,21 @@ export function RequestPreview({
   url,
   headers,
   body,
+  files,
 }: {
   method: string;
   url: string;
   headers: string;
   body: string;
+  files?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
 
   const hasContent = method && url;
 
   if (!hasContent) return null;
+
+  const hasFiles = files && files.trim() && files !== "{}";
 
   return (
     <div className="rounded-md border bg-slate-50 p-3 dark:bg-slate-900/50">
@@ -202,6 +206,11 @@ export function RequestPreview({
           <span className="font-mono text-sm text-slate-600 dark:text-slate-400">
             {url || "No URL specified"}
           </span>
+          {hasFiles && (
+            <Badge variant="outline" className="text-xs">
+              Files
+            </Badge>
+          )}
         </div>
         <Button
           variant="ghost"
@@ -232,6 +241,17 @@ export function RequestPreview({
               </pre>
             </div>
           )}
+
+          {/* Files (only for POST, PUT, PATCH) */}
+          {["POST", "PUT", "PATCH"].includes(method.toUpperCase()) &&
+            hasFiles && (
+              <div>
+                <div className="mb-1 text-xs font-medium">Files:</div>
+                <pre className="overflow-x-auto rounded bg-slate-100 p-2 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-400">
+                  {files || "{}"}
+                </pre>
+              </div>
+            )}
         </div>
       )}
     </div>

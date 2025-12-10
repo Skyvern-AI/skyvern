@@ -3646,6 +3646,7 @@ class WorkflowService:
                 url=block_yaml.url,
                 headers=block_yaml.headers,
                 body=block_yaml.body,
+                files=block_yaml.files,
                 timeout=block_yaml.timeout,
                 follow_redirects=block_yaml.follow_redirects,
                 parameters=http_request_block_parameters,
