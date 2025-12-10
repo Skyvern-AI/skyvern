@@ -7,6 +7,7 @@ export type HttpRequestNodeData = NodeBaseData & {
   url: string;
   headers: string; // JSON string representation of headers
   body: string; // JSON string representation of body
+  files: string; // JSON string representation of files (dict mapping field names to file paths/URLs)
   timeout: number;
   followRedirects: boolean;
   parameterKeys: Array<string>;
@@ -22,6 +23,7 @@ export const httpRequestNodeDefaultData: HttpRequestNodeData = {
   url: "",
   headers: "{}",
   body: "{}",
+  files: "{}",
   timeout: 30,
   followRedirects: true,
   parameterKeys: [],

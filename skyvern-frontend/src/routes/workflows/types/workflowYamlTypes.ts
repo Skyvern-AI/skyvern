@@ -396,6 +396,7 @@ export type HttpRequestBlockYAML = BlockYAMLBase & {
   url: string | null;
   headers: Record<string, string> | null;
   body: Record<string, unknown> | null;
+  files?: Record<string, string> | null; // Dictionary mapping field names to file paths/URLs
   timeout: number;
   follow_redirects: boolean;
   parameter_keys?: Array<string> | null;
