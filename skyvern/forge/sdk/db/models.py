@@ -822,7 +822,7 @@ class PersistentBrowserSessionModel(Base):
     runnable_type = Column(String, nullable=True)
     runnable_id = Column(String, nullable=True, index=True)
     browser_id = Column(String, nullable=True)
-    browser_address = Column(String, nullable=True)
+    browser_address = Column(String, nullable=True, unique=True)
     status = Column(String, nullable=True, default="created")
     timeout_minutes = Column(Integer, nullable=True)
     ip_address = Column(String, nullable=True)
