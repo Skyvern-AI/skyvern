@@ -60,7 +60,7 @@ import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
-  title: "New Workflow",
+  title: "새 워크플로우",
   description: "",
   ai_fallback: true,
   run_with: "agent",
@@ -269,25 +269,25 @@ function Workflows() {
         <div className="space-y-5">
           <div className="flex items-center gap-2">
             <LightningBoltIcon className="size-6" />
-            <h1 className="text-2xl">Workflows</h1>
+            <h1 className="text-2xl">워크플로우</h1>
           </div>
           <p className="text-slate-300">
-            Create your own complex workflows by connecting web agents together.
-            Define a series of actions, set it, and forget it.
+            웹 에이전트를 연결하여 복잡한 워크플로우를 만들어 보세요.
+            일련의 작업을 정의하고, 설정한 뒤, 자동으로 실행하세요.
           </p>
         </div>
         <div className="flex gap-5">
           <NarrativeCard
             index={1}
-            description="Save browser sessions and reuse them in subsequent runs"
+            description="브라우저 세션을 저장하고 이후 실행에서 재사용"
           />
           <NarrativeCard
             index={2}
-            description="Connect multiple agents together to carry out complex objectives"
+            description="여러 에이전트를 연결하여 복잡한 목표 수행"
           />
           <NarrativeCard
             index={3}
-            description="Execute non-browser tasks such as sending emails"
+            description="이메일 전송 등 브라우저 외 작업 실행"
           />
         </div>
       </div>
@@ -296,14 +296,14 @@ function Workflows() {
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <h2 className="text-lg font-semibold">Folders</h2>
+              <h2 className="text-lg font-semibold">폴더</h2>
               <Button
                 variant="link"
                 size="sm"
                 className="h-auto p-0 text-blue-600 dark:text-blue-400"
                 onClick={() => setIsCreateFolderOpen(true)}
               >
-                + New folder
+                + 새 폴더
               </Button>
             </div>
             {allFolders.length > 5 && (
@@ -313,7 +313,7 @@ function Workflows() {
                 className="text-blue-600 dark:text-blue-400"
                 onClick={() => setIsViewAllFoldersOpen(true)}
               >
-                View all
+                전체 보기
               </Button>
             )}
           </div>
@@ -340,12 +340,12 @@ function Workflows() {
               <div className="mx-auto max-w-md">
                 <FileIcon className="mx-auto mb-3 h-10 w-10 text-blue-400 opacity-50" />
                 <h3 className="mb-2 text-slate-900 dark:text-slate-100">
-                  Organize Your Workflows with Folders
+                  폴더로 워크플로우를 정리하세요
                 </h3>
                 <p className="mb-4 text-sm text-slate-500 dark:text-slate-400">
-                  Keep your workflows organized by creating folders. Group
-                  related workflows together by project, team, or workflow type
-                  for easier management.
+                  폴더를 만들어 워크플로우를 체계적으로 관리하세요. 프로젝트,
+                  팀 또는 워크플로우 유형별로 관련 워크플로우를 그룹화하여
+                  더 쉽게 관리할 수 있습니다.
                 </p>
                 <Button
                   variant="link"
@@ -354,7 +354,7 @@ function Workflows() {
                   onClick={() => setIsCreateFolderOpen(true)}
                 >
                   <PlusIcon className="mr-2 h-4 w-4" />
-                  Create Your First Folder
+                  첫 폴더 만들기
                 </Button>
               </div>
             </div>
@@ -363,7 +363,7 @@ function Workflows() {
 
         {/* Workflows Section */}
         <header className="flex items-center justify-between">
-          <h1 className="text-xl">My Flows</h1>
+          <h1 className="text-xl">내 워크플로우</h1>
           {selectedFolderId && (
             <Button
               variant="link"
@@ -371,7 +371,7 @@ function Workflows() {
               className="h-auto p-0 text-blue-600 dark:text-blue-400"
               onClick={() => setSelectedFolderId(null)}
             >
-              View all workflows
+              모든 워크플로우 보기
             </Button>
           )}
         </header>
@@ -382,7 +382,7 @@ function Workflows() {
               setSearch(value);
               setParamPatch({ page: "1" });
             }}
-            placeholder="Search by title or parameter..."
+            placeholder="제목 또는 파라미터로 검색..."
             className="w-48 lg:w-72"
           />
           <div className="flex gap-4">
@@ -404,7 +404,7 @@ function Workflows() {
               ) : (
                 <PlusIcon className="mr-2 h-4 w-4" />
               )}
-              Create
+              만들기
             </Button>
           </div>
         </div>
@@ -415,10 +415,10 @@ function Workflows() {
                 <TableHead className="w-1/4 rounded-tl-lg text-slate-400">
                   ID
                 </TableHead>
-                <TableHead className="w-1/4 text-slate-400">Title</TableHead>
-                <TableHead className="w-1/6 text-slate-400">Folder</TableHead>
+                <TableHead className="w-1/4 text-slate-400">제목</TableHead>
+                <TableHead className="w-1/6 text-slate-400">폴더</TableHead>
                 <TableHead className="w-1/6 text-slate-400">
-                  Created At
+                  생성일
                 </TableHead>
                 <TableHead className="rounded-tr-lg"></TableHead>
               </TableRow>
@@ -454,7 +454,7 @@ function Workflows() {
                 ))
               ) : displayWorkflows?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={5}>No workflows found</TableCell>
+                  <TableCell colSpan={5}>워크플로우가 없습니다</TableCell>
                 </TableRow>
               ) : (
                 displayWorkflows?.map((workflow) => {
@@ -588,7 +588,7 @@ function Workflows() {
                                     </div>
                                   </TooltipTrigger>
                                   <TooltipContent>
-                                    Assign to Folder
+                                    폴더에 할당
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
@@ -614,9 +614,9 @@ function Workflows() {
                                   <TooltipContent>
                                     {hasParameters
                                       ? isExpanded
-                                        ? "Hide Parameters"
-                                        : "Show Parameters"
-                                      : "No Parameters"}
+                                        ? "파라미터 숨기기"
+                                        : "파라미터 보기"
+                                      : "파라미터 없음"}
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
@@ -637,7 +637,7 @@ function Workflows() {
                                     </Button>
                                   </TooltipTrigger>
                                   <TooltipContent>
-                                    Open in Editor
+                                    편집기에서 열기
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
@@ -658,7 +658,7 @@ function Workflows() {
                                     </Button>
                                   </TooltipTrigger>
                                   <TooltipContent>
-                                    Create New Run
+                                    새 실행 만들기
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
@@ -693,7 +693,7 @@ function Workflows() {
           </Table>
           <div className="relative px-3 py-3">
             <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-              <span className="text-slate-400">Items per page</span>
+              <span className="text-slate-400">페이지당 항목 수</span>
               <select
                 className="h-9 rounded-md border border-slate-300 bg-background px-3"
                 value={itemsPerPage}

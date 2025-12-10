@@ -108,8 +108,8 @@ function CredentialsModal({ onCredentialCreated }: Props) {
         queryKey: ["credentials"],
       });
       toast({
-        title: "Credential created",
-        description: "Your credential has been created successfully",
+        title: "인증 정보 생성됨",
+        description: "인증 정보가 성공적으로 생성되었습니다",
         variant: "success",
       });
       onCredentialCreated?.(data.credential_id);
@@ -131,8 +131,8 @@ function CredentialsModal({ onCredentialCreated }: Props) {
         : creditCardCredentialValues.name.trim();
     if (name === "") {
       toast({
-        title: "Error",
-        description: "Name is required",
+        title: "오류",
+        description: "이름은 필수입니다",
         variant: "destructive",
       });
       return;
@@ -146,8 +146,8 @@ function CredentialsModal({ onCredentialCreated }: Props) {
 
       if (username === "" || password === "") {
         toast({
-          title: "Error",
-          description: "Username and password are required",
+          title: "오류",
+          description: "사용자명과 비밀번호는 필수입니다",
           variant: "destructive",
         });
         return;
@@ -179,8 +179,8 @@ function CredentialsModal({ onCredentialCreated }: Props) {
         cardHolderName === ""
       ) {
         toast({
-          title: "Error",
-          description: "All credit card fields are required",
+          title: "오류",
+          description: "모든 신용카드 필드는 필수입니다",
           variant: "destructive",
         });
         return;
@@ -189,8 +189,8 @@ function CredentialsModal({ onCredentialCreated }: Props) {
       const cardExpirationDateParts = cardExpirationDate.split("/");
       if (cardExpirationDateParts.length !== 2) {
         toast({
-          title: "Error",
-          description: "Invalid card expiration date",
+          title: "오류",
+          description: "유효하지 않은 카드 만료일입니다",
           variant: "destructive",
         });
         return;
@@ -199,8 +199,8 @@ function CredentialsModal({ onCredentialCreated }: Props) {
       const cardExpirationYear = cardExpirationDateParts[1];
       if (!cardExpirationMonth || !cardExpirationYear) {
         toast({
-          title: "Error",
-          description: "Invalid card expiration date",
+          title: "오류",
+          description: "유효하지 않은 카드 만료일입니다",
           variant: "destructive",
         });
         return;
@@ -234,7 +234,7 @@ function CredentialsModal({ onCredentialCreated }: Props) {
     >
       <DialogContent className="w-[700px] max-w-[700px]">
         <DialogHeader>
-          <DialogTitle className="font-bold">Add Credential</DialogTitle>
+          <DialogTitle className="font-bold">인증 정보 추가</DialogTitle>
         </DialogHeader>
         {type === CredentialModalTypes.PASSWORD ? (
           <PasswordCredentialContent
@@ -255,7 +255,7 @@ function CredentialsModal({ onCredentialCreated }: Props) {
             {createCredentialMutation.isPending ? (
               <ReloadIcon className="mr-2 size-4 animate-spin" />
             ) : null}
-            Save
+            저장
           </Button>
         </DialogFooter>
       </DialogContent>

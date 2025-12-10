@@ -56,32 +56,32 @@ function EditFolderDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Edit Folder</DialogTitle>
+          <DialogTitle>폴더 편집</DialogTitle>
           <DialogDescription>
-            Update the folder's title and description.
+            폴더의 이름과 설명을 수정하세요.
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit}>
           <div className="grid gap-4 py-4">
             <div className="grid gap-2">
-              <Label htmlFor="edit-folder-title">Title</Label>
+              <Label htmlFor="edit-folder-title">이름</Label>
               <Input
                 id="edit-folder-title"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                placeholder="e.g., Production Workflows"
+                placeholder="예: 프로덕션 워크플로우"
                 autoFocus
               />
             </div>
             <div className="grid gap-2">
               <Label htmlFor="edit-folder-description">
-                Description (optional)
+                설명 (선택사항)
               </Label>
               <Textarea
                 id="edit-folder-description"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
-                placeholder="Add a description..."
+                placeholder="설명을 입력하세요..."
                 rows={3}
               />
             </div>
@@ -92,13 +92,13 @@ function EditFolderDialog({
               variant="outline"
               onClick={() => onOpenChange(false)}
             >
-              Cancel
+              취소
             </Button>
             <Button
               type="submit"
               disabled={!title.trim() || updateFolderMutation.isPending}
             >
-              Save Changes
+              변경사항 저장
             </Button>
           </DialogFooter>
         </form>

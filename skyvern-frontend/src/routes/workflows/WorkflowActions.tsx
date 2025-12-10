@@ -92,7 +92,7 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Failed to delete workflow",
+        title: "워크플로우 삭제 실패",
         description: error.message,
       });
     },
@@ -121,12 +121,12 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
             className="p-2"
           >
             <CopyIcon className="mr-2 h-4 w-4" />
-            Clone Workflow
+            워크플로우 복제
           </DropdownMenuItem>
           <DropdownMenuSub>
             <DropdownMenuSubTrigger>
               <DownloadIcon className="mr-2 h-4 w-4" />
-              Export as...
+              내보내기...
             </DropdownMenuSubTrigger>
             <DropdownMenuPortal>
               <DropdownMenuSubContent>
@@ -150,23 +150,23 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
           <DialogTrigger>
             <DropdownMenuItem className="p-2">
               <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
-              Delete Workflow
+              워크플로우 삭제
             </DropdownMenuItem>
           </DialogTrigger>
         </DropdownMenuContent>
       </DropdownMenu>
       <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
         <DialogHeader>
-          <DialogTitle>Are you sure?</DialogTitle>
+          <DialogTitle>정말 삭제하시겠습니까?</DialogTitle>
           <DialogDescription>
-            The workflow{" "}
-            <span className="font-semibold text-primary">{workflow.title}</span>{" "}
-            will be deleted.
+            워크플로우{" "}
+            <span className="font-semibold text-primary">{workflow.title}</span>
+            이(가) 삭제됩니다.
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
           <DialogClose asChild>
-            <Button variant="secondary">Cancel</Button>
+            <Button variant="secondary">취소</Button>
           </DialogClose>
           <Button
             variant="destructive"
@@ -178,7 +178,7 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
             {deleteWorkflowMutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
             )}
-            Delete
+            삭제
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -20,40 +20,40 @@ function SideNav() {
       })}
     >
       <NavLinkGroup
-        title="Build"
+        title="만들기"
         links={[
           {
-            label: "Discover",
+            label: "둘러보기",
             to: "/discover",
             icon: <CompassIcon className="size-6" />,
           },
           {
-            label: "Workflows",
+            label: "워크플로우",
             to: "/workflows",
             icon: <LightningBoltIcon className="size-6" />,
           },
           {
-            label: "Runs",
+            label: "실행 기록",
             to: "/runs",
             icon: <CounterClockwiseClockIcon className="size-6" />,
           },
           {
-            label: "Browsers",
+            label: "브라우저",
             to: "/browser-sessions",
             icon: <GlobeIcon className="size-6" />,
           },
         ]}
       />
       <NavLinkGroup
-        title={"General"}
+        title={"일반"}
         links={[
           {
-            label: "Settings",
+            label: "설정",
             to: "/settings",
             icon: <GearIcon className="size-6" />,
           },
           {
-            label: "Credentials",
+            label: "인증 정보",
             to: "/credentials",
             icon: <KeyIcon className="size-6" />,
           },
