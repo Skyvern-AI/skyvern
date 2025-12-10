@@ -62,7 +62,9 @@ function CredentialSelector({ value, onChange }: Props) {
                 <p className="text-xs text-slate-400">
                   {credential.credential_type === "password"
                     ? "Password"
-                    : "Credit Card"}
+                    : credential.credential_type === "credit_card"
+                      ? "Credit Card"
+                      : "Secret"}
                 </p>
               </div>
             </CustomSelectItem>

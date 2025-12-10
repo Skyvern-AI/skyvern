@@ -500,29 +500,51 @@ export type CreditCardCredentialApiResponse = {
   brand: string;
 };
 
+export type SecretCredentialResponse = {
+  secret_label?: string | null;
+};
+
 export type CredentialApiResponse = {
   credential_id: string;
-  credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse;
-  credential_type: "password" | "credit_card";
+  credential:
+    | PasswordCredentialApiResponse
+    | CreditCardCredentialApiResponse
+    | SecretCredentialResponse;
+  credential_type: "password" | "credit_card" | "secret";
   name: string;
 };
 
 export function isPasswordCredential(
-  credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse,
+  credential:
+    | PasswordCredentialApiResponse
+    | CreditCardCredentialApiResponse
+    | SecretCredentialResponse,
 ): credential is PasswordCredentialApiResponse {
   return "username" in credential;
 }
 
 export function isCreditCardCredential(
-  credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse,
+  credential:
+    | PasswordCredentialApiResponse
+    | CreditCardCredentialApiResponse
+    | SecretCredentialResponse,
 ): credential is CreditCardCredentialApiResponse {
   return "last_four" in credential;
 }
 
+export function isSecretCredential(
+  credential:
+    | PasswordCredentialApiResponse
+    | CreditCardCredentialApiResponse
+    | SecretCredentialResponse,
+): credential is SecretCredentialResponse {
+  return !("username" in credential) && !("last_four" in credential);
+}
+
 export type CreateCredentialRequest = {
   name: string;
-  credential_type: "password" | "credit_card";
-  credential: PasswordCredential | CreditCardCredential;
+  credential_type: "password" | "credit_card" | "secret";
+  credential: PasswordCredential | CreditCardCredential | SecretCredential;
 };
 
 export type PasswordCredential = {
@@ -540,6 +562,11 @@ export type CreditCardCredential = {
   card_exp_year: string;
   card_brand: string;
   card_holder_name: string;
+};
+
+export type SecretCredential = {
+  secret_value: string;
+  secret_label?: string | null;
 };
 
 export const OtpType = {
