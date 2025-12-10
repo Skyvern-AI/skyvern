@@ -871,6 +871,7 @@ class TaskRunModel(Base):
     # Compute cost tracking fields
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
+    memory_mb = Column(Integer, nullable=True)
     duration_ms = Column(BigInteger, nullable=True)
     compute_cost = Column(Numeric, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

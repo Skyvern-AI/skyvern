@@ -4567,6 +4567,7 @@ class AgentDB:
         run_id: str,
         instance_type: str | None = None,
         vcpu_millicores: int | None = None,
+        memory_mb: int | None = None,
         duration_ms: int | None = None,
         compute_cost: float | None = None,
     ) -> None:
@@ -4589,6 +4590,8 @@ class AgentDB:
                 task_run.instance_type = instance_type
             if vcpu_millicores is not None:
                 task_run.vcpu_millicores = vcpu_millicores
+            if memory_mb is not None:
+                task_run.memory_mb = memory_mb
             if duration_ms is not None:
                 task_run.duration_ms = duration_ms
             if compute_cost is not None:
