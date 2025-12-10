@@ -5,7 +5,7 @@ from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
-from skyvern.constants import SKYVERN_DIR
+from skyvern.constants import REPO_ROOT_DIR, SKYVERN_DIR
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 # NOTE: _DEFAULT_ENV_FILES resolves .env paths at import time and assumes
@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     HAR_PATH: str | None = "./har"
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"
+    DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
