@@ -3916,7 +3916,7 @@ class HttpRequestBlock(Block):
 
         # If files are provided, don't set default Content-Type (aiohttp will set multipart/form-data)
         if not self.files:
-            if not self.headers.get("Content-Type") or not self.headers.get("content-type"):
+            if not self.headers.get("Content-Type") and not self.headers.get("content-type"):
                 LOG.info("Adding default content-type as application/json", headers=self.headers)
                 self.headers["Content-Type"] = "application/json"
 
