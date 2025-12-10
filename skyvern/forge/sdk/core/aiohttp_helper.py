@@ -1,6 +1,8 @@
 import asyncio
+import os
 from typing import Any
 
+import aiofiles
 import aiohttp
 import structlog
 
@@ -15,9 +17,9 @@ async def aiohttp_request(
     url: str,
     headers: dict[str, str] | None = None,
     *,
-    body: dict[str, Any] | str | None = None,
-    data: dict[str, Any] | None = None,
+    data: Any | None = None,
     json_data: dict[str, Any] | None = None,
+    files: dict[str, str] | None = None,
     cookies: dict[str, str] | None = None,
     timeout: int = DEFAULT_REQUEST_TIMEOUT,
     follow_redirects: bool = True,
@@ -26,14 +28,28 @@ async def aiohttp_request(
     """
     Generic HTTP request function that supports all HTTP methods.
 
+    Args:
+        method: HTTP method (GET, POST, etc.)
+        url: Request URL
+        headers: Request headers
+        data: Request body data (dict for form data, or other types)
+        json_data: JSON data to send (takes precedence over data)
+        files: Dictionary mapping field names to file paths for multipart file uploads
+        cookies: Request cookies
+        timeout: Request timeout in seconds
+        follow_redirects: Whether to follow redirects
+        proxy: Proxy URL
+
     Returns:
         Tuple of (status_code, response_headers, response_body)
         where response_body can be dict (for JSON) or str (for text)
     """
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-        request_kwargs = {
+        # Ensure headers is always a dict for type safety
+        headers_dict: dict[str, str] = headers or {}
+        request_kwargs: dict[str, Any] = {
             "url": url,
-            "headers": headers or {},
+            "headers": headers_dict,
             "cookies": cookies,
             "proxy": proxy,
             "allow_redirects": follow_redirects,
@@ -41,17 +57,41 @@ async def aiohttp_request(
 
         # Handle body based on content type and method
         if method.upper() != "GET":
+            # If files are provided, use multipart/form-data
+            if files is not None:
+                form = aiohttp.FormData()
+
+                # Add files to form
+                for field_name, file_path in files.items():
+                    if not os.path.exists(file_path):
+                        raise FileNotFoundError(f"File not found: {file_path}")
+
+                    filename = os.path.basename(file_path)
+                    async with aiofiles.open(file_path, "rb") as f:
+                        file_content = await f.read()
+                        form.add_field(field_name, file_content, filename=filename)
+
+                # Add data fields to form if provided
+                if data is not None and isinstance(data, dict):
+                    for key, value in data.items():
+                        form.add_field(key, str(value))
+
+                request_kwargs["data"] = form
+                # Remove Content-Type header if present, let aiohttp set it for multipart
+                # headers_dict is already typed as dict[str, str] from initialization
+                if "Content-Type" in headers_dict:
+                    del headers_dict["Content-Type"]
+                if "content-type" in headers_dict:
+                    del headers_dict["content-type"]
             # Explicit overrides first
-            if json_data is not None:
+            elif json_data is not None:
                 request_kwargs["json"] = json_data
             elif data is not None:
-                request_kwargs["data"] = data
-            elif body is not None:
-                content_type = (headers or {}).get("Content-Type") or (headers or {}).get("content-type") or ""
-                if "application/x-www-form-urlencoded" in content_type.lower():
-                    request_kwargs["data"] = body
+                content_type = headers_dict.get("Content-Type") or headers_dict.get("content-type") or ""
+                if "application/json" in content_type.lower():
+                    request_kwargs["json"] = data
                 else:
-                    request_kwargs["json"] = body
+                    request_kwargs["data"] = data
 
         async with session.request(method.upper(), **request_kwargs) as response:
             response_headers = dict(response.headers)
