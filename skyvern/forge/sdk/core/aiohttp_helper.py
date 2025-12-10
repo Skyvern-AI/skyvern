@@ -58,7 +58,7 @@ async def aiohttp_request(
         # Handle body based on content type and method
         if method.upper() != "GET":
             # If files are provided, use multipart/form-data
-            if files is not None:
+            if files:
                 form = aiohttp.FormData()
 
                 # Add files to form
