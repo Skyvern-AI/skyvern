@@ -30,6 +30,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialType,
     CreditCardCredential,
     PasswordCredential,
+    SecretCredential,
 )
 from skyvern.forge.sdk.services.credentials import parse_totp_secret
 
@@ -83,6 +84,26 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
             ),
             name=item["name"],
             credential_type=CredentialType.CREDIT_CARD,
+        )
+    elif item["type"] == BitwardenItemType.SECURE_NOTE:
+        notes = item.get("notes") or ""
+        secret_value = ""
+        secret_label = None
+        try:
+            parsed_notes = json.loads(notes)
+            if isinstance(parsed_notes, dict):
+                secret_value = parsed_notes.get("secret_value", "") or ""
+                secret_label = parsed_notes.get("secret_label")
+            else:
+                secret_value = notes
+        except Exception:
+            secret_value = notes
+
+        return CredentialItem(
+            item_id=item["id"],
+            credential=SecretCredential(secret_value=secret_value, secret_label=secret_label),
+            name=item["name"],
+            credential_type=CredentialType.SECRET,
         )
     else:
         raise BitwardenGetItemError(f"Unsupported item type: {item['type']}")
@@ -807,7 +828,7 @@ class BitwardenService:
     async def create_credential_item(
         collection_id: str,
         name: str,
-        credential: PasswordCredential | CreditCardCredential,
+        credential: PasswordCredential | CreditCardCredential | SecretCredential,
     ) -> str:
         try:
             master_password, bw_organization_id, _, _ = await BitwardenService._get_skyvern_auth_secrets()
@@ -820,8 +841,15 @@ class BitwardenService:
                     name=name,
                     credential=credential,
                 )
-            else:
+            elif isinstance(credential, CreditCardCredential):
                 return await BitwardenService._create_credit_card_item_using_server(
+                    bw_organization_id=bw_organization_id,
+                    collection_id=collection_id,
+                    name=name,
+                    credential=credential,
+                )
+            else:
+                return await BitwardenService._create_secret_item_using_server(
                     bw_organization_id=bw_organization_id,
                     collection_id=collection_id,
                     name=name,
@@ -829,6 +857,39 @@ class BitwardenService:
                 )
         except Exception as e:
             raise e
+
+    @staticmethod
+    async def _create_secret_item_using_server(
+        bw_organization_id: str,
+        collection_id: str,
+        name: str,
+        credential: SecretCredential,
+    ) -> str:
+        item_template = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/template/item", timeout=120)
+        secure_note_template = await aiohttp_get_json(
+            f"{BITWARDEN_SERVER_BASE_URL}/object/template/item.securenote", timeout=120
+        )
+
+        item_template = item_template["data"]["template"]
+        secure_note_template = secure_note_template["data"]["template"]
+
+        item_template["type"] = get_bitwarden_item_type_code(BitwardenItemType.SECURE_NOTE)
+        item_template["name"] = name
+        item_template["collectionIds"] = [collection_id]
+        item_template["organizationId"] = bw_organization_id
+        item_template["secureNote"] = secure_note_template
+        item_template["notes"] = json.dumps(
+            {
+                "secret_value": credential.secret_value,
+                "secret_label": credential.secret_label,
+            }
+        )
+
+        response = await aiohttp_post(f"{BITWARDEN_SERVER_BASE_URL}/object/item", data=item_template, timeout=120)
+        if not response or response.get("success") is False:
+            raise BitwardenCreateLoginItemError("Failed to create secret item")
+
+        return response["data"]["id"]
 
     @staticmethod
     async def _get_skyvern_auth_master_password() -> str:
@@ -1010,6 +1071,27 @@ class BitwardenService:
                     card_cvv=credit_card_item["code"],
                     card_brand=credit_card_item["brand"],
                 ),
+            )
+        elif response["data"]["type"] == BitwardenItemType.SECURE_NOTE:
+            name = response["data"]["name"]
+            notes = response["data"].get("notes") or ""
+            secret_value = ""
+            secret_label = None
+            try:
+                parsed_notes = json.loads(notes)
+                if isinstance(parsed_notes, dict):
+                    secret_value = parsed_notes.get("secret_value", "") or ""
+                    secret_label = parsed_notes.get("secret_label")
+                else:
+                    secret_value = notes
+            except Exception:
+                secret_value = notes
+
+            return CredentialItem(
+                item_id=item_id,
+                credential_type=CredentialType.SECRET,
+                name=name,
+                credential=SecretCredential(secret_value=secret_value, secret_label=secret_label),
             )
         else:
             raise BitwardenGetItemError(f"Unsupported item type: {response['data']['type']}")

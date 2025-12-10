@@ -9,6 +9,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialType,
     CreditCardCredential,
     PasswordCredential,
+    SecretCredential,
 )
 
 LOG = structlog.get_logger()
@@ -35,7 +36,9 @@ class CustomCredentialAPIClient:
             "Content-Type": "application/json",
         }
 
-    def _credential_to_api_payload(self, credential: PasswordCredential | CreditCardCredential) -> dict[str, Any]:
+    def _credential_to_api_payload(
+        self, credential: PasswordCredential | CreditCardCredential | SecretCredential
+    ) -> dict[str, Any]:
         """Convert Skyvern credential to API payload format."""
         if isinstance(credential, PasswordCredential):
             return {
@@ -55,6 +58,14 @@ class CustomCredentialAPIClient:
                 "card_cvv": credential.card_cvv,
                 "card_brand": credential.card_brand,
             }
+        elif isinstance(credential, SecretCredential):
+            payload = {
+                "type": "secret",
+                "secret_value": credential.secret_value,
+            }
+            if credential.secret_label is not None:
+                payload["secret_label"] = credential.secret_label
+            return payload
         else:
             raise TypeError(f"Unsupported credential type: {type(credential)}")
 
@@ -107,10 +118,28 @@ class CustomCredentialAPIClient:
                 name=name,
                 credential_type=CredentialType.CREDIT_CARD,
             )
+        elif credential_type == "secret":
+            required_fields = ["secret_value"]
+            missing = [f for f in required_fields if f not in credential_data]
+            if missing:
+                raise ValueError(f"Missing required secret fields from API: {missing}")
+
+            credential = SecretCredential(
+                secret_value=credential_data["secret_value"],
+                secret_label=credential_data.get("secret_label"),
+            )
+            return CredentialItem(
+                item_id=item_id,
+                credential=credential,
+                name=name,
+                credential_type=CredentialType.SECRET,
+            )
         else:
             raise ValueError(f"Unsupported credential type from API: {credential_type}")
 
-    async def create_credential(self, name: str, credential: PasswordCredential | CreditCardCredential) -> str:
+    async def create_credential(
+        self, name: str, credential: PasswordCredential | CreditCardCredential | SecretCredential
+    ) -> str:
         """
         Create a credential using the custom API.
 
