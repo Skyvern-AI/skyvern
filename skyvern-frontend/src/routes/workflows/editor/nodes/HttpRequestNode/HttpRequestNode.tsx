@@ -58,6 +58,8 @@ const headersTooltip =
   "HTTP headers to include with the request as JSON object.";
 const bodyTooltip =
   "Request body as JSON object. Only used for POST, PUT, PATCH methods.";
+const filesTooltip =
+  'Files to upload as multipart/form-data. Dictionary mapping field names to file paths/URLs. Supports HTTP/HTTPS URLs, S3 URIs (s3://), or limited local file access. Example: {"file": "https://example.com/file.pdf"} or {"document": "s3://bucket/path/file.pdf"}';
 const timeoutTooltip = "Request timeout in seconds.";
 const followRedirectsTooltip =
   "Whether to automatically follow HTTP redirects.";
@@ -287,12 +289,34 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
             </div>
           )}
 
+          {/* Files Section */}
+          {showBodyEditor && (
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">Files</Label>
+                <HelpTooltip content={filesTooltip} />
+              </div>
+              <CodeEditor
+                className="w-full"
+                language="json"
+                value={data.files}
+                onChange={(value) => {
+                  update({ files: value || "{}" });
+                }}
+                readOnly={!editable}
+                minHeight="80px"
+                maxHeight="160px"
+              />
+            </div>
+          )}
+
           {/* Request Preview */}
           <RequestPreview
             method={data.method}
             url={data.url}
             headers={data.headers}
             body={data.body}
+            files={data.files}
           />
         </div>
 
@@ -399,9 +423,10 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                 authentication and content headers
               </li>
               <li>
-                Pass a credential/secret parameter and reference it in headers
-                or body with {"{{ my_credential.password }}"}
+                Password credential: {"{{ my_credential.username }}"} /{" "}
+                {"{{ my_credential.password }}"}
               </li>
+              <li>Secret credential: {"{{ my_secret.secret_value }}"}</li>
               <li>
                 The request will return response data including status, headers,
                 and body

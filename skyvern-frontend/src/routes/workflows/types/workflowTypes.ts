@@ -546,6 +546,7 @@ export type HttpRequestBlock = WorkflowBlockBase & {
   url: string | null;
   headers: Record<string, string> | null;
   body: Record<string, unknown> | null;
+  files: Record<string, string> | null; // Dictionary mapping field names to file paths/URLs
   timeout: number;
   follow_redirects: boolean;
   parameters: Array<WorkflowParameter>;

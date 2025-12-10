@@ -760,6 +760,7 @@ function convertToNode(
           url: block.url ?? "",
           headers: JSON.stringify(block.headers || {}, null, 2),
           body: JSON.stringify(block.body || {}, null, 2),
+          files: JSON.stringify(block.files || {}, null, 2),
           timeout: block.timeout,
           followRedirects: block.follow_redirects,
           parameterKeys: block.parameters.map((p) => p.key),
@@ -2193,6 +2194,17 @@ function getWorkflowBlock(
           string
         > | null,
         body: JSONParseSafe(node.data.body) as Record<string, unknown> | null,
+        files: (() => {
+          const parsed = JSONParseSafe(node.data.files) as Record<
+            string,
+            string
+          > | null;
+          // Convert empty object to null to match backend's "if not self.files" check
+          if (parsed && Object.keys(parsed).length === 0) {
+            return null;
+          }
+          return parsed;
+        })(),
         timeout: node.data.timeout,
         follow_redirects: node.data.followRedirects,
         parameter_keys: node.data.parameterKeys,
