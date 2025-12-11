@@ -33,6 +33,26 @@ export interface DownloadFilesOptions extends SkyvernApi.DownloadFilesRequest {
     timeout?: number;
 }
 
+/**
+ * Main entry point for the Skyvern SDK.
+ *
+ * This class provides methods to launch and connect to browsers (both local and cloud-hosted),
+ * and access the Skyvern API client for task and workflow management. It combines browser
+ * automation capabilities with AI-powered task execution.
+ *
+ * @example
+ * ```typescript
+ * // Remote mode: Connect to Skyvern Cloud (API key required)
+ * const skyvern = new Skyvern({ apiKey: "your-api-key" });
+ *
+ * // Launch a cloud browser
+ * const browser = await skyvern.launchCloudBrowser();
+ * const page = await browser.getWorkingPage();
+ *
+ * // Execute AI-powered tasks
+ * await page.agent.runTask("Fill out the form and submit it");
+ * ```
+ */
 export class Skyvern extends SkyvernClient {
     private readonly _apiKey: string;
     private readonly _environment: SkyvernEnvironment | string;
@@ -156,6 +176,19 @@ export class Skyvern extends SkyvernClient {
         return response;
     }
 
+    /**
+     * Launch a new cloud-hosted browser session.
+     *
+     * This creates a new browser session in Skyvern's cloud infrastructure and connects to it.
+     *
+     * @param options - Optional configuration
+     * @param options.timeout - Timeout in minutes for the session. Timeout is applied after the session is started.
+     *        Must be between 5 and 1440. Defaults to 60.
+     * @param options.proxyLocation - Geographic proxy location to route the browser traffic through.
+     *        This is only available in Skyvern Cloud.
+     *
+     * @returns SkyvernBrowser instance connected to the new cloud session.
+     */
     async launchCloudBrowser(options?: {
         timeout?: number;
         proxyLocation?: SkyvernApi.ProxyLocation;
@@ -172,6 +205,13 @@ export class Skyvern extends SkyvernClient {
         return this._connectToCloudBrowserSession(browserSession);
     }
 
+    /**
+     * Connect to an existing cloud-hosted browser session by ID.
+     *
+     * @param browserSessionId - The ID of the cloud browser session to connect to.
+     *
+     * @returns SkyvernBrowser instance connected to the cloud session.
+     */
     async connectToCloudBrowserSession(browserSessionId: string): Promise<SkyvernBrowser> {
         this._ensureCloudEnvironment();
 
@@ -182,6 +222,21 @@ export class Skyvern extends SkyvernClient {
         return this._connectToCloudBrowserSession(browserSession);
     }
 
+    /**
+     * Get or create a cloud browser session.
+     *
+     * This method attempts to reuse the most recent available cloud browser session.
+     * If no session exists, it creates a new one. This is useful for cost efficiency
+     * and session persistence.
+     *
+     * @param options - Optional configuration
+     * @param options.timeout - Timeout in minutes for the session. Timeout is applied after the session is started.
+     *        Must be between 5 and 1440. Defaults to 60. Only used when creating a new session.
+     * @param options.proxyLocation - Geographic proxy location to route the browser traffic through.
+     *        This is only available in Skyvern Cloud. Only used when creating a new session.
+     *
+     * @returns SkyvernBrowser instance connected to an existing or new cloud session.
+     */
     async useCloudBrowser(options?: { timeout?: number; proxyLocation?: ProxyLocation }): Promise<SkyvernBrowser> {
         this._ensureCloudEnvironment();
 
@@ -204,6 +259,16 @@ export class Skyvern extends SkyvernClient {
         return this._connectToCloudBrowserSession(browserSession);
     }
 
+    /**
+     * Connect to an existing browser instance via Chrome DevTools Protocol (CDP).
+     *
+     * Use this to connect to a browser that's already running with CDP enabled,
+     * whether local or remote.
+     *
+     * @param cdpUrl - The CDP WebSocket URL (e.g., "http://localhost:9222").
+     *
+     * @returns SkyvernBrowser instance connected to the existing browser.
+     */
     async connectToBrowserOverCdp(cdpUrl: string): Promise<SkyvernBrowser> {
         const browser = await chromium.connectOverCDP(cdpUrl);
         const browserContext = browser.contexts()[0] ?? (await browser.newContext());
@@ -213,6 +278,9 @@ export class Skyvern extends SkyvernClient {
         return skyvernBrowser;
     }
 
+    /**
+     * Close all browsers and release resources.
+     */
     async close(): Promise<void> {
         await Promise.all(Array.from(this._browsers).map((browser) => browser.close()));
         this._browsers.clear();

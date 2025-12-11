@@ -12,6 +12,9 @@ export class SkyvernBrowserPageAi {
         this._page = page;
     }
 
+    /**
+     * Click an element using AI via API call.
+     */
     async aiClick(options: {
         selector?: string;
         intention: string;
@@ -41,6 +44,9 @@ export class SkyvernBrowserPageAi {
         return response.result ? String(response.result) : options.selector || null;
     }
 
+    /**
+     * Input text into an element using AI via API call.
+     */
     async aiInputText(options: {
         selector?: string;
         value?: string;
@@ -76,6 +82,9 @@ export class SkyvernBrowserPageAi {
         return response.result ? String(response.result) : options.value || "";
     }
 
+    /**
+     * Select an option from a dropdown using AI via API call.
+     */
     async aiSelectOption(options: {
         selector?: string;
         value?: string;
@@ -107,6 +116,9 @@ export class SkyvernBrowserPageAi {
         return response.result ? String(response.result) : options.value || "";
     }
 
+    /**
+     * Upload a file using AI via API call.
+     */
     async aiUploadFile(options: {
         selector?: string;
         fileUrl?: string;
@@ -138,6 +150,9 @@ export class SkyvernBrowserPageAi {
         return response.result ? String(response.result) : options.fileUrl || "";
     }
 
+    /**
+     * Extract information from the page using AI via API call.
+     */
     async aiExtract(options: {
         prompt: string;
         extractSchema?: Record<string, unknown> | unknown[] | string;
@@ -169,6 +184,9 @@ export class SkyvernBrowserPageAi {
         return (response.result as Record<string, unknown> | unknown[] | string) || null;
     }
 
+    /**
+     * Validate the current page state using AI via API call.
+     */
     async aiValidate(options: { prompt: string; model?: Record<string, unknown> }): Promise<boolean> {
         LOG.info("AI validate", { prompt: options.prompt, model: options.model, workflow_run_id: this._browser.workflowRunId });
 
@@ -191,6 +209,9 @@ export class SkyvernBrowserPageAi {
         return response.result != null ? Boolean(response.result) : false;
     }
 
+    /**
+     * Perform an action on the page using AI via API call.
+     */
     async aiAct(prompt: string): Promise<void> {
         LOG.info("AI act", { prompt, workflow_run_id: this._browser.workflowRunId });
 
@@ -210,6 +231,13 @@ export class SkyvernBrowserPageAi {
         }
     }
 
+    /**
+     * Locate an element on the page using AI and return its XPath selector via API call.
+     *
+     * @param prompt - Natural language description of the element to locate (e.g., 'find "download invoices" button')
+     *
+     * @returns XPath selector string (e.g., 'xpath=//button[@id="download"]') or null if not found
+     */
     async aiLocateElement(prompt: string): Promise<string | null> {
         LOG.info("AI locate element", { prompt, workflow_run_id: this._browser.workflowRunId });
 
@@ -235,6 +263,9 @@ export class SkyvernBrowserPageAi {
         return null;
     }
 
+    /**
+     * Send a prompt to the LLM and get a response based on the provided schema via API call.
+     */
     async aiPrompt(options: {
         prompt: string;
         schema?: Record<string, unknown>;
