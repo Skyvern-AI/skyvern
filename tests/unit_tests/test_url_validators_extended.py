@@ -36,7 +36,8 @@ class TestEncodeUrl:
         """Special characters in path should be encoded."""
         url = "https://example.com/path<with>brackets"
         result = encode_url(url)
-        assert "%3C" in result or "<" not in result.split("?")[0].split("//")[1]
+        # Angle brackets should be percent-encoded
+        assert result == "https://example.com/path%3Cwith%3Ebrackets"
 
     def test_preserve_query_structure(self):
         """Query string structure (= and &) should be preserved."""
@@ -56,14 +57,18 @@ class TestEncodeUrl:
         """Unicode characters in path should be encoded."""
         url = "https://example.com/路径"
         result = encode_url(url)
-        # Unicode should be percent-encoded
+        # Unicode should be percent-encoded, original characters should not appear
+        assert "路径" not in result
         assert "example.com/" in result
+        # "路径" in UTF-8 is encoded as %E8%B7%AF%E5%BE%84
+        assert "%E8%B7%AF%E5%BE%84" in result
 
     def test_fragment_preserved(self):
-        """URL fragments should be handled."""
+        """URL fragments should be preserved."""
         url = "https://example.com/page#section"
         result = encode_url(url)
-        assert "example.com" in result
+        # Fragment should be preserved in the output
+        assert result == "https://example.com/page#section"
 
 
 class TestPrependSchemeAndValidateUrl:
