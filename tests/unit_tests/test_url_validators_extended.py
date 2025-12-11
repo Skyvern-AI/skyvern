@@ -78,11 +78,6 @@ class TestPrependSchemeAndValidateUrl:
         """Empty URL should return empty string."""
         assert prepend_scheme_and_validate_url("") == ""
 
-    def test_none_like_empty(self):
-        """Empty string should return as-is."""
-        result = prepend_scheme_and_validate_url("")
-        assert result == ""
-
     def test_https_url_unchanged(self):
         """URL with https scheme should remain unchanged."""
         url = "https://example.com"
@@ -156,10 +151,11 @@ class TestEncodeUrlEdgeCases:
         assert "//double//slashes" in result
 
     def test_url_with_credentials(self):
-        """URL with credentials should be handled."""
+        """URL with credentials should preserve the authority portion."""
         url = "https://user:pass@example.com/path"
         result = encode_url(url)
-        assert "example.com" in result
+        # Full authority portion including credentials should be preserved
+        assert "user:pass@example.com" in result
 
     def test_very_long_url(self):
         """Very long URL should be handled."""
