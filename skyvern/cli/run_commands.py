@@ -52,13 +52,18 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
     )
     res = await skyvern_agent.run_task(prompt=prompt, url=url, user_agent="skyvern-mcp", wait_for_completion=True)
 
-    # TODO: It would be nice if we could return the task URL here
     output = res.model_dump()["output"]
-    base_url = settings.SKYVERN_BASE_URL
-    run_history_url = (
-        "https://app.skyvern.com/history" if "skyvern.com" in base_url else "http://localhost:8080/history"
-    )
-    return {"output": output, "run_history_url": run_history_url}
+    # Use the specific task URL if available, otherwise fall back to history page
+    if res.app_url:
+        task_url = res.app_url
+    else:
+        base_url = settings.SKYVERN_BASE_URL
+        task_url = (
+            f"https://app.skyvern.com/tasks/{res.run_id}/actions"
+            if "skyvern.com" in base_url
+            else f"http://localhost:8080/tasks/{res.run_id}/actions"
+        )
+    return {"output": output, "task_url": task_url, "run_id": res.run_id}
 
 
 def get_pids_on_port(port: int) -> List[int]:
