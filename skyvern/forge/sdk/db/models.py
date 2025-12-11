@@ -1052,6 +1052,7 @@ class ScriptBlockModel(Base):
     run_signature = Column(String, nullable=True)
     workflow_run_id = Column(String, nullable=True)
     workflow_run_block_id = Column(String, nullable=True)
+    input_fields = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
