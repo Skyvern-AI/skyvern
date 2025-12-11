@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol, cast
 from urllib.parse import parse_qsl, urlparse
 
 import psutil
@@ -422,13 +422,13 @@ async def _create_headless_chromium(
         )
 
     # Check for browser_profile_id and load from storage if available
-    browser_profile_id = kwargs.get("browser_profile_id")
-    organization_id = kwargs.get("organization_id")
+    browser_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
+    organization_id_for_profile = cast(str | None, kwargs.get("organization_id"))
     user_data_dir: str | None = None
 
-    if browser_profile_id and organization_id:
+    if browser_profile_id and organization_id_for_profile:
         profile_dir = await app.STORAGE.retrieve_browser_profile(
-            organization_id=organization_id,
+            organization_id=organization_id_for_profile,
             profile_id=browser_profile_id,
         )
         if profile_dir:
@@ -442,7 +442,7 @@ async def _create_headless_chromium(
             LOG.warning(
                 "Browser profile not found, using temp directory",
                 browser_profile_id=browser_profile_id,
-                organization_id=organization_id,
+                organization_id=organization_id_for_profile,
             )
 
     if not user_data_dir:
@@ -487,13 +487,13 @@ async def _create_headful_chromium(
         )
 
     # Check for browser_profile_id and load from storage if available
-    browser_profile_id = kwargs.get("browser_profile_id")
-    organization_id = kwargs.get("organization_id")
+    browser_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
+    organization_id_for_profile = cast(str | None, kwargs.get("organization_id"))
     user_data_dir: str | None = None
 
-    if browser_profile_id and organization_id:
+    if browser_profile_id and organization_id_for_profile:
         profile_dir = await app.STORAGE.retrieve_browser_profile(
-            organization_id=organization_id,
+            organization_id=organization_id_for_profile,
             profile_id=browser_profile_id,
         )
         if profile_dir:
@@ -507,7 +507,7 @@ async def _create_headful_chromium(
             LOG.warning(
                 "Browser profile not found, using temp directory",
                 browser_profile_id=browser_profile_id,
-                organization_id=organization_id,
+                organization_id=organization_id_for_profile,
             )
 
     if not user_data_dir:
