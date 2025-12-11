@@ -13,7 +13,7 @@ import { SkyvernBrowserPageCore, type SkyvernBrowserPage } from "./SkyvernBrowse
  * @example
  * ```typescript
  * const skyvern = Skyvern.local();
- * const browser = await skyvern.launchLocalBrowser();
+ * const browser = await skyvern.launchCloudBrowser();
  *
  * // Get or create the working page
  * const page = await browser.getWorkingPage();

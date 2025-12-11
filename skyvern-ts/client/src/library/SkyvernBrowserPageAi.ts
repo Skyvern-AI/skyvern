@@ -3,9 +3,6 @@ import type * as Skyvern from "../api/index.js";
 import type { SkyvernBrowser } from "./SkyvernBrowser.js";
 import { LOG } from "./logger.js";
 
-/**
- * Implementation of SkyvernPageAi that makes API calls to the server.
- */
 export class SkyvernBrowserPageAi {
     private readonly _browser: SkyvernBrowser;
     private readonly _page: Page;
