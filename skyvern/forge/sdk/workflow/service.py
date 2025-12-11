@@ -12,7 +12,6 @@ from typing import Any, Literal, cast
 
 import httpx
 import structlog
-from asyncpg.exceptions import NotNullViolationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 import skyvern
@@ -525,9 +524,7 @@ class WorkflowService:
     @staticmethod
     def _format_parameter_persistence_error(error: SQLAlchemyError) -> str:
         if isinstance(error, IntegrityError):
-            orig_error = getattr(error, "orig", None)
-            if isinstance(orig_error, NotNullViolationError):
-                return "value cannot be null"
+            return "value cannot be null"
         return "database error while saving parameter value"
 
     async def auto_create_browser_session_if_needed(
