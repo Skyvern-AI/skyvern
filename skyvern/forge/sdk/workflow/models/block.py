@@ -2872,7 +2872,7 @@ class FileParserBlock(Block):
         elif self.file_type == FileType.EXCEL:
             try:
                 # Try to read the file with pandas to validate it's a valid Excel file
-                pd.read_excel(file_path, nrows=1, engine="openpyxl")
+                pd.read_excel(file_path, nrows=1, engine="calamine")
             except Exception as e:
                 raise InvalidFileType(
                     file_url=file_url_used, file_type=self.file_type, error=f"Invalid Excel file format: {str(e)}"
@@ -2931,14 +2931,14 @@ class FileParserBlock(Block):
         """Parse Excel file and return list of dictionaries."""
         try:
             # Read Excel file with pandas, specifying engine explicitly
-            df = pd.read_excel(file_path, engine="openpyxl")
+            df = pd.read_excel(file_path, engine="calamine")
             # Clean and convert DataFrame to list of dictionaries
             return self._clean_dataframe_for_json(df)
         except ImportError as e:
             raise InvalidFileType(
                 file_url=self.file_url,
                 file_type=self.file_type,
-                error=f"Missing required dependency for Excel parsing: {str(e)}. Please install openpyxl: pip install openpyxl",
+                error=f"Missing required dependency for Excel parsing: {str(e)}. Please install calamine: pip install python-calamine",
             )
         except Exception as e:
             raise InvalidFileType(
