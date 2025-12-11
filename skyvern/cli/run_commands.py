@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 from typing import Any, List, Optional
+from urllib.parse import urlparse
 
 import psutil
 import typer
@@ -53,16 +54,19 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
     res = await skyvern_agent.run_task(prompt=prompt, url=url, user_agent="skyvern-mcp", wait_for_completion=True)
 
     output = res.model_dump()["output"]
-    # Use the specific task URL if available, otherwise fall back to history page
+    # Use the specific task URL if available, otherwise construct fallback URL
     if res.app_url:
         task_url = res.app_url
     else:
+        # Fallback: construct URL based on environment settings
         base_url = settings.SKYVERN_BASE_URL
-        task_url = (
-            f"https://app.skyvern.com/tasks/{res.run_id}/actions"
-            if "skyvern.com" in base_url
-            else f"http://localhost:8080/tasks/{res.run_id}/actions"
-        )
+        if "skyvern.com" in base_url:
+            task_url = f"https://app.skyvern.com/tasks/{res.run_id}/actions"
+        else:
+            # For self-hosted: derive host from API base URL, UI defaults to port 8080
+            parsed = urlparse(base_url)
+            ui_host = parsed.hostname or "localhost"
+            task_url = f"http://{ui_host}:8080/tasks/{res.run_id}/actions"
     return {"output": output, "task_url": task_url, "run_id": res.run_id}
 
 
