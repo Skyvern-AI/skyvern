@@ -9,6 +9,13 @@ function getAppUrlForRun(runId: string): string {
     return `https://app.skyvern.com/runs/${runId}`;
 }
 
+/**
+ * Provides methods to run Skyvern tasks and workflows in the context of a browser page.
+ *
+ * This class enables executing AI-powered browser automation tasks while sharing the
+ * context of an existing browser page. It supports running custom tasks, login workflows,
+ * and pre-defined workflows with automatic waiting for completion.
+ */
 export class SkyvernBrowserPageAgent {
     private readonly _browser: SkyvernBrowser;
     private readonly _page: Page;
@@ -18,6 +25,25 @@ export class SkyvernBrowserPageAgent {
         this._page = page;
     }
 
+    /**
+     * Run a task in the context of this page and wait for it to finish.
+     *
+     * @param prompt - Natural language description of the task to perform.
+     * @param options - Optional configuration
+     * @param options.engine - The execution engine to use. Defaults to skyvern_v2.
+     * @param options.model - LLM model configuration options.
+     * @param options.url - URL to navigate to. If not provided, uses the current page URL.
+     * @param options.webhookUrl - URL to receive webhook notifications about task progress.
+     * @param options.totpIdentifier - Identifier for TOTP (Time-based One-Time Password) authentication.
+     * @param options.totpUrl - URL to fetch TOTP codes from.
+     * @param options.title - Human-readable title for this task run.
+     * @param options.errorCodeMapping - Mapping of error codes to custom error messages.
+     * @param options.dataExtractionSchema - Schema defining what data to extract from the page.
+     * @param options.maxSteps - Maximum number of steps the agent can take.
+     * @param options.timeout - Maximum time in seconds to wait for task completion.
+     *
+     * @returns TaskRunResponse containing the task execution results.
+     */
     async runTask(
         prompt: string,
         options?: {
@@ -70,6 +96,26 @@ export class SkyvernBrowserPageAgent {
         return completedRun as Skyvern.TaskRunResponse;
     }
 
+    /**
+     * Run a login task in the context of this page and wait for it to finish.
+     *
+     * @param credentialType - Type of credential store to use (e.g., skyvern, bitwarden, onepassword).
+     * @param options - Optional configuration
+     * @param options.url - URL to navigate to for login. If not provided, uses the current page URL.
+     * @param options.credentialId - ID of the credential to use.
+     * @param options.bitwardenCollectionId - Bitwarden collection ID containing the credentials.
+     * @param options.bitwardenItemId - Bitwarden item ID for the credentials.
+     * @param options.onepasswordVaultId - 1Password vault ID containing the credentials.
+     * @param options.onepasswordItemId - 1Password item ID for the credentials.
+     * @param options.prompt - Additional instructions for the login process.
+     * @param options.webhookUrl - URL to receive webhook notifications about login progress.
+     * @param options.totpIdentifier - Identifier for TOTP authentication.
+     * @param options.totpUrl - URL to fetch TOTP codes from.
+     * @param options.extraHttpHeaders - Additional HTTP headers to include in requests.
+     * @param options.timeout - Maximum time in seconds to wait for login completion.
+     *
+     * @returns WorkflowRunResponse containing the login workflow execution results.
+     */
     async login(
         credentialType: string,
         options?: {
@@ -126,6 +172,23 @@ export class SkyvernBrowserPageAgent {
         return completedRun as Skyvern.WorkflowRunResponse;
     }
 
+    /**
+     * Run a file download task in the context of this page and wait for it to finish.
+     *
+     * @param prompt - Instructions for navigating to and downloading the file.
+     * @param options - Optional configuration
+     * @param options.url - URL to navigate to for file download. If not provided, uses the current page URL.
+     * @param options.downloadSuffix - Suffix or complete filename for the downloaded file.
+     * @param options.downloadTimeout - Timeout in seconds for the download operation.
+     * @param options.maxStepsPerRun - Maximum number of steps to execute.
+     * @param options.webhookUrl - URL to receive webhook notifications about download progress.
+     * @param options.totpIdentifier - Identifier for TOTP authentication.
+     * @param options.totpUrl - URL to fetch TOTP codes from.
+     * @param options.extraHttpHeaders - Additional HTTP headers to include in requests.
+     * @param options.timeout - Maximum time in seconds to wait for download completion.
+     *
+     * @returns WorkflowRunResponse containing the file download workflow execution results.
+     */
     async downloadFiles(
         prompt: string,
         options?: {
@@ -172,6 +235,21 @@ export class SkyvernBrowserPageAgent {
         return completedRun as Skyvern.WorkflowRunResponse;
     }
 
+    /**
+     * Run a workflow in the context of this page and wait for it to finish.
+     *
+     * @param workflowId - ID of the workflow to execute.
+     * @param options - Optional configuration
+     * @param options.parameters - Dictionary of parameters to pass to the workflow.
+     * @param options.template - Whether this is a workflow template.
+     * @param options.title - Human-readable title for this workflow run.
+     * @param options.webhookUrl - URL to receive webhook notifications about workflow progress.
+     * @param options.totpUrl - URL to fetch TOTP codes from.
+     * @param options.totpIdentifier - Identifier for TOTP authentication.
+     * @param options.timeout - Maximum time in seconds to wait for workflow completion.
+     *
+     * @returns WorkflowRunResponse containing the workflow execution results.
+     */
     async runWorkflow(
         workflowId: string,
         options?: {

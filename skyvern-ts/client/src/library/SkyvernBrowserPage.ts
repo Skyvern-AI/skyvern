@@ -3,6 +3,25 @@ import type { SkyvernBrowser } from "./SkyvernBrowser.js";
 import { SkyvernBrowserPageAgent } from "./SkyvernBrowserPageAgent.js";
 import { SkyvernBrowserPageAi } from "./SkyvernBrowserPageAi.js";
 
+/**
+ * A browser page wrapper that combines Playwright's page API with Skyvern's AI capabilities.
+ *
+ * This class provides a unified interface for both traditional browser automation (via Playwright)
+ * and AI-powered task execution (via Skyvern). It exposes standard page methods like click, fill,
+ * goto, etc., while also providing access to Skyvern's task and workflow execution through the
+ * `agent` attribute.
+ *
+ * @example
+ * ```typescript
+ * // Use standard Playwright methods
+ * await page.goto("https://example.com");
+ * await page.fill("#username", "user@example.com");
+ * await page.click("#login-button");
+ *
+ * // Or use Skyvern's AI capabilities
+ * await page.agent.runTask("Fill out the contact form and submit it");
+ * ```
+ */
 export class SkyvernBrowserPageCore {
     private readonly _browser: SkyvernBrowser;
     private readonly _page: Page;
@@ -115,6 +134,17 @@ export class SkyvernBrowserPageCore {
         }
     }
 
+    /**
+     * Perform an action on the page using AI based on a natural language prompt.
+     *
+     * @param prompt - Natural language description of the action to perform.
+     *
+     * @example
+     * ```typescript
+     * // Simple action
+     * await page.act("Click the login button");
+     * ```
+     */
     async act(prompt: string): Promise<void> {
         return this._ai.aiAct(prompt);
     }

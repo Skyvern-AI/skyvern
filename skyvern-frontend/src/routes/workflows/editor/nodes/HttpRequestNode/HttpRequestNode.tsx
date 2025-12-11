@@ -6,19 +6,16 @@ import {
 } from "@/components/ui/accordion";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useCallback } from "react";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
+import { NodeHeader } from "../components/NodeHeader";
+import type { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
 import type { HttpRequestNode as HttpRequestNodeType } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Switch } from "@/components/ui/switch";
 import { placeholders, helpTooltips } from "../../helpContent";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
-import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
@@ -64,13 +61,12 @@ const timeoutTooltip = "Request timeout in seconds.";
 const followRedirectsTooltip =
   "Whether to automatically follow HTTP redirects.";
 
-function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
+function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
   const { editable } = data;
-  const [label, setLabel] = useNodeLabelChangeHandler({
+  const [label] = useNodeLabelChangeHandler({
     id,
     initialValue: data.label,
   });
-  const deleteNodeCallback = useDeleteNodeCallback();
   const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
@@ -139,27 +135,14 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
         className="opacity-0"
       />
       <div className="w-[36rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <header className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={WorkflowBlockTypes.HttpRequest}
-                className="size-6"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">HTTP Request Block</span>
-            </div>
-          </div>
-          <div className="flex gap-2">
-            {/* Quick Action Buttons */}
+        <NodeHeader
+          blockLabel={label}
+          editable={editable}
+          nodeId={id}
+          totpIdentifier={null}
+          totpUrl={null}
+          type={type as WorkflowBlockType}
+          extraActions={
             <CurlImportDialog onImport={handleCurlImport}>
               <Button
                 variant="outline"
@@ -171,14 +154,8 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                 Import cURL
               </Button>
             </CurlImportDialog>
-
-            <NodeActionMenu
-              onDelete={() => {
-                deleteNodeCallback(id);
-              }}
-            />
-          </div>
-        </header>
+          }
+        />
 
         <div className="space-y-4">
           {/* Method and URL Section */}
