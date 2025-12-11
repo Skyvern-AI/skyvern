@@ -933,15 +933,27 @@ class LLMAPIHandlerFactory:
                 )
                 raise SkyvernContextWindowExceededError() from e
             except CancelledError:
+                # Speculative steps are intentionally cancelled when goal verification completes first,
+                # so we log at debug level. Non-speculative cancellations are unexpected errors.
                 t_llm_cancelled = time.perf_counter()
-                LOG.error(
-                    "LLM request got cancelled",
-                    llm_key=llm_key,
-                    model=model_name,
-                    prompt_name=prompt_name,
-                    duration=t_llm_cancelled - t_llm_request,
-                )
-                raise LLMProviderError(llm_key)
+                if is_speculative_step:
+                    LOG.debug(
+                        "LLM request cancelled (speculative step)",
+                        llm_key=llm_key,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                        duration=t_llm_cancelled - t_llm_request,
+                    )
+                    raise
+                else:
+                    LOG.error(
+                        "LLM request got cancelled",
+                        llm_key=llm_key,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                        duration=t_llm_cancelled - t_llm_request,
+                    )
+                    raise LLMProviderError(llm_key) from None
             except Exception as e:
                 duration_seconds = time.time() - start_time
                 LOG.exception(
@@ -1301,14 +1313,25 @@ class LLMCaller:
             )
             raise SkyvernContextWindowExceededError() from e
         except CancelledError:
+            # Speculative steps are intentionally cancelled when goal verification returns completed,
+            # so we log at debug level. Non-speculative cancellations are unexpected errors.
             t_llm_cancelled = time.perf_counter()
-            LOG.error(
-                "LLM request got cancelled",
-                llm_key=self.llm_key,
-                model=self.llm_config.model_name,
-                duration=t_llm_cancelled - t_llm_request,
-            )
-            raise LLMProviderError(self.llm_key)
+            if is_speculative_step:
+                LOG.debug(
+                    "LLM request cancelled (speculative step)",
+                    llm_key=self.llm_key,
+                    model=self.llm_config.model_name,
+                    duration=t_llm_cancelled - t_llm_request,
+                )
+                raise
+            else:
+                LOG.error(
+                    "LLM request got cancelled",
+                    llm_key=self.llm_key,
+                    model=self.llm_config.model_name,
+                    duration=t_llm_cancelled - t_llm_request,
+                )
+                raise LLMProviderError(self.llm_key) from None
         except Exception as e:
             LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
             raise LLMProviderError(self.llm_key) from e
