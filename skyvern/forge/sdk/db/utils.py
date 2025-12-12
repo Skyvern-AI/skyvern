@@ -300,6 +300,7 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         step_id=artifact_model.step_id,
         workflow_run_id=artifact_model.workflow_run_id,
         workflow_run_block_id=artifact_model.workflow_run_block_id,
+        run_id=artifact_model.run_id,
         observer_cruise_id=artifact_model.observer_cruise_id,
         observer_thought_id=artifact_model.observer_thought_id,
         created_at=artifact_model.created_at,
