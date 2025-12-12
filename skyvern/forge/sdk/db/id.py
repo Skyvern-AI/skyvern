@@ -64,6 +64,7 @@ WORKFLOW_PREFIX = "w"
 WORKFLOW_RUN_BLOCK_PREFIX = "wrb"
 WORKFLOW_RUN_PREFIX = "wr"
 WORKFLOW_SCRIPT_PREFIX = "ws"
+WORKFLOW_TEMPLATE_PREFIX = "wt"
 
 
 def generate_workflow_id() -> str:
@@ -89,6 +90,11 @@ def generate_workflow_run_id() -> str:
 def generate_workflow_script_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_SCRIPT_PREFIX}_{int_id}"
+
+
+def generate_workflow_template_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_TEMPLATE_PREFIX}_{int_id}"
 
 
 def generate_aws_secret_parameter_id() -> str:
