@@ -137,7 +137,6 @@ if typing.TYPE_CHECKING:
         FileType,
         FileUploadBlock,
         FileUploadBlockYaml,
-        Folder,
         ForLoopBlock,
         ForLoopBlockLoopBlocksItem,
         ForLoopBlockLoopBlocksItem_Action,
@@ -300,6 +299,8 @@ if typing.TYPE_CHECKING:
         Script,
         ScriptFileCreate,
         ScriptRunResponse,
+        SecretCredential,
+        SecretCredentialResponse,
         SelectOption,
         SelectOptionAction,
         SelectOptionActionData,
@@ -495,7 +496,7 @@ if typing.TYPE_CHECKING:
         WorkflowStatus,
     )
     from .errors import BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnprocessableEntityError
-    from . import scripts, workflows
+    from . import scripts
     from .client import AsyncSkyvern, Skyvern
     from .environment import SkyvernEnvironment
     from .version import __version__
@@ -633,7 +634,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "FileType": ".types",
     "FileUploadBlock": ".types",
     "FileUploadBlockYaml": ".types",
-    "Folder": ".types",
     "ForLoopBlock": ".types",
     "ForLoopBlockLoopBlocksItem": ".types",
     "ForLoopBlockLoopBlocksItem_Action": ".types",
@@ -798,6 +798,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "Script": ".types",
     "ScriptFileCreate": ".types",
     "ScriptRunResponse": ".types",
+    "SecretCredential": ".types",
+    "SecretCredentialResponse": ".types",
     "SelectOption": ".types",
     "SelectOptionAction": ".types",
     "SelectOptionActionData": ".types",
@@ -996,7 +998,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowStatus": ".types",
     "__version__": ".version",
     "scripts": ".scripts",
-    "workflows": ".workflows",
 }
 
 
@@ -1155,7 +1156,6 @@ __all__ = [
     "FileType",
     "FileUploadBlock",
     "FileUploadBlockYaml",
-    "Folder",
     "ForLoopBlock",
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
@@ -1320,6 +1320,8 @@ __all__ = [
     "Script",
     "ScriptFileCreate",
     "ScriptRunResponse",
+    "SecretCredential",
+    "SecretCredentialResponse",
     "SelectOption",
     "SelectOptionAction",
     "SelectOptionActionData",
@@ -1518,5 +1520,4 @@ __all__ = [
     "WorkflowStatus",
     "__version__",
     "scripts",
-    "workflows",
 ]
