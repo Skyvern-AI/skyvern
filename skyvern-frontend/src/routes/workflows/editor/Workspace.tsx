@@ -1123,6 +1123,7 @@ function Workspace({
           cacheKeyValue={cacheKeyValue}
           cacheKeyValues={cacheKeyValues}
           isGeneratingCode={isGeneratingCode}
+          isTemplate={workflow?.is_template}
           saving={workflowChangesStore.saveIsPending}
           cacheKeyValuesPanelOpen={
             workflowPanelState.active &&
