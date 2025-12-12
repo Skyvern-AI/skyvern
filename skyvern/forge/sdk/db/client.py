@@ -1221,7 +1221,7 @@ class AgentDB:
         self,
         *,
         organization_id: str | None,
-        artifact_type: ArtifactType | None = None,
+        artifact_types: list[ArtifactType] | None = None,
         task_id: str | None = None,
         step_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -1235,8 +1235,8 @@ class AgentDB:
                 # Build base query
                 query = select(ArtifactModel)
 
-                if artifact_type is not None:
-                    query = query.filter_by(artifact_type=artifact_type)
+                if artifact_types is not None:
+                    query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
                 if task_id is not None:
                     query = query.filter_by(task_id=task_id)
                 if step_id is not None:
@@ -1284,7 +1284,7 @@ class AgentDB:
     ) -> Artifact | None:
         artifacts = await self.get_artifacts_by_entity_id(
             organization_id=organization_id,
-            artifact_type=artifact_type,
+            artifact_types=[artifact_type],
             task_id=task_id,
             step_id=step_id,
             workflow_run_id=workflow_run_id,

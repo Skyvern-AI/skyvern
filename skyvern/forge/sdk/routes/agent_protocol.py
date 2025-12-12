@@ -1936,6 +1936,7 @@ async def get_steps(
 async def get_artifacts(
     entity_type: EntityType,
     entity_id: str,
+    artifact_type: Annotated[list[ArtifactType] | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Response:
     """
@@ -1944,6 +1945,7 @@ async def get_artifacts(
     Args:
         entity_type: Type of entity to fetch artifacts for
         entity_id: ID of the entity
+        artifact_type: Optional list of artifact types to filter by
         current_org: Current organization from auth
 
     Returns:
@@ -1963,7 +1965,11 @@ async def get_artifacts(
     params = {
         entity_type_to_param[entity_type]: entity_id,
     }
-    artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
+    artifacts = await app.DATABASE.get_artifacts_by_entity_id(
+        organization_id=current_org.organization_id, 
+        artifact_types=artifact_type,
+        **params
+    )  # type: ignore
 
     if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
