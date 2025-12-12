@@ -227,3 +227,4 @@ navigation:
   - tab: demo
 experimental:
   openapi-parser-v3: true
+  dynamic-snippets: true
