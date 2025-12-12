@@ -27,5 +27,8 @@ export namespace CreateCredentialRequest {
     /**
      * The credential data to store
      */
-    export type Credential = Skyvern.NonEmptyPasswordCredential | Skyvern.NonEmptyCreditCardCredential;
+    export type Credential =
+        | Skyvern.NonEmptyPasswordCredential
+        | Skyvern.NonEmptyCreditCardCredential
+        | Skyvern.SecretCredential;
 }

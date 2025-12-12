@@ -267,6 +267,7 @@ class WorkflowDefinitionYamlBlocksItem_HttpRequest(UniversalBaseModel):
     url: typing.Optional[str] = None
     headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     body: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    files: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     timeout: typing.Optional[int] = None
     follow_redirects: typing.Optional[bool] = None
     parameter_keys: typing.Optional[typing.List[str]] = None

@@ -4,5 +4,8 @@ import typing
 
 from .non_empty_credit_card_credential import NonEmptyCreditCardCredential
 from .non_empty_password_credential import NonEmptyPasswordCredential
+from .secret_credential import SecretCredential
 
-CreateCredentialRequestCredential = typing.Union[NonEmptyPasswordCredential, NonEmptyCreditCardCredential]
+CreateCredentialRequestCredential = typing.Union[
+    NonEmptyPasswordCredential, NonEmptyCreditCardCredential, SecretCredential
+]
