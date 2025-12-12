@@ -57,6 +57,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_block_id,
     generate_workflow_run_id,
     generate_workflow_script_id,
+    generate_workflow_template_id,
 )
 from skyvern.forge.sdk.schemas.task_v2 import ThoughtType
 
@@ -293,6 +294,28 @@ class WorkflowModel(Base):
     workflow_permanent_id = Column(String, nullable=False, default=generate_workflow_permanent_id, index=True)
     version = Column(Integer, default=1, nullable=False)
     is_saved_task = Column(Boolean, default=False, nullable=False)
+
+
+class WorkflowTemplateModel(Base):
+    """
+    Tracks which workflows are marked as templates.
+    Keyed by workflow_permanent_id (not versioned workflow_id) because
+    template status is a property of the workflow identity, not a version.
+    """
+
+    __tablename__ = "workflow_templates"
+
+    workflow_template_id = Column(String, primary_key=True, default=generate_workflow_template_id)
+    workflow_permanent_id = Column(String, nullable=False, index=True)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
 
 
 class WorkflowRunModel(Base):

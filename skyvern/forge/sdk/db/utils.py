@@ -308,7 +308,22 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
     )
 
 
-def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = False) -> Workflow:
+def convert_to_workflow(
+    workflow_model: WorkflowModel,
+    debug_enabled: bool = False,
+    is_template: bool = False,
+) -> Workflow:
+    """
+    Convert a WorkflowModel to a Workflow pydantic model.
+
+    Args:
+        workflow_model: The database model to convert.
+        debug_enabled: Whether to log debug messages.
+        is_template: Whether this workflow is marked as a template.
+            This is computed separately from the workflow_templates table
+            since template status is at the workflow_permanent_id level,
+            not the versioned workflow level.
+    """
     if debug_enabled:
         LOG.debug(
             "Converting WorkflowModel to Workflow",
@@ -329,6 +344,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         max_screenshot_scrolls=workflow_model.max_screenshot_scrolling_times,
         version=workflow_model.version,
         is_saved_task=workflow_model.is_saved_task,
+        is_template=is_template,
         description=workflow_model.description,
         workflow_definition=WorkflowDefinition.model_validate(workflow_model.workflow_definition),
         created_at=workflow_model.created_at,
