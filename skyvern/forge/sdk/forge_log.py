@@ -169,7 +169,6 @@ def _generate_exception_hash(exc_type: type, tb: TracebackType) -> str:
     error from the same location always produces the same hash.
     """
     import hashlib  # noqa: PLC0415
-    from pathlib import Path  # noqa: PLC0415
 
     hasher = hashlib.sha256()
 
@@ -180,7 +179,13 @@ def _generate_exception_hash(exc_type: type, tb: TracebackType) -> str:
         frame = current_tb.tb_frame
         code = frame.f_code
 
-        filename = Path(code.co_filename).name
+        # Extract filename without Path object for better performance
+        filename = code.co_filename
+        if "/" in filename:
+            filename = filename.rpartition("/")[-1]
+        elif "\\" in filename:
+            filename = filename.rpartition("\\")[-1]
+
         lineno = current_tb.tb_lineno
         func_name = code.co_name
         hasher.update(f"{filename}:{lineno}:{func_name}".encode())
