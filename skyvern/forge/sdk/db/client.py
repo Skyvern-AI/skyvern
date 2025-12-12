@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
+from sqlalchemy import and_, asc, case, delete, exists, func, or_, pool, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -438,12 +438,21 @@ class AgentDB:
         """
         try:
             async with self.Session() as session:
-                query = (
-                    select(func.count(distinct(tuple_(StepModel.task_id, StepModel.order))))
-                    .where(StepModel.task_id.in_(task_ids))
-                    .where(StepModel.organization_id == organization_id)
+                pairs_sq = (
+                    select(StepModel.task_id, StepModel.order)
+                    .where(
+                        StepModel.task_id.in_(task_ids),
+                        StepModel.organization_id == organization_id,
+                    )
+                    .distinct()
+                    .subquery()
                 )
-                return (await session.execute(query)).scalar()
+
+                # count those distinct rows
+                query = select(func.count()).select_from(pairs_sq)
+
+                result = await session.execute(query)
+                return result.scalar_one()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

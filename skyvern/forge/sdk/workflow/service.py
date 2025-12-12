@@ -178,7 +178,7 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
     And return the dumped workflow definition as a python dictionary.
     """
     # Convert the workflow definition to a dictionary
-    workflow_dict = workflow_definition.model_dump()
+    workflow_dict = workflow_definition.model_dump(mode="json")
     fields_to_remove = [
         "created_at",
         "modified_at",
@@ -1411,7 +1411,7 @@ class WorkflowService:
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
-            workflow_definition=workflow_definition.model_dump(),
+            workflow_definition=workflow_definition.model_dump(mode="json"),
             organization_id=organization_id,
             description=description,
             proxy_location=proxy_location,
@@ -1759,7 +1759,7 @@ class WorkflowService:
             title=title,
             organization_id=organization_id,
             description=description,
-            workflow_definition=(workflow_definition.model_dump() if workflow_definition else None),
+            workflow_definition=(workflow_definition.model_dump(mode="json") if workflow_definition else None),
         )
 
         return updated_workflow

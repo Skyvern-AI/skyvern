@@ -128,6 +128,7 @@ class Skyvern(AsyncSkyvern):
         *,
         llm_config: LLMRouterConfig | LLMConfig | None = None,
         settings: dict[str, Any] | None = None,
+        use_in_memory_db: bool | None = None,
     ) -> "Skyvern":
         """Local/embedded mode: Run Skyvern locally in-process.
 
@@ -186,19 +187,31 @@ class Skyvern(AsyncSkyvern):
             settings: Optional dictionary of Skyvern settings to override.
                 These override the corresponding settings from your .env file.
                 Example: {"MAX_STEPS_PER_RUN": 100, "BROWSER_TYPE": "chromium-headful"}
+            use_in_memory_db: Optional flag to use an in-memory database.
 
         Returns:
             Skyvern: A Skyvern instance running in local/embedded mode.
         """
         from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
 
-        if not os.path.exists(".env"):
-            raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
-
         load_dotenv(".env")
-        api_key = os.getenv("SKYVERN_API_KEY")
-        if not api_key:
-            raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
+
+        if use_in_memory_db is not None:
+            do_use_in_memory_db = use_in_memory_db
+        else:
+            do_use_in_memory_db = os.environ.get("SKYVERN_USE_IN_MEMORY_DB", "").lower() == "true"
+
+        if not do_use_in_memory_db and not os.path.exists(".env"):
+            raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment.")
+
+        if not llm_config and not os.path.exists(".env"):
+            raise ValueError(
+                "LLM configuration is required. Either provide llm_config parameter or "
+                "run `skyvern quickstart` to configure LLM settings in .env file."
+            )
+
+        if not do_use_in_memory_db and not os.getenv("SKYVERN_API_KEY"):
+            raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment.")
 
         obj = cls.__new__(cls)
 
@@ -208,6 +221,7 @@ class Skyvern(AsyncSkyvern):
             httpx_client=create_embedded_server(
                 llm_config=llm_config,
                 settings_overrides=settings,
+                use_in_memory_db=do_use_in_memory_db,
             ),
         )
 

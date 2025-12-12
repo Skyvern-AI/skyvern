@@ -8,7 +8,7 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
 
-from skyvern.forge.forge_app_initializer import start_forge_app
+from skyvern.forge.forge_app_initializer import setup_local_organization, start_forge_app
 from skyvern.utils import migrate_db
 from skyvern.utils.env_paths import resolve_backend_env_path
 
@@ -16,7 +16,7 @@ from .browser import setup_browser_config
 from .console import console
 from .database import setup_postgresql
 from .llm_setup import setup_llm_providers, update_or_add_env_var
-from .mcp import setup_local_organization, setup_mcp
+from .mcp import setup_mcp
 
 
 def init_env(
