@@ -2319,6 +2319,7 @@ async def get_workflows(
     page_size: int = Query(10, ge=1),
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
+    only_templates: bool = Query(False),
     search_key: str | None = Query(
         None,
         description="Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).",
@@ -2372,9 +2373,32 @@ async def get_workflows(
         page_size=page_size,
         only_saved_tasks=only_saved_tasks,
         only_workflows=only_workflows,
+        only_templates=only_templates,
         search_key=effective_search,
         folder_id=folder_id,
         statuses=effective_statuses,
+    )
+
+
+@base_router.put(
+    "/workflows/{workflow_permanent_id}/template",
+    tags=["Workflows"],
+)
+async def set_workflow_template_status(
+    workflow_permanent_id: str,
+    is_template: bool = Query(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict:
+    """
+    Set or unset a workflow as a template.
+
+    Template status is stored at the workflow_permanent_id level (not per-version),
+    meaning all versions of a workflow share the same template status.
+    """
+    return await app.WORKFLOW_SERVICE.set_template_status(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        is_template=is_template,
     )
 
 
