@@ -86,6 +86,11 @@ class InputOrSelectContext(BaseModel):
     def __repr__(self) -> str:
         return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input}, intention={self.intention})"
 
+    @property
+    def requires_mini_agent(self) -> bool:
+        """Whether the input/select flow should stay in proactive (mini-agent) mode."""
+        return bool(self.is_search_bar or self.is_location_input or self.is_date_related or self.date_format)
+
 
 class ClickContext(BaseModel):
     thought: str | None = None
@@ -135,9 +140,27 @@ class Action(BaseModel):
     # TOTP timing information for multi-field TOTP sequences
     totp_timing_info: dict[str, Any] | None = None
 
+    # flag indicating whether the action requires mini-agent mode
+    has_mini_agent: bool | None = None
+
     created_at: datetime | None = None
     modified_at: datetime | None = None
     created_by: str | None = None
+
+    @property
+    def input_requires_mini_agent(self) -> bool:
+        """Derive whether proactive (mini-agent) mode is required for this action."""
+        if self.action_type not in {ActionType.INPUT_TEXT, ActionType.SELECT_OPTION}:
+            return False
+        if not self.input_or_select_context:
+            return False
+        return self.input_or_select_context.requires_mini_agent
+
+    def set_has_mini_agent(self) -> None:
+        """
+        Set the has_mini_agent flag to True if any mini-agent is envolved when handling the action.
+        """
+        self.has_mini_agent = True
 
     @classmethod
     def validate(cls: Type[T], value: Any) -> T:

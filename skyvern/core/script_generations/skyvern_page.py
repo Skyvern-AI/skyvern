@@ -74,7 +74,21 @@ class SkyvernPage(Page):
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        return await fn(self, *args, **kwargs)
+        context = skyvern_context.current()
+        label = getattr(self, "current_label", None)
+        action_override = None
+        if context and label:
+            current_count = context.action_counters.get(label, 0) + 1
+            context.action_counters[label] = current_count
+            action_override = context.action_ai_overrides.get(label, {}).get(current_count)
+            context.ai_mode_override = action_override
+
+        try:
+            return await fn(self, *args, **kwargs)
+        finally:
+            if context:
+                # Reset override after each action so defaults apply when no mapping is provided.
+                context.ai_mode_override = None
 
     @staticmethod
     def action_wrap(
@@ -387,9 +401,7 @@ class SkyvernPage(Page):
             error_to_raise = None
             if selector:
                 try:
-                    locator = self.page.locator(selector)
-                    await handler_utils.input_sequentially(locator, value, timeout=timeout)
-                    return value
+                    return await self._ai.input_text_with_secret_resolution(selector, value, timeout=timeout)
                 except Exception as e:
                     error_to_raise = e
                     selector = None

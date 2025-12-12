@@ -72,6 +72,8 @@ class SkyvernContext:
     {"loop_value": "str", "output_parameter": "the key of the parameter", "output_value": Any}
     """
     generate_script: bool = True
+    action_ai_overrides: dict[str, dict[int, str]] = field(default_factory=dict)
+    action_counters: dict[str, int] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id})"
