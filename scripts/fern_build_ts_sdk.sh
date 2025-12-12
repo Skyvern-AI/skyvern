@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-#CURRENT_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+CURRENT_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
 fern generate --group ts-sdk --log-level debug --version "$CURRENT_VERSION" --preview
 
 mkdir -p skyvern-ts/client

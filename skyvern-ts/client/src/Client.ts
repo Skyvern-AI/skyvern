@@ -2,7 +2,6 @@
 
 import * as Skyvern from "./api/index.js";
 import { Scripts } from "./api/resources/scripts/client/Client.js";
-import { Workflows } from "./api/resources/workflows/client/Client.js";
 import type { BaseClientOptions, BaseRequestOptions } from "./BaseClient.js";
 import { mergeHeaders, mergeOnlyDefinedHeaders } from "./core/headers.js";
 import * as core from "./core/index.js";
@@ -17,7 +16,6 @@ export declare namespace SkyvernClient {
 
 export class SkyvernClient {
     protected readonly _options: SkyvernClient.Options;
-    protected _workflows: Workflows | undefined;
     protected _scripts: Scripts | undefined;
 
     constructor(_options: SkyvernClient.Options = {}) {
@@ -28,18 +26,14 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "1.0.2",
-                    "User-Agent": "@skyvern/client/1.0.2",
+                    "X-Fern-SDK-Version": "1.0.3",
+                    "User-Agent": "@skyvern/client/1.0.3",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
                 _options?.headers,
             ),
         };
-    }
-
-    public get workflows(): Workflows {
-        return (this._workflows ??= new Workflows(this._options));
     }
 
     public get scripts(): Scripts {

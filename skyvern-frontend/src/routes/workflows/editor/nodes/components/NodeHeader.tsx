@@ -64,6 +64,7 @@ interface Props {
   blockLabel: string; // today, this + wpid act as the identity of a block
   disabled?: boolean;
   editable: boolean;
+  extraActions?: React.ReactNode;
   nodeId: string;
   totpIdentifier: string | null;
   totpUrl: string | null;
@@ -156,6 +157,7 @@ function NodeHeader({
   blockLabel,
   disabled = false,
   editable,
+  extraActions,
   nodeId,
   totpIdentifier,
   totpUrl,
@@ -563,6 +565,7 @@ function NodeHeader({
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
+          {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
               <button className="rounded p-1 hover:bg-red-500 hover:text-black disabled:opacity-50">
