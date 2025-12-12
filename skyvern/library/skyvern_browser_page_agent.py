@@ -1,6 +1,6 @@
 import asyncio
 import typing
-from typing import Any
+from typing import Any, Literal, overload
 
 import structlog
 from playwright.async_api import Page
@@ -98,16 +98,85 @@ class SkyvernBrowserPageAgent:
         LOG.info("AI task finished", run_id=task_run.run_id, status=task_run.status)
         return TaskRunResponse.model_validate(task_run.model_dump())
 
+    @overload
     async def login(
         self,
-        credential_type: CredentialType,
         *,
+        credential_type: Literal[CredentialType.skyvern] = CredentialType.skyvern,
+        credential_id: str,
+        url: str | None = None,
+        prompt: str | None = None,
+        webhook_url: str | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+    ) -> WorkflowRunResponse: ...
+
+    @overload
+    async def login(
+        self,
+        *,
+        credential_type: Literal[CredentialType.bitwarden],
+        bitwarden_item_id: str,
+        bitwarden_collection_id: str | None = None,
+        url: str | None = None,
+        prompt: str | None = None,
+        webhook_url: str | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+    ) -> WorkflowRunResponse: ...
+
+    @overload
+    async def login(
+        self,
+        *,
+        credential_type: Literal[CredentialType.onepassword],
+        onepassword_vault_id: str,
+        onepassword_item_id: str,
+        url: str | None = None,
+        prompt: str | None = None,
+        webhook_url: str | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+    ) -> WorkflowRunResponse: ...
+
+    @overload
+    async def login(
+        self,
+        *,
+        credential_type: Literal[CredentialType.azure_vault],
+        azure_vault_name: str,
+        azure_vault_username_key: str,
+        azure_vault_password_key: str,
+        azure_vault_totp_secret_key: str | None = None,
+        url: str | None = None,
+        prompt: str | None = None,
+        webhook_url: str | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+    ) -> WorkflowRunResponse: ...
+
+    async def login(
+        self,
+        *,
+        credential_type: CredentialType = CredentialType.skyvern,
         url: str | None = None,
         credential_id: str | None = None,
         bitwarden_collection_id: str | None = None,
         bitwarden_item_id: str | None = None,
         onepassword_vault_id: str | None = None,
         onepassword_item_id: str | None = None,
+        azure_vault_name: str | None = None,
+        azure_vault_username_key: str | None = None,
+        azure_vault_password_key: str | None = None,
+        azure_vault_totp_secret_key: str | None = None,
         prompt: str | None = None,
         webhook_url: str | None = None,
         totp_identifier: str | None = None,
@@ -117,14 +186,53 @@ class SkyvernBrowserPageAgent:
     ) -> WorkflowRunResponse:
         """Run a login task in the context of this page and wait for it to finish.
 
+        This method has multiple overloaded signatures for different credential types:
+
+        1. Skyvern credentials (default):
+            ```python
+            await page.agent.login(credential_id="cred_123")
+            ```
+
+        2. Bitwarden credentials:
+            ```python
+            await page.agent.login(
+                credential_type=CredentialType.bitwarden,
+                bitwarden_collection_id="collection_id",
+                bitwarden_item_id="item_id",
+            )
+            ```
+
+        3. 1Password credentials:
+            ```python
+            await page.agent.login(
+                credential_type=CredentialType.onepassword,
+                onepassword_vault_id="vault_id",
+                onepassword_item_id="item_id",
+            )
+            ```
+
+        4. Azure Vault credentials:
+            ```python
+            await page.agent.login(
+                credential_type=CredentialType.azure_vault,
+                azure_vault_name="vault_name",
+                azure_vault_username_key="username_key",
+                azure_vault_password_key="password_key",
+            )
+            ```
+
         Args:
-            credential_type: Type of credential store to use (e.g., skyvern, bitwarden, onepassword).
+            credential_id: ID of the Skyvern credential to use (required for skyvern credential_type).
+            credential_type: Type of credential store to use. Defaults to CredentialType.skyvern.
             url: URL to navigate to for login. If not provided, uses the current page URL.
-            credential_id: ID of the credential to use.
-            bitwarden_collection_id: Bitwarden collection ID containing the credentials.
-            bitwarden_item_id: Bitwarden item ID for the credentials.
-            onepassword_vault_id: 1Password vault ID containing the credentials.
-            onepassword_item_id: 1Password item ID for the credentials.
+            bitwarden_collection_id: Bitwarden collection ID (optional for bitwarden credential_type).
+            bitwarden_item_id: Bitwarden item ID (required for bitwarden credential_type).
+            onepassword_vault_id: 1Password vault ID (required for onepassword credential_type).
+            onepassword_item_id: 1Password item ID (required for onepassword credential_type).
+            azure_vault_name: Azure Vault name (required for azure_vault credential_type).
+            azure_vault_username_key: Azure Vault username key (required for azure_vault credential_type).
+            azure_vault_password_key: Azure Vault password key (required for azure_vault credential_type).
+            azure_vault_totp_secret_key: Azure Vault TOTP secret key (optional for azure_vault credential_type).
             prompt: Additional instructions for the login process.
             webhook_url: URL to receive webhook notifications about login progress.
             totp_identifier: Identifier for TOTP authentication.
@@ -146,6 +254,10 @@ class SkyvernBrowserPageAgent:
             bitwarden_item_id=bitwarden_item_id,
             onepassword_vault_id=onepassword_vault_id,
             onepassword_item_id=onepassword_item_id,
+            azure_vault_name=azure_vault_name,
+            azure_vault_username_key=azure_vault_username_key,
+            azure_vault_password_key=azure_vault_password_key,
+            azure_vault_totp_secret_key=azure_vault_totp_secret_key,
             prompt=prompt,
             webhook_url=webhook_url,
             totp_identifier=totp_identifier,
