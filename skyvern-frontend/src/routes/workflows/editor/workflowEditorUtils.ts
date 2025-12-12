@@ -775,10 +775,7 @@ function serializeConditionalBlock(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
 ): ConditionalBlockYAML {
-  const mergeLabel =
-    findConditionalMergeLabel(node, nodes, edges) ??
-    node.data.mergeLabel ??
-    null;
+  const mergeLabel = findConditionalMergeLabel(node, nodes, edges) ?? null;
 
   const branchConditions = node.data.branches.map((branch) => {
     const orderedNodes = getConditionalBranchNodeSequence(
@@ -787,11 +784,7 @@ function serializeConditionalBlock(
       nodes,
       edges,
     );
-    const nextBlockLabel =
-      orderedNodes[0]?.data.label ??
-      mergeLabel ??
-      branch.next_block_label ??
-      null;
+    const nextBlockLabel = orderedNodes[0]?.data.label ?? mergeLabel ?? null;
 
     return {
       ...branch,
