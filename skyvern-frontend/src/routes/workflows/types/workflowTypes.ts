@@ -562,6 +562,7 @@ export type WorkflowApiResponse = {
   workflow_id: string;
   organization_id: string;
   is_saved_task: boolean;
+  is_template: boolean;
   title: string;
   workflow_permanent_id: string;
   version: number;

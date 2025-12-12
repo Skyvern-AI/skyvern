@@ -1,4 +1,6 @@
 import {
+  BookmarkFilledIcon,
+  BookmarkIcon,
   ChevronDownIcon,
   ChevronUpIcon,
   ClockIcon,
@@ -21,6 +23,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
+import { getClient } from "@/api/AxiosClient";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { AxiosError } from "axios";
+import { toast } from "@/components/ui/use-toast";
 import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
 import { useCreateWorkflowMutation } from "../hooks/useCreateWorkflowMutation";
 import { convert } from "./workflowEditorUtils";
@@ -41,6 +48,7 @@ type Props = {
   cacheKeyValues: CacheKeyValuesResponse | undefined;
   cacheKeyValuesPanelOpen: boolean;
   isGeneratingCode?: boolean;
+  isTemplate?: boolean;
   parametersPanelOpen: boolean;
   saving: boolean;
   showAllCode: boolean;
@@ -61,6 +69,7 @@ function WorkflowHeader({
   cacheKeyValues,
   cacheKeyValuesPanelOpen,
   isGeneratingCode,
+  isTemplate,
   parametersPanelOpen,
   saving,
   showAllCode,
@@ -89,6 +98,41 @@ function WorkflowHeader({
   const [chosenCacheKeyValue, setChosenCacheKeyValue] = useState<string | null>(
     cacheKeyValue ?? null,
   );
+
+  const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
+
+  const templateMutation = useMutation({
+    mutationFn: async (newIsTemplate: boolean) => {
+      // Template endpoint only exists on /v1 (no /api prefix)
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return client.put(
+        `/workflows/${workflowPermanentId}/template?is_template=${newIsTemplate}`,
+      );
+    },
+    onSuccess: (_, newIsTemplate) => {
+      queryClient.invalidateQueries({
+        queryKey: ["workflows"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["orgTemplates"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflow", workflowPermanentId],
+      });
+      toast({
+        title: newIsTemplate ? "Saved as template" : "Removed from templates",
+        variant: "success",
+      });
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Failed to update template status",
+        description: error.message,
+      });
+    },
+  });
 
   const dom: Dom = {
     input: useRef<HTMLInputElement>(null),
@@ -294,6 +338,39 @@ function WorkflowHeader({
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Save</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    disabled={
+                      isRecording || templateMutation.isPending || saving
+                    }
+                    size="icon"
+                    variant={isTemplate ? "default" : "tertiary"}
+                    className="size-10 min-w-[2.5rem]"
+                    onClick={() => {
+                      const newIsTemplate = !isTemplate;
+                      if (newIsTemplate) {
+                        // When saving AS template, save the workflow first
+                        onSave();
+                      }
+                      templateMutation.mutate(newIsTemplate);
+                    }}
+                  >
+                    {templateMutation.isPending ? (
+                      <ReloadIcon className="size-6 animate-spin" />
+                    ) : isTemplate ? (
+                      <BookmarkFilledIcon className="size-6" />
+                    ) : (
+                      <BookmarkIcon className="size-6" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {isTemplate ? "Remove from Templates" : "Save as Template"}
+                </TooltipContent>
               </Tooltip>
             </TooltipProvider>
             {!workflowRunIsRunningOrQueued && (
