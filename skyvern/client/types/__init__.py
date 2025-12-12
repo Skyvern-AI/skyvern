@@ -148,7 +148,6 @@ if typing.TYPE_CHECKING:
     from .file_type import FileType
     from .file_upload_block import FileUploadBlock
     from .file_upload_block_yaml import FileUploadBlockYaml
-    from .folder import Folder
     from .for_loop_block import ForLoopBlock
     from .for_loop_block_loop_blocks_item import (
         ForLoopBlockLoopBlocksItem,
@@ -329,6 +328,8 @@ if typing.TYPE_CHECKING:
     from .script import Script
     from .script_file_create import ScriptFileCreate
     from .script_run_response import ScriptRunResponse
+    from .secret_credential import SecretCredential
+    from .secret_credential_response import SecretCredentialResponse
     from .select_option import SelectOption
     from .select_option_action import SelectOptionAction
     from .select_option_action_data import SelectOptionActionData
@@ -671,7 +672,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "FileType": ".file_type",
     "FileUploadBlock": ".file_upload_block",
     "FileUploadBlockYaml": ".file_upload_block_yaml",
-    "Folder": ".folder",
     "ForLoopBlock": ".for_loop_block",
     "ForLoopBlockLoopBlocksItem": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Action": ".for_loop_block_loop_blocks_item",
@@ -834,6 +834,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "Script": ".script",
     "ScriptFileCreate": ".script_file_create",
     "ScriptRunResponse": ".script_run_response",
+    "SecretCredential": ".secret_credential",
+    "SecretCredentialResponse": ".secret_credential_response",
     "SelectOption": ".select_option",
     "SelectOptionAction": ".select_option_action",
     "SelectOptionActionData": ".select_option_action_data",
@@ -1182,7 +1184,6 @@ __all__ = [
     "FileType",
     "FileUploadBlock",
     "FileUploadBlockYaml",
-    "Folder",
     "ForLoopBlock",
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
@@ -1345,6 +1346,8 @@ __all__ = [
     "Script",
     "ScriptFileCreate",
     "ScriptRunResponse",
+    "SecretCredential",
+    "SecretCredentialResponse",
     "SelectOption",
     "SelectOptionAction",
     "SelectOptionActionData",
