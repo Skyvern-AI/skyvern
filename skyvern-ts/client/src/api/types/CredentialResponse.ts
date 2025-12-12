@@ -20,5 +20,8 @@ export namespace CredentialResponse {
     /**
      * The credential data
      */
-    export type Credential = Skyvern.PasswordCredentialResponse | Skyvern.CreditCardCredentialResponse;
+    export type Credential =
+        | Skyvern.PasswordCredentialResponse
+        | Skyvern.CreditCardCredentialResponse
+        | Skyvern.SecretCredentialResponse;
 }

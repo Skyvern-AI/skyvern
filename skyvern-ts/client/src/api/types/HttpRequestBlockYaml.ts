@@ -12,6 +12,7 @@ export interface HttpRequestBlockYaml {
     url?: string;
     headers?: Record<string, string | undefined>;
     body?: Record<string, unknown>;
+    files?: Record<string, string | undefined>;
     timeout?: number;
     follow_redirects?: boolean;
     parameter_keys?: string[];
