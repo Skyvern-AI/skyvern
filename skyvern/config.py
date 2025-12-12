@@ -288,6 +288,12 @@ class Settings(BaseSettings):
     AZURE_GPT5_1_API_KEY: str | None = None
     AZURE_GPT5_1_API_BASE: str | None = None
     AZURE_GPT5_1_API_VERSION: str = "2025-04-01-preview"
+    # AZURE gpt-5.2
+    ENABLE_AZURE_GPT5_2: bool = False
+    AZURE_GPT5_2_DEPLOYMENT: str = "gpt-5.2"
+    AZURE_GPT5_2_API_KEY: str | None = None
+    AZURE_GPT5_2_API_BASE: str | None = None
+    AZURE_GPT5_2_API_VERSION: str = "2025-04-01-preview"
 
     # GEMINI
     GEMINI_API_KEY: str | None = None
@@ -432,6 +438,7 @@ class Settings(BaseSettings):
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
+                "azure/gpt-5.2": {"llm_key": "AZURE_OPENAI_GPT5_2", "label": "GPT 5.2"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
                 "us.anthropic.claude-opus-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
@@ -469,6 +476,7 @@ class Settings(BaseSettings):
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
+                "azure/gpt-5.2": {"llm_key": "AZURE_OPENAI_GPT5_2", "label": "GPT 5.2"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
                 "us.anthropic.claude-opus-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
