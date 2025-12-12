@@ -126,7 +126,7 @@ def add_error_processor(logger: logging.Logger, method_name: str, event_dict: Ev
     """
     A custom processor extending error logs with additional info
     """
-    import sys
+    import sys  # noqa: PLC0415
 
     exc_info = event_dict.get("exc_info")
 
@@ -168,8 +168,8 @@ def _generate_exception_hash(exc_type: type, tb: TracebackType) -> str:
     Excludes dynamic data like error messages to ensure the same
     error from the same location always produces the same hash.
     """
-    import hashlib
-    from pathlib import Path
+    import hashlib  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
 
     hasher = hashlib.sha256()
 
