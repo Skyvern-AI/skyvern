@@ -5,7 +5,6 @@ import os
 import shutil
 import subprocess
 from typing import Any, List, Optional
-from urllib.parse import urlparse
 
 import psutil
 import typer
@@ -55,19 +54,13 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
 
     output = res.model_dump()["output"]
     # Primary: use app_url from API response (always correct for both tasks and workflows)
-    # Fallback: construct task-specific URL since run_task always returns a task run id
+    # Fallback: use SKYVERN_APP_URL config (consistent with rest of codebase)
     if res.app_url:
         task_url = res.app_url
     else:
-        # Fallback for self-hosted when app_url is not available
-        # Note: This assumes run_id is a task run id (from run_task), not a workflow run id
-        base_url = settings.SKYVERN_BASE_URL
-        if "skyvern.com" in base_url:
-            task_url = f"https://app.skyvern.com/tasks/{res.run_id}/actions"
-        else:
-            parsed = urlparse(base_url)
-            ui_host = parsed.hostname or "localhost"
-            task_url = f"http://{ui_host}:8080/tasks/{res.run_id}/actions"
+        # Fallback when app_url is not available
+        # Uses /tasks/ route since run_task always returns a task run id
+        task_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{res.run_id}/actions"
     return {"output": output, "task_url": task_url, "run_id": res.run_id}
 
 
