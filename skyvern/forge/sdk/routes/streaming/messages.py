@@ -60,12 +60,6 @@ async def messages(
     client_id: str | None = None,
     token: str | None = None,
 ) -> None:
-    LOG.info(
-        "Starting message stream.",
-        browser_session_id=browser_session_id,
-        workflow_run_id=workflow_run_id,
-    )
-
     organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
 
     if not organization_id:
