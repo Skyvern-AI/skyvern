@@ -260,7 +260,7 @@ class MessageChannel:
                 )
 
         if datums:
-            LOG.info(f"{self.class_name} Drained {len(datums)} messages from message channel.", **self.identity)
+            LOG.debug(f"{self.class_name} Drained {len(datums)} messages from message channel.", **self.identity)
 
         return datums
 
@@ -544,19 +544,12 @@ async def get_message_channel_for_browser_session(
     Return a message channel for a browser session, with a list of loops to run concurrently.
     """
 
-    LOG.info("Getting message channel for browser session.", browser_session_id=browser_session_id)
-
     browser_session = await verify_browser_session(
         browser_session_id=browser_session_id,
         organization_id=organization_id,
     )
 
     if not browser_session:
-        LOG.info(
-            "Message channel: no initial browser session found.",
-            browser_session_id=browser_session_id,
-            organization_id=organization_id,
-        )
         return None
 
     message_channel = MessageChannel(
@@ -565,8 +558,6 @@ async def get_message_channel_for_browser_session(
         browser_session=browser_session,
         websocket=websocket,
     )
-
-    LOG.info("Got message channel for browser session.", message_channel=message_channel)
 
     loops = [
         asyncio.create_task(loop_verify_browser_session(message_channel)),
@@ -602,11 +593,6 @@ async def get_message_channel_for_workflow_run(
         return None
 
     if not browser_session:
-        LOG.info(
-            "Message channel: no initial browser session found for workflow run.",
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-        )
         return None
 
     message_channel = MessageChannel(

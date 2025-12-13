@@ -25,7 +25,12 @@ from skyvern.webeye.actions.actions import (
     SelectOption,
     SolveCaptchaAction,
 )
-from skyvern.webeye.actions.handler import ActionHandler, handle_complete_action
+from skyvern.webeye.actions.handler import (
+    ActionHandler,
+    generate_totp_value,
+    get_actual_value_of_parameter_if_secret,
+    handle_complete_action,
+)
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
@@ -392,6 +397,17 @@ class ScriptSkyvernPage(SkyvernPage):
         except Exception:
             # If screenshot creation fails, don't block execution
             pass
+
+    async def get_actual_value(self, value: str) -> str:
+        """Input text into an element identified by ``selector``."""
+        context = skyvern_context.ensure_context()
+        if context and context.workflow_run_id:
+            # support TOTP secret and internal it to TOTP code
+            is_totp_value = value == "BW_TOTP" or value == "OP_TOTP" or value == "AZ_TOTP"
+            if is_totp_value:
+                value = generate_totp_value(context.workflow_run_id, value)
+            value = get_actual_value_of_parameter_if_secret(context.workflow_run_id, value)
+        return value
 
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)

@@ -1093,7 +1093,7 @@ async def handle_input_text_action(
         text: str = ""
     else:
         # For regular inputs, resolve secrets
-        text_result = await get_actual_value_of_parameter_if_secret(task, action.text)
+        text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
         if text_result is None:
             return [ActionFailure(FailedToFetchSecret())]
         text = text_result
@@ -1323,7 +1323,7 @@ async def handle_input_text_action(
     class_name: str | None = await skyvern_element.get_attr("class")
     if class_name and "blinking-cursor" in class_name:
         if is_totp_value:
-            text = generate_totp_value(task=task, parameter=action.text)
+            text = generate_totp_value_with_task(task=task, parameter=action.text)
         await skyvern_element.press_fill(text=text)
         return [ActionSuccess()]
 
@@ -1365,7 +1365,7 @@ async def handle_input_text_action(
 
     if is_totp_value:
         LOG.info("Skipping the auto completion logic since it's a TOTP input")
-        text = generate_totp_value(task=task, parameter=action.text)
+        text = generate_totp_value_with_task(task=task, parameter=action.text)
         await skyvern_element.input(text)
         return [ActionSuccess()]
 
@@ -1516,7 +1516,7 @@ async def handle_upload_file_action(
     # After this point if the file_url is a secret, it will be replaced with the actual value
     # In order to make sure we don't log the secret value, we log the action with the original value action.file_url
     # ************************************************************************************************************** #
-    file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
+    file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
     decoded_url = urllib.parse.unquote(file_url)
     if (
         file_url not in str(task.navigation_payload)
@@ -2258,7 +2258,13 @@ ActionHandler.register_action_type(ActionType.GOTO_URL, handle_goto_url_action)
 ActionHandler.register_action_type(ActionType.CLOSE_PAGE, handle_close_page_action)
 
 
-async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
+def get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
+    return secret_value if secret_value is not None else parameter
+
+
+def get_actual_value_of_parameter_if_secret_with_task(task: Task, parameter: str) -> Any:
     """
     Get the actual value of a parameter if it's a secret. If it's not a secret, return the parameter value as is.
 
@@ -2269,22 +2275,23 @@ async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) ->
     if task.workflow_run_id is None:
         return parameter
 
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
-    secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
-    return secret_value if secret_value is not None else parameter
+    return get_actual_value_of_parameter_if_secret(task.workflow_run_id, parameter)
 
 
-def generate_totp_value(task: Task, parameter: str) -> str:
-    if task.workflow_run_id is None:
-        return parameter
-
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+def generate_totp_value(workflow_run_id: str, parameter: str) -> str:
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
     totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
     totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
     if not totp_secret:
         LOG.warning("No TOTP secret found, returning the parameter value as is", parameter=parameter)
         return parameter
     return pyotp.TOTP(totp_secret).now()
+
+
+def generate_totp_value_with_task(task: Task, parameter: str) -> str:
+    if task.workflow_run_id is None:
+        return parameter
+    return generate_totp_value(task.workflow_run_id, parameter)
 
 
 async def chain_click(
@@ -2306,7 +2313,7 @@ async def chain_click(
     LOG.info("Chain click starts", action=action, locator=locator)
     file = pending_upload_files or []
     if not file and action.file_url:
-        file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
+        file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
         file = await handler_utils.download_file(file_url, action.model_dump())
 
     is_filechooser_trigger = False
@@ -3074,7 +3081,7 @@ async def select_from_emerging_elements(
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
-        actual_value = await get_actual_value_of_parameter_if_secret(task=task, parameter=value)
+        actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
         LOG.info(
             "No clickable option found, but found input element to search",
             element_id=element_id,
@@ -3229,7 +3236,7 @@ async def select_from_dropdown(
             element_id=element_id,
         )
         try:
-            actual_value = await get_actual_value_of_parameter_if_secret(task=task, parameter=value)
+            actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
             input_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
             await input_element.scroll_into_view()
             current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())

@@ -30,6 +30,7 @@ from skyvern.webeye.actions.actions import (
     UploadFileAction,
 )
 from skyvern.webeye.actions.handler import (
+    get_actual_value_of_parameter_if_secret,
     handle_click_action,
     handle_input_text_action,
     handle_select_option_action,
@@ -280,9 +281,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     value = json_response.get("answer", value)
 
                     if context and context.workflow_run_id:
-                        transformed_value = await _get_actual_value_of_parameter_if_secret(
-                            context.workflow_run_id, str(value)
-                        )
+                        transformed_value = get_actual_value_of_parameter_if_secret(context.workflow_run_id, str(value))
                     action = InputTextAction(
                         element_id=element_id,
                         text=value,
@@ -797,16 +796,3 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         except Exception:
             LOG.exception("ai_act: failed to execute action", action_type=action_type, prompt=prompt)
-
-
-async def _get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
-    """
-    Get the actual value of a parameter if it's a secret. If it's not a secret, return the parameter value as is.
-
-    Just return the parameter value if the task isn't a workflow's task.
-
-    This is only used for InputTextAction, UploadFileAction, and ClickAction (if it has a file_url).
-    """
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-    secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
-    return secret_value if secret_value is not None else parameter

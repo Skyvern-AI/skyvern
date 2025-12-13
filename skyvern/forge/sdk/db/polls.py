@@ -2,7 +2,7 @@ import asyncio
 
 from structlog import get_logger
 
-from skyvern.forge.sdk.db.client import AgentDB
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
 LOG = get_logger(__name__)

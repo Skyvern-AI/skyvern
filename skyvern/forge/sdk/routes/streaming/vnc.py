@@ -113,12 +113,6 @@ async def stream(
             return
 
         vnc_channel, loops = result
-
-        LOG.info(
-            "Starting vnc for browser session.",
-            browser_session_id=browser_session_id,
-            organization_id=organization_id,
-        )
     elif task_id:
         result = await get_vnc_channel_for_task(
             client_id=client_id,

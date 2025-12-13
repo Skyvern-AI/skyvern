@@ -1398,7 +1398,7 @@ class ForLoopBlock(Block):
                 workflow_run_context.update_block_metadata(loop_block.label, metadata)
 
                 original_loop_block = loop_block
-                loop_block = loop_block.copy()
+                loop_block = loop_block.model_copy(deep=True)
                 current_block = loop_block
 
                 block_output = await loop_block.execute_safe(

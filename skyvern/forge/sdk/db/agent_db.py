@@ -3,7 +3,23 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
+from sqlalchemy import (
+    Connection,
+    and_,
+    asc,
+    case,
+    delete,
+    distinct,
+    event,
+    exists,
+    func,
+    or_,
+    pool,
+    select,
+    tuple_,
+    update,
+)
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -51,6 +67,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
     WorkflowScriptModel,
+    WorkflowTemplateModel,
 )
 from skyvern.forge.sdk.db.utils import (
     _custom_json_serializer,
@@ -152,28 +169,60 @@ def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     return result
 
 
-DB_CONNECT_ARGS: dict[str, Any] = {}
+def _connect_args_for_driver(database_string: str) -> dict[str, Any]:
+    driver = make_url(database_string).drivername  # "postgresql+psycopg" or "postgresql+asyncpg"
+    args: dict[str, Any] = {}
 
-if "postgresql+psycopg" in settings.DATABASE_STRING:
-    DB_CONNECT_ARGS = {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"}
-elif "postgresql+asyncpg" in settings.DATABASE_STRING:
-    DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
+    if settings.DB_DISABLE_PREPARED_STATEMENTS:
+        if driver == "postgresql+psycopg":
+            # psycopg3: completely disable prepared statements (None vs 0)
+            # 0 disables caching but still uses prepared statements
+            # None completely disables prepared statement usage
+            args["prepare_threshold"] = None
+        elif driver == "postgresql+asyncpg":
+            # asyncpg: disable statement cache (prepared statements)
+            args["statement_cache_size"] = 0
+        else:
+            LOG.warning(
+                "The database driver might not be well optimized or supported by skyvern: {driver}", driver=driver
+            )
+
+    return args
+
+
+def _install_statement_timeout(engine: AsyncEngine, timeout_ms: int) -> None:
+    if not timeout_ms or timeout_ms <= 0:
+        return
+
+    timeout_value = int(timeout_ms)
+
+    # Works for direct AND poolers because it's not a startup parameter.
+    # Applies per-transaction, which is the most reliable behavior with transaction pooling.
+    @event.listens_for(engine.sync_engine, "begin")
+    def _set_timeout(conn: Connection) -> None:
+        # Use a unique comment with object id to prevent psycopg3 from reusing prepared statement names,
+        # which can cause "prepared statement already exists" errors with connection poolers.
+        sql = f"SET LOCAL statement_timeout = {timeout_value} /* {id(conn)} */"
+        conn.exec_driver_sql(sql)
+
+
+def make_async_engine(database_string: str) -> AsyncEngine:
+    engine = create_async_engine(
+        database_string,
+        json_serializer=_custom_json_serializer,
+        connect_args=_connect_args_for_driver(database_string),
+        poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
+    )
+
+    _install_statement_timeout(engine, settings.DATABASE_STATEMENT_TIMEOUT_MS)
+    return engine
 
 
 class AgentDB:
     def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
         super().__init__()
         self.debug_enabled = debug_enabled
-        self.engine = (
-            create_async_engine(
-                database_string,
-                json_serializer=_custom_json_serializer,
-                connect_args=DB_CONNECT_ARGS,
-                poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
-            )
-            if db_engine is None
-            else db_engine
-        )
+        self.engine = db_engine or make_async_engine(database_string)
         self.Session = async_sessionmaker(bind=self.engine)
 
     async def create_task(
@@ -1525,7 +1574,19 @@ class AgentDB:
                 if organization_id:
                     get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
                 if workflow := (await session.scalars(get_workflow_query)).first():
-                    return convert_to_workflow(workflow, self.debug_enabled)
+                    is_template = (
+                        await self.is_workflow_template(
+                            workflow_permanent_id=workflow.workflow_permanent_id,
+                            organization_id=workflow.organization_id,
+                        )
+                        if organization_id
+                        else False
+                    )
+                    return convert_to_workflow(
+                        workflow,
+                        self.debug_enabled,
+                        is_template=is_template,
+                    )
                 return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -1552,7 +1613,19 @@ class AgentDB:
             get_workflow_query = get_workflow_query.order_by(WorkflowModel.version.desc())
             async with self.Session() as session:
                 if workflow := (await session.scalars(get_workflow_query)).first():
-                    return convert_to_workflow(workflow, self.debug_enabled)
+                    is_template = (
+                        await self.is_workflow_template(
+                            workflow_permanent_id=workflow.workflow_permanent_id,
+                            organization_id=workflow.organization_id,
+                        )
+                        if organization_id
+                        else False
+                    )
+                    return convert_to_workflow(
+                        workflow,
+                        self.debug_enabled,
+                        is_template=is_template,
+                    )
                 return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -1581,7 +1654,19 @@ class AgentDB:
             get_workflow_query = get_workflow_query.filter(WorkflowRunModel.workflow_run_id == workflow_run_id)
             async with self.Session() as session:
                 if workflow := (await session.scalars(get_workflow_query)).first():
-                    return convert_to_workflow(workflow, self.debug_enabled)
+                    is_template = (
+                        await self.is_workflow_template(
+                            workflow_permanent_id=workflow.workflow_permanent_id,
+                            organization_id=workflow.organization_id,
+                        )
+                        if organization_id
+                        else False
+                    )
+                    return convert_to_workflow(
+                        workflow,
+                        self.debug_enabled,
+                        is_template=is_template,
+                    )
                 return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -1606,7 +1691,18 @@ class AgentDB:
 
             async with self.Session() as session:
                 workflows = (await session.scalars(get_workflows_query)).all()
-                return [convert_to_workflow(workflow, self.debug_enabled) for workflow in workflows]
+                template_permanent_ids: set[str] = set()
+                if workflows and organization_id:
+                    template_permanent_ids = await self.get_org_template_permanent_ids(organization_id)
+
+                return [
+                    convert_to_workflow(
+                        workflow,
+                        self.debug_enabled,
+                        is_template=workflow.workflow_permanent_id in template_permanent_ids,
+                    )
+                    for workflow in workflows
+                ]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1655,7 +1751,20 @@ class AgentDB:
                     main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )
                 workflows = (await session.scalars(main_query)).all()
-                return [convert_to_workflow(workflow, self.debug_enabled) for workflow in workflows]
+
+                # Map template status by permanent_id so API responses surface is_template
+                template_permanent_ids: set[str] = set()
+                if workflows and organization_id:
+                    template_permanent_ids = await self.get_org_template_permanent_ids(organization_id)
+
+                return [
+                    convert_to_workflow(
+                        workflow,
+                        self.debug_enabled,
+                        is_template=workflow.workflow_permanent_id in template_permanent_ids,
+                    )
+                    for workflow in workflows
+                ]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1667,6 +1776,7 @@ class AgentDB:
         page_size: int = 10,
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
+        only_templates: bool = False,
         search_key: str | None = None,
         folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
@@ -1717,6 +1827,13 @@ class AgentDB:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(True))
                 elif only_workflows:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(False))
+                if only_templates:
+                    # Filter by workflow_templates table (templates at permanent_id level)
+                    template_subquery = select(WorkflowTemplateModel.workflow_permanent_id).where(
+                        WorkflowTemplateModel.organization_id == organization_id,
+                        WorkflowTemplateModel.deleted_at.is_(None),
+                    )
+                    main_query = main_query.where(WorkflowModel.workflow_permanent_id.in_(template_subquery))
                 if statuses:
                     main_query = main_query.where(WorkflowModel.status.in_(statuses))
                 if folder_id:
@@ -1851,7 +1968,18 @@ class AgentDB:
                     main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )
                 workflows = (await session.scalars(main_query)).all()
-                return [convert_to_workflow(workflow, self.debug_enabled) for workflow in workflows]
+                template_permanent_ids: set[str] = set()
+                if workflows and organization_id:
+                    template_permanent_ids = await self.get_org_template_permanent_ids(organization_id)
+
+                return [
+                    convert_to_workflow(
+                        workflow,
+                        self.debug_enabled,
+                        is_template=workflow.workflow_permanent_id in template_permanent_ids,
+                    )
+                    for workflow in workflows
+                ]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1895,7 +2023,19 @@ class AgentDB:
                         workflow.import_error = import_error
                     await session.commit()
                     await session.refresh(workflow)
-                    return convert_to_workflow(workflow, self.debug_enabled)
+                    is_template = (
+                        await self.is_workflow_template(
+                            workflow_permanent_id=workflow.workflow_permanent_id,
+                            organization_id=workflow.organization_id,
+                        )
+                        if organization_id
+                        else False
+                    )
+                    return convert_to_workflow(
+                        workflow,
+                        self.debug_enabled,
+                        is_template=is_template,
+                    )
                 else:
                     raise NotFoundError("Workflow not found")
         except SQLAlchemyError:
@@ -1926,6 +2066,95 @@ class AgentDB:
             update_deleted_at_query = update_deleted_at_query.values(deleted_at=datetime.utcnow())
             await session.execute(update_deleted_at_query)
             await session.commit()
+
+    async def add_workflow_template(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> None:
+        """Add a workflow to the templates table."""
+        try:
+            async with self.Session() as session:
+                existing = (
+                    await session.scalars(
+                        select(WorkflowTemplateModel)
+                        .where(WorkflowTemplateModel.workflow_permanent_id == workflow_permanent_id)
+                        .where(WorkflowTemplateModel.organization_id == organization_id)
+                    )
+                ).first()
+                if existing:
+                    if existing.deleted_at is not None:
+                        existing.deleted_at = None
+                        await session.commit()
+                    return
+                template = WorkflowTemplateModel(
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                )
+                session.add(template)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in add_workflow_template", exc_info=True)
+            raise
+
+    async def remove_workflow_template(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> None:
+        """Soft delete a workflow from the templates table."""
+        try:
+            async with self.Session() as session:
+                update_deleted_at_query = (
+                    update(WorkflowTemplateModel)
+                    .where(WorkflowTemplateModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(WorkflowTemplateModel.organization_id == organization_id)
+                    .where(WorkflowTemplateModel.deleted_at.is_(None))
+                    .values(deleted_at=datetime.utcnow())
+                )
+                await session.execute(update_deleted_at_query)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in remove_workflow_template", exc_info=True)
+            raise
+
+    async def get_org_template_permanent_ids(
+        self,
+        organization_id: str,
+    ) -> set[str]:
+        """Get all workflow_permanent_ids that are templates for an organization."""
+        try:
+            async with self.Session() as session:
+                result = await session.scalars(
+                    select(WorkflowTemplateModel.workflow_permanent_id)
+                    .where(WorkflowTemplateModel.organization_id == organization_id)
+                    .where(WorkflowTemplateModel.deleted_at.is_(None))
+                )
+                return set(result.all())
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_org_template_permanent_ids", exc_info=True)
+            raise
+
+    async def is_workflow_template(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> bool:
+        """Check if a workflow is marked as a template."""
+        try:
+            async with self.Session() as session:
+                result = (
+                    await session.scalars(
+                        select(WorkflowTemplateModel)
+                        .where(WorkflowTemplateModel.workflow_permanent_id == workflow_permanent_id)
+                        .where(WorkflowTemplateModel.organization_id == organization_id)
+                        .where(WorkflowTemplateModel.deleted_at.is_(None))
+                    )
+                ).first()
+                return result is not None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in is_workflow_template", exc_info=True)
+            raise
 
     async def create_folder(
         self,

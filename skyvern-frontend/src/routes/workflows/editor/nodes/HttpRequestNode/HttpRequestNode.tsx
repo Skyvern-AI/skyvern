@@ -10,6 +10,7 @@ import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChan
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useCallback } from "react";
 import { NodeHeader } from "../components/NodeHeader";
+import { NodeTabs } from "../components/NodeTabs";
 import type { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
 import type { HttpRequestNode as HttpRequestNodeType } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -30,7 +31,13 @@ import {
 } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { CodeIcon, PlusIcon, MagicWandIcon } from "@radix-ui/react-icons";
+import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 import { CurlImportDialog } from "./CurlImportDialog";
 import { QuickHeadersDialog } from "./QuickHeadersDialog";
 import { MethodBadge, UrlValidator, RequestPreview } from "./HttpUtils";
@@ -115,6 +122,30 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
 
   const showBodyEditor =
     data.method !== "GET" && data.method !== "HEAD" && data.method !== "DELETE";
+
+  const handleAddParameterToBody = useCallback(
+    (parameterKey: string) => {
+      const parameterSyntax = `{{ ${parameterKey} }}`;
+      const currentBody = data.body || "{}";
+      try {
+        const parsed = JSON.parse(currentBody);
+        // Add as a new field with unique key
+        const existingKeys = Object.keys(parsed);
+        let keyIndex = existingKeys.length + 1;
+        let newKey = `param_${keyIndex}`;
+        while (existingKeys.includes(newKey)) {
+          keyIndex++;
+          newKey = `param_${keyIndex}`;
+        }
+        parsed[newKey] = parameterSyntax;
+        update({ body: JSON.stringify(parsed, null, 2) });
+      } catch {
+        // If invalid JSON, reset to valid JSON with the parameter
+        update({ body: JSON.stringify({ param_1: parameterSyntax }, null, 2) });
+      }
+    },
+    [data.body, update],
+  );
 
   return (
     <div
@@ -248,9 +279,30 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
           {/* Body Section */}
           {showBodyEditor && (
             <div className="space-y-2">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">Body</Label>
-                <HelpTooltip content={bodyTooltip} />
+              <div className="flex items-center justify-between">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Body</Label>
+                  <HelpTooltip content={bodyTooltip} />
+                </div>
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      disabled={!editable}
+                    >
+                      <PlusIcon className="mr-1 h-3 w-3" />
+                      Add Parameter
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[22rem]">
+                    <WorkflowBlockParameterSelect
+                      nodeId={id}
+                      onAdd={handleAddParameterToBody}
+                    />
+                  </PopoverContent>
+                </Popover>
               </div>
               <CodeEditor
                 className="w-full"
@@ -412,6 +464,8 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
             </ul>
           </div>
         </div>
+
+        <NodeTabs blockLabel={label} />
       </div>
     </div>
   );
