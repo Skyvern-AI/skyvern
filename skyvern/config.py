@@ -59,6 +59,7 @@ class Settings(BaseSettings):
         if platform.system() == "Windows"
         else "postgresql+psycopg://skyvern@localhost/skyvern"
     )
+    DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
     PROMPT_ACTION_HISTORY_WINDOW: int = 1

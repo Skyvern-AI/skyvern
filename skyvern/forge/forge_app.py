@@ -21,7 +21,7 @@ from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.cache.factory import CacheFactory
-from skyvern.forge.sdk.db.client import AgentDB
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
@@ -44,6 +44,7 @@ class ForgeApp:
 
     SETTINGS_MANAGER: Settings
     DATABASE: AgentDB
+    REPLICA_DATABASE: AgentDB
     STORAGE: BaseStorage
     CACHE: BaseCache
     ARTIFACT_MANAGER: ArtifactManager
@@ -93,6 +94,12 @@ def create_forge_app() -> ForgeApp:
     app.SETTINGS_MANAGER = settings
 
     app.DATABASE = AgentDB(settings.DATABASE_STRING, debug_enabled=settings.DEBUG_MODE)
+
+    if settings.DATABASE_REPLICA_STRING and settings.DATABASE_REPLICA_STRING != settings.DATABASE_STRING:
+        app.REPLICA_DATABASE = AgentDB(settings.DATABASE_REPLICA_STRING, debug_enabled=settings.DEBUG_MODE)
+    else:
+        app.REPLICA_DATABASE = app.DATABASE
+
     if settings.SKYVERN_STORAGE_TYPE == "s3":
         StorageFactory.set_storage(S3Storage())
     app.STORAGE = StorageFactory.get_storage()

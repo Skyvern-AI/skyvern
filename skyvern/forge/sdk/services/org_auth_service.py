@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.db.client import AgentDB
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
 
