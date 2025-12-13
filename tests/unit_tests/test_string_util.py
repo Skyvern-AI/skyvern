@@ -1,4 +1,3 @@
-import pytest
 
 from skyvern.webeye.string_util import remove_whitespace
 

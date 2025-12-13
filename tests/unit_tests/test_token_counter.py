@@ -1,5 +1,4 @@
 """Tests for token counter utility."""
-import pytest
 
 from skyvern.utils.token_counter import count_tokens
 

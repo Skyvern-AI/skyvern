@@ -1,7 +1,6 @@
 """Tests for string utility functions."""
 import string
 
-import pytest
 
 from skyvern.utils.strings import RANDOM_STRING_POOL, generate_random_string
 
