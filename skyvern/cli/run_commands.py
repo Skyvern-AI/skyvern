@@ -54,16 +54,17 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
     res = await skyvern_agent.run_task(prompt=prompt, url=url, user_agent="skyvern-mcp", wait_for_completion=True)
 
     output = res.model_dump()["output"]
-    # Use the specific task URL if available, otherwise construct fallback URL
+    # Primary: use app_url from API response (always correct for both tasks and workflows)
+    # Fallback: construct task-specific URL since run_task always returns a task run id
     if res.app_url:
         task_url = res.app_url
     else:
-        # Fallback: construct URL based on environment settings
+        # Fallback for self-hosted when app_url is not available
+        # Note: This assumes run_id is a task run id (from run_task), not a workflow run id
         base_url = settings.SKYVERN_BASE_URL
         if "skyvern.com" in base_url:
             task_url = f"https://app.skyvern.com/tasks/{res.run_id}/actions"
         else:
-            # For self-hosted: derive host from API base URL, UI defaults to port 8080
             parsed = urlparse(base_url)
             ui_host = parsed.hostname or "localhost"
             task_url = f"http://{ui_host}:8080/tasks/{res.run_id}/actions"
