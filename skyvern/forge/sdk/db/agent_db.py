@@ -175,8 +175,10 @@ def _connect_args_for_driver(database_string: str) -> dict[str, Any]:
 
     if settings.DB_DISABLE_PREPARED_STATEMENTS:
         if driver == "postgresql+psycopg":
-            # psycopg3: disable server-side prepares
-            args["prepare_threshold"] = 0
+            # psycopg3: completely disable prepared statements (None vs 0)
+            # 0 disables caching but still uses prepared statements
+            # None completely disables prepared statement usage
+            args["prepare_threshold"] = None
         elif driver == "postgresql+asyncpg":
             # asyncpg: disable statement cache (prepared statements)
             args["statement_cache_size"] = 0
@@ -192,11 +194,16 @@ def _install_statement_timeout(engine: AsyncEngine, timeout_ms: int) -> None:
     if not timeout_ms or timeout_ms <= 0:
         return
 
+    timeout_value = int(timeout_ms)
+
     # Works for direct AND poolers because it's not a startup parameter.
     # Applies per-transaction, which is the most reliable behavior with transaction pooling.
     @event.listens_for(engine.sync_engine, "begin")
     def _set_timeout(conn: Connection) -> None:
-        conn.exec_driver_sql(f"SET LOCAL statement_timeout = {int(timeout_ms)}")
+        # Use a unique comment with object id to prevent psycopg3 from reusing prepared statement names,
+        # which can cause "prepared statement already exists" errors with connection poolers.
+        sql = f"SET LOCAL statement_timeout = {timeout_value} /* {id(conn)} */"
+        conn.exec_driver_sql(sql)
 
 
 def make_async_engine(database_string: str) -> AsyncEngine:
