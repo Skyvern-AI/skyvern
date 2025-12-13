@@ -1,6 +1,6 @@
 """Tests for string utility functions."""
-import string
 
+import string
 
 from skyvern.utils.strings import RANDOM_STRING_POOL, generate_random_string
 

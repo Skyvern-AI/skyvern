@@ -1,4 +1,5 @@
 """Extended tests for URL validators module."""
+
 import pytest
 
 from skyvern.exceptions import InvalidUrl
