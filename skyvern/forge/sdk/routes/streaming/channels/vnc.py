@@ -460,17 +460,12 @@ async def get_vnc_channel_for_browser_session(
     Return a vnc channel for a browser session, with a list of loops to run concurrently.
     """
 
-    LOG.info("Getting vnc context for browser session.", browser_session_id=browser_session_id)
-
     browser_session = await verify_browser_session(
         browser_session_id=browser_session_id,
         organization_id=organization_id,
     )
 
     if not browser_session:
-        LOG.info(
-            "No initial browser session found.", browser_session_id=browser_session_id, organization_id=organization_id
-        )
         return None
 
     x_api_key = await get_x_api_key(organization_id)
@@ -516,7 +511,6 @@ async def get_vnc_channel_for_task(
         return None
 
     if not browser_session:
-        LOG.info("No initial browser session found for task.", task_id=task_id, organization_id=organization_id)
         return None
 
     x_api_key = await get_x_api_key(organization_id)
@@ -562,11 +556,6 @@ async def get_vnc_channel_for_workflow_run(
         return None
 
     if not browser_session:
-        LOG.info(
-            "No initial browser session found for workflow run.",
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-        )
         return None
 
     x_api_key = await get_x_api_key(organization_id)
