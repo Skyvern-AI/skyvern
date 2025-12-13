@@ -68,12 +68,6 @@ async def verify_browser_session(
         return None
 
     if is_final_status(browser_session.status):
-        LOG.info(
-            "Browser session is invalid, as it is in a final state.",
-            browser_session_status=browser_session.status,
-            browser_session_id=browser_session_id,
-            organization_id=organization_id,
-        )
         return None
 
     started_at = browser_session.started_at
