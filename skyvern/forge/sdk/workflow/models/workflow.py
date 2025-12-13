@@ -75,6 +75,7 @@ class Workflow(BaseModel):
     workflow_permanent_id: str
     version: int
     is_saved_task: bool
+    is_template: bool = False
     description: str | None = None
     workflow_definition: WorkflowDefinition
     proxy_location: ProxyLocationInput = None

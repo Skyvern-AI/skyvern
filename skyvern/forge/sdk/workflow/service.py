@@ -1579,6 +1579,40 @@ class WorkflowService:
 
         return workflow
 
+    async def set_template_status(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        is_template: bool,
+    ) -> dict[str, Any]:
+        """
+        Set or unset a workflow as a template.
+
+        Template status is stored in a separate workflow_templates table keyed by
+        workflow_permanent_id, since template status is a property of the workflow
+        identity, not a specific version.
+
+        Returns a dict with the result since we're not updating the workflow itself.
+        """
+        # Verify workflow exists and belongs to org
+        await self.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+
+        if is_template:
+            await app.DATABASE.add_workflow_template(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+        else:
+            await app.DATABASE.remove_workflow_template(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+
+        return {"workflow_permanent_id": workflow_permanent_id, "is_template": is_template}
+
     async def get_workflow_versions_by_permanent_id(
         self,
         workflow_permanent_id: str,
@@ -1688,6 +1722,7 @@ class WorkflowService:
         page_size: int = 10,
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
+        only_templates: bool = False,
         search_key: str | None = None,
         folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
@@ -1705,6 +1740,7 @@ class WorkflowService:
             page_size=page_size,
             only_saved_tasks=only_saved_tasks,
             only_workflows=only_workflows,
+            only_templates=only_templates,
             search_key=search_key,
             folder_id=folder_id,
             statuses=statuses,

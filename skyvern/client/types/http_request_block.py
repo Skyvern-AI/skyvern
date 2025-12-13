@@ -30,6 +30,7 @@ class HttpRequestBlock(UniversalBaseModel):
     url: typing.Optional[str] = None
     headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     body: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    files: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     timeout: typing.Optional[int] = None
     follow_redirects: typing.Optional[bool] = None
     parameters: typing.Optional[typing.List[HttpRequestBlockParametersItem]] = None

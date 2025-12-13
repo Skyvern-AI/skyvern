@@ -74,6 +74,24 @@ class LLMCallStats(BaseModel):
     llm_cost: float | None = None
 
 
+def _get_artifact_targets_and_persist_flag(
+    step: Step | None,
+    is_speculative_step: bool,
+    task_v2: TaskV2 | None,
+    thought: Thought | None,
+    ai_suggestion: AISuggestion | None,
+) -> tuple[bool, dict[str, Any]]:
+    artifact_targets = {
+        "step": step if not is_speculative_step else None,
+        "task_v2": task_v2,
+        "thought": thought,
+        "ai_suggestion": ai_suggestion,
+    }
+    has_artifact_target = any(value is not None for value in artifact_targets.values())
+    should_persist_llm_artifacts = not is_speculative_step and has_artifact_target
+    return should_persist_llm_artifacts, artifact_targets
+
+
 async def _log_hashed_href_map_artifacts_if_needed(
     context: SkyvernContext | None,
     step: Step | None,
@@ -83,14 +101,14 @@ async def _log_hashed_href_map_artifacts_if_needed(
     *,
     is_speculative_step: bool,
 ) -> None:
-    if context and context.hashed_href_map and step and not is_speculative_step:
+    should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
+        step, is_speculative_step, task_v2, thought, ai_suggestion
+    )
+    if context and context.hashed_href_map and should_persist_llm_artifacts:
         await app.ARTIFACT_MANAGER.create_llm_artifact(
             data=json.dumps(context.hashed_href_map, indent=2).encode("utf-8"),
             artifact_type=ArtifactType.HASHED_HREF_MAP,
-            step=step,
-            task_v2=task_v2,
-            thought=thought,
-            ai_suggestion=ai_suggestion,
+            **artifact_targets,
         )
 
 
@@ -391,6 +409,9 @@ class LLMAPIHandlerFactory:
 
             context = skyvern_context.current()
             is_speculative_step = step.is_speculative if step else False
+            should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
+                step, is_speculative_step, task_v2, thought, ai_suggestion
+            )
             await _log_hashed_href_map_artifacts_if_needed(
                 context,
                 step,
@@ -401,15 +422,12 @@ class LLMAPIHandlerFactory:
             )
 
             llm_prompt_value = prompt
-
-            if step and not is_speculative_step:
+            if should_persist_llm_artifacts:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
                     data=llm_prompt_value.encode("utf-8"),
                     artifact_type=ArtifactType.LLM_PROMPT,
                     screenshots=screenshots,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
+                    **artifact_targets,
                 )
             # Build messages and apply caching in one step
             messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
@@ -422,14 +440,11 @@ class LLMAPIHandlerFactory:
                     "vertex_cache_attached": vertex_cache_attached_flag,
                 }
                 llm_request_json = json.dumps(llm_request_payload)
-                if step and not is_speculative_step:
+                if should_persist_llm_artifacts:
                     await app.ARTIFACT_MANAGER.create_llm_artifact(
                         data=llm_request_json.encode("utf-8"),
                         artifact_type=ArtifactType.LLM_REQUEST,
-                        step=step,
-                        task_v2=task_v2,
-                        thought=thought,
-                        ai_suggestion=ai_suggestion,
+                        **artifact_targets,
                     )
                 return llm_request_json
 
@@ -595,14 +610,11 @@ class LLMAPIHandlerFactory:
                 raise LLMProviderError(llm_key) from e
 
             llm_response_json = response.model_dump_json(indent=2)
-            if step and not is_speculative_step:
+            if should_persist_llm_artifacts:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
                     data=llm_response_json.encode("utf-8"),
                     artifact_type=ArtifactType.LLM_RESPONSE,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
+                    **artifact_targets,
                 )
             prompt_tokens = 0
             completion_tokens = 0
@@ -661,14 +673,11 @@ class LLMAPIHandlerFactory:
                 )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
             parsed_response_json = json.dumps(parsed_response, indent=2)
-            if step and not is_speculative_step:
+            if should_persist_llm_artifacts:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
                     data=parsed_response_json.encode("utf-8"),
                     artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
+                    **artifact_targets,
                 )
 
             rendered_response_json = None
@@ -677,14 +686,11 @@ class LLMAPIHandlerFactory:
                 rendered_content = Template(llm_content).render(context.hashed_href_map)
                 parsed_response = json.loads(rendered_content)
                 rendered_response_json = json.dumps(parsed_response, indent=2)
-                if step and not is_speculative_step:
+                if should_persist_llm_artifacts:
                     await app.ARTIFACT_MANAGER.create_llm_artifact(
                         data=rendered_response_json.encode("utf-8"),
                         artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                        step=step,
-                        task_v2=task_v2,
-                        thought=thought,
-                        ai_suggestion=ai_suggestion,
+                        **artifact_targets,
                     )
 
             # Track LLM API handler duration, token counts, and cost
@@ -796,6 +802,9 @@ class LLMAPIHandlerFactory:
 
             context = skyvern_context.current()
             is_speculative_step = step.is_speculative if step else False
+            should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
+                step, is_speculative_step, task_v2, thought, ai_suggestion
+            )
             await _log_hashed_href_map_artifacts_if_needed(
                 context,
                 step,
@@ -806,15 +815,12 @@ class LLMAPIHandlerFactory:
             )
 
             llm_prompt_value = prompt
-            if step and not is_speculative_step:
+            if should_persist_llm_artifacts:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
                     data=llm_prompt_value.encode("utf-8"),
                     artifact_type=ArtifactType.LLM_PROMPT,
                     screenshots=screenshots,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
+                    **artifact_targets,
                 )
 
             if not llm_config.supports_vision:
@@ -900,14 +906,11 @@ class LLMAPIHandlerFactory:
                 "vertex_cache_attached": vertex_cache_attached,
             }
             llm_request_json = json.dumps(llm_request_payload)
-            if step and not is_speculative_step:
+            if should_persist_llm_artifacts:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
                     data=llm_request_json.encode("utf-8"),
                     artifact_type=ArtifactType.LLM_REQUEST,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
+                    **artifact_targets,
                 )
 
             t_llm_request = time.perf_counter()
@@ -933,15 +936,27 @@ class LLMAPIHandlerFactory:
                 )
                 raise SkyvernContextWindowExceededError() from e
             except CancelledError:
+                # Speculative steps are intentionally cancelled when goal verification completes first,
+                # so we log at debug level. Non-speculative cancellations are unexpected errors.
                 t_llm_cancelled = time.perf_counter()
-                LOG.error(
-                    "LLM request got cancelled",
-                    llm_key=llm_key,
-                    model=model_name,
-                    prompt_name=prompt_name,
-                    duration=t_llm_cancelled - t_llm_request,
-                )
-                raise LLMProviderError(llm_key)
+                if is_speculative_step:
+                    LOG.debug(
+                        "LLM request cancelled (speculative step)",
+                        llm_key=llm_key,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                        duration=t_llm_cancelled - t_llm_request,
+                    )
+                    raise
+                else:
+                    LOG.error(
+                        "LLM request got cancelled",
+                        llm_key=llm_key,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                        duration=t_llm_cancelled - t_llm_request,
+                    )
+                    raise LLMProviderError(llm_key) from None
             except Exception as e:
                 duration_seconds = time.time() - start_time
                 LOG.exception(
@@ -954,14 +969,11 @@ class LLMAPIHandlerFactory:
                 raise LLMProviderError(llm_key) from e
 
             llm_response_json = response.model_dump_json(indent=2)
-            if step and not is_speculative_step:
+            if should_persist_llm_artifacts:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
                     data=llm_response_json.encode("utf-8"),
                     artifact_type=ArtifactType.LLM_RESPONSE,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
+                    **artifact_targets,
                 )
 
             prompt_tokens = 0
@@ -1024,14 +1036,11 @@ class LLMAPIHandlerFactory:
                 )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
             parsed_response_json = json.dumps(parsed_response, indent=2)
-            if step and not is_speculative_step:
+            if should_persist_llm_artifacts:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
                     data=parsed_response_json.encode("utf-8"),
                     artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
+                    **artifact_targets,
                 )
 
             rendered_response_json = None
@@ -1040,14 +1049,11 @@ class LLMAPIHandlerFactory:
                 rendered_content = Template(llm_content).render(context.hashed_href_map)
                 parsed_response = json.loads(rendered_content)
                 rendered_response_json = json.dumps(parsed_response, indent=2)
-                if step and not is_speculative_step:
+                if should_persist_llm_artifacts:
                     await app.ARTIFACT_MANAGER.create_llm_artifact(
                         data=rendered_response_json.encode("utf-8"),
                         artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                        step=step,
-                        task_v2=task_v2,
-                        thought=thought,
-                        ai_suggestion=ai_suggestion,
+                        **artifact_targets,
                     )
 
             # Track LLM API handler duration, token counts, and cost
@@ -1205,6 +1211,9 @@ class LLMCaller:
 
         context = skyvern_context.current()
         is_speculative_step = step.is_speculative if step else False
+        should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
+            step, is_speculative_step, task_v2, thought, ai_suggestion
+        )
         await _log_hashed_href_map_artifacts_if_needed(
             context,
             step,
@@ -1232,15 +1241,12 @@ class LLMCaller:
             screenshots = resize_screenshots(screenshots, target_dimension)
 
         llm_prompt_value = prompt or ""
-        if prompt and step and not is_speculative_step:
+        if prompt and should_persist_llm_artifacts:
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=prompt.encode("utf-8"),
                 artifact_type=ArtifactType.LLM_PROMPT,
                 screenshots=screenshots,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
+                **artifact_targets,
             )
 
         if not self.llm_config.supports_vision:
@@ -1271,14 +1277,11 @@ class LLMCaller:
             **parameters,
         }
         llm_request_json = json.dumps(llm_request_payload)
-        if step and not is_speculative_step:
+        if should_persist_llm_artifacts:
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=llm_request_json.encode("utf-8"),
                 artifact_type=ArtifactType.LLM_REQUEST,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
+                **artifact_targets,
             )
         t_llm_request = time.perf_counter()
         try:
@@ -1301,27 +1304,35 @@ class LLMCaller:
             )
             raise SkyvernContextWindowExceededError() from e
         except CancelledError:
+            # Speculative steps are intentionally cancelled when goal verification returns completed,
+            # so we log at debug level. Non-speculative cancellations are unexpected errors.
             t_llm_cancelled = time.perf_counter()
-            LOG.error(
-                "LLM request got cancelled",
-                llm_key=self.llm_key,
-                model=self.llm_config.model_name,
-                duration=t_llm_cancelled - t_llm_request,
-            )
-            raise LLMProviderError(self.llm_key)
+            if is_speculative_step:
+                LOG.debug(
+                    "LLM request cancelled (speculative step)",
+                    llm_key=self.llm_key,
+                    model=self.llm_config.model_name,
+                    duration=t_llm_cancelled - t_llm_request,
+                )
+                raise
+            else:
+                LOG.error(
+                    "LLM request got cancelled",
+                    llm_key=self.llm_key,
+                    model=self.llm_config.model_name,
+                    duration=t_llm_cancelled - t_llm_request,
+                )
+                raise LLMProviderError(self.llm_key) from None
         except Exception as e:
             LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
             raise LLMProviderError(self.llm_key) from e
 
         llm_response_json = response.model_dump_json(indent=2)
-        if step and not is_speculative_step:
+        if should_persist_llm_artifacts:
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=llm_response_json.encode("utf-8"),
                 artifact_type=ArtifactType.LLM_RESPONSE,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
+                **artifact_targets,
             )
 
         call_stats = await self.get_call_stats(response)
@@ -1374,14 +1385,11 @@ class LLMCaller:
 
         parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix, force_dict)
         parsed_response_json = json.dumps(parsed_response, indent=2)
-        if step and not is_speculative_step:
+        if should_persist_llm_artifacts:
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=parsed_response_json.encode("utf-8"),
                 artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
+                **artifact_targets,
             )
 
         rendered_response_json = None
@@ -1390,14 +1398,11 @@ class LLMCaller:
             rendered_content = Template(llm_content).render(context.hashed_href_map)
             parsed_response = json.loads(rendered_content)
             rendered_response_json = json.dumps(parsed_response, indent=2)
-            if step and not is_speculative_step:
+            if should_persist_llm_artifacts:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
                     data=rendered_response_json.encode("utf-8"),
                     artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
+                    **artifact_targets,
                 )
 
         if step and is_speculative_step:

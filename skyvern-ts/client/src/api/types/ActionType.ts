@@ -8,6 +8,7 @@ export const ActionType = {
     SelectOption: "select_option",
     Checkbox: "checkbox",
     Wait: "wait",
+    Hover: "hover",
     NullAction: "null_action",
     SolveCaptcha: "solve_captcha",
     Terminate: "terminate",
