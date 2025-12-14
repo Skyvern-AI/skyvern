@@ -15,6 +15,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -398,15 +399,36 @@ class ScriptSkyvernPage(SkyvernPage):
             # If screenshot creation fails, don't block execution
             pass
 
-    async def get_actual_value(self, value: str) -> str:
+    async def get_actual_value(
+        self,
+        value: str,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str:
         """Input text into an element identified by ``selector``."""
         context = skyvern_context.ensure_context()
         if context and context.workflow_run_id:
+            task_id = context.task_id
+            workflow_run_id = context.workflow_run_id
+            organization_id = context.organization_id
+            value = get_actual_value_of_parameter_if_secret(workflow_run_id, value)
+
             # support TOTP secret and internal it to TOTP code
             is_totp_value = value == "BW_TOTP" or value == "OP_TOTP" or value == "AZ_TOTP"
             if is_totp_value:
                 value = generate_totp_value(context.workflow_run_id, value)
-            value = get_actual_value_of_parameter_if_secret(context.workflow_run_id, value)
+            elif (totp_identifier or totp_url) and organization_id:
+                totp_value = await poll_otp_value(
+                    organization_id=organization_id,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    totp_verification_url=totp_url,
+                    totp_identifier=totp_identifier,
+                )
+                if totp_value:
+                    # use the totp verification code
+                    value = totp_value.value
+
         return value
 
     async def goto(self, url: str, **kwargs: Any) -> None:
