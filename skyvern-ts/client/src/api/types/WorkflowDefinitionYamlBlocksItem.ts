@@ -5,6 +5,7 @@ import type * as Skyvern from "../index.js";
 export type WorkflowDefinitionYamlBlocksItem =
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Action
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Code
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.Conditional
     | Skyvern.WorkflowDefinitionYamlBlocksItem.DownloadToS3
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Extraction
     | Skyvern.WorkflowDefinitionYamlBlocksItem.FileDownload
@@ -13,6 +14,7 @@ export type WorkflowDefinitionYamlBlocksItem =
     | Skyvern.WorkflowDefinitionYamlBlocksItem.ForLoop
     | Skyvern.WorkflowDefinitionYamlBlocksItem.GotoUrl
     | Skyvern.WorkflowDefinitionYamlBlocksItem.HttpRequest
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.HumanInteraction
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Login
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Navigation
     | Skyvern.WorkflowDefinitionYamlBlocksItem.PdfParser
@@ -31,6 +33,10 @@ export namespace WorkflowDefinitionYamlBlocksItem {
 
     export interface Code extends Skyvern.CodeBlockYaml {
         block_type: "code";
+    }
+
+    export interface Conditional extends Skyvern.ConditionalBlockYaml {
+        block_type: "conditional";
     }
 
     export interface DownloadToS3 extends Skyvern.DownloadToS3BlockYaml {
@@ -63,6 +69,10 @@ export namespace WorkflowDefinitionYamlBlocksItem {
 
     export interface HttpRequest extends Skyvern.HttpRequestBlockYaml {
         block_type: "http_request";
+    }
+
+    export interface HumanInteraction extends Skyvern.HumanInteractionBlockYaml {
+        block_type: "human_interaction";
     }
 
     export interface Login extends Skyvern.LoginBlockYaml {

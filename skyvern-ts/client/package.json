@@ -1,8 +1,12 @@
 {
     "name": "@skyvern/client",
-    "version": "0.2.18",
+    "version": "1.0.3",
     "private": false,
-    "repository": "github:Skyvern-AI/skyvern-typescript",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Skyvern-AI/skyvern.git",
+        "directory": "skyvern-ts/client"
+    },
     "type": "commonjs",
     "main": "./dist/cjs/index.js",
     "module": "./dist/esm/index.mjs",
@@ -42,6 +46,9 @@
         "test:unit": "vitest --project unit",
         "test:wire": "vitest --project wire"
     },
+    "dependencies": {
+        "playwright": "^1.48.0"
+    },
     "devDependencies": {
         "webpack": "^5.97.1",
         "ts-loader": "^9.5.1",
@@ -61,5 +68,10 @@
     "engines": {
         "node": ">=18.0.0"
     },
-    "sideEffects": false
+    "sideEffects": false,
+    "description": "The Skyvern TypeScript library provides convenient access to the Skyvern APIs from TypeScript.",
+    "publishConfig": {
+        "access": "public",
+        "provenance": true
+    }
 }

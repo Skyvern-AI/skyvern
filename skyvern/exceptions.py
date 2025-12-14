@@ -82,6 +82,11 @@ class MissingElement(SkyvernException):
         )
 
 
+class MissingExtractActionsResponse(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("extract-actions response missing")
+
+
 class MultipleElementsFound(SkyvernException):
     def __init__(self, num: int, selector: str | None = None, element_id: str | None = None):
         super().__init__(
@@ -168,6 +173,17 @@ class WorkflowNotFound(SkyvernHTTPException):
         )
 
 
+class WorkflowNotFoundForWorkflowRun(SkyvernHTTPException):
+    def __init__(
+        self,
+        workflow_run_id: str | None = None,
+    ) -> None:
+        super().__init__(
+            f"Workflow not found for workflow run {workflow_run_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
 class WorkflowRunNotFound(SkyvernHTTPException):
     def __init__(self, workflow_run_id: str) -> None:
         super().__init__(f"WorkflowRun {workflow_run_id} not found", status_code=status.HTTP_404_NOT_FOUND)
@@ -178,6 +194,14 @@ class MissingValueForParameter(SkyvernHTTPException):
         super().__init__(
             f"Missing value for parameter {parameter_key} in workflow run {workflow_run_id} of workflow {workflow_id}",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class WorkflowRunParameterPersistenceError(SkyvernException):
+    def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str, reason: str) -> None:
+        super().__init__(
+            f"Failed to persist workflow parameter '{parameter_key}' for workflow run {workflow_run_id} "
+            f"of workflow {workflow_id}. Reason: {reason}"
         )
 
 
@@ -248,11 +272,6 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
         super().__init__(
             f"Unknown error while creating browser context for {browser_type}. Exception type: {type(exception)} Exception message: {str(exception)}"
         )
-
-
-class BrowserStateMissingPage(SkyvernException):
-    def __init__(self) -> None:
-        super().__init__("BrowserState is missing the main page")
 
 
 class OrganizationNotFound(SkyvernHTTPException):
@@ -482,6 +501,11 @@ class FailToClick(SkyvernException):
         super().__init__(f"Failed to click({anchor}). element_id={element_id}, error_msg={msg}")
 
 
+class FailToHover(SkyvernException):
+    def __init__(self, element_id: str, msg: str):
+        super().__init__(f"Failed to hover. element_id={element_id}, error_msg={msg}")
+
+
 class FailToSelectByLabel(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(f"Failed to select by label. element_id={element_id}")
@@ -668,6 +692,13 @@ class InputToInvisibleElement(SkyvernException):
         )
 
 
+class InputToReadonlyElement(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(
+            f"The element(id={element_id}) now is readonly. Try to interact with other elements, or try to interact with it later when it's not readonly."
+        )
+
+
 class FailedToParseActionInstruction(SkyvernException):
     def __init__(self, reason: str | None, error_type: str | None):
         super().__init__(
@@ -759,8 +790,8 @@ class LLMCallerNotFoundError(SkyvernException):
 
 
 class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str) -> None:
-        super().__init__(f"Browser session {browser_session_id} is already occupied")
+    def __init__(self, browser_session_id: str, runnable_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
 
 
 class BrowserSessionNotRenewable(SkyvernException):
@@ -779,6 +810,14 @@ class BrowserSessionNotFound(SkyvernHTTPException):
             f"Browser session {browser_session_id} does not exist or is not live.",
             status_code=status.HTTP_404_NOT_FOUND,
         )
+
+
+class BrowserProfileNotFound(SkyvernHTTPException):
+    def __init__(self, profile_id: str, organization_id: str | None = None) -> None:
+        message = f"Browser profile {profile_id} not found"
+        if organization_id:
+            message += f" for organization {organization_id}"
+        super().__init__(message, status_code=status.HTTP_404_NOT_FOUND)
 
 
 class CannotUpdateWorkflowDueToCodeCache(SkyvernException):
@@ -832,3 +871,10 @@ class AzureConfigurationError(AzureBaseError):
 class ScriptTerminationException(SkyvernException):
     def __init__(self, reason: str | None = None) -> None:
         super().__init__(reason)
+
+
+class InvalidSchemaError(SkyvernException):
+    def __init__(self, message: str, validation_errors: list[str] | None = None):
+        self.message = message
+        self.validation_errors = validation_errors or []
+        super().__init__(self.message)

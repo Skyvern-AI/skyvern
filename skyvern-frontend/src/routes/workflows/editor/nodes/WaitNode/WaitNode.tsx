@@ -11,6 +11,7 @@ import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
+import { useRecordingStore } from "@/store/useRecordingStore";
 
 function WaitNode({ id, data, type }: NodeProps<WaitNode>) {
   const { editable, label } = data;
@@ -25,9 +26,14 @@ function WaitNode({ id, data, type }: NodeProps<WaitNode>) {
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   const update = useUpdate<WaitNode["data"]>({ id, editable });
+  const recordingStore = useRecordingStore();
 
   return (
-    <div>
+    <div
+      className={cn({
+        "pointer-events-none opacity-50": recordingStore.isRecording,
+      })}
+    >
       <Handle
         type="source"
         position={Position.Bottom}

@@ -16,9 +16,10 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { SubmitEvent } from "@/types";
-import { apiBaseUrl } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { type ApiCommandOptions } from "@/util/apiCommands";
+import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
@@ -31,7 +32,12 @@ import { stringify as convertToYAML } from "yaml";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { TaskFormSection } from "./TaskFormSection";
 import { savedTaskFormSchema, SavedTaskFormValues } from "./taskFormTypes";
-import { OrganizationApiResponse, ProxyLocation } from "@/api/types";
+import {
+  CreateTaskRequest,
+  OrganizationApiResponse,
+  ProxyLocation,
+  RunEngine,
+} from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 
@@ -39,11 +45,13 @@ type Props = {
   initialValues: SavedTaskFormValues;
 };
 
-function transform(value: unknown) {
+function transform<T>(value: T): T | null {
   return value === "" ? null : value;
 }
 
-function createTaskRequestObject(formValues: SavedTaskFormValues) {
+function createTaskRequestObject(
+  formValues: SavedTaskFormValues,
+): CreateTaskRequest {
   return {
     title: formValues.title,
     url: formValues.url,
@@ -79,6 +87,7 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
     webhook_callback_url: values.webhookCallbackUrl,
     proxy_location: values.proxyLocation,
     workflow_definition: {
+      version: 2,
       parameters: [
         {
           parameter_type: "workflow",
@@ -759,17 +768,33 @@ function SavedTaskForm({ initialValues }: Props) {
 
         <div className="flex justify-end gap-3">
           <CopyApiCommandDropdown
-            getOptions={() =>
-              ({
+            getOptions={() => {
+              const formValues = form.getValues();
+              const includeOverrideHeader =
+                formValues.maxStepsOverride !== null &&
+                formValues.maxStepsOverride !== MAX_STEPS_DEFAULT;
+
+              const headers: Record<string, string> = {
+                "Content-Type": "application/json",
+                "x-api-key": apiCredential ?? "<your-api-key>",
+              };
+
+              if (includeOverrideHeader) {
+                headers["x-max-steps-override"] = String(
+                  formValues.maxStepsOverride,
+                );
+              }
+
+              return {
                 method: "POST",
-                url: `${apiBaseUrl}/tasks`,
-                body: createTaskRequestObject(form.getValues()),
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                },
-              }) satisfies ApiCommandOptions
-            }
+                url: `${runsApiBaseUrl}/run/tasks`,
+                body: buildTaskRunPayload(
+                  createTaskRequestObject(formValues),
+                  RunEngine.SkyvernV1,
+                ),
+                headers,
+              } satisfies ApiCommandOptions;
+            }}
           />
           <Button
             type="submit"

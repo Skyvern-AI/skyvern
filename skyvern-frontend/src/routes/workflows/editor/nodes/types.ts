@@ -5,10 +5,19 @@ export type NodeBaseData = {
   debuggable: boolean;
   label: string;
   continueOnFailure: boolean;
+  nextLoopOnFailure?: boolean;
   editable: boolean;
   model: WorkflowModel | null;
   showCode?: boolean;
   comparisonColor?: string;
+  /**
+   * Optional metadata used for conditional branches.
+   * These values are only set on nodes that live within a conditional block.
+   */
+  conditionalBranchId?: string | null;
+  conditionalLabel?: string | null;
+  conditionalNodeId?: string | null;
+  conditionalMergeLabel?: string | null;
 };
 
 export const errorMappingExampleValue = {
@@ -37,6 +46,7 @@ export const workflowBlockTitle: {
 } = {
   action: "Browser Action",
   code: "Code",
+  conditional: "Conditional",
   download_to_s3: "Download",
   extraction: "Extraction",
   file_download: "File Download",
@@ -50,6 +60,7 @@ export const workflowBlockTitle: {
   upload_to_s3: "Upload To S3",
   file_upload: "Cloud Storage",
   validation: "Validation",
+  human_interaction: "Human Interaction",
   wait: "Wait",
   pdf_parser: "PDF Parser",
   task_v2: "Browser Task v2",

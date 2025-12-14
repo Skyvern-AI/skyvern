@@ -10,7 +10,6 @@ import {
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -21,7 +20,10 @@ import { helpTooltips } from "../../helpContent";
 import { errorMappingExampleValue } from "../types";
 import type { ValidationNode } from "./types";
 import { AppNode } from "..";
-import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
+import {
+  getAvailableOutputParameterKeys,
+  isNodeInsideForLoop,
+} from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { ModelSelector } from "@/components/ModelSelector";
@@ -34,6 +36,8 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
+import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -54,6 +58,7 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<ValidationNode["data"]>({ id, editable });
+  const isInsideForLoop = isNodeInsideForLoop(nodes, id);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -91,6 +96,17 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
             nodeId={id}
             totpIdentifier={null}
             totpUrl={null}
+            transmutations={{
+              blockTitle: "Validation",
+              self: "agent",
+              others: [
+                {
+                  label: "human",
+                  reason: "Convert to human validation",
+                  nodeName: "human_interaction",
+                },
+              ],
+            }}
             type={type}
           />
           <div className="space-y-2">
@@ -103,6 +119,7 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
               ) : null}
             </div>
             <WorkflowBlockInputTextarea
+              aiImprove={AI_IMPROVE_CONFIGS.validation.completeCriterion}
               nodeId={id}
               onChange={(value) => {
                 update({ completeCriterion: value });
@@ -114,6 +131,7 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
           <div className="space-y-2">
             <Label className="text-xs text-slate-300">Terminate if...</Label>
             <WorkflowBlockInputTextarea
+              aiImprove={AI_IMPROVE_CONFIGS.validation.terminateCriterion}
               nodeId={id}
               onChange={(value) => {
                 update({ terminateCriterion: value });
@@ -198,36 +216,22 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
                       </div>
                     )}
                   </div>
-                  <Separator />
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Continue on Failure
-                      </Label>
-                      <HelpTooltip
-                        content={
-                          helpTooltips["validation"]["continueOnFailure"]
-                        }
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={data.continueOnFailure}
-                        onCheckedChange={(checked) => {
-                          if (!editable) {
-                            return;
-                          }
-                          update({ continueOnFailure: checked });
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <BlockExecutionOptions
+                    continueOnFailure={data.continueOnFailure}
+                    nextLoopOnFailure={data.nextLoopOnFailure}
+                    editable={editable}
+                    isInsideForLoop={isInsideForLoop}
+                    blockType="validation"
+                    onContinueOnFailureChange={(checked) => {
+                      update({ continueOnFailure: checked });
+                    }}
+                    onNextLoopOnFailureChange={(checked) => {
+                      update({ nextLoopOnFailure: checked });
+                    }}
+                  />
                   <DisableCache
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

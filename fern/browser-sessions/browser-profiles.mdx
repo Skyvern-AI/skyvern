@@ -1,0 +1,103 @@
+---
+title: Browser Profiles
+subtitle: Persist authenticated browser state for reuse
+slug: browser-sessions/browser-profiles
+---
+
+## Why Browser Profiles?
+
+Browser Profiles capture the full browser state (cookies, storage, session files) after a run completes so that future runs can skip the login or warm-up steps. They are ideal when you:
+
+- Need repeatable workflows that stay logged into the same account across days.
+- Want to fan out multiple workflows that all reuse the same authenticated browser state.
+- Need an audit-friendly way to persist state separate from long-lived browser sessions.
+
+Whereas a **browser session** is a temporary, real-time browser, a **browser profile** is a reusable snapshot created from that session (or from a workflow run that persisted its session). Profiles are scoped to your organization and can be reused as often as you need.
+
+## How Browser Profiles Work
+
+1. Run a workflow with `persist_browser_session: true` **or** open a persistent browser session.
+2. Close the workflow run or browser session so Skyvern can upload the archived state.
+3. Create a browser profile from that source once the upload finishes.
+4. Pass `browser_profile_id` to subsequent workflow runs to restore the saved state instantly.
+
+## Option A — Create a Profile from a Workflow Run
+
+Use this approach when you already ran a workflow with `persist_browser_session: true`. Always poll the run (e.g., `GET /v1/runs/{run_id}`) until it reaches `status = "completed"` before attempting to create the profile—Skyvern only begins uploading the archived browser state once the run finishes.
+
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+
+# After the workflow run completes, reuse its persisted session
+browser_profile = await skyvern.browser_profiles.create_browser_profile(
+    name="hn-login-profile",
+    workflow_run_id="wr_123",
+)
+print(browser_profile.browser_profile_id)
+```
+
+### Important: Wait for Session Upload
+
+Session persistence finishes asynchronously. Calling `create_browser_profile` immediately after completion usually returns a 400 such as:
+
+- `Browser session does not have a persisted session`
+
+Add a short retry loop until the archive is ready:
+
+```python
+import asyncio
+import httpx
+
+async def create_profile_with_retry(
+    client: httpx.AsyncClient,
+    payload: dict,
+    retries: int = 10,
+    retry_delay: float = 1.0,
+):
+    for attempt in range(retries):
+        resp = await client.post("https://api.skyvern.com/v1/browser_profiles", json=payload)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 400 and "persisted" in resp.text.lower():
+            await asyncio.sleep(retry_delay)
+            continue
+        resp.raise_for_status()
+    raise RuntimeError("Session never finished uploading a profile archive")
+```
+
+## Option B — Create a Profile from a Browser Session
+
+If you opened a persistent browser session directly (without a workflow), close it and then create a profile using the session ID:
+
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+
+browser_profile = await skyvern.browser_profiles.create_browser_profile(
+    name="support-agent",
+    browser_session_id="pbs_123",
+    description="Support queue session",
+)
+```
+
+## Use a Browser Profile in New Workflow Runs
+
+Once a profile exists, pass its ID when running workflows. Skyvern restores the saved cookies, storage, and local files before the first step runs, so the workflow behaves as if it never logged out.
+
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+
+workflow_run = await skyvern.run_workflow(
+    workflow_id="wf_abc",
+    browser_profile_id="bp_123",
+)
+print(workflow_run.run_id)
+```
+
+If the workflow also sets `persist_browser_session: true`, you can capture a fresh profile again at the end and keep the cycle going.
+

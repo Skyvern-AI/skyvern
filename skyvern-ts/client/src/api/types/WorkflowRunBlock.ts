@@ -36,6 +36,13 @@ export interface WorkflowRunBlock {
     attachments?: string[];
     subject?: string;
     body?: string;
+    instructions?: string;
+    positive_descriptor?: string;
+    negative_descriptor?: string;
+    executed_branch_id?: string;
+    executed_branch_expression?: string;
+    executed_branch_result?: boolean;
+    executed_branch_next_block?: string;
 }
 
 export namespace WorkflowRunBlock {

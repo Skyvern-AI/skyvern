@@ -5,6 +5,7 @@ import type * as Skyvern from "../index.js";
 export type WorkflowDefinitionBlocksItem =
     | Skyvern.WorkflowDefinitionBlocksItem.Action
     | Skyvern.WorkflowDefinitionBlocksItem.Code
+    | Skyvern.WorkflowDefinitionBlocksItem.Conditional
     | Skyvern.WorkflowDefinitionBlocksItem.DownloadToS3
     | Skyvern.WorkflowDefinitionBlocksItem.Extraction
     | Skyvern.WorkflowDefinitionBlocksItem.FileDownload
@@ -13,6 +14,7 @@ export type WorkflowDefinitionBlocksItem =
     | Skyvern.WorkflowDefinitionBlocksItem.ForLoop
     | Skyvern.WorkflowDefinitionBlocksItem.GotoUrl
     | Skyvern.WorkflowDefinitionBlocksItem.HttpRequest
+    | Skyvern.WorkflowDefinitionBlocksItem.HumanInteraction
     | Skyvern.WorkflowDefinitionBlocksItem.Login
     | Skyvern.WorkflowDefinitionBlocksItem.Navigation
     | Skyvern.WorkflowDefinitionBlocksItem.PdfParser
@@ -31,6 +33,10 @@ export namespace WorkflowDefinitionBlocksItem {
 
     export interface Code extends Skyvern.CodeBlock {
         block_type: "code";
+    }
+
+    export interface Conditional extends Skyvern.ConditionalBlock {
+        block_type: "conditional";
     }
 
     export interface DownloadToS3 extends Skyvern.DownloadToS3Block {
@@ -63,6 +69,10 @@ export namespace WorkflowDefinitionBlocksItem {
 
     export interface HttpRequest extends Skyvern.HttpRequestBlock {
         block_type: "http_request";
+    }
+
+    export interface HumanInteraction extends Skyvern.HumanInteractionBlock {
+        block_type: "human_interaction";
     }
 
     export interface Login extends Skyvern.LoginBlock {

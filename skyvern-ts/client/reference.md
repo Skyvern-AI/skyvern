@@ -1,5 +1,5 @@
 # Reference
-<details><summary><code>client.<a href="/src/Client.ts">deployScript</a>(scriptId, { ...params }) -> Skyvern.CreateScriptResponse</code></summary>
+<details><summary><code>client.<a href="/src/Client.ts">runSdkAction</a>({ ...params }) -> Skyvern.RunSdkActionResponse</code></summary>
 <dl>
 <dd>
 
@@ -11,7 +11,7 @@
 <dl>
 <dd>
 
-Deploy a script with updated files, creating a new version
+Execute a single SDK action with the specified parameters
 </dd>
 </dl>
 </dd>
@@ -26,11 +26,11 @@ Deploy a script with updated files, creating a new version
 <dd>
 
 ```typescript
-await client.deployScript("s_abc123", {
-    files: [{
-            path: "src/main.py",
-            content: "content"
-        }]
+await client.runSdkAction({
+    url: "url",
+    action: {
+        type: "ai_act"
+    }
 });
 
 ```
@@ -47,15 +47,7 @@ await client.deployScript("s_abc123", {
 <dl>
 <dd>
 
-**scriptId:** `string` — The unique identifier of the script
-    
-</dd>
-</dl>
-
-<dl>
-<dd>
-
-**request:** `Skyvern.DeployScriptRequest` 
+**request:** `Skyvern.RunSdkActionRequest` 
     
 </dd>
 </dl>

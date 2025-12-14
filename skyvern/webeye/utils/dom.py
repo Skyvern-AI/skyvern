@@ -8,7 +8,7 @@ from random import uniform
 from urllib.parse import urlparse
 
 import structlog
-from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Page, TimeoutError
+from playwright.async_api import ElementHandle, FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR, TEXT_INPUT_DELAY
@@ -27,7 +27,8 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.webeye.actions import handler_utils
-from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
+from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
+from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -85,6 +86,7 @@ RAW_INPUT_NAME_VALUE = ["name", "email", "username", "password", "phone"]
 class SkyvernOptionType(typing.TypedDict):
     optionIndex: int
     text: str
+    value: str
 
 
 class SkyvernElement:
@@ -131,8 +133,10 @@ class SkyvernElement:
         self._id_cache = static_element.get("id", "")
         self._tag_name = static_element.get("tagName", "")
         self._selectable = static_element.get("isSelectable", False)
+        self._hover_only = static_element.get("hoverOnly", False)
         self._frame_id = static_element.get("frame", "")
         self._attributes = static_element.get("attributes", {})
+        self._rect: FloatRect | None = None
 
     def __repr__(self) -> str:
         return f"SkyvernElement({str(self.__static_element)})"
@@ -209,6 +213,12 @@ class SkyvernElement:
         if await self.get_attr("min") or await self.get_attr("max") or await self.get_attr("step"):
             return True
 
+        # maxlength=6 or maxlength=1 usually means it's an OTP input field
+        # already consider type="tel" or type="number" as raw_input in the previous logic, so need to confirm it for the OTP field
+        max_length = str(await self.get_attr("maxlength", mode="static"))
+        if input_type.lower() == "text" and max_length in ["1", "6"]:
+            return True
+
         return False
 
     async def is_spinbtn_input(self) -> bool:
@@ -274,6 +284,43 @@ class SkyvernElement:
                 aria_disabled = aria_disabled_attr.lower() != "false"
 
         return disabled or aria_disabled or style_disabled
+
+    async def is_readonly(self, dynamic: bool = False) -> bool:
+        # if attr not exist, return None
+        # if attr is like 'readonly', return empty string or True
+        # if attr is like `readonly=false`, return the value
+        readonly = False
+        aria_readonly = False
+
+        readonly_attr: bool | str | None = None
+        aria_readonly_attr: bool | str | None = None
+        mode: typing.Literal["auto", "dynamic"] = "dynamic" if dynamic else "auto"
+
+        try:
+            readonly_attr = await self.get_attr("readonly", mode=mode)
+            aria_readonly_attr = await self.get_attr("aria-readonly", mode=mode)
+        except Exception:
+            LOG.exception(
+                "Failed to get the readonly attribute",
+                element=self.__static_element,
+                element_id=self.get_id(),
+            )
+
+        if readonly_attr is not None:
+            # readonly_attr should be bool or str
+            if isinstance(readonly_attr, bool):
+                readonly = readonly_attr
+            if isinstance(readonly_attr, str):
+                readonly = readonly_attr.lower() != "false"
+
+        if aria_readonly_attr is not None:
+            # aria_readonly_attr should be bool or str
+            if isinstance(aria_readonly_attr, bool):
+                aria_readonly = aria_readonly_attr
+            if isinstance(aria_readonly_attr, str):
+                aria_readonly = aria_readonly_attr.lower() != "false"
+
+        return readonly or aria_readonly
 
     async def is_selectable(self) -> bool:
         return await self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
@@ -355,6 +402,49 @@ class SkyvernElement:
     def get_attributes(self) -> dict:
         return self._attributes
 
+    def requires_hover(self) -> bool:
+        return bool(self._hover_only)
+
+    async def hover_to_reveal(
+        self,
+        max_depth: int = 4,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        settle_delay_s: float = 0.15,
+    ) -> bool:
+        if not self.requires_hover():
+            return False
+
+        hover_target = self.get_locator()
+        for depth in range(max_depth):
+            try:
+                await hover_target.scroll_into_view_if_needed()
+                await hover_target.hover(timeout=timeout)
+                await asyncio.sleep(settle_delay_s)
+                if await self.get_locator().is_visible(timeout=timeout):
+                    LOG.debug("Hover reveal succeeded", element_id=self.get_id(), depth=depth)
+                    return True
+            except Exception:
+                LOG.debug(
+                    "Hover attempt failed while trying to reveal element",
+                    exc_info=True,
+                    element_id=self.get_id(),
+                    depth=depth,
+                )
+
+            parent_locator = hover_target.locator("..")
+            try:
+                if await parent_locator.count() != 1:
+                    break
+            except Exception:
+                LOG.debug(
+                    "Unable to evaluate parent locator during hover reveal", exc_info=True, element_id=self.get_id()
+                )
+                break
+            hover_target = parent_locator
+
+        LOG.debug("Hover reveal attempts exhausted", element_id=self.get_id())
+        return False
+
     def get_options(self) -> list[SkyvernOptionType]:
         options = self.__static_element.get("options", None)
         if options is None:
@@ -370,6 +460,12 @@ class SkyvernElement:
 
     def get_locator(self) -> Locator:
         return self.locator
+
+    async def get_rect(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> FloatRect | None:
+        if self._rect is not None:
+            return self._rect
+        self._rect = await self.get_locator().bounding_box(timeout=timeout)
+        return self._rect
 
     async def get_element_handler(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> ElementHandle:
         handler = await self.locator.element_handle(timeout=timeout)
@@ -569,6 +665,13 @@ class SkyvernElement:
 
             index += 1
         return None
+
+    async def find_file_input_in_children(self) -> Locator | None:
+        """Sometime the file input is invisible on the page, so it won't exist in the element tree, but it can be found in the DOM."""
+        locator = self.get_locator().locator('input[type="file"]')
+        if await locator.count() != 1:
+            return None
+        return locator
 
     async def get_attr(
         self,
@@ -777,6 +880,33 @@ class SkyvernElement:
     async def scroll_into_view(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         if not await self.is_visible():
             return
+
+        try:
+            target_x: int | None = None
+            target_y: int | None = None
+
+            rect = await self.get_rect(timeout=timeout)
+            if rect is not None:
+                element_x = rect["x"] if rect["x"] > 0 else None
+                element_y = rect["y"] if rect["y"] > 0 else None
+
+            # calculating y to move the element to the middle of the viewport
+            if element_y is not None:
+                target_y = max(int(element_y - (settings.BROWSER_HEIGHT / 2)), 0)
+
+            if element_x is not None:
+                target_x = max(int(element_x - (settings.BROWSER_WIDTH / 2)), 0)
+
+            skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+            if target_x is not None and target_y is not None:
+                await skyvern_frame.safe_scroll_to_x_y(target_x, target_y)
+        except Exception:
+            LOG.info(
+                "Failed to calculate the y to move the element to the middle of the viewport, ignore it",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+
         try:
             element_handler = await self.get_element_handler(timeout=timeout)
             await element_handler.scroll_into_view_if_needed(timeout=timeout)

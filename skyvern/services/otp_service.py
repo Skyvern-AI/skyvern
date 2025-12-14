@@ -1,5 +1,4 @@
 import asyncio
-import json
 from datetime import datetime, timedelta
 
 import structlog
@@ -10,7 +9,7 @@ from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificati
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
-from skyvern.forge.sdk.core.security import generate_skyvern_signature
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
@@ -88,6 +87,7 @@ async def poll_otp_value(
         otp_value: OTPValue | None = None
         if totp_verification_url:
             otp_value = await _get_otp_value_from_url(
+                organization_id,
                 totp_verification_url,
                 org_token.token,
                 task_id=task_id,
@@ -107,6 +107,7 @@ async def poll_otp_value(
 
 
 async def _get_otp_value_from_url(
+    organization_id: str,
     url: str,
     api_key: str,
     task_id: str | None = None,
@@ -120,19 +121,14 @@ async def _get_otp_value_from_url(
         request_data["workflow_run_id"] = workflow_run_id
     if workflow_permanent_id:
         request_data["workflow_permanent_id"] = workflow_permanent_id
-    payload = json.dumps(request_data)
-    signature = generate_skyvern_signature(
-        payload=payload,
+    signed_data = generate_skyvern_webhook_signature(
+        payload=request_data,
         api_key=api_key,
     )
-    timestamp = str(int(datetime.utcnow().timestamp()))
-    headers = {
-        "x-skyvern-timestamp": timestamp,
-        "x-skyvern-signature": signature,
-        "Content-Type": "application/json",
-    }
     try:
-        json_resp = await aiohttp_post(url=url, data=request_data, headers=headers, raise_exception=False)
+        json_resp = await aiohttp_post(
+            url=url, str_data=signed_data.signed_payload, headers=signed_data.headers, raise_exception=False
+        )
     except Exception as e:
         LOG.error("Failed to get otp value from url", exc_info=True)
         raise FailedToGetTOTPVerificationCode(
@@ -145,14 +141,25 @@ async def _get_otp_value_from_url(
     if not json_resp:
         return None
 
-    code = json_resp.get("verification_code", None)
-    if code:
-        return OTPValue(value=code, type=OTPType.TOTP)
+    content = json_resp.get("verification_code", None)
+    if not content:
+        return None
 
-    magic_link = json_resp.get("magic_link", None)
-    if magic_link:
-        return OTPValue(value=magic_link, type=OTPType.MAGIC_LINK)
-    return None
+    otp_value: OTPValue | None = OTPValue(value=content, type=OTPType.TOTP)
+    if isinstance(content, str) and len(content) > 10:
+        try:
+            otp_value = await parse_otp_login(content, organization_id)
+        except Exception:
+            LOG.warning("faile to parse content by LLM call", exc_info=True)
+
+    if not otp_value:
+        LOG.warning(
+            "Failed to parse otp login from the totp url",
+            content=content,
+        )
+        return None
+
+    return otp_value
 
 
 async def _get_otp_value_from_db(

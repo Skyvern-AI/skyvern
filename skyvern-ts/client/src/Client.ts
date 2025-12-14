@@ -26,8 +26,8 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "0.2.18",
-                    "User-Agent": "@skyvern/client/0.2.18",
+                    "X-Fern-SDK-Version": "1.0.3",
+                    "User-Agent": "@skyvern/client/1.0.3",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
@@ -74,7 +74,6 @@ export class SkyvernClient {
             mergeOnlyDefinedHeaders({
                 "x-user-agent": userAgent != null ? userAgent : undefined,
                 "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
             }),
             requestOptions?.headers,
         );
@@ -82,7 +81,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/run/tasks",
             ),
             method: "POST",
@@ -173,7 +172,6 @@ export class SkyvernClient {
                 "x-max-steps-override": maxStepsOverride != null ? maxStepsOverride.toString() : undefined,
                 "x-user-agent": userAgent != null ? userAgent : undefined,
                 "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
             }),
             requestOptions?.headers,
         );
@@ -181,7 +179,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/run/workflows",
             ),
             method: "POST",
@@ -255,17 +253,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.GetRunResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/runs/${core.url.encodePathParam(runId)}`,
             ),
             method: "GET",
@@ -332,17 +327,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<unknown>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/runs/${core.url.encodePathParam(runId)}/cancel`,
             ),
             method: "POST",
@@ -390,8 +382,8 @@ export class SkyvernClient {
      * Get all workflows with the latest version for the organization.
      *
      * Search semantics:
-     * - If `search_key` is provided, its value is used as a unified search term for both
-     *   `workflows.title` and workflow parameter metadata (key, description, and default_value for
+     * - If `search_key` is provided, its value is used as a unified search term for
+     *   `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for
      *   `WorkflowParameterModel`).
      * - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
      * - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
@@ -409,6 +401,7 @@ export class SkyvernClient {
      *         only_workflows: true,
      *         search_key: "search_key",
      *         title: "title",
+     *         folder_id: "folder_id",
      *         template: true
      *     })
      */
@@ -430,6 +423,8 @@ export class SkyvernClient {
             only_workflows: onlyWorkflows,
             search_key: searchKey,
             title,
+            folder_id: folderId,
+            status,
             template,
         } = request;
         const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
@@ -457,23 +452,32 @@ export class SkyvernClient {
             _queryParams.title = title;
         }
 
+        if (folderId != null) {
+            _queryParams.folder_id = folderId;
+        }
+
+        if (status != null) {
+            if (Array.isArray(status)) {
+                _queryParams.status = status.map((item) => item);
+            } else {
+                _queryParams.status = status;
+            }
+        }
+
         if (template != null) {
             _queryParams.template = template.toString();
         }
 
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/workflows",
             ),
             method: "GET",
@@ -520,46 +524,52 @@ export class SkyvernClient {
     /**
      * Create a new workflow
      *
-     * @param {Skyvern.WorkflowRequest} request
+     * @param {Skyvern.CreateWorkflowRequest} request
      * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
      *
      * @throws {@link Skyvern.UnprocessableEntityError}
      *
      * @example
-     *     await client.createWorkflow({})
+     *     await client.createWorkflow({
+     *         folder_id: "folder_id",
+     *         body: {}
+     *     })
      */
     public createWorkflow(
-        request: Skyvern.WorkflowRequest,
+        request: Skyvern.CreateWorkflowRequest,
         requestOptions?: SkyvernClient.RequestOptions,
     ): core.HttpResponsePromise<Skyvern.Workflow> {
         return core.HttpResponsePromise.fromPromise(this.__createWorkflow(request, requestOptions));
     }
 
     private async __createWorkflow(
-        request: Skyvern.WorkflowRequest,
+        request: Skyvern.CreateWorkflowRequest,
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.Workflow>> {
+        const { folder_id: folderId, body: _body } = request;
+        const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
+        if (folderId != null) {
+            _queryParams.folder_id = folderId;
+        }
+
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/workflows",
             ),
             method: "POST",
             headers: _headers,
             contentType: "application/json",
-            queryParameters: requestOptions?.queryParams,
+            queryParameters: { ..._queryParams, ...requestOptions?.queryParams },
             requestType: "json",
-            body: request,
+            body: _body,
             timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
             maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
             abortSignal: requestOptions?.abortSignal,
@@ -625,17 +635,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.Workflow>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/workflows/${core.url.encodePathParam(workflowId)}`,
             ),
             method: "POST",
@@ -706,17 +713,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<unknown>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/workflows/${core.url.encodePathParam(workflowId)}/delete`,
             ),
             method: "POST",
@@ -787,17 +791,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.Artifact>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/artifacts/${core.url.encodePathParam(artifactId)}`,
             ),
             method: "GET",
@@ -880,17 +881,14 @@ export class SkyvernClient {
 
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/runs/${core.url.encodePathParam(runId)}/artifacts`,
             ),
             method: "GET",
@@ -958,17 +956,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<unknown>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/runs/${core.url.encodePathParam(runId)}/retry_webhook`,
             ),
             method: "POST",
@@ -1040,17 +1035,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.WorkflowRunTimeline[]>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/runs/${core.url.encodePathParam(runId)}/timeline`,
             ),
             method: "GET",
@@ -1099,6 +1091,335 @@ export class SkyvernClient {
     }
 
     /**
+     * Get all browser profiles for the organization
+     *
+     * @param {Skyvern.ListBrowserProfilesRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.listBrowserProfiles({
+     *         include_deleted: true
+     *     })
+     */
+    public listBrowserProfiles(
+        request: Skyvern.ListBrowserProfilesRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.BrowserProfile[]> {
+        return core.HttpResponsePromise.fromPromise(this.__listBrowserProfiles(request, requestOptions));
+    }
+
+    private async __listBrowserProfiles(
+        request: Skyvern.ListBrowserProfilesRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.BrowserProfile[]>> {
+        const { include_deleted: includeDeleted } = request;
+        const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
+        if (includeDeleted != null) {
+            _queryParams.include_deleted = includeDeleted.toString();
+        }
+
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "v1/browser_profiles",
+            ),
+            method: "GET",
+            headers: _headers,
+            queryParameters: { ..._queryParams, ...requestOptions?.queryParams },
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.BrowserProfile[], rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /v1/browser_profiles.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Create a browser profile from a persistent browser session or workflow run.
+     *
+     * @param {Skyvern.CreateBrowserProfileRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.BadRequestError}
+     * @throws {@link Skyvern.ConflictError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.createBrowserProfile({
+     *         name: "name"
+     *     })
+     */
+    public createBrowserProfile(
+        request: Skyvern.CreateBrowserProfileRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.BrowserProfile> {
+        return core.HttpResponsePromise.fromPromise(this.__createBrowserProfile(request, requestOptions));
+    }
+
+    private async __createBrowserProfile(
+        request: Skyvern.CreateBrowserProfileRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.BrowserProfile>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "v1/browser_profiles",
+            ),
+            method: "POST",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.BrowserProfile, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 400:
+                    throw new Skyvern.BadRequestError(_response.error.body as unknown, _response.rawResponse);
+                case 409:
+                    throw new Skyvern.ConflictError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/browser_profiles.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Get a specific browser profile by ID
+     *
+     * @param {string} profileId - The ID of the browser profile. browser_profile_id starts with `bp_`
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.getBrowserProfile("bp_123456")
+     */
+    public getBrowserProfile(
+        profileId: string,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.BrowserProfile> {
+        return core.HttpResponsePromise.fromPromise(this.__getBrowserProfile(profileId, requestOptions));
+    }
+
+    private async __getBrowserProfile(
+        profileId: string,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.BrowserProfile>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/browser_profiles/${core.url.encodePathParam(profileId)}`,
+            ),
+            method: "GET",
+            headers: _headers,
+            queryParameters: requestOptions?.queryParams,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.BrowserProfile, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling GET /v1/browser_profiles/{profile_id}.",
+                );
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Delete a browser profile (soft delete)
+     *
+     * @param {string} profileId - The ID of the browser profile to delete. browser_profile_id starts with `bp_`
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.deleteBrowserProfile("bp_123456")
+     */
+    public deleteBrowserProfile(
+        profileId: string,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<void> {
+        return core.HttpResponsePromise.fromPromise(this.__deleteBrowserProfile(profileId, requestOptions));
+    }
+
+    private async __deleteBrowserProfile(
+        profileId: string,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<void>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/browser_profiles/${core.url.encodePathParam(profileId)}`,
+            ),
+            method: "DELETE",
+            headers: _headers,
+            queryParameters: requestOptions?.queryParams,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: undefined, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling DELETE /v1/browser_profiles/{profile_id}.",
+                );
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
      * Get all active browser sessions for the organization
      *
      * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
@@ -1120,17 +1441,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.BrowserSessionResponse[]>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/browser_sessions",
             ),
             method: "GET",
@@ -1201,17 +1519,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.BrowserSessionResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/browser_sessions",
             ),
             method: "POST",
@@ -1285,17 +1600,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<unknown>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/browser_sessions/${core.url.encodePathParam(browserSessionId)}/close`,
             ),
             method: "POST",
@@ -1369,17 +1681,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.BrowserSessionResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/browser_sessions/${core.url.encodePathParam(browserSessionId)}`,
             ),
             method: "GET",
@@ -1456,17 +1765,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.TotpCode>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/credentials/totp",
             ),
             method: "POST",
@@ -1550,17 +1856,14 @@ export class SkyvernClient {
 
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/credentials",
             ),
             method: "GET",
@@ -1636,17 +1939,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.CredentialResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/credentials",
             ),
             method: "POST",
@@ -1717,17 +2017,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<void>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/credentials/${core.url.encodePathParam(credentialId)}/delete`,
             ),
             method: "POST",
@@ -1797,17 +2094,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.CredentialResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/credentials/${core.url.encodePathParam(credentialId)}`,
             ),
             method: "GET",
@@ -1879,17 +2173,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.WorkflowRunResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/run/tasks/login",
             ),
             method: "POST",
@@ -1937,6 +2228,88 @@ export class SkyvernClient {
     }
 
     /**
+     * Download a file from a website by navigating and clicking download buttons
+     *
+     * @param {Skyvern.DownloadFilesRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.downloadFiles({
+     *         navigation_goal: "navigation_goal"
+     *     })
+     */
+    public downloadFiles(
+        request: Skyvern.DownloadFilesRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.WorkflowRunResponse> {
+        return core.HttpResponsePromise.fromPromise(this.__downloadFiles(request, requestOptions));
+    }
+
+    private async __downloadFiles(
+        request: Skyvern.DownloadFilesRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.WorkflowRunResponse>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "v1/run/tasks/download_files",
+            ),
+            method: "POST",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.WorkflowRunResponse, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling POST /v1/run/tasks/download_files.",
+                );
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
      * Retrieves a paginated list of scripts for the current organization
      *
      * @param {Skyvern.GetScriptsRequest} request
@@ -1973,17 +2346,14 @@ export class SkyvernClient {
 
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/scripts",
             ),
             method: "GET",
@@ -2051,17 +2421,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.CreateScriptResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/scripts",
             ),
             method: "POST",
@@ -2132,17 +2499,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.Script>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/scripts/${core.url.encodePathParam(scriptId)}`,
             ),
             method: "GET",
@@ -2218,17 +2582,14 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.CreateScriptResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/scripts/${core.url.encodePathParam(scriptId)}/deploy`,
             ),
             method: "POST",
@@ -2277,8 +2638,86 @@ export class SkyvernClient {
         }
     }
 
-    protected async _getCustomAuthorizationHeaders(): Promise<Record<string, string | undefined>> {
-        const xApiKeyValue = await core.Supplier.get(this._options.xApiKey);
-        return { "x-api-key": xApiKeyValue };
+    /**
+     * Execute a single SDK action with the specified parameters
+     *
+     * @param {Skyvern.RunSdkActionRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.runSdkAction({
+     *         url: "url",
+     *         action: {
+     *             type: "ai_act"
+     *         }
+     *     })
+     */
+    public runSdkAction(
+        request: Skyvern.RunSdkActionRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.RunSdkActionResponse> {
+        return core.HttpResponsePromise.fromPromise(this.__runSdkAction(request, requestOptions));
+    }
+
+    private async __runSdkAction(
+        request: Skyvern.RunSdkActionRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.RunSdkActionResponse>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "v1/sdk/run_action",
+            ),
+            method: "POST",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.RunSdkActionResponse, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/sdk/run_action.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
     }
 }

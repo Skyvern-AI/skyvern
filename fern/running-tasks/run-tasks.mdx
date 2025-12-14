@@ -64,7 +64,12 @@ With this mapping, if Skyvern encounters a login failure, the task output will s
 
 Parameter: `proxy_location`
 
-Some websites block requests from certain countries. You can set a proxy location to route the browser traffic through.
+Some websites lock content behind geo-fences. Override this parameter to route the browser through a residential proxy in a specific country, state, or city.
+
+- Use enum values such as `RESIDENTIAL_GB`, `RESIDENTIAL_DE`, or `RESIDENTIAL_ISP` for country-level pools.
+- Send a GeoTarget object (e.g., `{"country": "US", "subdivision": "CA"}`) for granular U.S. states or cities.
+
+See [Proxy & Geo Targeting](/running-tasks/proxy-location) for the full list of options and sample API calls.
 
 ### 2FA Support (TOTP)
 - [totp_identifier](/api-reference/api-reference/agent/run-task#request.body.totp_identifier): Skyvern can receive the TOTP code and use this identifier to identify the code for authentication.
@@ -126,7 +131,7 @@ For example, if you want to get the title, URL, and points of the top post on Ha
 ```python
 from skyvern import Skyvern
 
-skyvern = Skyvern()
+skyvern = Skyvern(api_key="YOUR_API_KEY")
 task = await skyvern.run_task(
     prompt="Find the top post on hackernews today",
     data_extraction_schema={
@@ -154,7 +159,7 @@ When you are sending a run task request the Skyvern service, you can set the `wa
 ```python
 from skyvern import Skyvern
 
-skyvern = Skyvern()
+skyvern = Skyvern(api_key="YOUR_API_KEY")
 task = await skyvern.run_task(
     prompt="Find the top post on hackernews today",
     # the request will be hanging until the task is done
@@ -168,7 +173,7 @@ Instead of waiting, you can also set the `webhook_url` in the run task request a
 ```python
 from skyvern import Skyvern
 
-skyvern = Skyvern()
+skyvern = Skyvern(api_key="YOUR_API_KEY")
 task = await skyvern.run_task(
     prompt="Find the top post on hackernews today",
     webhook_url="https://your-webhook-url.com",

@@ -1,6 +1,8 @@
 import { memo } from "react";
 import { CodeBlockNode as CodeBlockNodeComponent } from "./CodeBlockNode/CodeBlockNode";
 import { CodeBlockNode } from "./CodeBlockNode/types";
+import { ConditionalNode as ConditionalNodeComponent } from "./ConditionalNode/ConditionalNode";
+import type { ConditionalNode } from "./ConditionalNode/types";
 import { LoopNode as LoopNodeComponent } from "./LoopNode/LoopNode";
 import type { LoopNode } from "./LoopNode/types";
 import { SendEmailNode as SendEmailNodeComponent } from "./SendEmailNode/SendEmailNode";
@@ -43,11 +45,14 @@ import { URLNode } from "./URLNode/types";
 import { URLNode as URLNodeComponent } from "./URLNode/URLNode";
 import { HttpRequestNode } from "./HttpRequestNode/types";
 import { HttpRequestNode as HttpRequestNodeComponent } from "./HttpRequestNode/HttpRequestNode";
+import { HumanInteractionNode } from "./HumanInteractionNode/types";
+import { HumanInteractionNode as HumanInteractionNodeComponent } from "./HumanInteractionNode/HumanInteractionNode";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
 export type WorkflowBlockNode =
   | LoopNode
+  | ConditionalNode
   | TaskNode
   | TextPromptNode
   | SendEmailNode
@@ -57,6 +62,7 @@ export type WorkflowBlockNode =
   | FileUploadNode
   | DownloadNode
   | ValidationNode
+  | HumanInteractionNode
   | ActionNode
   | NavigationNode
   | ExtractionNode
@@ -80,6 +86,7 @@ export type AppNode = UtilityNode | WorkflowBlockNode;
 
 export const nodeTypes = {
   loop: memo(LoopNodeComponent),
+  conditional: memo(ConditionalNodeComponent),
   task: memo(TaskNodeComponent),
   textPrompt: memo(TextPromptNodeComponent),
   sendEmail: memo(SendEmailNodeComponent),
@@ -93,6 +100,7 @@ export const nodeTypes = {
   validation: memo(ValidationNodeComponent),
   action: memo(ActionNodeComponent),
   navigation: memo(NavigationNodeComponent),
+  human_interaction: memo(HumanInteractionNodeComponent),
   extraction: memo(ExtractionNodeComponent),
   login: memo(LoginNodeComponent),
   wait: memo(WaitNodeComponent),

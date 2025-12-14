@@ -30,7 +30,7 @@ if __name__ == "__main__":
     )
 
     uvicorn.run(
-        "skyvern.forge.api_app:app",
+        "skyvern.forge.api_app:create_api_app",
         host="0.0.0.0",
         port=port,
         log_level="info",
@@ -39,4 +39,5 @@ if __name__ == "__main__":
             f"{temp_path_for_excludes}/**/*.py",
             f"{artifact_path_for_excludes}/{settings.ENV}/**/scripts/**/**/*.py",
         ],
+        factory=True,
     )

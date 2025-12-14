@@ -23,7 +23,8 @@ export const baseHelpTooltipContent = {
     "If you are running multiple workflows at once, you will need to give the block an identifier to know that this TOTP goes with this block.",
   continueOnFailure:
     "Allow the workflow to continue if it encounters a failure.",
-  cacheActions: "Cache the actions of this block.",
+  nextLoopOnFailure:
+    "When inside a for loop, continue to the next iteration if this block fails.",
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
 } as const;
@@ -73,6 +74,8 @@ export const helpTooltips = {
     ...baseHelpTooltipContent,
     loopValue:
       "Define the values to iterate over. Use a parameter reference or natural language (e.g., 'Extract links of the top 2 posts'). Natural language automatically creates an extraction block that generates a list of string values. Use {{ current_value }} in the loop to get the current iteration value.",
+    nextLoopOnFailure:
+      "When enabled, if any block inside the loop fails, the loop will immediately jump to the next iteration instead of stopping.",
   },
   sendEmail: {
     ...baseHelpTooltipContent,

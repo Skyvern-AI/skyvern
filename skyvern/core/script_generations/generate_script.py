@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import keyword
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import libcst as cst
@@ -27,7 +28,17 @@ from skyvern.schemas.workflows import FileStorageType
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger(__name__)
-GENERATE_CODE_AI_MODE = "proactive"
+GENERATE_CODE_AI_MODE_PROACTIVE = "proactive"
+GENERATE_CODE_AI_MODE_FALLBACK = "fallback"
+
+
+@dataclass
+class ScriptBlockSource:
+    label: str
+    code: str
+    run_signature: str | None
+    workflow_run_id: str | None
+    workflow_run_block_id: str | None
 
 
 # --------------------------------------------------------------------- #
@@ -80,6 +91,7 @@ def sanitize_variable_name(name: str) -> str:
 
 ACTION_MAP = {
     "click": "click",
+    "hover": "hover",
     "input_text": "fill",
     "upload_file": "upload_file",
     "select_option": "select_option",
@@ -97,12 +109,14 @@ ACTION_MAP = {
 }
 ACTIONS_WITH_XPATH = [
     "click",
+    "hover",
     "input_text",
     "type",
     "fill",
     "upload_file",
     "select_option",
 ]
+ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT = ["extract"]
 
 INDENT = " " * 4
 DOUBLE_INDENT = " " * 8
@@ -228,7 +242,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
     """
     Turn one Action dict into:
 
-        await page.<method>(selector=..., intention=..., data=context.parameters)
+        await page.<method>(selector=..., prompt=..., data=context.parameters)
 
     Or if assign_to_output is True for extract actions:
 
@@ -250,16 +264,33 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
         )
 
     if method == "click":
+        ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
+        click_context = act.get("click_context")
+        if click_context and isinstance(click_context, dict) and click_context.get("single_option_click"):
+            ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
         args.append(
             cst.Arg(
                 keyword=cst.Name("ai"),
-                value=_value(GENERATE_CODE_AI_MODE),
+                value=_value(ai_mode),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
                 ),
             )
         )
+    elif method == "hover":
+        hold_seconds = act.get("hold_seconds")
+        if hold_seconds and hold_seconds > 0:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("hold_seconds"),
+                    value=_value(hold_seconds),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
     elif method in ["type", "fill"]:
         # Use context.parameters if field_name is available, otherwise fallback to direct value
         if act.get("field_name"):
@@ -286,7 +317,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
         args.append(
             cst.Arg(
                 keyword=cst.Name("ai"),
-                value=_value(GENERATE_CODE_AI_MODE),
+                value=_value(GENERATE_CODE_AI_MODE_PROACTIVE),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -319,6 +350,8 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
     elif method == "select_option":
         option = act.get("option", {})
         value = option.get("value")
+        label = option.get("label")
+        value = value or label
         if value:
             if act.get("field_name"):
                 option_value = cst.Subscript(
@@ -343,7 +376,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
             args.append(
                 cst.Arg(
                     keyword=cst.Name("ai"),
-                    value=_value(GENERATE_CODE_AI_MODE),
+                    value=_value(GENERATE_CODE_AI_MODE_PROACTIVE),
                     whitespace_after_arg=cst.ParenthesizedWhitespace(
                         indent=True,
                         last_line=cst.SimpleWhitespace(INDENT),
@@ -374,7 +407,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
         args.append(
             cst.Arg(
                 keyword=cst.Name("ai"),
-                value=_value(GENERATE_CODE_AI_MODE),
+                value=_value(GENERATE_CODE_AI_MODE_PROACTIVE),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -415,18 +448,34 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                     comma=cst.Comma(),
                 )
             )
+    action_context = act.get("input_or_select_context")
+    if action_context and action_context.get("date_format") and method in ["type", "fill", "select_option"]:
+        date_format_value = action_context.get("date_format")
+        data = {"date_format": date_format_value}
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("data"),
+                value=_value(data),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     intention = act.get("intention") or act.get("reasoning") or ""
-    if intention:
+    if intention and method not in ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT:
         args.extend(
             [
                 cst.Arg(
-                    keyword=cst.Name("intention"),
+                    keyword=cst.Name("prompt"),
                     value=_value(intention),
                     whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
                     comma=cst.Comma(),
                 ),
             ]
         )
+    _mark_last_arg_as_comma(args)
 
     # Only use indented parentheses if we have arguments
     if args:
@@ -464,7 +513,6 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
     name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
     body_stmts: list[cst.BaseStatement] = []
-    is_extraction_block = block.get("block_type") == "extraction"
 
     if block.get("url"):
         body_stmts.append(cst.parse_statement(f"await page.goto({repr(block['url'])})"))
@@ -474,7 +522,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
             continue
 
         # For extraction blocks, assign extract action results to output variable
-        assign_to_output = is_extraction_block and act["action_type"] == "extract"
+        assign_to_output = act["action_type"] == "extract"
         body_stmts.append(_action_to_stmt(act, block, assign_to_output=assign_to_output))
 
     # add complete action
@@ -484,7 +532,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
         body_stmts.append(_action_to_stmt(complete_action, block))
 
     # For extraction blocks, add return output statement if we have actions
-    if is_extraction_block and any(
+    if any(
         act["action_type"] == "extract"
         for act in actions
         if act["action_type"] not in [ActionType.COMPLETE, ActionType.TERMINATE, ActionType.NULL_ACTION]
@@ -515,12 +563,18 @@ def _build_task_v2_block_fn(block: dict[str, Any], child_blocks: list[dict[str, 
     body_stmts: list[cst.BaseStatement] = []
 
     # Add calls to child workflow sub-tasks
+    has_extract_block = False
     for child_block in child_blocks:
-        stmt = _build_block_statement(child_block)
+        is_extract_block = child_block.get("block_type") == "extraction"
+        if is_extract_block:
+            has_extract_block = True
+        stmt = _build_block_statement(child_block, assign_output=is_extract_block)
         body_stmts.append(stmt)
 
     if not body_stmts:
         body_stmts.append(cst.parse_statement("return None"))
+    elif has_extract_block:
+        body_stmts.append(cst.parse_statement("return output"))
 
     return FunctionDef(
         name=Name(name),
@@ -639,16 +693,30 @@ def _build_action_statement(
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
-        cst.Arg(
-            keyword=cst.Name("label"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
     ]
-
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    if block.get("label"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block.get("label")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                ),
+                comma=cst.Comma(),
+            )
+        )
+    _mark_last_arg_as_comma(args)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("action")),
         args=args,
@@ -679,7 +747,10 @@ def _build_login_statement(
 
 
 def _build_extract_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    assign_output: bool = True,
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.extract statement."""
     args = [
@@ -699,15 +770,30 @@ def _build_extract_statement(
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
-        cst.Arg(
-            keyword=cst.Name("label"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
     ]
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    if block.get("label"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block_title),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                ),
+                comma=cst.Comma(),
+            )
+        )
+    _mark_last_arg_as_comma(args)
 
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("extract")),
@@ -718,7 +804,17 @@ def _build_extract_statement(
         ),
     )
 
-    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+    if assign_output:
+        return cst.SimpleStatementLine(
+            [
+                cst.Assign(
+                    targets=[cst.AssignTarget(target=cst.Name("output"))],
+                    value=cst.Await(call),
+                )
+            ]
+        )
+    else:
+        return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
 def _build_navigate_statement(
@@ -848,6 +944,18 @@ def _build_validate_statement(
             )
         )
 
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     # Add label if it exists
     if block.get("label") is not None:
         args.append(
@@ -870,6 +978,13 @@ def _build_validate_statement(
     )
 
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
+def _build_human_interaction_statement(
+    block: dict[str, Any],
+) -> cst.SimpleStatementLine:
+    LOG.warning("Human interaction code generation is not yet implemented.", block=block)
+    return cst.SimpleStatementLine([cst.Expr(cst.Comment("# TODO: Implement human interaction logic"))])
 
 
 def _build_wait_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
@@ -1073,6 +1188,18 @@ def _build_pdf_parser_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
             )
         )
 
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("label") is not None:
         args.append(
             cst.Arg(
@@ -1124,6 +1251,18 @@ def _build_file_url_parser_statement(block: dict[str, Any]) -> cst.SimpleStateme
             cst.Arg(
                 keyword=cst.Name("schema"),
                 value=_value(block.get("json_schema")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1278,6 +1417,18 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
             )
         )
 
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("label") is not None:
         args.append(
             cst.Arg(
@@ -1290,7 +1441,7 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
             )
         )
 
-    if block.get("parameters") is not None:
+    if block.get("parameters"):
         parameters = block.get("parameters", [])
         parameter_list = [parameter["key"] for parameter in parameters]
         args.append(
@@ -1299,10 +1450,12 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
                 value=_value(parameter_list),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
                 ),
             )
         )
 
+    _mark_last_arg_as_comma(args)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("prompt")),
         args=args,
@@ -1385,47 +1538,6 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
     )
 
     return for_loop
-
-
-def _build_goto_statement_for_loop(block: dict[str, Any]) -> cst.SimpleStatementLine:
-    """Build a skyvern.goto statement for use within loops, handling current_value template."""
-    url_value = block.get("url", "")
-
-    # Handle {{current_value}} template by replacing it with the current_value variable
-    if url_value == "{{current_value}}":
-        url_expr = cst.Name("current_value")
-    else:
-        url_expr = _value(url_value)
-
-    args = [
-        cst.Arg(
-            keyword=cst.Name("url"),
-            value=url_expr,
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-        cst.Arg(
-            keyword=cst.Name("label"),
-            value=_value(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
-    ]
-
-    call = cst.Call(
-        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("goto")),
-        args=args,
-        whitespace_before_args=cst.ParenthesizedWhitespace(
-            indent=True,
-            last_line=cst.SimpleWhitespace(INDENT),
-        ),
-    )
-
-    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
 def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
@@ -1527,6 +1639,31 @@ def __build_base_task_statement(
                 ),
             )
         )
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    # Add error_code_mapping if it exists
+    if block.get("error_code_mapping") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("error_code_mapping"),
+                value=_value(block.get("error_code_mapping")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("block_type") == "task_v2":
         args.append(
             cst.Arg(
@@ -1556,7 +1693,9 @@ def __build_base_task_statement(
 # --------------------------------------------------------------------- #
 
 
-def _build_block_statement(block: dict[str, Any], data_variable_name: str | None = None) -> cst.SimpleStatementLine:
+def _build_block_statement(
+    block: dict[str, Any], data_variable_name: str | None = None, assign_output: bool = False
+) -> cst.SimpleStatementLine:
     """Build a block statement."""
     block_type = block.get("block_type")
     block_title = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
@@ -1572,11 +1711,13 @@ def _build_block_statement(block: dict[str, Any], data_variable_name: str | None
         elif block_type == "login":
             stmt = _build_login_statement(block_title, block, data_variable_name)
         elif block_type == "extraction":
-            stmt = _build_extract_statement(block_title, block, data_variable_name)
+            stmt = _build_extract_statement(block_title, block, data_variable_name, assign_output)
         elif block_type == "navigation":
             stmt = _build_navigate_statement(block_title, block, data_variable_name)
     elif block_type == "validation":
         stmt = _build_validate_statement(block_title, block, data_variable_name)
+    elif block_type == "human_interaction":
+        stmt = _build_human_interaction_statement(block)
     elif block_type == "task_v2":
         stmt = _build_run_task_statement(block_title, block, data_variable_name)
     elif block_type == "send_email":
@@ -1615,7 +1756,7 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
     ]
 
     for block in blocks:
-        stmt = _build_block_statement(block)
+        stmt = _build_block_statement(block, assign_output=False)
         body.append(stmt)
 
     params = cst.Parameters(
@@ -1680,10 +1821,25 @@ async def generate_workflow_script_python_code(
     script_id: str | None = None,
     script_revision_id: str | None = None,
     pending: bool = False,
+    cached_blocks: dict[str, ScriptBlockSource] | None = None,
+    updated_block_labels: set[str] | None = None,
 ) -> str:
     """
     Build a LibCST Module and emit .code (PEP-8-formatted source).
+
+    Cached script blocks can be reused by providing them via `cached_blocks`. Any labels present in
+    `updated_block_labels` will be regenerated from the latest workflow run execution data.
     """
+    cached_blocks = cached_blocks or {}
+    updated_block_labels = set(updated_block_labels or [])
+
+    # Drop cached entries that do not have usable source
+    cached_blocks = {label: source for label, source in cached_blocks.items() if source.code}
+    # Always regenerate the orchestrator block so it stays aligned with the workflow definition
+    cached_blocks.pop(settings.WORKFLOW_START_BLOCK_LABEL, None)
+
+    if task_v2_child_blocks is None:
+        task_v2_child_blocks = {}
     # --- imports --------------------------------------------------------
     imports: list[cst.BaseStatement] = [
         cst.SimpleStatementLine([cst.Import(names=[cst.ImportAlias(cst.Name("asyncio"))])]),
@@ -1732,33 +1888,47 @@ async def generate_workflow_script_python_code(
     generated_model_cls = _build_generated_model_from_schema(generated_schema)
 
     # --- blocks ---------------------------------------------------------
-    block_fns = []
+    block_fns: list[cst.CSTNode] = []
     task_v1_blocks = [block for block in blocks if block["block_type"] in SCRIPT_TASK_BLOCKS]
     task_v2_blocks = [block for block in blocks if block["block_type"] == "task_v2"]
 
-    if task_v2_child_blocks is None:
-        task_v2_child_blocks = {}
+    def append_block_code(block_code: str) -> None:
+        nonlocal block_fns
+        parsed = cst.parse_module(block_code)
+        if block_fns:
+            block_fns.append(cst.EmptyLine())
+            block_fns.append(cst.EmptyLine())
+        block_fns.extend(parsed.body)
 
     # Handle task v1 blocks (excluding child blocks of task_v2)
     for idx, task in enumerate(task_v1_blocks):
-        # Skip if this is a child block of a task_v2 block
         if task.get("parent_task_v2_label"):
             continue
 
-        block_fn_def = _build_block_fn(task, actions_by_task.get(task.get("task_id", ""), []))
+        block_name = task.get("label") or task.get("title") or task.get("task_id") or f"task_{idx}"
+        cached_source = cached_blocks.get(block_name)
+        use_cached = cached_source is not None and block_name not in updated_block_labels
 
-        # Create script block if we have script context
+        if use_cached:
+            assert cached_source is not None
+            block_code = cached_source.code
+            run_signature = cached_source.run_signature
+            block_workflow_run_id = cached_source.workflow_run_id
+            block_workflow_run_block_id = cached_source.workflow_run_block_id
+        else:
+            block_fn_def = _build_block_fn(task, actions_by_task.get(task.get("task_id", ""), []))
+            temp_module = cst.Module(body=[block_fn_def])
+            block_code = temp_module.code
+
+            block_stmt = _build_block_statement(task)
+            run_signature_module = cst.Module(body=[block_stmt])
+            run_signature = run_signature_module.code.strip()
+
+            block_workflow_run_id = task.get("workflow_run_id") or run_id
+            block_workflow_run_block_id = task.get("workflow_run_block_id")
+
         if script_id and script_revision_id and organization_id:
             try:
-                block_name = task.get("label") or task.get("title") or task.get("task_id") or f"task_{idx}"
-                temp_module = cst.Module(body=[block_fn_def])
-                block_code = temp_module.code
-
-                # Extract the run signature (the statement that calls skyvern.action/extract/etc)
-                block_stmt = _build_block_statement(task)
-                run_signature_module = cst.Module(body=[block_stmt])
-                run_signature = run_signature_module.code.strip()
-
                 await create_or_update_script_block(
                     block_code=block_code,
                     script_revision_id=script_revision_id,
@@ -1767,80 +1937,67 @@ async def generate_workflow_script_python_code(
                     block_label=block_name,
                     update=pending,
                     run_signature=run_signature,
+                    workflow_run_id=block_workflow_run_id,
+                    workflow_run_block_id=block_workflow_run_block_id,
                 )
             except Exception as e:
                 LOG.error("Failed to create script block", error=str(e), exc_info=True)
-                # Continue without script block creation if it fails
 
-        block_fns.append(block_fn_def)
-        if idx < len(task_v1_blocks) - 1:
-            block_fns.append(cst.EmptyLine())
-            block_fns.append(cst.EmptyLine())
+        append_block_code(block_code)
 
     # Handle task_v2 blocks
-    for idx, task_v2 in enumerate(task_v2_blocks):
+    for task_v2 in task_v2_blocks:
         task_v2_label = task_v2.get("label") or f"task_v2_{task_v2.get('workflow_run_block_id')}"
         child_blocks = task_v2_child_blocks.get(task_v2_label, [])
 
-        # Create the task_v2 function
-        task_v2_fn_def = _build_task_v2_block_fn(task_v2, child_blocks)
+        cached_source = cached_blocks.get(task_v2_label)
+        use_cached = cached_source is not None and task_v2_label not in updated_block_labels
 
-        # Create script block for task_v2 that includes both the main function and child functions
+        block_code = ""
+        run_signature = None
+        block_workflow_run_id = task_v2.get("workflow_run_id") or run_id
+        block_workflow_run_block_id = task_v2.get("workflow_run_block_id")
+
+        if use_cached:
+            assert cached_source is not None
+            block_code = cached_source.code
+            run_signature = cached_source.run_signature
+            block_workflow_run_id = cached_source.workflow_run_id
+            block_workflow_run_block_id = cached_source.workflow_run_block_id
+        else:
+            task_v2_fn_def = _build_task_v2_block_fn(task_v2, child_blocks)
+            task_v2_block_body: list[cst.CSTNode] = [task_v2_fn_def]
+
+            for child_block in child_blocks:
+                if child_block.get("block_type") in SCRIPT_TASK_BLOCKS and child_block.get("block_type") != "task_v2":
+                    child_fn_def = _build_block_fn(child_block, actions_by_task.get(child_block.get("task_id", ""), []))
+                    task_v2_block_body.append(cst.EmptyLine())
+                    task_v2_block_body.append(cst.EmptyLine())
+                    task_v2_block_body.append(child_fn_def)
+
+            temp_module = cst.Module(body=task_v2_block_body)
+            block_code = temp_module.code
+
+            task_v2_stmt = _build_block_statement(task_v2)
+            run_signature = cst.Module(body=[task_v2_stmt]).code.strip()
+
         if script_id and script_revision_id and organization_id:
             try:
-                # Build the complete module for this task_v2 block
-                task_v2_block_body = [task_v2_fn_def]
-
-                # Add child block functions
-                for child_block in child_blocks:
-                    if (
-                        child_block.get("block_type") in SCRIPT_TASK_BLOCKS
-                        and child_block.get("block_type") != "task_v2"
-                    ):
-                        child_fn_def = _build_block_fn(
-                            child_block, actions_by_task.get(child_block.get("task_id", ""), [])
-                        )
-                        task_v2_block_body.append(cst.EmptyLine())
-                        task_v2_block_body.append(cst.EmptyLine())
-                        task_v2_block_body.append(child_fn_def)
-
-                # Create the complete module for this task_v2 block
-                temp_module = cst.Module(body=task_v2_block_body)
-                task_v2_block_code = temp_module.code
-
-                block_name = task_v2.get("label") or task_v2.get("title") or f"task_v2_{idx}"
-
-                # Extract the run signature for task_v2 block
-                task_v2_stmt = _build_block_statement(task_v2)
-                run_signature_module = cst.Module(body=[task_v2_stmt])
-                run_signature = run_signature_module.code.strip()
-
                 await create_or_update_script_block(
-                    block_code=task_v2_block_code,
+                    block_code=block_code,
                     script_revision_id=script_revision_id,
                     script_id=script_id,
                     organization_id=organization_id,
-                    block_label=block_name,
+                    block_label=task_v2_label,
                     update=pending,
                     run_signature=run_signature,
+                    workflow_run_id=block_workflow_run_id,
+                    workflow_run_block_id=block_workflow_run_block_id,
                 )
             except Exception as e:
                 LOG.error("Failed to create task_v2 script block", error=str(e), exc_info=True)
-                # Continue without script block creation if it fails
 
-        block_fns.append(task_v2_fn_def)
-
-        # Create individual functions for child blocks
-        for child_block in child_blocks:
-            if child_block.get("block_type") in SCRIPT_TASK_BLOCKS and child_block.get("block_type") != "task_v2":
-                child_fn_def = _build_block_fn(child_block, actions_by_task.get(child_block.get("task_id", ""), []))
-                block_fns.append(cst.EmptyLine())
-                block_fns.append(cst.EmptyLine())
-                block_fns.append(child_fn_def)
-
-        if idx < len(task_v2_blocks) - 1:
-            block_fns.append(cst.EmptyLine())
-            block_fns.append(cst.EmptyLine())
+        append_block_code(block_code)
 
     # --- runner ---------------------------------------------------------
     run_fn = _build_run_fn(blocks, workflow_run_request)
@@ -1912,6 +2069,8 @@ async def create_or_update_script_block(
     block_label: str,
     update: bool = False,
     run_signature: str | None = None,
+    workflow_run_id: str | None = None,
+    workflow_run_block_id: str | None = None,
 ) -> None:
     """
     Create a script block in the database and save the block code to a script file.
@@ -1925,6 +2084,8 @@ async def create_or_update_script_block(
         block_label: Optional custom name for the block (defaults to function name)
         update: Whether to update the script block instead of creating a new one
         run_signature: The function call code to execute this block (e.g., "await skyvern.action(...)")
+        workflow_run_id: The workflow run that generated this cached block
+        workflow_run_block_id: The workflow run block that generated this cached block
     """
     block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
     try:
@@ -1941,6 +2102,8 @@ async def create_or_update_script_block(
                 organization_id=organization_id,
                 script_block_label=block_label,
                 run_signature=run_signature,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
             )
         elif run_signature:
             # Update the run_signature if provided
@@ -1948,6 +2111,8 @@ async def create_or_update_script_block(
                 script_block_id=script_block.script_block_id,
                 organization_id=organization_id,
                 run_signature=run_signature,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
             )
 
         # Step 4: Create script file for the block
@@ -1997,6 +2162,8 @@ async def create_or_update_script_block(
                 script_block_id=script_block.script_block_id,
                 organization_id=organization_id,
                 script_file_id=script_file.file_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
             )
 
     except Exception as e:

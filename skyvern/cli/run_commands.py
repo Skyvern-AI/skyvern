@@ -16,6 +16,7 @@ from rich.prompt import Confirm
 
 from skyvern.cli.console import console
 from skyvern.cli.utils import start_services
+from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.forge_log import setup_logger
@@ -45,18 +46,24 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
         url: The starting URL of the website where the task should be performed
     """
     skyvern_agent = Skyvern(
+        environment=SkyvernEnvironment.CLOUD,
         base_url=settings.SKYVERN_BASE_URL,
         api_key=settings.SKYVERN_API_KEY,
     )
     res = await skyvern_agent.run_task(prompt=prompt, url=url, user_agent="skyvern-mcp", wait_for_completion=True)
 
-    # TODO: It would be nice if we could return the task URL here
     output = res.model_dump()["output"]
-    base_url = settings.SKYVERN_BASE_URL
-    run_history_url = (
-        "https://app.skyvern.com/history" if "skyvern.com" in base_url else "http://localhost:8080/history"
-    )
-    return {"output": output, "run_history_url": run_history_url}
+    # Primary: use app_url from API response (handles both task and workflow run IDs correctly)
+    if res.app_url:
+        task_url = res.app_url
+    else:
+        # Fallback when app_url is not available (e.g., older API versions)
+        # Determine route based on run_id prefix: 'wr_' for workflows, otherwise tasks
+        if res.run_id and res.run_id.startswith("wr_"):
+            task_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{res.run_id}/overview"
+        else:
+            task_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{res.run_id}/actions"
+    return {"output": output, "task_url": task_url, "run_id": res.run_id}
 
 
 def get_pids_on_port(port: int) -> List[int]:
@@ -93,10 +100,11 @@ def run_server() -> None:
     port = settings.PORT
     console.print(Panel(f"[bold green]Starting Skyvern API Server on port {port}...", border_style="green"))
     uvicorn.run(
-        "skyvern.forge.api_app:app",
+        "skyvern.forge.api_app:create_api_app",
         host="0.0.0.0",
         port=port,
         log_level="info",
+        factory=True,
     )
 
 

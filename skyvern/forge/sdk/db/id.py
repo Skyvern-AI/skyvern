@@ -39,6 +39,8 @@ CREDENTIAL_AZURE_VAULT_PARAMETER_PREFIX = "azcp"
 CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
 DEBUG_SESSION_PREFIX = "ds"
+FOLDER_PREFIX = "fld"
+BROWSER_PROFILE_PREFIX = "bp"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -62,6 +64,7 @@ WORKFLOW_PREFIX = "w"
 WORKFLOW_RUN_BLOCK_PREFIX = "wrb"
 WORKFLOW_RUN_PREFIX = "wr"
 WORKFLOW_SCRIPT_PREFIX = "ws"
+WORKFLOW_TEMPLATE_PREFIX = "wt"
 
 
 def generate_workflow_id() -> str:
@@ -87,6 +90,11 @@ def generate_workflow_run_id() -> str:
 def generate_workflow_script_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_SCRIPT_PREFIX}_{int_id}"
+
+
+def generate_workflow_template_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_TEMPLATE_PREFIX}_{int_id}"
 
 
 def generate_aws_secret_parameter_id() -> str:
@@ -194,6 +202,11 @@ def generate_persistent_browser_session_id() -> str:
     return f"{PERSISTENT_BROWSER_SESSION_ID}_{int_id}"
 
 
+def generate_browser_profile_id() -> str:
+    int_id = generate_id()
+    return f"{BROWSER_PROFILE_PREFIX}_{int_id}"
+
+
 def generate_task_run_id() -> str:
     int_id = generate_id()
     return f"{TASK_RUN_PREFIX}_{int_id}"
@@ -212,6 +225,11 @@ def generate_credential_id() -> str:
 def generate_debug_session_id() -> str:
     int_id = generate_id()
     return f"{DEBUG_SESSION_PREFIX}_{int_id}"
+
+
+def generate_folder_id() -> str:
+    int_id = generate_id()
+    return f"{FOLDER_PREFIX}_{int_id}"
 
 
 def generate_organization_bitwarden_collection_id() -> str:

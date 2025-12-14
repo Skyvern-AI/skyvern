@@ -1,14 +1,16 @@
+import copy
 import dataclasses
 import json
 import time
 from asyncio import CancelledError
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 import litellm
 import structlog
 from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
+from litellm.types.router import AllowedFailsPolicy
 from litellm.utils import CustomStreamWrapper, ModelResponse
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
@@ -17,6 +19,8 @@ from pydantic import BaseModel
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge import app
+from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_handler
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
@@ -24,18 +28,42 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
-from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMConfig, LLMRouterConfig, dummy_llm_api_handler
+from skyvern.forge.sdk.api.llm.models import (
+    LLMAllowedFailsPolicy,
+    LLMConfig,
+    LLMRouterConfig,
+)
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, llm_messages_builder_with_history, parse_api_response
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 
 LOG = structlog.get_logger()
+
+EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
+CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
+
+# Default thinking budget for extract-actions prompt (can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
+EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = 512
+
+
+@runtime_checkable
+class RouterWithModelList(Protocol):
+    model_list: list[dict[str, Any]]
+
+
+def _get_primary_model_dict(router: Any, main_model_group: str) -> dict[str, Any] | None:
+    if isinstance(router, RouterWithModelList):
+        for model_dict in router.model_list:
+            if model_dict.get("model_name") == main_model_group:
+                return model_dict
+    return None
 
 
 class LLMCallStats(BaseModel):
@@ -46,10 +74,100 @@ class LLMCallStats(BaseModel):
     llm_cost: float | None = None
 
 
+def _get_artifact_targets_and_persist_flag(
+    step: Step | None,
+    is_speculative_step: bool,
+    task_v2: TaskV2 | None,
+    thought: Thought | None,
+    ai_suggestion: AISuggestion | None,
+) -> tuple[bool, dict[str, Any]]:
+    artifact_targets = {
+        "step": step if not is_speculative_step else None,
+        "task_v2": task_v2,
+        "thought": thought,
+        "ai_suggestion": ai_suggestion,
+    }
+    has_artifact_target = any(value is not None for value in artifact_targets.values())
+    should_persist_llm_artifacts = not is_speculative_step and has_artifact_target
+    return should_persist_llm_artifacts, artifact_targets
+
+
+async def _log_hashed_href_map_artifacts_if_needed(
+    context: SkyvernContext | None,
+    step: Step | None,
+    task_v2: TaskV2 | None,
+    thought: Thought | None,
+    ai_suggestion: AISuggestion | None,
+    *,
+    is_speculative_step: bool,
+) -> None:
+    should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
+        step, is_speculative_step, task_v2, thought, ai_suggestion
+    )
+    if context and context.hashed_href_map and should_persist_llm_artifacts:
+        await app.ARTIFACT_MANAGER.create_llm_artifact(
+            data=json.dumps(context.hashed_href_map, indent=2).encode("utf-8"),
+            artifact_type=ArtifactType.HASHED_HREF_MAP,
+            **artifact_targets,
+        )
+
+
+def _log_vertex_cache_hit_if_needed(
+    context: SkyvernContext | None,
+    prompt_name: str,
+    llm_identifier: str,
+    cached_tokens: int,
+) -> None:
+    if cached_tokens > 0 and prompt_name == EXTRACT_ACTION_PROMPT_NAME and context and context.vertex_cache_name:
+        LOG.info(
+            "Vertex cache hit",
+            prompt_name=prompt_name,
+            llm_key=llm_identifier,
+            cached_tokens=cached_tokens,
+            cache_name=context.vertex_cache_name,
+            cache_key=context.vertex_cache_key,
+            cache_variant=context.vertex_cache_variant,
+        )
+
+
+def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> AllowedFailsPolicy | None:
+    if policy is None:
+        return None
+
+    return AllowedFailsPolicy(
+        BadRequestErrorAllowedFails=policy.bad_request_error_allowed_fails,
+        AuthenticationErrorAllowedFails=policy.authentication_error_allowed_fails,
+        TimeoutErrorAllowedFails=policy.timeout_error_allowed_fails,
+        RateLimitErrorAllowedFails=policy.rate_limit_error_allowed_fails,
+        ContentPolicyViolationErrorAllowedFails=policy.content_policy_violation_error_allowed_fails,
+        InternalServerErrorAllowedFails=policy.internal_server_error_allowed_fails,
+    )
+
+
 class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
     _thinking_budget_settings: dict[str, int] | None = None
     _prompt_caching_settings: dict[str, bool] | None = None
+
+    @staticmethod
+    def _models_equivalent(left: str | None, right: str | None) -> bool:
+        """Used only by `llm_api_handler_with_router_and_fallback`. Router model
+        groups carry the `vertex-` prefix while LiteLLM responses return the
+        underlying provider label (e.g. `gemini-2.5-pro`). Stripping the prefix
+        lets us detect whether the configured primary (the router's
+        `main_model_group`) actually served the request without replumbing every
+        config/registry reference.
+        """
+        if left == right:
+            return True
+        if left is None or right is None:
+            return False
+
+        def _normalize(label: str) -> str:
+            normalized = label.lower()
+            return normalized[len("vertex-") :] if normalized.startswith("vertex-") else normalized
+
+        return _normalize(left) == _normalize(right)
 
     @staticmethod
     def _apply_thinking_budget_optimization(
@@ -66,9 +184,34 @@ class LLMAPIHandlerFactory:
                 check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
             except Exception:
                 check_model = model_label
+
+        # Check reasoning support (safe call - log but don't fail if litellm errors)
+        supports_reasoning = False
+        if check_model:
+            try:
+                supports_reasoning = litellm.supports_reasoning(model=check_model)
+            except Exception as exc:  # pragma: no cover - diagnostic safeguard
+                LOG.debug(
+                    "Failed to check reasoning support via litellm",
+                    model=check_model,
+                    error=str(exc),
+                )
+
         try:
-            # Early return if model doesn't support reasoning
-            if check_model and not litellm.supports_reasoning(model=check_model):
+            # Gemini router/fallback configs (e.g., gemini-2.5-pro-gpt-5-fallback-router)
+            # are not recognized by litellm, but they do support reasoning budgets.
+            if not supports_reasoning and model_label:
+                model_label_lower = model_label.lower()
+                if "gemini" in model_label_lower and "fallback" in model_label_lower:
+                    supports_reasoning = True
+                    LOG.info(
+                        "Forcing reasoning support for Gemini fallback model",
+                        prompt_name=prompt_name,
+                        budget=new_budget,
+                        model=model_label,
+                    )
+
+            if check_model and not supports_reasoning:
                 LOG.info(
                     "Thinking budget optimization not supported for model",
                     prompt_name=prompt_name,
@@ -177,6 +320,7 @@ class LLMAPIHandlerFactory:
         if not override_llm_key:
             return default
         try:
+            # Explicit overrides should honor the exact model choice and skip experimentation reroutes.
             return LLMAPIHandlerFactory.get_llm_api_handler(override_llm_key)
         except Exception:
             LOG.warning(
@@ -207,7 +351,7 @@ class LLMAPIHandlerFactory:
             retry_after=llm_config.retry_delay_seconds,
             disable_cooldowns=llm_config.disable_cooldowns,
             allowed_fails=llm_config.allowed_fails,
-            allowed_fails_policy=llm_config.allowed_fails_policy,
+            allowed_fails_policy=_convert_allowed_fails_policy(llm_config.allowed_fails_policy),
             cooldown_time=llm_config.cooldown_time,
             set_verbose=(False if settings.is_cloud_environment() else llm_config.set_verbose),
             enable_pre_call_checks=True,
@@ -229,7 +373,8 @@ class LLMAPIHandlerFactory:
             use_message_history: bool = False,
             raw_response: bool = False,
             window_dimension: Resolution | None = None,
-        ) -> dict[str, Any]:
+            force_dict: bool = True,
+        ) -> dict[str, Any] | Any:
             """
             Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
 
@@ -256,58 +401,66 @@ class LLMAPIHandlerFactory:
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     parameters, new_budget, llm_config, prompt_name
                 )
-
-            context = skyvern_context.current()
-            if context and len(context.hashed_href_map) > 0:
-                await app.ARTIFACT_MANAGER.create_llm_artifact(
-                    data=json.dumps(context.hashed_href_map, indent=2).encode("utf-8"),
-                    artifact_type=ArtifactType.HASHED_HREF_MAP,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
+            elif prompt_name == EXTRACT_ACTION_PROMPT_NAME:
+                # Apply default thinking budget for extract-actions (512) unless overridden by experiment
+                LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+                    parameters, EXTRACT_ACTION_DEFAULT_THINKING_BUDGET, llm_config, prompt_name
                 )
 
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=prompt.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_PROMPT,
-                screenshots=screenshots,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
+            context = skyvern_context.current()
+            is_speculative_step = step.is_speculative if step else False
+            should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
+                step, is_speculative_step, task_v2, thought, ai_suggestion
             )
+            await _log_hashed_href_map_artifacts_if_needed(
+                context,
+                step,
+                task_v2,
+                thought,
+                ai_suggestion,
+                is_speculative_step=is_speculative_step,
+            )
+
+            llm_prompt_value = prompt
+            if should_persist_llm_artifacts:
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=llm_prompt_value.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_PROMPT,
+                    screenshots=screenshots,
+                    **artifact_targets,
+                )
             # Build messages and apply caching in one step
             messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
 
+            async def _log_llm_request_artifact(model_label: str, vertex_cache_attached_flag: bool) -> str:
+                llm_request_payload = {
+                    "model": model_label,
+                    "messages": messages,
+                    **parameters,
+                    "vertex_cache_attached": vertex_cache_attached_flag,
+                }
+                llm_request_json = json.dumps(llm_request_payload)
+                if should_persist_llm_artifacts:
+                    await app.ARTIFACT_MANAGER.create_llm_artifact(
+                        data=llm_request_json.encode("utf-8"),
+                        artifact_type=ArtifactType.LLM_REQUEST,
+                        **artifact_targets,
+                    )
+                return llm_request_json
+
             # Inject context caching system message when available
+            # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts
+            # (e.g., check-user-goal) with the extract-action schema
             try:
-                context_cached_static_prompt = getattr(context, "cached_static_prompt", None)
                 if (
-                    context_cached_static_prompt
+                    context
+                    and context.cached_static_prompt
+                    and prompt_name == EXTRACT_ACTION_PROMPT_NAME  # Only inject for extract-actions
                     and isinstance(llm_config, LLMConfig)
                     and isinstance(llm_config.model_name, str)
                 ):
-                    # Check if this is a Vertex AI model
-                    if "vertex_ai/" in llm_config.model_name:
-                        caching_system_message = {
-                            "role": "system",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": context_cached_static_prompt,
-                                    "cache_control": {"type": "ephemeral", "ttl": "3600s"},
-                                }
-                            ],
-                        }
-                        messages = [caching_system_message] + messages
-                        LOG.info(
-                            "Applied Vertex context caching",
-                            prompt_name=prompt_name,
-                            model=llm_config.model_name,
-                            ttl_seconds=3600,
-                        )
                     # Check if this is an OpenAI model
-                    elif (
+                    if (
                         llm_config.model_name.startswith("gpt-")
                         or llm_config.model_name.startswith("o1-")
                         or llm_config.model_name.startswith("o3-")
@@ -319,7 +472,7 @@ class LLMAPIHandlerFactory:
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": context_cached_static_prompt,
+                                    "text": context.cached_static_prompt,
                                 }
                             ],
                         }
@@ -332,24 +485,97 @@ class LLMAPIHandlerFactory:
             except Exception as e:
                 LOG.warning("Failed to apply context caching system message", error=str(e), exc_info=True)
 
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=json.dumps(
-                    {
-                        "model": llm_key,
-                        "messages": messages,
-                        **parameters,
-                    }
-                ).encode("utf-8"),
-                artifact_type=ArtifactType.LLM_REQUEST,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
+            cache_resource_name = getattr(context, "vertex_cache_name", None)
+            cache_variant = getattr(context, "vertex_cache_variant", None)
+            primary_model_dict = _get_primary_model_dict(router, main_model_group)
+            should_attach_vertex_cache = bool(
+                cache_resource_name is not None
+                and prompt_name == EXTRACT_ACTION_PROMPT_NAME
+                and getattr(context, "use_prompt_caching", False)
+                and main_model_group
+                and "gemini" in main_model_group.lower()
+                and primary_model_dict is not None
             )
-            try:
-                response = await router.acompletion(
-                    model=main_model_group, messages=messages, timeout=settings.LLM_CONFIG_TIMEOUT, **parameters
+
+            model_used = main_model_group
+            llm_request_json = ""
+
+            async def _call_primary_with_vertex_cache(
+                cache_name: str,
+                cache_variant_name: str | None,
+            ) -> tuple[ModelResponse, str, str]:
+                if primary_model_dict is None:
+                    raise ValueError("Primary router model missing configuration")
+                litellm_params = copy.deepcopy(primary_model_dict.get("litellm_params") or {})
+                if not litellm_params:
+                    raise ValueError("Primary router model missing litellm_params")
+                active_params = copy.deepcopy(litellm_params)
+                active_params.update(parameters)
+                active_params["cached_content"] = cache_name
+                request_model = active_params.pop("model", primary_model_dict.get("model_name", main_model_group))
+                LOG.info(
+                    "Adding Vertex AI cache reference to primary Gemini request",
+                    prompt_name=prompt_name,
+                    primary_model=main_model_group,
+                    fallback_model=llm_config.fallback_model_group,
+                    cache_name=cache_name,
+                    cache_key=getattr(context, "vertex_cache_key", None),
+                    cache_variant=cache_variant_name,
                 )
+                request_payload_json = await _log_llm_request_artifact(request_model, True)
+                response = await litellm.acompletion(
+                    model=request_model,
+                    messages=messages,
+                    timeout=settings.LLM_CONFIG_TIMEOUT,
+                    drop_params=True,
+                    **active_params,
+                )
+                return response, request_model, request_payload_json
+
+            async def _call_router_without_cache() -> tuple[ModelResponse, str]:
+                request_payload_json = await _log_llm_request_artifact(llm_key, False)
+                response = await router.acompletion(
+                    model=main_model_group,
+                    messages=messages,
+                    timeout=settings.LLM_CONFIG_TIMEOUT,
+                    drop_params=True,
+                    **parameters,
+                )
+                return response, request_payload_json
+
+            try:
+                response: ModelResponse | None = None
+                if should_attach_vertex_cache and cache_resource_name:
+                    try:
+                        response, direct_model_used, llm_request_json = await _call_primary_with_vertex_cache(
+                            cache_resource_name,
+                            cache_variant,
+                        )
+                        model_used = response.model or direct_model_used
+                    except CancelledError:
+                        raise
+                    except Exception as cache_error:
+                        LOG.warning(
+                            "Vertex cache primary call failed, retrying via router",
+                            prompt_name=prompt_name,
+                            error=str(cache_error),
+                            cache_name=cache_resource_name,
+                            cache_variant=cache_variant,
+                        )
+                        response = None
+
+                if response is None:
+                    response, llm_request_json = await _call_router_without_cache()
+                    response_model = response.model or main_model_group
+                    model_used = response_model
+                    if not LLMAPIHandlerFactory._models_equivalent(response_model, main_model_group):
+                        LOG.info(
+                            "LLM router fallback succeeded",
+                            llm_key=llm_key,
+                            prompt_name=prompt_name,
+                            primary_model=main_model_group,
+                            fallback_model=response_model,
+                        )
             except litellm.exceptions.APIError as e:
                 raise LLMProviderErrorRetryableTask(llm_key) from e
             except litellm.exceptions.ContextWindowExceededError as e:
@@ -383,14 +609,13 @@ class LLMAPIHandlerFactory:
                 )
                 raise LLMProviderError(llm_key) from e
 
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=response.model_dump_json(indent=2).encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
-            )
+            llm_response_json = response.model_dump_json(indent=2)
+            if should_persist_llm_artifacts:
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=llm_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE,
+                    **artifact_targets,
+                )
             prompt_tokens = 0
             completion_tokens = 0
             reasoning_tokens = 0
@@ -425,7 +650,7 @@ class LLMAPIHandlerFactory:
                 # Fallback for Vertex/Gemini: LiteLLM exposes cache_read_input_tokens on usage
                 if cached_tokens == 0:
                     cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
-            if step:
+            if step and not is_speculative_step:
                 await app.DATABASE.update_step(
                     task_id=step.task_id,
                     step_id=step.step_id,
@@ -446,28 +671,27 @@ class LLMAPIHandlerFactory:
                     reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_token_count=cached_tokens if cached_tokens > 0 else None,
                 )
-            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
-            )
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
+            parsed_response_json = json.dumps(parsed_response, indent=2)
+            if should_persist_llm_artifacts:
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=parsed_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                    **artifact_targets,
+                )
 
+            rendered_response_json = None
             if context and len(context.hashed_href_map) > 0:
                 llm_content = json.dumps(parsed_response)
                 rendered_content = Template(llm_content).render(context.hashed_href_map)
                 parsed_response = json.loads(rendered_content)
-                await app.ARTIFACT_MANAGER.create_llm_artifact(
-                    data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
-                )
+                rendered_response_json = json.dumps(parsed_response, indent=2)
+                if should_persist_llm_artifacts:
+                    await app.ARTIFACT_MANAGER.create_llm_artifact(
+                        data=rendered_response_json.encode("utf-8"),
+                        artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                        **artifact_targets,
+                    )
 
             # Track LLM API handler duration, token counts, and cost
             organization_id = organization_id or (
@@ -477,7 +701,7 @@ class LLMAPIHandlerFactory:
             LOG.info(
                 "LLM API handler duration metrics",
                 llm_key=llm_key,
-                model=main_model_group,
+                model=model_used,
                 prompt_name=prompt_name,
                 duration_seconds=duration_seconds,
                 step_id=step.step_id if step else None,
@@ -490,12 +714,33 @@ class LLMAPIHandlerFactory:
                 llm_cost=llm_cost if llm_cost > 0 else None,
             )
 
+            if step and is_speculative_step:
+                step.speculative_llm_metadata = SpeculativeLLMMetadata(
+                    prompt=llm_prompt_value,
+                    llm_request_json=llm_request_json,
+                    llm_response_json=llm_response_json,
+                    parsed_response_json=parsed_response_json,
+                    rendered_response_json=rendered_response_json,
+                    llm_key=llm_key,
+                    model=model_used,
+                    duration_seconds=duration_seconds,
+                    input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                    output_tokens=completion_tokens if completion_tokens > 0 else None,
+                    reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+                    cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                    llm_cost=llm_cost if llm_cost > 0 else None,
+                )
+
             return parsed_response
 
+        llm_api_handler_with_router_and_fallback.llm_key = llm_key  # type: ignore[attr-defined]
         return llm_api_handler_with_router_and_fallback
 
     @staticmethod
-    def get_llm_api_handler(llm_key: str, base_parameters: dict[str, Any] | None = None) -> LLMAPIHandler:
+    def get_llm_api_handler(
+        llm_key: str,
+        base_parameters: dict[str, Any] | None = None,
+    ) -> LLMAPIHandler:
         try:
             llm_config = LLMConfigRegistry.get_config(llm_key)
         except InvalidLLMConfigError:
@@ -526,7 +771,8 @@ class LLMAPIHandlerFactory:
             use_message_history: bool = False,
             raw_response: bool = False,
             window_dimension: Resolution | None = None,
-        ) -> dict[str, Any]:
+            force_dict: bool = True,
+        ) -> dict[str, Any] | Any:
             start_time = time.time()
             active_parameters = base_parameters or {}
             if parameters is None:
@@ -535,6 +781,9 @@ class LLMAPIHandlerFactory:
             active_parameters.update(parameters)
             if llm_config.litellm_params:  # type: ignore
                 active_parameters.update(llm_config.litellm_params)  # type: ignore
+
+            if "timeout" not in active_parameters:
+                active_parameters["timeout"] = settings.LLM_CONFIG_TIMEOUT
 
             # Apply thinking budget optimization if settings are available
             if (
@@ -545,27 +794,34 @@ class LLMAPIHandlerFactory:
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     active_parameters, new_budget, llm_config, prompt_name
                 )
-
-            context = skyvern_context.current()
-            if context and len(context.hashed_href_map) > 0:
-                await app.ARTIFACT_MANAGER.create_llm_artifact(
-                    data=json.dumps(context.hashed_href_map, indent=2).encode("utf-8"),
-                    artifact_type=ArtifactType.HASHED_HREF_MAP,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
+            elif prompt_name == EXTRACT_ACTION_PROMPT_NAME:
+                # Apply default thinking budget for extract-actions (512) unless overridden by experiment
+                LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+                    active_parameters, EXTRACT_ACTION_DEFAULT_THINKING_BUDGET, llm_config, prompt_name
                 )
 
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=prompt.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_PROMPT,
-                screenshots=screenshots,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
+            context = skyvern_context.current()
+            is_speculative_step = step.is_speculative if step else False
+            should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
+                step, is_speculative_step, task_v2, thought, ai_suggestion
             )
+            await _log_hashed_href_map_artifacts_if_needed(
+                context,
+                step,
+                task_v2,
+                thought,
+                ai_suggestion,
+                is_speculative_step=is_speculative_step,
+            )
+
+            llm_prompt_value = prompt
+            if should_persist_llm_artifacts:
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=llm_prompt_value.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_PROMPT,
+                    screenshots=screenshots,
+                    **artifact_targets,
+                )
 
             if not llm_config.supports_vision:
                 screenshots = None
@@ -575,34 +831,18 @@ class LLMAPIHandlerFactory:
             messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
 
             # Inject context caching system message when available
+            # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts
+            # (e.g., check-user-goal) with the extract-action schema
             try:
-                context_cached_static_prompt = getattr(context, "cached_static_prompt", None)
                 if (
-                    context_cached_static_prompt
+                    context
+                    and context.cached_static_prompt
+                    and prompt_name == EXTRACT_ACTION_PROMPT_NAME  # Only inject for extract-actions
                     and isinstance(llm_config, LLMConfig)
                     and isinstance(llm_config.model_name, str)
                 ):
-                    # Check if this is a Vertex AI model
-                    if "vertex_ai/" in llm_config.model_name:
-                        caching_system_message = {
-                            "role": "system",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": context_cached_static_prompt,
-                                    "cache_control": {"type": "ephemeral", "ttl": "3600s"},
-                                }
-                            ],
-                        }
-                        messages = [caching_system_message] + messages
-                        LOG.info(
-                            "Applied Vertex context caching",
-                            prompt_name=prompt_name,
-                            model=llm_config.model_name,
-                            ttl_seconds=3600,
-                        )
                     # Check if this is an OpenAI model
-                    elif (
+                    if (
                         llm_config.model_name.startswith("gpt-")
                         or llm_config.model_name.startswith("o1-")
                         or llm_config.model_name.startswith("o3-")
@@ -614,7 +854,7 @@ class LLMAPIHandlerFactory:
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": context_cached_static_prompt,
+                                    "text": context.cached_static_prompt,
                                 }
                             ],
                         }
@@ -626,30 +866,60 @@ class LLMAPIHandlerFactory:
                         )
             except Exception as e:
                 LOG.warning("Failed to apply context caching system message", error=str(e), exc_info=True)
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=json.dumps(
-                    {
-                        "model": model_name,
-                        "messages": messages,
-                        # we're not using active_parameters here because it may contain sensitive information
-                        **parameters,
-                    }
-                ).encode("utf-8"),
-                artifact_type=ArtifactType.LLM_REQUEST,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
-            )
+
+            # Add Vertex AI cache reference only for the intended cached prompt
+            vertex_cache_attached = False
+            cache_resource_name = getattr(context, "vertex_cache_name", None)
+            if (
+                cache_resource_name
+                and prompt_name == EXTRACT_ACTION_PROMPT_NAME
+                and getattr(context, "use_prompt_caching", False)
+                and "gemini" in model_name.lower()
+            ):
+                active_parameters["cached_content"] = cache_resource_name
+                vertex_cache_attached = True
+                LOG.info(
+                    "Adding Vertex AI cache reference to request",
+                    prompt_name=prompt_name,
+                    cache_attached=True,
+                    cache_name=cache_resource_name,
+                    cache_key=getattr(context, "vertex_cache_key", None),
+                    cache_variant=getattr(context, "vertex_cache_variant", None),
+                )
+            elif "cached_content" in active_parameters:
+                removed_cache = active_parameters.pop("cached_content", None)
+                if removed_cache:
+                    LOG.info(
+                        "Removed Vertex AI cache reference from request",
+                        prompt_name=prompt_name,
+                        cache_was_attached=True,
+                        cache_name=cache_resource_name,
+                        cache_key=getattr(context, "vertex_cache_key", None),
+                        cache_variant=getattr(context, "vertex_cache_variant", None),
+                    )
+
+            llm_request_payload = {
+                "model": model_name,
+                "messages": messages,
+                # we're not using active_parameters here because it may contain sensitive information
+                **parameters,
+                "vertex_cache_attached": vertex_cache_attached,
+            }
+            llm_request_json = json.dumps(llm_request_payload)
+            if should_persist_llm_artifacts:
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=llm_request_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_REQUEST,
+                    **artifact_targets,
+                )
+
             t_llm_request = time.perf_counter()
             try:
-                # TODO (kerem): add a timeout to this call
                 # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
                 # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
                 response = await litellm.acompletion(
                     model=model_name,
                     messages=messages,
-                    timeout=settings.LLM_CONFIG_TIMEOUT,
                     drop_params=True,  # Drop unsupported parameters gracefully
                     **active_parameters,
                 )
@@ -666,15 +936,27 @@ class LLMAPIHandlerFactory:
                 )
                 raise SkyvernContextWindowExceededError() from e
             except CancelledError:
+                # Speculative steps are intentionally cancelled when goal verification completes first,
+                # so we log at debug level. Non-speculative cancellations are unexpected errors.
                 t_llm_cancelled = time.perf_counter()
-                LOG.error(
-                    "LLM request got cancelled",
-                    llm_key=llm_key,
-                    model=model_name,
-                    prompt_name=prompt_name,
-                    duration=t_llm_cancelled - t_llm_request,
-                )
-                raise LLMProviderError(llm_key)
+                if is_speculative_step:
+                    LOG.debug(
+                        "LLM request cancelled (speculative step)",
+                        llm_key=llm_key,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                        duration=t_llm_cancelled - t_llm_request,
+                    )
+                    raise
+                else:
+                    LOG.error(
+                        "LLM request got cancelled",
+                        llm_key=llm_key,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                        duration=t_llm_cancelled - t_llm_request,
+                    )
+                    raise LLMProviderError(llm_key) from None
             except Exception as e:
                 duration_seconds = time.time() - start_time
                 LOG.exception(
@@ -686,14 +968,13 @@ class LLMAPIHandlerFactory:
                 )
                 raise LLMProviderError(llm_key) from e
 
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=response.model_dump_json(indent=2).encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
-            )
+            llm_response_json = response.model_dump_json(indent=2)
+            if should_persist_llm_artifacts:
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=llm_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE,
+                    **artifact_targets,
+                )
 
             prompt_tokens = 0
             completion_tokens = 0
@@ -730,7 +1011,9 @@ class LLMAPIHandlerFactory:
                 if cached_tokens == 0:
                     cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
 
-            if step:
+            _log_vertex_cache_hit_if_needed(context, prompt_name, model_name, cached_tokens)
+
+            if step and not is_speculative_step:
                 await app.DATABASE.update_step(
                     task_id=step.task_id,
                     step_id=step.step_id,
@@ -751,28 +1034,27 @@ class LLMAPIHandlerFactory:
                     cached_token_count=cached_tokens if cached_tokens > 0 else None,
                     thought_cost=llm_cost,
                 )
-            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
-            )
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
+            parsed_response_json = json.dumps(parsed_response, indent=2)
+            if should_persist_llm_artifacts:
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=parsed_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                    **artifact_targets,
+                )
 
+            rendered_response_json = None
             if context and len(context.hashed_href_map) > 0:
                 llm_content = json.dumps(parsed_response)
                 rendered_content = Template(llm_content).render(context.hashed_href_map)
                 parsed_response = json.loads(rendered_content)
-                await app.ARTIFACT_MANAGER.create_llm_artifact(
-                    data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                    step=step,
-                    task_v2=task_v2,
-                    thought=thought,
-                    ai_suggestion=ai_suggestion,
-                )
+                rendered_response_json = json.dumps(parsed_response, indent=2)
+                if should_persist_llm_artifacts:
+                    await app.ARTIFACT_MANAGER.create_llm_artifact(
+                        data=rendered_response_json.encode("utf-8"),
+                        artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                        **artifact_targets,
+                    )
 
             # Track LLM API handler duration, token counts, and cost
             organization_id = organization_id or (
@@ -795,8 +1077,26 @@ class LLMAPIHandlerFactory:
                 llm_cost=llm_cost if llm_cost > 0 else None,
             )
 
+            if step and is_speculative_step:
+                step.speculative_llm_metadata = SpeculativeLLMMetadata(
+                    prompt=llm_prompt_value,
+                    llm_request_json=llm_request_json,
+                    llm_response_json=llm_response_json,
+                    parsed_response_json=parsed_response_json,
+                    rendered_response_json=rendered_response_json,
+                    llm_key=llm_key,
+                    model=llm_config.model_name,
+                    duration_seconds=duration_seconds,
+                    input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                    output_tokens=completion_tokens if completion_tokens > 0 else None,
+                    reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+                    cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                    llm_cost=llm_cost if llm_cost > 0 else None,
+                )
+
             return parsed_response
 
+        llm_api_handler.llm_key = llm_key  # type: ignore[attr-defined]
         return llm_api_handler
 
     @staticmethod
@@ -868,7 +1168,11 @@ class LLMCaller:
         self.openai_client = None
         if self.llm_key.startswith("openrouter/"):
             self.llm_key = self.llm_key.replace("openrouter/", "")
-            self.openai_client = AsyncOpenAI(api_key=settings.OPENROUTER_API_KEY, base_url=settings.OPENROUTER_API_BASE)
+            self.openai_client = AsyncOpenAI(
+                api_key=settings.OPENROUTER_API_KEY,
+                base_url=settings.OPENROUTER_API_BASE,
+                http_client=ForgeAsyncHttpxClientWrapper(),
+            )
 
     def add_tool_result(self, tool_result: dict[str, Any]) -> None:
         self.current_tool_results.append(tool_result)
@@ -891,8 +1195,9 @@ class LLMCaller:
         use_message_history: bool = False,
         raw_response: bool = False,
         window_dimension: Resolution | None = None,
+        force_dict: bool = True,
         **extra_parameters: Any,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | Any:
         start_time = time.perf_counter()
         active_parameters = self.base_parameters or {}
         if parameters is None:
@@ -905,15 +1210,18 @@ class LLMCaller:
             active_parameters.update(self.llm_config.litellm_params)  # type: ignore
 
         context = skyvern_context.current()
-        if context and len(context.hashed_href_map) > 0:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=json.dumps(context.hashed_href_map, indent=2).encode("utf-8"),
-                artifact_type=ArtifactType.HASHED_HREF_MAP,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
-            )
+        is_speculative_step = step.is_speculative if step else False
+        should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
+            step, is_speculative_step, task_v2, thought, ai_suggestion
+        )
+        await _log_hashed_href_map_artifacts_if_needed(
+            context,
+            step,
+            task_v2,
+            thought,
+            ai_suggestion,
+            is_speculative_step=is_speculative_step,
+        )
 
         if screenshots and self.screenshot_scaling_enabled:
             target_dimension = self.get_screenshot_resize_target_dimension(window_dimension)
@@ -932,15 +1240,13 @@ class LLMCaller:
                         tool["display_width_px"] = target_dimension["width"]
             screenshots = resize_screenshots(screenshots, target_dimension)
 
-        if prompt:
+        llm_prompt_value = prompt or ""
+        if prompt and should_persist_llm_artifacts:
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=prompt.encode("utf-8"),
                 artifact_type=ArtifactType.LLM_PROMPT,
                 screenshots=screenshots,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
+                **artifact_targets,
             )
 
         if not self.llm_config.supports_vision:
@@ -964,21 +1270,19 @@ class LLMCaller:
                 screenshots,
                 message_pattern=message_pattern,
             )
-        await app.ARTIFACT_MANAGER.create_llm_artifact(
-            data=json.dumps(
-                {
-                    "model": self.llm_config.model_name,
-                    "messages": messages,
-                    # we're not using active_parameters here because it may contain sensitive information
-                    **parameters,
-                }
-            ).encode("utf-8"),
-            artifact_type=ArtifactType.LLM_REQUEST,
-            step=step,
-            task_v2=task_v2,
-            thought=thought,
-            ai_suggestion=ai_suggestion,
-        )
+        llm_request_payload = {
+            "model": self.llm_config.model_name,
+            "messages": messages,
+            # we're not using active_parameters here because it may contain sensitive information
+            **parameters,
+        }
+        llm_request_json = json.dumps(llm_request_payload)
+        if should_persist_llm_artifacts:
+            await app.ARTIFACT_MANAGER.create_llm_artifact(
+                data=llm_request_json.encode("utf-8"),
+                artifact_type=ArtifactType.LLM_REQUEST,
+                **artifact_targets,
+            )
         t_llm_request = time.perf_counter()
         try:
             response = await self._dispatch_llm_call(
@@ -1000,29 +1304,39 @@ class LLMCaller:
             )
             raise SkyvernContextWindowExceededError() from e
         except CancelledError:
+            # Speculative steps are intentionally cancelled when goal verification returns completed,
+            # so we log at debug level. Non-speculative cancellations are unexpected errors.
             t_llm_cancelled = time.perf_counter()
-            LOG.error(
-                "LLM request got cancelled",
-                llm_key=self.llm_key,
-                model=self.llm_config.model_name,
-                duration=t_llm_cancelled - t_llm_request,
-            )
-            raise LLMProviderError(self.llm_key)
+            if is_speculative_step:
+                LOG.debug(
+                    "LLM request cancelled (speculative step)",
+                    llm_key=self.llm_key,
+                    model=self.llm_config.model_name,
+                    duration=t_llm_cancelled - t_llm_request,
+                )
+                raise
+            else:
+                LOG.error(
+                    "LLM request got cancelled",
+                    llm_key=self.llm_key,
+                    model=self.llm_config.model_name,
+                    duration=t_llm_cancelled - t_llm_request,
+                )
+                raise LLMProviderError(self.llm_key) from None
         except Exception as e:
             LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
             raise LLMProviderError(self.llm_key) from e
 
-        await app.ARTIFACT_MANAGER.create_llm_artifact(
-            data=response.model_dump_json(indent=2).encode("utf-8"),
-            artifact_type=ArtifactType.LLM_RESPONSE,
-            step=step,
-            task_v2=task_v2,
-            thought=thought,
-            ai_suggestion=ai_suggestion,
-        )
+        llm_response_json = response.model_dump_json(indent=2)
+        if should_persist_llm_artifacts:
+            await app.ARTIFACT_MANAGER.create_llm_artifact(
+                data=llm_response_json.encode("utf-8"),
+                artifact_type=ArtifactType.LLM_RESPONSE,
+                **artifact_targets,
+            )
 
         call_stats = await self.get_call_stats(response)
-        if step:
+        if step and not is_speculative_step:
             await app.DATABASE.update_step(
                 task_id=step.task_id,
                 step_id=step.step_id,
@@ -1064,30 +1378,48 @@ class LLMCaller:
             cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens else None,
             llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost else None,
         )
+
+        # Raw response is used for CUA engine LLM calls.
         if raw_response:
             return response.model_dump(exclude_none=True)
 
-        parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix)
-        await app.ARTIFACT_MANAGER.create_llm_artifact(
-            data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-            artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-            step=step,
-            task_v2=task_v2,
-            thought=thought,
-            ai_suggestion=ai_suggestion,
-        )
+        parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix, force_dict)
+        parsed_response_json = json.dumps(parsed_response, indent=2)
+        if should_persist_llm_artifacts:
+            await app.ARTIFACT_MANAGER.create_llm_artifact(
+                data=parsed_response_json.encode("utf-8"),
+                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                **artifact_targets,
+            )
 
+        rendered_response_json = None
         if context and len(context.hashed_href_map) > 0:
             llm_content = json.dumps(parsed_response)
             rendered_content = Template(llm_content).render(context.hashed_href_map)
             parsed_response = json.loads(rendered_content)
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                step=step,
-                task_v2=task_v2,
-                thought=thought,
-                ai_suggestion=ai_suggestion,
+            rendered_response_json = json.dumps(parsed_response, indent=2)
+            if should_persist_llm_artifacts:
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=rendered_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                    **artifact_targets,
+                )
+
+        if step and is_speculative_step:
+            step.speculative_llm_metadata = SpeculativeLLMMetadata(
+                prompt=llm_prompt_value,
+                llm_request_json=llm_request_json,
+                llm_response_json=llm_response_json,
+                parsed_response_json=parsed_response_json,
+                rendered_response_json=rendered_response_json,
+                llm_key=self.llm_key,
+                model=self.llm_config.model_name,
+                duration_seconds=duration_seconds,
+                input_tokens=call_stats.input_tokens,
+                output_tokens=call_stats.output_tokens,
+                reasoning_tokens=call_stats.reasoning_tokens,
+                cached_tokens=call_stats.cached_tokens,
+                llm_cost=call_stats.llm_cost,
             )
 
         return parsed_response
@@ -1252,7 +1584,8 @@ class LLMCaller:
         if isinstance(response, UITarsResponse):
             ui_tars_usage = response.usage
             return LLMCallStats(
-                llm_cost=0,  # TODO: calculate the cost according to the price: https://www.volcengine.com/docs/82379/1544106
+                llm_cost=0,
+                # TODO: calculate the cost according to the price: https://www.volcengine.com/docs/82379/1544106
                 input_tokens=ui_tars_usage.get("prompt_tokens", 0),
                 output_tokens=ui_tars_usage.get("completion_tokens", 0),
                 cached_tokens=0,  # only part of model support cached tokens

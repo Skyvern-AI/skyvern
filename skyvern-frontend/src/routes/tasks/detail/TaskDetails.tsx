@@ -1,10 +1,13 @@
+import { AxiosError } from "axios";
 import { getClient } from "@/api/AxiosClient";
 import { useState } from "react";
 import {
+  RunEngine,
   Status,
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
+import { Status404 } from "@/components/Status404";
 import { StatusBadge } from "@/components/StatusBadge";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
@@ -25,15 +28,19 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { apiBaseUrl } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { type ApiCommandOptions } from "@/util/apiCommands";
+import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, Outlet, useParams } from "react-router-dom";
+import { Link, Outlet } from "react-router-dom";
 import { statusIsFinalized } from "../types";
+import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
+import { useFirstParam } from "@/hooks/useFirstParam";
+import * as env from "@/util/env";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -49,7 +56,7 @@ function createTaskRequestObject(values: TaskApiResponse) {
 }
 
 function TaskDetails() {
-  const { taskId } = useParams();
+  const taskId = useFirstParam("taskId", "runId");
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
@@ -59,7 +66,7 @@ function TaskDetails() {
     isLoading: taskIsLoading,
     isError: taskIsError,
     error: taskError,
-  } = useTaskQuery({ id: taskId });
+  } = useTaskQuery({ id: taskId ?? undefined });
 
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useQuery<WorkflowRunStatusApiResponse>({
@@ -129,6 +136,12 @@ function TaskDetails() {
   const [replayOpen, setReplayOpen] = useState(false);
 
   if (taskIsError) {
+    const status = (taskError as AxiosError | undefined)?.response?.status;
+
+    if (status === 404) {
+      return <Status404 />;
+    }
+
     return <div>Error: {taskError?.message}</div>;
   }
 
@@ -206,14 +219,30 @@ function TaskDetails() {
                     },
                   } satisfies ApiCommandOptions;
                 }
+
+                const includeOverrideHeader =
+                  task.max_steps_per_run !== null &&
+                  task.max_steps_per_run !== MAX_STEPS_DEFAULT;
+
+                const headers: Record<string, string> = {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
+                };
+
+                if (includeOverrideHeader) {
+                  headers["x-max-steps-override"] = String(
+                    task.max_steps_per_run,
+                  );
+                }
+
                 return {
                   method: "POST",
-                  url: `${apiBaseUrl}/tasks`,
-                  body: createTaskRequestObject(task),
-                  headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": apiCredential ?? "<your-api-key>",
-                  },
+                  url: `${runsApiBaseUrl}/run/tasks`,
+                  body: buildTaskRunPayload(
+                    createTaskRequestObject(task),
+                    RunEngine.SkyvernV1,
+                  ),
+                  headers,
                 } satisfies ApiCommandOptions;
               }}
               webhookDisabled={taskIsLoading || !taskHasTerminalState}
@@ -275,7 +304,11 @@ function TaskDetails() {
             workflow &&
             workflowRun && (
               <Link
-                to={`/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`}
+                to={
+                  env.useNewRunsUrl
+                    ? `/runs/${workflowRun.workflow_run_id}`
+                    : `/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`
+                }
               >
                 {workflow.title}
               </Link>

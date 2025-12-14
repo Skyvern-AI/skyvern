@@ -21,7 +21,8 @@ export function statusIsNotFinalized({ status }: { status: Status }): boolean {
   return (
     status === Status.Created ||
     status === Status.Queued ||
-    status === Status.Running
+    status === Status.Running ||
+    status === Status.Paused
   );
 }
 
@@ -49,4 +50,8 @@ export function statusIsRunningOrQueued({
   status: Status;
 }): boolean {
   return status === Status.Queued || status === Status.Running;
+}
+
+export function statusIsCancellable({ status }: { status: Status }): boolean {
+  return statusIsNotFinalized({ status });
 }

@@ -1,10 +1,9 @@
-import { ActionsApiResponse } from "@/api/types";
+import { ActionsApiResponse, Status as WorkflowRunStatus } from "@/api/types";
 import { BrowserStream } from "@/components/BrowserStream";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { ActionScreenshot } from "@/routes/tasks/detail/ActionScreenshot";
 import { statusIsFinalized } from "@/routes/tasks/types";
-import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
-import { useParams } from "react-router-dom";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
   isAction,
@@ -37,32 +36,29 @@ export type WorkflowRunOverviewActiveElement =
 function WorkflowRunOverview() {
   const [searchParams] = useSearchParams();
   const active = searchParams.get("active");
-  const { workflowPermanentId } = useParams<{
-    workflowPermanentId: string;
-  }>();
   const queryClient = useQueryClient();
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+    useWorkflowRunWithWorkflowQuery();
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
 
+  const workflowRunId = workflowRun?.workflow_run_id;
+  const workflow = workflowRun?.workflow;
+  const workflowPermanentId = workflow?.workflow_permanent_id;
+
   const invalidateQueries = useCallback(() => {
-    if (workflowRun) {
+    if (workflowRunId) {
       queryClient.invalidateQueries({
-        queryKey: [
-          "workflowRun",
-          workflowPermanentId,
-          workflowRun.workflow_run_id,
-        ],
+        queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
       });
       queryClient.invalidateQueries({ queryKey: ["workflowRuns"] });
       queryClient.invalidateQueries({
-        queryKey: ["workflowTasks", workflowRun.workflow_run_id],
+        queryKey: ["workflowTasks", workflowRunId],
       });
       queryClient.invalidateQueries({ queryKey: ["runs"] });
     }
-  }, [queryClient, workflowPermanentId, workflowRun]);
+  }, [queryClient, workflowPermanentId, workflowRunId]);
 
   if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
     return (
@@ -87,25 +83,50 @@ function WorkflowRunOverview() {
     workflowRunIsFinalized,
   );
 
-  const streamingComponent = workflowRun.browser_session_id ? (
-    <BrowserStream
-      workflow={{ run: workflowRun }}
-      onClose={() => invalidateQueries()}
-    />
-  ) : (
-    <WorkflowRunStream />
+  const browserSessionId = workflowRun.browser_session_id;
+
+  const isPaused =
+    workflowRun && workflowRun.status === WorkflowRunStatus.Paused;
+
+  const showStreamingBrowser =
+    (!workflowRunIsFinalized &&
+      browserSessionId &&
+      isWorkflowRunBlock(selection) &&
+      selection.block_type === "human_interaction") ||
+    selection === "stream";
+
+  const shouldShowBrowserStream = !!(
+    browserSessionId &&
+    !workflowRunIsFinalized &&
+    (selection === "stream" ||
+      (isWorkflowRunBlock(selection) &&
+        selection.block_type === "human_interaction"))
   );
 
   return (
     <AspectRatio ratio={16 / 9}>
-      {selection === "stream" && streamingComponent}
-      {selection !== "stream" && isAction(selection) && (
-        <ActionScreenshot
-          index={selection.action_order ?? 0}
-          stepId={selection.step_id ?? ""}
+      {shouldShowBrowserStream && (
+        <BrowserStream
+          key={browserSessionId}
+          browserSessionId={browserSessionId}
+          interactive={isPaused}
+          showControlButtons={isPaused}
+          workflow={undefined}
+          onClose={invalidateQueries}
         />
       )}
-      {isWorkflowRunBlock(selection) && (
+      {!shouldShowBrowserStream && selection === "stream" && (
+        <WorkflowRunStream />
+      )}
+      {selection !== "stream" &&
+        !showStreamingBrowser &&
+        isAction(selection) && (
+          <ActionScreenshot
+            index={selection.action_order ?? 0}
+            stepId={selection.step_id ?? ""}
+          />
+        )}
+      {isWorkflowRunBlock(selection) && !showStreamingBrowser && (
         <WorkflowRunBlockScreenshot
           workflowRunBlockId={selection.workflow_run_block_id}
         />

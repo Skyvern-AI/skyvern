@@ -13,12 +13,18 @@ type Props = {
   page?: number;
   pageSize?: number;
   statusFilters?: Array<Status>;
+  search?: string;
 } & UseQueryOptions;
 
-function useRunsQuery({ page = 1, pageSize = 10, statusFilters }: Props) {
+function useRunsQuery({
+  page = 1,
+  pageSize = 10,
+  statusFilters,
+  search,
+}: Props) {
   const credentialGetter = useCredentialGetter();
   return useQuery<Array<Task | WorkflowRunApiResponse>>({
-    queryKey: ["runs", { statusFilters }, page, pageSize],
+    queryKey: ["runs", { statusFilters }, page, pageSize, search],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
@@ -28,6 +34,9 @@ function useRunsQuery({ page = 1, pageSize = 10, statusFilters }: Props) {
         statusFilters.forEach((status) => {
           params.append("status", status);
         });
+      }
+      if (search) {
+        params.append("search_key", search);
       }
       return client.get("/runs", { params }).then((res) => res.data);
     },

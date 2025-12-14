@@ -3,8 +3,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Type, TypeVar
 
 import structlog
-from litellm import ConfigDict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.errors.errors import UserDefinedError
 from skyvern.webeye.actions.action_types import ActionType
@@ -29,13 +28,50 @@ class SelectOption(BaseModel):
         return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
 
 
+class VerificationStatus(StrEnum):
+    """Status of user goal verification."""
+
+    complete = "complete"  # Goal achieved successfully
+    terminate = "terminate"  # Goal cannot be achieved, stop trying
+    continue_step = "continue"  # Goal not yet achieved, continue with more steps
+
+
 class CompleteVerifyResult(BaseModel):
-    user_goal_achieved: bool
+    # New field: explicit status with three options (used when experiment is enabled)
+    status: VerificationStatus | None = None
+
+    # Legacy fields: for backward compatibility (used when experiment is disabled)
+    user_goal_achieved: bool = False
+    should_terminate: bool = False
+
     thoughts: str
     page_info: str | None = None
 
     def __repr__(self) -> str:
-        return f"CompleteVerifyResponse(thoughts={self.thoughts}, user_goal_achieved={self.user_goal_achieved}, page_info={self.page_info})"
+        if self.status:
+            return f"CompleteVerifyResult(status={self.status}, thoughts={self.thoughts}, page_info={self.page_info})"
+        return f"CompleteVerifyResult(thoughts={self.thoughts}, user_goal_achieved={self.user_goal_achieved}, should_terminate={self.should_terminate}, page_info={self.page_info})"
+
+    @property
+    def is_complete(self) -> bool:
+        """True if goal was achieved (supports both new and legacy formats)."""
+        if self.status:
+            return self.status == VerificationStatus.complete
+        return self.user_goal_achieved
+
+    @property
+    def is_terminate(self) -> bool:
+        """True if task should terminate (supports both new and legacy formats)."""
+        if self.status:
+            return self.status == VerificationStatus.terminate
+        return self.should_terminate
+
+    @property
+    def is_continue(self) -> bool:
+        """True if task should continue (supports both new and legacy formats)."""
+        if self.status:
+            return self.status == VerificationStatus.continue_step
+        return not self.user_goal_achieved and not self.should_terminate
 
 
 class InputOrSelectContext(BaseModel):
@@ -45,9 +81,15 @@ class InputOrSelectContext(BaseModel):
     is_search_bar: bool | None = None  # don't trigger custom-selection logic when it's a search bar
     is_location_input: bool | None = None  # address input usually requires auto completion
     is_date_related: bool | None = None  # date picker mini agent requires some special logic
+    date_format: str | None = None
 
     def __repr__(self) -> str:
         return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input}, intention={self.intention})"
+
+
+class ClickContext(BaseModel):
+    thought: str | None = None
+    single_option_click: bool | None = None
 
 
 class Action(BaseModel):
@@ -88,13 +130,23 @@ class Action(BaseModel):
     option: SelectOption | None = None
     is_checked: bool | None = None
     verified: bool = False
+    click_context: ClickContext | None = None
 
     # TOTP timing information for multi-field TOTP sequences
     totp_timing_info: dict[str, Any] | None = None
 
+    # flag indicating whether the action requires mini-agent mode
+    has_mini_agent: bool | None = None
+
     created_at: datetime | None = None
     modified_at: datetime | None = None
     created_by: str | None = None
+
+    def set_has_mini_agent(self) -> None:
+        """
+        Set the has_mini_agent flag to True if any mini-agent is involved when handling the action.
+        """
+        self.has_mini_agent = True
 
     @classmethod
     def validate(cls: Type[T], value: Any) -> T:
@@ -214,9 +266,10 @@ class SolveCaptchaAction(Action):
 class SelectOptionAction(WebAction):
     action_type: ActionType = ActionType.SELECT_OPTION
     option: SelectOption
+    download: bool = False
 
     def __repr__(self) -> str:
-        return f"SelectOptionAction(element_id={self.element_id}, option={self.option}, context={self.input_or_select_context})"
+        return f"SelectOptionAction(element_id={self.element_id}, option={self.option}, context={self.input_or_select_context}, download={self.download})"
 
 
 ###
@@ -236,6 +289,11 @@ class CheckboxAction(WebAction):
 class WaitAction(Action):
     action_type: ActionType = ActionType.WAIT
     seconds: int = 20
+
+
+class HoverAction(WebAction):
+    action_type: ActionType = ActionType.HOVER
+    hold_seconds: float = 0.0
 
 
 class TerminateAction(DecisiveAction):

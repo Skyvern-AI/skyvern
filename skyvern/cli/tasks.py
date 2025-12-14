@@ -41,7 +41,7 @@ def _get_client(api_key: str | None = None) -> Skyvern:
 
 def _list_workflow_tasks(client: Skyvern, run_id: str) -> list[dict]:
     """Return tasks for the given workflow run."""
-    resp = client.agent._client_wrapper.httpx_client.request(
+    resp = client._client_wrapper.httpx_client.request(
         "api/v1/tasks",
         method="GET",
         params={"workflow_run_id": run_id, "page_size": 100, "page": 1},

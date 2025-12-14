@@ -4,6 +4,7 @@ export const BlockType = {
     Task: "task",
     TaskV2: "task_v2",
     ForLoop: "for_loop",
+    Conditional: "conditional",
     Code: "code",
     TextPrompt: "text_prompt",
     DownloadToS3: "download_to_s3",
@@ -21,5 +22,6 @@ export const BlockType = {
     GotoUrl: "goto_url",
     PdfParser: "pdf_parser",
     HttpRequest: "http_request",
+    HumanInteraction: "human_interaction",
 } as const;
 export type BlockType = (typeof BlockType)[keyof typeof BlockType];

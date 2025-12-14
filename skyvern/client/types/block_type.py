@@ -7,6 +7,7 @@ BlockType = typing.Union[
         "task",
         "task_v2",
         "for_loop",
+        "conditional",
         "code",
         "text_prompt",
         "download_to_s3",
@@ -24,6 +25,7 @@ BlockType = typing.Union[
         "goto_url",
         "pdf_parser",
         "http_request",
+        "human_interaction",
     ],
     typing.Any,
 ]

@@ -192,6 +192,7 @@ export type Parameter =
 export type WorkflowBlock =
   | TaskBlock
   | ForLoopBlock
+  | ConditionalBlock
   | TextPromptBlock
   | CodeBlock
   | UploadToS3Block
@@ -200,6 +201,7 @@ export type WorkflowBlock =
   | SendEmailBlock
   | FileURLParserBlock
   | ValidationBlock
+  | HumanInteractionBlock
   | ActionBlock
   | NavigationBlock
   | ExtractionBlock
@@ -214,6 +216,7 @@ export type WorkflowBlock =
 export const WorkflowBlockTypes = {
   Task: "task",
   ForLoop: "for_loop",
+  Conditional: "conditional",
   Code: "code",
   TextPrompt: "text_prompt",
   DownloadToS3: "download_to_s3",
@@ -222,6 +225,7 @@ export const WorkflowBlockTypes = {
   SendEmail: "send_email",
   FileURLParser: "file_url_parser",
   Validation: "validation",
+  HumanInteraction: "human_interaction",
   Action: "action",
   Navigation: "navigation",
   Extraction: "extraction",
@@ -285,7 +289,35 @@ export type WorkflowBlockBase = {
   block_type: WorkflowBlockType;
   output_parameter: OutputParameter;
   continue_on_failure: boolean;
+  next_loop_on_failure?: boolean;
   model: WorkflowModel | null;
+  next_block_label?: string | null;
+};
+
+export const BranchCriteriaTypes = {
+  Jinja2Template: "jinja2_template",
+} as const;
+
+export type BranchCriteriaType =
+  (typeof BranchCriteriaTypes)[keyof typeof BranchCriteriaTypes];
+
+export type BranchCriteria = {
+  criteria_type: BranchCriteriaType;
+  expression: string;
+  description: string | null;
+};
+
+export type BranchCondition = {
+  id: string;
+  criteria: BranchCriteria | null;
+  next_block_label: string | null;
+  description: string | null;
+  is_default: boolean;
+};
+
+export type ConditionalBlock = WorkflowBlockBase & {
+  block_type: "conditional";
+  branch_conditions: Array<BranchCondition>;
 };
 
 export type TaskBlock = WorkflowBlockBase & {
@@ -305,7 +337,6 @@ export type TaskBlock = WorkflowBlockBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache?: boolean;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
@@ -318,7 +349,6 @@ export type Taskv2Block = WorkflowBlockBase & {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_steps: number | null;
-  cache_actions?: boolean;
   disable_cache: boolean;
 };
 
@@ -396,6 +426,20 @@ export type ValidationBlock = WorkflowBlockBase & {
   disable_cache?: boolean;
 };
 
+export type HumanInteractionBlock = WorkflowBlockBase & {
+  block_type: "human_interaction";
+
+  instructions: string;
+  positive_descriptor: string;
+  negative_descriptor: string;
+  timeout_seconds: number;
+
+  sender: string;
+  recipients: Array<string>;
+  subject: string;
+  body: string;
+};
+
 export type ActionBlock = WorkflowBlockBase & {
   block_type: "action";
   url: string | null;
@@ -409,7 +453,6 @@ export type ActionBlock = WorkflowBlockBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache?: boolean;
   engine: RunEngine | null;
 };
@@ -427,7 +470,6 @@ export type NavigationBlock = WorkflowBlockBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache?: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
@@ -444,7 +486,6 @@ export type ExtractionBlock = WorkflowBlockBase & {
   max_retries?: number;
   max_steps_per_run?: number | null;
   parameters: Array<WorkflowParameter>;
-  cache_actions: boolean;
   disable_cache?: boolean;
   engine: RunEngine | null;
 };
@@ -460,7 +501,6 @@ export type LoginBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache?: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
@@ -484,7 +524,6 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache?: boolean;
   engine: RunEngine | null;
   download_timeout: number | null; // seconds
@@ -507,12 +546,14 @@ export type HttpRequestBlock = WorkflowBlockBase & {
   url: string | null;
   headers: Record<string, string> | null;
   body: Record<string, unknown> | null;
+  files: Record<string, string> | null; // Dictionary mapping field names to file paths/URLs
   timeout: number;
   follow_redirects: boolean;
   parameters: Array<WorkflowParameter>;
 };
 
 export type WorkflowDefinition = {
+  version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
 };
@@ -521,6 +562,7 @@ export type WorkflowApiResponse = {
   workflow_id: string;
   organization_id: string;
   is_saved_task: boolean;
+  is_template: boolean;
   title: string;
   workflow_permanent_id: string;
   version: number;
@@ -543,6 +585,8 @@ export type WorkflowApiResponse = {
   ai_fallback: boolean | null;
   run_sequentially: boolean | null;
   sequential_key: string | null;
+  folder_id: string | null;
+  import_error: string | null;
 };
 
 export type WorkflowSettings = {
@@ -566,3 +610,9 @@ export function isOutputParameter(
 ): parameter is OutputParameter {
   return parameter.parameter_type === "output";
 }
+
+export type ImprovePromptForWorkflowResponse = {
+  error: string | null;
+  improved: string;
+  original: string;
+};

@@ -4,5 +4,6 @@
 export const CredentialTypeOutput = {
     Password: "password",
     CreditCard: "credit_card",
+    Secret: "secret",
 } as const;
 export type CredentialTypeOutput = (typeof CredentialTypeOutput)[keyof typeof CredentialTypeOutput];

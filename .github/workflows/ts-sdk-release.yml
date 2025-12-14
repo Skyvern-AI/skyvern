@@ -1,0 +1,72 @@
+name: Build Skyvern TS SDK and publish to npm
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'skyvern-ts/client/package.json'
+jobs:
+  check-version-change:
+    runs-on: ubuntu-latest
+    outputs:
+      version_changed: ${{ steps.check.outputs.version_changed }}
+      current_version: ${{ steps.check.outputs.current_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Check if version changed
+        id: check
+        run: |
+          # Get version from current package.json
+          CURRENT_VERSION=$(node -p "require('./skyvern-ts/client/package.json').version")
+
+          # Get version from previous commit
+          git checkout HEAD^1
+          PREVIOUS_VERSION=$(node -p "require('./skyvern-ts/client/package.json').version")
+          git checkout -
+
+          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
+            echo "Version changed from $PREVIOUS_VERSION to $CURRENT_VERSION"
+            echo "version_changed=true" >> $GITHUB_OUTPUT
+            echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "Version remained at $CURRENT_VERSION"
+            echo "version_changed=false" >> $GITHUB_OUTPUT
+            echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          fi
+  build-and-publish-sdk:
+    runs-on: ubuntu-latest
+    needs: check-version-change
+    if: needs.check-version-change.outputs.version_changed == 'true' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ./skyvern-ts/client
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Upgrade npm to a Trusted Publishing-capable version
+        run: npm i -g npm@^11.5.1
+      - name: Install Fern dependencies
+        run: npm install -g patch-package
+      - name: Install dependencies
+        run: npm ci
+      - name: Build CJS
+        run: npx tsc --project ./tsconfig.cjs.json
+      - name: Build ESM
+        run: npx tsc --project ./tsconfig.esm.json
+      - name: Rename ESM files
+        run: node scripts/rename-to-esm-files.js dist/esm
+      - name: Publish to npm with provenance via OIDC
+        env:
+          NPM_CONFIG_PROVENANCE: "true"
+        run: npm publish --access public --provenance

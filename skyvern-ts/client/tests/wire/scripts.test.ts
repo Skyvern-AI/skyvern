@@ -7,7 +7,7 @@ import { mockServerPool } from "../mock-server/MockServerPool";
 describe("Scripts", () => {
     test("runScript (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -26,7 +26,7 @@ describe("Scripts", () => {
 
     test("runScript (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server

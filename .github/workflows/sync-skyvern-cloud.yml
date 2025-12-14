@@ -51,6 +51,16 @@ jobs:
               echo "GIT_EMAIL=stas@skyvern.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=stas" >> $GITHUB_OUTPUT
               ;;
+            marcmuon)
+              echo "GH_PAT=${{ secrets.MARC_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=marc@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=marcmuon" >> $GITHUB_OUTPUT
+              ;;
+            celalzamanoglu)
+              echo "GH_PAT=${{ secrets.CELAL_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=celal@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=celalzamanoglu" >> $GITHUB_OUTPUT
+              ;;
             *)
               echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
               echo "GIT_EMAIL=shu@skyvern.com" >> $GITHUB_OUTPUT

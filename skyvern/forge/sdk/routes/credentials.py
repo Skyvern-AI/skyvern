@@ -1,3 +1,5 @@
+import json
+
 import structlog
 from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
 
@@ -5,27 +7,37 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.code_samples import (
-    CREATE_CREDENTIAL_CODE_SAMPLE,
-    CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD,
-    DELETE_CREDENTIAL_CODE_SAMPLE,
-    GET_CREDENTIAL_CODE_SAMPLE,
-    GET_CREDENTIALS_CODE_SAMPLE,
-    SEND_TOTP_CODE_CODE_SAMPLE,
+    CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_PYTHON,
+    CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_TS,
+    CREATE_CREDENTIAL_CODE_SAMPLE_PYTHON,
+    CREATE_CREDENTIAL_CODE_SAMPLE_TS,
+    DELETE_CREDENTIAL_CODE_SAMPLE_PYTHON,
+    DELETE_CREDENTIAL_CODE_SAMPLE_TS,
+    GET_CREDENTIAL_CODE_SAMPLE_PYTHON,
+    GET_CREDENTIAL_CODE_SAMPLE_TS,
+    GET_CREDENTIALS_CODE_SAMPLE_PYTHON,
+    GET_CREDENTIALS_CODE_SAMPLE_TS,
+    SEND_TOTP_CODE_CODE_SAMPLE_PYTHON,
+    SEND_TOTP_CODE_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
+    Credential,
     CredentialResponse,
     CredentialType,
     CredentialVaultType,
     CreditCardCredentialResponse,
     PasswordCredentialResponse,
+    SecretCredentialResponse,
 )
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredentialResponse,
     CreateAzureClientSecretCredentialRequest,
+    CreateCustomCredentialServiceConfigRequest,
     CreateOnePasswordTokenRequest,
     CreateOnePasswordTokenResponse,
+    CustomCredentialServiceConfigResponse,
     Organization,
 )
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCreate
@@ -60,7 +72,14 @@ async def fetch_credential_item_background(item_id: str) -> None:
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-method-name": "send_totp_code",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": SEND_TOTP_CODE_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": SEND_TOTP_CODE_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": SEND_TOTP_CODE_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.post(
@@ -80,6 +99,19 @@ async def send_totp_code(
         workflow_id=data.workflow_id,
         workflow_run_id=data.workflow_run_id,
     )
+    # validate task_id, workflow_id, workflow_run_id are valid ids in db if provided
+    if data.task_id:
+        task = await app.DATABASE.get_task(data.task_id, curr_org.organization_id)
+        if not task:
+            raise HTTPException(status_code=400, detail=f"Invalid task id: {data.task_id}")
+    if data.workflow_id:
+        workflow = await app.DATABASE.get_workflow(data.workflow_id, curr_org.organization_id)
+        if not workflow:
+            raise HTTPException(status_code=400, detail=f"Invalid workflow id: {data.workflow_id}")
+    if data.workflow_run_id:
+        workflow_run = await app.DATABASE.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
+        if not workflow_run:
+            raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
     content = data.content.strip()
     otp_value: OTPValue | None = OTPValue(value=content, type=OTPType.TOTP)
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
@@ -111,6 +143,58 @@ async def send_totp_code(
     )
 
 
+@base_router.get(
+    "/credentials/totp",
+    response_model=list[TOTPCode],
+    summary="List TOTP codes",
+    description="Retrieves recent TOTP codes for the current organization.",
+    tags=["Credentials"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_totp_codes",
+    },
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/totp/",
+    response_model=list[TOTPCode],
+    include_in_schema=False,
+)
+async def get_totp_codes(
+    curr_org: Organization = Depends(org_auth_service.get_current_org),
+    totp_identifier: str | None = Query(
+        None,
+        description="Filter by TOTP identifier such as an email or phone number.",
+        examples=["john.doe@example.com"],
+    ),
+    workflow_run_id: str | None = Query(
+        None,
+        description="Filter by workflow run ID.",
+        examples=["wr_123456"],
+    ),
+    otp_type: OTPType | None = Query(
+        None,
+        description="Filter by OTP type (e.g. totp, magic_link).",
+        examples=[OTPType.TOTP.value],
+    ),
+    limit: int = Query(
+        50,
+        ge=1,
+        le=200,
+        description="Maximum number of codes to return.",
+    ),
+) -> list[TOTPCode]:
+    codes = await app.DATABASE.get_recent_otp_codes(
+        organization_id=curr_org.organization_id,
+        limit=limit,
+        valid_lifespan_minutes=None,
+        otp_type=otp_type,
+        workflow_run_id=workflow_run_id,
+        totp_identifier=totp_identifier,
+    )
+
+    return codes
+
+
 @legacy_base_router.post("/credentials")
 @legacy_base_router.post("/credentials/", include_in_schema=False)
 @base_router.post(
@@ -125,8 +209,10 @@ async def send_totp_code(
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {"sdk": "python", "code": CREATE_CREDENTIAL_CODE_SAMPLE},
-                    {"sdk": "python", "code": CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD},
+                    {"sdk": "python", "code": CREATE_CREDENTIAL_CODE_SAMPLE_PYTHON},
+                    {"sdk": "python", "code": CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_PYTHON},
+                    {"sdk": "typescript", "code": CREATE_CREDENTIAL_CODE_SAMPLE_TS},
+                    {"sdk": "typescript", "code": CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_TS},
                 ]
             }
         ],
@@ -152,7 +238,7 @@ async def create_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    credential_service = await _get_credential_vault_service(current_org.organization_id)
+    credential_service = await _get_credential_vault_service()
 
     credential = await credential_service.create_credential(organization_id=current_org.organization_id, data=data)
 
@@ -182,6 +268,14 @@ async def create_credential(
             credential_type=data.credential_type,
             name=data.name,
         )
+    elif data.credential_type == CredentialType.SECRET:
+        credential_response = SecretCredentialResponse(secret_label=data.credential.secret_label)
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=data.credential_type,
+            name=data.name,
+        )
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported credential type: {data.credential_type}")
 
@@ -196,7 +290,14 @@ async def create_credential(
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-method-name": "delete_credential",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_CREDENTIAL_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": DELETE_CREDENTIAL_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": DELETE_CREDENTIAL_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.post(
@@ -243,7 +344,14 @@ async def delete_credential(
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_credential",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_CREDENTIAL_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_CREDENTIAL_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_CREDENTIAL_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.get(
@@ -260,9 +368,13 @@ async def get_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    credential_service = await _get_credential_vault_service(current_org.organization_id)
+    credential = await app.DATABASE.get_credential(
+        credential_id=credential_id, organization_id=current_org.organization_id
+    )
+    if not credential:
+        raise HTTPException(status_code=404, detail="Credential not found")
 
-    return await credential_service.get_credential(current_org.organization_id, credential_id)
+    return _convert_to_response(credential)
 
 
 @legacy_base_router.get("/credentials")
@@ -275,7 +387,14 @@ async def get_credential(
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_credentials",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_CREDENTIALS_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_CREDENTIALS_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_CREDENTIALS_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.get(
@@ -300,9 +419,8 @@ async def get_credentials(
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
     ),
 ) -> list[CredentialResponse]:
-    credential_service = await _get_credential_vault_service(current_org.organization_id)
-
-    return await credential_service.get_credentials(current_org.organization_id, page, page_size)
+    credentials = await app.DATABASE.get_credentials(current_org.organization_id, page=page, page_size=page_size)
+    return [_convert_to_response(credential) for credential in credentials]
 
 
 @base_router.get(
@@ -511,14 +629,157 @@ async def update_azure_client_secret_credential(
         )
 
 
-async def _get_credential_vault_service(organization_id: str) -> CredentialVaultService:
-    org_collection = await app.DATABASE.get_organization_bitwarden_collection(organization_id)
+@base_router.get(
+    "/credentials/custom_credential/get",
+    response_model=CustomCredentialServiceConfigResponse,
+    summary="Get Custom Credential Service Configuration",
+    description="Retrieves the current custom credential service configuration for the organization.",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/custom_credential/get/",
+    response_model=CustomCredentialServiceConfigResponse,
+    include_in_schema=False,
+)
+async def get_custom_credential_service_config(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CustomCredentialServiceConfigResponse:
+    """
+    Get the current custom credential service configuration for the organization.
+    """
+    try:
+        auth_token = await app.DATABASE.get_valid_org_auth_token(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.custom_credential_service.value,
+        )
+        if not auth_token:
+            raise HTTPException(
+                status_code=404,
+                detail="No custom credential service configuration found for this organization",
+            )
 
-    if settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.BITWARDEN or org_collection:
+        return CustomCredentialServiceConfigResponse(token=auth_token)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOG.error(
+            "Failed to get custom credential service configuration",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get custom credential service configuration: {e!s}",
+        ) from e
+
+
+@base_router.post(
+    "/credentials/custom_credential/create",
+    response_model=CustomCredentialServiceConfigResponse,
+    summary="Create or update Custom Credential Service Configuration",
+    description="Creates or updates a custom credential service configuration for the current organization. Only one valid configuration is allowed per organization.",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/credentials/custom_credential/create/",
+    response_model=CustomCredentialServiceConfigResponse,
+    include_in_schema=False,
+)
+async def update_custom_credential_service_config(
+    request: CreateCustomCredentialServiceConfigRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CustomCredentialServiceConfigResponse:
+    """
+    Create or update a custom credential service configuration for the current organization.
+
+    This endpoint ensures only one valid custom credential service configuration exists per organization.
+    If a valid configuration already exists, it will be invalidated before creating the new one.
+    """
+    try:
+        # Invalidate any existing valid custom credential service configuration for this organization
+        await app.DATABASE.invalidate_org_auth_tokens(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.custom_credential_service,
+        )
+
+        # Store the configuration as JSON in the token field
+        config_json = json.dumps(request.config.model_dump())
+
+        # Create the new configuration
+        auth_token = await app.DATABASE.create_org_auth_token(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.custom_credential_service,
+            token=config_json,
+        )
+
+        LOG.info(
+            "Created or updated custom credential service configuration",
+            organization_id=current_org.organization_id,
+            token_id=auth_token.id,
+        )
+
+        return CustomCredentialServiceConfigResponse(token=auth_token)
+
+    except Exception as e:
+        LOG.error(
+            "Failed to create or update custom credential service configuration",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create or update custom credential service configuration: {e!s}",
+        ) from e
+
+
+async def _get_credential_vault_service() -> CredentialVaultService:
+    if settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.BITWARDEN:
         return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
     elif settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.AZURE_VAULT:
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Azure Vault credential is not supported")
         return app.AZURE_CREDENTIAL_VAULT_SERVICE
+    elif settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.CUSTOM:
+        if not app.CUSTOM_CREDENTIAL_VAULT_SERVICE:
+            raise HTTPException(status_code=400, detail="Custom credential vault is not supported")
+        return app.CUSTOM_CREDENTIAL_VAULT_SERVICE
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
+
+
+def _convert_to_response(credential: Credential) -> CredentialResponse:
+    if credential.credential_type == CredentialType.PASSWORD:
+        credential_response = PasswordCredentialResponse(
+            username=credential.username or credential.credential_id,
+            totp_type=credential.totp_type,
+        )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=credential.credential_type,
+            name=credential.name,
+        )
+    elif credential.credential_type == CredentialType.CREDIT_CARD:
+        credential_response = CreditCardCredentialResponse(
+            last_four=credential.card_last4 or "****",
+            brand=credential.card_brand or "Card Brand",
+        )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=credential.credential_type,
+            name=credential.name,
+        )
+    elif credential.credential_type == CredentialType.SECRET:
+        credential_response = SecretCredentialResponse(secret_label=credential.secret_label)
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=credential.credential_type,
+            name=credential.name,
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Credential type not supported")

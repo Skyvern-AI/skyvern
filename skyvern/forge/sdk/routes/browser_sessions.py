@@ -6,15 +6,23 @@ from fastapi.responses import ORJSONResponse
 from skyvern import analytics
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.code_samples import (
-    CLOSE_BROWSER_SESSION_CODE_SAMPLE,
-    CREATE_BROWSER_SESSION_CODE_SAMPLE,
-    GET_BROWSER_SESSION_CODE_SAMPLE,
-    GET_BROWSER_SESSIONS_CODE_SAMPLE,
+    CLOSE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
+    CLOSE_BROWSER_SESSION_CODE_SAMPLE_TS,
+    CREATE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
+    CREATE_BROWSER_SESSION_CODE_SAMPLE_TS,
+    GET_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
+    GET_BROWSER_SESSION_CODE_SAMPLE_TS,
+    GET_BROWSER_SESSIONS_CODE_SAMPLE_PYTHON,
+    GET_BROWSER_SESSIONS_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.schemas.browser_sessions import CreateBrowserSessionRequest
+from skyvern.schemas.browser_sessions import (
+    CreateBrowserSessionRequest,
+    ProcessBrowserSessionRecordingRequest,
+    ProcessBrowserSessionRecordingResponse,
+)
 from skyvern.webeye.schemas import BrowserSessionResponse
 
 
@@ -56,7 +64,14 @@ async def get_browser_sessions_all(
     tags=["Browser Sessions"],
     openapi_extra={
         "x-fern-sdk-method-name": "create_browser_session",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CREATE_BROWSER_SESSION_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": CREATE_BROWSER_SESSION_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": CREATE_BROWSER_SESSION_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Create a browser session that persists across multiple runs",
     summary="Create a session",
@@ -71,7 +86,7 @@ async def get_browser_sessions_all(
     include_in_schema=False,
 )
 async def create_browser_session(
-    browser_session_request: CreateBrowserSessionRequest,
+    browser_session_request: CreateBrowserSessionRequest = CreateBrowserSessionRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
@@ -87,7 +102,14 @@ async def create_browser_session(
     tags=["Browser Sessions"],
     openapi_extra={
         "x-fern-sdk-method-name": "close_browser_session",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CLOSE_BROWSER_SESSION_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": CLOSE_BROWSER_SESSION_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": CLOSE_BROWSER_SESSION_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Close a session. Once closed, the session cannot be used again.",
     summary="Close a session",
@@ -122,7 +144,14 @@ async def close_browser_session(
     tags=["Browser Sessions"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_browser_session",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_BROWSER_SESSION_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_BROWSER_SESSION_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_BROWSER_SESSION_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Get details about a specific browser session, including the browser address for cdp connection.",
     summary="Get a session",
@@ -159,7 +188,14 @@ async def get_browser_session(
     tags=["Browser Sessions"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_browser_sessions",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_BROWSER_SESSIONS_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_BROWSER_SESSIONS_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_BROWSER_SESSIONS_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Get all active browser sessions for the organization",
     summary="Get active browser sessions",
@@ -185,3 +221,29 @@ async def get_browser_sessions(
             for browser_session in browser_sessions
         ]
     )
+
+
+@base_router.post(
+    "/browser_sessions/{browser_session_id}/process_recording",
+    include_in_schema=False,
+)
+async def process_recording(
+    browser_session_id: str = Path(..., description="The ID of the browser session.", examples=["pbs_123456"]),
+    recording_request: ProcessBrowserSessionRecordingRequest = ProcessBrowserSessionRecordingRequest(),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ProcessBrowserSessionRecordingResponse:
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+        browser_session_id,
+        current_org.organization_id,
+    )
+    if not browser_session:
+        raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
+
+    blocks, parameters = await app.BROWSER_SESSION_RECORDING_SERVICE.process_recording(
+        organization_id=current_org.organization_id,
+        browser_session_id=browser_session_id,
+        compressed_chunks=recording_request.compressed_chunks,
+        workflow_permanent_id=recording_request.workflow_permanent_id,
+    )
+
+    return ProcessBrowserSessionRecordingResponse(blocks=blocks, parameters=parameters)

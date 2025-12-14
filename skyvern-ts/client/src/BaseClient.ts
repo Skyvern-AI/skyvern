@@ -7,7 +7,6 @@ export interface BaseClientOptions {
     environment?: core.Supplier<environments.SkyvernEnvironment | string>;
     /** Specify a custom URL to connect the client to. */
     baseUrl?: core.Supplier<string>;
-    xApiKey?: core.Supplier<string | undefined>;
     /** Override the x-api-key header */
     apiKey?: core.Supplier<string | undefined>;
     /** Additional headers to include in requests. */
