@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import random
@@ -92,7 +93,6 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
-    FileDownloadBlock,
     ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -125,8 +125,8 @@ from skyvern.webeye.actions.parse_actions import (
     parse_ui_tars_actions,
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
-from skyvern.webeye.browser_factory import BrowserState
-from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
+from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -143,6 +143,7 @@ class SpeculativePlan:
     use_caching: bool
     llm_json_response: dict[str, Any] | None
     llm_metadata: SpeculativeLLMMetadata | None = None
+    prompt_name: str = "extract-actions"
 
 
 class ActionLinkedNode:
@@ -443,7 +444,7 @@ class ForgeAgent:
                 page = await browser_state.must_get_working_page()
                 current_url = page.url
                 if current_url.rstrip("/") != task.url.rstrip("/"):
-                    await page.goto(task.url)
+                    await page.goto(task.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                 step = await self.update_step(
                     step, status=StepStatus.completed, is_last=True, output=AgentStepOutput(action_results=[])
                 )
@@ -945,11 +946,19 @@ class ForgeAgent:
                 json_response = speculative_plan.llm_json_response
                 reuse_speculative_llm_response = json_response is not None
                 speculative_llm_metadata = speculative_plan.llm_metadata
+                prompt_name = speculative_plan.prompt_name
+                await self._persist_scrape_artifacts(
+                    task=task,
+                    step=step,
+                    scraped_page=scraped_page,
+                    context=context,
+                )
             else:
                 (
                     scraped_page,
                     extract_action_prompt,
                     use_caching,
+                    prompt_name,
                 ) = await self.build_and_record_step_prompt(
                     task,
                     step,
@@ -1014,7 +1023,7 @@ class ForgeAgent:
                     if not reuse_speculative_llm_response:
                         json_response = await llm_api_handler(
                             prompt=extract_action_prompt,
-                            prompt_name="extract-actions",
+                            prompt_name=prompt_name,
                             step=step,
                             screenshots=scraped_page.screenshots,
                         )
@@ -1369,44 +1378,8 @@ class ForgeAgent:
                     properties={"task_url": task.url, "organization_id": task.organization_id},
                 )
 
-                # Check if parallel verification is enabled
-                distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "ENABLE_PARALLEL_USER_GOAL_CHECK",
-                    distinct_id,
-                    properties={"organization_id": task.organization_id, "task_url": task.url},
-                )
-
-                if not disable_user_goal_check and not enable_parallel_verification:
-                    # Standard synchronous verification
-                    working_page = await browser_state.must_get_working_page()
-                    complete_action = await self.check_user_goal_complete(
-                        page=working_page,
-                        scraped_page=scraped_page,
-                        task=task,
-                        step=step,
-                        task_block=task_block,
-                    )
-                    if complete_action is not None:
-                        LOG.info("User goal achieved, executing complete action")
-                        complete_action.organization_id = task.organization_id
-                        complete_action.workflow_run_id = task.workflow_run_id
-                        complete_action.task_id = task.task_id
-                        complete_action.step_id = step.step_id
-                        complete_action.step_order = step.order
-                        complete_action.action_order = len(detailed_agent_step_output.actions_and_results)
-                        complete_results = await ActionHandler.handle_action(
-                            scraped_page, task, step, working_page, complete_action
-                        )
-                        detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
-                        await self.record_artifacts_after_action(task, step, browser_state, engine)
-                elif enable_parallel_verification:
-                    # Parallel verification enabled - defer check to handle_completed_step
-                    LOG.info(
-                        "Parallel verification enabled, deferring user goal check to handle_completed_step",
-                        step_id=step.step_id,
-                        task_id=task.task_id,
-                    )
+                # Parallel verification is always enabled (user goal check deferred to handle_completed_step)
+                enable_parallel_verification = not disable_user_goal_check
 
             # if the last action is complete and is successful, check if there's a data extraction goal
             # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
@@ -1762,43 +1735,6 @@ class ForgeAgent:
 
         return actions
 
-    async def _should_skip_screenshot_annotations(self, task: Task, draw_boxes: bool) -> bool:
-        """
-        Check PostHog feature flag to determine if screenshot annotations should be skipped.
-
-        Args:
-            task: The task being executed
-            draw_boxes: Current value indicating if boxes should be drawn
-
-        Returns:
-            bool: True if annotations should be drawn, False if they should be skipped
-        """
-        if not draw_boxes:  # Only check if we were going to draw boxes
-            return draw_boxes
-
-        try:
-            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-            skip_annotations = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "SKIP_SCREENSHOT_ANNOTATIONS",
-                distinct_id,
-                properties={"organization_id": task.organization_id},
-            )
-            if skip_annotations:
-                LOG.info(
-                    "Skipping screenshot annotations per SKIP_SCREENSHOT_ANNOTATIONS feature flag",
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-                return False
-        except Exception:
-            LOG.warning(
-                "Failed to check SKIP_SCREENSHOT_ANNOTATIONS feature flag, using default behavior",
-                task_id=task.task_id,
-                exc_info=True,
-            )
-
-        return draw_boxes
-
     async def _speculate_next_step_plan(
         self,
         task: Task,
@@ -1818,7 +1754,7 @@ class ForgeAgent:
         try:
             next_step.is_speculative = True
 
-            scraped_page, extract_action_prompt, use_caching = await self.build_and_record_step_prompt(
+            scraped_page, extract_action_prompt, use_caching, prompt_name = await self.build_and_record_step_prompt(
                 task,
                 next_step,
                 browser_state,
@@ -1833,7 +1769,7 @@ class ForgeAgent:
 
             llm_json_response = await llm_api_handler(
                 prompt=extract_action_prompt,
-                prompt_name="extract-actions",
+                prompt_name=prompt_name,
                 step=next_step,
                 screenshots=scraped_page.screenshots,
             )
@@ -1856,6 +1792,7 @@ class ForgeAgent:
                 use_caching=use_caching,
                 llm_json_response=llm_json_response,
                 llm_metadata=metadata_copy,
+                prompt_name=prompt_name,
             )
         except Exception:
             LOG.warning(
@@ -2024,7 +1961,7 @@ class ForgeAgent:
             )
 
     async def complete_verify(
-        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step, task_block: BaseTaskBlock | None = None
+        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteVerifyResult:
         LOG.info(
             "Checking if user goal is achieved after re-scraping the page",
@@ -2043,33 +1980,29 @@ class ForgeAgent:
             actions_and_results_str = await self._get_action_results(task, current_step=step)
 
         # Check if we should use the termination-aware prompt (experiment)
-        # Only enabled for file download blocks
         use_termination_prompt = False
-        is_file_download_block = task_block is not None and isinstance(task_block, FileDownloadBlock)
-
-        if is_file_download_block:
-            try:
-                distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                use_termination_prompt = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "USE_TERMINATION_AWARE_COMPLETE_VERIFICATION",
-                    distinct_id,
-                    properties={"organization_id": task.organization_id},
-                )
-                if use_termination_prompt:
-                    LOG.info(
-                        "Experiment enabled: using termination-aware complete verification prompt for file download block",
-                        task_id=task.task_id,
-                        workflow_run_id=task.workflow_run_id,
-                        organization_id=task.organization_id,
-                        block_type="file_download",
-                    )
-            except Exception as e:
-                LOG.warning(
-                    "Failed to check USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment; using legacy behavior",
+        try:
+            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+            use_termination_prompt = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "USE_TERMINATION_AWARE_COMPLETE_VERIFICATION",
+                distinct_id,
+                properties={"organization_id": task.organization_id, "task_url": task.url},
+            )
+            if use_termination_prompt:
+                LOG.info(
+                    "Experiment enabled: using termination-aware complete verification prompt for file download block",
                     task_id=task.task_id,
                     workflow_run_id=task.workflow_run_id,
-                    error=str(e),
+                    organization_id=task.organization_id,
+                    block_type="file_download",
                 )
+        except Exception as e:
+            LOG.warning(
+                "Failed to check USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment; using legacy behavior",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                error=str(e),
+            )
 
         # Select the appropriate template based on experiment
         template_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
@@ -2133,7 +2066,7 @@ class ForgeAgent:
         return CompleteVerifyResult.model_validate(verification_result)
 
     async def check_user_goal_complete(
-        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step, task_block: BaseTaskBlock | None = None
+        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteAction | TerminateAction | None:
         try:
             verification_result = await self.complete_verify(
@@ -2141,7 +2074,6 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
-                task_block=task_block,
             )
 
             # Check if we should terminate instead of complete
@@ -2185,6 +2117,13 @@ class ForgeAgent:
         if not working_page:
             raise MissingBrowserStatePage()
 
+        skyvern_frame: SkyvernFrame | None = None
+        try:
+            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info("Failed to wait for animation end, ignore it", exc_info=True)
+
         context = skyvern_context.ensure_context()
         scrolling_number = context.max_screenshot_scrolls
         if scrolling_number is None:
@@ -2194,14 +2133,22 @@ class ForgeAgent:
             scrolling_number = 0
 
         try:
+            # get current x, y position of the page
+            x: int | None = None
+            y: int | None = None
+            try:
+                x, y = await skyvern_frame.get_scroll_x_y() if skyvern_frame else (None, None)
+                LOG.debug("Current x, y position of the page before taking screenshot", x=x, y=y)
+            except Exception:
+                LOG.warning("Failed to get current x, y position of the page", exc_info=True)
+
             screenshot = await browser_state.take_post_action_screenshot(
                 scrolling_number=scrolling_number,
-                use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "ENABLE_PLAYWRIGHT_FULLPAGE",
-                    task.workflow_run_id or task.task_id,
-                    properties={"organization_id": task.organization_id},
-                ),
             )
+            # scroll back to the original x, y position of the page
+            if skyvern_frame and x is not None and y is not None:
+                await skyvern_frame.safe_scroll_to_x_y(x, y)
+                LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
                 artifact_type=ArtifactType.SCREENSHOT_ACTION,
@@ -2309,13 +2256,9 @@ class ForgeAgent:
             draw_boxes = False
             scroll = False
 
-        # Check PostHog feature flag to skip screenshot annotations
-        draw_boxes = await self._should_skip_screenshot_annotations(task, draw_boxes)
-
-        return await scrape_website(
-            browser_state,
-            task.url,
-            app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step),
+        return await browser_state.scrape_website(
+            url=task.url,
+            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step),
             scrape_exclude=app.scrape_exclude,
             max_screenshot_number=max_screenshot_number,
             draw_boxes=draw_boxes,
@@ -2330,7 +2273,7 @@ class ForgeAgent:
         engine: RunEngine,
         *,
         persist_artifacts: bool = True,
-    ) -> tuple[ScrapedPage, str, bool]:
+    ) -> tuple[ScrapedPage, str, bool, str]:
         # Check if we have pre-scraped data from parallel verification optimization
         context = skyvern_context.current()
         scraped_page: ScrapedPage | None = None
@@ -2410,10 +2353,11 @@ class ForgeAgent:
         use_caching = False
 
         if persist_artifacts:
-            await app.ARTIFACT_MANAGER.create_artifact(
+            await self._persist_scrape_artifacts(
+                task=task,
                 step=step,
-                artifact_type=ArtifactType.HTML_SCRAPE,
-                data=scraped_page.html.encode(),
+                scraped_page=scraped_page,
+                context=context,
             )
         LOG.info(
             "Scraped website",
@@ -2422,57 +2366,10 @@ class ForgeAgent:
             num_elements=len(scraped_page.elements),
             url=task.url,
         )
-        # TODO: we only use HTML element for now, introduce a way to switch in the future
-        enable_speed_optimizations = getattr(context, "enable_speed_optimizations", False)
-        element_tree_format = ElementTreeFormat.HTML
-
-        # OPTIMIZATION: Use economy tree (skip SVGs) when ENABLE_SPEED_OPTIMIZATIONS is enabled
-        # Economy tree removes all SVG elements from the DOM tree sent to LLM
-        # - SVGs are decorative (icons, logos, graphics) - not needed for action planning
-        # - Even for charts/graphs: LLM sees them in screenshots, not SVG code
-        # - Saves ~8s per SVG x ~15 SVGs = ~120s per workflow (30% speedup!)
-        #
-        # RETRY STRATEGY: Use economy tree on first attempt only
-        # - retry_index 0: Use economy tree (fast, no SVGs)
-        # - retry_index 1+: Use regular tree (SVGs loaded from existing 4-week cache)
-        # Note: SVG conversions are already cached globally with 4-week TTL, so retries are fast
-        #
-        # COORDINATION: The enable_speed_optimizations decision is made ONCE before scraping
-        # and stored in context. Both SVG conversion skip (agent_functions.py) and tree
-        # selection (here) use the SAME value, ensuring perfect coordination.
-        element_tree_in_prompt: str = ""
-
-        # Use the speed optimization decision from context (set before scraping)
-        enable_speed_optimizations = context.enable_speed_optimizations if context else False
-
-        if not enable_speed_optimizations:
-            # Optimization disabled - use regular tree always
-            element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
-        elif step.retry_index == 0:
-            # First attempt - use economy tree (fast, no SVG conversion)
-            # Note: SVG conversion was already skipped in cleanup_element_tree_func
-            # based on the same context.enable_speed_optimizations value
-            element_tree_in_prompt = scraped_page.build_economy_elements_tree(element_tree_format)
-            LOG.info(
-                "Speed optimization: Using economy element tree (skipping SVGs)",
-                step_order=step.order,
-                step_retry=step.retry_index,
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-            )
-        else:
-            # Retry 1+ - use regular tree (SVGs will be loaded from existing 4-week cache)
-            element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
-            LOG.info(
-                "Speed optimization: Using regular tree on retry (SVGs from global cache)",
-                step_order=step.order,
-                step_retry=step.retry_index,
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-            )
         extract_action_prompt = ""
+        prompt_name = EXTRACT_ACTION_PROMPT_NAME  # Default; overwritten below for non-CUA engines
         if engine not in CUA_ENGINES:
-            extract_action_prompt, use_caching = await self._build_extract_action_prompt(
+            extract_action_prompt, use_caching, prompt_name = await self._build_extract_action_prompt(
                 task,
                 step,
                 browser_state,
@@ -2481,37 +2378,130 @@ class ForgeAgent:
                 expire_verification_code=True,
             )
 
-        if persist_artifacts:
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
-                data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode(),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
-                data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode(),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
-                data=json.dumps(scraped_page.element_tree, indent=2).encode(),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
-                data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode(),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
-                data=element_tree_in_prompt.encode(),
-            )
+        return scraped_page, extract_action_prompt, use_caching, prompt_name
 
-        return scraped_page, extract_action_prompt, use_caching
+    async def _persist_scrape_artifacts(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        context: SkyvernContext | None,
+    ) -> None:
+        """
+        Persist the core scrape artifacts (HTML + element metadata) for a step.
+        This is used both for regular runs and when adopting a speculative plan.
+        """
+
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.HTML_SCRAPE,
+            data=scraped_page.html.encode(),
+        )
+
+        element_tree_format = ElementTreeFormat.HTML
+        element_tree_in_prompt = self._build_element_tree_for_prompt(
+            scraped_page=scraped_page,
+            step=step,
+            task=task,
+            context=context,
+            element_tree_format=element_tree_format,
+        )
+
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+            data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode(),
+        )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+            data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode(),
+        )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
+            data=json.dumps(scraped_page.element_tree, indent=2).encode(),
+        )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+            data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode(),
+        )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+            data=element_tree_in_prompt.encode(),
+        )
+
+    def _build_element_tree_for_prompt(
+        self,
+        *,
+        scraped_page: ScrapedPage,
+        step: Step,
+        task: Task,
+        context: SkyvernContext | None,
+        element_tree_format: ElementTreeFormat,
+    ) -> str:
+        """
+        Determine which element tree representation should be captured for the prompt/artifacts.
+        Mirrors the previous inline logic so that speculative runs can reuse it.
+        """
+
+        enable_speed_optimizations = context.enable_speed_optimizations if context else False
+        if not enable_speed_optimizations:
+            return scraped_page.build_element_tree(element_tree_format)
+
+        if step.retry_index == 0:
+            element_tree_in_prompt = scraped_page.build_economy_elements_tree(element_tree_format)
+            LOG.info(
+                "Speed optimization: Using economy element tree (skipping SVGs)",
+                step_order=step.order,
+                step_retry=step.retry_index,
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+            return element_tree_in_prompt
+
+        element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
+        LOG.info(
+            "Speed optimization: Using regular tree on retry (SVGs from global cache)",
+            step_order=step.order,
+            step_retry=step.retry_index,
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        return element_tree_in_prompt
+
+    @staticmethod
+    def _build_extract_action_cache_variant(
+        verification_code_check: bool,
+        has_magic_link_page: bool,
+        complete_criterion: str | None,
+    ) -> str:
+        """
+        Build a short-but-unique cache variant identifier so extract-action prompts that
+        differ meaningfully (OTP, magic link flows, complete criteria) do not reuse the
+        same Vertex cache object.
+        """
+        variant_parts: list[str] = []
+        if verification_code_check:
+            variant_parts.append("vc")
+        if has_magic_link_page:
+            variant_parts.append("ml")
+        if complete_criterion:
+            normalized = " ".join(complete_criterion.split())
+            digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:6]
+            variant_parts.append(f"cc{digest}")
+        return "-".join(variant_parts) if variant_parts else "std"
 
     async def _create_vertex_cache_for_task(
-        self, task: Task, static_prompt: str, context: SkyvernContext, llm_key_override: str | None
+        self,
+        task: Task,
+        static_prompt: str,
+        context: SkyvernContext,
+        llm_key_override: str | None,
+        prompt_variant: str | None = None,
     ) -> None:
         """
         Create a Vertex AI cache for the task's static prompt.
@@ -2522,9 +2512,9 @@ class ForgeAgent:
             task: The task to create cache for
             static_prompt: The static prompt content to cache
             context: The Skyvern context to store the cache name in
+            llm_key_override: Optional override when we explicitly pick an LLM key
+            prompt_variant: Cache variant identifier (std/vc/ml/etc.)
         """
-        # Early return if task doesn't have an llm_key
-        # This should not happen given the guard at the call site, but being defensive
         resolved_llm_key = llm_key_override or task.llm_key
 
         if not resolved_llm_key:
@@ -2534,17 +2524,20 @@ class ForgeAgent:
             )
             return
 
+        cache_variant = prompt_variant or "std"
+
         try:
             LOG.info(
                 "Attempting Vertex AI cache creation",
                 task_id=task.task_id,
                 llm_key=resolved_llm_key,
+                cache_variant=cache_variant,
             )
             cache_manager = get_cache_manager()
 
-            # Use llm_key as cache_key so all tasks with the same model share the same cache
-            # This maximizes cache reuse and reduces cache storage costs
-            cache_key = f"{EXTRACT_ACTION_CACHE_KEY_PREFIX}-{resolved_llm_key}"
+            variant_suffix = f"-{cache_variant}" if cache_variant else ""
+
+            cache_key = f"{EXTRACT_ACTION_CACHE_KEY_PREFIX}{variant_suffix}-{resolved_llm_key}"
 
             # Get the actual model name from LLM config to ensure correct format
             # (e.g., "gemini-2.5-flash" with decimal, not "gemini-2-5-flash")
@@ -2608,8 +2601,10 @@ class ForgeAgent:
                 ttl_seconds=3600,  # 1 hour
             )
 
-            # Store cache resource name in context
+            # Store cache metadata in context
             context.vertex_cache_name = cache_data["name"]
+            context.vertex_cache_key = cache_key
+            context.vertex_cache_variant = cache_variant
 
             LOG.info(
                 "Created Vertex AI cache for task",
@@ -2617,6 +2612,7 @@ class ForgeAgent:
                 cache_key=cache_key,
                 cache_name=cache_data["name"],
                 model_name=model_name,
+                cache_variant=cache_variant,
             )
         except Exception as e:
             LOG.warning(
@@ -2634,7 +2630,7 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         verification_code_check: bool = False,
         expire_verification_code: bool = False,
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, bool, str]:
         actions_and_results_str = await self._get_action_results(task)
 
         # Generate the extract action prompt
@@ -2691,12 +2687,14 @@ class ForgeAgent:
 
         context = skyvern_context.ensure_context()
 
-        # Reset cached prompt by default; we will set it below if caching is enabled.
+        # Reset cached prompt and cache reference by default; we will set them below if caching is enabled.
+        # This prevents extract-action cache from being attached to other prompts like decisive-criterion-validate.
         context.cached_static_prompt = None
+        context.vertex_cache_name = None
 
         # Check if prompt caching is enabled for extract-action
         use_caching = False
-        prompt_caching_settings = LLMAPIHandlerFactory._prompt_caching_settings or {}
+        prompt_caching_settings = await self._get_prompt_caching_settings(context)
         effective_llm_key = task.llm_key
         if not effective_llm_key:
             handler_for_key = LLMAPIHandlerFactory.get_override_llm_api_handler(
@@ -2744,6 +2742,11 @@ class ForgeAgent:
                     "parse_select_feature_enabled": context.enable_parse_select_in_extract,
                     "has_magic_link_page": context.has_magic_link_page(task.task_id),
                 }
+                cache_variant = self._build_extract_action_cache_variant(
+                    verification_code_check=verification_code_check,
+                    has_magic_link_page=context.has_magic_link_page(task.task_id),
+                    complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
                     f"{template}-dynamic",
@@ -2761,7 +2764,13 @@ class ForgeAgent:
 
                 # Create Vertex AI cache for Gemini models
                 if effective_llm_key and "GEMINI" in effective_llm_key:
-                    await self._create_vertex_cache_for_task(task, static_prompt, context, effective_llm_key)
+                    await self._create_vertex_cache_for_task(
+                        task,
+                        static_prompt,
+                        context,
+                        effective_llm_key,
+                        prompt_variant=cache_variant,
+                    )
 
                 combined_prompt = f"{static_prompt.rstrip()}\n\n{dynamic_prompt.lstrip()}"
 
@@ -2769,8 +2778,11 @@ class ForgeAgent:
                     "Using cached prompt",
                     task_id=task.task_id,
                     prompt_name=EXTRACT_ACTION_PROMPT_NAME,
+                    cache_variant=cache_variant,
                 )
-                return combined_prompt, use_caching
+                # Map template to prompt_name for logging/caching guards
+                prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
+                return combined_prompt, use_caching, prompt_name
 
             except Exception as e:
                 LOG.warning("Failed to load cached prompt templates, falling back to original", error=str(e))
@@ -2796,7 +2808,58 @@ class ForgeAgent:
             has_magic_link_page=context.has_magic_link_page(task.task_id),
         )
 
-        return full_prompt, use_caching
+        # Map template to prompt_name for logging/caching guards
+        prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
+        return full_prompt, use_caching, prompt_name
+
+    async def _get_prompt_caching_settings(self, context: SkyvernContext) -> dict[str, bool]:
+        """
+        Resolve prompt caching settings for the current run.
+
+        We prefer explicit overrides via LLMAPIHandlerFactory.set_prompt_caching_settings(), which
+        are mostly used by scripts/tests. When no override exists, evaluate the PostHog experiment
+        once per context and cache the result on the context to avoid repeated lookups.
+        """
+        if LLMAPIHandlerFactory._prompt_caching_settings is not None:
+            return LLMAPIHandlerFactory._prompt_caching_settings
+
+        if context.prompt_caching_settings is not None:
+            return context.prompt_caching_settings
+
+        distinct_id = context.run_id or context.workflow_run_id or context.task_id
+        organization_id = context.organization_id
+        context.prompt_caching_settings = {}
+
+        if not distinct_id or not organization_id:
+            return context.prompt_caching_settings
+
+        try:
+            enabled = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "PROMPT_CACHING_OPTIMIZATION",
+                distinct_id,
+                properties={"organization_id": organization_id},
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Failed to evaluate prompt caching experiment; defaulting to disabled",
+                distinct_id=distinct_id,
+                organization_id=organization_id,
+                error=str(exc),
+            )
+            return context.prompt_caching_settings
+
+        if enabled:
+            context.prompt_caching_settings = {
+                EXTRACT_ACTION_PROMPT_NAME: True,
+                EXTRACT_ACTION_TEMPLATE: True,
+            }
+            LOG.info(
+                "Prompt caching optimization enabled",
+                distinct_id=distinct_id,
+                organization_id=organization_id,
+            )
+
+        return context.prompt_caching_settings
 
     def _should_process_totp(self, scraped_page: ScrapedPage | None) -> bool:
         """Detect TOTP pages by checking for multiple input fields or verification keywords."""
@@ -2930,6 +2993,23 @@ class ForgeAgent:
             ):
                 final_navigation_payload = (
                     final_navigation_payload + "\n" + str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
+                )
+            elif isinstance(final_navigation_payload, list):
+                verification_code_dict = str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
+                if verification_code_dict not in final_navigation_payload:
+                    final_navigation_payload.append(verification_code_dict)
+                else:
+                    LOG.warning(
+                        "Verification code already exists in navigation payload",
+                        final_navigation_payload=final_navigation_payload,
+                    )
+
+            elif final_navigation_payload is None:
+                final_navigation_payload = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
+            else:
+                LOG.warning(
+                    "Didn't add verification code to navigation payload",
+                    final_navigation_payload=final_navigation_payload,
                 )
             if expire_verification_code:
                 current_context.totp_codes.pop(task.task_id)
@@ -3067,13 +3147,7 @@ class ForgeAgent:
             browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
             if browser_state is not None and await browser_state.get_working_page() is not None:
                 try:
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            task.workflow_run_id or task.task_id,
-                            properties={"organization_id": task.organization_id},
-                        )
-                    )
+                    screenshot = await browser_state.take_fullpage_screenshot()
                     await app.ARTIFACT_MANAGER.create_artifact(
                         step=last_step,
                         artifact_type=ArtifactType.SCREENSHOT_FINAL,
@@ -3241,16 +3315,31 @@ class ForgeAgent:
         if screenshot_artifact:
             screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
 
-        first_step = await app.DATABASE.get_first_step(task_id=task.task_id, organization_id=task.organization_id)
-        if first_step:
-            recording_artifact = await app.DATABASE.get_artifact(
-                task_id=task.task_id,
-                step_id=first_step.step_id,
-                artifact_type=ArtifactType.RECORDING,
-                organization_id=task.organization_id,
-            )
-            if recording_artifact:
-                recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+        # Get recording url from browser session first,
+        # if not found, get the recording url from the first step
+        if task.browser_session_id:
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
+                        organization_id=task.organization_id,
+                        browser_session_id=task.browser_session_id,
+                    )
+                    # FIXME: we only support one recording for now
+                    recording_url = recordings[0].url if recordings else None
+            except asyncio.TimeoutError:
+                LOG.warning("Timeout getting recordings", browser_session_id=task.browser_session_id)
+
+        if recording_url is None:
+            first_step = await app.DATABASE.get_first_step(task_id=task.task_id, organization_id=task.organization_id)
+            if first_step:
+                recording_artifact = await app.DATABASE.get_artifact(
+                    task_id=task.task_id,
+                    step_id=first_step.step_id,
+                    artifact_type=ArtifactType.RECORDING,
+                    organization_id=task.organization_id,
+                )
+                if recording_artifact:
+                    recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
         latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
@@ -3463,6 +3552,7 @@ class ForgeAgent:
                 queued_seconds=queued_seconds,
                 task_status=status,
                 organization_id=task.organization_id,
+                failure_reason=failure_reason,
             )
 
         await save_task_logs(task.task_id)
@@ -3509,7 +3599,6 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
-                task_block=task_block,
             ),
             name=f"verify_goal_{step.step_id}",
         )
@@ -4012,44 +4101,39 @@ class ForgeAgent:
     ) -> tuple[bool | None, Step | None, Step | None]:
         # Check if parallel verification should be used
         # Only use it when we have the required data AND when verification would normally happen
+        task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
         should_verify = (
             complete_verification
             and not step.is_goal_achieved()
             and not step.is_terminated()
             and not isinstance(task_block, ActionBlock)
+            and not task_completes_on_download
             and (task.navigation_goal or task.complete_criterion)
         )
 
         if should_verify and browser_state and scraped_page:
-            try:
-                distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "ENABLE_PARALLEL_USER_GOAL_CHECK",
-                    distinct_id,
-                    properties={"organization_id": task.organization_id, "task_url": task.url},
-                )
+            disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "DISABLE_USER_GOAL_CHECK",
+                task.workflow_run_id if task.workflow_run_id else task.task_id,
+                properties={"task_url": task.url, "organization_id": task.organization_id},
+            )
 
-                if enable_parallel_verification:
-                    LOG.info(
-                        "Parallel verification enabled, using optimized flow",
-                        step_id=step.step_id,
-                        task_id=task.task_id,
-                    )
-                    return await self._handle_completed_step_with_parallel_verification(
-                        organization=organization,
-                        task=task,
-                        step=step,
-                        page=page,
-                        browser_state=browser_state,
-                        scraped_page=scraped_page,
-                        engine=engine,
-                        task_block=task_block,
-                    )
-            except Exception:
-                LOG.warning(
-                    "Failed to check parallel verification feature flag, using standard flow",
+            if disable_user_goal_check:
+                LOG.info(
+                    "User goal verification disabled via feature flag",
                     step_id=step.step_id,
-                    exc_info=True,
+                    task_id=task.task_id,
+                )
+            else:
+                return await self._handle_completed_step_with_parallel_verification(
+                    organization=organization,
+                    task=task,
+                    step=step,
+                    page=page,
+                    browser_state=browser_state,
+                    scraped_page=scraped_page,
+                    engine=engine,
+                    task_block=task_block,
                 )
 
         if step.is_goal_achieved():
@@ -4271,7 +4355,7 @@ class ForgeAgent:
             current_context = skyvern_context.ensure_context()
             current_context.totp_codes[task.task_id] = otp_value.value
 
-            extract_action_prompt, use_caching = await self._build_extract_action_prompt(
+            extract_action_prompt, use_caching, prompt_name = await self._build_extract_action_prompt(
                 task,
                 step,
                 browser_state,
@@ -4294,7 +4378,7 @@ class ForgeAgent:
                 prompt=extract_action_prompt,
                 step=step,
                 screenshots=scraped_page.screenshots,
-                prompt_name="extract-actions",
+                prompt_name=prompt_name,
             )
         return json_response
 

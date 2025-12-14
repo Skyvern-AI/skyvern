@@ -32,6 +32,7 @@ from skyvern.exceptions import (
     ErrFoundSelectableElement,
     FailedToFetchSecret,
     FailToClick,
+    FailToHover,
     FailToSelectByIndex,
     FailToSelectByLabel,
     FailToSelectByValue,
@@ -67,6 +68,7 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
@@ -100,16 +102,14 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
-from skyvern.webeye.scraper.scraper import (
+from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
     ElementTreeFormat,
-    IncrementalScrapePage,
     ScrapedPage,
-    hash_element,
     json_to_html,
-    trim_element_tree,
 )
+from skyvern.webeye.scraper.scraper import IncrementalScrapePage, hash_element, trim_element_tree
 from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElement, SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -475,6 +475,7 @@ class ActionHandler:
                 )
 
             if not download_triggered:
+                results[-1].download_triggered = False
                 return results
             results[-1].download_triggered = True
 
@@ -723,6 +724,14 @@ async def handle_click_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
+    try:
+        await skyvern_element.scroll_into_view()
+    except Exception:
+        LOG.info(
+            "Failed to scroll into view, ignore it and continue executing",
+            element_id=skyvern_element.get_id(),
+        )
+
     if action.download:
         results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
 
@@ -851,7 +860,7 @@ async def handle_sequential_click_for_dropdown(
     response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
         prompt=prompt,
         step=step,
-        prompt_name="check-user-goal",
+        prompt_name="check-user-goal-after-click",
     )
     verify_result = CompleteVerifyResult.model_validate(response)
     if verify_result.user_goal_achieved:
@@ -1084,7 +1093,7 @@ async def handle_input_text_action(
         text: str = ""
     else:
         # For regular inputs, resolve secrets
-        text_result = await get_actual_value_of_parameter_if_secret(task, action.text)
+        text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
         if text_result is None:
             return [ActionFailure(FailedToFetchSecret())]
         text = text_result
@@ -1115,6 +1124,7 @@ async def handle_input_text_action(
             element_id=skyvern_element.get_id(),
             action=action,
         )
+        action.set_has_mini_agent()
         return await handle_select_option_action(select_action, page, scraped_page, task, step)
 
     incremental_element: list[dict] = []
@@ -1210,6 +1220,7 @@ async def handle_input_text_action(
             try_to_quit_dropdown = True
             try:
                 # TODO: we don't select by value for the auto completion detect case
+                action.set_has_mini_agent()
 
                 select_result = await sequentially_select_from_dropdown(
                     action=select_action,
@@ -1294,6 +1305,7 @@ async def handle_input_text_action(
     # check the phone number format when type=tel and the text is not a secret value
     if not is_secret_value and await skyvern_element.get_attr("type") == "tel":
         try:
+            action.set_has_mini_agent()
             text = await check_phone_number_format(
                 value=text,
                 action=action,
@@ -1314,7 +1326,7 @@ async def handle_input_text_action(
     class_name: str | None = await skyvern_element.get_attr("class")
     if class_name and "blinking-cursor" in class_name:
         if is_totp_value:
-            text = generate_totp_value(task=task, parameter=action.text)
+            text = generate_totp_value_with_task(task=task, parameter=action.text)
         await skyvern_element.press_fill(text=text)
         return [ActionSuccess()]
 
@@ -1356,7 +1368,7 @@ async def handle_input_text_action(
 
     if is_totp_value:
         LOG.info("Skipping the auto completion logic since it's a TOTP input")
-        text = generate_totp_value(task=task, parameter=action.text)
+        text = generate_totp_value_with_task(task=task, parameter=action.text)
         await skyvern_element.input(text)
         return [ActionSuccess()]
 
@@ -1364,6 +1376,7 @@ async def handle_input_text_action(
     if action.totp_timing_info:
         timing_info = action.totp_timing_info
         if timing_info.get("is_totp_sequence"):
+            action.set_has_mini_agent()
             result = await _handle_multi_field_totp_sequence(timing_info, task)
             if result is not None:
                 return result  # Return ActionFailure if TOTP handling failed
@@ -1396,6 +1409,7 @@ async def handle_input_text_action(
 
         if tag_name == InteractiveElement.INPUT and await skyvern_element.get_attr("type") == "date":
             try:
+                action.set_has_mini_agent()
                 text = await check_date_format(
                     value=text,
                     action=action,
@@ -1417,6 +1431,7 @@ async def handle_input_text_action(
         if not await skyvern_element.is_raw_input():
             is_location_input = input_or_select_context.is_location_input if input_or_select_context else False
             if input_or_select_context and (await skyvern_element.is_auto_completion_input() or is_location_input):
+                action.set_has_mini_agent()
                 if result := await input_or_auto_complete_input(
                     input_or_select_context=input_or_select_context,
                     scraped_page=scraped_page,
@@ -1507,7 +1522,7 @@ async def handle_upload_file_action(
     # After this point if the file_url is a secret, it will be replaced with the actual value
     # In order to make sure we don't log the secret value, we log the action with the original value action.file_url
     # ************************************************************************************************************** #
-    file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
+    file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
     decoded_url = urllib.parse.unquote(file_url)
     if (
         file_url not in str(task.navigation_payload)
@@ -1658,6 +1673,7 @@ async def handle_select_option_action(
     # Confirm if the select action is on the custom option element
     if await skyvern_element.is_custom_option():
         click_action = ClickAction(element_id=action.element_id)
+        action.set_has_mini_agent()
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
     if not await skyvern_element.is_selectable():
@@ -1766,6 +1782,7 @@ async def handle_select_option_action(
             action=action,
         )
         check_action = CheckboxAction(element_id=action.element_id, is_checked=True)
+        action.set_has_mini_agent()
         return await handle_checkbox_action(check_action, page, scraped_page, task, step)
 
     if await skyvern_element.is_radio():
@@ -1774,6 +1791,7 @@ async def handle_select_option_action(
             action=action,
         )
         click_action = ClickAction(element_id=action.element_id)
+        action.set_has_mini_agent()
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
     # FIXME: maybe there's a case where <input type="button"> could trigger dropdown menu?
@@ -1783,6 +1801,7 @@ async def handle_select_option_action(
             action=action,
         )
         click_action = ClickAction(element_id=action.element_id)
+        action.set_has_mini_agent()
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
     LOG.info(
@@ -1988,6 +2007,44 @@ async def handle_wait_action(
 ) -> list[ActionResult]:
     await asyncio.sleep(action.seconds)
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
+
+
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+async def handle_hover_action(
+    action: actions.HoverAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    dom = DomUtil(scraped_page=scraped_page, page=page)
+    try:
+        skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+    except Exception as exc:
+        LOG.warning(
+            "Failed to resolve element for hover action",
+            action=action,
+            workflow_run_id=task.workflow_run_id,
+            exc_info=True,
+        )
+        return [ActionFailure(exception=exc)]
+
+    try:
+        await skyvern_element.hover_to_reveal()
+        await skyvern_element.get_locator().scroll_into_view_if_needed()
+        await skyvern_element.get_locator().hover(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+
+        if action.hold_seconds and action.hold_seconds > 0:
+            await asyncio.sleep(action.hold_seconds)
+        return [ActionSuccess()]
+    except Exception as exc:
+        LOG.warning(
+            "Hover action failed",
+            action=action,
+            workflow_run_id=task.workflow_run_id,
+            exc_info=True,
+        )
+        return [ActionFailure(FailToHover(skyvern_element.get_id(), msg=str(exc)))]
 
 
 @TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
@@ -2197,6 +2254,7 @@ ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_ac
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
 ActionHandler.register_action_type(ActionType.SELECT_OPTION, handle_select_option_action)
 ActionHandler.register_action_type(ActionType.WAIT, handle_wait_action)
+ActionHandler.register_action_type(ActionType.HOVER, handle_hover_action)
 ActionHandler.register_action_type(ActionType.TERMINATE, handle_terminate_action)
 ActionHandler.register_action_type(ActionType.COMPLETE, handle_complete_action)
 ActionHandler.register_action_type(ActionType.EXTRACT, handle_extract_action)
@@ -2210,7 +2268,13 @@ ActionHandler.register_action_type(ActionType.GOTO_URL, handle_goto_url_action)
 ActionHandler.register_action_type(ActionType.CLOSE_PAGE, handle_close_page_action)
 
 
-async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
+def get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
+    return secret_value if secret_value is not None else parameter
+
+
+def get_actual_value_of_parameter_if_secret_with_task(task: Task, parameter: str) -> Any:
     """
     Get the actual value of a parameter if it's a secret. If it's not a secret, return the parameter value as is.
 
@@ -2221,22 +2285,23 @@ async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) ->
     if task.workflow_run_id is None:
         return parameter
 
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
-    secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
-    return secret_value if secret_value is not None else parameter
+    return get_actual_value_of_parameter_if_secret(task.workflow_run_id, parameter)
 
 
-def generate_totp_value(task: Task, parameter: str) -> str:
-    if task.workflow_run_id is None:
-        return parameter
-
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+def generate_totp_value(workflow_run_id: str, parameter: str) -> str:
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
     totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
     totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
     if not totp_secret:
         LOG.warning("No TOTP secret found, returning the parameter value as is", parameter=parameter)
         return parameter
     return pyotp.TOTP(totp_secret).now()
+
+
+def generate_totp_value_with_task(task: Task, parameter: str) -> str:
+    if task.workflow_run_id is None:
+        return parameter
+    return generate_totp_value(task.workflow_run_id, parameter)
 
 
 async def chain_click(
@@ -2258,7 +2323,7 @@ async def chain_click(
     LOG.info("Chain click starts", action=action, locator=locator)
     file = pending_upload_files or []
     if not file and action.file_url:
-        file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
+        file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
         file = await handler_utils.download_file(file_url, action.model_dump())
 
     is_filechooser_trigger = False
@@ -2328,7 +2393,8 @@ async def chain_click(
                     locator=locator,
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_attr_id():
-                    await bound_locator.click(timeout=timeout)
+                    # click on (0, 0) to avoid playwright clicking on the wrong element by accident
+                    await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -2344,7 +2410,8 @@ async def chain_click(
                     locator=locator,
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_direct_parent():
-                    await bound_locator.click(timeout=timeout)
+                    # click on (0, 0) to avoid playwright clicking on the wrong element by accident
+                    await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -3024,7 +3091,7 @@ async def select_from_emerging_elements(
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
-        actual_value = await get_actual_value_of_parameter_if_secret(task=task, parameter=value)
+        actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
         LOG.info(
             "No clickable option found, but found input element to search",
             element_id=element_id,
@@ -3179,7 +3246,7 @@ async def select_from_dropdown(
             element_id=element_id,
         )
         try:
-            actual_value = await get_actual_value_of_parameter_if_secret(task=task, parameter=value)
+            actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
             input_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
             await input_element.scroll_into_view()
             current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
@@ -3577,6 +3644,7 @@ async def normal_select(
     step: Step,
     builder: ElementTreeBuilder,
 ) -> List[ActionResult]:
+    action.set_has_mini_agent()
     try:
         current_text = await skyvern_element.get_attr("selected")
         if current_text and (current_text == action.option.label or current_text == action.option.value):
@@ -3787,7 +3855,15 @@ async def extract_information_for_navigation_goal(
         step=step,
         screenshots=scraped_page.screenshots,
         prompt_name="extract-information",
+        force_dict=False,
     )
+
+    # Validate and fill missing fields based on schema
+    if task.extracted_information_schema:
+        json_response = validate_and_fill_extraction_result(
+            extraction_result=json_response,
+            schema=task.extracted_information_schema,
+        )
 
     return ScrapeResult(
         scraped_data=json_response,

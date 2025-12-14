@@ -537,6 +537,7 @@ describe("SkyvernClient", () => {
                 is_saved_task: true,
                 description: "description",
                 workflow_definition: {
+                    version: 1,
                     parameters: [
                         {
                             parameter_type: "aws_secret",
@@ -605,6 +606,7 @@ describe("SkyvernClient", () => {
                 is_saved_task: true,
                 description: "description",
                 workflow_definition: {
+                    version: 1,
                     parameters: [
                         {
                             parameter_type: "aws_secret",
@@ -682,6 +684,7 @@ describe("SkyvernClient", () => {
             is_saved_task: true,
             description: "description",
             workflow_definition: {
+                version: 1,
                 parameters: [
                     {
                         parameter_type: "aws_secret",
@@ -749,6 +752,7 @@ describe("SkyvernClient", () => {
             is_saved_task: true,
             description: "description",
             workflow_definition: {
+                version: 1,
                 parameters: [
                     {
                         parameter_type: "aws_secret",
@@ -834,6 +838,7 @@ describe("SkyvernClient", () => {
             is_saved_task: true,
             description: "description",
             workflow_definition: {
+                version: 1,
                 parameters: [
                     {
                         parameter_type: "aws_secret",
@@ -898,6 +903,7 @@ describe("SkyvernClient", () => {
             is_saved_task: true,
             description: "description",
             workflow_definition: {
+                version: 1,
                 parameters: [
                     {
                         parameter_type: "aws_secret",
@@ -1238,6 +1244,10 @@ describe("SkyvernClient", () => {
                     instructions: "instructions",
                     positive_descriptor: "positive_descriptor",
                     negative_descriptor: "negative_descriptor",
+                    executed_branch_id: "executed_branch_id",
+                    executed_branch_expression: "executed_branch_expression",
+                    executed_branch_result: true,
+                    executed_branch_next_block: "executed_branch_next_block",
                 },
                 thought: {
                     thought_id: "thought_id",
@@ -1325,6 +1335,10 @@ describe("SkyvernClient", () => {
                     instructions: "instructions",
                     positive_descriptor: "positive_descriptor",
                     negative_descriptor: "negative_descriptor",
+                    executed_branch_id: "executed_branch_id",
+                    executed_branch_expression: "executed_branch_expression",
+                    executed_branch_result: true,
+                    executed_branch_next_block: "executed_branch_next_block",
                 },
                 thought: {
                     thought_id: "thought_id",
@@ -1408,6 +1422,277 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.getRunTimeline("run_id");
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("list_browser_profiles (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = [
+            {
+                browser_profile_id: "browser_profile_id",
+                organization_id: "organization_id",
+                name: "name",
+                description: "description",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+                deleted_at: "2024-01-15T09:30:00Z",
+            },
+        ];
+        server
+            .mockEndpoint()
+            .get("/v1/browser_profiles")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.listBrowserProfiles({
+            include_deleted: true,
+        });
+        expect(response).toEqual([
+            {
+                browser_profile_id: "browser_profile_id",
+                organization_id: "organization_id",
+                name: "name",
+                description: "description",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+                deleted_at: "2024-01-15T09:30:00Z",
+            },
+        ]);
+    });
+
+    test("list_browser_profiles (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .get("/v1/browser_profiles")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.listBrowserProfiles();
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("create_browser_profile (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { name: "name" };
+        const rawResponseBody = {
+            browser_profile_id: "browser_profile_id",
+            organization_id: "organization_id",
+            name: "name",
+            description: "description",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        };
+        server
+            .mockEndpoint()
+            .post("/v1/browser_profiles")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.createBrowserProfile({
+            name: "name",
+        });
+        expect(response).toEqual({
+            browser_profile_id: "browser_profile_id",
+            organization_id: "organization_id",
+            name: "name",
+            description: "description",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        });
+    });
+
+    test("create_browser_profile (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { name: "name" };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/browser_profiles")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(400)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.createBrowserProfile({
+                name: "name",
+            });
+        }).rejects.toThrow(Skyvern.BadRequestError);
+    });
+
+    test("create_browser_profile (3)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { name: "name" };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/browser_profiles")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(409)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.createBrowserProfile({
+                name: "name",
+            });
+        }).rejects.toThrow(Skyvern.ConflictError);
+    });
+
+    test("create_browser_profile (4)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { name: "name" };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/browser_profiles")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.createBrowserProfile({
+                name: "name",
+            });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("get_browser_profile (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = {
+            browser_profile_id: "browser_profile_id",
+            organization_id: "organization_id",
+            name: "name",
+            description: "description",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        };
+        server
+            .mockEndpoint()
+            .get("/v1/browser_profiles/bp_123456")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.getBrowserProfile("bp_123456");
+        expect(response).toEqual({
+            browser_profile_id: "browser_profile_id",
+            organization_id: "organization_id",
+            name: "name",
+            description: "description",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        });
+    });
+
+    test("get_browser_profile (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .get("/v1/browser_profiles/profile_id")
+            .respondWith()
+            .statusCode(404)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.getBrowserProfile("profile_id");
+        }).rejects.toThrow(Skyvern.NotFoundError);
+    });
+
+    test("get_browser_profile (3)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .get("/v1/browser_profiles/profile_id")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.getBrowserProfile("profile_id");
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("delete_browser_profile (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        server.mockEndpoint().delete("/v1/browser_profiles/bp_123456").respondWith().statusCode(200).build();
+
+        const response = await client.deleteBrowserProfile("bp_123456");
+        expect(response).toEqual(undefined);
+    });
+
+    test("delete_browser_profile (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .delete("/v1/browser_profiles/profile_id")
+            .respondWith()
+            .statusCode(404)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.deleteBrowserProfile("profile_id");
+        }).rejects.toThrow(Skyvern.NotFoundError);
+    });
+
+    test("delete_browser_profile (3)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .delete("/v1/browser_profiles/profile_id")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.deleteBrowserProfile("profile_id");
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
@@ -1877,7 +2162,11 @@ describe("SkyvernClient", () => {
         const rawResponseBody = [
             {
                 credential_id: "cred_1234567890",
-                credential: { username: "user@example.com", totp_type: "authenticator" },
+                credential: {
+                    username: "user@example.com",
+                    totp_type: "authenticator",
+                    totp_identifier: "totp_identifier",
+                },
                 credential_type: "password",
                 name: "Amazon Login",
             },
@@ -1894,6 +2183,7 @@ describe("SkyvernClient", () => {
                 credential: {
                     username: "user@example.com",
                     totp_type: "authenticator",
+                    totp_identifier: "totp_identifier",
                 },
                 credential_type: "password",
                 name: "Amazon Login",
@@ -1923,7 +2213,11 @@ describe("SkyvernClient", () => {
         };
         const rawResponseBody = {
             credential_id: "cred_1234567890",
-            credential: { username: "user@example.com", totp_type: "authenticator" },
+            credential: {
+                username: "user@example.com",
+                totp_type: "authenticator",
+                totp_identifier: "totp_identifier",
+            },
             credential_type: "password",
             name: "Amazon Login",
         };
@@ -1950,6 +2244,7 @@ describe("SkyvernClient", () => {
             credential: {
                 username: "user@example.com",
                 totp_type: "authenticator",
+                totp_identifier: "totp_identifier",
             },
             credential_type: "password",
             name: "Amazon Login",
@@ -2020,7 +2315,11 @@ describe("SkyvernClient", () => {
 
         const rawResponseBody = {
             credential_id: "cred_1234567890",
-            credential: { username: "user@example.com", totp_type: "authenticator" },
+            credential: {
+                username: "user@example.com",
+                totp_type: "authenticator",
+                totp_identifier: "totp_identifier",
+            },
             credential_type: "password",
             name: "Amazon Login",
         };
@@ -2038,6 +2337,7 @@ describe("SkyvernClient", () => {
             credential: {
                 username: "user@example.com",
                 totp_type: "authenticator",
+                totp_identifier: "totp_identifier",
             },
             credential_type: "password",
             name: "Amazon Login",
@@ -2194,6 +2494,142 @@ describe("SkyvernClient", () => {
         await expect(async () => {
             return await client.login({
                 credential_type: "skyvern",
+            });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("download_files (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { navigation_goal: "navigation_goal" };
+        const rawResponseBody = {
+            run_id: "tsk_123",
+            status: "created",
+            output: { key: "value" },
+            downloaded_files: [
+                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+            ],
+            recording_url: "recording_url",
+            screenshot_urls: ["screenshot_urls"],
+            failure_reason: "failure_reason",
+            created_at: "2025-01-01T00:00:00Z",
+            modified_at: "2025-01-01T00:05:00Z",
+            queued_at: "2024-01-15T09:30:00Z",
+            started_at: "2024-01-15T09:30:00Z",
+            finished_at: "2024-01-15T09:30:00Z",
+            app_url: "app_url",
+            browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
+            max_screenshot_scrolls: 1,
+            script_run: { ai_fallback_triggered: true },
+            errors: [{ key: "value" }],
+            run_with: "run_with",
+            ai_fallback: true,
+            run_request: {
+                workflow_id: "wpid_123",
+                parameters: { key: "value" },
+                title: "title",
+                proxy_location: "RESIDENTIAL",
+                webhook_url: "webhook_url",
+                totp_url: "totp_url",
+                totp_identifier: "totp_identifier",
+                browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
+                max_screenshot_scrolls: 1,
+                extra_http_headers: { key: "value" },
+                browser_address: "browser_address",
+                ai_fallback: true,
+                run_with: "run_with",
+            },
+        };
+        server
+            .mockEndpoint()
+            .post("/v1/run/tasks/download_files")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.downloadFiles({
+            navigation_goal: "navigation_goal",
+        });
+        expect(response).toEqual({
+            run_id: "tsk_123",
+            status: "created",
+            output: {
+                key: "value",
+            },
+            downloaded_files: [
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    modified_at: "2024-01-15T09:30:00Z",
+                },
+            ],
+            recording_url: "recording_url",
+            screenshot_urls: ["screenshot_urls"],
+            failure_reason: "failure_reason",
+            created_at: "2025-01-01T00:00:00Z",
+            modified_at: "2025-01-01T00:05:00Z",
+            queued_at: "2024-01-15T09:30:00Z",
+            started_at: "2024-01-15T09:30:00Z",
+            finished_at: "2024-01-15T09:30:00Z",
+            app_url: "app_url",
+            browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
+            max_screenshot_scrolls: 1,
+            script_run: {
+                ai_fallback_triggered: true,
+            },
+            errors: [
+                {
+                    key: "value",
+                },
+            ],
+            run_with: "run_with",
+            ai_fallback: true,
+            run_request: {
+                workflow_id: "wpid_123",
+                parameters: {
+                    key: "value",
+                },
+                title: "title",
+                proxy_location: "RESIDENTIAL",
+                webhook_url: "webhook_url",
+                totp_url: "totp_url",
+                totp_identifier: "totp_identifier",
+                browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
+                max_screenshot_scrolls: 1,
+                extra_http_headers: {
+                    key: "value",
+                },
+                browser_address: "browser_address",
+                ai_fallback: true,
+                run_with: "run_with",
+            },
+        });
+    });
+
+    test("download_files (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { navigation_goal: "navigation_goal" };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/run/tasks/download_files")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.downloadFiles({
+                navigation_goal: "navigation_goal",
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });

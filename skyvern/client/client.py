@@ -12,6 +12,7 @@ from .environment import SkyvernEnvironment
 from .raw_client import AsyncRawSkyvern, RawSkyvern
 from .types.artifact import Artifact
 from .types.artifact_type import ArtifactType
+from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
@@ -26,18 +27,18 @@ from .types.script_file_create import ScriptFileCreate
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 from .types.skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
 from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
+from .types.task_run_request_proxy_location import TaskRunRequestProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
+from .types.workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
 from .types.workflow_run_response import WorkflowRunResponse
 from .types.workflow_run_timeline import WorkflowRunTimeline
 from .types.workflow_status import WorkflowStatus
 
 if typing.TYPE_CHECKING:
-    from .browser_profiles.client import AsyncBrowserProfilesClient, BrowserProfilesClient
     from .scripts.client import AsyncScriptsClient, ScriptsClient
-    from .workflows.client import AsyncWorkflowsClient, WorkflowsClient
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
 
@@ -108,8 +109,6 @@ class Skyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
-        self._workflows: typing.Optional[WorkflowsClient] = None
-        self._browser_profiles: typing.Optional[BrowserProfilesClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
 
     @property
@@ -131,7 +130,7 @@ class Skyvern:
         url: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[TaskRunRequestProxyLocation] = OMIT,
         data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
         error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_steps: typing.Optional[int] = OMIT,
@@ -169,7 +168,7 @@ class Skyvern:
         title : typing.Optional[str]
             The title for the task
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[TaskRunRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -193,6 +192,7 @@ class Skyvern:
             - US-FL: Florida
             - US-WA: Washington
             - NONE: No proxy
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
 
@@ -294,7 +294,7 @@ class Skyvern:
         user_agent: typing.Optional[str] = None,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[WorkflowRunRequestProxyLocation] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -327,7 +327,7 @@ class Skyvern:
         title : typing.Optional[str]
             The title for this workflow run
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[WorkflowRunRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -351,6 +351,7 @@ class Skyvern:
             - US-FL: Florida
             - US-WA: Washington
             - NONE: No proxy
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         webhook_url : typing.Optional[str]
             URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions.
@@ -847,6 +848,160 @@ class Skyvern:
         _response = self._raw_client.get_run_timeline(run_id, request_options=request_options)
         return _response.data
 
+    def list_browser_profiles(
+        self, *, include_deleted: typing.Optional[bool] = None, request_options: typing.Optional[RequestOptions] = None
+    ) -> typing.List[BrowserProfile]:
+        """
+        Get all browser profiles for the organization
+
+        Parameters
+        ----------
+        include_deleted : typing.Optional[bool]
+            Include deleted browser profiles
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[BrowserProfile]
+            Successfully retrieved browser profiles
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.list_browser_profiles(
+            include_deleted=True,
+        )
+        """
+        _response = self._raw_client.list_browser_profiles(
+            include_deleted=include_deleted, request_options=request_options
+        )
+        return _response.data
+
+    def create_browser_profile(
+        self,
+        *,
+        name: str,
+        description: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> BrowserProfile:
+        """
+        Create a browser profile from a persistent browser session or workflow run.
+
+        Parameters
+        ----------
+        name : str
+            Name for the browser profile
+
+        description : typing.Optional[str]
+            Optional profile description
+
+        browser_session_id : typing.Optional[str]
+            Persistent browser session to convert into a profile
+
+        workflow_run_id : typing.Optional[str]
+            Workflow run whose persisted session should be captured
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserProfile
+            Successfully created browser profile
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.create_browser_profile(
+            name="name",
+        )
+        """
+        _response = self._raw_client.create_browser_profile(
+            name=name,
+            description=description,
+            browser_session_id=browser_session_id,
+            workflow_run_id=workflow_run_id,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def get_browser_profile(
+        self, profile_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> BrowserProfile:
+        """
+        Get a specific browser profile by ID
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile. browser_profile_id starts with `bp_`
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserProfile
+            Successfully retrieved browser profile
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_browser_profile(
+            profile_id="bp_123456",
+        )
+        """
+        _response = self._raw_client.get_browser_profile(profile_id, request_options=request_options)
+        return _response.data
+
+    def delete_browser_profile(
+        self, profile_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> None:
+        """
+        Delete a browser profile (soft delete)
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile to delete. browser_profile_id starts with `bp_`
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.delete_browser_profile(
+            profile_id="bp_123456",
+        )
+        """
+        _response = self._raw_client.delete_browser_profile(profile_id, request_options=request_options)
+        return _response.data
+
     def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.List[BrowserSessionResponse]:
@@ -1234,15 +1389,16 @@ class Skyvern:
         *,
         credential_type: SkyvernSchemasRunBlocksCredentialType,
         url: typing.Optional[str] = OMIT,
-        prompt: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
         bitwarden_collection_id: typing.Optional[str] = OMIT,
         bitwarden_item_id: typing.Optional[str] = OMIT,
@@ -1263,13 +1419,10 @@ class Skyvern:
             Where to get the credential from
 
         url : typing.Optional[str]
-            Website url
-
-        prompt : typing.Optional[str]
-            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
+            Website URL
 
         webhook_url : typing.Optional[str]
-            Webhook URL to send login status updates
+            Webhook URL to send status updates
 
         proxy_location : typing.Optional[ProxyLocation]
             Proxy location to use
@@ -1283,6 +1436,9 @@ class Skyvern:
         browser_session_id : typing.Optional[str]
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
 
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
         browser_address : typing.Optional[str]
             The CDP address for the task.
 
@@ -1291,6 +1447,9 @@ class Skyvern:
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
+
+        prompt : typing.Optional[str]
+            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
 
         credential_id : typing.Optional[str]
             ID of the Skyvern credential to use for login.
@@ -1341,15 +1500,16 @@ class Skyvern:
         _response = self._raw_client.login(
             credential_type=credential_type,
             url=url,
-            prompt=prompt,
             webhook_url=webhook_url,
             proxy_location=proxy_location,
             totp_identifier=totp_identifier,
             totp_url=totp_url,
             browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
             browser_address=browser_address,
             extra_http_headers=extra_http_headers,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            prompt=prompt,
             credential_id=credential_id,
             bitwarden_collection_id=bitwarden_collection_id,
             bitwarden_item_id=bitwarden_item_id,
@@ -1359,6 +1519,110 @@ class Skyvern:
             azure_vault_username_key=azure_vault_username_key,
             azure_vault_password_key=azure_vault_password_key,
             azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.download_files(
+            navigation_goal="navigation_goal",
+        )
+        """
+        _response = self._raw_client.download_files(
+            navigation_goal=navigation_goal,
+            url=url,
+            webhook_url=webhook_url,
+            proxy_location=proxy_location,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
+            browser_address=browser_address,
+            extra_http_headers=extra_http_headers,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            download_suffix=download_suffix,
+            download_timeout=download_timeout,
+            max_steps_per_run=max_steps_per_run,
             request_options=request_options,
         )
         return _response.data
@@ -1586,22 +1850,6 @@ class Skyvern:
         return _response.data
 
     @property
-    def workflows(self):
-        if self._workflows is None:
-            from .workflows.client import WorkflowsClient  # noqa: E402
-
-            self._workflows = WorkflowsClient(client_wrapper=self._client_wrapper)
-        return self._workflows
-
-    @property
-    def browser_profiles(self):
-        if self._browser_profiles is None:
-            from .browser_profiles.client import BrowserProfilesClient  # noqa: E402
-
-            self._browser_profiles = BrowserProfilesClient(client_wrapper=self._client_wrapper)
-        return self._browser_profiles
-
-    @property
     def scripts(self):
         if self._scripts is None:
             from .scripts.client import ScriptsClient  # noqa: E402
@@ -1676,8 +1924,6 @@ class AsyncSkyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
-        self._workflows: typing.Optional[AsyncWorkflowsClient] = None
-        self._browser_profiles: typing.Optional[AsyncBrowserProfilesClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
 
     @property
@@ -1699,7 +1945,7 @@ class AsyncSkyvern:
         url: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[TaskRunRequestProxyLocation] = OMIT,
         data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
         error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_steps: typing.Optional[int] = OMIT,
@@ -1737,7 +1983,7 @@ class AsyncSkyvern:
         title : typing.Optional[str]
             The title for the task
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[TaskRunRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -1761,6 +2007,7 @@ class AsyncSkyvern:
             - US-FL: Florida
             - US-WA: Washington
             - NONE: No proxy
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
 
@@ -1870,7 +2117,7 @@ class AsyncSkyvern:
         user_agent: typing.Optional[str] = None,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[WorkflowRunRequestProxyLocation] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -1903,7 +2150,7 @@ class AsyncSkyvern:
         title : typing.Optional[str]
             The title for this workflow run
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[WorkflowRunRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -1927,6 +2174,7 @@ class AsyncSkyvern:
             - US-FL: Florida
             - US-WA: Washington
             - NONE: No proxy
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         webhook_url : typing.Optional[str]
             URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions.
@@ -2513,6 +2761,192 @@ class AsyncSkyvern:
         _response = await self._raw_client.get_run_timeline(run_id, request_options=request_options)
         return _response.data
 
+    async def list_browser_profiles(
+        self, *, include_deleted: typing.Optional[bool] = None, request_options: typing.Optional[RequestOptions] = None
+    ) -> typing.List[BrowserProfile]:
+        """
+        Get all browser profiles for the organization
+
+        Parameters
+        ----------
+        include_deleted : typing.Optional[bool]
+            Include deleted browser profiles
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[BrowserProfile]
+            Successfully retrieved browser profiles
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.list_browser_profiles(
+                include_deleted=True,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.list_browser_profiles(
+            include_deleted=include_deleted, request_options=request_options
+        )
+        return _response.data
+
+    async def create_browser_profile(
+        self,
+        *,
+        name: str,
+        description: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> BrowserProfile:
+        """
+        Create a browser profile from a persistent browser session or workflow run.
+
+        Parameters
+        ----------
+        name : str
+            Name for the browser profile
+
+        description : typing.Optional[str]
+            Optional profile description
+
+        browser_session_id : typing.Optional[str]
+            Persistent browser session to convert into a profile
+
+        workflow_run_id : typing.Optional[str]
+            Workflow run whose persisted session should be captured
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserProfile
+            Successfully created browser profile
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.create_browser_profile(
+                name="name",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.create_browser_profile(
+            name=name,
+            description=description,
+            browser_session_id=browser_session_id,
+            workflow_run_id=workflow_run_id,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def get_browser_profile(
+        self, profile_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> BrowserProfile:
+        """
+        Get a specific browser profile by ID
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile. browser_profile_id starts with `bp_`
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserProfile
+            Successfully retrieved browser profile
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_browser_profile(
+                profile_id="bp_123456",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_browser_profile(profile_id, request_options=request_options)
+        return _response.data
+
+    async def delete_browser_profile(
+        self, profile_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> None:
+        """
+        Delete a browser profile (soft delete)
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile to delete. browser_profile_id starts with `bp_`
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.delete_browser_profile(
+                profile_id="bp_123456",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.delete_browser_profile(profile_id, request_options=request_options)
+        return _response.data
+
     async def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.List[BrowserSessionResponse]:
@@ -2976,15 +3410,16 @@ class AsyncSkyvern:
         *,
         credential_type: SkyvernSchemasRunBlocksCredentialType,
         url: typing.Optional[str] = OMIT,
-        prompt: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
         bitwarden_collection_id: typing.Optional[str] = OMIT,
         bitwarden_item_id: typing.Optional[str] = OMIT,
@@ -3005,13 +3440,10 @@ class AsyncSkyvern:
             Where to get the credential from
 
         url : typing.Optional[str]
-            Website url
-
-        prompt : typing.Optional[str]
-            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
+            Website URL
 
         webhook_url : typing.Optional[str]
-            Webhook URL to send login status updates
+            Webhook URL to send status updates
 
         proxy_location : typing.Optional[ProxyLocation]
             Proxy location to use
@@ -3025,6 +3457,9 @@ class AsyncSkyvern:
         browser_session_id : typing.Optional[str]
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
 
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
         browser_address : typing.Optional[str]
             The CDP address for the task.
 
@@ -3033,6 +3468,9 @@ class AsyncSkyvern:
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
+
+        prompt : typing.Optional[str]
+            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
 
         credential_id : typing.Optional[str]
             ID of the Skyvern credential to use for login.
@@ -3091,15 +3529,16 @@ class AsyncSkyvern:
         _response = await self._raw_client.login(
             credential_type=credential_type,
             url=url,
-            prompt=prompt,
             webhook_url=webhook_url,
             proxy_location=proxy_location,
             totp_identifier=totp_identifier,
             totp_url=totp_url,
             browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
             browser_address=browser_address,
             extra_http_headers=extra_http_headers,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            prompt=prompt,
             credential_id=credential_id,
             bitwarden_collection_id=bitwarden_collection_id,
             bitwarden_item_id=bitwarden_item_id,
@@ -3109,6 +3548,118 @@ class AsyncSkyvern:
             azure_vault_username_key=azure_vault_username_key,
             azure_vault_password_key=azure_vault_password_key,
             azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.download_files(
+                navigation_goal="navigation_goal",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.download_files(
+            navigation_goal=navigation_goal,
+            url=url,
+            webhook_url=webhook_url,
+            proxy_location=proxy_location,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
+            browser_address=browser_address,
+            extra_http_headers=extra_http_headers,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            download_suffix=download_suffix,
+            download_timeout=download_timeout,
+            max_steps_per_run=max_steps_per_run,
             request_options=request_options,
         )
         return _response.data
@@ -3374,22 +3925,6 @@ class AsyncSkyvern:
             request_options=request_options,
         )
         return _response.data
-
-    @property
-    def workflows(self):
-        if self._workflows is None:
-            from .workflows.client import AsyncWorkflowsClient  # noqa: E402
-
-            self._workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
-        return self._workflows
-
-    @property
-    def browser_profiles(self):
-        if self._browser_profiles is None:
-            from .browser_profiles.client import AsyncBrowserProfilesClient  # noqa: E402
-
-            self._browser_profiles = AsyncBrowserProfilesClient(client_wrapper=self._client_wrapper)
-        return self._browser_profiles
 
     @property
     def scripts(self):

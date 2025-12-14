@@ -11,6 +11,7 @@ from .workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlPara
 
 
 class WorkflowDefinitionYaml(UniversalBaseModel):
+    version: typing.Optional[int] = None
     parameters: typing.List[WorkflowDefinitionYamlParametersItem]
     blocks: typing.List[WorkflowDefinitionYamlBlocksItem]
 

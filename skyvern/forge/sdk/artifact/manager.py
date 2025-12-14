@@ -52,6 +52,8 @@ class ArtifactManager:
             task_id = context.task_id
         if not run_id and context:
             run_id = context.run_id
+        if not workflow_run_block_id and context:
+            workflow_run_block_id = context.parent_workflow_run_block_id
 
         artifact = await app.DATABASE.create_artifact(
             artifact_id,
@@ -157,6 +159,8 @@ class ArtifactManager:
             uri=uri,
             thought_id=thought.observer_thought_id,
             task_v2_id=thought.observer_cruise_id,
+            workflow_run_id=thought.workflow_run_id,
+            workflow_run_block_id=thought.workflow_run_block_id,
             organization_id=thought.organization_id,
             data=data,
             path=path,
@@ -182,6 +186,7 @@ class ArtifactManager:
             artifact_type=artifact_type,
             uri=uri,
             task_v2_id=task_v2.observer_cruise_id,
+            workflow_run_id=task_v2.workflow_run_id,
             organization_id=task_v2.organization_id,
             data=data,
             path=path,

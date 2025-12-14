@@ -12,11 +12,13 @@ from .core.pydantic_utilities import parse_obj_as
 from .core.request_options import RequestOptions
 from .core.serialization import convert_and_respect_annotation_metadata
 from .errors.bad_request_error import BadRequestError
+from .errors.conflict_error import ConflictError
 from .errors.forbidden_error import ForbiddenError
 from .errors.not_found_error import NotFoundError
 from .errors.unprocessable_entity_error import UnprocessableEntityError
 from .types.artifact import Artifact
 from .types.artifact_type import ArtifactType
+from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
@@ -31,10 +33,12 @@ from .types.script_file_create import ScriptFileCreate
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 from .types.skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
 from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
+from .types.task_run_request_proxy_location import TaskRunRequestProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
+from .types.workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
 from .types.workflow_run_response import WorkflowRunResponse
 from .types.workflow_run_timeline import WorkflowRunTimeline
 from .types.workflow_status import WorkflowStatus
@@ -55,7 +59,7 @@ class RawSkyvern:
         url: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[TaskRunRequestProxyLocation] = OMIT,
         data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
         error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_steps: typing.Optional[int] = OMIT,
@@ -93,7 +97,7 @@ class RawSkyvern:
         title : typing.Optional[str]
             The title for the task
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[TaskRunRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -117,6 +121,7 @@ class RawSkyvern:
             - US-FL: Florida
             - US-WA: Washington
             - NONE: No proxy
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
 
@@ -181,7 +186,9 @@ class RawSkyvern:
                 "url": url,
                 "engine": engine,
                 "title": title,
-                "proxy_location": proxy_location,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=TaskRunRequestProxyLocation, direction="write"
+                ),
                 "data_extraction_schema": convert_and_respect_annotation_metadata(
                     object_=data_extraction_schema, annotation=TaskRunRequestDataExtractionSchema, direction="write"
                 ),
@@ -251,7 +258,7 @@ class RawSkyvern:
         user_agent: typing.Optional[str] = None,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[WorkflowRunRequestProxyLocation] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -284,7 +291,7 @@ class RawSkyvern:
         title : typing.Optional[str]
             The title for this workflow run
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[WorkflowRunRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -308,6 +315,7 @@ class RawSkyvern:
             - US-FL: Florida
             - US-WA: Washington
             - NONE: No proxy
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         webhook_url : typing.Optional[str]
             URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions.
@@ -359,7 +367,9 @@ class RawSkyvern:
                 "workflow_id": workflow_id,
                 "parameters": parameters,
                 "title": title,
-                "proxy_location": proxy_location,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=WorkflowRunRequestProxyLocation, direction="write"
+                ),
                 "webhook_url": webhook_url,
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
@@ -1066,6 +1076,270 @@ class RawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    def list_browser_profiles(
+        self, *, include_deleted: typing.Optional[bool] = None, request_options: typing.Optional[RequestOptions] = None
+    ) -> HttpResponse[typing.List[BrowserProfile]]:
+        """
+        Get all browser profiles for the organization
+
+        Parameters
+        ----------
+        include_deleted : typing.Optional[bool]
+            Include deleted browser profiles
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[typing.List[BrowserProfile]]
+            Successfully retrieved browser profiles
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/browser_profiles",
+            method="GET",
+            params={
+                "include_deleted": include_deleted,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    typing.List[BrowserProfile],
+                    parse_obj_as(
+                        type_=typing.List[BrowserProfile],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def create_browser_profile(
+        self,
+        *,
+        name: str,
+        description: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[BrowserProfile]:
+        """
+        Create a browser profile from a persistent browser session or workflow run.
+
+        Parameters
+        ----------
+        name : str
+            Name for the browser profile
+
+        description : typing.Optional[str]
+            Optional profile description
+
+        browser_session_id : typing.Optional[str]
+            Persistent browser session to convert into a profile
+
+        workflow_run_id : typing.Optional[str]
+            Workflow run whose persisted session should be captured
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[BrowserProfile]
+            Successfully created browser profile
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/browser_profiles",
+            method="POST",
+            json={
+                "name": name,
+                "description": description,
+                "browser_session_id": browser_session_id,
+                "workflow_run_id": workflow_run_id,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    BrowserProfile,
+                    parse_obj_as(
+                        type_=BrowserProfile,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 409:
+                raise ConflictError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def get_browser_profile(
+        self, profile_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> HttpResponse[BrowserProfile]:
+        """
+        Get a specific browser profile by ID
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile. browser_profile_id starts with `bp_`
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[BrowserProfile]
+            Successfully retrieved browser profile
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/browser_profiles/{jsonable_encoder(profile_id)}",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    BrowserProfile,
+                    parse_obj_as(
+                        type_=BrowserProfile,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def delete_browser_profile(
+        self, profile_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> HttpResponse[None]:
+        """
+        Delete a browser profile (soft delete)
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile to delete. browser_profile_id starts with `bp_`
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[None]
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/browser_profiles/{jsonable_encoder(profile_id)}",
+            method="DELETE",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return HttpResponse(response=_response, data=None)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
     def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> HttpResponse[typing.List[BrowserSessionResponse]]:
@@ -1677,15 +1951,16 @@ class RawSkyvern:
         *,
         credential_type: SkyvernSchemasRunBlocksCredentialType,
         url: typing.Optional[str] = OMIT,
-        prompt: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
         bitwarden_collection_id: typing.Optional[str] = OMIT,
         bitwarden_item_id: typing.Optional[str] = OMIT,
@@ -1706,13 +1981,10 @@ class RawSkyvern:
             Where to get the credential from
 
         url : typing.Optional[str]
-            Website url
-
-        prompt : typing.Optional[str]
-            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
+            Website URL
 
         webhook_url : typing.Optional[str]
-            Webhook URL to send login status updates
+            Webhook URL to send status updates
 
         proxy_location : typing.Optional[ProxyLocation]
             Proxy location to use
@@ -1726,6 +1998,9 @@ class RawSkyvern:
         browser_session_id : typing.Optional[str]
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
 
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
         browser_address : typing.Optional[str]
             The CDP address for the task.
 
@@ -1734,6 +2009,9 @@ class RawSkyvern:
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
+
+        prompt : typing.Optional[str]
+            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
 
         credential_id : typing.Optional[str]
             ID of the Skyvern credential to use for login.
@@ -1774,17 +2052,18 @@ class RawSkyvern:
             "v1/run/tasks/login",
             method="POST",
             json={
-                "credential_type": credential_type,
                 "url": url,
-                "prompt": prompt,
                 "webhook_url": webhook_url,
                 "proxy_location": proxy_location,
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
                 "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
+                "credential_type": credential_type,
+                "prompt": prompt,
                 "credential_id": credential_id,
                 "bitwarden_collection_id": bitwarden_collection_id,
                 "bitwarden_item_id": bitwarden_item_id,
@@ -1794,6 +2073,131 @@ class RawSkyvern:
                 "azure_vault_username_key": azure_vault_username_key,
                 "azure_vault_password_key": azure_vault_password_key,
                 "azure_vault_totp_secret_key": azure_vault_totp_secret_key,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[WorkflowRunResponse]:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[WorkflowRunResponse]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/run/tasks/download_files",
+            method="POST",
+            json={
+                "url": url,
+                "webhook_url": webhook_url,
+                "proxy_location": proxy_location,
+                "totp_identifier": totp_identifier,
+                "totp_url": totp_url,
+                "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
+                "browser_address": browser_address,
+                "extra_http_headers": extra_http_headers,
+                "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
+                "navigation_goal": navigation_goal,
+                "download_suffix": download_suffix,
+                "download_timeout": download_timeout,
+                "max_steps_per_run": max_steps_per_run,
             },
             headers={
                 "content-type": "application/json",
@@ -2171,7 +2575,7 @@ class AsyncRawSkyvern:
         url: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[TaskRunRequestProxyLocation] = OMIT,
         data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
         error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_steps: typing.Optional[int] = OMIT,
@@ -2209,7 +2613,7 @@ class AsyncRawSkyvern:
         title : typing.Optional[str]
             The title for the task
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[TaskRunRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -2233,6 +2637,7 @@ class AsyncRawSkyvern:
             - US-FL: Florida
             - US-WA: Washington
             - NONE: No proxy
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
 
@@ -2297,7 +2702,9 @@ class AsyncRawSkyvern:
                 "url": url,
                 "engine": engine,
                 "title": title,
-                "proxy_location": proxy_location,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=TaskRunRequestProxyLocation, direction="write"
+                ),
                 "data_extraction_schema": convert_and_respect_annotation_metadata(
                     object_=data_extraction_schema, annotation=TaskRunRequestDataExtractionSchema, direction="write"
                 ),
@@ -2367,7 +2774,7 @@ class AsyncRawSkyvern:
         user_agent: typing.Optional[str] = None,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[WorkflowRunRequestProxyLocation] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -2400,7 +2807,7 @@ class AsyncRawSkyvern:
         title : typing.Optional[str]
             The title for this workflow run
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[WorkflowRunRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -2424,6 +2831,7 @@ class AsyncRawSkyvern:
             - US-FL: Florida
             - US-WA: Washington
             - NONE: No proxy
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         webhook_url : typing.Optional[str]
             URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions.
@@ -2475,7 +2883,9 @@ class AsyncRawSkyvern:
                 "workflow_id": workflow_id,
                 "parameters": parameters,
                 "title": title,
-                "proxy_location": proxy_location,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=WorkflowRunRequestProxyLocation, direction="write"
+                ),
                 "webhook_url": webhook_url,
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
@@ -3182,6 +3592,270 @@ class AsyncRawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    async def list_browser_profiles(
+        self, *, include_deleted: typing.Optional[bool] = None, request_options: typing.Optional[RequestOptions] = None
+    ) -> AsyncHttpResponse[typing.List[BrowserProfile]]:
+        """
+        Get all browser profiles for the organization
+
+        Parameters
+        ----------
+        include_deleted : typing.Optional[bool]
+            Include deleted browser profiles
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[typing.List[BrowserProfile]]
+            Successfully retrieved browser profiles
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/browser_profiles",
+            method="GET",
+            params={
+                "include_deleted": include_deleted,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    typing.List[BrowserProfile],
+                    parse_obj_as(
+                        type_=typing.List[BrowserProfile],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def create_browser_profile(
+        self,
+        *,
+        name: str,
+        description: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[BrowserProfile]:
+        """
+        Create a browser profile from a persistent browser session or workflow run.
+
+        Parameters
+        ----------
+        name : str
+            Name for the browser profile
+
+        description : typing.Optional[str]
+            Optional profile description
+
+        browser_session_id : typing.Optional[str]
+            Persistent browser session to convert into a profile
+
+        workflow_run_id : typing.Optional[str]
+            Workflow run whose persisted session should be captured
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[BrowserProfile]
+            Successfully created browser profile
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/browser_profiles",
+            method="POST",
+            json={
+                "name": name,
+                "description": description,
+                "browser_session_id": browser_session_id,
+                "workflow_run_id": workflow_run_id,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    BrowserProfile,
+                    parse_obj_as(
+                        type_=BrowserProfile,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 409:
+                raise ConflictError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def get_browser_profile(
+        self, profile_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> AsyncHttpResponse[BrowserProfile]:
+        """
+        Get a specific browser profile by ID
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile. browser_profile_id starts with `bp_`
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[BrowserProfile]
+            Successfully retrieved browser profile
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/browser_profiles/{jsonable_encoder(profile_id)}",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    BrowserProfile,
+                    parse_obj_as(
+                        type_=BrowserProfile,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def delete_browser_profile(
+        self, profile_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> AsyncHttpResponse[None]:
+        """
+        Delete a browser profile (soft delete)
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile to delete. browser_profile_id starts with `bp_`
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[None]
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/browser_profiles/{jsonable_encoder(profile_id)}",
+            method="DELETE",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return AsyncHttpResponse(response=_response, data=None)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
     async def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> AsyncHttpResponse[typing.List[BrowserSessionResponse]]:
@@ -3793,15 +4467,16 @@ class AsyncRawSkyvern:
         *,
         credential_type: SkyvernSchemasRunBlocksCredentialType,
         url: typing.Optional[str] = OMIT,
-        prompt: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
         bitwarden_collection_id: typing.Optional[str] = OMIT,
         bitwarden_item_id: typing.Optional[str] = OMIT,
@@ -3822,13 +4497,10 @@ class AsyncRawSkyvern:
             Where to get the credential from
 
         url : typing.Optional[str]
-            Website url
-
-        prompt : typing.Optional[str]
-            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
+            Website URL
 
         webhook_url : typing.Optional[str]
-            Webhook URL to send login status updates
+            Webhook URL to send status updates
 
         proxy_location : typing.Optional[ProxyLocation]
             Proxy location to use
@@ -3842,6 +4514,9 @@ class AsyncRawSkyvern:
         browser_session_id : typing.Optional[str]
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
 
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
         browser_address : typing.Optional[str]
             The CDP address for the task.
 
@@ -3850,6 +4525,9 @@ class AsyncRawSkyvern:
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
+
+        prompt : typing.Optional[str]
+            Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
 
         credential_id : typing.Optional[str]
             ID of the Skyvern credential to use for login.
@@ -3890,17 +4568,18 @@ class AsyncRawSkyvern:
             "v1/run/tasks/login",
             method="POST",
             json={
-                "credential_type": credential_type,
                 "url": url,
-                "prompt": prompt,
                 "webhook_url": webhook_url,
                 "proxy_location": proxy_location,
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
                 "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
+                "credential_type": credential_type,
+                "prompt": prompt,
                 "credential_id": credential_id,
                 "bitwarden_collection_id": bitwarden_collection_id,
                 "bitwarden_item_id": bitwarden_item_id,
@@ -3910,6 +4589,131 @@ class AsyncRawSkyvern:
                 "azure_vault_username_key": azure_vault_username_key,
                 "azure_vault_password_key": azure_vault_password_key,
                 "azure_vault_totp_secret_key": azure_vault_totp_secret_key,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[WorkflowRunResponse]:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[WorkflowRunResponse]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/run/tasks/download_files",
+            method="POST",
+            json={
+                "url": url,
+                "webhook_url": webhook_url,
+                "proxy_location": proxy_location,
+                "totp_identifier": totp_identifier,
+                "totp_url": totp_url,
+                "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
+                "browser_address": browser_address,
+                "extra_http_headers": extra_http_headers,
+                "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
+                "navigation_goal": navigation_goal,
+                "download_suffix": download_suffix,
+                "download_timeout": download_timeout,
+                "max_steps_per_run": max_steps_per_run,
             },
             headers={
                 "content-type": "application/json",

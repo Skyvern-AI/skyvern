@@ -3,9 +3,13 @@
 import type * as Skyvern from "../index.js";
 
 export interface FileUploadBlockYaml {
+    /** Author-facing identifier; must be unique per workflow. */
     label: string;
+    /** Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]. */
+    next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     storage_type?: Skyvern.FileStorageType;
     s3_bucket?: string;
     aws_access_key_id?: string;

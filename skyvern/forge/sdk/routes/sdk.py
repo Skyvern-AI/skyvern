@@ -15,6 +15,7 @@ from skyvern.forge.sdk.schemas.sdk_actions import (
     RunSdkActionRequest,
     RunSdkActionResponse,
 )
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRequestBody,
@@ -199,6 +200,43 @@ async def run_sdk_action(
                 data=action.data,
             )
             result = extract_result
+        elif action.type == "locate_element":
+            xpath_result = await page_ai.ai_locate_element(
+                prompt=action.prompt,
+            )
+            result = xpath_result
+        elif action.type == "validate":
+            validation_result = await page_ai.ai_validate(
+                prompt=action.prompt,
+                model=action.model,
+            )
+            result = validation_result
+        elif action.type == "prompt":
+            prompt_result = await page_ai.ai_prompt(
+                prompt=action.prompt,
+                schema=action.schema,
+                model=action.model,
+            )
+            result = prompt_result
+        await app.DATABASE.update_task(
+            task_id=task.task_id,
+            organization_id=organization_id,
+            status=TaskStatus.completed,
+        )
+    except Exception as e:
+        await app.DATABASE.update_task(
+            task_id=task.task_id,
+            organization_id=organization_id,
+            status=TaskStatus.failed,
+            failure_reason=str(e),
+        )
+        LOG.error(
+            "SDK action failed",
+            action_type=action.type,
+            error=str(e),
+            exc_info=True,
+        )
+        raise
     finally:
         skyvern_context.reset()
 

@@ -40,8 +40,9 @@ export interface TaskRunRequest {
      * - US-FL: Florida
      * - US-WA: Washington
      * - NONE: No proxy
+     *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
      */
-    proxy_location?: Skyvern.ProxyLocation;
+    proxy_location?: TaskRunRequest.ProxyLocation;
     /**
      * The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
      */
@@ -87,6 +88,33 @@ export interface TaskRunRequest {
 }
 
 export namespace TaskRunRequest {
+    /**
+     *
+     * Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+     *
+     * Available geotargeting options:
+     * - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
+     * - RESIDENTIAL_ES: Spain
+     * - RESIDENTIAL_IE: Ireland
+     * - RESIDENTIAL_GB: United Kingdom
+     * - RESIDENTIAL_IN: India
+     * - RESIDENTIAL_JP: Japan
+     * - RESIDENTIAL_FR: France
+     * - RESIDENTIAL_DE: Germany
+     * - RESIDENTIAL_NZ: New Zealand
+     * - RESIDENTIAL_ZA: South Africa
+     * - RESIDENTIAL_AR: Argentina
+     * - RESIDENTIAL_AU: Australia
+     * - RESIDENTIAL_ISP: ISP proxy
+     * - US-CA: California
+     * - US-NY: New York
+     * - US-TX: Texas
+     * - US-FL: Florida
+     * - US-WA: Washington
+     * - NONE: No proxy
+     *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
+     */
+    export type ProxyLocation = Skyvern.ProxyLocation | Skyvern.GeoTarget | Record<string, unknown>;
     /**
      *
      * The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.

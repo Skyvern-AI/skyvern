@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -5,7 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.config import settings
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 from skyvern.utils.url_validators import validate_url
 
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
@@ -40,7 +41,7 @@ class TaskV2(BaseModel):
     output: dict[str, Any] | list | str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    proxy_location: ProxyLocation | None = None
+    proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None
     extracted_information_schema: dict | list | str | None = None
@@ -56,6 +57,32 @@ class TaskV2(BaseModel):
 
     created_at: datetime
     modified_at: datetime
+
+    @staticmethod
+    def _parse_proxy_location(proxy_location: ProxyLocationInput | str) -> ProxyLocationInput:
+        """Handle JSON strings that were persisted to the DB."""
+        if proxy_location is None or isinstance(proxy_location, (ProxyLocation, GeoTarget, dict)):
+            return proxy_location
+
+        if isinstance(proxy_location, str):
+            stripped = proxy_location.strip()
+            if not stripped:
+                return None
+
+            if stripped.startswith("{"):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, dict):
+                        return GeoTarget.model_validate(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            try:
+                return ProxyLocation(stripped)
+            except ValueError:
+                return None
+
+        return proxy_location
 
     @property
     def llm_key(self) -> str | None:
@@ -78,10 +105,15 @@ class TaskV2(BaseModel):
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
-        if url is None:
-            return None
+        if not url:
+            return url
 
         return validate_url(url)
+
+    @field_validator("proxy_location", mode="before")
+    @classmethod
+    def deserialize_proxy_location(cls, proxy_location: ProxyLocationInput | str) -> ProxyLocationInput:
+        return cls._parse_proxy_location(proxy_location)
 
 
 class ThoughtType(StrEnum):
@@ -137,8 +169,8 @@ class TaskV2Metadata(BaseModel):
     @field_validator("url")
     @classmethod
     def validate_urls(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
+        if not v:
+            return v
         return validate_url(v)
 
 
@@ -149,7 +181,7 @@ class TaskV2Request(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    proxy_location: ProxyLocation | None = None
+    proxy_location: ProxyLocationInput = None
     publish_workflow: bool = False
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
@@ -162,7 +194,12 @@ class TaskV2Request(BaseModel):
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
-        if url is None:
-            return None
+        if not url:
+            return url
 
         return validate_url(url)
+
+    @field_validator("proxy_location", mode="before")
+    @classmethod
+    def deserialize_proxy_location(cls, proxy_location: ProxyLocationInput | str) -> ProxyLocationInput:
+        return TaskV2._parse_proxy_location(proxy_location)

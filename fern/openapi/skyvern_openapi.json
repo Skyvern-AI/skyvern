@@ -484,15 +484,15 @@
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n'\n"
               },
               {
                 "sdk": "python",
-                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
+                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\n// Create a workflow in JSON format\nconst workflowDefinition = {\n    title: \"Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                cache_actions: false,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n                cache_actions: false\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.createWorkflow({\n    json_definition: workflowDefinition\n});\nconsole.log(workflow);\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\n// Create a workflow in JSON format\nconst workflowDefinition = {\n    title: \"Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.createWorkflow({\n    json_definition: workflowDefinition\n});\nconsole.log(workflow);\n"
               }
             ]
           }
@@ -546,6 +546,16 @@
               "type": "boolean",
               "default": false,
               "title": "Only Workflows"
+            }
+          },
+          {
+            "name": "only_templates",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Only Templates"
             }
           },
           {
@@ -762,15 +772,15 @@
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n'\n"
               },
               {
                 "sdk": "python",
-                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
+                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\nconst updatedWorkflowDefinition = {\n    title: \"Updated Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                cache_actions: false,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n                cache_actions: false\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.updateWorkflow(\"wpid_123\", {\n    json_definition: updatedWorkflowDefinition\n});\nconsole.log(workflow);\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\nconst updatedWorkflowDefinition = {\n    title: \"Updated Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: []\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.updateWorkflow(\"wpid_123\", {\n    json_definition: updatedWorkflowDefinition\n});\nconsole.log(workflow);\n"
               }
             ]
           }
@@ -854,479 +864,6 @@
             ]
           }
         ]
-      }
-    },
-    "/v1/folders": {
-      "post": {
-        "tags": [
-          "Workflows"
-        ],
-        "summary": "Create folder",
-        "description": "Create a new folder to organize workflows",
-        "operationId": "create_folder_v1_folders_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/FolderCreate"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successfully created folder",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Folder"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "get": {
-        "tags": [
-          "Workflows"
-        ],
-        "summary": "Get folders",
-        "description": "Get all folders for the organization",
-        "operationId": "get_folders_v1_folders_get",
-        "parameters": [
-          {
-            "name": "page",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Page number",
-              "default": 1,
-              "title": "Page"
-            },
-            "description": "Page number"
-          },
-          {
-            "name": "page_size",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "maximum": 500,
-              "minimum": 1,
-              "description": "Number of folders per page",
-              "default": 100,
-              "title": "Page Size"
-            },
-            "description": "Number of folders per page"
-          },
-          {
-            "name": "search",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Search folders by title or description",
-              "title": "Search"
-            },
-            "description": "Search folders by title or description"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successfully retrieved folders",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Folder"
-                  },
-                  "title": "Response Get Folders V1 Folders Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/folders/{folder_id}": {
-      "get": {
-        "tags": [
-          "Workflows"
-        ],
-        "summary": "Get folder",
-        "description": "Get a specific folder by ID",
-        "operationId": "get_folder_v1_folders__folder_id__get",
-        "parameters": [
-          {
-            "name": "folder_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Folder ID",
-              "examples": [
-                "fld_123"
-              ],
-              "title": "Folder Id"
-            },
-            "description": "Folder ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successfully retrieved folder",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Folder"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Folder not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "put": {
-        "tags": [
-          "Workflows"
-        ],
-        "summary": "Update folder",
-        "description": "Update a folder's title or description",
-        "operationId": "update_folder_v1_folders__folder_id__put",
-        "parameters": [
-          {
-            "name": "folder_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Folder ID",
-              "examples": [
-                "fld_123"
-              ],
-              "title": "Folder Id"
-            },
-            "description": "Folder ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/FolderUpdate"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successfully updated folder",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Folder"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Folder not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "tags": [
-          "Workflows"
-        ],
-        "summary": "Delete folder",
-        "description": "Delete a folder. Optionally delete all workflows in the folder.",
-        "operationId": "delete_folder_v1_folders__folder_id__delete",
-        "parameters": [
-          {
-            "name": "folder_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Folder ID",
-              "examples": [
-                "fld_123"
-              ],
-              "title": "Folder Id"
-            },
-            "description": "Folder ID"
-          },
-          {
-            "name": "delete_workflows",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "description": "If true, also delete all workflows in this folder",
-              "default": false,
-              "title": "Delete Workflows"
-            },
-            "description": "If true, also delete all workflows in this folder"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successfully deleted folder",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Delete Folder V1 Folders  Folder Id  Delete"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Folder not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/workflows/{workflow_permanent_id}/folder": {
-      "put": {
-        "tags": [
-          "Workflows"
-        ],
-        "summary": "Update workflow folder",
-        "description": "Update a workflow's folder assignment for the latest version",
-        "operationId": "update_workflow_folder_v1_workflows__workflow_permanent_id__folder_put",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Workflow permanent ID",
-              "examples": [
-                "wpid_123"
-              ],
-              "title": "Workflow Permanent Id"
-            },
-            "description": "Workflow permanent ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateWorkflowFolderRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successfully updated workflow folder",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Workflow"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Folder not found"
-          },
-          "404": {
-            "description": "Workflow not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
       }
     },
     "/v1/artifacts/{artifact_id}": {
@@ -1654,12 +1191,85 @@
         ]
       }
     },
+    "/v1/workflows/{workflow_permanent_id}/template": {
+      "put": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Set Workflow Template Status",
+        "description": "Set or unset a workflow as a template.\n\nTemplate status is stored at the workflow_permanent_id level (not per-version),\nmeaning all versions of a workflow share the same template status.",
+        "operationId": "set_workflow_template_status_v1_workflows__workflow_permanent_id__template_put",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "is_template",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "boolean",
+              "title": "Is Template"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Set Workflow Template Status V1 Workflows  Workflow Permanent Id  Template Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/browser_profiles": {
       "post": {
         "tags": [
           "Browser Profiles"
         ],
         "summary": "Create a browser profile",
+        "description": "Create a browser profile from a persistent browser session or workflow run.",
         "operationId": "create_browser_profile_v1_browser_profiles_post",
         "parameters": [
           {
@@ -1693,7 +1303,7 @@
         },
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Successfully created browser profile",
             "content": {
               "application/json": {
                 "schema": {
@@ -1701,6 +1311,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request - missing source or source not found"
+          },
+          "409": {
+            "description": "Browser profile name already exists"
           },
           "422": {
             "description": "Validation Error",
@@ -1712,7 +1328,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "create_browser_profile",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from a workflow run with persist_browser_session=True\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from a workflow run with persist_browser_session=True\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
+              }
+            ]
+          }
+        ]
       },
       "get": {
         "tags": [
@@ -1755,7 +1386,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Successfully retrieved browser profiles",
             "content": {
               "application/json": {
                 "schema": {
@@ -1778,7 +1409,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "list_browser_profiles",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_profiles = await skyvern.browser_profiles.list_browser_profiles()\nprint(browser_profiles)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst browserProfiles = await skyvern.browserProfiles.listBrowserProfiles();\nconsole.log(browserProfiles);\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/browser_profiles/{profile_id}": {
@@ -1847,7 +1493,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "get_browser_profile",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_profile = await skyvern.browser_profiles.get_browser_profile(\"bp_123\")\nprint(browser_profile)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst browserProfile = await skyvern.browserProfiles.getBrowserProfile(\"bp_123\");\nconsole.log(browserProfile);\n"
+              }
+            ]
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -1907,7 +1568,22 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "delete_browser_profile",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.browser_profiles.delete_browser_profile(\"bp_123\")\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.browserProfiles.deleteBrowserProfile(\"bp_123\");\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/browser_sessions": {
@@ -2676,79 +2352,6 @@
         ]
       }
     },
-    "/v1/prompts/improve": {
-      "post": {
-        "tags": [
-          "Prompts"
-        ],
-        "summary": "Improve prompt",
-        "description": "Improve a prompt based on a specific use-case",
-        "operationId": "improve_prompt_v1_prompts_improve_post",
-        "parameters": [
-          {
-            "name": "use-case",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "The use-case for prompt improvement",
-              "title": "Use-Case"
-            },
-            "description": "The use-case for prompt improvement"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ImprovePromptRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ImprovePromptResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/run/tasks/login": {
       "post": {
         "tags": [
@@ -2836,6 +2439,83 @@
               {
                 "sdk": "typescript",
                 "code": "// Login with password saved in 1Password\nimport { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"onepassword\",\n    onepassword_vault_id: \"1PASSWORD VAULT ID\",\n    onepassword_item_id: \"1PASSWORD ITEM ID\"\n});\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/run/tasks/download_files": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "File Download Task",
+        "description": "Download a file from a website by navigating and clicking download buttons",
+        "operationId": "download_files_v1_run_tasks_download_files_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DownloadFilesRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "download_files",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.download_files(\n    url=\"https://example.com/downloads\",\n    navigation_goal=\"Navigate to the downloads page and click the 'Download PDF' button\",\n    download_suffix=\"report.pdf\"\n)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.downloadFiles({\n    url: \"https://example.com/downloads\",\n    navigation_goal: \"Navigate to the downloads page and click the 'Download PDF' button\",\n    download_suffix: \"report.pdf\"\n});\n"
               }
             ]
           }
@@ -3797,7 +3477,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -3828,6 +3521,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -4044,11 +3742,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -4088,7 +3781,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -4106,6 +3812,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "url": {
             "anyOf": [
@@ -4209,11 +3920,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
@@ -4246,6 +3952,7 @@
           "select_option",
           "checkbox",
           "wait",
+          "hover",
           "null_action",
           "solve_captcha",
           "terminate",
@@ -4335,6 +4042,17 @@
               }
             ],
             "title": "Workflow Run Block Id"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
           },
           "observer_cruise_id": {
             "anyOf": [
@@ -5143,6 +4861,7 @@
           "task",
           "task_v2",
           "for_loop",
+          "conditional",
           "code",
           "text_prompt",
           "download_to_s3",
@@ -5163,6 +4882,145 @@
           "human_interaction"
         ],
         "title": "BlockType"
+      },
+      "BranchCondition": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "criteria": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/JinjaBranchCriteria"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PromptBranchCriteria"
+                  }
+                ],
+                "discriminator": {
+                  "propertyName": "criteria_type",
+                  "mapping": {
+                    "jinja2_template": "#/components/schemas/JinjaBranchCriteria",
+                    "prompt": "#/components/schemas/PromptBranchCriteria"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Criteria"
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "is_default": {
+            "type": "boolean",
+            "title": "Is Default",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "BranchCondition",
+        "description": "Represents a single conditional branch edge within a ConditionalBlock."
+      },
+      "BranchConditionYAML": {
+        "properties": {
+          "criteria": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BranchCriteriaYAML"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "is_default": {
+            "type": "boolean",
+            "title": "Is Default",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "BranchConditionYAML"
+      },
+      "BranchCriteriaYAML": {
+        "properties": {
+          "criteria_type": {
+            "type": "string",
+            "enum": [
+              "jinja2_template",
+              "prompt"
+            ],
+            "title": "Criteria Type",
+            "default": "jinja2_template"
+          },
+          "expression": {
+            "type": "string",
+            "title": "Expression"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "expression"
+        ],
+        "title": "BranchCriteriaYAML"
       },
       "BrowserProfile": {
         "properties": {
@@ -5512,7 +5370,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -5543,6 +5414,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "code": {
@@ -5626,7 +5502,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -5644,6 +5533,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "code": {
             "type": "string",
@@ -5670,6 +5564,138 @@
           "code"
         ],
         "title": "CodeBlockYAML"
+      },
+      "ConditionalBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "conditional",
+            "title": "Block Type",
+            "default": "conditional"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "branch_conditions": {
+            "items": {
+              "$ref": "#/components/schemas/BranchCondition"
+            },
+            "type": "array",
+            "title": "Branch Conditions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter"
+        ],
+        "title": "ConditionalBlock",
+        "description": "Branching block that selects the next block label based on list-ordered conditions."
+      },
+      "ConditionalBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "conditional",
+            "title": "Block Type",
+            "default": "conditional"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "branch_conditions": {
+            "items": {
+              "$ref": "#/components/schemas/BranchConditionYAML"
+            },
+            "type": "array",
+            "title": "Branch Conditions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "ConditionalBlockYAML"
       },
       "ContextParameter": {
         "properties": {
@@ -5906,6 +5932,9 @@
               },
               {
                 "$ref": "#/components/schemas/NonEmptyCreditCardCredential"
+              },
+              {
+                "$ref": "#/components/schemas/SecretCredential"
               }
             ],
             "title": "Credential",
@@ -6167,6 +6196,9 @@
               },
               {
                 "$ref": "#/components/schemas/CreditCardCredentialResponse"
+              },
+              {
+                "$ref": "#/components/schemas/SecretCredentialResponse"
               }
             ],
             "title": "Credential",
@@ -6199,7 +6231,8 @@
         "type": "string",
         "enum": [
           "password",
-          "credit_card"
+          "credit_card",
+          "secret"
         ],
         "title": "CredentialType",
         "description": "Type of credential stored in the system."
@@ -6257,11 +6290,203 @@
         "title": "DeployScriptRequest",
         "description": "Request model for deploying a script with updated files."
       },
+      "DownloadFilesRequest": {
+        "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url",
+            "description": "Website URL"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url",
+            "description": "Webhook URL to send status updates"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Proxy location to use"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url",
+            "description": "TOTP URL to fetch one-time passwords"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id",
+            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`",
+            "examples": [
+              "pbs_123456"
+            ]
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of a browser profile to reuse for this run"
+          },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "The CDP address for the task.",
+            "examples": [
+              "http://127.0.0.1:9222",
+              "ws://127.0.0.1:9222/devtools/browser/1234567890"
+            ]
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers",
+            "description": "Additional HTTP headers to include in requests"
+          },
+          "max_screenshot_scrolling_times": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolling Times",
+            "description": "Maximum number of times to scroll for screenshots"
+          },
+          "navigation_goal": {
+            "type": "string",
+            "title": "Navigation Goal",
+            "description": "Instructions for navigating to and downloading the file"
+          },
+          "download_suffix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Suffix",
+            "description": "Suffix or complete filename for the downloaded file"
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout",
+            "description": "Timeout in seconds for the download operation"
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run",
+            "description": "Maximum number of steps to execute"
+          }
+        },
+        "type": "object",
+        "required": [
+          "navigation_goal"
+        ],
+        "title": "DownloadFilesRequest"
+      },
       "DownloadToS3Block": {
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -6294,6 +6519,11 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "url": {
             "type": "string",
             "title": "Url"
@@ -6317,7 +6547,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -6335,6 +6578,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "url": {
             "type": "string",
@@ -6434,7 +6682,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -6465,6 +6726,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -6673,11 +6939,6 @@
               }
             ],
             "title": "Totp Identifier"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "complete_verification": {
             "type": "boolean",
@@ -6719,7 +6980,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -6737,6 +7011,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "data_extraction_goal": {
             "type": "string",
@@ -6811,11 +7090,6 @@
             ],
             "title": "Parameter Keys"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
@@ -6833,7 +7107,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -6864,6 +7151,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -7080,11 +7372,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -7124,7 +7411,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -7142,6 +7442,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "navigation_goal": {
             "type": "string",
@@ -7243,11 +7548,6 @@
               }
             ],
             "title": "Totp Identifier"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "disable_cache": {
             "type": "boolean",
@@ -7411,7 +7711,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -7442,6 +7755,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "file_url": {
@@ -7483,7 +7801,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -7501,6 +7832,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "file_url": {
             "type": "string",
@@ -7551,7 +7887,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -7582,6 +7931,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "storage_type": {
@@ -7694,7 +8048,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -7712,6 +8079,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "storage_type": {
             "$ref": "#/components/schemas/FileStorageType",
@@ -7823,130 +8195,24 @@
         ],
         "title": "FileUploadBlockYAML"
       },
-      "Folder": {
-        "properties": {
-          "title": {
-            "type": "string",
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Title",
-            "description": "Folder title"
-          },
-          "description": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Description",
-            "description": "Folder description"
-          },
-          "folder_id": {
-            "type": "string",
-            "title": "Folder Id"
-          },
-          "organization_id": {
-            "type": "string",
-            "title": "Organization Id"
-          },
-          "workflow_count": {
-            "type": "integer",
-            "title": "Workflow Count",
-            "description": "Number of workflows in this folder",
-            "default": 0
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time",
-            "title": "Created At"
-          },
-          "modified_at": {
-            "type": "string",
-            "format": "date-time",
-            "title": "Modified At"
-          }
-        },
-        "type": "object",
-        "required": [
-          "title",
-          "folder_id",
-          "organization_id",
-          "created_at",
-          "modified_at"
-        ],
-        "title": "Folder",
-        "description": "Response model for a folder"
-      },
-      "FolderCreate": {
-        "properties": {
-          "title": {
-            "type": "string",
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Title",
-            "description": "Folder title"
-          },
-          "description": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Description",
-            "description": "Folder description"
-          }
-        },
-        "type": "object",
-        "required": [
-          "title"
-        ],
-        "title": "FolderCreate",
-        "description": "Request model for creating a folder"
-      },
-      "FolderUpdate": {
-        "properties": {
-          "title": {
-            "anyOf": [
-              {
-                "type": "string",
-                "maxLength": 255,
-                "minLength": 1
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Title",
-            "description": "Folder title"
-          },
-          "description": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Description",
-            "description": "Folder description"
-          }
-        },
-        "type": "object",
-        "title": "FolderUpdate",
-        "description": "Request model for updating a folder"
-      },
       "ForLoopBlock": {
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -7979,9 +8245,17 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "loop_blocks": {
             "items": {
               "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ConditionalBlock"
+                },
                 {
                   "$ref": "#/components/schemas/ForLoopBlock"
                 },
@@ -8051,6 +8325,7 @@
                 "mapping": {
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
+                  "conditional": "#/components/schemas/ConditionalBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "extraction": "#/components/schemas/ExtractionBlock",
                   "file_download": "#/components/schemas/FileDownloadBlock",
@@ -8172,7 +8447,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -8190,6 +8478,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "loop_blocks": {
             "items": {
@@ -8256,6 +8549,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ConditionalBlockYAML"
                 }
               ]
             },
@@ -8291,6 +8587,67 @@
         ],
         "title": "ForLoopBlockYAML"
       },
+      "GeoTarget": {
+        "properties": {
+          "country": {
+            "type": "string",
+            "maxLength": 2,
+            "minLength": 2,
+            "title": "Country",
+            "description": "ISO 3166-1 alpha-2 country code (e.g., 'US', 'GB', 'DE')",
+            "examples": [
+              "US",
+              "GB",
+              "DE",
+              "FR"
+            ]
+          },
+          "subdivision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 10
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subdivision",
+            "description": "ISO 3166-2 subdivision code without country prefix (e.g., 'CA' for California, 'NY' for New York)",
+            "examples": [
+              "CA",
+              "NY",
+              "TX",
+              "ENG"
+            ]
+          },
+          "city": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "City",
+            "description": "City name in English from GeoNames (e.g., 'New York', 'Los Angeles', 'London')",
+            "examples": [
+              "New York",
+              "Los Angeles",
+              "London",
+              "Berlin"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "country"
+        ],
+        "title": "GeoTarget",
+        "description": "Granular geographic targeting for proxy selection.\n\nSupports country, subdivision (state/region), and city level targeting.\nUses ISO 3166-1 alpha-2 for countries, ISO 3166-2 for subdivisions,\nand GeoNames English names for cities.\n\nExamples:\n    - {\"country\": \"US\"} - United States (same as RESIDENTIAL)\n    - {\"country\": \"US\", \"subdivision\": \"CA\"} - California, US\n    - {\"country\": \"US\", \"subdivision\": \"NY\", \"city\": \"New York\"} - New York City\n    - {\"country\": \"GB\", \"city\": \"London\"} - London, UK"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -8308,7 +8665,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -8339,6 +8709,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "method": {
@@ -8382,6 +8757,20 @@
               }
             ],
             "title": "Body"
+          },
+          "files": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Files"
           },
           "timeout": {
             "type": "integer",
@@ -8469,7 +8858,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -8487,6 +8889,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "method": {
             "type": "string",
@@ -8530,6 +8937,20 @@
             ],
             "title": "Body"
           },
+          "files": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Files"
+          },
           "timeout": {
             "type": "integer",
             "title": "Timeout",
@@ -8565,7 +8986,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -8596,6 +9030,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -8812,11 +9251,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -8900,7 +9334,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -8918,6 +9365,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "instructions": {
             "type": "string",
@@ -8968,65 +9420,6 @@
           "body"
         ],
         "title": "HumanInteractionBlockYAML"
-      },
-      "ImprovePromptRequest": {
-        "properties": {
-          "context": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Context",
-            "description": "Additional context about the user's needs"
-          },
-          "prompt": {
-            "type": "string",
-            "minLength": 1,
-            "title": "Prompt",
-            "description": "The original prompt to improve"
-          }
-        },
-        "type": "object",
-        "required": [
-          "prompt"
-        ],
-        "title": "ImprovePromptRequest"
-      },
-      "ImprovePromptResponse": {
-        "properties": {
-          "error": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Error",
-            "description": "Error message if prompt improvement failed"
-          },
-          "improved": {
-            "type": "string",
-            "title": "Improved",
-            "description": "The improved version of the prompt"
-          },
-          "original": {
-            "type": "string",
-            "title": "Original",
-            "description": "The original prompt provided for improvement"
-          }
-        },
-        "type": "object",
-        "required": [
-          "improved",
-          "original"
-        ],
-        "title": "ImprovePromptResponse"
       },
       "InputOrSelectContext": {
         "properties": {
@@ -9202,11 +9595,74 @@
         "title": "InputTextAction",
         "description": "Input text action parameters."
       },
+      "JinjaBranchCriteria": {
+        "properties": {
+          "criteria_type": {
+            "type": "string",
+            "const": "jinja2_template",
+            "title": "Criteria Type",
+            "default": "jinja2_template"
+          },
+          "expression": {
+            "type": "string",
+            "title": "Expression"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "expression"
+        ],
+        "title": "JinjaBranchCriteria",
+        "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
+      },
+      "LocateElementAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "locate_element",
+            "title": "Type",
+            "default": "locate_element"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Natural language prompt to locate an element",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "title": "LocateElementAction",
+        "description": "Locate element action parameters."
+      },
       "LoginBlock": {
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -9237,6 +9693,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -9453,11 +9914,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -9497,7 +9953,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -9515,6 +9984,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "url": {
             "anyOf": [
@@ -9613,11 +10087,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
@@ -9659,10 +10128,6 @@
       },
       "LoginRequest": {
         "properties": {
-          "credential_type": {
-            "$ref": "#/components/schemas/skyvern__schemas__run_blocks__CredentialType",
-            "description": "Where to get the credential from"
-          },
           "url": {
             "anyOf": [
               {
@@ -9673,19 +10138,7 @@
               }
             ],
             "title": "Url",
-            "description": "Website url"
-          },
-          "prompt": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prompt",
-            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
+            "description": "Website URL"
           },
           "webhook_url": {
             "anyOf": [
@@ -9697,7 +10150,7 @@
               }
             ],
             "title": "Webhook Url",
-            "description": "Webhook URL to send login status updates"
+            "description": "Webhook URL to send status updates"
           },
           "proxy_location": {
             "anyOf": [
@@ -9803,6 +10256,22 @@
             ],
             "title": "Max Screenshot Scrolling Times",
             "description": "Maximum number of times to scroll for screenshots"
+          },
+          "credential_type": {
+            "$ref": "#/components/schemas/skyvern__schemas__run_blocks__CredentialType",
+            "description": "Where to get the credential from"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
           },
           "credential_id": {
             "anyOf": [
@@ -9926,7 +10395,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -9957,6 +10439,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -10166,11 +10653,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -10211,7 +10693,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -10229,6 +10724,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "navigation_goal": {
             "type": "string",
@@ -10335,11 +10835,6 @@
               }
             ],
             "title": "Totp Identifier"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "disable_cache": {
             "type": "boolean",
@@ -10496,6 +10991,22 @@
             "default": "none",
             "examples": [
               "authenticator"
+            ]
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "Identifier (email or phone number) used to fetch TOTP codes",
+            "examples": [
+              "user@example.com",
+              "+14155550123"
             ]
           }
         },
@@ -10727,7 +11238,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -10758,6 +11282,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "file_url": {
@@ -10796,7 +11325,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -10814,6 +11356,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "file_url": {
             "type": "string",
@@ -10856,6 +11403,22 @@
             "examples": [
               "authenticator"
             ]
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "Identifier (email or phone number) used to fetch TOTP codes",
+            "examples": [
+              "user@example.com",
+              "+14155550123"
+            ]
           }
         },
         "type": "object",
@@ -10864,6 +11427,84 @@
         ],
         "title": "PasswordCredentialResponse",
         "description": "Response model for password credentials, containing only the username."
+      },
+      "PromptAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "prompt",
+            "title": "Type",
+            "default": "prompt"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "The prompt to send to the LLM"
+          },
+          "schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schema",
+            "description": "Optional JSON schema to structure the response"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Optional model configuration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "PromptAction",
+        "description": "Prompt action parameters."
+      },
+      "PromptBranchCriteria": {
+        "properties": {
+          "criteria_type": {
+            "type": "string",
+            "const": "prompt",
+            "title": "Criteria Type",
+            "default": "prompt"
+          },
+          "expression": {
+            "type": "string",
+            "title": "Expression"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "expression"
+        ],
+        "title": "PromptBranchCriteria",
+        "description": "Natural language branch criteria."
       },
       "ProxyLocation": {
         "type": "string",
@@ -10969,6 +11610,15 @@
               },
               {
                 "$ref": "#/components/schemas/ExtractAction"
+              },
+              {
+                "$ref": "#/components/schemas/LocateElementAction"
+              },
+              {
+                "$ref": "#/components/schemas/ValidateAction"
+              },
+              {
+                "$ref": "#/components/schemas/PromptAction"
               }
             ],
             "title": "Action",
@@ -10981,7 +11631,10 @@
                 "ai_input_text": "#/components/schemas/InputTextAction",
                 "ai_select_option": "#/components/schemas/SelectOptionAction",
                 "ai_upload_file": "#/components/schemas/UploadFileAction",
-                "extract": "#/components/schemas/ExtractAction"
+                "extract": "#/components/schemas/ExtractAction",
+                "locate_element": "#/components/schemas/LocateElementAction",
+                "prompt": "#/components/schemas/PromptAction",
+                "validate": "#/components/schemas/ValidateAction"
               }
             }
           }
@@ -11156,6 +11809,56 @@
         "type": "object",
         "title": "ScriptRunResponse"
       },
+      "SecretCredential": {
+        "properties": {
+          "secret_value": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Secret Value",
+            "description": "The secret value",
+            "examples": [
+              "sk-abc123"
+            ]
+          },
+          "secret_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Label",
+            "description": "Optional label describing the secret"
+          }
+        },
+        "type": "object",
+        "required": [
+          "secret_value"
+        ],
+        "title": "SecretCredential",
+        "description": "Generic secret credential."
+      },
+      "SecretCredentialResponse": {
+        "properties": {
+          "secret_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Label",
+            "description": "Optional label for the stored secret"
+          }
+        },
+        "type": "object",
+        "title": "SecretCredentialResponse",
+        "description": "Response model for secret credentials."
+      },
       "SelectOption": {
         "properties": {
           "label": {
@@ -11266,7 +11969,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -11297,6 +12013,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "smtp_host": {
@@ -11364,7 +12085,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -11382,6 +12116,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "smtp_host_secret_parameter_key": {
             "type": "string",
@@ -11706,7 +12445,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -11737,6 +12489,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -11953,11 +12710,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -11997,7 +12749,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -12015,6 +12780,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "url": {
             "anyOf": [
@@ -12159,11 +12929,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
@@ -12261,10 +13026,18 @@
                 "$ref": "#/components/schemas/ProxyLocation"
               },
               {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n",
+            "title": "Proxy Location",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "data_extraction_schema": {
@@ -12750,7 +13523,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -12781,6 +13567,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "prompt": {
@@ -12849,7 +13640,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -12867,6 +13671,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "prompt": {
             "type": "string",
@@ -12932,7 +13741,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -12965,10 +13787,21 @@
             "title": "Disable Cache",
             "default": false
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "llm_key": {
-            "type": "string",
-            "title": "Llm Key",
-            "default": "AZURE_OPENAI_GPT4_1"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Key"
           },
           "prompt": {
             "type": "string",
@@ -13063,7 +13896,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -13082,10 +13928,21 @@
             ],
             "title": "Model"
           },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
           "llm_key": {
-            "type": "string",
-            "title": "Llm Key",
-            "default": "GEMINI_2_5_FLASH_WITH_GPT_4_1_MINI_FALLBACK"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Key"
           },
           "prompt": {
             "type": "string",
@@ -13372,25 +14229,6 @@
         "title": "TotpType",
         "description": "Type of 2FA/TOTP method used."
       },
-      "UpdateWorkflowFolderRequest": {
-        "properties": {
-          "folder_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Folder Id",
-            "description": "Folder ID to assign workflow to. Set to null to remove from folder."
-          }
-        },
-        "type": "object",
-        "title": "UpdateWorkflowFolderRequest",
-        "description": "Request model for updating a workflow's folder assignment"
-      },
       "UploadFileAction": {
         "properties": {
           "type": {
@@ -13462,7 +14300,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -13493,6 +14344,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "path": {
@@ -13524,7 +14380,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -13542,6 +14411,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "path": {
             "anyOf": [
@@ -13565,7 +14439,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -13596,6 +14483,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -13804,11 +14696,6 @@
               }
             ],
             "title": "Totp Identifier"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "complete_verification": {
             "type": "boolean",
@@ -13850,7 +14737,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -13868,6 +14768,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "url": {
             "type": "string",
@@ -13906,11 +14811,58 @@
         ],
         "title": "UserDefinedError"
       },
+      "ValidateAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "validate",
+            "title": "Type",
+            "default": "validate"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Validation criteria or condition to check"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Optional model configuration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "ValidateAction",
+        "description": "Validate action parameters."
+      },
       "ValidationBlock": {
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -13941,6 +14893,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "task_type": {
@@ -14157,11 +15114,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -14201,7 +15153,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -14219,6 +15184,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -14319,7 +15289,20 @@
         "properties": {
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
           },
           "block_type": {
             "type": "string",
@@ -14350,6 +15333,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
             "default": false
           },
           "wait_sec": {
@@ -14433,7 +15421,20 @@
           },
           "label": {
             "type": "string",
-            "title": "Label"
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
           },
           "continue_on_failure": {
             "type": "boolean",
@@ -14451,6 +15452,11 @@
               }
             ],
             "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
           },
           "wait_sec": {
             "type": "integer",
@@ -14490,6 +15496,11 @@
             "type": "boolean",
             "title": "Is Saved Task"
           },
+          "is_template": {
+            "type": "boolean",
+            "title": "Is Template",
+            "default": false
+          },
           "description": {
             "anyOf": [
               {
@@ -14510,9 +15521,17 @@
                 "$ref": "#/components/schemas/ProxyLocation"
               },
               {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Proxy Location"
           },
           "webhook_callback_url": {
             "anyOf": [
@@ -14724,9 +15743,17 @@
                 "$ref": "#/components/schemas/ProxyLocation"
               },
               {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Proxy Location"
           },
           "webhook_callback_url": {
             "anyOf": [
@@ -14880,6 +15907,11 @@
       },
       "WorkflowDefinition": {
         "properties": {
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "default": 1
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -14940,6 +15972,9 @@
           "blocks": {
             "items": {
               "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ConditionalBlock"
+                },
                 {
                   "$ref": "#/components/schemas/ForLoopBlock"
                 },
@@ -15009,6 +16044,7 @@
                 "mapping": {
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
+                  "conditional": "#/components/schemas/ConditionalBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "extraction": "#/components/schemas/ExtractionBlock",
                   "file_download": "#/components/schemas/FileDownloadBlock",
@@ -15044,6 +16080,11 @@
       },
       "WorkflowDefinitionYAML": {
         "properties": {
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "default": 1
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -15162,6 +16203,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ConditionalBlockYAML"
                 }
               ],
               "discriminator": {
@@ -15169,6 +16213,7 @@
                 "mapping": {
                   "action": "#/components/schemas/ActionBlockYAML",
                   "code": "#/components/schemas/CodeBlockYAML",
+                  "conditional": "#/components/schemas/ConditionalBlockYAML",
                   "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
                   "extraction": "#/components/schemas/ExtractionBlockYAML",
                   "file_download": "#/components/schemas/FileDownloadBlockYAML",
@@ -15780,6 +16825,50 @@
               }
             ],
             "title": "Negative Descriptor"
+          },
+          "executed_branch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Id"
+          },
+          "executed_branch_expression": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Expression"
+          },
+          "executed_branch_result": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Result"
+          },
+          "executed_branch_next_block": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed Branch Next Block"
           }
         },
         "type": "object",
@@ -15834,10 +16923,18 @@
                 "$ref": "#/components/schemas/ProxyLocation"
               },
               {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n",
+            "title": "Proxy Location",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "webhook_url": {
@@ -16355,7 +17452,8 @@
         "type": "string",
         "enum": [
           "password",
-          "credit_card"
+          "credit_card",
+          "secret"
         ],
         "title": "CredentialType",
         "description": "Type of credential stored in the system."

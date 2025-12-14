@@ -30,6 +30,8 @@ groups:
           repository: Skyvern-AI/skyvern-typescript
         config:
           namespaceExport: Skyvern
+          extraDependencies:
+            playwright: '^1.48.0'
           packageJson:
             description: "The Skyvern TypeScript library provides convenient access to the Skyvern APIs from TypeScript."
             publishConfig:

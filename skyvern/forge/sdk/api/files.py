@@ -228,7 +228,7 @@ def get_path_for_workflow_download_directory(run_id: str | None) -> Path:
 
 
 def get_download_dir(run_id: str | None) -> str:
-    download_dir = f"{REPO_ROOT_DIR}/downloads/{run_id}"
+    download_dir = os.path.join(settings.DOWNLOAD_PATH, str(run_id))
     os.makedirs(download_dir, exist_ok=True)
     return download_dir
 

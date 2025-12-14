@@ -24,11 +24,32 @@ class Constants:
     }
 
 
+def resolve_template_name(use_case: str) -> str:
+    """
+    Map a use-case to the template the LLM should receive.
+
+    Defaults to the generic template so new use-cases can be added from the UI
+    without requiring backend changes.
+    """
+    template_name = Constants.IMPROVE_PROMPT_USE_CASE_TO_TEMPLATE_MAP.get(use_case)
+    if template_name:
+        return template_name
+
+    LOG.info(
+        "Unknown improve prompt use case, falling back to default template",
+        use_case=use_case,
+        template_name=Constants.DEFAULT_TEMPLATE_NAME,
+    )
+
+    return Constants.DEFAULT_TEMPLATE_NAME
+
+
 @base_router.post(
     "/prompts/improve",
     tags=["Prompts"],
     description="Improve a prompt based on a specific use-case",
     summary="Improve prompt",
+    include_in_schema=False,
 )
 async def improve_prompt(
     request: ImprovePromptRequest,
@@ -38,10 +59,7 @@ async def improve_prompt(
     """
     Improve a prompt based on a specific use-case.
     """
-    template_name = Constants.IMPROVE_PROMPT_USE_CASE_TO_TEMPLATE_MAP.get(
-        use_case,
-        Constants.DEFAULT_TEMPLATE_NAME,
-    )
+    template_name = resolve_template_name(use_case)
 
     llm_prompt = prompt_engine.load_prompt(
         context=request.context,

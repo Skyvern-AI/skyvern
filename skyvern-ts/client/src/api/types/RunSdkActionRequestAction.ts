@@ -11,7 +11,10 @@ export type RunSdkActionRequestAction =
     | Skyvern.RunSdkActionRequestAction.AiInputText
     | Skyvern.RunSdkActionRequestAction.AiSelectOption
     | Skyvern.RunSdkActionRequestAction.AiUploadFile
-    | Skyvern.RunSdkActionRequestAction.Extract;
+    | Skyvern.RunSdkActionRequestAction.Extract
+    | Skyvern.RunSdkActionRequestAction.LocateElement
+    | Skyvern.RunSdkActionRequestAction.Prompt
+    | Skyvern.RunSdkActionRequestAction.Validate;
 
 export namespace RunSdkActionRequestAction {
     export interface AiAct extends Skyvern.ActAction {
@@ -36,5 +39,17 @@ export namespace RunSdkActionRequestAction {
 
     export interface Extract extends Skyvern.ExtractAction {
         type: "extract";
+    }
+
+    export interface LocateElement extends Skyvern.LocateElementAction {
+        type: "locate_element";
+    }
+
+    export interface Prompt extends Skyvern.PromptAction {
+        type: "prompt";
+    }
+
+    export interface Validate extends Skyvern.ValidateAction {
+        type: "validate";
     }
 }

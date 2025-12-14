@@ -2,7 +2,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { CredentialItem } from "./CredentialItem";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 
-type CredentialFilter = "password" | "credit_card";
+type CredentialFilter = "password" | "credit_card" | "secret";
 
 type Props = {
   filter?: CredentialFilter;
@@ -11,6 +11,7 @@ type Props = {
 const EMPTY_MESSAGE: Record<CredentialFilter, string> = {
   password: "No password credentials stored yet.",
   credit_card: "No credit cards stored yet.",
+  secret: "No secrets stored yet.",
 };
 
 function CredentialsList({ filter }: Props = {}) {

@@ -23,8 +23,8 @@ from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.services import workflow_script_service
 from skyvern.webeye.actions.action_types import POST_ACTION_EXECUTION_ACTION_TYPES
 from skyvern.webeye.actions.actions import Action
-from skyvern.webeye.browser_factory import BrowserState
-from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
+from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -646,4 +646,5 @@ class AgentFunction:
         )
 
     async def post_action_execution(self, action: Action) -> None:
-        asyncio.create_task(self._post_action_execution(action))
+        return
+        # asyncio.create_task(self._post_action_execution(action))

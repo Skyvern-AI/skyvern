@@ -4,9 +4,9 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .proxy_location import ProxyLocation
 from .run_engine import RunEngine
 from .task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
+from .task_run_request_proxy_location import TaskRunRequestProxyLocation
 
 
 class TaskRunRequest(UniversalBaseModel):
@@ -33,7 +33,7 @@ class TaskRunRequest(UniversalBaseModel):
     The title for the task
     """
 
-    proxy_location: typing.Optional[ProxyLocation] = pydantic.Field(default=None)
+    proxy_location: typing.Optional[TaskRunRequestProxyLocation] = pydantic.Field(default=None)
     """
     
     Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
@@ -58,6 +58,7 @@ class TaskRunRequest(UniversalBaseModel):
     - US-FL: Florida
     - US-WA: Washington
     - NONE: No proxy
+     Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
     """
 
     data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = pydantic.Field(default=None)

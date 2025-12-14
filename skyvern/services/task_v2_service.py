@@ -37,7 +37,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, RunEngine, RunType, TaskRunRequest, TaskRunResponse
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     PARAMETER_YAML_TYPES,
@@ -55,8 +55,8 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
-from skyvern.webeye.browser_factory import BrowserState
-from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
+from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -150,7 +150,7 @@ async def initialize_task_v2(
     organization: Organization,
     user_prompt: str,
     user_url: str | None = None,
-    proxy_location: ProxyLocation | None = None,
+    proxy_location: ProxyLocationInput = None,
     totp_identifier: str | None = None,
     totp_verification_url: str | None = None,
     webhook_callback_url: str | None = None,
@@ -657,7 +657,7 @@ async def run_task_v2_helper(
                 # Page failed to load properly, fallback to Google
                 if page:
                     try:
-                        await page.goto(fallback_url, timeout=15000)
+                        await page.goto(fallback_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                         fallback_occurred = True
                     except Exception:
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
@@ -682,10 +682,9 @@ async def run_task_v2_helper(
                 )
         else:
             try:
-                scraped_page = await scrape_website(
-                    browser_state,
-                    url,
-                    app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                scraped_page = await browser_state.scrape_website(
+                    url=url,
+                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
                     scrape_exclude=app.scrape_exclude,
                 )
                 if page is None:
@@ -908,10 +907,9 @@ async def run_task_v2_helper(
                     browser_session_id=browser_session_id,
                     browser_profile_id=workflow_run.browser_profile_id,
                 )
-                scraped_page = await scrape_website(
-                    browser_state,
-                    url,
-                    app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                scraped_page = await browser_state.scrape_website(
+                    url=url,
+                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
                     scrape_exclude=app.scrape_exclude,
                 )
                 completion_screenshots = scraped_page.screenshots

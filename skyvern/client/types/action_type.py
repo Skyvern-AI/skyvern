@@ -11,6 +11,7 @@ ActionType = typing.Union[
         "select_option",
         "checkbox",
         "wait",
+        "hover",
         "null_action",
         "solve_captcha",
         "terminate",

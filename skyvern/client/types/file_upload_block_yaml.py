@@ -10,9 +10,19 @@ from .file_storage_type import FileStorageType
 
 
 class FileUploadBlockYaml(UniversalBaseModel):
-    label: str
+    label: str = pydantic.Field()
+    """
+    Author-facing identifier; must be unique per workflow.
+    """
+
+    next_block_label: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]].
+    """
+
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
     aws_access_key_id: typing.Optional[str] = None

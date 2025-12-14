@@ -15,6 +15,9 @@ class SdkActionType(str, Enum):
     AI_UPLOAD_FILE = "ai_upload_file"
     AI_ACT = "ai_act"
     EXTRACT = "extract"
+    LOCATE_ELEMENT = "locate_element"
+    VALIDATE = "validate"
+    PROMPT = "prompt"
 
 
 # Base action class
@@ -137,9 +140,61 @@ class ExtractAction(SdkActionBase):
         return self.data if isinstance(self.data, dict) else None
 
 
+class LocateElementAction(SdkActionBase):
+    """Locate element action parameters."""
+
+    type: Literal["locate_element"] = "locate_element"
+    prompt: str = Field(default="", description="Natural language prompt to locate an element")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.prompt
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return None
+
+
+class ValidateAction(SdkActionBase):
+    """Validate action parameters."""
+
+    type: Literal["validate"] = "validate"
+    prompt: str = Field(..., description="Validation criteria or condition to check")
+    model: dict[str, Any] | None = Field(None, description="Optional model configuration")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.prompt
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return None
+
+
+class PromptAction(SdkActionBase):
+    """Prompt action parameters."""
+
+    type: Literal["prompt"] = "prompt"
+    prompt: str = Field(..., description="The prompt to send to the LLM")
+    schema: dict[str, Any] | None = Field(None, description="Optional JSON schema to structure the response")
+    model: dict[str, Any] | None = Field(None, description="Optional model configuration")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.prompt
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return None
+
+
 # Discriminated union of all action types
 SdkAction = Annotated[
-    Union[ClickAction, InputTextAction, SelectOptionAction, UploadFileAction, ActAction, ExtractAction],
+    Union[
+        ClickAction,
+        InputTextAction,
+        SelectOptionAction,
+        UploadFileAction,
+        ActAction,
+        ExtractAction,
+        LocateElementAction,
+        ValidateAction,
+        PromptAction,
+    ],
     Field(discriminator="type"),
 ]
 

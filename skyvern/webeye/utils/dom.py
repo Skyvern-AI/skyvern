@@ -27,7 +27,8 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.webeye.actions import handler_utils
-from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
+from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
+from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -85,6 +86,7 @@ RAW_INPUT_NAME_VALUE = ["name", "email", "username", "password", "phone"]
 class SkyvernOptionType(typing.TypedDict):
     optionIndex: int
     text: str
+    value: str
 
 
 class SkyvernElement:
@@ -131,6 +133,7 @@ class SkyvernElement:
         self._id_cache = static_element.get("id", "")
         self._tag_name = static_element.get("tagName", "")
         self._selectable = static_element.get("isSelectable", False)
+        self._hover_only = static_element.get("hoverOnly", False)
         self._frame_id = static_element.get("frame", "")
         self._attributes = static_element.get("attributes", {})
         self._rect: FloatRect | None = None
@@ -398,6 +401,49 @@ class SkyvernElement:
 
     def get_attributes(self) -> dict:
         return self._attributes
+
+    def requires_hover(self) -> bool:
+        return bool(self._hover_only)
+
+    async def hover_to_reveal(
+        self,
+        max_depth: int = 4,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        settle_delay_s: float = 0.15,
+    ) -> bool:
+        if not self.requires_hover():
+            return False
+
+        hover_target = self.get_locator()
+        for depth in range(max_depth):
+            try:
+                await hover_target.scroll_into_view_if_needed()
+                await hover_target.hover(timeout=timeout)
+                await asyncio.sleep(settle_delay_s)
+                if await self.get_locator().is_visible(timeout=timeout):
+                    LOG.debug("Hover reveal succeeded", element_id=self.get_id(), depth=depth)
+                    return True
+            except Exception:
+                LOG.debug(
+                    "Hover attempt failed while trying to reveal element",
+                    exc_info=True,
+                    element_id=self.get_id(),
+                    depth=depth,
+                )
+
+            parent_locator = hover_target.locator("..")
+            try:
+                if await parent_locator.count() != 1:
+                    break
+            except Exception:
+                LOG.debug(
+                    "Unable to evaluate parent locator during hover reveal", exc_info=True, element_id=self.get_id()
+                )
+                break
+            hover_target = parent_locator
+
+        LOG.debug("Hover reveal attempts exhausted", element_id=self.get_id())
+        return False
 
     def get_options(self) -> list[SkyvernOptionType]:
         options = self.__static_element.get("options", None)

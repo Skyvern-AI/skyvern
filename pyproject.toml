@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.0"
+version = "1.0.3"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -23,7 +23,6 @@ dependencies = [
     "greenlet==3.0.3 ; python_version >= '3.11' and python_version < '3.12'",
     "pillow>=10.1.0,<11",
     "starlette-context>=0.3.6,<0.4",
-    "ddtrace>=2.3.2,<3",
     "pydantic>=2.5.2,<3",
     "pydantic-settings>=2.1.0,<3",
     "fastapi>=0.115.4,<0.116",
@@ -62,18 +61,23 @@ dependencies = [
     "lark>=1.2.2,<2",
     "libcst>=1.8.2,<2",
     "curlparser>=0.1.0,<0.2",
-    "openpyxl>=3.1.5,<4",
     "pandas>=2.3.1,<3",
     "azure-identity>=1.24.0,<2",
     "azure-keyvault-secrets>=4.2.0,<5",
+    "jsonschema>=4.25.1",
+    "python-calamine>=0.6.1",
 ]
 
 [dependency-groups]
 cloud = [
+    "ddtrace>=2.3.2,<3",
     "stripe>=9.7.0,<10",
+    "temporalio[opentelemetry]>=1.6.0,<2",
     "temporalio>=1.6.0,<2",
     "dramatiq[asyncio]>=1.18.0,<2",
     "redis>=5.0.3,<6",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.38.0,<2",
+    "kr8s>=0.20.14,<1",
 ]
 dev = [
     "isort>=5.13.2",
@@ -94,6 +98,8 @@ dev = [
     "ruff>=0.11.12,<0.12",
     "aiosqlite>=0.21.0,<0.22",
     "moto[s3, server]>=5.1.5,<6",
+    "curlify>=3.0.0",
+    "openpyxl>=3.1.0",
 ]
 
 [tool.hatch.build]
@@ -194,9 +200,9 @@ skyvern = "skyvern.cli.commands:cli_app"
 norecursedirs = ["eval"]
 
 [tool.codeflash]
-# All paths are relative to this pyproject.toml's directory.                                                                                                                                                                                                                                                                 
-module-root = "skyvern"                                                                                                                                                                                                                                                                                                      
-tests-root = "codeflash-tests"                                                                                                                                                                                                                                                                                                         
-test-framework = "pytest"                                                                                                                                                                                                                                                                                                    
-ignore-paths = ["skyvern/client"]                                                                                                                                                                                                                                                                                                         
+# All paths are relative to this pyproject.toml's directory.
+module-root = "skyvern"
+tests-root = "codeflash-tests"
+test-framework = "pytest"
+ignore-paths = ["skyvern/client"]
 formatter-cmds = ["ruff check --exit-zero --fix $file", "ruff format $file"]

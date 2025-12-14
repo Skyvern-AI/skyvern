@@ -18,7 +18,7 @@ class SkyvernBrowser(BrowserContext):
 
     Example:
         ```python
-            skyvern = Skyvern()
+            skyvern = Skyvern.local()
             browser = await skyvern.launch_local_browser()
 
             # Get or create the working page
@@ -32,7 +32,6 @@ class SkyvernBrowser(BrowserContext):
         _browser_context: The underlying Playwright BrowserContext.
         _browser_session_id: Optional session ID for persistent browser sessions.
         _browser_address: Optional address for remote browser connections.
-        _client: The AsyncSkyvern client for API communication.
     """
 
     def __init__(
@@ -105,3 +104,25 @@ class SkyvernBrowser(BrowserContext):
 
     async def _create_skyvern_page(self, page: Page) -> SkyvernBrowserPage:
         return SkyvernBrowserPage(self, page)
+
+    async def close(self, **kwargs: Any) -> None:
+        """Close the browser and optionally close the browser session.
+
+        This method closes the browser context. If the browser is associated with a
+        cloud browser session (has a browser_session_id), it will also close the
+        browser session via the API, marking it as completed.
+
+        Args:
+            **kwargs: Arguments passed to the underlying BrowserContext.close() method.
+
+        Example:
+            ```python
+            browser = await skyvern.launch_cloud_browser()
+            # ... use the browser ...
+            await browser.close()  # Closes both browser and cloud session
+            ```
+        """
+        await self._browser_context.close(**kwargs)
+
+        if self._browser_session_id:
+            await self._skyvern.close_browser_session(self._browser_session_id)

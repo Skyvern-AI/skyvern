@@ -11,11 +11,21 @@ from .output_parameter import OutputParameter
 
 
 class FileUploadBlock(UniversalBaseModel):
-    label: str
+    label: str = pydantic.Field()
+    """
+    Author-facing identifier for a block; unique within a workflow.
+    """
+
+    next_block_label: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted.
+    """
+
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
     aws_access_key_id: typing.Optional[str] = None

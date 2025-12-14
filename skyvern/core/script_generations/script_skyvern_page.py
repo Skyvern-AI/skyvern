@@ -15,6 +15,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -25,9 +26,14 @@ from skyvern.webeye.actions.actions import (
     SelectOption,
     SolveCaptchaAction,
 )
-from skyvern.webeye.actions.handler import ActionHandler, handle_complete_action
-from skyvern.webeye.browser_factory import BrowserState
-from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
+from skyvern.webeye.actions.handler import (
+    ActionHandler,
+    generate_totp_value,
+    get_actual_value_of_parameter_if_secret,
+    handle_complete_action,
+)
+from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 LOG = structlog.get_logger()
 
@@ -106,8 +112,7 @@ class ScriptSkyvernPage(SkyvernPage):
         # initialize browser state
         # TODO: add workflow_run_id or eventually script_id/script_run_id
         browser_state = await cls._get_or_create_browser_state(browser_session_id=browser_session_id)
-        return await scrape_website(
-            browser_state=browser_state,
+        return await browser_state.scrape_website(
             url="",
             cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
             scrape_exclude=app.scrape_exclude,
@@ -137,6 +142,7 @@ class ScriptSkyvernPage(SkyvernPage):
             ActionType.INPUT_TEXT: "⌨️",
             ActionType.UPLOAD_FILE: "📤",
             ActionType.DOWNLOAD_FILE: "📥",
+            ActionType.HOVER: "🖱️",
             ActionType.SELECT_OPTION: "🎯",
             ActionType.WAIT: "⏳",
             ActionType.SOLVE_CAPTCHA: "🔓",
@@ -393,6 +399,38 @@ class ScriptSkyvernPage(SkyvernPage):
             # If screenshot creation fails, don't block execution
             pass
 
+    async def get_actual_value(
+        self,
+        value: str,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str:
+        """Input text into an element identified by ``selector``."""
+        context = skyvern_context.ensure_context()
+        if context and context.workflow_run_id:
+            task_id = context.task_id
+            workflow_run_id = context.workflow_run_id
+            organization_id = context.organization_id
+            value = get_actual_value_of_parameter_if_secret(workflow_run_id, value)
+
+            # support TOTP secret and internal it to TOTP code
+            is_totp_value = value == "BW_TOTP" or value == "OP_TOTP" or value == "AZ_TOTP"
+            if is_totp_value:
+                value = generate_totp_value(context.workflow_run_id, value)
+            elif (totp_identifier or totp_url) and organization_id:
+                totp_value = await poll_otp_value(
+                    organization_id=organization_id,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    totp_verification_url=totp_url,
+                    totp_identifier=totp_identifier,
+                )
+                if totp_value:
+                    # use the totp verification code
+                    value = totp_value.value
+
+        return value
+
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)
         url = prepend_scheme_and_validate_url(url)
@@ -402,7 +440,7 @@ class ScriptSkyvernPage(SkyvernPage):
         if context and context.script_mode:
             print(f"🌐 Navigating to: {url}")
 
-        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         await self.page.goto(url, timeout=timeout, **kwargs)
 
         if context and context.script_mode:

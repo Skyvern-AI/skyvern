@@ -5,6 +5,7 @@ import type * as Skyvern from "../index.js";
 export type WorkflowDefinitionYamlBlocksItem =
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Action
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Code
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.Conditional
     | Skyvern.WorkflowDefinitionYamlBlocksItem.DownloadToS3
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Extraction
     | Skyvern.WorkflowDefinitionYamlBlocksItem.FileDownload
@@ -32,6 +33,10 @@ export namespace WorkflowDefinitionYamlBlocksItem {
 
     export interface Code extends Skyvern.CodeBlockYaml {
         block_type: "code";
+    }
+
+    export interface Conditional extends Skyvern.ConditionalBlockYaml {
+        block_type: "conditional";
     }
 
     export interface DownloadToS3 extends Skyvern.DownloadToS3BlockYaml {

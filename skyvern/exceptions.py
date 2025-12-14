@@ -197,6 +197,14 @@ class MissingValueForParameter(SkyvernHTTPException):
         )
 
 
+class WorkflowRunParameterPersistenceError(SkyvernException):
+    def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str, reason: str) -> None:
+        super().__init__(
+            f"Failed to persist workflow parameter '{parameter_key}' for workflow run {workflow_run_id} "
+            f"of workflow {workflow_id}. Reason: {reason}"
+        )
+
+
 class InvalidCredentialId(SkyvernHTTPException):
     def __init__(self, credential_id: str) -> None:
         super().__init__(
@@ -493,6 +501,11 @@ class FailToClick(SkyvernException):
         super().__init__(f"Failed to click({anchor}). element_id={element_id}, error_msg={msg}")
 
 
+class FailToHover(SkyvernException):
+    def __init__(self, element_id: str, msg: str):
+        super().__init__(f"Failed to hover. element_id={element_id}, error_msg={msg}")
+
+
 class FailToSelectByLabel(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(f"Failed to select by label. element_id={element_id}")
@@ -777,8 +790,8 @@ class LLMCallerNotFoundError(SkyvernException):
 
 
 class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str) -> None:
-        super().__init__(f"Browser session {browser_session_id} is already occupied")
+    def __init__(self, browser_session_id: str, runnable_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
 
 
 class BrowserSessionNotRenewable(SkyvernException):
@@ -858,3 +871,10 @@ class AzureConfigurationError(AzureBaseError):
 class ScriptTerminationException(SkyvernException):
     def __init__(self, reason: str | None = None) -> None:
         super().__init__(reason)
+
+
+class InvalidSchemaError(SkyvernException):
+    def __init__(self, message: str, validation_errors: list[str] | None = None):
+        self.message = message
+        self.validation_errors = validation_errors or []
+        super().__init__(self.message)

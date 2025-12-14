@@ -3,8 +3,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Type, TypeVar
 
 import structlog
-from litellm import ConfigDict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.errors.errors import UserDefinedError
 from skyvern.webeye.actions.action_types import ActionType
@@ -136,9 +135,18 @@ class Action(BaseModel):
     # TOTP timing information for multi-field TOTP sequences
     totp_timing_info: dict[str, Any] | None = None
 
+    # flag indicating whether the action requires mini-agent mode
+    has_mini_agent: bool | None = None
+
     created_at: datetime | None = None
     modified_at: datetime | None = None
     created_by: str | None = None
+
+    def set_has_mini_agent(self) -> None:
+        """
+        Set the has_mini_agent flag to True if any mini-agent is involved when handling the action.
+        """
+        self.has_mini_agent = True
 
     @classmethod
     def validate(cls: Type[T], value: Any) -> T:
@@ -281,6 +289,11 @@ class CheckboxAction(WebAction):
 class WaitAction(Action):
     action_type: ActionType = ActionType.WAIT
     seconds: int = 20
+
+
+class HoverAction(WebAction):
+    action_type: ActionType = ActionType.HOVER
+    hold_seconds: float = 0.0
 
 
 class TerminateAction(DecisiveAction):

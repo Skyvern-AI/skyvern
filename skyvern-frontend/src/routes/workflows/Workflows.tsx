@@ -26,6 +26,8 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
+  BookmarkFilledIcon,
+  ChevronDownIcon,
   DotsHorizontalIcon,
   FileIcon,
   LightningBoltIcon,
@@ -39,9 +41,16 @@ import { useQuery } from "@tanstack/react-query";
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { NarrativeCard } from "./components/header/NarrativeCard";
 import { FolderCard } from "./components/FolderCard";
 import { CreateFolderDialog } from "./components/CreateFolderDialog";
+import { CreateFromTemplateDialog } from "./components/CreateFromTemplateDialog";
 import { ViewAllFoldersDialog } from "./components/ViewAllFoldersDialog";
 import { WorkflowFolderSelector } from "./components/WorkflowFolderSelector";
 import { HighlightText } from "./components/HighlightText";
@@ -49,6 +58,7 @@ import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
+import { convert } from "./editor/workflowEditorUtils";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowActions } from "./WorkflowActions";
@@ -65,6 +75,7 @@ const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   ai_fallback: true,
   run_with: "agent",
   workflow_definition: {
+    version: 2,
     blocks: [],
     parameters: [],
   },
@@ -86,6 +97,9 @@ function Workflows() {
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
   const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
   const [isViewAllFoldersOpen, setIsViewAllFoldersOpen] = useState(false);
+
+  // Template dialog state
+  const [isTemplateDialogOpen, setIsTemplateDialogOpen] = useState(false);
 
   // Poll for active imports
   const { activeImports, startPolling } = useActiveImportsPolling();
@@ -389,22 +403,38 @@ function Workflows() {
               onImportStart={startPolling}
               selectedFolderId={selectedFolderId}
             />
-            <Button
-              disabled={createWorkflowMutation.isPending}
-              onClick={() => {
-                createWorkflowMutation.mutate({
-                  ...emptyWorkflowRequest,
-                  folder_id: selectedFolderId,
-                });
-              }}
-            >
-              {createWorkflowMutation.isPending ? (
-                <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <PlusIcon className="mr-2 h-4 w-4" />
-              )}
-              Create
-            </Button>
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button disabled={createWorkflowMutation.isPending}>
+                  {createWorkflowMutation.isPending ? (
+                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <PlusIcon className="mr-2 h-4 w-4" />
+                  )}
+                  Create
+                  <ChevronDownIcon className="ml-2 h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  onSelect={() => {
+                    createWorkflowMutation.mutate({
+                      ...emptyWorkflowRequest,
+                      folder_id: selectedFolderId,
+                    });
+                  }}
+                >
+                  <PlusIcon className="mr-2 h-4 w-4" />
+                  Blank Workflow
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => setIsTemplateDialogOpen(true)}
+                >
+                  <BookmarkFilledIcon className="mr-2 h-4 w-4" />
+                  From Template
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
         <div className="rounded-lg border">
@@ -531,10 +561,22 @@ function Workflows() {
                               );
                             }}
                           >
-                            <HighlightText
-                              text={workflow.title}
-                              query={debouncedSearch}
-                            />
+                            <div className="flex items-center gap-2">
+                              <HighlightText
+                                text={workflow.title}
+                                query={debouncedSearch}
+                              />
+                              {workflow.is_template && (
+                                <TooltipProvider>
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <BookmarkFilledIcon className="h-3.5 w-3.5 shrink-0 text-blue-500" />
+                                    </TooltipTrigger>
+                                    <TooltipContent>Template</TooltipContent>
+                                  </Tooltip>
+                                </TooltipProvider>
+                              )}
+                            </div>
                           </TableCell>
                           <TableCell
                             onClick={(event) => {
@@ -746,6 +788,22 @@ function Workflows() {
           onOpenChange={setIsViewAllFoldersOpen}
           selectedFolderId={selectedFolderId}
           onFolderSelect={setSelectedFolderId}
+        />
+
+        {/* Template Dialog */}
+        <CreateFromTemplateDialog
+          open={isTemplateDialogOpen}
+          onOpenChange={setIsTemplateDialogOpen}
+          onSelectTemplate={(template) => {
+            const clonedWorkflow = convert({
+              ...template,
+              title: `${template.title} (copy)`,
+            });
+            createWorkflowMutation.mutate({
+              ...clonedWorkflow,
+              folder_id: selectedFolderId,
+            });
+          }}
         />
 
         <WorkflowTemplates />

@@ -42,6 +42,15 @@ if typing.TYPE_CHECKING:
     from .bitwarden_sensitive_information_parameter import BitwardenSensitiveInformationParameter
     from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
     from .block_type import BlockType
+    from .branch_condition import BranchCondition
+    from .branch_condition_criteria import (
+        BranchConditionCriteria,
+        BranchConditionCriteria_Jinja2Template,
+        BranchConditionCriteria_Prompt,
+    )
+    from .branch_condition_yaml import BranchConditionYaml
+    from .branch_criteria_yaml import BranchCriteriaYaml
+    from .branch_criteria_yaml_criteria_type import BranchCriteriaYamlCriteriaType
     from .browser_profile import BrowserProfile
     from .browser_session_response import BrowserSessionResponse
     from .click_action import ClickAction
@@ -63,6 +72,8 @@ if typing.TYPE_CHECKING:
         CodeBlockParametersItem_Workflow,
     )
     from .code_block_yaml import CodeBlockYaml
+    from .conditional_block import ConditionalBlock
+    from .conditional_block_yaml import ConditionalBlockYaml
     from .context_parameter import ContextParameter
     from .context_parameter_source import (
         ContextParameterSource,
@@ -137,12 +148,12 @@ if typing.TYPE_CHECKING:
     from .file_type import FileType
     from .file_upload_block import FileUploadBlock
     from .file_upload_block_yaml import FileUploadBlockYaml
-    from .folder import Folder
     from .for_loop_block import ForLoopBlock
     from .for_loop_block_loop_blocks_item import (
         ForLoopBlockLoopBlocksItem,
         ForLoopBlockLoopBlocksItem_Action,
         ForLoopBlockLoopBlocksItem_Code,
+        ForLoopBlockLoopBlocksItem_Conditional,
         ForLoopBlockLoopBlocksItem_DownloadToS3,
         ForLoopBlockLoopBlocksItem_Extraction,
         ForLoopBlockLoopBlocksItem_FileDownload,
@@ -182,6 +193,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockYamlLoopBlocksItem,
         ForLoopBlockYamlLoopBlocksItem_Action,
         ForLoopBlockYamlLoopBlocksItem_Code,
+        ForLoopBlockYamlLoopBlocksItem_Conditional,
         ForLoopBlockYamlLoopBlocksItem_DownloadToS3,
         ForLoopBlockYamlLoopBlocksItem_Extraction,
         ForLoopBlockYamlLoopBlocksItem_FileDownload,
@@ -202,6 +214,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockYamlLoopBlocksItem_Validation,
         ForLoopBlockYamlLoopBlocksItem_Wait,
     )
+    from .geo_target import GeoTarget
     from .get_run_response import (
         GetRunResponse,
         GetRunResponse_AnthropicCua,
@@ -248,6 +261,8 @@ if typing.TYPE_CHECKING:
     from .input_or_select_context import InputOrSelectContext
     from .input_text_action import InputTextAction
     from .input_text_action_data import InputTextActionData
+    from .jinja_branch_criteria import JinjaBranchCriteria
+    from .locate_element_action import LocateElementAction
     from .login_block import LoginBlock
     from .login_block_data_schema import LoginBlockDataSchema
     from .login_block_parameters_item import (
@@ -292,6 +307,8 @@ if typing.TYPE_CHECKING:
     from .password_credential_response import PasswordCredentialResponse
     from .pdf_parser_block import PdfParserBlock
     from .pdf_parser_block_yaml import PdfParserBlockYaml
+    from .prompt_action import PromptAction
+    from .prompt_branch_criteria import PromptBranchCriteria
     from .proxy_location import ProxyLocation
     from .run_engine import RunEngine
     from .run_sdk_action_request_action import (
@@ -302,12 +319,17 @@ if typing.TYPE_CHECKING:
         RunSdkActionRequestAction_AiSelectOption,
         RunSdkActionRequestAction_AiUploadFile,
         RunSdkActionRequestAction_Extract,
+        RunSdkActionRequestAction_LocateElement,
+        RunSdkActionRequestAction_Prompt,
+        RunSdkActionRequestAction_Validate,
     )
     from .run_sdk_action_response import RunSdkActionResponse
     from .run_status import RunStatus
     from .script import Script
     from .script_file_create import ScriptFileCreate
     from .script_run_response import ScriptRunResponse
+    from .secret_credential import SecretCredential
+    from .secret_credential_response import SecretCredentialResponse
     from .select_option import SelectOption
     from .select_option_action import SelectOptionAction
     from .select_option_action_data import SelectOptionActionData
@@ -335,6 +357,7 @@ if typing.TYPE_CHECKING:
     from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
     from .task_run_request import TaskRunRequest
     from .task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
+    from .task_run_request_proxy_location import TaskRunRequestProxyLocation
     from .task_run_response import TaskRunResponse
     from .task_run_response_output import TaskRunResponseOutput
     from .task_v2block import TaskV2Block
@@ -382,6 +405,7 @@ if typing.TYPE_CHECKING:
     )
     from .url_block_yaml import UrlBlockYaml
     from .user_defined_error import UserDefinedError
+    from .validate_action import ValidateAction
     from .validation_block import ValidationBlock
     from .validation_block_data_schema import ValidationBlockDataSchema
     from .validation_block_parameters_item import (
@@ -419,11 +443,13 @@ if typing.TYPE_CHECKING:
     from .wait_block_yaml import WaitBlockYaml
     from .workflow import Workflow
     from .workflow_create_yaml_request import WorkflowCreateYamlRequest
+    from .workflow_create_yaml_request_proxy_location import WorkflowCreateYamlRequestProxyLocation
     from .workflow_definition import WorkflowDefinition
     from .workflow_definition_blocks_item import (
         WorkflowDefinitionBlocksItem,
         WorkflowDefinitionBlocksItem_Action,
         WorkflowDefinitionBlocksItem_Code,
+        WorkflowDefinitionBlocksItem_Conditional,
         WorkflowDefinitionBlocksItem_DownloadToS3,
         WorkflowDefinitionBlocksItem_Extraction,
         WorkflowDefinitionBlocksItem_FileDownload,
@@ -463,6 +489,7 @@ if typing.TYPE_CHECKING:
         WorkflowDefinitionYamlBlocksItem,
         WorkflowDefinitionYamlBlocksItem_Action,
         WorkflowDefinitionYamlBlocksItem_Code,
+        WorkflowDefinitionYamlBlocksItem_Conditional,
         WorkflowDefinitionYamlBlocksItem_DownloadToS3,
         WorkflowDefinitionYamlBlocksItem_Extraction,
         WorkflowDefinitionYamlBlocksItem_FileDownload,
@@ -501,12 +528,14 @@ if typing.TYPE_CHECKING:
     from .workflow_parameter_type import WorkflowParameterType
     from .workflow_parameter_yaml import WorkflowParameterYaml
     from .workflow_parameter_yaml_default_value import WorkflowParameterYamlDefaultValue
+    from .workflow_proxy_location import WorkflowProxyLocation
     from .workflow_request import WorkflowRequest
     from .workflow_run_block import WorkflowRunBlock
     from .workflow_run_block_data_schema import WorkflowRunBlockDataSchema
     from .workflow_run_block_navigation_payload import WorkflowRunBlockNavigationPayload
     from .workflow_run_block_output import WorkflowRunBlockOutput
     from .workflow_run_request import WorkflowRunRequest
+    from .workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
     from .workflow_run_response import WorkflowRunResponse
     from .workflow_run_response_output import WorkflowRunResponseOutput
     from .workflow_run_timeline import WorkflowRunTimeline
@@ -547,6 +576,13 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BitwardenSensitiveInformationParameter": ".bitwarden_sensitive_information_parameter",
     "BitwardenSensitiveInformationParameterYaml": ".bitwarden_sensitive_information_parameter_yaml",
     "BlockType": ".block_type",
+    "BranchCondition": ".branch_condition",
+    "BranchConditionCriteria": ".branch_condition_criteria",
+    "BranchConditionCriteria_Jinja2Template": ".branch_condition_criteria",
+    "BranchConditionCriteria_Prompt": ".branch_condition_criteria",
+    "BranchConditionYaml": ".branch_condition_yaml",
+    "BranchCriteriaYaml": ".branch_criteria_yaml",
+    "BranchCriteriaYamlCriteriaType": ".branch_criteria_yaml_criteria_type",
     "BrowserProfile": ".browser_profile",
     "BrowserSessionResponse": ".browser_session_response",
     "ClickAction": ".click_action",
@@ -566,6 +602,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "CodeBlockParametersItem_Output": ".code_block_parameters_item",
     "CodeBlockParametersItem_Workflow": ".code_block_parameters_item",
     "CodeBlockYaml": ".code_block_yaml",
+    "ConditionalBlock": ".conditional_block",
+    "ConditionalBlockYaml": ".conditional_block_yaml",
     "ContextParameter": ".context_parameter",
     "ContextParameterSource": ".context_parameter_source",
     "ContextParameterSource_AwsSecret": ".context_parameter_source",
@@ -634,11 +672,11 @@ _dynamic_imports: typing.Dict[str, str] = {
     "FileType": ".file_type",
     "FileUploadBlock": ".file_upload_block",
     "FileUploadBlockYaml": ".file_upload_block_yaml",
-    "Folder": ".folder",
     "ForLoopBlock": ".for_loop_block",
     "ForLoopBlockLoopBlocksItem": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Action": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Code": ".for_loop_block_loop_blocks_item",
+    "ForLoopBlockLoopBlocksItem_Conditional": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_DownloadToS3": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Extraction": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_FileDownload": ".for_loop_block_loop_blocks_item",
@@ -674,6 +712,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockYamlLoopBlocksItem": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Action": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Code": ".for_loop_block_yaml_loop_blocks_item",
+    "ForLoopBlockYamlLoopBlocksItem_Conditional": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_DownloadToS3": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Extraction": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_FileDownload": ".for_loop_block_yaml_loop_blocks_item",
@@ -693,6 +732,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockYamlLoopBlocksItem_UploadToS3": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Validation": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Wait": ".for_loop_block_yaml_loop_blocks_item",
+    "GeoTarget": ".geo_target",
     "GetRunResponse": ".get_run_response",
     "GetRunResponse_AnthropicCua": ".get_run_response",
     "GetRunResponse_OpenaiCua": ".get_run_response",
@@ -733,6 +773,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "InputOrSelectContext": ".input_or_select_context",
     "InputTextAction": ".input_text_action",
     "InputTextActionData": ".input_text_action_data",
+    "JinjaBranchCriteria": ".jinja_branch_criteria",
+    "LocateElementAction": ".locate_element_action",
     "LoginBlock": ".login_block",
     "LoginBlockDataSchema": ".login_block_data_schema",
     "LoginBlockParametersItem": ".login_block_parameters_item",
@@ -773,6 +815,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "PasswordCredentialResponse": ".password_credential_response",
     "PdfParserBlock": ".pdf_parser_block",
     "PdfParserBlockYaml": ".pdf_parser_block_yaml",
+    "PromptAction": ".prompt_action",
+    "PromptBranchCriteria": ".prompt_branch_criteria",
     "ProxyLocation": ".proxy_location",
     "RunEngine": ".run_engine",
     "RunSdkActionRequestAction": ".run_sdk_action_request_action",
@@ -782,11 +826,16 @@ _dynamic_imports: typing.Dict[str, str] = {
     "RunSdkActionRequestAction_AiSelectOption": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_AiUploadFile": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_Extract": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_LocateElement": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_Prompt": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_Validate": ".run_sdk_action_request_action",
     "RunSdkActionResponse": ".run_sdk_action_response",
     "RunStatus": ".run_status",
     "Script": ".script",
     "ScriptFileCreate": ".script_file_create",
     "ScriptRunResponse": ".script_run_response",
+    "SecretCredential": ".secret_credential",
+    "SecretCredentialResponse": ".secret_credential_response",
     "SelectOption": ".select_option",
     "SelectOptionAction": ".select_option_action",
     "SelectOptionActionData": ".select_option_action_data",
@@ -812,6 +861,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "TaskBlockYamlDataSchema": ".task_block_yaml_data_schema",
     "TaskRunRequest": ".task_run_request",
     "TaskRunRequestDataExtractionSchema": ".task_run_request_data_extraction_schema",
+    "TaskRunRequestProxyLocation": ".task_run_request_proxy_location",
     "TaskRunResponse": ".task_run_response",
     "TaskRunResponseOutput": ".task_run_response_output",
     "TaskV2Block": ".task_v2block",
@@ -855,6 +905,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "UrlBlockParametersItem_Workflow": ".url_block_parameters_item",
     "UrlBlockYaml": ".url_block_yaml",
     "UserDefinedError": ".user_defined_error",
+    "ValidateAction": ".validate_action",
     "ValidationBlock": ".validation_block",
     "ValidationBlockDataSchema": ".validation_block_data_schema",
     "ValidationBlockParametersItem": ".validation_block_parameters_item",
@@ -888,10 +939,12 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WaitBlockYaml": ".wait_block_yaml",
     "Workflow": ".workflow",
     "WorkflowCreateYamlRequest": ".workflow_create_yaml_request",
+    "WorkflowCreateYamlRequestProxyLocation": ".workflow_create_yaml_request_proxy_location",
     "WorkflowDefinition": ".workflow_definition",
     "WorkflowDefinitionBlocksItem": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_Action": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_Code": ".workflow_definition_blocks_item",
+    "WorkflowDefinitionBlocksItem_Conditional": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_DownloadToS3": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_Extraction": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_FileDownload": ".workflow_definition_blocks_item",
@@ -927,6 +980,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowDefinitionYamlBlocksItem": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_Action": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_Code": ".workflow_definition_yaml_blocks_item",
+    "WorkflowDefinitionYamlBlocksItem_Conditional": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_DownloadToS3": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_Extraction": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_FileDownload": ".workflow_definition_yaml_blocks_item",
@@ -962,12 +1016,14 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowParameterType": ".workflow_parameter_type",
     "WorkflowParameterYaml": ".workflow_parameter_yaml",
     "WorkflowParameterYamlDefaultValue": ".workflow_parameter_yaml_default_value",
+    "WorkflowProxyLocation": ".workflow_proxy_location",
     "WorkflowRequest": ".workflow_request",
     "WorkflowRunBlock": ".workflow_run_block",
     "WorkflowRunBlockDataSchema": ".workflow_run_block_data_schema",
     "WorkflowRunBlockNavigationPayload": ".workflow_run_block_navigation_payload",
     "WorkflowRunBlockOutput": ".workflow_run_block_output",
     "WorkflowRunRequest": ".workflow_run_request",
+    "WorkflowRunRequestProxyLocation": ".workflow_run_request_proxy_location",
     "WorkflowRunResponse": ".workflow_run_response",
     "WorkflowRunResponseOutput": ".workflow_run_response_output",
     "WorkflowRunTimeline": ".workflow_run_timeline",
@@ -1032,6 +1088,13 @@ __all__ = [
     "BitwardenSensitiveInformationParameter",
     "BitwardenSensitiveInformationParameterYaml",
     "BlockType",
+    "BranchCondition",
+    "BranchConditionCriteria",
+    "BranchConditionCriteria_Jinja2Template",
+    "BranchConditionCriteria_Prompt",
+    "BranchConditionYaml",
+    "BranchCriteriaYaml",
+    "BranchCriteriaYamlCriteriaType",
     "BrowserProfile",
     "BrowserSessionResponse",
     "ClickAction",
@@ -1051,6 +1114,8 @@ __all__ = [
     "CodeBlockParametersItem_Output",
     "CodeBlockParametersItem_Workflow",
     "CodeBlockYaml",
+    "ConditionalBlock",
+    "ConditionalBlockYaml",
     "ContextParameter",
     "ContextParameterSource",
     "ContextParameterSource_AwsSecret",
@@ -1119,11 +1184,11 @@ __all__ = [
     "FileType",
     "FileUploadBlock",
     "FileUploadBlockYaml",
-    "Folder",
     "ForLoopBlock",
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
     "ForLoopBlockLoopBlocksItem_Code",
+    "ForLoopBlockLoopBlocksItem_Conditional",
     "ForLoopBlockLoopBlocksItem_DownloadToS3",
     "ForLoopBlockLoopBlocksItem_Extraction",
     "ForLoopBlockLoopBlocksItem_FileDownload",
@@ -1159,6 +1224,7 @@ __all__ = [
     "ForLoopBlockYamlLoopBlocksItem",
     "ForLoopBlockYamlLoopBlocksItem_Action",
     "ForLoopBlockYamlLoopBlocksItem_Code",
+    "ForLoopBlockYamlLoopBlocksItem_Conditional",
     "ForLoopBlockYamlLoopBlocksItem_DownloadToS3",
     "ForLoopBlockYamlLoopBlocksItem_Extraction",
     "ForLoopBlockYamlLoopBlocksItem_FileDownload",
@@ -1178,6 +1244,7 @@ __all__ = [
     "ForLoopBlockYamlLoopBlocksItem_UploadToS3",
     "ForLoopBlockYamlLoopBlocksItem_Validation",
     "ForLoopBlockYamlLoopBlocksItem_Wait",
+    "GeoTarget",
     "GetRunResponse",
     "GetRunResponse_AnthropicCua",
     "GetRunResponse_OpenaiCua",
@@ -1218,6 +1285,8 @@ __all__ = [
     "InputOrSelectContext",
     "InputTextAction",
     "InputTextActionData",
+    "JinjaBranchCriteria",
+    "LocateElementAction",
     "LoginBlock",
     "LoginBlockDataSchema",
     "LoginBlockParametersItem",
@@ -1258,6 +1327,8 @@ __all__ = [
     "PasswordCredentialResponse",
     "PdfParserBlock",
     "PdfParserBlockYaml",
+    "PromptAction",
+    "PromptBranchCriteria",
     "ProxyLocation",
     "RunEngine",
     "RunSdkActionRequestAction",
@@ -1267,11 +1338,16 @@ __all__ = [
     "RunSdkActionRequestAction_AiSelectOption",
     "RunSdkActionRequestAction_AiUploadFile",
     "RunSdkActionRequestAction_Extract",
+    "RunSdkActionRequestAction_LocateElement",
+    "RunSdkActionRequestAction_Prompt",
+    "RunSdkActionRequestAction_Validate",
     "RunSdkActionResponse",
     "RunStatus",
     "Script",
     "ScriptFileCreate",
     "ScriptRunResponse",
+    "SecretCredential",
+    "SecretCredentialResponse",
     "SelectOption",
     "SelectOptionAction",
     "SelectOptionActionData",
@@ -1297,6 +1373,7 @@ __all__ = [
     "TaskBlockYamlDataSchema",
     "TaskRunRequest",
     "TaskRunRequestDataExtractionSchema",
+    "TaskRunRequestProxyLocation",
     "TaskRunResponse",
     "TaskRunResponseOutput",
     "TaskV2Block",
@@ -1340,6 +1417,7 @@ __all__ = [
     "UrlBlockParametersItem_Workflow",
     "UrlBlockYaml",
     "UserDefinedError",
+    "ValidateAction",
     "ValidationBlock",
     "ValidationBlockDataSchema",
     "ValidationBlockParametersItem",
@@ -1373,10 +1451,12 @@ __all__ = [
     "WaitBlockYaml",
     "Workflow",
     "WorkflowCreateYamlRequest",
+    "WorkflowCreateYamlRequestProxyLocation",
     "WorkflowDefinition",
     "WorkflowDefinitionBlocksItem",
     "WorkflowDefinitionBlocksItem_Action",
     "WorkflowDefinitionBlocksItem_Code",
+    "WorkflowDefinitionBlocksItem_Conditional",
     "WorkflowDefinitionBlocksItem_DownloadToS3",
     "WorkflowDefinitionBlocksItem_Extraction",
     "WorkflowDefinitionBlocksItem_FileDownload",
@@ -1412,6 +1492,7 @@ __all__ = [
     "WorkflowDefinitionYamlBlocksItem",
     "WorkflowDefinitionYamlBlocksItem_Action",
     "WorkflowDefinitionYamlBlocksItem_Code",
+    "WorkflowDefinitionYamlBlocksItem_Conditional",
     "WorkflowDefinitionYamlBlocksItem_DownloadToS3",
     "WorkflowDefinitionYamlBlocksItem_Extraction",
     "WorkflowDefinitionYamlBlocksItem_FileDownload",
@@ -1447,12 +1528,14 @@ __all__ = [
     "WorkflowParameterType",
     "WorkflowParameterYaml",
     "WorkflowParameterYamlDefaultValue",
+    "WorkflowProxyLocation",
     "WorkflowRequest",
     "WorkflowRunBlock",
     "WorkflowRunBlockDataSchema",
     "WorkflowRunBlockNavigationPayload",
     "WorkflowRunBlockOutput",
     "WorkflowRunRequest",
+    "WorkflowRunRequestProxyLocation",
     "WorkflowRunResponse",
     "WorkflowRunResponseOutput",
     "WorkflowRunTimeline",

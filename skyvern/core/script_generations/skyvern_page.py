@@ -6,12 +6,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, overload
 
 import structlog
-from playwright.async_api import Page
+from playwright.async_api import Locator, Page
 
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.forge.sdk.api.files import download_file
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.library.ai_locator import AILocator
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 
@@ -92,8 +93,16 @@ class SkyvernPage(Page):
         return decorator
 
     async def goto(self, url: str, **kwargs: Any) -> None:
-        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         await self.page.goto(url, timeout=timeout, **kwargs)
+
+    async def get_actual_value(
+        self,
+        value: str,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str:
+        return value
 
     ######### Public Interfaces #########
 
@@ -204,6 +213,27 @@ class SkyvernPage(Page):
             locator = self.page.locator(selector)
             await locator.click(timeout=timeout, **kwargs)
 
+        return selector
+
+    @action_wrap(ActionType.HOVER)
+    async def hover(
+        self,
+        selector: str,
+        *,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        hold_seconds: float = 0.0,
+        intention: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Move the mouse over the element identified by `selector`."""
+        if not selector:
+            raise ValueError("Hover requires a selector.")
+
+        locator = self.page.locator(selector, **kwargs)
+        await locator.scroll_into_view_if_needed()
+        await locator.hover(timeout=timeout)
+        if hold_seconds and hold_seconds > 0:
+            await asyncio.sleep(hold_seconds)
         return selector
 
     @overload
@@ -365,6 +395,11 @@ class SkyvernPage(Page):
             error_to_raise = None
             if selector:
                 try:
+                    value = await self.get_actual_value(
+                        value,
+                        totp_identifier=totp_identifier,
+                        totp_url=totp_url,
+                    )
                     locator = self.page.locator(selector)
                     await handler_utils.input_sequentially(locator, value, timeout=timeout)
                     return value
@@ -682,6 +717,212 @@ class SkyvernPage(Page):
         """
         data = kwargs.pop("data", None)
         return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
+
+    async def validate(
+        self,
+        prompt: str,
+        model: dict[str, Any] | str | None = None,
+    ) -> bool:
+        """Validate the current page state using AI.
+
+        Args:
+            prompt: Validation criteria or condition to check
+            model: Optional model configuration. Can be either:
+                   - A dict with model configuration (e.g., {"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048})
+                   - A string with just the model name (e.g., "gpt-4")
+
+        Returns:
+            bool: True if validation passes, False otherwise
+
+        Examples:
+            ```python
+            # Simple validation
+            is_valid = await page.validate("Check if the login was successful")
+
+            # Validation with specific model (as string)
+            is_valid = await page.validate(
+                "Check if the order was placed",
+                model="gemini-2.5-flash-lite"
+            )
+
+            # Validation with model config (as dict)
+            is_valid = await page.validate(
+                "Check if the payment completed",
+                model={"model_name": "gemini-2.5-flash-lite", "max_tokens": 1024}
+            )
+            ```
+        """
+        normalized_model: dict[str, Any] | None = None
+        if isinstance(model, str):
+            normalized_model = {"model_name": model}
+        elif model is not None:
+            normalized_model = model
+
+        return await self._ai.ai_validate(prompt=prompt, model=normalized_model)
+
+    async def prompt(
+        self,
+        prompt: str,
+        schema: dict[str, Any] | None = None,
+        model: dict[str, Any] | str | None = None,
+    ) -> dict[str, Any] | list | str | None:
+        """Send a prompt to the LLM and get a response based on the provided schema.
+
+        This method allows you to interact with the LLM directly without requiring page context.
+        It's useful for making decisions, generating text, or processing information using AI.
+
+        Args:
+            prompt: The prompt to send to the LLM
+            schema: Optional JSON schema to structure the response. If provided, the LLM response
+                   will be validated against this schema.
+            model: Optional model configuration. Can be either:
+                   - A dict with model configuration (e.g., {"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048})
+                   - A string with just the model name (e.g., "gemini-2.5-flash-lite")
+
+        Returns:
+            LLM response structured according to the schema if provided, or unstructured response otherwise.
+
+        Examples:
+            ```python
+            # Simple unstructured prompt
+            response = await page.prompt("What is 2 + 2?")
+            # Returns: {'llm_response': '2 + 2 equals 4.'}
+
+            # Structured prompt with schema
+            response = await page.prompt(
+                "What is 2 + 2?",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "result_number": {"type": "int"},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+                    }
+                }
+            )
+            # Returns: {'result_number': 4, 'confidence': 1}
+            ```
+        """
+        normalized_model: dict[str, Any] | None = None
+        if isinstance(model, str):
+            normalized_model = {"model_name": model}
+        elif model is not None:
+            normalized_model = model
+
+        return await self._ai.ai_prompt(prompt=prompt, schema=schema, model=normalized_model)
+
+    @overload
+    def locator(
+        self,
+        selector: str,
+        *,
+        prompt: str | None = None,
+        ai: str | None = "fallback",
+        **kwargs: Any,
+    ) -> Locator: ...
+
+    @overload
+    def locator(
+        self,
+        *,
+        prompt: str,
+        ai: str | None = "fallback",
+        **kwargs: Any,
+    ) -> Locator: ...
+
+    def locator(
+        self,
+        selector: str | None = None,
+        *,
+        prompt: str | None = None,
+        ai: str | None = "fallback",
+        **kwargs: Any,
+    ) -> Locator:
+        """Get a Playwright locator using a CSS selector, AI-powered prompt, or both.
+
+        This method extends Playwright's locator() with AI capabilities. It supports three modes:
+        - **Selector-based**: Get locator using CSS selector (standard Playwright behavior)
+        - **AI-powered**: Use natural language to describe the element (returns lazy AILocator)
+        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+        The AI-powered locator is lazy - it only calls ai_locate_element when you actually
+        use the locator (e.g., when you call .click(), .fill(), etc.). Note that using this
+        AI locator lookup with prompt only works for elements you can interact with on the page.
+
+        Args:
+            selector: CSS selector for the target element.
+            prompt: Natural language description of which element to locate.
+            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+            **kwargs: All Playwright locator parameters (has_text, has, etc.)
+
+        Returns:
+            A Playwright Locator object (or AILocator proxy that acts like one).
+
+        Examples:
+            ```python
+            # Standard Playwright usage - selector only
+            download_button = page.locator("#download-btn")
+            await download_button.click()
+
+            # AI-powered - prompt only (returns lazy _AILocator)
+            download_button = page.locator(prompt='find "download invoices" button')
+            await download_button.click()  # AI resolves XPath here
+
+            # Fallback mode - try selector first, use AI if it fails
+            download_button = page.locator("#download-btn", prompt='find "download invoices" button')
+            await download_button.click()
+
+            # With Playwright parameters
+            submit_button = page.locator(prompt="find submit button", has_text="Submit")
+            await submit_button.click()
+            ```
+        """
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
+
+        context = skyvern_context.current()
+        if context and context.ai_mode_override:
+            ai = context.ai_mode_override
+
+        if ai == "fallback":
+            if selector and prompt:
+                # Try selector first, then AI
+                return AILocator(
+                    self.page,
+                    self._ai,
+                    prompt,
+                    selector=selector,
+                    selector_kwargs=kwargs,
+                    try_selector_first=True,
+                )
+
+            if selector:
+                return self.page.locator(selector, **kwargs)
+
+            if prompt:
+                return AILocator(
+                    self.page,
+                    self._ai,
+                    prompt,
+                    selector=None,
+                    selector_kwargs=kwargs,
+                )
+
+        elif ai == "proactive":
+            if prompt:
+                # Try AI first, then selector
+                return AILocator(
+                    self.page,
+                    self._ai,
+                    prompt,
+                    selector=selector,
+                    selector_kwargs=kwargs,
+                    try_selector_first=False,
+                )
+
+        if selector:
+            return self.page.locator(selector, **kwargs)
+
+        raise ValueError("Selector is required but was not provided")
 
     @action_wrap(ActionType.VERIFICATION_CODE)
     async def verification_code(self, prompt: str | None = None) -> None:

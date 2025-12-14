@@ -50,6 +50,10 @@ class WorkflowRunBlock(UniversalBaseModel):
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
     negative_descriptor: typing.Optional[str] = None
+    executed_branch_id: typing.Optional[str] = None
+    executed_branch_expression: typing.Optional[str] = None
+    executed_branch_result: typing.Optional[bool] = None
+    executed_branch_next_block: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

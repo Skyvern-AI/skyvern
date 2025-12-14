@@ -9,26 +9,33 @@ from openai import AsyncAzureOpenAI, AsyncOpenAI
 from skyvern.config import Settings
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
+from skyvern.forge.sdk.api.azure import AzureClientFactory
+from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
-from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
+from skyvern.forge.sdk.api.real_azure import RealAzureClientFactory
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.cache.factory import CacheFactory
-from skyvern.forge.sdk.db.client import AgentDB
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
-from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialVaultService
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.services.browser_recording.service import BrowserSessionRecordingService
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
 
 
@@ -37,6 +44,7 @@ class ForgeApp:
 
     SETTINGS_MANAGER: Settings
     DATABASE: AgentDB
+    REPLICA_DATABASE: AgentDB
     STORAGE: BaseStorage
     CACHE: BaseCache
     ARTIFACT_MANAGER: ArtifactManager
@@ -46,6 +54,7 @@ class ForgeApp:
     OPENAI_CLIENT: AsyncOpenAI | AsyncAzureOpenAI
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
     UI_TARS_CLIENT: AsyncOpenAI | None
+    AZURE_CLIENT_FACTORY: AzureClientFactory
     SECONDARY_LLM_API_HANDLER: LLMAPIHandler
     SELECT_AGENT_LLM_API_HANDLER: LLMAPIHandler
     NORMAL_SELECT_AGENT_LLM_API_HANDLER: LLMAPIHandler
@@ -62,8 +71,10 @@ class ForgeApp:
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
+    BROWSER_SESSION_RECORDING_SERVICE: BrowserSessionRecordingService
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
+    CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
     CREDENTIAL_VAULT_SERVICES: dict[str, CredentialVaultService | None]
     scrape_exclude: ScrapeExcludeFunc | None
     authentication_function: Callable[[str], Awaitable[Organization]] | None
@@ -83,16 +94,25 @@ def create_forge_app() -> ForgeApp:
     app.SETTINGS_MANAGER = settings
 
     app.DATABASE = AgentDB(settings.DATABASE_STRING, debug_enabled=settings.DEBUG_MODE)
+
+    if settings.DATABASE_REPLICA_STRING and settings.DATABASE_REPLICA_STRING != settings.DATABASE_STRING:
+        app.REPLICA_DATABASE = AgentDB(settings.DATABASE_REPLICA_STRING, debug_enabled=settings.DEBUG_MODE)
+    else:
+        app.REPLICA_DATABASE = app.DATABASE
+
     if settings.SKYVERN_STORAGE_TYPE == "s3":
         StorageFactory.set_storage(S3Storage())
     app.STORAGE = StorageFactory.get_storage()
     app.CACHE = CacheFactory.get_cache()
     app.ARTIFACT_MANAGER = ArtifactManager()
-    app.BROWSER_MANAGER = BrowserManager()
+    app.BROWSER_MANAGER = RealBrowserManager()
     app.EXPERIMENTATION_PROVIDER = NoOpExperimentationProvider()
 
     app.LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(settings.LLM_KEY)
-    app.OPENAI_CLIENT = AsyncOpenAI(api_key=settings.OPENAI_API_KEY or "")
+    app.OPENAI_CLIENT = AsyncOpenAI(
+        api_key=settings.OPENAI_API_KEY or "",
+        http_client=ForgeAsyncHttpxClientWrapper(),
+    )
     if settings.ENABLE_AZURE_CUA:
         app.OPENAI_CLIENT = AsyncAzureOpenAI(
             api_key=settings.AZURE_CUA_API_KEY,
@@ -110,6 +130,7 @@ def create_forge_app() -> ForgeApp:
         app.UI_TARS_CLIENT = AsyncOpenAI(
             api_key=settings.VOLCENGINE_API_KEY,
             base_url=settings.VOLCENGINE_API_BASE,
+            http_client=ForgeAsyncHttpxClientWrapper(),
         )
 
     app.SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
@@ -165,21 +186,38 @@ def create_forge_app() -> ForgeApp:
     app.WORKFLOW_SERVICE = WorkflowService()
     app.AGENT_FUNCTION = AgentFunction()
     app.PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=app.DATABASE)
+    app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
 
+    app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
     app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = BitwardenCredentialVaultService()
     app.AZURE_CREDENTIAL_VAULT_SERVICE = (
         AzureCredentialVaultService(
-            tenant_id=settings.AZURE_TENANT_ID,  # type: ignore[arg-type]
-            client_id=settings.AZURE_CLIENT_ID,  # type: ignore[arg-type]
-            client_secret=settings.AZURE_CLIENT_SECRET,  # type: ignore[arg-type]
+            app.AZURE_CLIENT_FACTORY.create_from_client_secret(
+                AzureClientSecretCredential(
+                    tenant_id=settings.AZURE_TENANT_ID,  # type: ignore
+                    client_id=settings.AZURE_CLIENT_ID,  # type: ignore
+                    client_secret=settings.AZURE_CLIENT_SECRET,  # type: ignore
+                )
+            ),
             vault_name=settings.AZURE_CREDENTIAL_VAULT,  # type: ignore[arg-type]
         )
         if settings.AZURE_CREDENTIAL_VAULT
         else None
     )
+    app.CUSTOM_CREDENTIAL_VAULT_SERVICE = (
+        CustomCredentialVaultService(
+            CustomCredentialAPIClient(
+                api_base_url=settings.CUSTOM_CREDENTIAL_API_BASE_URL,  # type: ignore
+                api_token=settings.CUSTOM_CREDENTIAL_API_TOKEN,  # type: ignore
+            )
+        )
+        if settings.CUSTOM_CREDENTIAL_API_BASE_URL and settings.CUSTOM_CREDENTIAL_API_TOKEN
+        else CustomCredentialVaultService()  # Create service without client for organization-based configuration
+    )
     app.CREDENTIAL_VAULT_SERVICES = {
         CredentialVaultType.BITWARDEN: app.BITWARDEN_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.AZURE_VAULT: app.AZURE_CREDENTIAL_VAULT_SERVICE,
+        CredentialVaultType.CUSTOM: app.CUSTOM_CREDENTIAL_VAULT_SERVICE,
     }
 
     app.scrape_exclude = None

@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
-import { CardStackIcon, PlusIcon } from "@radix-ui/react-icons";
+import { CardStackIcon, LockClosedIcon, PlusIcon } from "@radix-ui/react-icons";
 import {
   CredentialModalTypes,
   useCredentialModalState,
@@ -19,9 +19,14 @@ import { CredentialsTotpTab } from "./CredentialsTotpTab";
 import { useSearchParams } from "react-router-dom";
 
 const subHeaderText =
-  "Securely store your passwords, credit cards, and manage incoming 2FA codes for your workflows.";
+  "Securely store your passwords, credit cards, secrets, and manage incoming 2FA codes for your workflows.";
 
-const TAB_VALUES = ["passwords", "creditCards", "twoFactor"] as const;
+const TAB_VALUES = [
+  "passwords",
+  "creditCards",
+  "secrets",
+  "twoFactor",
+] as const;
 type TabValue = (typeof TAB_VALUES)[number];
 const DEFAULT_TAB: TabValue = "passwords";
 
@@ -79,6 +84,16 @@ function CredentialsPage() {
               <CardStackIcon className="mr-2 size-4" />
               Credit Card
             </DropdownMenuItem>
+            <DropdownMenuItem
+              onSelect={() => {
+                setIsOpen(true);
+                setType(CredentialModalTypes.SECRET);
+              }}
+              className="cursor-pointer"
+            >
+              <LockClosedIcon className="mr-2 size-4" />
+              Secret
+            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
@@ -90,6 +105,7 @@ function CredentialsPage() {
         <TabsList className="bg-slate-elevation1">
           <TabsTrigger value="passwords">Passwords</TabsTrigger>
           <TabsTrigger value="creditCards">Credit Cards</TabsTrigger>
+          <TabsTrigger value="secrets">Secrets</TabsTrigger>
           <TabsTrigger value="twoFactor">2FA</TabsTrigger>
         </TabsList>
 
@@ -99,6 +115,10 @@ function CredentialsPage() {
 
         <TabsContent value="creditCards" className="space-y-4">
           <CredentialsList filter="credit_card" />
+        </TabsContent>
+
+        <TabsContent value="secrets" className="space-y-4">
+          <CredentialsList filter="secret" />
         </TabsContent>
 
         <TabsContent value="twoFactor" className="space-y-4">

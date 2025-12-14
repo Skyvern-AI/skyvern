@@ -411,6 +411,44 @@ function hasASPClientControl() {
   return typeof ASPxClientControl !== "undefined";
 }
 
+// Check if element is only visible on hover (e.g., hover-only buttons)
+function isHoverOnlyElement(element) {
+  // Check for common hover-only patterns in class names
+  const className = element.className?.toString() ?? "";
+  const parentClassName = element.parentElement?.className?.toString() ?? "";
+
+  // Common hover-only class patterns
+  if (
+    className.includes("hover-") ||
+    className.includes("-hover") ||
+    parentClassName.includes("hover-") ||
+    parentClassName.includes("-hover")
+  ) {
+    return true;
+  }
+
+  // Check if parent has hover-related attributes or classes that might reveal this element
+  let parent = element.parentElement;
+  let depth = 0;
+  // Cap recursion to avoid walking the entire tree and bloating prompts
+  const maxDepth = 5;
+  while (parent && parent !== document.body && depth < maxDepth) {
+    const parentClass = parent.className?.toString() ?? "";
+    if (
+      parentClass.includes("hover") ||
+      parentClass.includes("card") ||
+      parentClass.includes("item")
+    ) {
+      // This element might be revealed on parent hover
+      return true;
+    }
+    parent = parent.parentElement;
+    depth += 1;
+  }
+
+  return false;
+}
+
 // from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L100-L119
 // NOTE: According this logic, some elements with aria-hidden won't be considered as invisible. And the result shows they are indeed interactable.
 function isElementVisible(element) {
@@ -450,6 +488,10 @@ function isElementVisible(element) {
   if (!isElementStyleVisibilityVisible(element, style)) return false;
   const rect = element.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) {
+    // Check if this element might be visible on hover before marking as invisible
+    if (isHoverOnlyElement(element)) {
+      return true;
+    }
     return false;
   }
 
@@ -824,7 +866,12 @@ function isInteractable(element, hoverStylesMap) {
   // https://developer.mozilla.org/en-US/docs/Web/CSS/pointer-events#none
   const elementPointerEvent = getElementComputedStyle(element)?.pointerEvents;
   if (elementPointerEvent === "none" && !element.disabled) {
-    return false;
+    // Some CTAs stay hidden until the parent is hovered
+    // When we can infer that the element is revealed on hover, keep it interactable so the agent
+    // has a chance to hover the parent before clicking.
+    if (!isHoverOnlyElement(element)) {
+      return false;
+    }
   }
 
   if (isInteractableInput(element, hoverStylesMap)) {
@@ -1186,6 +1233,10 @@ const isAngularDropdown = (element) => {
     return false;
   }
 
+  if (element.type?.toLowerCase() === "search") {
+    return false;
+  }
+
   const tagName = element.tagName.toLowerCase();
   if (tagName === "input" || tagName === "span") {
     const ariaLabel = element.hasAttribute("aria-label")
@@ -1380,6 +1431,7 @@ function getSelectOptions(element) {
     selectOptions.push({
       optionIndex: option.index,
       text: removeMultipleSpaces(option.textContent),
+      value: removeMultipleSpaces(option.value),
     });
   }
 
@@ -1507,6 +1559,50 @@ async function buildElementObject(
     attrs["required"] = true;
   }
 
+  // check DOM property of required/checked/selected/readonly/disabled
+  // the value from the DOM property should be the top priority
+  if (element.required !== undefined) {
+    delete attrs["required"];
+    delete attrs["aria-required"];
+    if (element.required) {
+      attrs["required"] = true;
+    }
+  }
+  if (element.checked !== undefined) {
+    delete attrs["checked"];
+    delete attrs["aria-checked"];
+    if (element.checked) {
+      attrs["checked"] = true;
+    } else if (
+      elementTagNameLower === "input" &&
+      (element.type === "checkbox" || element.type === "radio")
+    ) {
+      // checked property always exists for checkbox and radio elements
+      attrs["checked"] = false;
+    }
+  }
+  if (element.selected !== undefined) {
+    delete attrs["selected"];
+    delete attrs["aria-selected"];
+    if (element.selected) {
+      attrs["selected"] = true;
+    }
+  }
+  if (element.readOnly !== undefined) {
+    delete attrs["readonly"];
+    delete attrs["aria-readonly"];
+    if (element.readOnly) {
+      attrs["readonly"] = true;
+    }
+  }
+  if (element.disabled !== undefined) {
+    delete attrs["disabled"];
+    delete attrs["aria-disabled"];
+    if (element.disabled) {
+      attrs["disabled"] = true;
+    }
+  }
+
   if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
     if (element.type === "password") {
       attrs["value"] = element.value ? "*".repeat(element.value.length) : "";
@@ -1520,6 +1616,7 @@ async function buildElementObject(
     frame: frame,
     frame_index: window.GlobalSkyvernFrameIndex,
     interactable: interactable,
+    hoverOnly: isHoverOnlyElement(element),
     tagName: elementTagNameLower,
     attributes: attrs,
     beforePseudoText: getPseudoContent(element, "::before"),
@@ -2385,7 +2482,8 @@ function isClassNameIncludesHidden(className) {
   // some hidden elements are with the classname like `class="select-items select-hide"` or `class="dropdown-container dropdown-invisible"`
   return (
     className.toLowerCase().includes("hide") ||
-    className.toLowerCase().includes("invisible")
+    className.toLowerCase().includes("invisible") ||
+    className.toLowerCase().includes("closed")
   );
 }
 

@@ -18,11 +18,16 @@ from fastapi import (
 )
 from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse
+from pydantic import ValidationError
 
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
-from skyvern.exceptions import CannotUpdateWorkflowDueToCodeCache, MissingBrowserAddressError
+from skyvern.exceptions import (
+    CannotUpdateWorkflowDueToCodeCache,
+    MissingBrowserAddressError,
+    SkyvernHTTPException,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -164,17 +169,19 @@ async def run_task(
         data_extraction_schema = run_request.data_extraction_schema
         navigation_goal = run_request.prompt
         navigation_payload = None
-        task_generation = await task_v1_service.generate_task(
-            user_prompt=run_request.prompt,
-            organization=current_org,
-        )
-        url = url or task_generation.url
-        navigation_goal = task_generation.navigation_goal or run_request.prompt
-        if run_request.engine in CUA_ENGINES:
-            navigation_goal = run_request.prompt
-        navigation_payload = task_generation.navigation_payload
-        data_extraction_goal = task_generation.data_extraction_goal
-        data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
+        if not url:
+            task_generation = await task_v1_service.generate_task(
+                user_prompt=run_request.prompt,
+                organization=current_org,
+            )
+            # What if it's a SDK request with browser_session_id?
+            url = task_generation.url
+            navigation_goal = task_generation.navigation_goal or run_request.prompt
+            if run_request.engine in CUA_ENGINES:
+                navigation_goal = run_request.prompt
+            navigation_payload = task_generation.navigation_payload
+            data_extraction_goal = task_generation.data_extraction_goal
+            data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
 
         task_v1_request = TaskRequest(
             title=run_request.title,
@@ -824,6 +831,9 @@ async def update_workflow_legacy(
         ) from e
     except WorkflowParameterMissingRequiredValue as e:
         raise e
+    except (SkyvernHTTPException, ValidationError) as e:
+        # Bubble up well-formed client errors so they are not converted to 500s
+        raise e
     except Exception as e:
         LOG.exception(
             "Failed to update workflow",
@@ -895,6 +905,9 @@ async def update_workflow(
         raise HTTPException(status_code=422, detail="Invalid YAML")
     except WorkflowParameterMissingRequiredValue as e:
         raise e
+    except (SkyvernHTTPException, ValidationError) as e:
+        # Bubble up well-formed client errors so they are not converted to 500s
+        raise e
     except Exception as e:
         LOG.exception(
             "Failed to update workflow",
@@ -943,12 +956,13 @@ async def delete_workflow(
 
 
 ################# Folder Endpoints #################
-@legacy_base_router.post("/folders", response_model=Folder, tags=["agent"])
+@legacy_base_router.post("/folders", response_model=Folder, tags=["agent"], include_in_schema=False)
 @legacy_base_router.post("/folders/", response_model=Folder, include_in_schema=False)
 @base_router.post(
     "/folders",
     response_model=Folder,
     tags=["Workflows"],
+    include_in_schema=False,
     description="Create a new folder to organize workflows",
     summary="Create folder",
     responses={
@@ -982,12 +996,13 @@ async def create_folder(
     )
 
 
-@legacy_base_router.get("/folders/{folder_id}", response_model=Folder, tags=["agent"])
+@legacy_base_router.get("/folders/{folder_id}", response_model=Folder, tags=["agent"], include_in_schema=False)
 @legacy_base_router.get("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
 @base_router.get(
     "/folders/{folder_id}",
     response_model=Folder,
     tags=["Workflows"],
+    include_in_schema=False,
     description="Get a specific folder by ID",
     summary="Get folder",
     responses={
@@ -1023,12 +1038,13 @@ async def get_folder(
     )
 
 
-@legacy_base_router.get("/folders", response_model=list[Folder], tags=["agent"])
+@legacy_base_router.get("/folders", response_model=list[Folder], tags=["agent"], include_in_schema=False)
 @legacy_base_router.get("/folders/", response_model=list[Folder], include_in_schema=False)
 @base_router.get(
     "/folders",
     response_model=list[Folder],
     tags=["Workflows"],
+    include_in_schema=False,
     description="Get all folders for the organization",
     summary="Get folders",
     responses={
@@ -1077,12 +1093,13 @@ async def get_folders(
     return result
 
 
-@legacy_base_router.put("/folders/{folder_id}", response_model=Folder, tags=["agent"])
+@legacy_base_router.put("/folders/{folder_id}", response_model=Folder, tags=["agent"], include_in_schema=False)
 @legacy_base_router.put("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
 @base_router.put(
     "/folders/{folder_id}",
     response_model=Folder,
     tags=["Workflows"],
+    include_in_schema=False,
     description="Update a folder's title or description",
     summary="Update folder",
     responses={
@@ -1121,11 +1138,12 @@ async def update_folder(
     )
 
 
-@legacy_base_router.delete("/folders/{folder_id}", tags=["agent"])
+@legacy_base_router.delete("/folders/{folder_id}", tags=["agent"], include_in_schema=False)
 @legacy_base_router.delete("/folders/{folder_id}/", include_in_schema=False)
 @base_router.delete(
     "/folders/{folder_id}",
     tags=["Workflows"],
+    include_in_schema=False,
     description="Delete a folder. Optionally delete all workflows in the folder.",
     summary="Delete folder",
     responses={
@@ -1151,12 +1169,15 @@ async def delete_folder(
     return {"status": "deleted", "folder_id": folder_id, "workflows_deleted": delete_workflows}
 
 
-@legacy_base_router.put("/workflows/{workflow_permanent_id}/folder", response_model=Workflow, tags=["agent"])
+@legacy_base_router.put(
+    "/workflows/{workflow_permanent_id}/folder", response_model=Workflow, tags=["agent"], include_in_schema=False
+)
 @legacy_base_router.put("/workflows/{workflow_permanent_id}/folder/", response_model=Workflow, include_in_schema=False)
 @base_router.put(
     "/workflows/{workflow_permanent_id}/folder",
     response_model=Workflow,
     tags=["Workflows"],
+    include_in_schema=False,
     description="Update a workflow's folder assignment for the latest version",
     summary="Update workflow folder",
     responses={
@@ -2298,6 +2319,7 @@ async def get_workflows(
     page_size: int = Query(10, ge=1),
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
+    only_templates: bool = Query(False),
     search_key: str | None = Query(
         None,
         description="Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).",
@@ -2351,9 +2373,32 @@ async def get_workflows(
         page_size=page_size,
         only_saved_tasks=only_saved_tasks,
         only_workflows=only_workflows,
+        only_templates=only_templates,
         search_key=effective_search,
         folder_id=folder_id,
         statuses=effective_statuses,
+    )
+
+
+@base_router.put(
+    "/workflows/{workflow_permanent_id}/template",
+    tags=["Workflows"],
+)
+async def set_workflow_template_status(
+    workflow_permanent_id: str,
+    is_template: bool = Query(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict:
+    """
+    Set or unset a workflow as a template.
+
+    Template status is stored at the workflow_permanent_id level (not per-version),
+    meaning all versions of a workflow share the same template status.
+    """
+    return await app.WORKFLOW_SERVICE.set_template_status(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        is_template=is_template,
     )
 
 

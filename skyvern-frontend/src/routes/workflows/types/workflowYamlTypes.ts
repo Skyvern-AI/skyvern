@@ -1,11 +1,11 @@
-import { RunEngine } from "@/api/types";
+import { ProxyLocation, RunEngine } from "@/api/types";
 import { WorkflowBlockType } from "./workflowTypes";
 import { WorkflowModel } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
   description?: string | null;
-  proxy_location?: string | null;
+  proxy_location?: ProxyLocation | null;
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
   model?: WorkflowModel | null;
@@ -24,6 +24,7 @@ export type WorkflowCreateYAMLRequest = {
 };
 
 export type WorkflowDefinitionYAML = {
+  version?: number | null;
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
 };
@@ -127,6 +128,7 @@ export type BlockYAML =
   | SendEmailBlockYAML
   | FileUrlParserBlockYAML
   | ForLoopBlockYAML
+  | ConditionalBlockYAML
   | ValidationBlockYAML
   | HumanInteractionBlockYAML
   | ActionBlockYAML
@@ -144,6 +146,8 @@ export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
   label: string;
   continue_on_failure?: boolean;
+  next_loop_on_failure?: boolean;
+  next_block_label?: string | null;
 };
 
 export type TaskBlockYAML = BlockYAMLBase & {
@@ -356,6 +360,25 @@ export type ForLoopBlockYAML = BlockYAMLBase & {
   complete_if_empty: boolean;
 };
 
+export type BranchCriteriaYAML = {
+  criteria_type: string;
+  expression: string;
+  description?: string | null;
+};
+
+export type BranchConditionYAML = {
+  id: string;
+  criteria: BranchCriteriaYAML | null;
+  next_block_label: string | null;
+  description?: string | null;
+  is_default: boolean;
+};
+
+export type ConditionalBlockYAML = BlockYAMLBase & {
+  block_type: "conditional";
+  branch_conditions: Array<BranchConditionYAML>;
+};
+
 export type PDFParserBlockYAML = BlockYAMLBase & {
   block_type: "pdf_parser";
   file_url: string;
@@ -373,6 +396,7 @@ export type HttpRequestBlockYAML = BlockYAMLBase & {
   url: string | null;
   headers: Record<string, string> | null;
   body: Record<string, unknown> | null;
+  files?: Record<string, string> | null; // Dictionary mapping field names to file paths/URLs
   timeout: number;
   follow_redirects: boolean;
   parameter_keys?: Array<string> | null;

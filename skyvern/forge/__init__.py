@@ -17,14 +17,14 @@ class AppHolder:
     def __getattr__(self, name: str) -> Any:
         inst = object.__getattribute__(self, "_inst")
         if inst is None:
-            raise RuntimeError("ForgeApp is not initialized, start_forge_app should be called")
+            raise RuntimeError("ForgeApp is not initialized. Call start_forge_app() before accessing app properties.")
 
         return getattr(inst, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
         inst = object.__getattribute__(self, "_inst")
         if inst is None:
-            raise RuntimeError("ForgeApp is not initialized, start_forge_app should be called")
+            raise RuntimeError("ForgeApp is not initialized. Call start_forge_app() before accessing app properties.")
 
         setattr(inst, name, value)
 

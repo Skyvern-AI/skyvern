@@ -5,7 +5,7 @@ import type * as Skyvern from "../index.js";
 export interface WorkflowCreateYamlRequest {
     title: string;
     description?: string;
-    proxy_location?: Skyvern.ProxyLocation;
+    proxy_location?: WorkflowCreateYamlRequest.ProxyLocation;
     webhook_callback_url?: string;
     totp_verification_url?: string;
     totp_identifier?: string;
@@ -22,4 +22,8 @@ export interface WorkflowCreateYamlRequest {
     run_sequentially?: boolean;
     sequential_key?: string;
     folder_id?: string;
+}
+
+export namespace WorkflowCreateYamlRequest {
+    export type ProxyLocation = Skyvern.ProxyLocation | Skyvern.GeoTarget | Record<string, unknown>;
 }

@@ -5,6 +5,7 @@ import type * as Skyvern from "../index.js";
 export type ForLoopBlockLoopBlocksItem =
     | Skyvern.ForLoopBlockLoopBlocksItem.Action
     | Skyvern.ForLoopBlockLoopBlocksItem.Code
+    | Skyvern.ForLoopBlockLoopBlocksItem.Conditional
     | Skyvern.ForLoopBlockLoopBlocksItem.DownloadToS3
     | Skyvern.ForLoopBlockLoopBlocksItem.Extraction
     | Skyvern.ForLoopBlockLoopBlocksItem.FileDownload
@@ -32,6 +33,10 @@ export namespace ForLoopBlockLoopBlocksItem {
 
     export interface Code extends Skyvern.CodeBlock {
         block_type: "code";
+    }
+
+    export interface Conditional extends Skyvern.ConditionalBlock {
+        block_type: "conditional";
     }
 
     export interface DownloadToS3 extends Skyvern.DownloadToS3Block {

@@ -58,6 +58,12 @@ class WorkflowRunBlock(BaseModel):
     positive_descriptor: str | None = None
     negative_descriptor: str | None = None
 
+    # conditional block
+    executed_branch_id: str | None = None
+    executed_branch_expression: str | None = None
+    executed_branch_result: bool | None = None
+    executed_branch_next_block: str | None = None
+
 
 class WorkflowRunTimelineType(StrEnum):
     thought = "thought"

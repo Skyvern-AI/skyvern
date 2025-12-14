@@ -1,19 +1,29 @@
 import asyncio
 import os
-from typing import Any, overload
+import pathlib
+import tempfile
+from typing import Any
 
 import httpx
+import structlog
 from dotenv import load_dotenv
 from playwright.async_api import Playwright, async_playwright
 
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
+from skyvern.client.core import RequestOptions
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
+from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
-from skyvern.library.embedded_server_factory import create_embedded_server
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunStatus
+
+LOG = structlog.get_logger()
+
+
+def _get_browser_session_url(browser_session_id: str) -> str:
+    return f"https://app.skyvern.com/browser-session/{browser_session_id}"
 
 
 class Skyvern(AsyncSkyvern):
@@ -26,13 +36,13 @@ class Skyvern(AsyncSkyvern):
     Example:
         ```python
 
-        # Initialize with remote environment and API key
-        skyvern = Skyvern(environment=SkyvernEnvironment.CLOUD, api_key="your-api-key")
+        # Remote mode: Connect to Skyvern Cloud (API key required)
+        skyvern = Skyvern(api_key="your-api-key")
 
-        # Or in embedded mode (run `skyvern quickstart` first):
-        skyvern = Skyvern()
+        # Local/embedded mode (run `skyvern quickstart` first):
+        skyvern = Skyvern.local()
 
-        # Launch a local browser
+        # Launch a local browser (works only in local environment)
         browser = await skyvern.launch_local_browser(headless=False)
         page = await browser.get_working_page()
 
@@ -41,7 +51,7 @@ class Skyvern(AsyncSkyvern):
         page = await browser.get_working_page()
 
         # Execute AI-powered tasks
-        await page.run.run_task("Fill out the form and submit it")
+        await page.agent.run_task("Fill out the form and submit it")
         ```
 
     You can also mix AI-powered tasks with direct browser control in the same session:
@@ -62,7 +72,7 @@ class Skyvern(AsyncSkyvern):
         await page.goto("https://example.com")
 
         # Use AI to handle login
-        await page.run.login(
+        await page.agent.login(
             credential_type=CredentialType.skyvern,
             credential_id=credential.credential_id,
         )
@@ -74,12 +84,11 @@ class Skyvern(AsyncSkyvern):
         ```
     """
 
-    @overload
     def __init__(
         self,
         *,
-        environment: SkyvernEnvironment,
         api_key: str,
+        environment: SkyvernEnvironment = SkyvernEnvironment.CLOUD,
         base_url: str | None = None,
         timeout: float | None = None,
         follow_redirects: bool | None = True,
@@ -88,11 +97,11 @@ class Skyvern(AsyncSkyvern):
         """Remote mode: Connect to Skyvern Cloud or self-hosted instance.
 
         Args:
-            environment: The Skyvern environment to connect to. Use SkyvernEnvironment.CLOUD
-                for Skyvern Cloud or SkyvernEnvironment.PRODUCTION/STAGING for self-hosted
-                instances.
             api_key: API key for authenticating with Skyvern.
                 Can be found on the settings page: https://app.skyvern.com/settings
+            environment: The Skyvern environment to connect to. Use SkyvernEnvironment.CLOUD
+                for Skyvern Cloud or SkyvernEnvironment.PRODUCTION/STAGING for self-hosted
+                instances. Defaults to SkyvernEnvironment.CLOUD.
             base_url: Override the base URL for the Skyvern API. If not provided, uses the default URL for
                 the specified environment.
             timeout: Timeout in seconds for API requests. If not provided, uses the default timeout.
@@ -100,73 +109,118 @@ class Skyvern(AsyncSkyvern):
             httpx_client: Custom httpx AsyncClient for making API requests.
                 If not provided, a default client will be created.
         """
-        ...
-
-    @overload
-    def __init__(
-        self,
-        *,
-        openai_api_key: str | None = None,
-    ) -> None:
-        """Embedded mode: Run Skyvern locally in-process.
-
-        To use this mode, run `skyvern quickstart` first.
-
-        Args:
-            openai_api_key: Optional OpenAI API key override for LLM operations.
-                If not provided, the one from the .env file will be used.
-        """
-        ...
-
-    def __init__(
-        self,
-        *,
-        environment: SkyvernEnvironment | None = None,
-        openai_api_key: str | None = None,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        timeout: float | None = None,
-        follow_redirects: bool | None = True,
-        httpx_client: httpx.AsyncClient | None = None,
-    ):
-        if environment is None:
-            if httpx_client is not None:
-                raise ValueError("httpx_client is not supported in embedded mode")
-
-            if not os.path.exists(".env"):
-                raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
-
-            load_dotenv(".env")
-            api_key = os.getenv("SKYVERN_API_KEY")
-            if not api_key:
-                raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
-
-            super().__init__(
-                environment=SkyvernEnvironment.LOCAL,
-                api_key=api_key,
-                timeout=timeout,
-                follow_redirects=follow_redirects,
-                httpx_client=create_embedded_server(
-                    openai_api_key=openai_api_key,
-                ),
-            )
-        else:
-            if not api_key:
-                raise ValueError(f"Missing api_key for {environment.name}")
-
-            super().__init__(
-                base_url=base_url,
-                environment=environment,
-                api_key=api_key,
-                timeout=timeout,
-                follow_redirects=follow_redirects,
-                httpx_client=httpx_client,
-            )
+        super().__init__(
+            base_url=base_url,
+            environment=environment,
+            api_key=api_key,
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            httpx_client=httpx_client,
+        )
 
         self._environment = environment
-        self._api_key = api_key
-
+        self._api_key: str | None = api_key
         self._playwright: Playwright | None = None
+
+    @classmethod
+    def local(
+        cls,
+        *,
+        llm_config: LLMRouterConfig | LLMConfig | None = None,
+        settings: dict[str, Any] | None = None,
+    ) -> "Skyvern":
+        """Local/embedded mode: Run Skyvern locally in-process.
+
+        Prerequisites:
+            Run `skyvern quickstart` first to set up your local environment and create a .env file
+
+        Args:
+            llm_config: Optional custom LLM configuration (LLMConfig or LLMRouterConfig).
+                If provided, this will be registered as "CUSTOM_LLM" and used as the primary LLM,
+                overriding the LLM_KEY setting from your .env file.
+                If not provided, uses the LLM configured via LLM_KEY in your .env file.
+
+                Example 1 - Using .env configuration (simplest, recommended):
+                    ```python
+                    from skyvern import Skyvern
+
+                    # Uses LLM_KEY and other settings from your .env file
+                    # Created by running `skyvern quickstart`
+                    skyvern = Skyvern.local()
+                    ```
+
+                Example 2 - Custom LLM with environment variables:
+                    ```python
+                    from skyvern import Skyvern
+                    from skyvern.forge.sdk.api.llm.models import LLMConfig
+
+                    # Assumes OPENAI_API_KEY is set in your environment
+                    skyvern = Skyvern.local(
+                        llm_config=LLMConfig(
+                            model_name="gpt-4o",
+                            required_env_vars=["OPENAI_API_KEY"],
+                            supports_vision=True,
+                            add_assistant_prefix=False,
+                        )
+                    )
+                    ```
+
+                Example 3 - Explicitly providing credentials:
+                    ```python
+                    from skyvern import Skyvern
+                    from skyvern.forge.sdk.api.llm.models import LLMConfig, LiteLLMParams
+
+                    skyvern = Skyvern.local(
+                        llm_config=LLMConfig(
+                            model_name="gpt-4o",
+                            required_env_vars=[],  # No env vars required
+                            supports_vision=True,
+                            add_assistant_prefix=False,
+                            litellm_params=LiteLLMParams(
+                                api_base="https://api.openai.com/v1",
+                                api_key="sk-...",  # Your API key
+                            ),
+                        )
+                    )
+                    ```
+            settings: Optional dictionary of Skyvern settings to override.
+                These override the corresponding settings from your .env file.
+                Example: {"MAX_STEPS_PER_RUN": 100, "BROWSER_TYPE": "chromium-headful"}
+
+        Returns:
+            Skyvern: A Skyvern instance running in local/embedded mode.
+        """
+        from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
+
+        if not os.path.exists(".env"):
+            raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
+
+        load_dotenv(".env")
+        api_key = os.getenv("SKYVERN_API_KEY")
+        if not api_key:
+            raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
+
+        obj = cls.__new__(cls)
+
+        AsyncSkyvern.__init__(
+            obj,
+            environment=SkyvernEnvironment.LOCAL,
+            httpx_client=create_embedded_server(
+                llm_config=llm_config,
+                settings_overrides=settings,
+            ),
+        )
+
+        obj._environment = SkyvernEnvironment.LOCAL
+        obj._api_key = None
+        obj._playwright = None
+
+        return obj
+
+    @property
+    def environment(self) -> SkyvernEnvironment | None:
+        """Get the current Skyvern environment (CLOUD, STAGING, LOCAL, or None for embedded mode)."""
+        return self._environment
 
     async def run_task(
         self,
@@ -187,10 +241,11 @@ class Skyvern(AsyncSkyvern):
         browser_session_id: str | None = None,
         user_agent: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        publish_workflow: bool | None = None,
+        publish_workflow: bool = False,
         include_action_history_in_verification: bool | None = None,
         max_screenshot_scrolls: int | None = None,
         browser_address: str | None = None,
+        request_options: RequestOptions | None = None,
     ) -> TaskRunResponse:
         task_run = await super().run_task(
             prompt=prompt,
@@ -212,6 +267,7 @@ class Skyvern(AsyncSkyvern):
             include_action_history_in_verification=include_action_history_in_verification,
             max_screenshot_scrolls=max_screenshot_scrolls,
             browser_address=browser_address,
+            request_options=request_options,
         )
 
         if wait_for_completion:
@@ -244,6 +300,7 @@ class Skyvern(AsyncSkyvern):
         run_with: str | None = None,
         wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
+        request_options: RequestOptions | None = None,
     ) -> WorkflowRunResponse:
         workflow_run = await super().run_workflow(
             workflow_id=workflow_id,
@@ -263,6 +320,7 @@ class Skyvern(AsyncSkyvern):
             browser_address=browser_address,
             ai_fallback=ai_fallback,
             run_with=run_with,
+            request_options=request_options,
         )
         if wait_for_completion:
             async with asyncio.timeout(timeout):
@@ -298,6 +356,7 @@ class Skyvern(AsyncSkyvern):
         azure_vault_totp_secret_key: str | None = None,
         wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
+        request_options: RequestOptions | None = None,
     ) -> WorkflowRunResponse:
         workflow_run = await super().login(
             credential_type=credential_type,
@@ -320,6 +379,7 @@ class Skyvern(AsyncSkyvern):
             azure_vault_username_key=azure_vault_username_key,
             azure_vault_password_key=azure_vault_password_key,
             azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+            request_options=request_options,
         )
         if wait_for_completion:
             async with asyncio.timeout(timeout):
@@ -330,7 +390,14 @@ class Skyvern(AsyncSkyvern):
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
-    async def launch_local_browser(self, *, headless: bool = False, port: int = DEFAULT_CDP_PORT) -> SkyvernBrowser:
+    async def launch_local_browser(
+        self,
+        *,
+        headless: bool = False,
+        port: int = DEFAULT_CDP_PORT,
+        args: list[str] | None = None,
+        user_data_dir: str | None = None,
+    ) -> SkyvernBrowser:
         """Launch a new local Chromium browser with Chrome DevTools Protocol (CDP) enabled.
 
         This method launches a browser on your local machine with remote debugging enabled,
@@ -339,17 +406,32 @@ class Skyvern(AsyncSkyvern):
         Args:
             headless: Whether to run the browser in headless mode. Defaults to False.
             port: The port number for the CDP endpoint. Defaults to DEFAULT_CDP_PORT.
+            args: Additional command-line arguments to pass to Chromium. Defaults to None.
+                Example: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"]
 
         Returns:
             SkyvernBrowser: A browser instance with Skyvern capabilities.
         """
+
         playwright = await self._get_playwright()
-        browser = await playwright.chromium.launch(
+
+        if user_data_dir:
+            user_data_path = pathlib.Path(user_data_dir)
+        else:
+            user_data_path = pathlib.Path(tempfile.gettempdir()) / "skyvern-browser"
+
+        launch_args = [
+            f"--remote-debugging-port={port}",
+        ]
+        if args:
+            launch_args.extend(args)
+
+        browser_context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_path),
             headless=headless,
-            args=[f"--remote-debugging-port={port}"],
+            args=launch_args,
         )
         browser_address = f"http://localhost:{port}"
-        browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
         return SkyvernBrowser(self, browser_context, browser_address=browser_address)
 
     async def connect_to_browser_over_cdp(self, cdp_url: str) -> SkyvernBrowser:
@@ -380,26 +462,67 @@ class Skyvern(AsyncSkyvern):
         """
         self._ensure_cloud_environment()
         browser_session = await self.get_browser_session(browser_session_id)
+        if self._environment == SkyvernEnvironment.CLOUD:
+            LOG.info(
+                "Connecting to existing cloud browser session",
+                url=_get_browser_session_url(browser_session.browser_session_id),
+            )
+        else:
+            LOG.info(
+                "Connecting to existing cloud browser session", browser_session_id=browser_session.browser_session_id
+            )
         return await self._connect_to_cloud_browser_session(browser_session)
 
-    async def launch_cloud_browser(self) -> SkyvernBrowser:
+    async def launch_cloud_browser(
+        self,
+        *,
+        timeout: int | None = None,
+        proxy_location: ProxyLocation | None = None,
+    ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
 
         This creates a new browser session in Skyvern's cloud infrastructure and connects to it.
+
+        Args:
+            timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
+                Must be between 5 and 1440. Defaults to 60.
+            proxy_location: Geographic proxy location to route the browser traffic through.
+                This is only available in Skyvern Cloud.
 
         Returns:
             SkyvernBrowser: A browser instance connected to the new cloud session.
         """
         self._ensure_cloud_environment()
-        browser_session = await self.create_browser_session()
+        browser_session = await self.create_browser_session(
+            timeout=timeout,
+            proxy_location=proxy_location,
+        )
+        if self._environment == SkyvernEnvironment.CLOUD:
+            LOG.info(
+                "Launched new cloud browser session",
+                url=_get_browser_session_url(browser_session.browser_session_id),
+            )
+        else:
+            LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
         return await self._connect_to_cloud_browser_session(browser_session)
 
-    async def use_cloud_browser(self) -> SkyvernBrowser:
+    async def use_cloud_browser(
+        self,
+        *,
+        timeout: int | None = None,
+        proxy_location: ProxyLocation | None = None,
+    ) -> SkyvernBrowser:
         """Get or create a cloud browser session.
 
         This method attempts to reuse the most recent available cloud browser session.
         If no session exists, it creates a new one. This is useful for cost efficiency
         and session persistence.
+
+        Args:
+            timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
+                Must be between 5 and 1440. Defaults to 60. Only used when creating a new session.
+            proxy_location: Geographic proxy location to route the browser traffic through.
+                This is only available in Skyvern Cloud. Only used when creating a new session.
 
         Returns:
             SkyvernBrowser: A browser instance connected to an existing or new cloud session.
@@ -410,7 +533,29 @@ class Skyvern(AsyncSkyvern):
             (s for s in browser_sessions if s.runnable_id is None), key=lambda s: s.started_at, default=None
         )
         if browser_session is None:
-            browser_session = await self.create_browser_session()
+            LOG.info("No existing cloud browser session found, launching a new session")
+            browser_session = await self.create_browser_session(
+                timeout=timeout,
+                proxy_location=proxy_location,
+            )
+            if self._environment == SkyvernEnvironment.CLOUD:
+                LOG.info(
+                    "Launched new cloud browser session",
+                    url=_get_browser_session_url(browser_session.browser_session_id),
+                )
+            else:
+                LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
+        else:
+            if self._environment == SkyvernEnvironment.CLOUD:
+                LOG.info(
+                    "Reusing existing cloud browser session",
+                    url=_get_browser_session_url(browser_session.browser_session_id),
+                )
+            else:
+                LOG.info(
+                    "Reusing existing cloud browser session", browser_session_id=browser_session.browser_session_id
+                )
+
         return await self._connect_to_cloud_browser_session(browser_session)
 
     def _ensure_cloud_environment(self) -> None:
