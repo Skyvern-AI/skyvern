@@ -32,11 +32,12 @@ def init_env(
     )
     console.print("[italic]This wizard will help you set up Skyvern.[/italic]")
 
-    run_local = Confirm.ask(
-        "Would you like to run Skyvern [bold blue]locally[/bold blue] or in the [bold purple]cloud[/bold purple]?",
-        default=False,
+    infra_choice = Prompt.ask(
+        "Would you like to run Skyvern [bold blue]local[/bold blue]ly or in the [bold purple]cloud[/bold purple]?",
         choices=["local", "cloud"],
     )
+
+    run_local = infra_choice == "local"
 
     if run_local:
         setup_postgresql(no_postgres)
