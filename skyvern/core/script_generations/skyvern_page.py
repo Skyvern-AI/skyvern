@@ -96,7 +96,12 @@ class SkyvernPage(Page):
         timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         await self.page.goto(url, timeout=timeout, **kwargs)
 
-    async def get_actual_value(self, value: str) -> str:
+    async def get_actual_value(
+        self,
+        value: str,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str:
         return value
 
     ######### Public Interfaces #########
@@ -390,7 +395,11 @@ class SkyvernPage(Page):
             error_to_raise = None
             if selector:
                 try:
-                    value = await self.get_actual_value(value)
+                    value = await self.get_actual_value(
+                        value,
+                        totp_identifier=totp_identifier,
+                        totp_url=totp_url,
+                    )
                     locator = self.page.locator(selector)
                     await handler_utils.input_sequentially(locator, value, timeout=timeout)
                     return value
