@@ -329,13 +329,6 @@ async def _convert_css_shape_to_string(
                 )
                 return None
 
-            if not await locater.is_visible(timeout=settings.BROWSER_ACTION_TIMEOUT_MS):
-                LOG.info(
-                    "element is not visible on the page, going to abort conversion",
-                    element_id=element_id,
-                    key=shape_key,
-                )
-
             skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
 
             _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
