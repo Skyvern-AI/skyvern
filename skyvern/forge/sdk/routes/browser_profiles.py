@@ -12,6 +12,16 @@ from skyvern.exceptions import (
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
+from skyvern.forge.sdk.routes.code_samples import (
+    CREATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON,
+    CREATE_BROWSER_PROFILE_CODE_SAMPLE_TS,
+    DELETE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON,
+    DELETE_BROWSER_PROFILE_CODE_SAMPLE_TS,
+    GET_BROWSER_PROFILE_CODE_SAMPLE_PYTHON,
+    GET_BROWSER_PROFILE_CODE_SAMPLE_TS,
+    GET_BROWSER_PROFILES_CODE_SAMPLE_PYTHON,
+    GET_BROWSER_PROFILES_CODE_SAMPLE_TS,
+)
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfile,
@@ -41,6 +51,23 @@ def _handle_duplicate_profile_name(*, organization_id: str, name: str, exc: Inte
     response_model=BrowserProfile,
     tags=["Browser Profiles"],
     summary="Create a browser profile",
+    description="Create a browser profile from a persistent browser session or workflow run.",
+    openapi_extra={
+        "x-fern-sdk-method-name": "create_browser_profile",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": CREATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": CREATE_BROWSER_PROFILE_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
+    },
+    responses={
+        200: {"description": "Successfully created browser profile"},
+        400: {"description": "Invalid request - missing source or source not found"},
+        409: {"description": "Browser profile name already exists"},
+    },
 )
 @base_router.post(
     "/browser_profiles/",
@@ -84,6 +111,20 @@ async def create_browser_profile(
     tags=["Browser Profiles"],
     summary="List browser profiles",
     description="Get all browser profiles for the organization",
+    openapi_extra={
+        "x-fern-sdk-method-name": "list_browser_profiles",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_BROWSER_PROFILES_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_BROWSER_PROFILES_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
+    },
+    responses={
+        200: {"description": "Successfully retrieved browser profiles"},
+    },
 )
 @base_router.get(
     "/browser_profiles/",
@@ -124,6 +165,17 @@ async def list_browser_profiles(
     responses={
         200: {"description": "Successfully retrieved browser profile"},
         404: {"description": "Browser profile not found"},
+    },
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_browser_profile",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_BROWSER_PROFILE_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_BROWSER_PROFILE_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.get(
@@ -178,6 +230,17 @@ async def get_browser_profile(
         204: {"description": "Successfully deleted browser profile"},
         404: {"description": "Browser profile not found"},
     },
+    openapi_extra={
+        "x-fern-sdk-method-name": "delete_browser_profile",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": DELETE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": DELETE_BROWSER_PROFILE_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
+    },
 )
 @base_router.delete(
     "/browser_profiles/{profile_id}/",
@@ -227,8 +290,8 @@ async def _create_profile_from_session(
     description: str | None,
     browser_session_id: str,
 ) -> BrowserProfile:
-    browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
-    if browser_state is None:
+    browser_session = await app.DATABASE.get_persistent_browser_session(browser_session_id, organization_id)
+    if browser_session is None:
         LOG.warning(
             "Browser session not found for profile creation",
             organization_id=organization_id,
@@ -236,16 +299,22 @@ async def _create_profile_from_session(
         )
         raise BrowserSessionNotFound(browser_session_id)
 
-    session_dir = browser_state.browser_artifacts.browser_session_dir
+    session_dir = await app.STORAGE.retrieve_browser_profile(
+        organization_id=organization_id,
+        profile_id=browser_session_id,
+    )
     if not session_dir:
         LOG.warning(
-            "Browser session has no persisted data",
+            "Browser session archive not found for profile creation",
             organization_id=organization_id,
             browser_session_id=browser_session_id,
         )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Browser session does not have persisted data to store",
+            detail=(
+                "Browser session does not have a persisted profile archive. "
+                "Close the session and wait for upload before creating a browser profile."
+            ),
         )
 
     try:

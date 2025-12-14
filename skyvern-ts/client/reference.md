@@ -27,10 +27,9 @@ Execute a single SDK action with the specified parameters
 
 ```typescript
 await client.runSdkAction({
-    "x-user-agent": "x-user-agent",
     url: "url",
     action: {
-        type: "ai_click"
+        type: "ai_act"
     }
 });
 

@@ -11,7 +11,7 @@ const useFirstParam = (...paramNames: string[]) => {
       return value;
     }
   }
-  return null;
+  return undefined;
 };
 
 export { useFirstParam };

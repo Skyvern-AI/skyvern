@@ -19,3 +19,14 @@ class CreateWorkflowFromPromptRequestV2(BaseModel):
 CreateFromPromptRequest = t.Annotated[
     t.Union[CreateWorkflowFromPromptRequestV1, CreateWorkflowFromPromptRequestV2], Field(discriminator="task_version")
 ]
+
+
+class ImprovePromptRequest(BaseModel):
+    context: dict | None = Field(default_factory=dict, description="Additional context about the user's needs")
+    prompt: str = Field(..., min_length=1, description="The original prompt to improve")
+
+
+class ImprovePromptResponse(BaseModel):
+    error: str | None = Field(None, description="Error message if prompt improvement failed")
+    improved: str = Field(..., description="The improved version of the prompt")
+    original: str = Field(..., description="The original prompt provided for improvement")

@@ -27,6 +27,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     DragAction,
     GotoUrlAction,
+    HoverAction,
     InputOrSelectContext,
     InputTextAction,
     KeypressAction,
@@ -42,7 +43,7 @@ from skyvern.webeye.actions.actions import (
     VerificationCodeAction,
     WaitAction,
 )
-from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 LOG = structlog.get_logger()
 
@@ -154,6 +155,7 @@ def parse_action(
                 index=index,
             ),
             input_or_select_context=input_or_select_context,
+            download=action.get("download", False),
         )
 
     if action_type == ActionType.CHECKBOX:
@@ -164,6 +166,9 @@ def parse_action(
 
     if action_type == ActionType.WAIT:
         return WaitAction(**base_action_dict)
+
+    if action_type == ActionType.HOVER:
+        return HoverAction(**base_action_dict, hold_seconds=action.get("hold_seconds", 0) or 0)
 
     if action_type == ActionType.COMPLETE:
         return CompleteAction(

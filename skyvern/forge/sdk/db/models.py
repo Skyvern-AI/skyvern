@@ -3,6 +3,7 @@ import datetime
 import sqlalchemy
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -56,6 +57,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_block_id,
     generate_workflow_run_id,
     generate_workflow_script_id,
+    generate_workflow_template_id,
 )
 from skyvern.forge.sdk.schemas.task_v2 import ThoughtType
 
@@ -142,6 +144,7 @@ class StepModel(Base):
     cached_token_count = Column(Integer, default=0)
     step_cost = Column(Numeric, default=0)
     finished_at = Column(DateTime, nullable=True)
+    created_by = Column(String, nullable=True)
 
 
 class OrganizationModel(Base):
@@ -293,6 +296,28 @@ class WorkflowModel(Base):
     is_saved_task = Column(Boolean, default=False, nullable=False)
 
 
+class WorkflowTemplateModel(Base):
+    """
+    Tracks which workflows are marked as templates.
+    Keyed by workflow_permanent_id (not versioned workflow_id) because
+    template status is a property of the workflow identity, not a version.
+    """
+
+    __tablename__ = "workflow_templates"
+
+    workflow_template_id = Column(String, primary_key=True, default=generate_workflow_template_id)
+    workflow_permanent_id = Column(String, nullable=False, index=True)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class WorkflowRunModel(Base):
     __tablename__ = "workflow_runs"
     __table_args__ = (Index("idx_workflow_runs_org_created", "organization_id", "created_at"),)
@@ -317,7 +342,7 @@ class WorkflowRunModel(Base):
     browser_address = Column(String, nullable=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
-    depends_on_workflow_run_id = Column(String, nullable=True)
+    depends_on_workflow_run_id = Column(String, nullable=True, index=True)
     sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     debug_session_id: Column = Column(String, nullable=True)
@@ -713,6 +738,12 @@ class WorkflowRunBlockModel(Base):
     positive_descriptor = Column(String, nullable=True)
     negative_descriptor = Column(String, nullable=True)
 
+    # conditional block
+    executed_branch_id = Column(String, nullable=True)
+    executed_branch_expression = Column(String, nullable=True)
+    executed_branch_result = Column(Boolean, nullable=True)
+    executed_branch_next_block = Column(String, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
@@ -793,13 +824,28 @@ class ThoughtModel(Base):
 
 class PersistentBrowserSessionModel(Base):
     __tablename__ = "persistent_browser_sessions"
+    __table_args__ = (
+        Index(
+            "idx_persistent_browser_sessions_org_created_started_completed",
+            "organization_id",
+            "created_at",
+            "started_at",
+            "completed_at",
+        ),
+        Index(
+            "idx_persistent_browser_sessions_org_status_created",
+            "organization_id",
+            "status",
+            desc("created_at"),
+        ),
+    )
 
     persistent_browser_session_id = Column(String, primary_key=True, default=generate_persistent_browser_session_id)
     organization_id = Column(String, nullable=False, index=True)
     runnable_type = Column(String, nullable=True)
     runnable_id = Column(String, nullable=True, index=True)
     browser_id = Column(String, nullable=True)
-    browser_address = Column(String, nullable=True)
+    browser_address = Column(String, nullable=True, unique=True)
     status = Column(String, nullable=True, default="created")
     timeout_minutes = Column(Integer, nullable=True)
     ip_address = Column(String, nullable=True)
@@ -845,6 +891,12 @@ class TaskRunModel(Base):
     url = Column(String, nullable=True)
     url_hash = Column(String, nullable=True)
     cached = Column(Boolean, nullable=False, default=False)
+    # Compute cost tracking fields
+    instance_type = Column(String, nullable=True)
+    vcpu_millicores = Column(Integer, nullable=True)
+    memory_mb = Column(Integer, nullable=True)
+    duration_ms = Column(BigInteger, nullable=True)
+    compute_cost = Column(Numeric, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
@@ -879,6 +931,7 @@ class CredentialModel(Base):
     totp_identifier = Column(String, nullable=True, default=None)
     card_last4 = Column(String, nullable=True)
     card_brand = Column(String, nullable=True)
+    secret_label = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1022,6 +1075,7 @@ class ScriptBlockModel(Base):
     run_signature = Column(String, nullable=True)
     workflow_run_id = Column(String, nullable=True)
     workflow_run_block_id = Column(String, nullable=True)
+    input_fields = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

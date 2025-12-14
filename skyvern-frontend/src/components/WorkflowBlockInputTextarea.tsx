@@ -7,10 +7,18 @@ import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useEffect, useRef, useState } from "react";
 import { useDebouncedCallback } from "use-debounce";
 
+import { ImprovePrompt } from "./ImprovePrompt";
+
+interface AiImprove {
+  context?: Record<string, unknown>;
+  useCase: string;
+}
+
 type Props = Omit<
   React.ComponentProps<typeof AutoResizingTextarea>,
   "onChange"
 > & {
+  aiImprove?: AiImprove;
   canWriteTitle?: boolean;
   onChange: (value: string) => void;
   nodeId: string;
@@ -18,7 +26,13 @@ type Props = Omit<
 
 function WorkflowBlockInputTextarea(props: Props) {
   const { maybeAcceptTitle, maybeWriteTitle } = useWorkflowTitleStore();
-  const { nodeId, onChange, canWriteTitle = false, ...textAreaProps } = props;
+  const {
+    aiImprove,
+    nodeId,
+    onChange,
+    canWriteTitle = false,
+    ...textAreaProps
+  } = props;
   const [internalValue, setInternalValue] = useState(props.value ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [cursorPosition, setCursorPosition] = useState<{
@@ -71,6 +85,12 @@ function WorkflowBlockInputTextarea(props: Props) {
     }
   };
 
+  const handleOnChange = (value: string) => {
+    setInternalValue(value);
+    handleTextareaSelect();
+    doOnChange(value);
+  };
+
   return (
     <div className="relative">
       <AutoResizingTextarea
@@ -81,29 +101,42 @@ function WorkflowBlockInputTextarea(props: Props) {
           doOnChange.flush();
         }}
         onChange={(event) => {
-          setInternalValue(event.target.value);
-          handleTextareaSelect();
-          doOnChange(event.target.value);
+          handleOnChange(event.target.value);
         }}
         onClick={handleTextareaSelect}
         onKeyUp={handleTextareaSelect}
         onSelect={handleTextareaSelect}
-        className={cn("pr-9", props.className)}
+        className={cn(`${aiImprove ? "pr-12" : "pr-9"}`, props.className)}
       />
-      <div className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center">
-        <Popover>
-          <PopoverTrigger asChild>
-            <div className="rounded p-1 hover:bg-muted">
-              <PlusIcon className="size-4" />
-            </div>
-          </PopoverTrigger>
-          <PopoverContent className="w-[22rem]">
-            <WorkflowBlockParameterSelect
-              nodeId={nodeId}
-              onAdd={insertParameterAtCursor}
+
+      <div className="absolute right-1 top-0 flex size-9 items-center justify-end">
+        <div className="flex items-center justify-center gap-1">
+          {aiImprove && (
+            <ImprovePrompt
+              context={aiImprove.context}
+              isVisible={Boolean(internalValue.trim())}
+              size="small"
+              prompt={internalValue}
+              onImprove={(prompt) => handleOnChange(prompt)}
+              useCase={aiImprove.useCase}
             />
-          </PopoverContent>
-        </Popover>
+          )}
+          <div className="cursor-pointer">
+            <Popover>
+              <PopoverTrigger asChild>
+                <div className="rounded p-1 hover:bg-muted">
+                  <PlusIcon className="size-4" />
+                </div>
+              </PopoverTrigger>
+              <PopoverContent className="w-[22rem]">
+                <WorkflowBlockParameterSelect
+                  nodeId={nodeId}
+                  onAdd={insertParameterAtCursor}
+                />
+              </PopoverContent>
+            </Popover>
+          </div>
+        </div>
       </div>
     </div>
   );

@@ -54,6 +54,7 @@ function createTaskTemplateRequestObject(
     webhook_callback_url: task.request.webhook_callback_url,
     proxy_location: task.request.proxy_location,
     workflow_definition: {
+      version: 2,
       parameters: [
         {
           parameter_type: "workflow",

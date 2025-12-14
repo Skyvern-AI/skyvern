@@ -30,6 +30,7 @@ import {
 import { getInitialValues } from "@/routes/workflows/utils";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
 import {
@@ -63,6 +64,7 @@ interface Props {
   blockLabel: string; // today, this + wpid act as the identity of a block
   disabled?: boolean;
   editable: boolean;
+  extraActions?: React.ReactNode;
   nodeId: string;
   totpIdentifier: string | null;
   totpUrl: string | null;
@@ -155,6 +157,7 @@ function NodeHeader({
   blockLabel,
   disabled = false,
   editable,
+  extraActions,
   nodeId,
   totpIdentifier,
   totpUrl,
@@ -169,6 +172,7 @@ function NodeHeader({
   } = useParams();
   const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
+  const recordingStore = useRecordingStore();
   const { closeWorkflowPanel } = useWorkflowPanelStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -203,6 +207,8 @@ function NodeHeader({
 
   const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
+
+  const isRecording = recordingStore.isRecording;
 
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
@@ -559,6 +565,7 @@ function NodeHeader({
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
+          {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
               <button className="rounded p-1 hover:bg-red-500 hover:text-black disabled:opacity-50">
@@ -590,7 +597,8 @@ function NodeHeader({
                     "pointer-events-none fill-gray-500 text-gray-500":
                       workflowRunIsRunningOrQueued ||
                       !workflowPermanentId ||
-                      debugSession === undefined,
+                      debugSession === undefined ||
+                      isRecording,
                   })}
                   onClick={() => {
                     handleOnPlay();

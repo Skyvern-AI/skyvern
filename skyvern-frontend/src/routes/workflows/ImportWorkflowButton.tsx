@@ -35,9 +35,13 @@ function getErrorMessage(error: unknown, fallback: string): string {
 
 interface ImportWorkflowButtonProps {
   onImportStart?: () => void;
+  selectedFolderId?: string | null;
 }
 
-function ImportWorkflowButton({ onImportStart }: ImportWorkflowButtonProps) {
+function ImportWorkflowButton({
+  onImportStart,
+  selectedFolderId,
+}: ImportWorkflowButtonProps) {
   const inputId = useId();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -45,6 +49,10 @@ function ImportWorkflowButton({ onImportStart }: ImportWorkflowButtonProps) {
   const createWorkflowFromYamlMutation = async (yaml: string) => {
     try {
       const client = await getClient(credentialGetter);
+      const params: Record<string, string> = {};
+      if (selectedFolderId) {
+        params.folder_id = selectedFolderId;
+      }
       await client.post<string, { data: WorkflowApiResponse }>(
         "/workflows",
         yaml,
@@ -52,11 +60,15 @@ function ImportWorkflowButton({ onImportStart }: ImportWorkflowButtonProps) {
           headers: {
             "Content-Type": "text/plain",
           },
+          params,
         },
       );
 
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["folders"],
       });
       toast({
         variant: "success",
@@ -78,10 +90,15 @@ function ImportWorkflowButton({ onImportStart }: ImportWorkflowButtonProps) {
       formData.append("file", file);
 
       const client = await getClient(credentialGetter);
+      const params: Record<string, string> = {};
+      if (selectedFolderId) {
+        params.folder_id = selectedFolderId;
+      }
       await client.post("/workflows/import-pdf", formData, {
         headers: {
           "Content-Type": "multipart/form-data",
         },
+        params,
       });
 
       // Notify parent to start polling

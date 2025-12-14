@@ -7,6 +7,7 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { deepEqualStringArrays } from "@/util/equality";
 import { cn } from "@/util/utils";
 
@@ -17,6 +18,7 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
+  const recordingStore = useRecordingStore();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const thisBlockIsTargetted =
@@ -26,7 +28,11 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const update = useUpdate<CodeBlockNode["data"]>({ id, editable });
 
   return (
-    <div>
+    <div
+      className={cn({
+        "pointer-events-none opacity-50": recordingStore.isRecording,
+      })}
+    >
       <Handle
         type="source"
         position={Position.Bottom}

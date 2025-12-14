@@ -32,6 +32,11 @@ class NonEmptyPasswordCredential(UniversalBaseModel):
     Type of 2FA method used for this credential
     """
 
+    totp_identifier: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Identifier (email or phone number) used to fetch TOTP codes
+    """
+
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
     else:

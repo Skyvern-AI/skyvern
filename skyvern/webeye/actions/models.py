@@ -10,7 +10,7 @@ from skyvern.errors.errors import UserDefinedError
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.actions.responses import ActionResult
-from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 
 class DetailedAgentStepOutput(BaseModel):

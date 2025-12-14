@@ -18,11 +18,16 @@ from fastapi import (
 )
 from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse
+from pydantic import ValidationError
 
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
-from skyvern.exceptions import CannotUpdateWorkflowDueToCodeCache, MissingBrowserAddressError
+from skyvern.exceptions import (
+    CannotUpdateWorkflowDueToCodeCache,
+    MissingBrowserAddressError,
+    SkyvernHTTPException,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -164,17 +169,19 @@ async def run_task(
         data_extraction_schema = run_request.data_extraction_schema
         navigation_goal = run_request.prompt
         navigation_payload = None
-        task_generation = await task_v1_service.generate_task(
-            user_prompt=run_request.prompt,
-            organization=current_org,
-        )
-        url = url or task_generation.url
-        navigation_goal = task_generation.navigation_goal or run_request.prompt
-        if run_request.engine in CUA_ENGINES:
-            navigation_goal = run_request.prompt
-        navigation_payload = task_generation.navigation_payload
-        data_extraction_goal = task_generation.data_extraction_goal
-        data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
+        if not url:
+            task_generation = await task_v1_service.generate_task(
+                user_prompt=run_request.prompt,
+                organization=current_org,
+            )
+            # What if it's a SDK request with browser_session_id?
+            url = task_generation.url
+            navigation_goal = task_generation.navigation_goal or run_request.prompt
+            if run_request.engine in CUA_ENGINES:
+                navigation_goal = run_request.prompt
+            navigation_payload = task_generation.navigation_payload
+            data_extraction_goal = task_generation.data_extraction_goal
+            data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
 
         task_v1_request = TaskRequest(
             title=run_request.title,
@@ -484,6 +491,7 @@ async def cancel_run(
 )
 async def create_workflow_legacy(
     request: Request,
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create-legacy")
@@ -495,6 +503,9 @@ async def create_workflow_legacy(
 
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+        # Override folder_id if provided as query parameter
+        if folder_id is not None:
+            workflow_create_request.folder_id = folder_id
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org, request=workflow_create_request
         )
@@ -535,6 +546,7 @@ async def create_workflow_legacy(
 )
 async def create_workflow(
     data: WorkflowRequest,
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create")
@@ -549,6 +561,9 @@ async def create_workflow(
                 status_code=422,
                 detail="Invalid workflow definition. Workflow should be provided in either yaml or json format.",
             )
+        # Override folder_id if provided as query parameter
+        if folder_id is not None:
+            workflow_definition.folder_id = folder_id
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
@@ -669,6 +684,7 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
 async def import_workflow_from_pdf(
     background_tasks: BackgroundTasks,
     file: UploadFile = Depends(_validate_file_size),
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
@@ -702,6 +718,7 @@ async def import_workflow_from_pdf(
         workflow_definition={"parameters": [], "blocks": []},
         organization_id=current_org.organization_id,
         status=WorkflowStatus.importing,
+        folder_id=folder_id,
     )
 
     # Process PDF import in background (LLM call is the slow part)
@@ -814,6 +831,9 @@ async def update_workflow_legacy(
         ) from e
     except WorkflowParameterMissingRequiredValue as e:
         raise e
+    except (SkyvernHTTPException, ValidationError) as e:
+        # Bubble up well-formed client errors so they are not converted to 500s
+        raise e
     except Exception as e:
         LOG.exception(
             "Failed to update workflow",
@@ -885,6 +905,9 @@ async def update_workflow(
         raise HTTPException(status_code=422, detail="Invalid YAML")
     except WorkflowParameterMissingRequiredValue as e:
         raise e
+    except (SkyvernHTTPException, ValidationError) as e:
+        # Bubble up well-formed client errors so they are not converted to 500s
+        raise e
     except Exception as e:
         LOG.exception(
             "Failed to update workflow",
@@ -933,12 +956,13 @@ async def delete_workflow(
 
 
 ################# Folder Endpoints #################
-@legacy_base_router.post("/folders", response_model=Folder, tags=["agent"])
+@legacy_base_router.post("/folders", response_model=Folder, tags=["agent"], include_in_schema=False)
 @legacy_base_router.post("/folders/", response_model=Folder, include_in_schema=False)
 @base_router.post(
     "/folders",
     response_model=Folder,
     tags=["Workflows"],
+    include_in_schema=False,
     description="Create a new folder to organize workflows",
     summary="Create folder",
     responses={
@@ -972,12 +996,13 @@ async def create_folder(
     )
 
 
-@legacy_base_router.get("/folders/{folder_id}", response_model=Folder, tags=["agent"])
+@legacy_base_router.get("/folders/{folder_id}", response_model=Folder, tags=["agent"], include_in_schema=False)
 @legacy_base_router.get("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
 @base_router.get(
     "/folders/{folder_id}",
     response_model=Folder,
     tags=["Workflows"],
+    include_in_schema=False,
     description="Get a specific folder by ID",
     summary="Get folder",
     responses={
@@ -1013,12 +1038,13 @@ async def get_folder(
     )
 
 
-@legacy_base_router.get("/folders", response_model=list[Folder], tags=["agent"])
+@legacy_base_router.get("/folders", response_model=list[Folder], tags=["agent"], include_in_schema=False)
 @legacy_base_router.get("/folders/", response_model=list[Folder], include_in_schema=False)
 @base_router.get(
     "/folders",
     response_model=list[Folder],
     tags=["Workflows"],
+    include_in_schema=False,
     description="Get all folders for the organization",
     summary="Get folders",
     responses={
@@ -1067,12 +1093,13 @@ async def get_folders(
     return result
 
 
-@legacy_base_router.put("/folders/{folder_id}", response_model=Folder, tags=["agent"])
+@legacy_base_router.put("/folders/{folder_id}", response_model=Folder, tags=["agent"], include_in_schema=False)
 @legacy_base_router.put("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
 @base_router.put(
     "/folders/{folder_id}",
     response_model=Folder,
     tags=["Workflows"],
+    include_in_schema=False,
     description="Update a folder's title or description",
     summary="Update folder",
     responses={
@@ -1111,11 +1138,12 @@ async def update_folder(
     )
 
 
-@legacy_base_router.delete("/folders/{folder_id}", tags=["agent"])
+@legacy_base_router.delete("/folders/{folder_id}", tags=["agent"], include_in_schema=False)
 @legacy_base_router.delete("/folders/{folder_id}/", include_in_schema=False)
 @base_router.delete(
     "/folders/{folder_id}",
     tags=["Workflows"],
+    include_in_schema=False,
     description="Delete a folder. Optionally delete all workflows in the folder.",
     summary="Delete folder",
     responses={
@@ -1141,12 +1169,15 @@ async def delete_folder(
     return {"status": "deleted", "folder_id": folder_id, "workflows_deleted": delete_workflows}
 
 
-@legacy_base_router.put("/workflows/{workflow_permanent_id}/folder", response_model=Workflow, tags=["agent"])
+@legacy_base_router.put(
+    "/workflows/{workflow_permanent_id}/folder", response_model=Workflow, tags=["agent"], include_in_schema=False
+)
 @legacy_base_router.put("/workflows/{workflow_permanent_id}/folder/", response_model=Workflow, include_in_schema=False)
 @base_router.put(
     "/workflows/{workflow_permanent_id}/folder",
     response_model=Workflow,
     tags=["Workflows"],
+    include_in_schema=False,
     description="Update a workflow's folder assignment for the latest version",
     summary="Update workflow folder",
     responses={
@@ -1634,10 +1665,8 @@ async def cancel_task(
             detail=f"Task not found {task_id}",
         )
     task = await app.agent.update_task(task_obj, status=TaskStatus.canceled)
-    # get latest step
-    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
     # retry the webhook
-    await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=x_api_key)
+    await app.agent.execute_task_webhook(task=task, api_key=x_api_key)
 
 
 async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api_key: str | None = None) -> None:
@@ -1768,7 +1797,7 @@ async def retry_webhook(
         return await app.agent.build_task_response(task=task_obj)
 
     # retry the webhook
-    await app.agent.execute_task_webhook(task=task_obj, last_step=latest_step, api_key=x_api_key)
+    await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key)
 
     return await app.agent.build_task_response(task=task_obj, last_step=latest_step)
 
@@ -1847,6 +1876,10 @@ async def get_runs(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    search_key: str | None = Query(
+        None,
+        description="Search runs by parameter key, parameter description, or run parameter value.",
+    ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-get")
 
@@ -1854,7 +1887,9 @@ async def get_runs(
     if page > 10:
         return []
 
-    runs = await app.DATABASE.get_all_runs(current_org.organization_id, page=page, page_size=page_size, status=status)
+    runs = await app.DATABASE.get_all_runs(
+        current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
+    )
     return ORJSONResponse([run.model_dump() for run in runs])
 
 
@@ -2284,6 +2319,7 @@ async def get_workflows(
     page_size: int = Query(10, ge=1),
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
+    only_templates: bool = Query(False),
     search_key: str | None = Query(
         None,
         description="Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).",
@@ -2337,9 +2373,32 @@ async def get_workflows(
         page_size=page_size,
         only_saved_tasks=only_saved_tasks,
         only_workflows=only_workflows,
+        only_templates=only_templates,
         search_key=effective_search,
         folder_id=folder_id,
         statuses=effective_statuses,
+    )
+
+
+@base_router.put(
+    "/workflows/{workflow_permanent_id}/template",
+    tags=["Workflows"],
+)
+async def set_workflow_template_status(
+    workflow_permanent_id: str,
+    is_template: bool = Query(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict:
+    """
+    Set or unset a workflow as a template.
+
+    Template status is stored at the workflow_permanent_id level (not per-version),
+    meaning all versions of a workflow share the same template status.
+    """
+    return await app.WORKFLOW_SERVICE.set_template_status(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        is_template=is_template,
     )
 
 
@@ -2661,6 +2720,59 @@ async def get_task_v2(
     return task_v2.model_dump(by_alias=True)
 
 
+async def _flatten_workflow_run_timeline_recursive(
+    timeline: WorkflowRunTimeline,
+    organization_id: str,
+) -> list[WorkflowRunTimeline]:
+    """
+    Recursively flatten a timeline item and its children, handling TaskV2 blocks.
+
+    TaskV2 blocks are replaced with their internal workflow run blocks.
+    Other blocks (like ForLoop) are kept with their children recursively processed.
+    """
+    result = []
+
+    # Check if this is a TaskV2 block that needs to be flattened
+    if timeline.block and timeline.block.block_type == BlockType.TaskV2:
+        if timeline.block.block_workflow_run_id:
+            # Recursively flatten the TaskV2's internal workflow run
+            nested_timeline = await _flatten_workflow_run_timeline(
+                organization_id=organization_id,
+                workflow_run_id=timeline.block.block_workflow_run_id,
+            )
+            result.extend(nested_timeline)
+        else:
+            LOG.warning(
+                "Block workflow run id is not set for task_v2 block",
+                workflow_run_block_id=timeline.block.workflow_run_block_id if timeline.block else None,
+                organization_id=organization_id,
+            )
+            result.append(timeline)
+    else:
+        # For non-TaskV2 blocks, process children recursively to handle nested TaskV2 blocks
+        new_children = []
+        if timeline.children:
+            for child in timeline.children:
+                child_results = await _flatten_workflow_run_timeline_recursive(
+                    timeline=child,
+                    organization_id=organization_id,
+                )
+                new_children.extend(child_results)
+
+        # Create a new timeline with processed children
+        processed_timeline = WorkflowRunTimeline(
+            type=timeline.type,
+            block=timeline.block,
+            thought=timeline.thought,
+            children=new_children,
+            created_at=timeline.created_at,
+            modified_at=timeline.modified_at,
+        )
+        result.append(processed_timeline)
+
+    return result
+
+
 async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: str) -> list[WorkflowRunTimeline]:
     """
     Get the timeline workflow runs including the nested workflow runs in a flattened list
@@ -2676,29 +2788,18 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
-    # loop through the run block timeline, find the task_v2 blocks, flatten the timeline for task_v2
+
+    # Recursively flatten the timeline, handling TaskV2 blocks at any nesting level
     final_workflow_run_block_timeline = []
     for timeline in workflow_run_block_timeline:
         if not timeline.block:
             continue
-        if timeline.block.block_type != BlockType.TaskV2:
-            # flatten the timeline for task_v2
-            final_workflow_run_block_timeline.append(timeline)
-            continue
-        if not timeline.block.block_workflow_run_id:
-            LOG.warning(
-                "Block workflow run id is not set for task_v2 block",
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                task_v2_id=task_v2_obj.observer_cruise_id if task_v2_obj else None,
-            )
-            continue
-        # in the future if we want to nested taskv2 shows up as a nested block, we should not flatten the timeline
-        workflow_blocks = await _flatten_workflow_run_timeline(
+
+        flattened = await _flatten_workflow_run_timeline_recursive(
+            timeline=timeline,
             organization_id=organization_id,
-            workflow_run_id=timeline.block.block_workflow_run_id,
         )
-        final_workflow_run_block_timeline.extend(workflow_blocks)
+        final_workflow_run_block_timeline.extend(flattened)
 
     if task_v2_obj and task_v2_obj.observer_cruise_id:
         thought_timeline = await task_v2_service.get_thought_timelines(

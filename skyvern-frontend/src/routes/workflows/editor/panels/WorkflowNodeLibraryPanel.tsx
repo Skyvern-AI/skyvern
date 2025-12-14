@@ -11,6 +11,14 @@ import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { AddNodeProps } from "../Workspace";
 import { Input } from "@/components/ui/input";
+import { useNodes } from "@xyflow/react";
+import { AppNode } from "../nodes";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 const enableCodeBlock =
   import.meta.env.VITE_ENABLE_CODE_BLOCK?.toLowerCase() === "true";
@@ -134,6 +142,17 @@ const nodeLibraryItems: Array<{
     ),
     title: "Text Prompt Block",
     description: "Process text with LLM",
+  },
+  {
+    nodeType: "conditional",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Conditional}
+        className="size-6"
+      />
+    ),
+    title: "Conditional Block",
+    description: "Branch execution based on conditions",
   },
   {
     nodeType: "sendEmail",
@@ -268,6 +287,7 @@ function WorkflowNodeLibraryPanel({
   onNodeClick,
   first,
 }: Props) {
+  const nodes = useNodes() as Array<AppNode>;
   const workflowPanelData = useWorkflowPanelStore(
     (state) => state.workflowPanelState.data,
   );
@@ -279,6 +299,46 @@ function WorkflowNodeLibraryPanel({
   );
   const [search, setSearch] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Determine parent context to check if certain blocks should be disabled
+  const parentNode = workflowPanelData?.parent
+    ? nodes.find((n) => n.id === workflowPanelData.parent)
+    : null;
+  const parentType = parentNode?.type;
+
+  // Check if a node type should be disabled based on parent context
+  const isBlockDisabled = (
+    nodeType: NonNullable<WorkflowBlockNode["type"]>,
+  ): { disabled: boolean; reason: string } => {
+    // Disable conditional inside conditional
+    if (nodeType === "conditional" && parentType === "conditional") {
+      return {
+        disabled: true,
+        reason:
+          "We're working on supporting nested conditionals. Soon you'll be able to use this feature!",
+      };
+    }
+
+    // Disable conditional inside loop
+    if (nodeType === "conditional" && parentType === "loop") {
+      return {
+        disabled: true,
+        reason:
+          "We're working on supporting conditionals inside loops. Soon you'll be able to use this feature!",
+      };
+    }
+
+    // Disable loop inside conditional
+    if (nodeType === "loop" && parentType === "conditional") {
+      return {
+        disabled: true,
+        reason:
+          "We're working on supporting loops inside conditionals. Soon you'll be able to use this feature!",
+      };
+    }
+
+    return { disabled: false, reason: "" };
+  };
 
   useEffect(() => {
     // Focus the input when the panel becomes active
@@ -374,39 +434,64 @@ function WorkflowNodeLibraryPanel({
           <ScrollAreaViewport className="h-full">
             <div className="space-y-2">
               {filteredItems.length > 0 ? (
-                filteredItems.map((item) => (
-                  <div
-                    key={item.nodeType}
-                    className="flex cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
-                    onClick={() => {
-                      onNodeClick({
-                        nodeType: item.nodeType,
-                        next: workflowPanelData?.next ?? null,
-                        parent: workflowPanelData?.parent,
-                        previous: workflowPanelData?.previous ?? null,
-                        connectingEdgeType:
-                          workflowPanelData?.connectingEdgeType ??
-                          "edgeWithAddButton",
-                      });
-                      closeWorkflowPanel();
-                    }}
-                  >
-                    <div className="flex gap-2">
-                      <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
-                        {item.icon}
+                filteredItems.map((item) => {
+                  const { disabled, reason } = isBlockDisabled(item.nodeType);
+                  const itemContent = (
+                    <div
+                      key={item.nodeType}
+                      className={`flex items-center justify-between rounded-sm bg-slate-elevation4 p-4 ${
+                        disabled
+                          ? "cursor-not-allowed opacity-50"
+                          : "cursor-pointer hover:bg-slate-elevation5"
+                      }`}
+                      onClick={() => {
+                        if (disabled) return;
+                        onNodeClick({
+                          nodeType: item.nodeType,
+                          next: workflowPanelData?.next ?? null,
+                          parent: workflowPanelData?.parent,
+                          previous: workflowPanelData?.previous ?? null,
+                          connectingEdgeType:
+                            workflowPanelData?.connectingEdgeType ??
+                            "edgeWithAddButton",
+                          branch: workflowPanelData?.branchContext,
+                        });
+                        closeWorkflowPanel();
+                      }}
+                    >
+                      <div className="flex gap-2">
+                        <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
+                          {item.icon}
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <span className="max-w-64 truncate text-base">
+                            {item.title}
+                          </span>
+                          <span className="text-xs text-slate-400">
+                            {item.description}
+                          </span>
+                        </div>
                       </div>
-                      <div className="flex flex-col gap-1">
-                        <span className="max-w-64 truncate text-base">
-                          {item.title}
-                        </span>
-                        <span className="text-xs text-slate-400">
-                          {item.description}
-                        </span>
-                      </div>
+                      <PlusIcon className="size-6 shrink-0" />
                     </div>
-                    <PlusIcon className="size-6 shrink-0" />
-                  </div>
-                ))
+                  );
+
+                  // Wrap with tooltip if disabled
+                  if (disabled) {
+                    return (
+                      <TooltipProvider key={item.nodeType}>
+                        <Tooltip>
+                          <TooltipTrigger asChild>{itemContent}</TooltipTrigger>
+                          <TooltipContent side="right">
+                            <p className="max-w-xs">{reason}</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    );
+                  }
+
+                  return itemContent;
+                })
               ) : (
                 <div className="p-4 text-center text-sm text-slate-400">
                   No results found

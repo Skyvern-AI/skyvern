@@ -146,6 +146,94 @@ class ProxyLocation(StrEnum):
         return mapping.get(proxy_location, "US")
 
 
+# Supported countries for GeoTarget - must match Massive's coverage
+SUPPORTED_GEO_COUNTRIES = frozenset(
+    {
+        "US",
+        "AR",
+        "AU",
+        "BR",
+        "CA",
+        "DE",
+        "ES",
+        "FR",
+        "GB",
+        "IE",
+        "IN",
+        "IT",
+        "JP",
+        "MX",
+        "NL",
+        "NZ",
+        "TR",
+        "ZA",
+    }
+)
+
+
+class GeoTarget(BaseModel):
+    """
+    Granular geographic targeting for proxy selection.
+
+    Supports country, subdivision (state/region), and city level targeting.
+    Uses ISO 3166-1 alpha-2 for countries, ISO 3166-2 for subdivisions,
+    and GeoNames English names for cities.
+
+    Examples:
+        - {"country": "US"} - United States (same as RESIDENTIAL)
+        - {"country": "US", "subdivision": "CA"} - California, US
+        - {"country": "US", "subdivision": "NY", "city": "New York"} - New York City
+        - {"country": "GB", "city": "London"} - London, UK
+    """
+
+    country: str = Field(
+        description="ISO 3166-1 alpha-2 country code (e.g., 'US', 'GB', 'DE')",
+        examples=["US", "GB", "DE", "FR"],
+        min_length=2,
+        max_length=2,
+    )
+    subdivision: str | None = Field(
+        default=None,
+        description="ISO 3166-2 subdivision code without country prefix (e.g., 'CA' for California, 'NY' for New York)",
+        examples=["CA", "NY", "TX", "ENG"],
+        max_length=10,
+    )
+    city: str | None = Field(
+        default=None,
+        description="City name in English from GeoNames (e.g., 'New York', 'Los Angeles', 'London')",
+        examples=["New York", "Los Angeles", "London", "Berlin"],
+        max_length=100,
+    )
+
+    @field_validator("country")
+    @classmethod
+    def validate_country(cls, v: str) -> str:
+        """Validate country is in supported list and normalize to uppercase."""
+        v = v.upper()
+        if v not in SUPPORTED_GEO_COUNTRIES:
+            raise ValueError(
+                f"Country '{v}' is not supported for geo targeting. "
+                f"Supported countries: {sorted(SUPPORTED_GEO_COUNTRIES)}"
+            )
+        return v
+
+    @field_validator("subdivision")
+    @classmethod
+    def validate_subdivision(cls, v: str | None) -> str | None:
+        """Normalize subdivision code to uppercase and strip country prefix if present."""
+        if v is None:
+            return v
+        v = v.upper()
+        # Strip country prefix if accidentally included (e.g., "US-CA" -> "CA")
+        if "-" in v:
+            v = v.split("-", 1)[1]
+        return v
+
+
+# Type alias for proxy location that accepts either legacy enum or new GeoTarget
+ProxyLocationInput = ProxyLocation | GeoTarget | dict | None
+
+
 def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
     if proxy_location == ProxyLocation.NONE:
         return None
@@ -277,9 +365,10 @@ class TaskRunRequest(BaseModel):
     title: str | None = Field(
         default=None, description="The title for the task", examples=["The title of my first skyvern task"]
     )
-    proxy_location: ProxyLocation | None = Field(
+    proxy_location: ProxyLocation | GeoTarget | dict | None = Field(
         default=ProxyLocation.RESIDENTIAL,
-        description=PROXY_LOCATION_DOC_STRING,
+        description=PROXY_LOCATION_DOC_STRING + " Can also be a GeoTarget object for granular city/state targeting: "
+        '{"country": "US", "subdivision": "CA", "city": "San Francisco"}',
     )
     data_extraction_schema: dict | list | str | None = Field(
         default=None,
@@ -353,8 +442,8 @@ class TaskRunRequest(BaseModel):
         Returns:
             The validated URL or None if no URL was provided
         """
-        if url is None:
-            return None
+        if not url:
+            return url
 
         return validate_url(url)
 
@@ -365,9 +454,10 @@ class WorkflowRunRequest(BaseModel):
     )
     parameters: dict[str, Any] | None = Field(default=None, description="Parameters to pass to the workflow")
     title: str | None = Field(default=None, description="The title for this workflow run")
-    proxy_location: ProxyLocation | None = Field(
+    proxy_location: ProxyLocation | GeoTarget | dict | None = Field(
         default=ProxyLocation.RESIDENTIAL,
-        description=PROXY_LOCATION_DOC_STRING,
+        description=PROXY_LOCATION_DOC_STRING + " Can also be a GeoTarget object for granular city/state targeting: "
+        '{"country": "US", "subdivision": "CA", "city": "San Francisco"}',
     )
     webhook_url: str | None = Field(
         default=None,
@@ -416,8 +506,8 @@ class WorkflowRunRequest(BaseModel):
     @field_validator("webhook_url", "totp_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
-        if url is None:
-            return None
+        if not url:
+            return url
         return validate_url(url)
 
     @model_validator(mode="after")

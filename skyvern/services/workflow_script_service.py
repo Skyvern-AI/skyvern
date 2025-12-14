@@ -8,8 +8,10 @@ from skyvern.core.script_generations.generate_script import ScriptBlockSource, g
 from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.workflow.models.block import get_all_blocks
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
 from skyvern.schemas.scripts import FileEncoding, Script, ScriptFileCreate, ScriptStatus
+from skyvern.schemas.workflows import BlockType
 from skyvern.services import script_service
 
 LOG = structlog.get_logger()
@@ -76,22 +78,21 @@ async def get_workflow_script(
             return None, rendered_cache_key_value
 
         # Check if there are existing cached scripts for this workflow + cache_key_value
-        existing_scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
+        existing_script = await app.DATABASE.get_workflow_script_by_cache_key_value(
             organization_id=workflow.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=rendered_cache_key_value,
             statuses=[status],
         )
 
-        if existing_scripts:
+        if existing_script:
             LOG.info(
                 "Found cached script for workflow",
                 workflow_id=workflow.workflow_id,
                 cache_key_value=rendered_cache_key_value,
                 workflow_run_id=workflow_run.workflow_run_id,
-                script_count=len(existing_scripts),
             )
-            return existing_scripts[0], rendered_cache_key_value
+            return existing_script, rendered_cache_key_value
 
         return None, rendered_cache_key_value
 
@@ -163,6 +164,27 @@ async def generate_workflow_script(
     cached_script: Script | None = None,
     updated_block_labels: set[str] | None = None,
 ) -> None:
+    # Disable script generation for workflows containing conditional blocks to avoid caching divergent paths.
+    try:
+        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+        has_conditional = any(block.block_type == BlockType.CONDITIONAL for block in all_blocks)
+    except Exception:
+        has_conditional = False
+        LOG.warning(
+            "Failed to inspect workflow blocks for conditional types; continuing with script generation",
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            exc_info=True,
+        )
+
+    if has_conditional:
+        LOG.info(
+            "Skipping script generation for workflow containing conditional blocks",
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+        )
+        return
+
     try:
         LOG.info(
             "Generating script for workflow",

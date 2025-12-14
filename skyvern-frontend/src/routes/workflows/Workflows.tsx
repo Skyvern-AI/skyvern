@@ -1,6 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   Pagination,
   PaginationContent,
@@ -27,22 +26,31 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
+  BookmarkFilledIcon,
+  ChevronDownIcon,
   DotsHorizontalIcon,
   FileIcon,
   LightningBoltIcon,
-  MagnifyingGlassIcon,
   MixerHorizontalIcon,
+  Pencil2Icon,
   PlayIcon,
   PlusIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { NarrativeCard } from "./components/header/NarrativeCard";
 import { FolderCard } from "./components/FolderCard";
 import { CreateFolderDialog } from "./components/CreateFolderDialog";
+import { CreateFromTemplateDialog } from "./components/CreateFromTemplateDialog";
 import { ViewAllFoldersDialog } from "./components/ViewAllFoldersDialog";
 import { WorkflowFolderSelector } from "./components/WorkflowFolderSelector";
 import { HighlightText } from "./components/HighlightText";
@@ -50,11 +58,16 @@ import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
-import { Parameter, WorkflowApiResponse } from "./types/workflowTypes";
+import { convert } from "./editor/workflowEditorUtils";
+import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowActions } from "./WorkflowActions";
 import { WorkflowTemplates } from "../discover/WorkflowTemplates";
 import { Skeleton } from "@/components/ui/skeleton";
+import { TableSearchInput } from "@/components/TableSearchInput";
+import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
+import { useKeywordSearch } from "./hooks/useKeywordSearch";
+import { useParameterExpansion } from "./hooks/useParameterExpansion";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -62,6 +75,7 @@ const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   ai_fallback: true,
   run_with: "agent",
   workflow_definition: {
+    version: 2,
     blocks: [],
     parameters: [],
   },
@@ -84,10 +98,8 @@ function Workflows() {
   const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
   const [isViewAllFoldersOpen, setIsViewAllFoldersOpen] = useState(false);
 
-  // Parameter expansion state
-  const [manuallyExpandedRows, setManuallyExpandedRows] = useState<Set<string>>(
-    new Set(),
-  );
+  // Template dialog state
+  const [isTemplateDialogOpen, setIsTemplateDialogOpen] = useState(false);
 
   // Poll for active imports
   const { activeImports, startPolling } = useActiveImportsPolling();
@@ -175,59 +187,36 @@ function Workflows() {
   const isNextDisabled =
     isFetching || !nextPageWorkflows || nextPageWorkflows.length === 0;
 
-  // Check if a specific parameter matches the search
-  const parameterMatchesSearch = useCallback(
-    (param: Parameter): boolean => {
-      if (!debouncedSearch.trim()) return false;
-      const lowerQuery = debouncedSearch.toLowerCase();
+  const { matchesParameter, isSearchActive } =
+    useKeywordSearch(debouncedSearch);
+  const {
+    expandedRows,
+    toggleExpanded: toggleParametersExpanded,
+    setAutoExpandedRows,
+  } = useParameterExpansion();
 
-      const keyMatch = param.key?.toLowerCase().includes(lowerQuery) ?? false;
-      const descMatch =
-        param.description?.toLowerCase().includes(lowerQuery) ?? false;
-      const valueMatch = Boolean(
-        param.parameter_type === "workflow" &&
-          param.default_value &&
-          String(param.default_value).toLowerCase().includes(lowerQuery),
-      );
-
-      return keyMatch || descMatch || valueMatch;
-    },
-    [debouncedSearch],
-  );
-
-  // Auto-expand rows when parameters match search
-  const autoExpandedRows = useMemo(() => {
-    if (!debouncedSearch.trim()) return new Set<string>();
-
-    const expanded = new Set<string>();
-
-    workflows.forEach((workflow) => {
-      const hasParameterMatch = workflow.workflow_definition.parameters?.some(
-        (param) => parameterMatchesSearch(param),
-      );
-
-      if (hasParameterMatch) {
-        expanded.add(workflow.workflow_permanent_id);
-      }
-    });
-
-    return expanded;
-  }, [workflows, debouncedSearch, parameterMatchesSearch]);
-
-  // Combine manual and auto-expanded rows
-  const expandedRows = useMemo(() => {
-    return new Set([...manuallyExpandedRows, ...autoExpandedRows]);
-  }, [manuallyExpandedRows, autoExpandedRows]);
-
-  const toggleParametersExpanded = (workflowId: string) => {
-    const newExpanded = new Set(manuallyExpandedRows);
-    if (newExpanded.has(workflowId)) {
-      newExpanded.delete(workflowId);
-    } else {
-      newExpanded.add(workflowId);
+  useEffect(() => {
+    if (!isSearchActive) {
+      setAutoExpandedRows([]);
+      return;
     }
-    setManuallyExpandedRows(newExpanded);
-  };
+
+    const matchingWorkflows = workflows.filter((workflow) =>
+      workflow.workflow_definition.parameters?.some((param) => {
+        const value =
+          param.parameter_type === "workflow" ? param.default_value : undefined;
+        return matchesParameter({
+          key: param.key,
+          value,
+          description: param.description ?? null,
+        });
+      }),
+    );
+
+    setAutoExpandedRows(
+      matchingWorkflows.map((workflow) => workflow.workflow_permanent_id),
+    );
+  }, [isSearchActive, workflows, matchesParameter, setAutoExpandedRows]);
 
   function handleRowClick(
     event: React.MouseEvent<HTMLTableCellElement>,
@@ -400,35 +389,52 @@ function Workflows() {
           )}
         </header>
         <div className="flex justify-between">
-          <div className="relative">
-            <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
-              <MagnifyingGlassIcon className="size-6" />
-            </div>
-            <Input
-              value={search}
-              onChange={(event) => {
-                setSearch(event.target.value);
-                setParamPatch({ page: "1" });
-              }}
-              placeholder="Search by title or parameter..."
-              className="w-48 pl-9 lg:w-72"
-            />
-          </div>
+          <TableSearchInput
+            value={search}
+            onChange={(value) => {
+              setSearch(value);
+              setParamPatch({ page: "1" });
+            }}
+            placeholder="Search by title or parameter..."
+            className="w-48 lg:w-72"
+          />
           <div className="flex gap-4">
-            <ImportWorkflowButton onImportStart={startPolling} />
-            <Button
-              disabled={createWorkflowMutation.isPending}
-              onClick={() => {
-                createWorkflowMutation.mutate(emptyWorkflowRequest);
-              }}
-            >
-              {createWorkflowMutation.isPending ? (
-                <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <PlusIcon className="mr-2 h-4 w-4" />
-              )}
-              Create
-            </Button>
+            <ImportWorkflowButton
+              onImportStart={startPolling}
+              selectedFolderId={selectedFolderId}
+            />
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button disabled={createWorkflowMutation.isPending}>
+                  {createWorkflowMutation.isPending ? (
+                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <PlusIcon className="mr-2 h-4 w-4" />
+                  )}
+                  Create
+                  <ChevronDownIcon className="ml-2 h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  onSelect={() => {
+                    createWorkflowMutation.mutate({
+                      ...emptyWorkflowRequest,
+                      folder_id: selectedFolderId,
+                    });
+                  }}
+                >
+                  <PlusIcon className="mr-2 h-4 w-4" />
+                  Blank Workflow
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => setIsTemplateDialogOpen(true)}
+                >
+                  <BookmarkFilledIcon className="mr-2 h-4 w-4" />
+                  From Template
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
         <div className="rounded-lg border">
@@ -481,10 +487,17 @@ function Workflows() {
                 </TableRow>
               ) : (
                 displayWorkflows?.map((workflow) => {
-                  const hasParameters =
-                    workflow.workflow_definition.parameters.filter(
-                      (p) => p.parameter_type !== "output",
-                    ).length > 0;
+                  const parameterItems = workflow.workflow_definition.parameters
+                    .filter((p) => p.parameter_type !== "output")
+                    .map((param) => ({
+                      key: param.key,
+                      value:
+                        param.parameter_type === "workflow"
+                          ? param.default_value ?? ""
+                          : "",
+                      description: param.description ?? null,
+                    }));
+                  const hasParameters = parameterItems.length > 0;
                   const isExpanded = expandedRows.has(
                     workflow.workflow_permanent_id,
                   );
@@ -548,10 +561,22 @@ function Workflows() {
                               );
                             }}
                           >
-                            <HighlightText
-                              text={workflow.title}
-                              query={debouncedSearch}
-                            />
+                            <div className="flex items-center gap-2">
+                              <HighlightText
+                                text={workflow.title}
+                                query={debouncedSearch}
+                              />
+                              {workflow.is_template && (
+                                <TooltipProvider>
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <BookmarkFilledIcon className="h-3.5 w-3.5 shrink-0 text-blue-500" />
+                                    </TooltipTrigger>
+                                    <TooltipContent>Template</TooltipContent>
+                                  </Tooltip>
+                                </TooltipProvider>
+                              )}
+                            </div>
                           </TableCell>
                           <TableCell
                             onClick={(event) => {
@@ -591,12 +616,23 @@ function Workflows() {
                           </TableCell>
                           <TableCell>
                             <div className="flex justify-end gap-2">
-                              <WorkflowFolderSelector
-                                workflowPermanentId={
-                                  workflow.workflow_permanent_id
-                                }
-                                currentFolderId={workflow.folder_id}
-                              />
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <div>
+                                      <WorkflowFolderSelector
+                                        workflowPermanentId={
+                                          workflow.workflow_permanent_id
+                                        }
+                                        currentFolderId={workflow.folder_id}
+                                      />
+                                    </div>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    Assign to Folder
+                                  </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
                               <TooltipProvider>
                                 <Tooltip>
                                   <TooltipTrigger asChild>
@@ -622,6 +658,27 @@ function Workflows() {
                                         ? "Hide Parameters"
                                         : "Show Parameters"
                                       : "No Parameters"}
+                                  </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      size="icon"
+                                      variant="outline"
+                                      onClick={(event) => {
+                                        handleIconClick(
+                                          event,
+                                          `/workflows/${workflow.workflow_permanent_id}/debug`,
+                                        );
+                                      }}
+                                    >
+                                      <Pencil2Icon className="h-4 w-4" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    Open in Editor
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
@@ -661,63 +718,11 @@ function Workflows() {
                             colSpan={5}
                             className="bg-slate-50 dark:bg-slate-900/50"
                           >
-                            <div className="ml-8 space-y-2 py-4">
-                              <div className="mb-3 text-sm font-medium">
-                                Parameters
-                              </div>
-                              <div className="space-y-2">
-                                {workflow.workflow_definition.parameters
-                                  .filter((p) => p.parameter_type !== "output")
-                                  .map((param, idx) => {
-                                    const matchesParam =
-                                      parameterMatchesSearch(param);
-
-                                    return (
-                                      <div
-                                        key={idx}
-                                        className={cn(
-                                          "grid grid-cols-[140px_1fr_2fr] gap-4 rounded border bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900",
-                                          matchesParam &&
-                                            "shadow-[0_0_15px_rgba(59,130,246,0.3)] ring-2 ring-blue-500/50",
-                                        )}
-                                      >
-                                        <div className="font-medium text-blue-600 dark:text-blue-400">
-                                          <HighlightText
-                                            text={param.key}
-                                            query={debouncedSearch}
-                                          />
-                                        </div>
-                                        <div className="truncate">
-                                          {param.parameter_type ===
-                                            "workflow" &&
-                                          param.default_value ? (
-                                            <HighlightText
-                                              text={String(param.default_value)}
-                                              query={debouncedSearch}
-                                            />
-                                          ) : (
-                                            <span className="text-slate-400">
-                                              -
-                                            </span>
-                                          )}
-                                        </div>
-                                        <div className="text-slate-500">
-                                          {param.description ? (
-                                            <HighlightText
-                                              text={param.description}
-                                              query={debouncedSearch}
-                                            />
-                                          ) : (
-                                            <span className="text-slate-400">
-                                              No description
-                                            </span>
-                                          )}
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
-                              </div>
-                            </div>
+                            <ParameterDisplayInline
+                              parameters={parameterItems}
+                              searchQuery={debouncedSearch}
+                              keywordMatchesParameter={matchesParameter}
+                            />
                           </TableCell>
                         </TableRow>
                       )}
@@ -783,6 +788,22 @@ function Workflows() {
           onOpenChange={setIsViewAllFoldersOpen}
           selectedFolderId={selectedFolderId}
           onFolderSelect={setSelectedFolderId}
+        />
+
+        {/* Template Dialog */}
+        <CreateFromTemplateDialog
+          open={isTemplateDialogOpen}
+          onOpenChange={setIsTemplateDialogOpen}
+          onSelectTemplate={(template) => {
+            const clonedWorkflow = convert({
+              ...template,
+              title: `${template.title} (copy)`,
+            });
+            createWorkflowMutation.mutate({
+              ...clonedWorkflow,
+              folder_id: selectedFolderId,
+            });
+          }}
         />
 
         <WorkflowTemplates />

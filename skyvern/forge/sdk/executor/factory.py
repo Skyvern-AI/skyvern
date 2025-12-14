@@ -1,4 +1,5 @@
-from skyvern.forge.sdk.executor.async_executor import AsyncExecutor, BackgroundTaskExecutor
+from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
+from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 
 
 class AsyncExecutorFactory:

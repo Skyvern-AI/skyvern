@@ -144,7 +144,10 @@ function WorkflowRunTimelineBlockItem({
             <div className="flex flex-col items-end gap-[1px]">
               <div className="flex gap-1 self-start rounded bg-slate-elevation5 px-2 py-1">
                 {showDiagnosticLink ? (
-                  <Link to={`/tasks/${block.task_id}/diagnostics`}>
+                  <Link
+                    to={`/tasks/${block.task_id}/diagnostics`}
+                    onClick={(event) => event.stopPropagation()}
+                  >
                     <div className="flex gap-1">
                       <ExternalLinkIcon className="size-4" />
                       <span className="text-xs">Diagnostics</span>
@@ -168,6 +171,33 @@ function WorkflowRunTimelineBlockItem({
         {block.description ? (
           <div className="text-xs text-slate-400">{block.description}</div>
         ) : null}
+        {block.block_type === "conditional" && block.executed_branch_id && (
+          <div className="space-y-1 rounded bg-slate-elevation5 px-3 py-2 text-xs">
+            {block.executed_branch_expression !== null &&
+            block.executed_branch_expression !== undefined ? (
+              <div className="text-slate-300">
+                Condition{" "}
+                <code className="rounded bg-slate-elevation3 px-1.5 py-0.5 font-mono text-slate-200">
+                  {block.executed_branch_expression}
+                </code>{" "}
+                evaluated to{" "}
+                <span className="font-medium text-success">True</span>
+              </div>
+            ) : (
+              <div className="text-slate-300">
+                No conditions matched, executing default branch
+              </div>
+            )}
+            {block.executed_branch_next_block && (
+              <div className="text-slate-400">
+                → Executing next block:{" "}
+                <span className="font-medium text-slate-300">
+                  {block.executed_branch_next_block}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {block.block_type === "human_interaction" && (

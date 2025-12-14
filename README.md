@@ -332,6 +332,7 @@ Examples include:
 ### Password Manager Integrations
 Skyvern currently supports the following password manager integrations:
 - [x] Bitwarden
+- [x] Custom Credential Service (HTTP API)
 - [ ] 1Password
 - [ ] LastPass
 

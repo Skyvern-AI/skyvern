@@ -11,6 +11,7 @@ import { useOnChange } from "@/hooks/useOnChange";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
@@ -33,6 +34,7 @@ import {
   EdgeChange,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { nanoid } from "nanoid";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useBlocker } from "react-router-dom";
 import {
@@ -76,14 +78,17 @@ import {
 import "./reactFlowOverrideStyles.css";
 import {
   convertEchoParameters,
+  convertToNode,
   createNode,
   descendants,
+  generateNodeLabel,
   getAdditionalParametersForEmailBlock,
   getOrderedChildrenBlocks,
   getOutputParameterKey,
   getWorkflowBlocks,
   getWorkflowSettings,
   layout,
+  upgradeWorkflowDefinitionToVersionTwo,
 } from "./workflowEditorUtils";
 import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
@@ -116,6 +121,26 @@ function convertToParametersYAML(
         | CredentialParameterYAML
         | undefined => {
         if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
+          // Convert boolean default values to strings for backend
+          let defaultValue = parameter.defaultValue;
+          if (
+            parameter.dataType === "boolean" &&
+            typeof parameter.defaultValue === "boolean"
+          ) {
+            defaultValue = String(parameter.defaultValue);
+          }
+          if (
+            (parameter.dataType === "integer" ||
+              parameter.dataType === "float") &&
+            (typeof parameter.defaultValue === "number" ||
+              typeof parameter.defaultValue === "string")
+          ) {
+            defaultValue =
+              parameter.defaultValue === null
+                ? parameter.defaultValue
+                : String(parameter.defaultValue);
+          }
+
           return {
             parameter_type: WorkflowParameterTypes.Workflow,
             key: parameter.key,
@@ -123,7 +148,7 @@ function convertToParametersYAML(
             workflow_parameter_type: parameter.dataType,
             ...(parameter.defaultValue === null
               ? {}
-              : { default_value: parameter.defaultValue }),
+              : { default_value: defaultValue }),
           };
         } else if (
           parameter.parameterType === WorkflowEditorParameterTypes.Context
@@ -284,9 +309,14 @@ function FlowRenderer({
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
   const flowIsConstrained = debugStore.isDebugMode;
 
+  // Track if this is the initial load to prevent false "unsaved changes" detection
+  const isInitialLoadRef = useRef(true);
+
   useEffect(() => {
     if (nodesInitialized) {
       setShouldConstrainPan(true);
+      // Mark initial load as complete after nodes are initialized
+      isInitialLoadRef.current = false;
     }
   }, [nodesInitialized]);
 
@@ -298,6 +328,16 @@ function FlowRenderer({
   const setGetSaveDataRef = useRef(workflowChangesStore.setGetSaveData);
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
   const saveWorkflow = useWorkflowSave({ status: "published" });
+  const recordedBlocks = useRecordedBlocksStore((state) => state.blocks);
+  const recordedParameters = useRecordedBlocksStore(
+    (state) => state.parameters,
+  );
+  const recordedInsertionPoint = useRecordedBlocksStore(
+    (state) => state.insertionPoint,
+  );
+  const clearRecordedBlocks = useRecordedBlocksStore(
+    (state) => state.clearRecordedBlocks,
+  );
   useShouldNotifyWhenClosingTab(workflowChangesStore.hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
     return (
@@ -340,6 +380,11 @@ function FlowRenderer({
 
   const constructSaveData = useCallback((): WorkflowSaveData => {
     const blocks = getWorkflowBlocks(nodes, edges);
+    const { blocks: upgradedBlocks, version: workflowDefinitionVersion } =
+      upgradeWorkflowDefinitionToVersionTwo(
+        blocks,
+        workflow.workflow_definition.version,
+      );
     const settings = getWorkflowSettings(nodes);
     const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
     const filteredParameters = workflow.workflow_definition.parameters.filter(
@@ -357,7 +402,7 @@ function FlowRenderer({
 
     // if there is an email node, we need to add the email aws secret parameters
     const emailAwsSecretParameters = getAdditionalParametersForEmailBlock(
-      blocks,
+      upgradedBlocks,
       overallParameters,
     );
 
@@ -367,7 +412,8 @@ function FlowRenderer({
         ...parametersInYAMLConvertibleJSON,
         ...emailAwsSecretParameters,
       ],
-      blocks,
+      blocks: upgradedBlocks,
+      workflowDefinitionVersion,
       title,
       settings,
       workflow,
@@ -545,6 +591,110 @@ function FlowRenderer({
     doLayout(nodes, edges);
   }
 
+  // effect to add new blocks that were generated from a browser recording,
+  // along with any new parameters
+  useEffect(() => {
+    if (!recordedBlocks || !recordedInsertionPoint) {
+      return;
+    }
+
+    const { previous, next, parent, connectingEdgeType } =
+      recordedInsertionPoint;
+
+    const newNodes: Array<AppNode> = [];
+    const newEdges: Array<Edge> = [];
+
+    let existingLabels = nodes
+      .filter(isWorkflowBlockNode)
+      .map((node) => node.data.label);
+
+    let prevNodeId = previous;
+
+    // convert each WorkflowBlock to an AppNode
+    recordedBlocks.forEach((block, index) => {
+      const id = nanoid();
+      const label = generateNodeLabel(existingLabels);
+      existingLabels = [...existingLabels, label];
+      const blockWithLabel = { ...block, label: block.label || label };
+
+      const node = convertToNode(
+        { id, parentId: parent },
+        blockWithLabel,
+        true,
+      );
+      newNodes.push(node);
+
+      // create edge from previous node to this one
+      if (prevNodeId) {
+        newEdges.push({
+          id: nanoid(),
+          type: "edgeWithAddButton",
+          source: prevNodeId,
+          target: id,
+          style: { strokeWidth: 2 },
+        });
+      }
+
+      // if this is the last block, connect to next
+      if (index === recordedBlocks.length - 1 && next) {
+        newEdges.push({
+          id: nanoid(),
+          type: connectingEdgeType,
+          source: id,
+          target: next,
+          style: { strokeWidth: 2 },
+        });
+      }
+
+      prevNodeId = id;
+    });
+
+    const editedEdges = previous
+      ? edges.filter((edge) => edge.source !== previous)
+      : edges;
+
+    const previousNode = nodes.find((node) => node.id === previous);
+    const previousNodeIndex = previousNode
+      ? nodes.indexOf(previousNode)
+      : nodes.length - 1;
+
+    const newNodesAfter = [
+      ...nodes.slice(0, previousNodeIndex + 1),
+      ...newNodes,
+      ...nodes.slice(previousNodeIndex + 1),
+    ];
+
+    workflowChangesStore.setHasChanges(true);
+    doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
+
+    const newParameters = Array<ParametersState[number]>();
+
+    for (const newParameter of recordedParameters ?? []) {
+      const exists = parameters.some((param) => param.key === newParameter.key);
+
+      if (!exists) {
+        newParameters.push({
+          key: newParameter.key,
+          parameterType: "workflow",
+          dataType: newParameter.workflow_parameter_type,
+          description: newParameter.description ?? null,
+          defaultValue: newParameter.default_value ?? "",
+        });
+      }
+    }
+
+    if (newParameters.length > 0) {
+      const workflowParametersStore = useWorkflowParametersStore.getState();
+      workflowParametersStore.setParameters([
+        ...workflowParametersStore.parameters,
+        ...newParameters,
+      ]);
+    }
+
+    clearRecordedBlocks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordedBlocks, recordedInsertionPoint]);
+
   const editorElementRef = useRef<HTMLDivElement>(null);
 
   useAutoPan(editorElementRef, nodes);
@@ -705,7 +855,10 @@ function FlowRenderer({
             if (dimensionChanges.length > 0) {
               doLayout(tempNodes, edges);
             }
+
+            // Only track changes after initial load is complete
             if (
+              !isInitialLoadRef.current &&
               changes.some((change) => {
                 return (
                   change.type === "add" ||
@@ -718,22 +871,6 @@ function FlowRenderer({
             }
 
             onNodesChange(changes);
-
-            // NOTE: should no longer be needed (woot!) - delete if true (want real-world testing first)
-            // // only allow one update in _this_ render cycle
-            // if (onNodesChangeTimeoutRef.current === null) {
-            //   onNodesChange(changes);
-            //   onNodesChangeTimeoutRef.current = setTimeout(() => {
-            //     onNodesChangeTimeoutRef.current = null;
-            //   }, 0);
-            // } else {
-            //   // if we have an update in this render cycle already, then to
-            //   // prevent max recursion errors, defer the update to next render
-            //   // cycle
-            //   nextTick().then(() => {
-            //     onNodesChange(changes);
-            //   });
-            // }
           }}
           onEdgesChange={onEdgesChange}
           nodeTypes={nodeTypes}

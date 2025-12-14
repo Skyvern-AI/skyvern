@@ -51,6 +51,7 @@ class CredentialVaultService(ABC):
                 credential_type=data.credential_type,
                 username=data.credential.username,
                 totp_type=data.credential.totp_type,
+                totp_identifier=data.credential.totp_identifier,
                 card_last4=None,
                 card_brand=None,
             )
@@ -65,6 +66,21 @@ class CredentialVaultService(ABC):
                 totp_type="none",
                 card_last4=data.credential.card_number[-4:],
                 card_brand=data.credential.card_brand,
+                totp_identifier=None,
+            )
+        elif data.credential_type == CredentialType.SECRET:
+            return await app.DATABASE.create_credential(
+                organization_id=organization_id,
+                name=data.name,
+                vault_type=vault_type,
+                item_id=item_id,
+                credential_type=data.credential_type,
+                username=None,
+                totp_type="none",
+                card_last4=None,
+                card_brand=None,
+                totp_identifier=None,
+                secret_label=data.credential.secret_label,
             )
         else:
             raise Exception(f"Unsupported credential type: {data.credential_type}")

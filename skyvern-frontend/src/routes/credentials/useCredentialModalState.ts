@@ -6,6 +6,7 @@ const typeParam = "type";
 export const CredentialModalTypes = {
   PASSWORD: "password",
   CREDIT_CARD: "credit-card",
+  SECRET: "secret",
 } as const;
 
 export type CredentialModalType =

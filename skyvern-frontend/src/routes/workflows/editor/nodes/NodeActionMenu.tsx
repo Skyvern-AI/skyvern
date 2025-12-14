@@ -1,3 +1,5 @@
+import { DotsHorizontalIcon } from "@radix-ui/react-icons";
+
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -6,7 +8,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { DotsHorizontalIcon } from "@radix-ui/react-icons";
+import { useRecordingStore } from "@/store/useRecordingStore";
 
 type Props = {
   isDeletable?: boolean;
@@ -23,6 +25,9 @@ function NodeActionMenu({
   onDelete,
   onShowScript,
 }: Props) {
+  const recordingStore = useRecordingStore();
+  const isRecording = recordingStore.isRecording;
+
   if (!isDeletable && !isScriptable) {
     return null;
   }
@@ -37,6 +42,7 @@ function NodeActionMenu({
         <DropdownMenuSeparator />
         {isDeletable && (
           <DropdownMenuItem
+            disabled={isRecording}
             onSelect={() => {
               onDelete?.();
             }}

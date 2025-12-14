@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
-import { CardStackIcon, PlusIcon } from "@radix-ui/react-icons";
+import { CardStackIcon, LockClosedIcon, PlusIcon } from "@radix-ui/react-icons";
 import {
   CredentialModalTypes,
   useCredentialModalState,
@@ -16,13 +16,41 @@ import {
 import { KeyIcon } from "@/components/icons/KeyIcon";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CredentialsTotpTab } from "./CredentialsTotpTab";
+import { useSearchParams } from "react-router-dom";
 
 const subHeaderText =
-  "Securely store your passwords, credit cards, and manage incoming 2FA codes for your workflows.";
+  "Securely store your passwords, credit cards, secrets, and manage incoming 2FA codes for your workflows.";
+
+const TAB_VALUES = [
+  "passwords",
+  "creditCards",
+  "secrets",
+  "twoFactor",
+] as const;
+type TabValue = (typeof TAB_VALUES)[number];
+const DEFAULT_TAB: TabValue = "passwords";
 
 function CredentialsPage() {
   const { setIsOpen, setType } = useCredentialModalState();
-  const [activeTab, setActiveTab] = useState("passwords");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tabParam = searchParams.get("tab");
+  const matchedTab = TAB_VALUES.find((tab) => tab === tabParam);
+  const activeTab: TabValue = matchedTab ?? DEFAULT_TAB;
+
+  useEffect(() => {
+    if (tabParam && !matchedTab) {
+      const params = new URLSearchParams(searchParams);
+      params.set("tab", DEFAULT_TAB);
+      setSearchParams(params, { replace: true });
+    }
+  }, [tabParam, matchedTab, searchParams, setSearchParams]);
+
+  function handleTabChange(value: string) {
+    const nextTab = TAB_VALUES.find((tab) => tab === value) ?? DEFAULT_TAB;
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", nextTab);
+    setSearchParams(params, { replace: true });
+  }
 
   return (
     <div className="space-y-5">
@@ -56,17 +84,28 @@ function CredentialsPage() {
               <CardStackIcon className="mr-2 size-4" />
               Credit Card
             </DropdownMenuItem>
+            <DropdownMenuItem
+              onSelect={() => {
+                setIsOpen(true);
+                setType(CredentialModalTypes.SECRET);
+              }}
+              className="cursor-pointer"
+            >
+              <LockClosedIcon className="mr-2 size-4" />
+              Secret
+            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
       <Tabs
-        defaultValue="passwords"
+        value={activeTab}
         className="space-y-4"
-        onValueChange={setActiveTab}
+        onValueChange={handleTabChange}
       >
         <TabsList className="bg-slate-elevation1">
           <TabsTrigger value="passwords">Passwords</TabsTrigger>
           <TabsTrigger value="creditCards">Credit Cards</TabsTrigger>
+          <TabsTrigger value="secrets">Secrets</TabsTrigger>
           <TabsTrigger value="twoFactor">2FA</TabsTrigger>
         </TabsList>
 
@@ -76,6 +115,10 @@ function CredentialsPage() {
 
         <TabsContent value="creditCards" className="space-y-4">
           <CredentialsList filter="credit_card" />
+        </TabsContent>
+
+        <TabsContent value="secrets" className="space-y-4">
+          <CredentialsList filter="secret" />
         </TabsContent>
 
         <TabsContent value="twoFactor" className="space-y-4">

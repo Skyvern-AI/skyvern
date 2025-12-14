@@ -40,6 +40,7 @@ import { statusIsFinalized } from "../types";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
 import { useFirstParam } from "@/hooks/useFirstParam";
+import * as env from "@/util/env";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -303,7 +304,11 @@ function TaskDetails() {
             workflow &&
             workflowRun && (
               <Link
-                to={`/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`}
+                to={
+                  env.useNewRunsUrl
+                    ? `/runs/${workflowRun.workflow_run_id}`
+                    : `/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`
+                }
               >
                 {workflow.title}
               </Link>

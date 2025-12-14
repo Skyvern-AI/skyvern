@@ -1,4 +1,8 @@
+import typing
 from typing import Any
+
+if typing.TYPE_CHECKING:
+    from skyvern.library.skyvern import Skyvern  # noqa: E402
 
 # noinspection PyUnresolvedReferences
 __all__ = ["Skyvern"]

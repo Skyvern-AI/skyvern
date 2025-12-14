@@ -17,7 +17,12 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useParams, useSearchParams } from "react-router-dom";
-import { useEdgesState, useNodesState, Edge } from "@xyflow/react";
+import {
+  useEdgesState,
+  useNodesState,
+  useReactFlow,
+  Edge,
+} from "@xyflow/react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
@@ -29,6 +34,7 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { WorkflowRunStream } from "@/routes/workflows/workflowRun/WorkflowRunStream";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSidebarStore } from "@/store/SidebarStore";
 
 import { AnimatedWave } from "@/components/AnimatedWave";
@@ -56,7 +62,10 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import {
+  BranchContext,
+  useWorkflowPanelStore,
+} from "@/store/WorkflowPanelStore";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
@@ -67,6 +76,7 @@ import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
+import { ConditionalNodeData } from "./nodes/ConditionalNode/types";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import { WorkflowCacheKeyValuesPanel } from "./panels/WorkflowCacheKeyValuesPanel";
@@ -104,6 +114,7 @@ export type AddNodeProps = {
   next: string | null;
   parent?: string;
   connectingEdgeType: string;
+  branch?: BranchContext;
 };
 
 interface Dom {
@@ -213,6 +224,7 @@ function Workspace({
     useWorkflowPanelStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+  const { getNodes, getEdges } = useReactFlow();
   const saveWorkflow = useWorkflowSave({ status: "published" });
 
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -238,6 +250,7 @@ function Workspace({
   const queryClient = useQueryClient();
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
   const blockScriptStore = useBlockScriptStore();
+  const recordingStore = useRecordingStore();
   const cacheKey = workflow?.cache_key ?? "";
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
@@ -256,6 +269,22 @@ function Workspace({
   const dom: Dom = {
     splitLeft: useRef<HTMLInputElement>(null),
   };
+
+  // Track all used labels globally (including those in saved branch states)
+  // Initialize with labels from initial nodes
+  const usedLabelsRef = useRef<Set<string>>(
+    new Set(
+      initialNodes.filter(isWorkflowBlockNode).map((node) => node.data.label),
+    ),
+  );
+
+  // Sync usedLabelsRef with current nodes to handle any external changes
+  useEffect(() => {
+    const currentLabels = nodes
+      .filter(isWorkflowBlockNode)
+      .map((node) => node.data.label);
+    usedLabelsRef.current = new Set(currentLabels);
+  }, [nodes]);
 
   const handleOnSave = async () => {
     const errors = getWorkflowErrors(nodes);
@@ -626,11 +655,38 @@ function Workspace({
     };
   }, [dom.splitLeft]);
 
-  function doLayout(nodes: Array<AppNode>, edges: Array<Edge>) {
-    const layoutedElements = layout(nodes, edges);
-    setNodes(layoutedElements.nodes);
-    setEdges(layoutedElements.edges);
-  }
+  const doLayout = useCallback(
+    (nodes: Array<AppNode>, edges: Array<Edge>) => {
+      const layoutedElements = layout(nodes, edges);
+      setNodes(layoutedElements.nodes);
+      setEdges(layoutedElements.edges);
+    },
+    [setNodes, setEdges],
+  );
+
+  // Listen for conditional branch changes to trigger re-layout
+  useEffect(() => {
+    const handleBranchChange = () => {
+      // Use a small delay to ensure visibility updates have propagated
+      setTimeout(() => {
+        // Get the latest nodes and edges (including visibility changes)
+        const currentNodes = getNodes() as Array<AppNode>;
+        const currentEdges = getEdges();
+
+        const layoutedElements = layout(currentNodes, currentEdges);
+        setNodes(layoutedElements.nodes);
+        setEdges(layoutedElements.edges);
+      }, 10); // Small delay to ensure visibility updates complete
+    };
+
+    window.addEventListener("conditional-branch-changed", handleBranchChange);
+    return () => {
+      window.removeEventListener(
+        "conditional-branch-changed",
+        handleBranchChange,
+      );
+    };
+  }, [getNodes, getEdges, setNodes, setEdges]);
 
   function addNode({
     nodeType,
@@ -638,21 +694,35 @@ function Workspace({
     next,
     parent,
     connectingEdgeType,
+    branch,
   }: AddNodeProps) {
     const newNodes: Array<AppNode> = [];
     const newEdges: Array<Edge> = [];
     const id = nanoid();
-    const existingLabels = nodes
-      .filter(isWorkflowBlockNode)
-      .map((node) => node.data.label);
+    // Use global label tracking instead of just current nodes
+    const existingLabels = Array.from(usedLabelsRef.current);
+    const newLabel = generateNodeLabel(existingLabels);
+    const computedParentId = parent ?? branch?.conditionalNodeId;
     const node = createNode(
-      { id, parentId: parent },
+      { id, parentId: computedParentId },
       nodeType,
-      generateNodeLabel(existingLabels),
+      newLabel,
     );
+    // Track the new label
+    usedLabelsRef.current.add(newLabel);
+
+    if (branch && "data" in node) {
+      node.data = {
+        ...node.data,
+        conditionalBranchId: branch.branchId,
+        conditionalLabel: branch.conditionalLabel,
+        conditionalNodeId: branch.conditionalNodeId,
+        conditionalMergeLabel: branch.mergeLabel ?? null,
+      };
+    }
     newNodes.push(node);
     if (previous) {
-      const newEdge = {
+      const newEdge: Edge = {
         id: nanoid(),
         type: "edgeWithAddButton",
         source: previous,
@@ -660,11 +730,17 @@ function Workspace({
         style: {
           strokeWidth: 2,
         },
+        data: branch
+          ? {
+              conditionalNodeId: branch.conditionalNodeId,
+              conditionalBranchId: branch.branchId,
+            }
+          : undefined,
       };
       newEdges.push(newEdge);
     }
     if (next) {
-      const newEdge = {
+      const newEdge: Edge = {
         id: nanoid(),
         type: connectingEdgeType,
         source: id,
@@ -672,6 +748,12 @@ function Workspace({
         style: {
           strokeWidth: 2,
         },
+        data: branch
+          ? {
+              conditionalNodeId: branch.conditionalNodeId,
+              conditionalBranchId: branch.branchId,
+            }
+          : undefined,
       };
       newEdges.push(newEdge);
     }
@@ -696,8 +778,59 @@ function Workspace({
       newEdges.push(defaultEdge(startNodeId, adderNodeId));
     }
 
+    if (nodeType === "conditional" && "data" in node) {
+      // Conditional blocks need StartNode and NodeAdderNode as children
+      const startNodeId = nanoid();
+      const adderNodeId = nanoid();
+      newNodes.push(
+        startNode(
+          startNodeId,
+          {
+            withWorkflowSettings: false,
+            editable: true,
+            label: "__start_block__",
+            showCode: false,
+            parentNodeType: "conditional",
+          },
+          id,
+        ),
+      );
+      newNodes.push(nodeAdderNode(adderNodeId, id));
+
+      // Create an edge for each branch (initially all branches have START → NodeAdder)
+      const conditionalData = node.data as ConditionalNodeData;
+      conditionalData.branches.forEach((branch) => {
+        const edge: Edge = {
+          id: nanoid(),
+          type: "default",
+          source: startNodeId,
+          target: adderNodeId,
+          style: { strokeWidth: 2 },
+          data: {
+            conditionalNodeId: id,
+            conditionalBranchId: branch.id,
+          },
+        };
+        newEdges.push(edge);
+      });
+    }
+
     const editedEdges = previous
-      ? edges.filter((edge) => edge.source !== previous)
+      ? edges.filter((edge) => {
+          // Don't remove edges from the previous node
+          if (edge.source !== previous) {
+            return true;
+          }
+          // If we're in a branch, only remove the edge for this branch
+          if (branch) {
+            const edgeData = edge.data as
+              | { conditionalBranchId?: string }
+              | undefined;
+            return edgeData?.conditionalBranchId !== branch.branchId;
+          }
+          // Otherwise remove all edges from previous
+          return false;
+        })
       : edges;
 
     const previousNode = nodes.find((node) => node.id === previous);
@@ -990,6 +1123,7 @@ function Workspace({
           cacheKeyValue={cacheKeyValue}
           cacheKeyValues={cacheKeyValues}
           isGeneratingCode={isGeneratingCode}
+          isTemplate={workflow?.is_template}
           saving={workflowChangesStore.saveIsPending}
           cacheKeyValuesPanelOpen={
             workflowPanelState.active &&
@@ -1339,6 +1473,7 @@ function Workspace({
                   <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
                     <div key={reloadKey} className="w-full flex-1">
                       <BrowserStream
+                        exfiltrate={recordingStore.isRecording}
                         interactive={true}
                         browserSessionId={
                           activeDebugSession?.browser_session_id
@@ -1359,13 +1494,15 @@ function Workspace({
                           "mr-16": !blockLabel,
                         })}
                       >
-                        {showPowerButton && (
+                        {!recordingStore.isRecording && showPowerButton && (
                           <PowerButton onClick={() => cycle()} />
                         )}
-                        <ReloadButton
-                          isReloading={isReloading}
-                          onClick={() => reload()}
-                        />
+                        {!recordingStore.isRecording && (
+                          <ReloadButton
+                            isReloading={isReloading}
+                            onClick={() => reload()}
+                          />
+                        )}
                       </div>
                     </footer>
                   </div>

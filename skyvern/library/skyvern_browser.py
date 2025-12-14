@@ -1,26 +1,25 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from playwright.async_api import BrowserContext, Page
 
-from skyvern.client import AsyncSkyvern
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 
 if TYPE_CHECKING:
-    from skyvern.library.skyvern_sdk import SkyvernSdk
+    from skyvern.library.skyvern import Skyvern
 
 
-class SkyvernBrowser:
+class SkyvernBrowser(BrowserContext):
     """A browser context wrapper that creates Skyvern-enabled pages.
 
-    This class wraps a Playwright BrowserContext and provides methods to create
+    This class extends Playwright BrowserContext and provides methods to create
     SkyvernBrowserPage instances that combine traditional browser automation with
     AI-powered task execution capabilities. It manages browser session state and
     enables persistent browser sessions across multiple pages.
 
     Example:
         ```python
-            sdk = SkyvernSdk()
-            browser = await sdk.launch_local_browser()
+            skyvern = Skyvern.local()
+            browser = await skyvern.launch_local_browser()
 
             # Get or create the working page
             page = await browser.get_working_page()
@@ -33,23 +32,35 @@ class SkyvernBrowser:
         _browser_context: The underlying Playwright BrowserContext.
         _browser_session_id: Optional session ID for persistent browser sessions.
         _browser_address: Optional address for remote browser connections.
-        _client: The AsyncSkyvern client for API communication.
     """
 
     def __init__(
         self,
-        sdk: "SkyvernSdk",
+        skyvern: "Skyvern",
         browser_context: BrowserContext,
         *,
         browser_session_id: str | None = None,
         browser_address: str | None = None,
     ):
-        self._sdk = sdk
+        super().__init__(browser_context)
+        self._skyvern = skyvern
         self._browser_context = browser_context
         self._browser_session_id = browser_session_id
         self._browser_address = browser_address
 
         self.workflow_run_id: None | str = None
+
+    def __getattribute__(self, name: str) -> Any:
+        browser_context = object.__getattribute__(self, "_browser_context")
+        if hasattr(browser_context, name):
+            for cls in type(self).__mro__:
+                if cls is BrowserContext:
+                    break
+                if name in cls.__dict__:
+                    return object.__getattribute__(self, name)
+            return getattr(browser_context, name)
+
+        return object.__getattribute__(self, name)
 
     @property
     def browser_session_id(self) -> str | None:
@@ -60,12 +71,8 @@ class SkyvernBrowser:
         return self._browser_address
 
     @property
-    def client(self) -> AsyncSkyvern:
-        return self._sdk.api
-
-    @property
-    def sdk(self) -> "SkyvernSdk":
-        return self._sdk
+    def skyvern(self) -> "Skyvern":
+        return self._skyvern
 
     async def get_working_page(self) -> SkyvernBrowserPage:
         """Get the most recent page or create a new one if none exists.
@@ -97,3 +104,25 @@ class SkyvernBrowser:
 
     async def _create_skyvern_page(self, page: Page) -> SkyvernBrowserPage:
         return SkyvernBrowserPage(self, page)
+
+    async def close(self, **kwargs: Any) -> None:
+        """Close the browser and optionally close the browser session.
+
+        This method closes the browser context. If the browser is associated with a
+        cloud browser session (has a browser_session_id), it will also close the
+        browser session via the API, marking it as completed.
+
+        Args:
+            **kwargs: Arguments passed to the underlying BrowserContext.close() method.
+
+        Example:
+            ```python
+            browser = await skyvern.launch_cloud_browser()
+            # ... use the browser ...
+            await browser.close()  # Closes both browser and cloud session
+            ```
+        """
+        await self._browser_context.close(**kwargs)
+
+        if self._browser_session_id:
+            await self._skyvern.close_browser_session(self._browser_session_id)

@@ -90,6 +90,7 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
                 <Link
                   to={`/tasks/${item.task_id}/diagnostics`}
                   title="Go to diagnostics"
+                  onClick={(event) => event.stopPropagation()}
                 >
                   <div className="flex items-center gap-2 px-3 py-1 text-sm font-medium">
                     <ExternalLinkIcon />
