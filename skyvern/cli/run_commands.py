@@ -52,13 +52,18 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
     )
     res = await skyvern_agent.run_task(prompt=prompt, url=url, user_agent="skyvern-mcp", wait_for_completion=True)
 
-    # TODO: It would be nice if we could return the task URL here
     output = res.model_dump()["output"]
-    base_url = settings.SKYVERN_BASE_URL
-    run_history_url = (
-        "https://app.skyvern.com/history" if "skyvern.com" in base_url else "http://localhost:8080/history"
-    )
-    return {"output": output, "run_history_url": run_history_url}
+    # Primary: use app_url from API response (handles both task and workflow run IDs correctly)
+    if res.app_url:
+        task_url = res.app_url
+    else:
+        # Fallback when app_url is not available (e.g., older API versions)
+        # Determine route based on run_id prefix: 'wr_' for workflows, otherwise tasks
+        if res.run_id and res.run_id.startswith("wr_"):
+            task_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{res.run_id}/overview"
+        else:
+            task_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{res.run_id}/actions"
+    return {"output": output, "task_url": task_url, "run_id": res.run_id}
 
 
 def get_pids_on_port(port: int) -> List[int]:
