@@ -1124,6 +1124,7 @@ async def handle_input_text_action(
             element_id=skyvern_element.get_id(),
             action=action,
         )
+        action.set_has_mini_agent()
         return await handle_select_option_action(select_action, page, scraped_page, task, step)
 
     incremental_element: list[dict] = []
@@ -1219,6 +1220,7 @@ async def handle_input_text_action(
             try_to_quit_dropdown = True
             try:
                 # TODO: we don't select by value for the auto completion detect case
+                action.set_has_mini_agent()
 
                 select_result = await sequentially_select_from_dropdown(
                     action=select_action,
@@ -1303,6 +1305,7 @@ async def handle_input_text_action(
     # check the phone number format when type=tel and the text is not a secret value
     if not is_secret_value and await skyvern_element.get_attr("type") == "tel":
         try:
+            action.set_has_mini_agent()
             text = await check_phone_number_format(
                 value=text,
                 action=action,
@@ -1373,6 +1376,7 @@ async def handle_input_text_action(
     if action.totp_timing_info:
         timing_info = action.totp_timing_info
         if timing_info.get("is_totp_sequence"):
+            action.set_has_mini_agent()
             result = await _handle_multi_field_totp_sequence(timing_info, task)
             if result is not None:
                 return result  # Return ActionFailure if TOTP handling failed
@@ -1405,6 +1409,7 @@ async def handle_input_text_action(
 
         if tag_name == InteractiveElement.INPUT and await skyvern_element.get_attr("type") == "date":
             try:
+                action.set_has_mini_agent()
                 text = await check_date_format(
                     value=text,
                     action=action,
@@ -1426,6 +1431,7 @@ async def handle_input_text_action(
         if not await skyvern_element.is_raw_input():
             is_location_input = input_or_select_context.is_location_input if input_or_select_context else False
             if input_or_select_context and (await skyvern_element.is_auto_completion_input() or is_location_input):
+                action.set_has_mini_agent()
                 if result := await input_or_auto_complete_input(
                     input_or_select_context=input_or_select_context,
                     scraped_page=scraped_page,
@@ -1667,6 +1673,7 @@ async def handle_select_option_action(
     # Confirm if the select action is on the custom option element
     if await skyvern_element.is_custom_option():
         click_action = ClickAction(element_id=action.element_id)
+        action.set_has_mini_agent()
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
     if not await skyvern_element.is_selectable():
@@ -1775,6 +1782,7 @@ async def handle_select_option_action(
             action=action,
         )
         check_action = CheckboxAction(element_id=action.element_id, is_checked=True)
+        action.set_has_mini_agent()
         return await handle_checkbox_action(check_action, page, scraped_page, task, step)
 
     if await skyvern_element.is_radio():
@@ -1783,6 +1791,7 @@ async def handle_select_option_action(
             action=action,
         )
         click_action = ClickAction(element_id=action.element_id)
+        action.set_has_mini_agent()
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
     # FIXME: maybe there's a case where <input type="button"> could trigger dropdown menu?
@@ -1792,6 +1801,7 @@ async def handle_select_option_action(
             action=action,
         )
         click_action = ClickAction(element_id=action.element_id)
+        action.set_has_mini_agent()
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
     LOG.info(
@@ -3634,6 +3644,7 @@ async def normal_select(
     step: Step,
     builder: ElementTreeBuilder,
 ) -> List[ActionResult]:
+    action.set_has_mini_agent()
     try:
         current_text = await skyvern_element.get_attr("selected")
         if current_text and (current_text == action.option.label or current_text == action.option.value):
