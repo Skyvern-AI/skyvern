@@ -4,7 +4,7 @@ import { BrowserSessions } from "@/routes/browserSessions/BrowserSessions";
 import { PageLayout } from "./components/PageLayout";
 import { DiscoverPage } from "./routes/discover/DiscoverPage";
 import { HistoryPage } from "./routes/history/HistoryPage";
-import { RootLayout } from "./routes/root/RootLayout";
+import { ConditionalRoot } from "./routes/root/ConditionalRoot";
 import { Settings } from "./routes/settings/Settings";
 import { CreateNewTaskFormPage } from "./routes/tasks/create/CreateNewTaskFormPage";
 import { RetryTask } from "./routes/tasks/create/retry/RetryTask";
@@ -26,11 +26,9 @@ import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOut
 import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunOverview";
 import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
 import { WorkflowRunCode } from "@/routes/workflows/workflowRun/WorkflowRunCode";
-import { DebugStoreProvider } from "@/store/DebugStoreContext";
 import { CredentialsPage } from "@/routes/credentials/CredentialsPage.tsx";
 import { RunRouter } from "@/routes/runs/RunRouter";
 import { LoginPage } from "@/routes/auth/LoginPage";
-import { AuthGuard } from "@/routes/auth/AuthGuard";
 
 const router = createBrowserRouter([
   {
@@ -43,13 +41,7 @@ const router = createBrowserRouter([
   },
   {
     path: "/",
-    element: (
-      <AuthGuard>
-        <DebugStoreProvider>
-          <RootLayout />
-        </DebugStoreProvider>
-      </AuthGuard>
-    ),
+    element: <ConditionalRoot />,
     children: [
       {
         path: "runs",
