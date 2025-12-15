@@ -909,7 +909,7 @@ class LLMAPIHandlerFactory:
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
             return llm_caller.call
 
-        # For GitHub Copilot via OPENAI_COMPATIBLE, use LLMCaller for custom header support
+        # For GitHub Copilot via OPENAI_COMPATIBLE, use LLMCaller for a custom header
         if llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
             return llm_caller.call
@@ -1372,7 +1372,7 @@ class LLMCaller:
                 http_client=ForgeAsyncHttpxClientWrapper(),
             )
         elif self.llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
-            # For GitHub Copilot, use the actual model name (e.g., "claude-sonnet-4.5")
+            # For GitHub Copilot, use the actual model name from OPENAI_COMPATIBLE_MODEL_NAME
             self.llm_key = settings.OPENAI_COMPATIBLE_MODEL_NAME or self.llm_key
             self.openai_client = AsyncOpenAI(
                 api_key=settings.OPENAI_COMPATIBLE_API_KEY, base_url=settings.OPENAI_COMPATIBLE_API_BASE
@@ -1810,19 +1810,16 @@ class LLMCaller:
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
     ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
-
-        # Skip cost calculation for OpenRouter as it has its own pricing
         if self.original_llm_key.startswith("openrouter/"):
             return empty_call_stats
 
-        # Handle OPENAI_COMPATIBLE providers (GitHub Copilot, custom endpoints, etc.)
-        # These don't have pricing info in litellm, so we skip cost calculation but still extract token counts
+        # Handle OPENAI_COMPATIBLE provider GitHub Copilot
         if self.original_llm_key == "OPENAI_COMPATIBLE" and isinstance(response, (ModelResponse, CustomStreamWrapper)):
             input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(
                 response
             )
             return LLMCallStats(
-                llm_cost=None,  # TODO: calculate the cost according to the price: https://github.com/features/copilot/plans
+                llm_cost=0,  # TODO: calculate the cost according to the price: https://github.com/features/copilot/plans
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cached_tokens=cached_tokens,
