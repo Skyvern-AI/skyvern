@@ -1349,8 +1349,11 @@ class WorkflowService:
                 return
             if target not in label_to_block:
                 raise InvalidWorkflowDefinition(f"Block {source} references unknown next_block_label {target}")
-            adjacency[source].add(target)
-            incoming[target] += 1
+            # Only increment incoming count if this is a new edge
+            # (multiple branches of a conditional block may point to the same target)
+            if target not in adjacency[source]:
+                adjacency[source].add(target)
+                incoming[target] += 1
 
         for label, block in label_to_block.items():
             if isinstance(block, ConditionalBlock):
