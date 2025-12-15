@@ -6,6 +6,7 @@ import os
 import random
 import re
 import string
+import uuid
 from asyncio.exceptions import CancelledError
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -51,6 +52,7 @@ from skyvern.exceptions import (
     MissingBrowserStatePage,
     MissingExtractActionsResponse,
     NoTOTPVerificationCodeFound,
+    PDFEmbedBase64DecodeError,
     ScrapingFailed,
     SkyvernException,
     StepTerminationError,
@@ -110,6 +112,7 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     CompleteVerifyResult,
     DecisiveAction,
+    DownloadFileAction,
     ExtractAction,
     GotoUrlAction,
     ReloadPageAction,
@@ -1035,16 +1038,73 @@ class ForgeAgent:
                     if json_response is None:
                         raise MissingExtractActionsResponse()
                     try:
-                        otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
-                            task, step, scraped_page, browser_state, json_response
-                        )
-                        if otp_actions:
-                            detailed_agent_step_output.llm_response = otp_json_response
-                            actions = otp_actions
+                        if pdf_embed_src := scraped_page.check_pdf_viewer_embed():
+                            LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
+                            pdf_bytes: bytes | None = None
+                            download_url: str | None = None
+
+                            # Check if the embed src is a data URI with base64 encoded PDF
+                            # Format: data:application/pdf[;charset=...];base64,<base64_data>
+                            if pdf_embed_src.startswith("data:application/pdf"):
+                                # Use more precise regex to extract base64 data after the base64, prefix
+                                # This pattern matches: data:application/pdf[;optional_params];base64,<data>
+                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_embed_src, re.S)
+                                if not m:
+                                    raise PDFEmbedBase64DecodeError(
+                                        pdf_embed_src=pdf_embed_src,
+                                        reason="Failed to extract base64 data from PDF embed src. Expected format: data:application/pdf[;charset=...];base64,<data>",
+                                    )
+
+                                base64_data = m.group(1)
+                                LOG.info(
+                                    "Found base64 data in PDF embed src",
+                                    step_id=step.step_id,
+                                    base64_data_length=len(base64_data),
+                                )
+
+                                # Decode base64 data with error handling
+                                try:
+                                    pdf_bytes = base64.b64decode(base64_data, validate=True)
+                                except Exception as e:
+                                    raise PDFEmbedBase64DecodeError(
+                                        pdf_embed_src=pdf_embed_src,
+                                        reason=f"Failed to decode base64 data: {str(e)}",
+                                    ) from e
+                            else:
+                                # If not a data URI, treat it as a URL
+                                LOG.info(
+                                    "Found PDF embed src as URL (not base64 data)",
+                                    step_id=step.step_id,
+                                    download_url=pdf_embed_src,
+                                )
+                                download_url = pdf_embed_src
+
+                            actions = [
+                                DownloadFileAction(
+                                    reasoning="Downloading the file from the PDF viewer.",
+                                    organization_id=task.organization_id,
+                                    workflow_run_id=task.workflow_run_id,
+                                    task_id=task.task_id,
+                                    step_id=step.step_id,
+                                    step_order=step.order,
+                                    action_order=0,
+                                    file_name=f"{uuid.uuid4()}.pdf",
+                                    byte=pdf_bytes,
+                                    download_url=download_url,
+                                    download=True,
+                                )
+                            ]
                         else:
-                            actions = parse_actions(
-                                task, step.step_id, step.order, scraped_page, json_response["actions"]
+                            otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
+                                task, step, scraped_page, browser_state, json_response
                             )
+                            if otp_actions:
+                                detailed_agent_step_output.llm_response = otp_json_response
+                                actions = otp_actions
+                            else:
+                                actions = parse_actions(
+                                    task, step.step_id, step.order, scraped_page, json_response["actions"]
+                                )
 
                         if context:
                             context.pop_totp_code(task.task_id)
@@ -1761,6 +1821,11 @@ class ForgeAgent:
                 engine,
                 persist_artifacts=False,
             )
+
+            if scraped_page.check_pdf_viewer_embed():
+                next_step.is_speculative = False
+                LOG.info("Skipping speculative extract-actions for PDF viewer page", step_id=current_step.step_id)
+                return None
 
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 task.llm_key,

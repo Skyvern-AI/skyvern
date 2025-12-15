@@ -178,6 +178,32 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         self._clean_up_func = clean_up_func
         self._scrape_exclude = scrape_exclude
 
+    def check_pdf_viewer_embed(self) -> str | None:
+        """
+        Check if the page contains a PDF viewer embed.
+        If found, return the src attribute of the embed.
+        """
+        if len(self.elements) != 1:
+            return None
+
+        element = self.elements[0]
+        if element.get("tagName", "") != "embed":
+            return None
+
+        attributes: dict = element.get("attributes", {})
+        if not attributes:
+            return None
+
+        type_attr: str | None = attributes.get("type")
+        if not type_attr:
+            return None
+
+        if type_attr.lower() != "application/pdf":
+            return None
+
+        LOG.info("Found a PDF viewer page", element=element)
+        return attributes.get("src", "")
+
     def support_economy_elements_tree(self) -> bool:
         return True
 
