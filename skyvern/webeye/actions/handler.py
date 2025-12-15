@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import os
+import shutil
 import time
 import urllib.parse
 import uuid
@@ -21,11 +22,11 @@ from skyvern.constants import (
     BROWSER_DOWNLOAD_MAX_WAIT_TIME,
     BROWSER_DOWNLOAD_TIMEOUT,
     DROPDOWN_MENU_MAX_DISTANCE,
-    REPO_ROOT_DIR,
     SKYVERN_ID_ATTR,
 )
 from skyvern.errors.errors import TOTPExpiredError
 from skyvern.exceptions import (
+    DownloadedFileNotFound,
     DownloadFileMaxWaitingTime,
     EmptySelect,
     ErrEmptyTweakValue,
@@ -60,6 +61,7 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.files import download_file as download_file_api
 from skyvern.forge.sdk.api.files import (
     get_download_dir,
     list_downloading_files_in_directory,
@@ -102,6 +104,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_factory import initialize_download_dir
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -1591,7 +1594,8 @@ async def handle_upload_file_action(
         )
 
 
-# This function is deprecated. Downloads are handled by the click action handler now.
+# This function is deprecated in 'extract-actions' prompt. Downloads are handled by the click action handler now.
+# Currently, it's only used for the download action triggered by the code.
 @TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_download_file_action(
     action: actions.DownloadFileAction,
@@ -1600,41 +1604,71 @@ async def handle_download_file_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    # Get wait config once for this handler
-    wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
-
-    dom = DomUtil(scraped_page=scraped_page, page=page)
-    skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
-
     file_name = f"{action.file_name or uuid.uuid4()}"
-    full_file_path = f"{REPO_ROOT_DIR}/downloads/{task.workflow_run_id or task.task_id}/{file_name}"
+    download_folder = initialize_download_dir()
+    full_file_path = f"{download_folder}/{file_name}"
+
     try:
-        # Start waiting for the download
-        async with page.expect_download() as download_info:
-            await asyncio.sleep(get_wait_time(wait_config, "post_click_delay", default=0.3))
+        # Priority 1: If byte data is provided, save it directly
+        if action.byte is not None:
+            with open(full_file_path, "wb") as f:
+                f.write(action.byte)
 
-            locator = skyvern_element.locator
-            await locator.click(
-                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-                modifiers=["Alt"],
+            LOG.info(
+                "DownloadFileAction: Saved file from byte data",
+                action=action,
+                full_file_path=full_file_path,
+                file_size=len(action.byte),
             )
+            return [ActionSuccess(download_triggered=True)]
 
-        download = await download_info.value
+        # Priority 2: If download_url is provided, download from URL
+        if action.download_url is not None:
+            downloaded_path = await download_file_api(action.download_url)
+            # Check if the downloaded file actually exists
+            if not os.path.exists(downloaded_path):
+                LOG.error(
+                    "DownloadFileAction: Downloaded file path does not exist",
+                    action=action,
+                    downloaded_path=downloaded_path,
+                    download_url=action.download_url,
+                    full_file_path=full_file_path,
+                )
+                return [ActionFailure(DownloadedFileNotFound(downloaded_path, action.download_url))]
 
-        # Create download folders if they don't exist
-        download_folder = f"{REPO_ROOT_DIR}/downloads/{task.workflow_run_id or task.task_id}"
-        os.makedirs(download_folder, exist_ok=True)
-        # Wait for the download process to complete and save the downloaded file
-        await download.save_as(full_file_path)
+            # Move the downloaded file to the target location
+            # If the downloaded file has a different name, use it; otherwise use the specified file_name
+            if os.path.basename(downloaded_path) != file_name:
+                # Copy to target location with specified file_name
+                shutil.copy2(downloaded_path, full_file_path)
+                # Optionally remove the temporary file
+                try:
+                    os.remove(downloaded_path)
+                except Exception:
+                    pass  # Ignore errors when removing temp file
+            else:
+                # Move to target location
+                shutil.move(downloaded_path, full_file_path)
+
+            LOG.info(
+                "DownloadFileAction: Downloaded file from URL",
+                action=action,
+                full_file_path=full_file_path,
+                download_url=action.download_url,
+            )
+            return [ActionSuccess(download_triggered=True)]
+
+        return [ActionSuccess(download_triggered=False)]
+
     except Exception as e:
         LOG.exception(
             "DownloadFileAction: Failed to download file",
             action=action,
             full_file_path=full_file_path,
+            download_url=action.download_url,
+            has_byte=action.byte is not None,
         )
         return [ActionFailure(e)]
-
-    return [ActionSuccess(data={"file_path": full_file_path})]
 
 
 @TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
@@ -2250,7 +2284,7 @@ ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captch
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
 ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_action)
-# ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
+ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
 ActionHandler.register_action_type(ActionType.SELECT_OPTION, handle_select_option_action)
 ActionHandler.register_action_type(ActionType.WAIT, handle_wait_action)

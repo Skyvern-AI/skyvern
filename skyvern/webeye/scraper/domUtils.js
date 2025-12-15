@@ -1795,6 +1795,16 @@ async function buildElementTree(
       } else if (tagName === "div" && isDOMNodeRepresentDiv(element)) {
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (
+        tagName === "embed" &&
+        element.getAttribute("type")?.toLowerCase() === "application/pdf"
+      ) {
+        elementObj = await buildElementObject(
+          frame,
+          element,
+          interactable,
+          true,
+        );
+      } else if (
         getElementText(element).length > 0 &&
         getElementText(element).length <= 5000
       ) {

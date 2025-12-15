@@ -104,6 +104,14 @@ class ImaginaryFileUrl(SkyvernException):
         super().__init__(f"File url {file_url} is imaginary.")
 
 
+class DownloadedFileNotFound(SkyvernException):
+    def __init__(self, downloaded_path: str, download_url: str | None = None) -> None:
+        message = f"Downloaded file does not exist at path: {downloaded_path}. This may indicate the download failed silently or the file was removed."
+        if download_url:
+            message += f" Download URL: {download_url}"
+        super().__init__(message)
+
+
 class MissingBrowserState(SkyvernException):
     def __init__(self, task_id: str | None = None, workflow_run_id: str | None = None) -> None:
         task_str = f"task_id={task_id}" if task_id else ""
@@ -878,3 +886,19 @@ class InvalidSchemaError(SkyvernException):
         self.message = message
         self.validation_errors = validation_errors or []
         super().__init__(self.message)
+
+
+class PDFEmbedBase64DecodeError(SkyvernException):
+    """Raised when failed to extract or decode base64 data from PDF embed src attribute."""
+
+    def __init__(self, pdf_embed_src: str | None = None, reason: str | None = None):
+        self.pdf_embed_src = pdf_embed_src
+        self.reason = reason
+        message = "Failed to extract or decode base64 data from PDF embed src"
+        if reason:
+            message += f". Reason: {reason}"
+        if pdf_embed_src:
+            # Truncate long base64 strings for logging
+            src_preview = pdf_embed_src[:100] + "..." if len(pdf_embed_src) > 100 else pdf_embed_src
+            message += f". PDF embed src: {src_preview}"
+        super().__init__(message)

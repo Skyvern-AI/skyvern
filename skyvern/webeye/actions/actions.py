@@ -246,13 +246,15 @@ class UploadFileAction(WebAction):
         return f"UploadFileAction(element_id={self.element_id}, file={self.file_url}, is_upload_file_tag={self.is_upload_file_tag})"
 
 
-# this is a deprecated action type
-class DownloadFileAction(WebAction):
+# This action is deprecated in 'extract-actions' prompt. Only used for the download action triggered by the code.
+class DownloadFileAction(Action):
     action_type: ActionType = ActionType.DOWNLOAD_FILE
     file_name: str
+    byte: Annotated[bytes | None, Field(exclude=True)] = None  # bytes data
+    download_url: str | None = None  # URL to download file from
 
     def __repr__(self) -> str:
-        return f"DownloadFileAction(element_id={self.element_id}, file_name={self.file_name})"
+        return f"DownloadFileAction(file_name={self.file_name}, download_url={self.download_url}, has_byte={self.byte is not None})"
 
 
 class NullAction(Action):
