@@ -3431,6 +3431,17 @@
             ],
             "title": "Totp Timing Info"
           },
+          "has_mini_agent": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Has Mini Agent"
+          },
           "created_at": {
             "anyOf": [
               {
