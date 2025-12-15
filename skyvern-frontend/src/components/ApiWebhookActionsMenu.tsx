@@ -30,12 +30,12 @@ export function ApiWebhookActionsMenu({
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button type="button" variant="secondary">
-          API & Webhooks
+          API & 웹훅
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent>
         <DropdownMenuLabel className="py-2 text-base">
-          Re-run via API
+          API로 재실행
         </DropdownMenuLabel>
         <DropdownMenuItem
           onSelect={() => {
@@ -43,14 +43,13 @@ export function ApiWebhookActionsMenu({
             copyText(curl).then(() => {
               toast({
                 variant: "success",
-                title: "Copied to Clipboard",
-                description:
-                  "The cURL command has been copied to your clipboard.",
+                title: "클립보드에 복사됨",
+                description: "cURL 명령어가 클립보드에 복사되었습니다.",
               });
             });
           }}
         >
-          Copy cURL (Unix/Linux/macOS)
+          cURL 복사 (Unix/Linux/macOS)
         </DropdownMenuItem>
         <DropdownMenuItem
           onSelect={() => {
@@ -58,18 +57,18 @@ export function ApiWebhookActionsMenu({
             copyText(powershell).then(() => {
               toast({
                 variant: "success",
-                title: "Copied to Clipboard",
+                title: "클립보드에 복사됨",
                 description:
-                  "The PowerShell command has been copied to your clipboard.",
+                  "PowerShell 명령어가 클립보드에 복사되었습니다.",
               });
             });
           }}
         >
-          Copy PowerShell (Windows)
+          PowerShell 복사 (Windows)
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuLabel className="py-2 text-base">
-          Webhooks
+          웹훅
         </DropdownMenuLabel>
         <DropdownMenuItem
           disabled={webhookDisabled}
@@ -77,7 +76,7 @@ export function ApiWebhookActionsMenu({
             setTimeout(() => onTestWebhook(), 0);
           }}
         >
-          Test Webhook
+          웹훅 테스트
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

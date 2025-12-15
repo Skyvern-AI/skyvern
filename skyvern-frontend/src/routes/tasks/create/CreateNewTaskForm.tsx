@@ -158,13 +158,13 @@ function CreateNewTaskForm({ initialValues }: Props) {
       if (error.response?.status === 402) {
         toast({
           variant: "destructive",
-          title: "Failed to create task",
+          title: "작업 생성 실패",
           description:
-            "You don't have enough credits to run this task. Go to billing to see your credit balance.",
+            "이 작업을 실행할 크레딧이 부족합니다. 결제 페이지에서 크레딧 잔액을 확인하세요.",
           action: (
-            <ToastAction altText="Go to Billing">
+            <ToastAction altText="결제 페이지로">
               <Button asChild>
-                <Link to="billing">Go to Billing</Link>
+                <Link to="billing">결제 페이지로</Link>
               </Button>
             </ToastAction>
           ),
@@ -173,19 +173,19 @@ function CreateNewTaskForm({ initialValues }: Props) {
       }
       toast({
         variant: "destructive",
-        title: "There was an error creating the task.",
+        title: "작업 생성 중 오류가 발생했습니다.",
         description: error.message,
       });
     },
     onSuccess: (response) => {
       toast({
         variant: "success",
-        title: "Task Created",
-        description: `${response.data.task_id} created successfully.`,
+        title: "작업 생성됨",
+        description: `${response.data.task_id}가 성공적으로 생성되었습니다.`,
         action: (
-          <ToastAction altText="View">
+          <ToastAction altText="보기">
             <Button asChild>
-              <Link to={`/tasks/${response.data.task_id}`}>View</Link>
+              <Link to={`/tasks/${response.data.task_id}`}>보기</Link>
             </Button>
           </ToastAction>
         ),
@@ -220,7 +220,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
       <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
         <TaskFormSection
           index={1}
-          title="Base Content"
+          title="기본 설정"
           active={isActive("base")}
           onClick={() => {
             toggleSection("base");
@@ -243,7 +243,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                           <div className="w-72">
                             <h1 className="text-lg">URL</h1>
                             <h2 className="text-base text-slate-400">
-                              The starting URL for the task
+                              작업의 시작 URL
                             </h2>
                           </div>
                         </FormLabel>
@@ -265,10 +265,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Navigation Goal</h1>
+                            <h1 className="text-lg">탐색 목표</h1>
                             <h2 className="text-base text-slate-400">
-                              Where should Skyvern go and what should Skyvern
-                              do?
+                              어디로 이동하고 무엇을 수행해야 하나요?
                             </h2>
                           </div>
                         </FormLabel>
@@ -276,7 +275,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                           <FormControl>
                             <AutoResizingTextarea
                               {...field}
-                              placeholder="Tell Skyvern what to do."
+                              placeholder="수행할 작업을 입력하세요."
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
@@ -296,10 +295,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
                           <div className="flex gap-16">
                             <FormLabel>
                               <div className="w-72">
-                                <h1 className="text-lg">Navigation Payload</h1>
+                                <h1 className="text-lg">탐색 페이로드</h1>
                                 <h2 className="text-base text-slate-400">
-                                  Specify important parameters, routes, or
-                                  states
+                                  중요한 매개변수, 경로 또는 상태 지정
                                 </h2>
                               </div>
                               <Button
@@ -311,7 +309,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                                 }}
                                 size="sm"
                               >
-                                Hide Advanced Settings
+                                고급 설정 숨기기
                               </Button>
                             </FormLabel>
                             <div className="w-full">
@@ -343,7 +341,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       }}
                       size="sm"
                     >
-                      Show Advanced Settings
+                      고급 설정 보기
                     </Button>
                   </div>
                 )}
@@ -353,7 +351,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
         </TaskFormSection>
         <TaskFormSection
           index={2}
-          title="Extraction"
+          title="데이터 추출"
           active={isActive("extraction")}
           onClick={() => {
             toggleSection("extraction");
@@ -374,9 +372,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Data Extraction Goal</h1>
+                            <h1 className="text-lg">데이터 추출 목표</h1>
                             <h2 className="text-base text-slate-400">
-                              What outputs are you looking to get?
+                              어떤 결과를 얻고 싶으신가요?
                             </h2>
                           </div>
                         </FormLabel>
@@ -384,7 +382,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                           <FormControl>
                             <AutoResizingTextarea
                               {...field}
-                              placeholder="What data do you need to extract?"
+                              placeholder="추출할 데이터를 설명하세요."
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
@@ -402,9 +400,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Data Schema</h1>
+                            <h1 className="text-lg">데이터 스키마</h1>
                             <h2 className="text-base text-slate-400">
-                              Specify the output format in JSON
+                              JSON 형식으로 출력 형식 지정
                             </h2>
                           </div>
                         </FormLabel>
@@ -430,7 +428,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
         </TaskFormSection>
         <TaskFormSection
           index={3}
-          title="Advanced Settings"
+          title="고급 설정"
           active={isActive("advanced")}
           onClick={() => {
             toggleSection("advanced");
@@ -453,10 +451,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Include Action History</h1>
+                            <h1 className="text-lg">작업 기록 포함</h1>
                             <h2 className="text-base text-slate-400">
-                              Whether to include action history when verifying
-                              the task completion.
+                              작업 완료 확인 시 작업 기록을 포함할지 여부
                             </h2>
                           </div>
                         </FormLabel>
@@ -483,10 +480,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Max Steps Override</h1>
+                            <h1 className="text-lg">최대 단계 수 설정</h1>
                             <h2 className="text-base text-slate-400">
-                              Want to allow this task to execute more or less
-                              steps than the default?
+                              기본값보다 더 많거나 적은 단계를 실행하시겠습니까?
                             </h2>
                           </div>
                         </FormLabel>
@@ -497,7 +493,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                               type="number"
                               min={1}
                               value={field.value ?? ""}
-                              placeholder={`Default: ${organization?.max_steps_per_run ?? MAX_STEPS_DEFAULT}`}
+                              placeholder={`기본값: ${organization?.max_steps_per_run ?? MAX_STEPS_DEFAULT}`}
                               onChange={(event) => {
                                 const value =
                                   event.target.value === ""
@@ -521,10 +517,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Webhook Callback URL</h1>
+                            <h1 className="text-lg">웹훅 콜백 URL</h1>
                             <h2 className="text-base text-slate-400">
-                              The URL of a webhook endpoint to send the
-                              extracted information
+                              추출된 정보를 전송할 웹훅 엔드포인트 URL
                             </h2>
                           </div>
                         </FormLabel>
@@ -550,7 +545,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                                     className="self-start"
                                     disabled={!field.value}
                                   >
-                                    Test Webhook
+                                    웹훅 테스트
                                   </Button>
                                 }
                               />
@@ -572,11 +567,10 @@ function CreateNewTaskForm({ initialValues }: Props) {
                           <FormLabel>
                             <div className="w-72">
                               <div className="flex items-center gap-2 text-lg">
-                                Proxy Location
+                                프록시 위치
                               </div>
                               <h2 className="text-sm text-slate-400">
-                                Route Skyvern through one of our available
-                                proxies.
+                                사용 가능한 프록시 중 하나를 통해 라우팅합니다.
                               </h2>
                             </div>
                           </FormLabel>
@@ -603,9 +597,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Max Screenshot Scrolls</h1>
+                            <h1 className="text-lg">최대 스크린샷 스크롤</h1>
                             <h2 className="text-base text-slate-400">
-                              {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                              {`작업 후 스크린샷의 최대 스크롤 횟수. 기본값은 ${MAX_SCREENSHOT_SCROLLS_DEFAULT}입니다. 0으로 설정하면 현재 뷰포트만 캡처합니다.`}
                             </h2>
                           </div>
                         </FormLabel>
@@ -616,7 +610,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                               type="number"
                               min={0}
                               value={field.value ?? ""}
-                              placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
+                              placeholder={`기본값: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
                               onChange={(event) => {
                                 const value =
                                   event.target.value === ""
@@ -641,10 +635,10 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Extra HTTP Headers</h1>
+                            <h1 className="text-lg">추가 HTTP 헤더</h1>
                             <h2 className="text-base text-slate-400">
-                              Specify some self defined HTTP requests headers in
-                              Dict format
+                              사전 형식으로 사용자 정의 HTTP 요청 헤더를
+                              지정하세요
                             </h2>
                           </div>
                         </FormLabel>
@@ -653,7 +647,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                             <KeyValueInput
                               value={field.value ?? ""}
                               onChange={(val) => field.onChange(val)}
-                              addButtonText="Add Header"
+                              addButtonText="헤더 추가"
                             />
                           </FormControl>
                           <FormMessage />
@@ -670,10 +664,10 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Error Messages</h1>
+                            <h1 className="text-lg">오류 메시지</h1>
                             <h2 className="text-base text-slate-400">
-                              Specify any error outputs you would like to be
-                              notified about
+                              알림 받고 싶은 오류 출력을
+                              지정하세요
                             </h2>
                           </div>
                         </FormLabel>
@@ -702,15 +696,15 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">2FA Identifier</h1>
-                            <h2 className="text-base text-slate-400"></h2>
+                            <h1 className="text-lg">2FA 식별자</h1>
+                            <h2 className="text-base text-slate-400">작업에 연결할 TOTP 식별자</h2>
                           </div>
                         </FormLabel>
                         <div className="w-full">
                           <FormControl>
                             <Input
                               {...field}
-                              placeholder="Add an ID that links your TOTP to the task"
+                              placeholder="작업에 연결할 TOTP ID를 입력하세요"
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
@@ -728,10 +722,10 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Browser Address</h1>
+                            <h1 className="text-lg">브라우저 주소</h1>
                             <h2 className="text-base text-slate-400">
-                              The address of the Browser server to use for the
-                              task run.
+                              작업 실행에 사용할 브라우저 서버
+                              주소입니다.
                             </h2>
                           </div>
                         </FormLabel>
@@ -789,7 +783,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
             )}
             <PlayIcon className="mr-2 h-4 w-4" />
-            Run
+            실행
           </Button>
         </div>
       </form>

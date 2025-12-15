@@ -37,15 +37,15 @@ function DeleteCredentialButton({ credential }: Props) {
         queryKey: ["credentials"],
       });
       toast({
-        title: "Credential deleted",
+        title: "인증 정보 삭제됨",
         variant: "success",
-        description: "The credential has been deleted.",
+        description: "인증 정보가 삭제되었습니다.",
       });
     },
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Failed to delete credential",
+        title: "인증 정보 삭제 실패",
         description: error.message,
       });
     },
@@ -62,22 +62,21 @@ function DeleteCredentialButton({ credential }: Props) {
               </Button>
             </DialogTrigger>
           </TooltipTrigger>
-          <TooltipContent>Delete Credential</TooltipContent>
+          <TooltipContent>인증 정보 삭제</TooltipContent>
         </Tooltip>
       </TooltipProvider>
       <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
         <DialogHeader>
-          <DialogTitle>Are you sure?</DialogTitle>
+          <DialogTitle>확실합니까?</DialogTitle>
         </DialogHeader>
         <div className="text-sm text-slate-400">
-          The credential{" "}
-          <span className="font-bold text-primary">{credential.name}</span> will
-          be PERMANENTLY deleted. The Skyvern team has no way to restore a
-          credential once it's deleted.
+          인증 정보{" "}
+          <span className="font-bold text-primary">{credential.name}</span>이(가)
+          영구적으로 삭제됩니다. 삭제된 인증 정보는 복구할 수 없습니다.
         </div>
         <DialogFooter>
           <DialogClose asChild>
-            <Button variant="secondary">Cancel</Button>
+            <Button variant="secondary">취소</Button>
           </DialogClose>
           <Button
             variant="destructive"
@@ -89,7 +88,7 @@ function DeleteCredentialButton({ credential }: Props) {
             {deleteCredentialMutation.isPending && (
               <ReloadIcon className="mr-2 size-4 animate-spin" />
             )}
-            Delete
+            삭제
           </Button>
         </DialogFooter>
       </DialogContent>

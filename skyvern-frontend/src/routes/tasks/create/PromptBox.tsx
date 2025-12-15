@@ -369,10 +369,9 @@ function PromptBox() {
                   <header>고급 설정</header>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Webhook Callback URL</div>
+                      <div className="text-sm">웹훅 콜백 URL</div>
                       <div className="text-xs text-slate-400">
-                        The URL of a webhook endpoint to send the extracted
-                        information
+                        추출된 정보를 전송할 웹훅 엔드포인트 URL
                       </div>
                     </div>
                     <div className="flex flex-col gap-2">
@@ -394,7 +393,7 @@ function PromptBox() {
                             className="self-start"
                             disabled={!webhookCallbackUrl}
                           >
-                            Test Webhook
+                            웹훅 테스트
                           </Button>
                         }
                       />
@@ -402,9 +401,9 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Proxy Location</div>
+                      <div className="text-sm">프록시 위치</div>
                       <div className="text-xs text-slate-400">
-                        Route Skyvern through one of our available proxies.
+                        사용 가능한 프록시 중 하나를 통해 라우팅합니다.
                       </div>
                     </div>
                     <ProxySelector
@@ -414,9 +413,9 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Browser Session ID</div>
+                      <div className="text-sm">브라우저 세션 ID</div>
                       <div className="text-xs text-slate-400">
-                        The ID of a persistent browser session
+                        영구 브라우저 세션의 ID
                       </div>
                     </div>
                     <Input
@@ -429,10 +428,9 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Browser Address</div>
+                      <div className="text-sm">브라우저 주소</div>
                       <div className="text-xs text-slate-400">
-                        The address of the Browser server to use for the task
-                        run.
+                        작업 실행에 사용할 브라우저 서버의 주소
                       </div>
                     </div>
                     <Input
@@ -445,9 +443,9 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">2FA Identifier</div>
+                      <div className="text-sm">2FA 식별자</div>
                       <div className="text-xs text-slate-400">
-                        The identifier for a 2FA code for this task.
+                        이 작업에 대한 2FA 코드의 식별자
                       </div>
                     </div>
                     <Input
@@ -459,10 +457,9 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Extra HTTP Headers</div>
+                      <div className="text-sm">추가 HTTP 헤더</div>
                       <div className="text-xs text-slate-400">
-                        Specify some self defined HTTP requests headers in Dict
-                        format
+                        Dict 형식으로 사용자 정의 HTTP 요청 헤더 지정
                       </div>
                     </div>
                     <div className="flex-1">
@@ -477,17 +474,16 @@ function PromptBox() {
                                 : JSON.stringify(val),
                           )
                         }
-                        addButtonText="Add Header"
+                        addButtonText="헤더 추가"
                       />
                     </div>
                   </div>
 
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Generate Script</div>
+                      <div className="text-sm">스크립트 생성</div>
                       <div className="text-xs text-slate-400">
-                        Whether to generate scripts for this task run (on
-                        success).
+                        이 작업 실행 성공 시 스크립트를 생성할지 여부
                       </div>
                     </div>
                     <Switch
@@ -499,10 +495,9 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Publish Workflow</div>
+                      <div className="text-sm">워크플로우 게시</div>
                       <div className="text-xs text-slate-400">
-                        Whether to create a workflow alongside this task run.
-                        Will also be created if "Generate Scripts" is true.
+                        이 작업 실행과 함께 워크플로우를 생성할지 여부. "스크립트 생성"이 활성화되면 자동으로 생성됩니다.
                       </div>
                     </div>
                     <Switch
@@ -514,14 +509,14 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Max Steps Override</div>
+                      <div className="text-sm">최대 단계 수</div>
                       <div className="text-xs text-slate-400">
-                        The maximum number of steps to take for this task.
+                        이 작업에 대한 최대 단계 수
                       </div>
                     </div>
                     <Input
                       value={maxStepsOverride ?? ""}
-                      placeholder={`Default: ${MAX_STEPS_DEFAULT}`}
+                      placeholder={`기본값: ${MAX_STEPS_DEFAULT}`}
                       onChange={(event) => {
                         setMaxStepsOverride(event.target.value);
                       }}
@@ -529,9 +524,9 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Data Schema</div>
+                      <div className="text-sm">데이터 스키마</div>
                       <div className="text-xs text-slate-400">
-                        Specify the output data schema in JSON format
+                        JSON 형식으로 출력 데이터 스키마 지정
                       </div>
                     </div>
                     <div className="flex-1">
@@ -547,14 +542,14 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Max Screenshot Scrolls</div>
+                      <div className="text-sm">최대 스크린샷 스크롤</div>
                       <div className="text-xs text-slate-400">
-                        {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                        {`작업 후 스크린샷의 최대 스크롤 수. 기본값은 ${MAX_SCREENSHOT_SCROLLS_DEFAULT}입니다. 0으로 설정하면 현재 뷰포트 스크린샷만 캡처합니다.`}
                       </div>
                     </div>
                     <Input
                       value={maxScreenshotScrolls ?? ""}
-                      placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
+                      placeholder={`기본값: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
                       onChange={(event) => {
                         setMaxScreenshotScrolls(event.target.value);
                       }}

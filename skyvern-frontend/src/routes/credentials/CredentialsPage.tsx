@@ -111,37 +111,36 @@ function CredentialsPage() {
       {activeTab !== "twoFactor" && (
         <div className="mt-8 border-t border-slate-700 pt-4">
           <div className="text-sm italic text-slate-400">
-            <strong>Note:</strong> This feature requires a Bitwarden-compatible
-            server ({" "}
+            <strong>참고:</strong> 이 기능을 사용하려면 Bitwarden 호환 서버({" "}
             <a
               href="https://bitwarden.com/help/self-host-an-organization/"
               target="_blank"
               rel="noopener noreferrer"
               className="text-blue-400 underline hover:text-blue-300"
             >
-              self-hosted Bitwarden
+              자체 호스팅 Bitwarden
             </a>{" "}
-            ) or{" "}
+            ) 또는{" "}
             <a
               href="https://github.com/dani-garcia/vaultwarden"
               target="_blank"
               rel="noopener noreferrer"
               className="text-blue-400 underline hover:text-blue-300"
             >
-              this community version
+              이 커뮤니티 버전
             </a>{" "}
-            or a paid Bitwarden account. Make sure the relevant
-            `SKYVERN_AUTH_BITWARDEN_*` environment variables are configured. See
-            details{" "}
+            또는 유료 Bitwarden 계정이 필요합니다. 관련
+            `SKYVERN_AUTH_BITWARDEN_*` 환경 변수가 구성되어 있는지 확인하세요.
+            자세한 내용은{" "}
             <a
               href="https://docs.skyvern.com/credentials/bitwarden"
               target="_blank"
               rel="noopener noreferrer"
               className="text-blue-400 underline hover:text-blue-300"
             >
-              here
+              여기
             </a>
-            .
+            에서 확인하세요.
           </div>
         </div>
       )}

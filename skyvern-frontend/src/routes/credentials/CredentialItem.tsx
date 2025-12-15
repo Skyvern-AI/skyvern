@@ -10,11 +10,11 @@ function CredentialItem({ credential }: Props) {
   const getTotpTypeDisplay = (totpType: string) => {
     switch (totpType) {
       case "authenticator":
-        return "Authenticator App";
+        return "인증 앱";
       case "email":
-        return "Email";
+        return "이메일";
       case "text":
-        return "Text Message";
+        return "문자 메시지";
       case "none":
       default:
         return "";
@@ -33,10 +33,10 @@ function CredentialItem({ credential }: Props) {
         <div className="border-l pl-5">
           <div className="flex gap-5">
             <div className="shrink-0 space-y-2">
-              <p className="text-sm text-slate-400">Username/Email</p>
-              <p className="text-sm text-slate-400">Password</p>
+              <p className="text-sm text-slate-400">사용자명/이메일</p>
+              <p className="text-sm text-slate-400">비밀번호</p>
               {credential.credential.totp_type !== "none" && (
-                <p className="text-sm text-slate-400">2FA Type</p>
+                <p className="text-sm text-slate-400">2FA 유형</p>
               )}
             </div>
             <div className="space-y-2">
@@ -54,8 +54,8 @@ function CredentialItem({ credential }: Props) {
         <div className="flex gap-5 border-l pl-5">
           <div className="flex gap-5">
             <div className="shrink-0 space-y-2">
-              <p className="text-sm text-slate-400">Card Number</p>
-              <p className="text-sm text-slate-400">Brand</p>
+              <p className="text-sm text-slate-400">카드 번호</p>
+              <p className="text-sm text-slate-400">브랜드</p>
             </div>
           </div>
           <div className="flex gap-5">

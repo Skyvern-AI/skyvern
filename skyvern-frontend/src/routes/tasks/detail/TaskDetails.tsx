@@ -120,14 +120,14 @@ function TaskDetails() {
       }
       toast({
         variant: "success",
-        title: "Task Canceled",
-        description: "The task has been successfully canceled.",
+        title: "작업 취소됨",
+        description: "작업이 성공적으로 취소되었습니다.",
       });
     },
     onError: (error) => {
       toast({
         variant: "destructive",
-        title: "Error",
+        title: "오류",
         description: error.message,
       });
     },
@@ -149,7 +149,7 @@ function TaskDetails() {
     task?.status === Status.Completed && task.extracted_information !== null;
   const extractedInformation = showExtractedInformation ? (
     <div className="space-y-1">
-      <Label className="text-lg">Extracted Information</Label>
+      <Label className="text-lg">추출된 정보</Label>
       <CodeEditor
         language="json"
         value={JSON.stringify(task.extracted_information, null, 2)}
@@ -172,7 +172,7 @@ function TaskDetails() {
     task?.status === Status.TimedOut;
   const failureReason = showFailureReason ? (
     <div className="space-y-1">
-      <Label className="text-lg">Failure Reason</Label>
+      <Label className="text-lg">실패 이유</Label>
       <CodeEditor
         language="json"
         value={JSON.stringify(task.failure_reason, null, 2)}
@@ -186,7 +186,7 @@ function TaskDetails() {
 
   const webhookFailureReason = task?.webhook_failure_reason ? (
     <div className="space-y-1">
-      <Label>Webhook Failure Reason</Label>
+      <Label>웹훅 실패 이유</Label>
       <div className="rounded-md border border-yellow-600 p-4 text-sm">
         {task.webhook_failure_reason}
       </div>
@@ -258,18 +258,18 @@ function TaskDetails() {
             {taskIsRunningOrQueued && (
               <Dialog>
                 <DialogTrigger asChild>
-                  <Button variant="destructive">Cancel</Button>
+                  <Button variant="destructive">취소</Button>
                 </DialogTrigger>
                 <DialogContent>
                   <DialogHeader>
-                    <DialogTitle>Are you sure?</DialogTitle>
+                    <DialogTitle>확실합니까?</DialogTitle>
                     <DialogDescription>
-                      Are you sure you want to cancel this task?
+                      이 작업을 취소하시겠습니까?
                     </DialogDescription>
                   </DialogHeader>
                   <DialogFooter>
                     <DialogClose asChild>
-                      <Button variant="secondary">Back</Button>
+                      <Button variant="secondary">뒤로</Button>
                     </DialogClose>
                     <Button
                       variant="destructive"
@@ -281,7 +281,7 @@ function TaskDetails() {
                       {cancelTaskMutation.isPending && (
                         <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
                       )}
-                      Cancel Task
+                      작업 취소
                     </Button>
                   </DialogFooter>
                 </DialogContent>
@@ -291,7 +291,7 @@ function TaskDetails() {
               <Button asChild>
                 <Link to={`/tasks/create/retry/${task.task_id}`}>
                   <PlayIcon className="mr-2 h-4 w-4" />
-                  Rerun
+                  재실행
                 </Link>
               </Button>
             )}
@@ -329,19 +329,19 @@ function TaskDetails() {
       <SwitchBarNavigation
         options={[
           {
-            label: "Actions",
+            label: "작업",
             to: "actions",
           },
           {
-            label: "Recording",
+            label: "녹화",
             to: "recording",
           },
           {
-            label: "Parameters",
+            label: "매개변수",
             to: "parameters",
           },
           {
-            label: "Diagnostics",
+            label: "진단",
             to: "diagnostics",
           },
         ]}

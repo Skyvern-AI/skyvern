@@ -23,7 +23,7 @@ function CopyApiCommandDropdown({ getOptions }: Props) {
       <DropdownMenuTrigger asChild>
         <Button type="button" variant="secondary">
           <CopyIcon className="mr-2 h-4 w-4" />
-          Copy API Command
+          API 명령어 복사
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent>
@@ -33,14 +33,13 @@ function CopyApiCommandDropdown({ getOptions }: Props) {
             copyText(curl).then(() => {
               toast({
                 variant: "success",
-                title: "Copied to Clipboard",
-                description:
-                  "The cURL command has been copied to your clipboard.",
+                title: "클립보드에 복사됨",
+                description: "cURL 명령어가 클립보드에 복사되었습니다.",
               });
             });
           }}
         >
-          Copy cURL (Unix/Linux/macOS)
+          cURL 복사 (Unix/Linux/macOS)
         </DropdownMenuItem>
         <DropdownMenuItem
           onSelect={() => {
@@ -48,14 +47,14 @@ function CopyApiCommandDropdown({ getOptions }: Props) {
             copyText(powershell).then(() => {
               toast({
                 variant: "success",
-                title: "Copied to Clipboard",
+                title: "클립보드에 복사됨",
                 description:
-                  "The PowerShell command has been copied to your clipboard.",
+                  "PowerShell 명령어가 클립보드에 복사되었습니다.",
               });
             });
           }}
         >
-          Copy PowerShell (Windows)
+          PowerShell 복사 (Windows)
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
