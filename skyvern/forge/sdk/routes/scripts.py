@@ -418,7 +418,7 @@ async def get_workflow_script_blocks(
         raise HTTPException(status_code=404, detail="Workflow not found")
     workflow_run_id = block_script_request.workflow_run_id
     if workflow_run_id:
-        workflow_run = await app.DATABASE.get_workflow_run(
+        workflow_run = await app.REPLICA_DATABASE.get_workflow_run(
             workflow_run_id=workflow_run_id,
             organization_id=current_org.organization_id,
         )
@@ -441,7 +441,7 @@ async def get_workflow_script_blocks(
     cache_key = block_script_request.cache_key or workflow.cache_key or ""
     status = block_script_request.status
 
-    script = await app.DATABASE.get_workflow_script_by_cache_key_value(
+    script = await app.REPLICA_DATABASE.get_workflow_script_by_cache_key_value(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         workflow_run_id=block_script_request.workflow_run_id,
