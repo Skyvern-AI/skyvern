@@ -74,7 +74,22 @@ class SkyvernPage(Page):
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        return await fn(self, *args, **kwargs)
+        context = skyvern_context.current()
+        # label = self.current_label
+        # action_override = None
+        # if context and label:
+        #     current_count = context.action_counters.get(label, 0) + 1
+        # context.action_counters[label] = current_count
+        # action_override = context.action_ai_overrides.get(label, {}).get(current_count)
+        # context.ai_mode_override = action_override
+
+        try:
+            return await fn(self, *args, **kwargs)
+        finally:
+            if context:
+                # Reset override after each action so defaults apply when no mapping is provided.
+                # context.ai_mode_override = None
+                pass
 
     @staticmethod
     def action_wrap(
