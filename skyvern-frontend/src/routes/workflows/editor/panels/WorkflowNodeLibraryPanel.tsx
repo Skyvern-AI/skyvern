@@ -319,15 +319,6 @@ function WorkflowNodeLibraryPanel({
       };
     }
 
-    // Disable conditional inside loop
-    if (nodeType === "conditional" && parentType === "loop") {
-      return {
-        disabled: true,
-        reason:
-          "We're working on supporting conditionals inside loops. Soon you'll be able to use this feature!",
-      };
-    }
-
     // Disable loop inside conditional
     if (nodeType === "loop" && parentType === "conditional") {
       return {
