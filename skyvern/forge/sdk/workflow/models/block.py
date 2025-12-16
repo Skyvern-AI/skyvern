@@ -33,6 +33,7 @@ from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     GET_DOWNLOADED_FILES_TIMEOUT,
     MAX_UPLOAD_FILE_COUNT,
+    SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
@@ -53,6 +54,7 @@ from skyvern.forge.sdk.api.files import (
     create_named_temporary_file,
     download_file,
     download_from_s3,
+    get_effective_download_run_id,
     get_path_for_workflow_download_directory,
     parse_uri_to_path,
 )
@@ -846,14 +848,41 @@ class BaseTaskBlock(Block):
                 )
                 success = updated_task.status == TaskStatus.completed
 
+                # Determine the run_id for download operations (consistent across save and get)
+                download_run_id = get_effective_download_run_id(
+                    context_run_id=current_context.run_id if current_context else None,
+                    workflow_run_id=workflow_run_id,
+                    task_id=updated_task.task_id,
+                )
+
+                # Ensure downloaded files are saved to storage before querying
+                # This fixes timing issue where files are in local dir but not yet in S3
+                try:
+                    async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                        await app.STORAGE.save_downloaded_files(
+                            organization_id=workflow_run.organization_id,
+                            run_id=download_run_id,
+                        )
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "Timeout saving downloaded files before building block output",
+                        task_id=updated_task.task_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to save downloaded files before building block output",
+                        exc_info=True,
+                        task_id=updated_task.task_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+
                 downloaded_files: list[FileInfo] = []
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                         downloaded_files = await app.STORAGE.get_downloaded_files(
                             organization_id=workflow_run.organization_id,
-                            run_id=current_context.run_id
-                            if current_context and current_context.run_id
-                            else workflow_run_id or updated_task.task_id,
+                            run_id=download_run_id,
                         )
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
