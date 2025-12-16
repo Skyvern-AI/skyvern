@@ -938,12 +938,22 @@ function reconstructConditionalStructure(
     if (block.block_type !== "conditional") {
       if (block.block_type === "for_loop") {
         // Recursively handle conditionals inside loops
-        reconstructConditionalStructure(
+        const recursiveResult = reconstructConditionalStructure(
           block.loop_blocks,
           newNodes,
           labelToNodeMap,
           blocksByLabel,
         );
+        // Merge edges from recursive call
+        newEdges.push(...recursiveResult.edges);
+        // Merge nodes from recursive call (deduplicate by id)
+        const existingNodeIds = new Set(newNodes.map((n) => n.id));
+        recursiveResult.nodes.forEach((node) => {
+          if (!existingNodeIds.has(node.id)) {
+            newNodes.push(node);
+            existingNodeIds.add(node.id);
+          }
+        });
       }
       return;
     }
@@ -1312,8 +1322,12 @@ function getElements(
     }
   });
 
-  const loopBlocks = data.filter((d) => d.block.block_type === "for_loop");
+  const loopBlocks = data.filter(
+    (d): d is typeof d & { block: ForLoopBlock } =>
+      d.block.block_type === "for_loop",
+  );
   loopBlocks.forEach((block) => {
+    const loopBlock = block.block;
     const startNodeId = nanoid();
     nodes.push(
       startNode(
@@ -1327,32 +1341,67 @@ function getElements(
         block.id,
       ),
     );
-    const children = data.filter((b) => b.parentId === block.id);
+
+    // Collect labels that belong to conditional branches inside this loop so we
+    // don't chain them as top-level loop children (they are handled by the
+    // conditional's own edges).
+    const branchLabels = new Set<string>();
+    const collectBranchLabels = (loopChildren: Array<WorkflowBlock>) => {
+      loopChildren.forEach((child) => {
+        if (child.block_type === "conditional") {
+          child.branch_conditions.forEach((branch) => {
+            collectLabelsForBranch(
+              branch.next_block_label,
+              child.next_block_label ?? null,
+              blocksByLabel,
+            ).forEach((label) => branchLabels.add(label));
+          });
+        }
+        if (child.block_type === "for_loop") {
+          collectBranchLabels(child.loop_blocks);
+        }
+      });
+    };
+    collectBranchLabels(loopBlock.loop_blocks);
+
+    // Only keep loop children that are not part of any conditional branch.
+    const children = data.filter(
+      (b) => b.parentId === block.id && !branchLabels.has(b.block.label),
+    );
     const adderNodeId = nanoid();
+
     if (children.length === 0) {
       edges.push(defaultEdge(startNodeId, adderNodeId));
     } else {
-      const firstChild = children.find((c) => c.previous === null)!;
-      edges.push(edgeWithAddButton(startNodeId, firstChild.id));
-
-      // Chain loop children based on their next pointers
       const childById = new Map<string, (typeof children)[number]>();
       children.forEach((c) => childById.set(c.id, c));
+
+      const firstChild =
+        children.find(
+          (c) => c.previous === null || !childById.has(c.previous),
+        ) ?? children[0]!;
+      edges.push(edgeWithAddButton(startNodeId, firstChild.id));
+
       let current = firstChild;
-      while (current?.next) {
-        const nextChild = childById.get(current.next);
+      let lastChild = firstChild;
+      while (current) {
+        const nextChild = current.next ? childById.get(current.next) : null;
         if (!nextChild) {
           break;
         }
         edges.push(edgeWithAddButton(current.id, nextChild.id));
+        lastChild = nextChild;
         current = nextChild;
       }
+
+      nodes.push(nodeAdderNode(adderNodeId, block.id));
+      if (lastChild) {
+        edges.push(defaultEdge(lastChild.id, adderNodeId));
+      }
+      return;
     }
-    const lastChild = children.find((c) => c.next === null);
+
     nodes.push(nodeAdderNode(adderNodeId, block.id));
-    if (lastChild) {
-      edges.push(defaultEdge(lastChild.id, adderNodeId));
-    }
   });
 
   // Reconstruct conditional hierarchy and create conditional edges
@@ -2219,6 +2268,20 @@ function getOrderedChildrenBlocks(
   edges: Array<Edge>,
   parentId: string,
 ): Array<BlockYAML> {
+  const nodesById = new Map(nodes.map((n) => [n.id, n]));
+  const includedIds = new Set<string>();
+
+  const hasAncestor = (nodeId: string | null, ancestorId: string): boolean => {
+    let current = nodeId ? nodesById.get(nodeId) : undefined;
+    while (current) {
+      if (current.parentId === ancestorId) {
+        return true;
+      }
+      current = current.parentId ? nodesById.get(current.parentId) : undefined;
+    }
+    return false;
+  };
+
   const parentNode = nodes.find((node) => node.id === parentId);
   if (!parentNode) {
     return [];
@@ -2240,6 +2303,7 @@ function getOrderedChildrenBlocks(
   const children: Array<BlockYAML> = [];
   let currentNode: WorkflowBlockNode | undefined = firstChild;
   while (currentNode) {
+    includedIds.add(currentNode.id);
     if (currentNode.type === "loop") {
       const loopChildren = getOrderedChildrenBlocks(
         nodes,
@@ -2264,6 +2328,38 @@ function getOrderedChildrenBlocks(
     const next = nodes.find((node) => node.id === nextId);
     currentNode = next && isWorkflowBlockNode(next) ? next : undefined;
   }
+
+  // Add any additional workflow block nodes that belong under this parent (e.g., conditional branches)
+  nodes.forEach((node) => {
+    if (!isWorkflowBlockNode(node)) {
+      return;
+    }
+    if (includedIds.has(node.id)) {
+      return;
+    }
+    if (!hasAncestor(node.id, parentId)) {
+      return;
+    }
+
+    if (node.type === "loop") {
+      const loopChildren = getOrderedChildrenBlocks(nodes, edges, node.id);
+      children.push({
+        block_type: "for_loop",
+        label: node.data.label,
+        continue_on_failure: node.data.continueOnFailure,
+        next_loop_on_failure: node.data.nextLoopOnFailure,
+        loop_blocks: loopChildren,
+        loop_variable_reference: node.data.loopVariableReference,
+        complete_if_empty: node.data.completeIfEmpty,
+      });
+      includedIds.add(node.id);
+      return;
+    }
+
+    children.push(getWorkflowBlock(node, nodes, edges));
+    includedIds.add(node.id);
+  });
+
   return children;
 }
 
@@ -2271,6 +2367,20 @@ function getWorkflowBlocksUtil(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
 ): Array<BlockYAML> {
+  const nodesById = new Map(nodes.map((n) => [n.id, n]));
+
+  const isInsideLoop = (nodeId: string): boolean => {
+    let current = nodesById.get(nodeId);
+    while (current?.parentId) {
+      const parent = nodesById.get(current.parentId);
+      if (parent?.type === "loop") {
+        return true;
+      }
+      current = parent;
+    }
+    return false;
+  };
+
   return nodes.flatMap((node) => {
     // Skip utility nodes
     if (node.type === "start" || node.type === "nodeAdder") {
@@ -2280,6 +2390,11 @@ function getWorkflowBlocksUtil(
     // Check if this node is inside a conditional branch
     const isConditionalBranchNode =
       isWorkflowBlockNode(node) && node.data.conditionalNodeId;
+
+    // If this node is inside any loop, it will be emitted through that loop's loop_blocks
+    if (isInsideLoop(node.id)) {
+      return [];
+    }
 
     // Skip nodes with parentId UNLESS they're in a conditional branch
     // (loop children should be filtered out, conditional branch children should stay)
