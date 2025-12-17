@@ -11198,7 +11198,7 @@
             "title": "Prompt",
             "description": "The prompt to send to the LLM"
           },
-          "schema": {
+          "response_schema": {
             "anyOf": [
               {
                 "additionalProperties": true,
@@ -11208,7 +11208,7 @@
                 "type": "null"
               }
             ],
-            "title": "Schema",
+            "title": "Response Schema",
             "description": "Optional JSON schema to structure the response"
           },
           "model": {
