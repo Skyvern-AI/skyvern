@@ -9,6 +9,7 @@ import type * as Skyvern from "../../index.js";
  *         page_size: 1,
  *         only_saved_tasks: true,
  *         only_workflows: true,
+ *         only_templates: true,
  *         search_key: "search_key",
  *         title: "title",
  *         folder_id: "folder_id",
@@ -20,6 +21,7 @@ export interface GetWorkflowsRequest {
     page_size?: number;
     only_saved_tasks?: boolean;
     only_workflows?: boolean;
+    only_templates?: boolean;
     /** Unified search across workflow title, folder name, and parameter metadata (key, description, default_value). */
     search_key?: string;
     /** Deprecated: use search_key instead. */

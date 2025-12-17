@@ -1,0 +1,1 @@
+export type { SetWorkflowTemplateStatusV1WorkflowsWorkflowPermanentIdTemplatePutRequest } from "./SetWorkflowTemplateStatusV1WorkflowsWorkflowPermanentIdTemplatePutRequest.js";
