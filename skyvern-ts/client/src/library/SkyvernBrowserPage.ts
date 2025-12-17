@@ -154,26 +154,98 @@ export class SkyvernBrowserPageCore {
         }
     }
 
+    /**
+     * Fill an input field using a CSS selector, AI-powered prompt matching, or both.
+     *
+     * This method supports three modes:
+     * - **Selector-based**: Fill the input field with a value using CSS selector
+     * - **AI-powered**: Use natural language prompt (AI extracts value from prompt or uses provided value)
+     * - **Fallback mode**: Try the selector first, fall back to AI if it fails
+     *
+     * @param selector - CSS selector for the target input element.
+     * @param value - The text value to input into the field.
+     * @param options - Fill options including prompt.
+     * @param options.prompt - Natural language description of which field to fill and what value.
+     *
+     * @example
+     * ```typescript
+     * // Fill using selector and value
+     * await page.fill("#email-input", "user@example.com");
+     *
+     * // Fill using AI with natural language
+     * await page.fill({ prompt: "Fill 'user@example.com' in the email address field" });
+     *
+     * // Try selector first, fall back to AI if selector fails
+     * await page.fill("#email-input", "user@example.com", { prompt: "Fill the email address" });
+     * ```
+     */
     async fill(selector: string, value: string, options?: Parameters<Page["fill"]>[2]): Promise<void>;
     async fill(options: { prompt: string; value?: string } & Partial<Parameters<Page["fill"]>[2]>): Promise<void>;
     async fill(
-        selectorOrOptions: string | ({ prompt: string; value?: string } & Partial<Parameters<Page["fill"]>[2]>),
+        selector: string,
+        value: string,
+        options: { prompt: string } & Partial<Parameters<Page["fill"]>[2]>,
+    ): Promise<void>;
+    async fill(
+        selectorOrOptions?: string | ({ prompt: string; value?: string } & Partial<Parameters<Page["fill"]>[2]>),
         value?: string,
-        options?: Parameters<Page["fill"]>[2],
+        options?: Parameters<Page["fill"]>[2] | ({ prompt?: string } & Partial<Parameters<Page["fill"]>[2]>),
     ): Promise<void> {
+        let selector: string | undefined;
+        let fillValue: string | undefined;
+        let prompt: string | undefined;
+        let fillOptions: Partial<Parameters<Page["fill"]>[2]> = {};
+        let timeout: number | undefined;
+
         if (typeof selectorOrOptions === "string") {
-            if (value === undefined) {
-                throw new Error("value is required when selector is provided");
+            selector = selectorOrOptions;
+            fillValue = value;
+            if (options && typeof options === "object") {
+                const { prompt: p, timeout: t, ...rest } = options as {
+                    prompt?: string;
+                    timeout?: number;
+                } & Partial<Parameters<Page["fill"]>[2]>;
+                prompt = p;
+                timeout = t;
+                fillOptions = rest;
+            } else if (options) {
+                fillOptions = options;
             }
-            return this._page.fill(selectorOrOptions, value, options);
-        } else {
-            const { prompt, value: fillValue, timeout, ...data } = selectorOrOptions;
+        } else if (selectorOrOptions && typeof selectorOrOptions === "object") {
+            const { prompt: p, value: v, timeout: t, ...rest } = selectorOrOptions;
+            prompt = p;
+            fillValue = v;
+            timeout = t;
+            fillOptions = rest;
+        }
+
+        if (!selector && !prompt) {
+            throw new Error("Missing input: pass a selector and/or a prompt.");
+        }
+
+        let errorToRaise: Error | undefined;
+        if (selector && fillValue !== undefined) {
+            try {
+                await this._page.fill(selector, fillValue, { ...fillOptions, timeout });
+                return;
+            } catch (error) {
+                errorToRaise = error as Error;
+                selector = undefined;
+            }
+        }
+
+        if (prompt) {
             await this._ai.aiInputText({
                 value: fillValue,
                 intention: prompt,
+                data: Object.keys(fillOptions).length > 0 ? fillOptions : undefined,
                 timeout,
-                data: Object.keys(data).length > 0 ? data : undefined,
             });
+            return;
+        }
+
+        if (errorToRaise) {
+            throw errorToRaise;
         }
     }
 
