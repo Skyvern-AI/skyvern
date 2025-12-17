@@ -249,33 +249,109 @@ export class SkyvernBrowserPageCore {
         }
     }
 
+    /**
+     * Select an option from a dropdown using a CSS selector, AI-powered prompt matching, or both.
+     *
+     * This method supports three modes:
+     * - **Selector-based**: Select the option with a value using CSS selector
+     * - **AI-powered**: Use natural language prompt (AI extracts value from prompt or uses provided value)
+     * - **Fallback mode**: Try the selector first, fall back to AI if it fails
+     *
+     * @param selector - CSS selector for the target select/dropdown element.
+     * @param value - The option value to select.
+     * @param options - Select options including prompt.
+     * @param options.prompt - Natural language description of which option to select.
+     *
+     * @example
+     * ```typescript
+     * // Select using selector and value
+     * await page.selectOption("#country", "us");
+     *
+     * // Select using AI with natural language
+     * await page.selectOption({ prompt: "Select 'United States' from the country dropdown" });
+     *
+     * // Try selector first, fall back to AI if selector fails
+     * await page.selectOption("#country", "us", { prompt: "Select United States from country" });
+     * ```
+     */
     async selectOption(
         selector: string,
         values: string | string[],
         options?: Parameters<Page["selectOption"]>[2],
-    ): Promise<string[]>;
+    ): Promise<void>;
     async selectOption(
         options: { prompt: string; value?: string } & Partial<Parameters<Page["selectOption"]>[2]>,
-    ): Promise<string[]>;
+    ): Promise<void>;
     async selectOption(
-        selectorOrOptions: string | ({ prompt: string; value?: string } & Partial<Parameters<Page["selectOption"]>[2]>),
+        selector: string,
+        values: string | string[],
+        options: { prompt: string } & Partial<Parameters<Page["selectOption"]>[2]>,
+    ): Promise<void>;
+    async selectOption(
+        selectorOrOptions?:
+            | string
+            | ({ prompt: string; value?: string } & Partial<Parameters<Page["selectOption"]>[2]>),
         values?: string | string[],
-        options?: Parameters<Page["selectOption"]>[2],
-    ): Promise<string[]> {
+        options?: Parameters<Page["selectOption"]>[2] | ({ prompt?: string } & Partial<Parameters<Page["selectOption"]>[2]>),
+    ): Promise<void> {
+        let selector: string | undefined;
+        let selectValue: string | string[] | undefined;
+        let prompt: string | undefined;
+        let selectOptions: Partial<Parameters<Page["selectOption"]>[2]> = {};
+        let timeout: number | undefined;
+
+        // Parse arguments
         if (typeof selectorOrOptions === "string") {
-            if (values === undefined) {
-                throw new Error("value is required when selector is provided");
+            selector = selectorOrOptions;
+            selectValue = values;
+            if (options && typeof options === "object") {
+                const { prompt: p, timeout: t, ...rest } = options as {
+                    prompt?: string;
+                    timeout?: number;
+                } & Partial<Parameters<Page["selectOption"]>[2]>;
+                prompt = p;
+                timeout = t;
+                selectOptions = rest;
+            } else if (options) {
+                selectOptions = options;
             }
-            return this._page.selectOption(selectorOrOptions, values, options);
-        } else {
-            const { prompt, value, timeout, ...data } = selectorOrOptions;
+        } else if (selectorOrOptions && typeof selectorOrOptions === "object") {
+            const { prompt: p, value: v, timeout: t, ...rest } = selectorOrOptions;
+            prompt = p;
+            selectValue = v;
+            timeout = t;
+            selectOptions = rest;
+        }
+
+        if (!selector && !prompt) {
+            throw new Error("Missing input: pass a selector and/or a prompt.");
+        }
+
+        // Try to select the option with the original selector first
+        let errorToRaise: Error | undefined;
+        if (selector && selectValue !== undefined) {
+            try {
+                await this._page.selectOption(selector, selectValue, { ...selectOptions, timeout });
+                return;
+            } catch (error) {
+                errorToRaise = error as Error;
+                selector = undefined;
+            }
+        }
+
+        // If the original selector doesn't work, try to select the option with AI
+        if (prompt) {
             await this._ai.aiSelectOption({
-                value,
+                value: typeof selectValue === "string" ? selectValue : selectValue?.[0],
                 intention: prompt,
+                data: Object.keys(selectOptions).length > 0 ? selectOptions : undefined,
                 timeout,
-                data: Object.keys(data).length > 0 ? data : undefined,
             });
-            return value ? [value] : [];
+            return;
+        }
+
+        if (errorToRaise) {
+            throw errorToRaise;
         }
     }
 
