@@ -172,7 +172,7 @@ class RunSdkActionRequestAction_Prompt(UniversalBaseModel):
 
     type: typing.Literal["prompt"] = "prompt"
     prompt: str
-    response_schema: typing_extensions.Annotated[
+    schema_: typing_extensions.Annotated[
         typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]], FieldMetadata(alias="schema")
     ] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None

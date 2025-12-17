@@ -496,7 +496,7 @@ if typing.TYPE_CHECKING:
         WorkflowStatus,
     )
     from .errors import BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnprocessableEntityError
-    from . import scripts
+    from . import scripts, workflows
     from .client import AsyncSkyvern, Skyvern
     from .environment import SkyvernEnvironment
     from .version import __version__
@@ -998,6 +998,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowStatus": ".types",
     "__version__": ".version",
     "scripts": ".scripts",
+    "workflows": ".workflows",
 }
 
 
@@ -1520,4 +1521,5 @@ __all__ = [
     "WorkflowStatus",
     "__version__",
     "scripts",
+    "workflows",
 ]
