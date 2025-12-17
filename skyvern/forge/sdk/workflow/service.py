@@ -2730,7 +2730,13 @@ class WorkflowService:
             await self.persist_video_data(browser_state, workflow, workflow_run)
             if tasks:
                 await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
-            if workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir:
+            # Skip workflow-scoped session save when using browser_profile_id to avoid conflicts
+            # (profile persistence is handled separately via the profile storage)
+            if (
+                workflow.persist_browser_session
+                and browser_state.browser_artifacts.browser_session_dir
+                and not workflow_run.browser_profile_id
+            ):
                 await app.STORAGE.store_browser_session(
                     workflow_run.organization_id,
                     workflow.workflow_permanent_id,

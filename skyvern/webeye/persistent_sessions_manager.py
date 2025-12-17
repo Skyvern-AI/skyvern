@@ -9,6 +9,7 @@ from playwright._impl._errors import TargetClosedError
 
 from skyvern.config import settings
 from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
+from skyvern.forge import app
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -313,6 +314,28 @@ class PersistentSessionsManager:
                 organization_id=organization_id,
                 session_id=browser_session_id,
             )
+
+            # Export session profile before closing (so it can be used to create browser profiles)
+            browser_artifacts = browser_session.browser_state.browser_artifacts
+            if browser_artifacts and browser_artifacts.browser_session_dir:
+                try:
+                    await app.STORAGE.store_browser_profile(
+                        organization_id=organization_id,
+                        profile_id=browser_session_id,
+                        directory=browser_artifacts.browser_session_dir,
+                    )
+                    LOG.info(
+                        "Exported browser session profile",
+                        browser_session_id=browser_session_id,
+                        organization_id=organization_id,
+                    )
+                except Exception:
+                    LOG.exception(
+                        "Failed to export browser session profile",
+                        browser_session_id=browser_session_id,
+                        organization_id=organization_id,
+                    )
+
             self._browser_sessions.pop(browser_session_id, None)
 
             try:
