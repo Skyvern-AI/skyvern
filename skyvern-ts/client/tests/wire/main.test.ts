@@ -535,6 +535,7 @@ describe("SkyvernClient", () => {
                 workflow_permanent_id: "workflow_permanent_id",
                 version: 1,
                 is_saved_task: true,
+                is_template: true,
                 description: "description",
                 workflow_definition: {
                     version: 1,
@@ -591,6 +592,7 @@ describe("SkyvernClient", () => {
             page_size: 1,
             only_saved_tasks: true,
             only_workflows: true,
+            only_templates: true,
             search_key: "search_key",
             title: "title",
             folder_id: "folder_id",
@@ -604,6 +606,7 @@ describe("SkyvernClient", () => {
                 workflow_permanent_id: "workflow_permanent_id",
                 version: 1,
                 is_saved_task: true,
+                is_template: true,
                 description: "description",
                 workflow_definition: {
                     version: 1,
@@ -682,6 +685,7 @@ describe("SkyvernClient", () => {
             workflow_permanent_id: "workflow_permanent_id",
             version: 1,
             is_saved_task: true,
+            is_template: true,
             description: "description",
             workflow_definition: {
                 version: 1,
@@ -750,6 +754,7 @@ describe("SkyvernClient", () => {
             workflow_permanent_id: "workflow_permanent_id",
             version: 1,
             is_saved_task: true,
+            is_template: true,
             description: "description",
             workflow_definition: {
                 version: 1,
@@ -836,6 +841,7 @@ describe("SkyvernClient", () => {
             workflow_permanent_id: "workflow_permanent_id",
             version: 1,
             is_saved_task: true,
+            is_template: true,
             description: "description",
             workflow_definition: {
                 version: 1,
@@ -901,6 +907,7 @@ describe("SkyvernClient", () => {
             workflow_permanent_id: "workflow_permanent_id",
             version: 1,
             is_saved_task: true,
+            is_template: true,
             description: "description",
             workflow_definition: {
                 version: 1,
@@ -1025,6 +1032,7 @@ describe("SkyvernClient", () => {
             step_id: "step_id",
             workflow_run_id: "workflow_run_id",
             workflow_run_block_id: "workflow_run_block_id",
+            run_id: "run_id",
             observer_cruise_id: "observer_cruise_id",
             observer_thought_id: "observer_thought_id",
             ai_suggestion_id: "ai_suggestion_id",
@@ -1050,6 +1058,7 @@ describe("SkyvernClient", () => {
             step_id: "step_id",
             workflow_run_id: "workflow_run_id",
             workflow_run_block_id: "workflow_run_block_id",
+            run_id: "run_id",
             observer_cruise_id: "observer_cruise_id",
             observer_thought_id: "observer_thought_id",
             ai_suggestion_id: "ai_suggestion_id",
@@ -1109,6 +1118,7 @@ describe("SkyvernClient", () => {
                 step_id: "step_id",
                 workflow_run_id: "workflow_run_id",
                 workflow_run_block_id: "workflow_run_block_id",
+                run_id: "run_id",
                 observer_cruise_id: "observer_cruise_id",
                 observer_thought_id: "observer_thought_id",
                 ai_suggestion_id: "ai_suggestion_id",
@@ -1136,6 +1146,7 @@ describe("SkyvernClient", () => {
                 step_id: "step_id",
                 workflow_run_id: "workflow_run_id",
                 workflow_run_block_id: "workflow_run_block_id",
+                run_id: "run_id",
                 observer_cruise_id: "observer_cruise_id",
                 observer_thought_id: "observer_thought_id",
                 ai_suggestion_id: "ai_suggestion_id",

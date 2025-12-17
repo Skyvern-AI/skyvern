@@ -9,6 +9,10 @@ import type { GetRunResponse, ProxyLocation } from "../api/index.js";
 import { LOG } from "./logger.js";
 import * as core from "../core/index.js";
 
+function _getBrowserSessionUrl(browserSessionId: string): string {
+    return `https://app.skyvern.com/browser-session/${browserSessionId}`;
+}
+
 export interface SkyvernOptions extends BaseClientOptions {
     apiKey: string;
 }
@@ -200,7 +204,11 @@ export class Skyvern extends SkyvernClient {
             proxy_location: options?.proxyLocation,
         });
 
-        LOG.info("Launched new cloud browser session", { browser_session_id: browserSession.browser_session_id });
+        if (this._environment === SkyvernEnvironment.Cloud) {
+            LOG.info("Launched new cloud browser session", { url: _getBrowserSessionUrl(browserSession.browser_session_id) });
+        } else {
+            LOG.info("Launched new cloud browser session", { browser_session_id: browserSession.browser_session_id });
+        }
 
         return this._connectToCloudBrowserSession(browserSession);
     }
@@ -217,7 +225,11 @@ export class Skyvern extends SkyvernClient {
 
         const browserSession = await this.getBrowserSession(browserSessionId);
 
-        LOG.info("Connecting to existing cloud browser session", { browser_session_id: browserSession.browser_session_id });
+        if (this._environment === SkyvernEnvironment.Cloud) {
+            LOG.info("Connecting to existing cloud browser session", { url: _getBrowserSessionUrl(browserSession.browser_session_id) });
+        } else {
+            LOG.info("Connecting to existing cloud browser session", { browser_session_id: browserSession.browser_session_id });
+        }
 
         return this._connectToCloudBrowserSession(browserSession);
     }
@@ -254,7 +266,11 @@ export class Skyvern extends SkyvernClient {
             return this.launchCloudBrowser(options);
         }
 
-        LOG.info("Reusing existing cloud browser session", { browser_session_id: browserSession.browser_session_id });
+        if (this._environment === SkyvernEnvironment.Cloud) {
+            LOG.info("Reusing existing cloud browser session", { url: _getBrowserSessionUrl(browserSession.browser_session_id) });
+        } else {
+            LOG.info("Reusing existing cloud browser session", { browser_session_id: browserSession.browser_session_id });
+        }
 
         return this._connectToCloudBrowserSession(browserSession);
     }

@@ -9,6 +9,7 @@ export interface Workflow {
     workflow_permanent_id: string;
     version: number;
     is_saved_task: boolean;
+    is_template?: boolean;
     description?: string;
     workflow_definition: Skyvern.WorkflowDefinition;
     proxy_location?: Workflow.ProxyLocation;

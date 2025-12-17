@@ -99,32 +99,110 @@ export class SkyvernBrowserPageAgent {
     /**
      * Run a login task in the context of this page and wait for it to finish.
      *
-     * @param credentialType - Type of credential store to use (e.g., skyvern, bitwarden, onepassword).
-     * @param options - Optional configuration
-     * @param options.url - URL to navigate to for login. If not provided, uses the current page URL.
-     * @param options.credentialId - ID of the credential to use.
-     * @param options.bitwardenCollectionId - Bitwarden collection ID containing the credentials.
-     * @param options.bitwardenItemId - Bitwarden item ID for the credentials.
-     * @param options.onepasswordVaultId - 1Password vault ID containing the credentials.
-     * @param options.onepasswordItemId - 1Password item ID for the credentials.
-     * @param options.prompt - Additional instructions for the login process.
-     * @param options.webhookUrl - URL to receive webhook notifications about login progress.
-     * @param options.totpIdentifier - Identifier for TOTP authentication.
-     * @param options.totpUrl - URL to fetch TOTP codes from.
-     * @param options.extraHttpHeaders - Additional HTTP headers to include in requests.
-     * @param options.timeout - Maximum time in seconds to wait for login completion.
+     * This method has multiple overloaded signatures for different credential types:
      *
-     * @returns WorkflowRunResponse containing the login workflow execution results.
+     * 1. Skyvern credentials:
+     *    ```typescript
+     *    await page.agent.login("skyvern", {
+     *        credentialId: "cred_123"
+     *    });
+     *    ```
+     *
+     * 2. Bitwarden credentials:
+     *    ```typescript
+     *    await page.agent.login("bitwarden", {
+     *        bitwardenItemId: "item_id",
+     *        bitwardenCollectionId: "collection_id"
+     *    });
+     *    ```
+     *
+     * 3. 1Password credentials:
+     *    ```typescript
+     *    await page.agent.login("1password", {
+     *        onepasswordVaultId: "vault_id",
+     *        onepasswordItemId: "item_id"
+     *    });
+     *    ```
+     *
+     * 4. Azure Vault credentials:
+     *    ```typescript
+     *    await page.agent.login("azure_vault", {
+     *        azureVaultName: "vault_name",
+     *        azureVaultUsernameKey: "username_key",
+     *        azureVaultPasswordKey: "password_key",
+     *    });
+     *    ```
      */
     async login(
-        credentialType: string,
-        options?: {
+        credentialType: "skyvern",
+        options: {
+            credentialId: string;
+            url?: string;
+            prompt?: string;
+            webhookUrl?: string;
+            totpIdentifier?: string;
+            totpUrl?: string;
+            extraHttpHeaders?: Record<string, string>;
+            timeout?: number;
+        },
+    ): Promise<Skyvern.WorkflowRunResponse>;
+    async login(
+        credentialType: "bitwarden",
+        options: {
+            bitwardenItemId: string;
+            bitwardenCollectionId?: string;
+            url?: string;
+            prompt?: string;
+            webhookUrl?: string;
+            totpIdentifier?: string;
+            totpUrl?: string;
+            extraHttpHeaders?: Record<string, string>;
+            timeout?: number;
+        },
+    ): Promise<Skyvern.WorkflowRunResponse>;
+    async login(
+        credentialType: "1password",
+        options: {
+            onepasswordVaultId: string;
+            onepasswordItemId: string;
+            url?: string;
+            prompt?: string;
+            webhookUrl?: string;
+            totpIdentifier?: string;
+            totpUrl?: string;
+            extraHttpHeaders?: Record<string, string>;
+            timeout?: number;
+        },
+    ): Promise<Skyvern.WorkflowRunResponse>;
+    async login(
+        credentialType: "azure_vault",
+        options: {
+            azureVaultName: string;
+            azureVaultUsernameKey: string;
+            azureVaultPasswordKey: string;
+            azureVaultTotpSecretKey?: string;
+            url?: string;
+            prompt?: string;
+            webhookUrl?: string;
+            totpIdentifier?: string;
+            totpUrl?: string;
+            extraHttpHeaders?: Record<string, string>;
+            timeout?: number;
+        },
+    ): Promise<Skyvern.WorkflowRunResponse>;
+    async login(
+        credentialType: Skyvern.SkyvernSchemasRunBlocksCredentialType,
+        options: {
             url?: string;
             credentialId?: string;
             bitwardenCollectionId?: string;
             bitwardenItemId?: string;
             onepasswordVaultId?: string;
             onepasswordItemId?: string;
+            azureVaultName?: string;
+            azureVaultUsernameKey?: string;
+            azureVaultPasswordKey?: string;
+            azureVaultTotpSecretKey?: string;
             prompt?: string;
             webhookUrl?: string;
             totpIdentifier?: string;
@@ -137,20 +215,24 @@ export class SkyvernBrowserPageAgent {
 
         const workflowRun = await this._browser.skyvern.login(
             {
-                credential_type: credentialType as Skyvern.SkyvernSchemasRunBlocksCredentialType,
-                url: options?.url ?? this._getPageUrl(),
-                credential_id: options?.credentialId,
-                bitwarden_collection_id: options?.bitwardenCollectionId,
-                bitwarden_item_id: options?.bitwardenItemId,
-                onepassword_vault_id: options?.onepasswordVaultId,
-                onepassword_item_id: options?.onepasswordItemId,
-                prompt: options?.prompt,
-                webhook_url: options?.webhookUrl,
-                totp_identifier: options?.totpIdentifier,
-                totp_url: options?.totpUrl,
+                credential_type: credentialType,
+                url: options.url ?? this._getPageUrl(),
+                credential_id: options.credentialId,
+                bitwarden_collection_id: options.bitwardenCollectionId,
+                bitwarden_item_id: options.bitwardenItemId,
+                onepassword_vault_id: options.onepasswordVaultId,
+                onepassword_item_id: options.onepasswordItemId,
+                azure_vault_name: options.azureVaultName,
+                azure_vault_username_key: options.azureVaultUsernameKey,
+                azure_vault_password_key: options.azureVaultPasswordKey,
+                azure_vault_totp_secret_key: options.azureVaultTotpSecretKey,
+                prompt: options.prompt,
+                webhook_url: options.webhookUrl,
+                totp_identifier: options.totpIdentifier,
+                totp_url: options.totpUrl,
                 browser_session_id: this._browser.browserSessionId,
                 browser_address: this._browser.browserAddress,
-                extra_http_headers: options?.extraHttpHeaders,
+                extra_http_headers: options.extraHttpHeaders,
             },
             {
                 headers: { "x-user-agent": "skyvern-sdk" },
@@ -158,15 +240,15 @@ export class SkyvernBrowserPageAgent {
         );
 
         if (this._browser.skyvern.environment === SkyvernEnvironment.Cloud) {
-            LOG.info("AI login workflow is running, this may take a while", { url: getAppUrlForRun(workflowRun.run_id), run_id: workflowRun.run_id });
+            LOG.info("AI login workflow is running, this may take a while", {
+                url: getAppUrlForRun(workflowRun.run_id),
+                run_id: workflowRun.run_id,
+            });
         } else {
             LOG.info("AI login workflow is running, this may take a while", { run_id: workflowRun.run_id });
         }
 
-        const completedRun = await this._waitForRunCompletion(
-            workflowRun.run_id,
-            options?.timeout ?? DEFAULT_AGENT_TIMEOUT,
-        );
+        const completedRun = await this._waitForRunCompletion(workflowRun.run_id, options.timeout ?? DEFAULT_AGENT_TIMEOUT);
         LOG.info("AI login workflow finished", { run_id: completedRun.run_id, status: completedRun.status });
 
         return completedRun as Skyvern.WorkflowRunResponse;

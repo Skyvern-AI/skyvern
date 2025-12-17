@@ -172,7 +172,7 @@ class PromptAction(SdkActionBase):
 
     type: Literal["prompt"] = "prompt"
     prompt: str = Field(..., description="The prompt to send to the LLM")
-    schema: dict[str, Any] | None = Field(None, description="Optional JSON schema to structure the response")
+    response_schema: dict[str, Any] | None = Field(None, description="Optional JSON schema to structure the response")
     model: dict[str, Any] | None = Field(None, description="Optional model configuration")
 
     def get_navigation_goal(self) -> str | None:

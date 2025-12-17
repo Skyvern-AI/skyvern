@@ -542,6 +542,11 @@ class ScriptRunResponse(BaseModel):
     ai_fallback_triggered: bool = False
 
 
+class UploadFileResponse(BaseModel):
+    s3_uri: str = Field(description="S3 URI where the file was uploaded")
+    presigned_url: str = Field(description="Presigned URL to access the uploaded file")
+
+
 class BaseRunResponse(BaseModel):
     run_id: str = Field(
         description="Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs.",

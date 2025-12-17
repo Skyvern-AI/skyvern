@@ -25,6 +25,7 @@ class Artifact(UniversalBaseModel):
     step_id: typing.Optional[str] = None
     workflow_run_id: typing.Optional[str] = None
     workflow_run_block_id: typing.Optional[str] = None
+    run_id: typing.Optional[str] = None
     observer_cruise_id: typing.Optional[str] = None
     observer_thought_id: typing.Optional[str] = None
     ai_suggestion_id: typing.Optional[str] = None

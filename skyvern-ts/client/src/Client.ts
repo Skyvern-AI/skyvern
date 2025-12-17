@@ -2,6 +2,7 @@
 
 import * as Skyvern from "./api/index.js";
 import { Scripts } from "./api/resources/scripts/client/Client.js";
+import { Workflows } from "./api/resources/workflows/client/Client.js";
 import type { BaseClientOptions, BaseRequestOptions } from "./BaseClient.js";
 import { mergeHeaders, mergeOnlyDefinedHeaders } from "./core/headers.js";
 import * as core from "./core/index.js";
@@ -16,6 +17,7 @@ export declare namespace SkyvernClient {
 
 export class SkyvernClient {
     protected readonly _options: SkyvernClient.Options;
+    protected _workflows: Workflows | undefined;
     protected _scripts: Scripts | undefined;
 
     constructor(_options: SkyvernClient.Options = {}) {
@@ -34,6 +36,10 @@ export class SkyvernClient {
                 _options?.headers,
             ),
         };
+    }
+
+    public get workflows(): Workflows {
+        return (this._workflows ??= new Workflows(this._options));
     }
 
     public get scripts(): Scripts {
@@ -399,6 +405,7 @@ export class SkyvernClient {
      *         page_size: 1,
      *         only_saved_tasks: true,
      *         only_workflows: true,
+     *         only_templates: true,
      *         search_key: "search_key",
      *         title: "title",
      *         folder_id: "folder_id",
@@ -421,6 +428,7 @@ export class SkyvernClient {
             page_size: pageSize,
             only_saved_tasks: onlySavedTasks,
             only_workflows: onlyWorkflows,
+            only_templates: onlyTemplates,
             search_key: searchKey,
             title,
             folder_id: folderId,
@@ -442,6 +450,10 @@ export class SkyvernClient {
 
         if (onlyWorkflows != null) {
             _queryParams.only_workflows = onlyWorkflows.toString();
+        }
+
+        if (onlyTemplates != null) {
+            _queryParams.only_templates = onlyTemplates.toString();
         }
 
         if (searchKey != null) {

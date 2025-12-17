@@ -214,7 +214,7 @@ async def run_sdk_action(
         elif action.type == "prompt":
             prompt_result = await page_ai.ai_prompt(
                 prompt=action.prompt,
-                schema=action.schema,
+                schema=action.response_schema,
                 model=action.model,
             )
             result = prompt_result

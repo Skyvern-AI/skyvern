@@ -14,6 +14,7 @@ export interface Artifact {
     step_id?: string;
     workflow_run_id?: string;
     workflow_run_block_id?: string;
+    run_id?: string;
     observer_cruise_id?: string;
     observer_thought_id?: string;
     ai_suggestion_id?: string;
