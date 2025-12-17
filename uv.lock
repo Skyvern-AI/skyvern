@@ -2611,7 +2611,7 @@ wheels = [
 
 [[package]]
 name = "litellm"
-version = "1.80.7"
+version = "1.80.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -2628,9 +2628,9 @@ dependencies = [
     { name = "tiktoken" },
     { name = "tokenizers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a5/3f/af532014449c3931ae6cad2d97d267dd43d0de006060a8cbf0962e004024/litellm-1.80.7.tar.gz", hash = "sha256:3977a8d195aef842d01c18bf9e22984829363c6a4b54daf9a43c9dd9f190b42c", size = 12023127, upload-time = "2025-11-27T23:03:52.474Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/dd/44/0aaa7449e7c4aa05668ec03f1f68a01b1e476591071d9659a68db19371a2/litellm-1.80.10.tar.gz", hash = "sha256:4a4aff7558945c2f7e5c6523e67c1b5525a46b10b0e1ad6b8f847cb13b16779e", size = 12764777, upload-time = "2025-12-14T02:07:05.362Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/54/e0/2e60a0c09235fd7b55297390c557923f3c35a9cf001914222c26a7857d2b/litellm-1.80.7-py3-none-any.whl", hash = "sha256:f7d993f78c1e0e4e1202b2a925cc6540b55b6e5fb055dd342d88b145ab3102ed", size = 10848321, upload-time = "2025-11-27T23:03:50.002Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/a9/4814b6aa58f6705df2831eaadeb5bc8240684c8c9d5964245212f85049d1/litellm-1.80.10-py3-none-any.whl", hash = "sha256:9b3e561efaba0eb1291cb1555d3dcb7283cf7f3cb65aadbcdb42e2a8765898c8", size = 11264240, upload-time = "2025-12-14T02:07:02.414Z" },
 ]
 
 [[package]]
@@ -5211,13 +5211,13 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.25.1" },
     { name = "lark", specifier = ">=1.2.2,<2" },
     { name = "libcst", specifier = ">=1.8.2,<2" },
-    { name = "litellm", specifier = ">=1.75.8" },
+    { name = "litellm", specifier = ">=1.80.10" },
     { name = "onepassword-sdk", specifier = "==0.3.0" },
     { name = "openai", specifier = ">=1.68.2" },
     { name = "orjson", specifier = ">=3.9.10,<4" },
     { name = "pandas", specifier = ">=2.3.1,<3" },
     { name = "pdfplumber", specifier = ">=0.11.0,<0.12" },
-    { name = "pillow", specifier = ">=10.2.0" },
+    { name = "pillow", specifier = ">=10.1.0,<11" },
     { name = "playwright", marker = "python_full_version == '3.11.*'", specifier = "==1.46.0" },
     { name = "playwright", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">1.46.0" },
     { name = "posthog", specifier = ">=3.7.0,<4" },
