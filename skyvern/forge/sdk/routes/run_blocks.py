@@ -299,6 +299,7 @@ async def login(
     },
     description="Download a file from a website by navigating and clicking download buttons",
     summary="File Download Task",
+    include_in_schema=False,
 )
 async def download_files(
     request: Request,

@@ -1191,33 +1191,14 @@
         ]
       }
     },
-    "/v1/workflows/{workflow_permanent_id}/template": {
-      "put": {
+    "/v1/upload_file": {
+      "post": {
         "tags": [
-          "Workflows"
+          "Files"
         ],
-        "summary": "Set Workflow Template Status",
-        "description": "Set or unset a workflow as a template.\n\nTemplate status is stored at the workflow_permanent_id level (not per-version),\nmeaning all versions of a workflow share the same template status.",
-        "operationId": "set_workflow_template_status_v1_workflows__workflow_permanent_id__template_put",
+        "summary": "Upload File",
+        "operationId": "upload_file_v1_upload_file_post",
         "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Workflow Permanent Id"
-            }
-          },
-          {
-            "name": "is_template",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "boolean",
-              "title": "Is Template"
-            }
-          },
           {
             "name": "x-api-key",
             "in": "header",
@@ -1237,16 +1218,22 @@
             "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_file_v1_upload_file_post"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Set Workflow Template Status V1 Workflows  Workflow Permanent Id  Template Put"
-                }
+                "schema": {}
               }
             }
           },
@@ -1260,7 +1247,8 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "upload_file"
       }
     },
     "/v1/browser_profiles": {
@@ -2439,83 +2427,6 @@
               {
                 "sdk": "typescript",
                 "code": "// Login with password saved in 1Password\nimport { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"onepassword\",\n    onepassword_vault_id: \"1PASSWORD VAULT ID\",\n    onepassword_item_id: \"1PASSWORD ITEM ID\"\n});\n"
-              }
-            ]
-          }
-        ]
-      }
-    },
-    "/v1/run/tasks/download_files": {
-      "post": {
-        "tags": [
-          "Agent"
-        ],
-        "summary": "File Download Task",
-        "description": "Download a file from a website by navigating and clicking download buttons",
-        "operationId": "download_files_v1_run_tasks_download_files_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DownloadFilesRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WorkflowRunResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "download_files",
-        "x-fern-examples": [
-          {
-            "code-samples": [
-              {
-                "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.download_files(\n    url=\"https://example.com/downloads\",\n    navigation_goal=\"Navigate to the downloads page and click the 'Download PDF' button\",\n    download_suffix=\"report.pdf\"\n)\n"
-              },
-              {
-                "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.downloadFiles({\n    url: \"https://example.com/downloads\",\n    navigation_goal: \"Navigate to the downloads page and click the 'Download PDF' button\",\n    download_suffix: \"report.pdf\"\n});\n"
               }
             ]
           }
@@ -4894,6 +4805,20 @@
         ],
         "title": "BlockType"
       },
+      "Body_upload_file_v1_upload_file_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "format": "binary",
+            "title": "File"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_upload_file_v1_upload_file_post"
+      },
       "BranchCondition": {
         "properties": {
           "id": {
@@ -6300,185 +6225,6 @@
         ],
         "title": "DeployScriptRequest",
         "description": "Request model for deploying a script with updated files."
-      },
-      "DownloadFilesRequest": {
-        "properties": {
-          "url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Url",
-            "description": "Website URL"
-          },
-          "webhook_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Webhook Url",
-            "description": "Webhook URL to send status updates"
-          },
-          "proxy_location": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ProxyLocation"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Proxy location to use"
-          },
-          "totp_identifier": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Identifier",
-            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
-          },
-          "totp_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Url",
-            "description": "TOTP URL to fetch one-time passwords"
-          },
-          "browser_session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Browser Session Id",
-            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`",
-            "examples": [
-              "pbs_123456"
-            ]
-          },
-          "browser_profile_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Browser Profile Id",
-            "description": "ID of a browser profile to reuse for this run"
-          },
-          "browser_address": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Browser Address",
-            "description": "The CDP address for the task.",
-            "examples": [
-              "http://127.0.0.1:9222",
-              "ws://127.0.0.1:9222/devtools/browser/1234567890"
-            ]
-          },
-          "extra_http_headers": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "string"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Extra Http Headers",
-            "description": "Additional HTTP headers to include in requests"
-          },
-          "max_screenshot_scrolling_times": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Max Screenshot Scrolling Times",
-            "description": "Maximum number of times to scroll for screenshots"
-          },
-          "navigation_goal": {
-            "type": "string",
-            "title": "Navigation Goal",
-            "description": "Instructions for navigating to and downloading the file"
-          },
-          "download_suffix": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Download Suffix",
-            "description": "Suffix or complete filename for the downloaded file"
-          },
-          "download_timeout": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Download Timeout",
-            "description": "Timeout in seconds for the download operation"
-          },
-          "max_steps_per_run": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Max Steps Per Run",
-            "description": "Maximum number of steps to execute"
-          }
-        },
-        "type": "object",
-        "required": [
-          "navigation_goal"
-        ],
-        "title": "DownloadFilesRequest"
       },
       "DownloadToS3Block": {
         "properties": {
