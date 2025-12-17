@@ -1233,7 +1233,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/UploadFileResponse"
+                }
               }
             }
           },
@@ -14052,6 +14054,26 @@
         "type": "object",
         "title": "UploadFileAction",
         "description": "Upload file action parameters."
+      },
+      "UploadFileResponse": {
+        "properties": {
+          "s3_uri": {
+            "type": "string",
+            "title": "S3 Uri",
+            "description": "S3 URI where the file was uploaded"
+          },
+          "presigned_url": {
+            "type": "string",
+            "title": "Presigned Url",
+            "description": "Presigned URL to access the uploaded file"
+          }
+        },
+        "type": "object",
+        "required": [
+          "s3_uri",
+          "presigned_url"
+        ],
+        "title": "UploadFileResponse"
       },
       "UploadToS3Block": {
         "properties": {
