@@ -63,21 +63,94 @@ export class SkyvernBrowserPageCore {
         return this._browser;
     }
 
+    /**
+     * Click an element using a CSS selector, AI-powered prompt matching, or both.
+     *
+     * This method supports three modes:
+     * - **Selector-based**: Click the element matching the CSS selector
+     * - **AI-powered**: Use natural language to describe which element to click
+     * - **Fallback mode**: Try the selector first, fall back to AI if it fails
+     *
+     * @param selector - CSS selector for the target element.
+     * @param options - Click options including prompt.
+     * @param options.prompt - Natural language description of which element to click.
+     *
+     * @example
+     * ```typescript
+     * // Click using a CSS selector
+     * await page.click("#open-invoice-button");
+     *
+     * // Click using AI with natural language
+     * await page.click({ prompt: "Click on the 'Open Invoice' button" });
+     *
+     * // Try selector first, fall back to AI if selector fails
+     * await page.click("#open-invoice-button", { prompt: "Click on the 'Open Invoice' button" });
+     * ```
+     */
     async click(selector: string, options?: Parameters<Page["click"]>[1]): Promise<void>;
     async click(options: { prompt: string } & Partial<Parameters<Page["click"]>[1]>): Promise<void>;
     async click(
-        selectorOrOptions: string | ({ prompt: string } & Partial<Parameters<Page["click"]>[1]>),
-        options?: Parameters<Page["click"]>[1],
+        selector: string,
+        options: { prompt: string } & Partial<Parameters<Page["click"]>[1]>,
+    ): Promise<void>;
+    async click(
+        selectorOrOptions?: string | ({ prompt: string } & Partial<Parameters<Page["click"]>[1]>),
+        options?: Parameters<Page["click"]>[1] | ({ prompt?: string } & Partial<Parameters<Page["click"]>[1]>),
     ): Promise<void> {
+        let selector: string | undefined;
+        let prompt: string | undefined;
+        let clickOptions: Partial<Parameters<Page["click"]>[1]> = {};
+        let timeout: number | undefined;
+
+        // Parse arguments
         if (typeof selectorOrOptions === "string") {
-            return this._page.click(selectorOrOptions, options);
-        } else {
-            const { prompt, timeout, ...data } = selectorOrOptions;
+            selector = selectorOrOptions;
+            if (options && typeof options === "object") {
+                const { prompt: p, timeout: t, ...rest } = options as {
+                    prompt?: string;
+                    timeout?: number;
+                } & Partial<Parameters<Page["click"]>[1]>;
+                prompt = p;
+                timeout = t;
+                clickOptions = rest;
+            } else if (options) {
+                clickOptions = options;
+            }
+        } else if (selectorOrOptions && typeof selectorOrOptions === "object") {
+            const { prompt: p, timeout: t, ...rest } = selectorOrOptions;
+            prompt = p;
+            timeout = t;
+            clickOptions = rest;
+        }
+
+        if (!selector && !prompt) {
+            throw new Error("Missing input: pass a selector and/or a prompt.");
+        }
+
+        // Try to click the element with the original selector first
+        let errorToRaise: Error | undefined;
+        if (selector) {
+            try {
+                await this._page.click(selector, { ...clickOptions, timeout });
+                return;
+            } catch (error) {
+                errorToRaise = error as Error;
+                selector = undefined;
+            }
+        }
+
+        // If the original selector doesn't work, try to click the element with the AI generated selector
+        if (prompt) {
             await this._ai.aiClick({
                 intention: prompt,
+                data: Object.keys(clickOptions).length > 0 ? clickOptions : undefined,
                 timeout,
-                data: Object.keys(data).length > 0 ? data : undefined,
             });
+            return;
+        }
+
+        if (errorToRaise) {
+            throw errorToRaise;
         }
     }
 
