@@ -39,6 +39,7 @@ from .types.workflow_status import WorkflowStatus
 
 if typing.TYPE_CHECKING:
     from .scripts.client import AsyncScriptsClient, ScriptsClient
+    from .workflows.client import AsyncWorkflowsClient, WorkflowsClient
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
 
@@ -109,6 +110,7 @@ class Skyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
+        self._workflows: typing.Optional[WorkflowsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
 
     @property
@@ -500,6 +502,7 @@ class Skyvern:
         page_size: typing.Optional[int] = None,
         only_saved_tasks: typing.Optional[bool] = None,
         only_workflows: typing.Optional[bool] = None,
+        only_templates: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
         folder_id: typing.Optional[str] = None,
@@ -526,6 +529,8 @@ class Skyvern:
         only_saved_tasks : typing.Optional[bool]
 
         only_workflows : typing.Optional[bool]
+
+        only_templates : typing.Optional[bool]
 
         search_key : typing.Optional[str]
             Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
@@ -560,6 +565,7 @@ class Skyvern:
             page_size=1,
             only_saved_tasks=True,
             only_workflows=True,
+            only_templates=True,
             search_key="search_key",
             title="title",
             folder_id="folder_id",
@@ -571,6 +577,7 @@ class Skyvern:
             page_size=page_size,
             only_saved_tasks=only_saved_tasks,
             only_workflows=only_workflows,
+            only_templates=only_templates,
             search_key=search_key,
             title=title,
             folder_id=folder_id,
@@ -1850,6 +1857,14 @@ class Skyvern:
         return _response.data
 
     @property
+    def workflows(self):
+        if self._workflows is None:
+            from .workflows.client import WorkflowsClient  # noqa: E402
+
+            self._workflows = WorkflowsClient(client_wrapper=self._client_wrapper)
+        return self._workflows
+
+    @property
     def scripts(self):
         if self._scripts is None:
             from .scripts.client import ScriptsClient  # noqa: E402
@@ -1924,6 +1939,7 @@ class AsyncSkyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
+        self._workflows: typing.Optional[AsyncWorkflowsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
 
     @property
@@ -2347,6 +2363,7 @@ class AsyncSkyvern:
         page_size: typing.Optional[int] = None,
         only_saved_tasks: typing.Optional[bool] = None,
         only_workflows: typing.Optional[bool] = None,
+        only_templates: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
         folder_id: typing.Optional[str] = None,
@@ -2373,6 +2390,8 @@ class AsyncSkyvern:
         only_saved_tasks : typing.Optional[bool]
 
         only_workflows : typing.Optional[bool]
+
+        only_templates : typing.Optional[bool]
 
         search_key : typing.Optional[str]
             Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
@@ -2412,6 +2431,7 @@ class AsyncSkyvern:
                 page_size=1,
                 only_saved_tasks=True,
                 only_workflows=True,
+                only_templates=True,
                 search_key="search_key",
                 title="title",
                 folder_id="folder_id",
@@ -2426,6 +2446,7 @@ class AsyncSkyvern:
             page_size=page_size,
             only_saved_tasks=only_saved_tasks,
             only_workflows=only_workflows,
+            only_templates=only_templates,
             search_key=search_key,
             title=title,
             folder_id=folder_id,
@@ -3925,6 +3946,14 @@ class AsyncSkyvern:
             request_options=request_options,
         )
         return _response.data
+
+    @property
+    def workflows(self):
+        if self._workflows is None:
+            from .workflows.client import AsyncWorkflowsClient  # noqa: E402
+
+            self._workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
+        return self._workflows
 
     @property
     def scripts(self):

@@ -546,6 +546,7 @@ class RawSkyvern:
         page_size: typing.Optional[int] = None,
         only_saved_tasks: typing.Optional[bool] = None,
         only_workflows: typing.Optional[bool] = None,
+        only_templates: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
         folder_id: typing.Optional[str] = None,
@@ -572,6 +573,8 @@ class RawSkyvern:
         only_saved_tasks : typing.Optional[bool]
 
         only_workflows : typing.Optional[bool]
+
+        only_templates : typing.Optional[bool]
 
         search_key : typing.Optional[str]
             Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
@@ -602,6 +605,7 @@ class RawSkyvern:
                 "page_size": page_size,
                 "only_saved_tasks": only_saved_tasks,
                 "only_workflows": only_workflows,
+                "only_templates": only_templates,
                 "search_key": search_key,
                 "title": title,
                 "folder_id": folder_id,
@@ -3062,6 +3066,7 @@ class AsyncRawSkyvern:
         page_size: typing.Optional[int] = None,
         only_saved_tasks: typing.Optional[bool] = None,
         only_workflows: typing.Optional[bool] = None,
+        only_templates: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
         folder_id: typing.Optional[str] = None,
@@ -3088,6 +3093,8 @@ class AsyncRawSkyvern:
         only_saved_tasks : typing.Optional[bool]
 
         only_workflows : typing.Optional[bool]
+
+        only_templates : typing.Optional[bool]
 
         search_key : typing.Optional[str]
             Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
@@ -3118,6 +3125,7 @@ class AsyncRawSkyvern:
                 "page_size": page_size,
                 "only_saved_tasks": only_saved_tasks,
                 "only_workflows": only_workflows,
+                "only_templates": only_templates,
                 "search_key": search_key,
                 "title": title,
                 "folder_id": folder_id,

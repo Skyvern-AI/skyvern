@@ -19,6 +19,7 @@ class Workflow(UniversalBaseModel):
     workflow_permanent_id: str
     version: int
     is_saved_task: bool
+    is_template: typing.Optional[bool] = None
     description: typing.Optional[str] = None
     workflow_definition: WorkflowDefinition
     proxy_location: typing.Optional[WorkflowProxyLocation] = None
