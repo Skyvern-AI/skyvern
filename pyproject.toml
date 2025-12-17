@@ -16,7 +16,7 @@ dependencies = [
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.2,<4",
     "uvicorn[standard]>=0.24.0.post1,<0.25",
-    "litellm>=1.75.8",
+    "litellm>=1.80.10",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
     "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
