@@ -208,6 +208,10 @@ navigation:
             contents:
               - GET /v1/artifacts/{artifact_id}
               - GET /v1/runs/{run_id}/artifacts
+          - section: Files
+            contents:
+              - POST /v1/upload_file
+              - POST /v1/run/tasks/download_files
           - section: Scripts
             hidden: true
             contents:
