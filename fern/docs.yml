@@ -211,7 +211,6 @@ navigation:
           - section: Files
             contents:
               - POST /v1/upload_file
-              - POST /v1/run/tasks/download_files
           - section: Scripts
             hidden: true
             contents:
