@@ -36,7 +36,6 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import get_effective_download_run_id
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
@@ -2609,13 +2608,9 @@ class WorkflowService:
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                 context = skyvern_context.current()
-                download_run_id = get_effective_download_run_id(
-                    context_run_id=context.run_id if context else None,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
                 downloaded_files = await app.STORAGE.get_downloaded_files(
                     organization_id=workflow_run.organization_id,
-                    run_id=download_run_id,
+                    run_id=context.run_id if context and context.run_id else workflow_run.workflow_run_id,
                 )
                 if task_v2:
                     task_v2_downloaded_files = await app.STORAGE.get_downloaded_files(
@@ -2748,13 +2743,9 @@ class WorkflowService:
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 context = skyvern_context.current()
-                download_run_id = get_effective_download_run_id(
-                    context_run_id=context.run_id if context else None,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
                 await app.STORAGE.save_downloaded_files(
                     organization_id=workflow_run.organization_id,
-                    run_id=download_run_id,
+                    run_id=context.run_id if context and context.run_id else workflow_run.workflow_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
