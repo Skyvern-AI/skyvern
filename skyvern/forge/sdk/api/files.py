@@ -233,33 +233,6 @@ def get_download_dir(run_id: str | None) -> str:
     return download_dir
 
 
-def get_effective_download_run_id(
-    context_run_id: str | None = None,
-    workflow_run_id: str | None = None,
-    task_id: str | None = None,
-) -> str:
-    """
-    Get the effective run_id for download operations.
-
-    This ensures consistent run_id logic across all download-related operations
-    (save_downloaded_files, get_downloaded_files, get_download_dir).
-
-    Priority:
-    1. context_run_id (if set explicitly)
-    2. workflow_run_id (for workflow tasks)
-    3. task_id (for standalone tasks)
-
-    Raises ValueError if no valid run_id can be determined.
-    """
-    if context_run_id:
-        return context_run_id
-    if workflow_run_id:
-        return workflow_run_id
-    if task_id:
-        return task_id
-    raise ValueError("Cannot determine run_id: no context_run_id, workflow_run_id, or task_id provided")
-
-
 def list_files_in_directory(directory: Path, recursive: bool = False) -> list[str]:
     listed_files: list[str] = []
     for root, dirs, files in os.walk(directory):
