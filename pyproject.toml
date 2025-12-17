@@ -21,7 +21,7 @@ dependencies = [
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
     "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
     "greenlet==3.0.3 ; python_version >= '3.11' and python_version < '3.12'",
-    "pillow>=10.1.0,<11",
+    "pillow>=10.2.0",
     "starlette-context>=0.3.6,<0.4",
     "pydantic>=2.5.2,<3",
     "pydantic-settings>=2.1.0,<3",

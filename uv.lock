@@ -5217,7 +5217,7 @@ requires-dist = [
     { name = "orjson", specifier = ">=3.9.10,<4" },
     { name = "pandas", specifier = ">=2.3.1,<3" },
     { name = "pdfplumber", specifier = ">=0.11.0,<0.12" },
-    { name = "pillow", specifier = ">=10.1.0,<11" },
+    { name = "pillow", specifier = ">=10.2.0" },
     { name = "playwright", marker = "python_full_version == '3.11.*'", specifier = "==1.46.0" },
     { name = "playwright", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">1.46.0" },
     { name = "posthog", specifier = ">=3.7.0,<4" },
