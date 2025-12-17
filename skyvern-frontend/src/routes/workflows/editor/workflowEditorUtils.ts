@@ -134,18 +134,32 @@ function layoutUtil(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
   options: Dagre.configUnion = {},
+  allNodes?: Array<AppNode>,
 ): { nodes: Array<AppNode>; edges: Array<Edge> } {
   const g = new Dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}));
   g.setGraph({ rankdir: "TB", ...options });
 
   edges.forEach((edge) => g.setEdge(edge.source, edge.target));
-  nodes.forEach((node) =>
+  nodes.forEach((node) => {
+    // For loop/conditional nodes without measurements, use computed width
+    let width = node.measured?.width ?? 0;
+    let height = node.measured?.height ?? 0;
+
+    if (
+      (node.type === "loop" || node.type === "conditional") &&
+      !node.measured?.width
+    ) {
+      // Use full nodes array for nesting calculation
+      width = getLoopNodeWidth(node, allNodes ?? nodes);
+      height = 300; // Reasonable default height
+    }
+
     g.setNode(node.id, {
       ...node,
-      width: node.measured?.width ?? 0,
-      height: node.measured?.height ?? 0,
-    }),
-  );
+      width,
+      height,
+    });
+  });
 
   Dagre.layout(g);
 
@@ -251,11 +265,10 @@ function layout(
   loopNodes.forEach((node, index) => {
     const childNodes = nodes.filter((n) => n.parentId === node.id && !n.hidden);
     const childNodeIds = new Set(childNodes.map((child) => child.id));
+    // Include edges even if marked hidden, as long as both nodes are visible
+    // (edges might be hidden from branch switches but need to be used for layout)
     const childEdges = edges.filter(
-      (edge) =>
-        !edge.hidden &&
-        childNodeIds.has(edge.source) &&
-        childNodeIds.has(edge.target),
+      (edge) => childNodeIds.has(edge.source) && childNodeIds.has(edge.target),
     );
     const maxChildWidth = Math.max(
       ...childNodes.map((node) => node.measured?.width ?? 0),
@@ -266,10 +279,15 @@ function layout(
       ...n,
       position: { x: 0, y: 0 },
     }));
-    const layouted = layoutUtil(childNodesWithResetPositions, childEdges, {
-      marginx: (loopNodeWidth - maxChildWidth) / 2,
-      marginy: 225,
-    });
+    const layouted = layoutUtil(
+      childNodesWithResetPositions,
+      childEdges,
+      {
+        marginx: (loopNodeWidth - maxChildWidth) / 2,
+        marginy: 225,
+      },
+      nodes,
+    );
     loopNodeChildren[index] = layouted.nodes;
   });
 
@@ -283,14 +301,24 @@ function layout(
   conditionalNodes.forEach((node, index) => {
     const childNodes = nodes.filter((n) => n.parentId === node.id && !n.hidden);
     const childNodeIds = new Set(childNodes.map((child) => child.id));
-    const childEdges = edges.filter(
-      (edge) =>
-        !edge.hidden &&
-        childNodeIds.has(edge.source) &&
-        childNodeIds.has(edge.target),
-    );
+    // Include edges, but skip hidden edges completely (they're hidden for a reason - inactive branches)
+    const childEdges = edges.filter((edge) => {
+      if (!childNodeIds.has(edge.source) || !childNodeIds.has(edge.target)) {
+        return false;
+      }
+      // Exclude hidden edges from layout
+      if (edge.hidden) {
+        return false;
+      }
+      return true;
+    });
+    // Use computed width for loop nodes, measured width for others
     const maxChildWidth = Math.max(
-      ...childNodes.map((node) => node.measured?.width ?? 0),
+      ...childNodes.map((child) =>
+        child.type === "loop"
+          ? getLoopNodeWidth(child, nodes)
+          : child.measured?.width ?? 0,
+      ),
     );
     const conditionalNodeWidth = getLoopNodeWidth(node, nodes);
 
@@ -300,10 +328,15 @@ function layout(
       position: { x: 0, y: 0 },
     }));
 
-    const layouted = layoutUtil(childNodesWithResetPositions, childEdges, {
-      marginx: (conditionalNodeWidth - maxChildWidth) / 2,
-      marginy: 225,
-    });
+    const layouted = layoutUtil(
+      childNodesWithResetPositions,
+      childEdges,
+      {
+        marginx: (conditionalNodeWidth - maxChildWidth) / 2,
+        marginy: 225,
+      },
+      nodes,
+    );
 
     conditionalNodeChildren[index] = layouted.nodes;
   });
@@ -311,11 +344,10 @@ function layout(
   const topLevelNodes = nodes.filter((node) => !node.parentId && !node.hidden);
   const topLevelNodeIds = new Set(topLevelNodes.map((node) => node.id));
 
+  // Include edges even if marked hidden, as long as both nodes are visible
   const layoutEdges = edges.filter(
     (edge) =>
-      !edge.hidden &&
-      topLevelNodeIds.has(edge.source) &&
-      topLevelNodeIds.has(edge.target),
+      topLevelNodeIds.has(edge.source) && topLevelNodeIds.has(edge.target),
   );
 
   const syntheticEdges: Array<Edge> = [];
@@ -343,15 +375,53 @@ function layout(
   const topLevelNodesLayout = layoutUtil(
     topLevelNodes,
     layoutEdges.concat(syntheticEdges),
+    {},
+    nodes,
   );
 
   // Collect all hidden nodes to preserve them
   const hiddenNodes = nodes.filter((node) => node.hidden);
 
-  const finalNodes = topLevelNodesLayout.nodes
-    .concat(loopNodeChildren.flat())
+  // Combine all layouted nodes and sort by nesting depth to ensure parents come before children
+  const allLayoutedNodes = topLevelNodesLayout.nodes
     .concat(conditionalNodeChildren.flat())
-    .concat(hiddenNodes);
+    .concat(loopNodeChildren.flat());
+
+  // Sort by depth: top-level first, then depth-1, depth-2, etc.
+  const nodeDepths = new Map<string, number>();
+  const computeDepth = (nodeId: string): number => {
+    if (nodeDepths.has(nodeId)) {
+      return nodeDepths.get(nodeId)!;
+    }
+    // Look in both layouted nodes and full nodes array to find parents
+    let node = allLayoutedNodes.find((n) => n.id === nodeId);
+    if (!node) {
+      node = nodes.find((n) => n.id === nodeId);
+    }
+    if (!node) {
+      // Node doesn't exist anywhere, treat as top-level
+      nodeDepths.set(nodeId, 0);
+      return 0;
+    }
+    if (!node.parentId) {
+      // Node exists but has no parent
+      nodeDepths.set(nodeId, 0);
+      return 0;
+    }
+    const depth = computeDepth(node.parentId) + 1;
+    nodeDepths.set(nodeId, depth);
+    return depth;
+  };
+
+  allLayoutedNodes.forEach((node) => computeDepth(node.id));
+
+  const sortedNodes = allLayoutedNodes.sort((a, b) => {
+    const depthA = nodeDepths.get(a.id) ?? 0;
+    const depthB = nodeDepths.get(b.id) ?? 0;
+    return depthA - depthB;
+  });
+
+  const finalNodes = sortedNodes.concat(hiddenNodes);
 
   return {
     nodes: finalNodes,
