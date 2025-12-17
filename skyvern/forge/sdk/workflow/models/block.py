@@ -27,8 +27,6 @@ from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
 from pydantic import BaseModel, Field, model_validator
-from pypdf import PdfReader
-from pypdf.errors import PdfReadError
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -41,6 +39,7 @@ from skyvern.exceptions import (
     ContextParameterValueNotFound,
     MissingBrowserState,
     MissingBrowserStatePage,
+    PDFParsingError,
     SkyvernException,
     TaskNotFound,
     UnexpectedTaskStatus,
@@ -70,6 +69,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, validate_pdf_file
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     CustomizedCodeException,
@@ -3020,11 +3020,8 @@ class FileParserBlock(Block):
                 )
         elif self.file_type == FileType.PDF:
             try:
-                # Try to read the file with PyPDF to validate it's a valid PDF file
-                reader = PdfReader(file_path)
-                # Just check if we can access pages, don't read content yet
-                _ = len(reader.pages)
-            except Exception as e:
+                validate_pdf_file(file_path, file_identifier=file_url_used)
+            except PDFParsingError as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
 
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
@@ -3087,15 +3084,14 @@ class FileParserBlock(Block):
             )
 
     async def _parse_pdf_file(self, file_path: str) -> str:
-        """Parse PDF file and return extracted text."""
+        """Parse PDF file and return extracted text.
+
+        Uses the shared PDF parsing utility that tries pypdf first,
+        then falls back to pdfplumber if pypdf fails.
+        """
         try:
-            reader = PdfReader(file_path)
-            extracted_text = ""
-            page_count = len(reader.pages)
-            for i in range(page_count):
-                extracted_text += reader.pages[i].extract_text() + "\n"
-            return extracted_text
-        except PdfReadError as e:
+            return extract_pdf_file(file_path, file_identifier=self.file_url)
+        except PDFParsingError as e:
             raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
     async def _extract_with_ai(
@@ -3314,14 +3310,9 @@ class PDFParserBlock(Block):
         else:
             file_path = await download_file(self.file_url)
 
-        extracted_text = ""
         try:
-            reader = PdfReader(file_path)
-            page_count = len(reader.pages)
-            for i in range(page_count):
-                extracted_text += reader.pages[i].extract_text() + "\n"
-
-        except PdfReadError:
+            extracted_text = extract_pdf_file(file_path, file_identifier=self.file_url)
+        except PDFParsingError:
             return await self.build_block_result(
                 success=False,
                 failure_reason="Failed to parse PDF file",

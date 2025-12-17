@@ -2383,6 +2383,7 @@ async def get_workflows(
 @base_router.put(
     "/workflows/{workflow_permanent_id}/template",
     tags=["Workflows"],
+    include_in_schema=False,
 )
 async def set_workflow_template_status(
     workflow_permanent_id: str,
@@ -2607,17 +2608,17 @@ async def get_api_keys(
     return GetOrganizationAPIKeysResponse(api_keys=api_keys)
 
 
-@legacy_base_router.post(
+@base_router.post(
     "/upload_file",
-    tags=["server"],
+    tags=["Files"],
     openapi_extra={
         "x-fern-sdk-method-name": "upload_file",
     },
+    include_in_schema=True,
 )
-@legacy_base_router.post(
-    "/upload_file/",
-    include_in_schema=False,
-)
+@base_router.post("/upload_file/", include_in_schema=False)
+@legacy_base_router.post("/upload_file", include_in_schema=False)
+@legacy_base_router.post("/upload_file/", include_in_schema=False)
 async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
     current_org: Organization = Depends(org_auth_service.get_current_org),

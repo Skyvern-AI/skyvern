@@ -902,3 +902,15 @@ class PDFEmbedBase64DecodeError(SkyvernException):
             src_preview = pdf_embed_src[:100] + "..." if len(pdf_embed_src) > 100 else pdf_embed_src
             message += f". PDF embed src: {src_preview}"
         super().__init__(message)
+
+
+class PDFParsingError(SkyvernException):
+    """Raised when PDF parsing fails with all available parsers."""
+
+    def __init__(self, file_identifier: str, pypdf_error: str, pdfplumber_error: str):
+        self.file_identifier = file_identifier
+        self.pypdf_error = pypdf_error
+        self.pdfplumber_error = pdfplumber_error
+        super().__init__(
+            f"Failed to parse PDF '{file_identifier}'. pypdf error: {pypdf_error}; pdfplumber error: {pdfplumber_error}"
+        )

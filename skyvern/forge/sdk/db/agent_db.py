@@ -371,6 +371,39 @@ class AgentDB:
             LOG.exception("UnexpectedError")
             raise
 
+    async def bulk_create_artifacts(
+        self,
+        artifact_models: list[ArtifactModel],
+    ) -> list[Artifact]:
+        """
+        Bulk create multiple artifacts in a single database transaction.
+
+        Args:
+            artifact_models: List of ArtifactModel instances to insert
+
+        Returns:
+            List of created Artifact objects
+        """
+        if not artifact_models:
+            return []
+
+        try:
+            async with self.Session() as session:
+                session.add_all(artifact_models)
+                await session.commit()
+
+                # Refresh all artifacts to get their created_at and modified_at values
+                for artifact in artifact_models:
+                    await session.refresh(artifact)
+
+                return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifact_models]
+        except SQLAlchemyError:
+            LOG.exception("SQLAlchemyError during bulk artifact creation")
+            raise
+        except Exception:
+            LOG.exception("UnexpectedError during bulk artifact creation")
+            raise
+
     async def get_task(self, task_id: str, organization_id: str | None = None) -> Task | None:
         """Get a task by its id"""
         try:

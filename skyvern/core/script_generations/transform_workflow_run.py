@@ -102,6 +102,7 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
                 for action in actions:
                     action_dump = action.model_dump()
                     action_dump["xpath"] = action.get_xpath()
+                    action_dump["has_mini_agent"] = action.has_mini_agent
                     if (
                         "data_extraction_goal" in final_dump
                         and final_dump["data_extraction_goal"]
