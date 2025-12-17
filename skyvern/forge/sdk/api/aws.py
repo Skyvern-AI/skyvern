@@ -175,6 +175,7 @@ class AsyncAWSClient:
         metadata: dict | None = None,
         raise_exception: bool = False,
         tags: dict[str, str] | None = None,
+        content_type: str | None = None,
     ) -> None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/upload_file.html
         try:
@@ -185,6 +186,8 @@ class AsyncAWSClient:
                     extra_args["Metadata"] = metadata
                 if tags:
                     extra_args["Tagging"] = self._create_tag_string(tags)
+                if content_type:
+                    extra_args["ContentType"] = content_type
                 await client.upload_file(
                     Filename=file_path,
                     Bucket=parsed_uri.bucket,
