@@ -112,6 +112,7 @@ from skyvern.schemas.runs import (
     RunType,
     TaskRunRequest,
     TaskRunResponse,
+    UploadFileResponse,
     WorkflowRunRequest,
     WorkflowRunResponse,
 )
@@ -2615,6 +2616,7 @@ async def get_api_keys(
         "x-fern-sdk-method-name": "upload_file",
     },
     include_in_schema=True,
+    response_model=UploadFileResponse,
 )
 @base_router.post("/upload_file/", include_in_schema=False)
 @legacy_base_router.post("/upload_file", include_in_schema=False)
@@ -2622,18 +2624,14 @@ async def get_api_keys(
 async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
     current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> Response:
+) -> UploadFileResponse:
     uris = await app.STORAGE.save_legacy_file(
         organization_id=current_org.organization_id, filename=file.filename, fileObj=file.file
     )
     if not uris:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
     presigned_url, uploaded_s3_uri = uris
-    return ORJSONResponse(
-        content={"s3_uri": uploaded_s3_uri, "presigned_url": presigned_url},
-        status_code=200,
-        media_type="application/json",
-    )
+    return UploadFileResponse(s3_uri=uploaded_s3_uri, presigned_url=presigned_url)
 
 
 @legacy_v2_router.post(
