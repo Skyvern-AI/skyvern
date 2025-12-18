@@ -14,7 +14,6 @@ import {
 import type { Node } from "@xyflow/react";
 
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   DropdownMenu,
@@ -39,6 +38,7 @@ import {
 } from "./types";
 import type { BranchCondition } from "../../../types/workflowTypes";
 import { HelpTooltip } from "@/components/HelpTooltip";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 
 function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   const nodes = useNodes<AppNode>();
@@ -686,15 +686,16 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
                       />
                     )}
                   </div>
-                  <Input
+                  <WorkflowBlockInput
+                    nodeId={id}
                     value={
                       activeBranch.is_default
                         ? "Executed when no other condition matches"
                         : activeBranch.criteria?.expression ?? ""
                     }
                     disabled={!data.editable || activeBranch.is_default}
-                    onChange={(event) => {
-                      handleExpressionChange(event.target.value);
+                    onChange={(value) => {
+                      handleExpressionChange(value);
                     }}
                     placeholder="Enter condition to evaluate (Jinja or natural language)"
                   />
