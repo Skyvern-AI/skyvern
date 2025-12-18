@@ -28,7 +28,6 @@ const constants = {
 const deprecatedModelNames = new Set<string>([
   "gemini-2.5-flash-lite",
   "azure/gpt-4.1",
-  "azure/gpt-5",
   "azure/o3",
   "claude-haiku-4-5-20251001",
 ]);
