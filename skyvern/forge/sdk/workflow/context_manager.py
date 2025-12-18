@@ -44,7 +44,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.utils.strings import generate_random_string
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunParameter
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunParameter
 
 LOG = structlog.get_logger()
 
@@ -76,6 +76,7 @@ class WorkflowRunContext:
             | CredentialParameter
         ],
         block_outputs: dict[str, Any] | None = None,
+        workflow: "Workflow | None" = None,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(
@@ -84,6 +85,7 @@ class WorkflowRunContext:
             workflow_permanent_id=workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             aws_client=aws_client,
+            workflow=workflow,
         )
 
         workflow_run_context.organization_id = organization.organization_id
@@ -161,11 +163,13 @@ class WorkflowRunContext:
         workflow_permanent_id: str,
         workflow_run_id: str,
         aws_client: AsyncAWSClient,
+        workflow: "Workflow | None" = None,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
         self.workflow_permanent_id = workflow_permanent_id
         self.workflow_run_id = workflow_run_id
+        self.workflow = workflow
         self.blocks_metadata: dict[str, BlockMetadata] = {}
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
@@ -174,6 +178,13 @@ class WorkflowRunContext:
         self.organization_id: str | None = None
         self.include_secrets_in_templates: bool = False
         self.credential_totp_identifiers: dict[str, str] = {}
+
+    def set_workflow(self, workflow: "Workflow") -> None:
+        """
+        Update the cached workflow object in the context.
+        This is used when the workflow is fetched from the database as a fallback.
+        """
+        self.workflow = workflow
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
@@ -1078,6 +1089,7 @@ class WorkflowContextManager:
             | CredentialParameter
         ],
         block_outputs: dict[str, Any] | None = None,
+        workflow: "Workflow | None" = None,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -1091,6 +1103,7 @@ class WorkflowContextManager:
             context_parameters,
             secret_parameters,
             block_outputs,
+            workflow,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context

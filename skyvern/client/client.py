@@ -790,7 +790,11 @@ class Skyvern:
         return _response.data
 
     def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+        self,
+        run_id: str,
+        *,
+        webhook_url: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.Optional[typing.Any]:
         """
         Retry sending the webhook for a run
@@ -819,7 +823,7 @@ class Skyvern:
             run_id="tsk_123",
         )
         """
-        _response = self._raw_client.retry_run_webhook(run_id, request_options=request_options)
+        _response = self._raw_client.retry_run_webhook(run_id, webhook_url=webhook_url, request_options=request_options)
         return _response.data
 
     def get_run_timeline(
@@ -2701,7 +2705,11 @@ class AsyncSkyvern:
         return _response.data
 
     async def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+        self,
+        run_id: str,
+        *,
+        webhook_url: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.Optional[typing.Any]:
         """
         Retry sending the webhook for a run
@@ -2738,7 +2746,9 @@ class AsyncSkyvern:
 
         asyncio.run(main())
         """
-        _response = await self._raw_client.retry_run_webhook(run_id, request_options=request_options)
+        _response = await self._raw_client.retry_run_webhook(
+            run_id, webhook_url=webhook_url, request_options=request_options
+        )
         return _response.data
 
     async def get_run_timeline(

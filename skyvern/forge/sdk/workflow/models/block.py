@@ -626,9 +626,14 @@ class BaseTaskBlock(Block):
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
-        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
-            workflow_permanent_id=workflow_run.workflow_permanent_id,
-        )
+        # Get workflow from context if available, otherwise query database
+        workflow = workflow_run_context.workflow
+        if workflow is None:
+            workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
+            )
+            # Cache the workflow back to context for future block executions
+            workflow_run_context.set_workflow(workflow)
         # if the task url is parameterized, we need to get the value from the workflow run context
         if self.url and workflow_run_context.has_parameter(self.url) and workflow_run_context.has_value(self.url):
             task_url_parameter_value = workflow_run_context.get_value(self.url)
@@ -3962,32 +3967,39 @@ class HttpRequestBlock(Block):
         """Format template parameters in the block fields"""
         template_kwargs = {"force_include_secrets": True}
 
+        def _render_templates_in_json(value: object) -> object:
+            """
+            Recursively render Jinja templates in nested JSON-like structures.
+
+            This is required because HTTP request bodies are often deeply nested
+            dict/list structures, and templates may appear at any depth.
+            """
+            if isinstance(value, str):
+                return self.format_block_parameter_template_from_workflow_run_context(
+                    value, workflow_run_context, **template_kwargs
+                )
+            if isinstance(value, list):
+                return [_render_templates_in_json(item) for item in value]
+            if isinstance(value, dict):
+                return {
+                    cast(str, _render_templates_in_json(key)): _render_templates_in_json(val)
+                    for key, val in value.items()
+                }
+            return value
+
         if self.url:
             self.url = self.format_block_parameter_template_from_workflow_run_context(
                 self.url, workflow_run_context, **template_kwargs
             )
 
         if self.body:
-            # If body is provided as a template string, try to parse it as JSON
-            for key, value in self.body.items():
-                if isinstance(value, str):
-                    self.body[key] = self.format_block_parameter_template_from_workflow_run_context(
-                        value, workflow_run_context, **template_kwargs
-                    )
+            self.body = cast(dict[str, Any], _render_templates_in_json(self.body))
 
         if self.files:
-            # Format file paths in files dictionary
-            for field_name, file_path in self.files.items():
-                if isinstance(file_path, str):
-                    self.files[field_name] = self.format_block_parameter_template_from_workflow_run_context(
-                        file_path, workflow_run_context, **template_kwargs
-                    )
+            self.files = cast(dict[str, str], _render_templates_in_json(self.files))
 
         if self.headers:
-            for key, value in self.headers.items():
-                self.headers[key] = self.format_block_parameter_template_from_workflow_run_context(
-                    value, workflow_run_context, **template_kwargs
-                )
+            self.headers = cast(dict[str, str], _render_templates_in_json(self.headers))
 
     def validate_url(self, url: str) -> bool:
         """Validate if the URL is properly formatted"""
@@ -4510,9 +4522,41 @@ class ConditionalBlock(Block):
             raise ValueError("organization_id is required to evaluate natural language branches")
 
         workflow_run_context = evaluation_context.workflow_run_context
+        template_data = evaluation_context.build_template_data()
+
+        rendered_branch_criteria: list[dict[str, Any]] = []
+        for idx, branch in enumerate(branches):
+            expression = branch.criteria.expression if branch.criteria else ""
+            rendered_expression = expression
+
+            # Allow Jinja templating inside natural language branch expressions so users can
+            # mix free text with dynamic values (e.g., "If response: {{ foo.bar }}").
+            if "{{" in expression and "}}" in expression:
+                try:
+                    template = jinja_sandbox_env.from_string(expression)
+                except Exception as exc:
+                    raise FailedToFormatJinjaStyleParameter(
+                        template=expression,
+                        msg=str(exc),
+                    ) from exc
+
+                if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+                    if missing := get_missing_variables(expression, template_data):
+                        raise MissingJinjaVariables(template=expression, variables=missing)
+
+                try:
+                    rendered_expression = template.render(template_data)
+                except Exception as exc:
+                    raise FailedToFormatJinjaStyleParameter(
+                        template=expression,
+                        msg=str(exc),
+                    ) from exc
+
+            rendered_branch_criteria.append({"index": idx, "expression": rendered_expression})
+
         branch_criteria_payload = [
-            {"index": idx, "expression": branch.criteria.expression if branch.criteria else ""}
-            for idx, branch in enumerate(branches)
+            {"index": criterion["index"], "expression": criterion["expression"]}
+            for criterion in rendered_branch_criteria
         ]
 
         extraction_goal = prompt_engine.load_prompt(

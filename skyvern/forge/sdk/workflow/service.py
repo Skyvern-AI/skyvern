@@ -624,6 +624,7 @@ class WorkflowService:
                 context_parameters,
                 secret_parameters,
                 block_outputs,
+                workflow,
             )
         except Exception as e:
             LOG.exception(

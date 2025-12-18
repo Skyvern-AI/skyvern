@@ -957,7 +957,11 @@ class RawSkyvern:
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
     def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+        self,
+        run_id: str,
+        *,
+        webhook_url: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[typing.Optional[typing.Any]]:
         """
         Retry sending the webhook for a run
@@ -975,10 +979,18 @@ class RawSkyvern:
         HttpResponse[typing.Optional[typing.Any]]
             Successful Response
         """
+        request_kwargs: dict[str, typing.Any] = {}
+        if webhook_url is not None:
+            request_kwargs = {
+                "json": {"webhook_url": webhook_url},
+                "headers": {"content-type": "application/json"},
+                "omit": OMIT,
+            }
         _response = self._client_wrapper.httpx_client.request(
             f"v1/runs/{jsonable_encoder(run_id)}/retry_webhook",
             method="POST",
             request_options=request_options,
+            **request_kwargs,
         )
         try:
             if _response is None or not _response.text.strip():
@@ -3477,7 +3489,11 @@ class AsyncRawSkyvern:
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
     async def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+        self,
+        run_id: str,
+        *,
+        webhook_url: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[typing.Optional[typing.Any]]:
         """
         Retry sending the webhook for a run
@@ -3495,10 +3511,18 @@ class AsyncRawSkyvern:
         AsyncHttpResponse[typing.Optional[typing.Any]]
             Successful Response
         """
+        request_kwargs: dict[str, typing.Any] = {}
+        if webhook_url is not None:
+            request_kwargs = {
+                "json": {"webhook_url": webhook_url},
+                "headers": {"content-type": "application/json"},
+                "omit": OMIT,
+            }
         _response = await self._client_wrapper.httpx_client.request(
             f"v1/runs/{jsonable_encoder(run_id)}/retry_webhook",
             method="POST",
             request_options=request_options,
+            **request_kwargs,
         )
         try:
             if _response is None or not _response.text.strip():

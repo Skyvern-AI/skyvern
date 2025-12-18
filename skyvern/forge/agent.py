@@ -79,6 +79,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE, LLM_PROVIDER_ERROR_TYPE
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
+from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
@@ -2211,6 +2212,7 @@ class ForgeAgent:
         if engine in CUA_ENGINES:
             scrolling_number = 0
 
+        artifacts: list[BulkArtifactCreationRequest | None] = []
         try:
             # get current x, y position of the page
             x: int | None = None
@@ -2228,11 +2230,13 @@ class ForgeAgent:
             if skyvern_frame and x is not None and y is not None:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
                 LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                data=screenshot,
-            )
+                artifacts.append(
+                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                        data=screenshot,
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        step=step,
+                    )
+                )
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -2242,13 +2246,21 @@ class ForgeAgent:
         try:
             skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
             html = await skyvern_frame.get_content()
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.HTML_ACTION,
-                data=html.encode(),
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=html.encode(),
+                    artifact_type=ArtifactType.HTML_ACTION,
+                    step=step,
+                )
             )
         except Exception:
             LOG.exception("Failed to record html after action")
+
+        if artifacts:
+            try:
+                await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
+            except Exception:
+                LOG.warning("Failed to bulk create artifacts after action", exc_info=True)
 
         try:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
