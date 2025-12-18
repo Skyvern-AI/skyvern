@@ -186,7 +186,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
           return { ...edge, hidden: shouldHide };
         }
 
-        // Also hide edges connected to hidden nodes (cascading)
+        // Hide edges connected to hidden nodes
         const sourceNode = updatedNodesSnapshot.find(
           (n: AppNode) => n.id === edge.source,
         );
@@ -195,6 +195,22 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
         );
         if (sourceNode?.hidden || targetNode?.hidden) {
           return { ...edge, hidden: true };
+        }
+
+        // Unhide edges when both nodes are visible, but ONLY if they're not conditional branch edges
+        // (Conditional branch edges should stay hidden if they're for inactive branches)
+        if (
+          sourceNode &&
+          targetNode &&
+          !sourceNode.hidden &&
+          !targetNode.hidden
+        ) {
+          const isConditionalBranchEdge =
+            edgeData?.conditionalNodeId && edgeData?.conditionalBranchId;
+          if (!isConditionalBranchEdge) {
+            // Regular edge (e.g., loop's START → adder) - unhide when nodes are visible
+            return { ...edge, hidden: false };
+          }
         }
 
         return edge;

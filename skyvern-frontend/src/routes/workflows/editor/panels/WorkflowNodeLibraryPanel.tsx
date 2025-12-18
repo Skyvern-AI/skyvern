@@ -318,16 +318,6 @@ function WorkflowNodeLibraryPanel({
           "We're working on supporting nested conditionals. Soon you'll be able to use this feature!",
       };
     }
-
-    // Disable loop inside conditional
-    if (nodeType === "loop" && parentType === "conditional") {
-      return {
-        disabled: true,
-        reason:
-          "We're working on supporting loops inside conditionals. Soon you'll be able to use this feature!",
-      };
-    }
-
     return { disabled: false, reason: "" };
   };
 

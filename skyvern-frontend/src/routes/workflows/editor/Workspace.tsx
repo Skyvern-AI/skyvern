@@ -799,6 +799,7 @@ function Workspace({
 
       // Create an edge for each branch (initially all branches have START → NodeAdder)
       const conditionalData = node.data as ConditionalNodeData;
+      const activeBranchId = conditionalData.activeBranchId;
       conditionalData.branches.forEach((branch) => {
         const edge: Edge = {
           id: nanoid(),
@@ -810,6 +811,8 @@ function Workspace({
             conditionalNodeId: id,
             conditionalBranchId: branch.id,
           },
+          // Only the active branch's edge should be visible initially
+          hidden: branch.id !== activeBranchId,
         };
         newEdges.push(edge);
       });
@@ -844,7 +847,6 @@ function Workspace({
       ...newNodes,
       ...nodes.slice(previousNodeIndex + 1),
     ];
-
     workflowChangesStore.setHasChanges(true);
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
   }
