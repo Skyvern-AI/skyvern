@@ -12,6 +12,7 @@ class LiteLLMParams(TypedDict, total=False):
     vertex_credentials: str | None
     vertex_location: str | None
     thinking: dict[str, Any] | None
+    thinking_level: str | None
     service_tier: str | None
     timeout: float | None
 
