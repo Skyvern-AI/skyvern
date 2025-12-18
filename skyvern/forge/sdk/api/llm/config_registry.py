@@ -1292,10 +1292,23 @@ if settings.ENABLE_VERTEX_AI:
             litellm_params=LiteLLMParams(
                 api_base=f"{api_base}/gemini-3-pro-preview" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.0_FLASH",
+        LLMConfig(
+            "vertex_ai/gemini-3-flash-preview",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3-flash-preview" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
