@@ -222,13 +222,22 @@ async def build_run_preview(organization_id: str, run_id: str) -> RunWebhookPrev
     )
 
 
-async def replay_run_webhook(organization_id: str, run_id: str, target_url: str | None) -> RunWebhookReplayResponse:
+async def replay_run_webhook(
+    organization_id: str,
+    run_id: str,
+    target_url: str | None,
+    api_key: str | None = None,
+) -> RunWebhookReplayResponse:
     """
     Send the webhook payload for a run to either the stored URL or a caller-provided override.
+
+    If `api_key` is provided, it will be used to sign the webhook payload instead of looking up the organization's
+    API key from the database. This is useful for endpoints that authenticate with an API key and want the replay
+    signature to match the caller-provided key.
     """
     payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id)
-    api_key = await _get_api_key(organization_id=organization_id)
-    signed_data = generate_skyvern_webhook_signature(payload=payload.payload, api_key=api_key)
+    signing_key = api_key if api_key else await _get_api_key(organization_id=organization_id)
+    signed_data = generate_skyvern_webhook_signature(payload=payload.payload, api_key=signing_key)
 
     url_to_use: str | None = target_url if target_url else payload.default_webhook_url
 
