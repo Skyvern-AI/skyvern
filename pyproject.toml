@@ -75,7 +75,6 @@ cloud = [
     "stripe>=9.7.0,<10",
     "temporalio[opentelemetry]>=1.6.0,<2",
     "temporalio>=1.6.0,<2",
-    "dramatiq[asyncio]>=1.18.0,<2",
     "redis>=5.0.3,<6",
     "opentelemetry-exporter-otlp-proto-grpc>=1.38.0,<2",
     "kr8s>=0.20.14,<1",
