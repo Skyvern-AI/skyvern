@@ -4510,9 +4510,41 @@ class ConditionalBlock(Block):
             raise ValueError("organization_id is required to evaluate natural language branches")
 
         workflow_run_context = evaluation_context.workflow_run_context
+        template_data = evaluation_context.build_template_data()
+
+        rendered_branch_criteria: list[dict[str, Any]] = []
+        for idx, branch in enumerate(branches):
+            expression = branch.criteria.expression if branch.criteria else ""
+            rendered_expression = expression
+
+            # Allow Jinja templating inside natural language branch expressions so users can
+            # mix free text with dynamic values (e.g., "If response: {{ foo.bar }}").
+            if "{{" in expression and "}}" in expression:
+                try:
+                    template = jinja_sandbox_env.from_string(expression)
+                except Exception as exc:
+                    raise FailedToFormatJinjaStyleParameter(
+                        template=expression,
+                        msg=str(exc),
+                    ) from exc
+
+                if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+                    if missing := get_missing_variables(expression, template_data):
+                        raise MissingJinjaVariables(template=expression, variables=missing)
+
+                try:
+                    rendered_expression = template.render(template_data)
+                except Exception as exc:
+                    raise FailedToFormatJinjaStyleParameter(
+                        template=expression,
+                        msg=str(exc),
+                    ) from exc
+
+            rendered_branch_criteria.append({"index": idx, "expression": rendered_expression})
+
         branch_criteria_payload = [
-            {"index": idx, "expression": branch.criteria.expression if branch.criteria else ""}
-            for idx, branch in enumerate(branches)
+            {"index": criterion["index"], "expression": criterion["expression"]}
+            for criterion in rendered_branch_criteria
         ]
 
         extraction_goal = prompt_engine.load_prompt(
