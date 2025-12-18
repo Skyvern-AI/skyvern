@@ -130,6 +130,8 @@ async def run_sdk_action(
         [],
         [],
         [],
+        None,
+        workflow,
     )
 
     context = skyvern_context.ensure_context()
