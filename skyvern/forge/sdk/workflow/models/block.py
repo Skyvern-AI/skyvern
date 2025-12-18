@@ -3967,32 +3967,39 @@ class HttpRequestBlock(Block):
         """Format template parameters in the block fields"""
         template_kwargs = {"force_include_secrets": True}
 
+        def _render_templates_in_json(value: object) -> object:
+            """
+            Recursively render Jinja templates in nested JSON-like structures.
+
+            This is required because HTTP request bodies are often deeply nested
+            dict/list structures, and templates may appear at any depth.
+            """
+            if isinstance(value, str):
+                return self.format_block_parameter_template_from_workflow_run_context(
+                    value, workflow_run_context, **template_kwargs
+                )
+            if isinstance(value, list):
+                return [_render_templates_in_json(item) for item in value]
+            if isinstance(value, dict):
+                return {
+                    cast(str, _render_templates_in_json(key)): _render_templates_in_json(val)
+                    for key, val in value.items()
+                }
+            return value
+
         if self.url:
             self.url = self.format_block_parameter_template_from_workflow_run_context(
                 self.url, workflow_run_context, **template_kwargs
             )
 
         if self.body:
-            # If body is provided as a template string, try to parse it as JSON
-            for key, value in self.body.items():
-                if isinstance(value, str):
-                    self.body[key] = self.format_block_parameter_template_from_workflow_run_context(
-                        value, workflow_run_context, **template_kwargs
-                    )
+            self.body = cast(dict[str, Any], _render_templates_in_json(self.body))
 
         if self.files:
-            # Format file paths in files dictionary
-            for field_name, file_path in self.files.items():
-                if isinstance(file_path, str):
-                    self.files[field_name] = self.format_block_parameter_template_from_workflow_run_context(
-                        file_path, workflow_run_context, **template_kwargs
-                    )
+            self.files = cast(dict[str, str], _render_templates_in_json(self.files))
 
         if self.headers:
-            for key, value in self.headers.items():
-                self.headers[key] = self.format_block_parameter_template_from_workflow_run_context(
-                    value, workflow_run_context, **template_kwargs
-                )
+            self.headers = cast(dict[str, str], _render_templates_in_json(self.headers))
 
     def validate_url(self, url: str) -> bool:
         """Validate if the URL is properly formatted"""
