@@ -436,6 +436,7 @@ class Settings(BaseSettings):
                     "label": "Gemini 2.5 Flash",
                 },
                 "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
+                "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
                 "gemini-2.5-flash-lite": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
                     "label": "Gemini 2.5 Flash Lite",
@@ -474,6 +475,7 @@ class Settings(BaseSettings):
                     "label": "Gemini 2.5 Flash",
                 },
                 "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
+                "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
                 "gemini-2.5-flash-lite": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
                     "label": "Gemini 2.5 Flash Lite",

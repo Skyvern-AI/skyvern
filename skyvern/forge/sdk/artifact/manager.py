@@ -367,6 +367,24 @@ class ArtifactManager:
             data=data,
         )
 
+    async def bulk_create_artifacts(
+        self,
+        requests: list[BulkArtifactCreationRequest | None],
+    ) -> list[str]:
+        artifacts: list[ArtifactBatchData] = []
+        primary_key: str | None = None
+        for request in requests:
+            if request:
+                artifacts.extend(request.artifacts)
+                primary_key = request.primary_key
+
+        if primary_key is None or not artifacts:
+            return []
+
+        return await self._bulk_create_artifacts(
+            BulkArtifactCreationRequest(artifacts=artifacts, primary_key=primary_key)
+        )
+
     async def _bulk_create_artifacts(
         self,
         request: BulkArtifactCreationRequest,
@@ -636,7 +654,7 @@ class ArtifactManager:
 
         return BulkArtifactCreationRequest(artifacts=artifacts, primary_key=ai_suggestion.ai_suggestion_id)
 
-    async def create_llm_artifact(
+    async def prepare_llm_artifact(
         self,
         data: bytes,
         artifact_type: ArtifactType,
@@ -645,54 +663,40 @@ class ArtifactManager:
         thought: Thought | None = None,
         task_v2: TaskV2 | None = None,
         ai_suggestion: AISuggestion | None = None,
-    ) -> None:
-        """
-        Create LLM artifact with optional screenshots using bulk insert.
-
-        Args:
-            data: Main artifact data
-            artifact_type: Type of the main artifact
-            screenshots: Optional list of screenshot data
-            step: Optional Step entity
-            thought: Optional Thought entity
-            task_v2: Optional TaskV2 entity
-            ai_suggestion: Optional AISuggestion entity
-        """
+    ) -> BulkArtifactCreationRequest | None:
         if step:
-            request = self._prepare_step_artifacts(
+            return self._prepare_step_artifacts(
                 step=step,
                 artifact_type=artifact_type,
                 data=data,
                 screenshots=screenshots,
             )
-            await self._bulk_create_artifacts(request)
 
         elif task_v2:
-            request = self._prepare_task_v2_artifacts(
+            return self._prepare_task_v2_artifacts(
                 task_v2=task_v2,
                 artifact_type=artifact_type,
                 data=data,
                 screenshots=screenshots,
             )
-            await self._bulk_create_artifacts(request)
 
         elif thought:
-            request = self._prepare_thought_artifacts(
+            return self._prepare_thought_artifacts(
                 thought=thought,
                 artifact_type=artifact_type,
                 data=data,
                 screenshots=screenshots,
             )
-            await self._bulk_create_artifacts(request)
 
         elif ai_suggestion:
-            request = self._prepare_ai_suggestion_artifacts(
+            return self._prepare_ai_suggestion_artifacts(
                 ai_suggestion=ai_suggestion,
                 artifact_type=artifact_type,
                 data=data,
                 screenshots=screenshots,
             )
-            await self._bulk_create_artifacts(request)
+        else:
+            return None
 
     async def update_artifact_data(
         self,
