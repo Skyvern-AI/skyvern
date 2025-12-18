@@ -1880,41 +1880,55 @@ class ForgeAgent:
 
         LOG.debug("Persisting speculative LLM metadata")
 
+        artifacts = []
         if metadata.prompt:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=metadata.prompt.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_PROMPT,
-                screenshots=screenshots,
-                step=step,
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=metadata.prompt.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_PROMPT,
+                    screenshots=screenshots,
+                    step=step,
+                )
             )
 
         if metadata.llm_request_json:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=metadata.llm_request_json.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_REQUEST,
-                step=step,
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=metadata.llm_request_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_REQUEST,
+                    step=step,
+                )
             )
 
         if metadata.llm_response_json:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=metadata.llm_response_json.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE,
-                step=step,
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=metadata.llm_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE,
+                    step=step,
+                )
             )
 
         if metadata.parsed_response_json:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=metadata.parsed_response_json.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                step=step,
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=metadata.parsed_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                    step=step,
+                )
             )
 
         if metadata.rendered_response_json:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=metadata.rendered_response_json.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                step=step,
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=metadata.rendered_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                    step=step,
+                )
             )
+
+        if artifacts:
+            await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
 
         incremental_cost = metadata.llm_cost if metadata.llm_cost and metadata.llm_cost > 0 else None
         incremental_input_tokens = (
