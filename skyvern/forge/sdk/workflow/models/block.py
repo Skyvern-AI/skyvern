@@ -626,9 +626,14 @@ class BaseTaskBlock(Block):
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
-        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
-            workflow_permanent_id=workflow_run.workflow_permanent_id,
-        )
+        # Get workflow from context if available, otherwise query database
+        workflow = workflow_run_context.workflow
+        if workflow is None:
+            workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
+            )
+            # Cache the workflow back to context for future block executions
+            workflow_run_context.set_workflow(workflow)
         # if the task url is parameterized, we need to get the value from the workflow run context
         if self.url and workflow_run_context.has_parameter(self.url) and workflow_run_context.has_value(self.url):
             task_url_parameter_value = workflow_run_context.get_value(self.url)
