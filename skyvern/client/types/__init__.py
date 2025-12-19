@@ -385,6 +385,7 @@ if typing.TYPE_CHECKING:
     from .totp_type import TotpType
     from .upload_file_action import UploadFileAction
     from .upload_file_action_data import UploadFileActionData
+    from .upload_file_response import UploadFileResponse
     from .upload_to_s3block import UploadToS3Block
     from .upload_to_s3block_yaml import UploadToS3BlockYaml
     from .url_block import UrlBlock
@@ -887,6 +888,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "TotpType": ".totp_type",
     "UploadFileAction": ".upload_file_action",
     "UploadFileActionData": ".upload_file_action_data",
+    "UploadFileResponse": ".upload_file_response",
     "UploadToS3Block": ".upload_to_s3block",
     "UploadToS3BlockYaml": ".upload_to_s3block_yaml",
     "UrlBlock": ".url_block",
@@ -1399,6 +1401,7 @@ __all__ = [
     "TotpType",
     "UploadFileAction",
     "UploadFileActionData",
+    "UploadFileResponse",
     "UploadToS3Block",
     "UploadToS3BlockYaml",
     "UrlBlock",

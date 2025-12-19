@@ -7,7 +7,7 @@ export interface PromptAction {
     /** The prompt to send to the LLM */
     prompt: string;
     /** Optional JSON schema to structure the response */
-    schema?: Record<string, unknown>;
+    response_schema?: Record<string, unknown>;
     /** Optional model configuration */
     model?: Record<string, unknown>;
 }

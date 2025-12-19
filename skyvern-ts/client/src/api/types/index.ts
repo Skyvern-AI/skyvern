@@ -127,6 +127,7 @@ export * from "./ThoughtType.js";
 export * from "./TotpCode.js";
 export * from "./TotpType.js";
 export * from "./UploadFileAction.js";
+export * from "./UploadFileResponse.js";
 export * from "./UploadToS3Block.js";
 export * from "./UploadToS3BlockYaml.js";
 export * from "./UrlBlock.js";

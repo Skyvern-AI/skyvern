@@ -6,6 +6,7 @@ import datetime as dt
 import typing
 
 import httpx
+from . import core
 from .core.client_wrapper import AsyncClientWrapper, SyncClientWrapper
 from .core.request_options import RequestOptions
 from .environment import SkyvernEnvironment
@@ -30,6 +31,7 @@ from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExt
 from .types.task_run_request_proxy_location import TaskRunRequestProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
+from .types.upload_file_response import UploadFileResponse
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .types.workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
@@ -39,7 +41,6 @@ from .types.workflow_status import WorkflowStatus
 
 if typing.TYPE_CHECKING:
     from .scripts.client import AsyncScriptsClient, ScriptsClient
-    from .workflows.client import AsyncWorkflowsClient, WorkflowsClient
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
 
@@ -110,7 +111,6 @@ class Skyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
-        self._workflows: typing.Optional[WorkflowsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
 
     @property
@@ -790,11 +790,7 @@ class Skyvern:
         return _response.data
 
     def retry_run_webhook(
-        self,
-        run_id: str,
-        *,
-        webhook_url: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
+        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.Optional[typing.Any]:
         """
         Retry sending the webhook for a run
@@ -823,7 +819,7 @@ class Skyvern:
             run_id="tsk_123",
         )
         """
-        _response = self._raw_client.retry_run_webhook(run_id, webhook_url=webhook_url, request_options=request_options)
+        _response = self._raw_client.retry_run_webhook(run_id, request_options=request_options)
         return _response.data
 
     def get_run_timeline(
@@ -857,6 +853,35 @@ class Skyvern:
         )
         """
         _response = self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    def upload_file(
+        self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
+    ) -> UploadFileResponse:
+        """
+        Parameters
+        ----------
+        file : core.File
+            See core.File for more documentation
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        UploadFileResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.upload_file()
+        """
+        _response = self._raw_client.upload_file(file=file, request_options=request_options)
         return _response.data
 
     def list_browser_profiles(
@@ -1534,110 +1559,6 @@ class Skyvern:
         )
         return _response.data
 
-    def download_files(
-        self,
-        *,
-        navigation_goal: str,
-        url: typing.Optional[str] = OMIT,
-        webhook_url: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
-        totp_identifier: typing.Optional[str] = OMIT,
-        totp_url: typing.Optional[str] = OMIT,
-        browser_session_id: typing.Optional[str] = OMIT,
-        browser_profile_id: typing.Optional[str] = OMIT,
-        browser_address: typing.Optional[str] = OMIT,
-        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
-        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
-        download_suffix: typing.Optional[str] = OMIT,
-        download_timeout: typing.Optional[float] = OMIT,
-        max_steps_per_run: typing.Optional[int] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> WorkflowRunResponse:
-        """
-        Download a file from a website by navigating and clicking download buttons
-
-        Parameters
-        ----------
-        navigation_goal : str
-            Instructions for navigating to and downloading the file
-
-        url : typing.Optional[str]
-            Website URL
-
-        webhook_url : typing.Optional[str]
-            Webhook URL to send status updates
-
-        proxy_location : typing.Optional[ProxyLocation]
-            Proxy location to use
-
-        totp_identifier : typing.Optional[str]
-            Identifier for TOTP (Time-based One-Time Password) if required
-
-        totp_url : typing.Optional[str]
-            TOTP URL to fetch one-time passwords
-
-        browser_session_id : typing.Optional[str]
-            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
-
-        browser_profile_id : typing.Optional[str]
-            ID of a browser profile to reuse for this run
-
-        browser_address : typing.Optional[str]
-            The CDP address for the task.
-
-        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Additional HTTP headers to include in requests
-
-        max_screenshot_scrolling_times : typing.Optional[int]
-            Maximum number of times to scroll for screenshots
-
-        download_suffix : typing.Optional[str]
-            Suffix or complete filename for the downloaded file
-
-        download_timeout : typing.Optional[float]
-            Timeout in seconds for the download operation
-
-        max_steps_per_run : typing.Optional[int]
-            Maximum number of steps to execute
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        WorkflowRunResponse
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.download_files(
-            navigation_goal="navigation_goal",
-        )
-        """
-        _response = self._raw_client.download_files(
-            navigation_goal=navigation_goal,
-            url=url,
-            webhook_url=webhook_url,
-            proxy_location=proxy_location,
-            totp_identifier=totp_identifier,
-            totp_url=totp_url,
-            browser_session_id=browser_session_id,
-            browser_profile_id=browser_profile_id,
-            browser_address=browser_address,
-            extra_http_headers=extra_http_headers,
-            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
-            download_suffix=download_suffix,
-            download_timeout=download_timeout,
-            max_steps_per_run=max_steps_per_run,
-            request_options=request_options,
-        )
-        return _response.data
-
     def get_scripts(
         self,
         *,
@@ -1861,14 +1782,6 @@ class Skyvern:
         return _response.data
 
     @property
-    def workflows(self):
-        if self._workflows is None:
-            from .workflows.client import WorkflowsClient  # noqa: E402
-
-            self._workflows = WorkflowsClient(client_wrapper=self._client_wrapper)
-        return self._workflows
-
-    @property
     def scripts(self):
         if self._scripts is None:
             from .scripts.client import ScriptsClient  # noqa: E402
@@ -1943,7 +1856,6 @@ class AsyncSkyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
-        self._workflows: typing.Optional[AsyncWorkflowsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
 
     @property
@@ -2705,11 +2617,7 @@ class AsyncSkyvern:
         return _response.data
 
     async def retry_run_webhook(
-        self,
-        run_id: str,
-        *,
-        webhook_url: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
+        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.Optional[typing.Any]:
         """
         Retry sending the webhook for a run
@@ -2746,9 +2654,7 @@ class AsyncSkyvern:
 
         asyncio.run(main())
         """
-        _response = await self._raw_client.retry_run_webhook(
-            run_id, webhook_url=webhook_url, request_options=request_options
-        )
+        _response = await self._raw_client.retry_run_webhook(run_id, request_options=request_options)
         return _response.data
 
     async def get_run_timeline(
@@ -2790,6 +2696,43 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    async def upload_file(
+        self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
+    ) -> UploadFileResponse:
+        """
+        Parameters
+        ----------
+        file : core.File
+            See core.File for more documentation
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        UploadFileResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.upload_file()
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.upload_file(file=file, request_options=request_options)
         return _response.data
 
     async def list_browser_profiles(
@@ -3583,118 +3526,6 @@ class AsyncSkyvern:
         )
         return _response.data
 
-    async def download_files(
-        self,
-        *,
-        navigation_goal: str,
-        url: typing.Optional[str] = OMIT,
-        webhook_url: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
-        totp_identifier: typing.Optional[str] = OMIT,
-        totp_url: typing.Optional[str] = OMIT,
-        browser_session_id: typing.Optional[str] = OMIT,
-        browser_profile_id: typing.Optional[str] = OMIT,
-        browser_address: typing.Optional[str] = OMIT,
-        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
-        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
-        download_suffix: typing.Optional[str] = OMIT,
-        download_timeout: typing.Optional[float] = OMIT,
-        max_steps_per_run: typing.Optional[int] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> WorkflowRunResponse:
-        """
-        Download a file from a website by navigating and clicking download buttons
-
-        Parameters
-        ----------
-        navigation_goal : str
-            Instructions for navigating to and downloading the file
-
-        url : typing.Optional[str]
-            Website URL
-
-        webhook_url : typing.Optional[str]
-            Webhook URL to send status updates
-
-        proxy_location : typing.Optional[ProxyLocation]
-            Proxy location to use
-
-        totp_identifier : typing.Optional[str]
-            Identifier for TOTP (Time-based One-Time Password) if required
-
-        totp_url : typing.Optional[str]
-            TOTP URL to fetch one-time passwords
-
-        browser_session_id : typing.Optional[str]
-            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
-
-        browser_profile_id : typing.Optional[str]
-            ID of a browser profile to reuse for this run
-
-        browser_address : typing.Optional[str]
-            The CDP address for the task.
-
-        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Additional HTTP headers to include in requests
-
-        max_screenshot_scrolling_times : typing.Optional[int]
-            Maximum number of times to scroll for screenshots
-
-        download_suffix : typing.Optional[str]
-            Suffix or complete filename for the downloaded file
-
-        download_timeout : typing.Optional[float]
-            Timeout in seconds for the download operation
-
-        max_steps_per_run : typing.Optional[int]
-            Maximum number of steps to execute
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        WorkflowRunResponse
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.download_files(
-                navigation_goal="navigation_goal",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.download_files(
-            navigation_goal=navigation_goal,
-            url=url,
-            webhook_url=webhook_url,
-            proxy_location=proxy_location,
-            totp_identifier=totp_identifier,
-            totp_url=totp_url,
-            browser_session_id=browser_session_id,
-            browser_profile_id=browser_profile_id,
-            browser_address=browser_address,
-            extra_http_headers=extra_http_headers,
-            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
-            download_suffix=download_suffix,
-            download_timeout=download_timeout,
-            max_steps_per_run=max_steps_per_run,
-            request_options=request_options,
-        )
-        return _response.data
-
     async def get_scripts(
         self,
         *,
@@ -3956,14 +3787,6 @@ class AsyncSkyvern:
             request_options=request_options,
         )
         return _response.data
-
-    @property
-    def workflows(self):
-        if self._workflows is None:
-            from .workflows.client import AsyncWorkflowsClient  # noqa: E402
-
-            self._workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
-        return self._workflows
 
     @property
     def scripts(self):
