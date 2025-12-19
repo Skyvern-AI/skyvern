@@ -230,8 +230,8 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
     async def blob_exists(self, uri: str) -> bool:
         parsed = AzureUri(uri)
         try:
-            client = self._get_blob_service_client()
-            container_client = client.get_container_client(parsed.container)
+            # Use cached container clients for reduced overhead
+            container_client = self._get_container_client(parsed.container)
             blob_client = container_client.get_blob_client(parsed.blob_path)
             return await blob_client.exists()
         except Exception:
@@ -337,6 +337,15 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
             if log_exception:
                 LOG.exception("Failed to get blob metadata", uri=uri)
             return None
+
+    def _get_container_client(self, container: str):
+        container_clients = self._container_clients
+        if container in container_clients:
+            return container_clients[container]
+        client = self._get_blob_service_client()
+        container_client = client.get_container_client(container)
+        container_clients[container] = container_client
+        return container_client
 
 
 class RealAzureClientFactory(AzureClientFactory):
