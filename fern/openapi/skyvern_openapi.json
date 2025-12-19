@@ -1061,6 +1061,23 @@
             "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/RetryRunWebhookRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Request"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -11295,6 +11312,24 @@
           "NONE"
         ],
         "title": "ProxyLocation"
+      },
+      "RetryRunWebhookRequest": {
+        "properties": {
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url",
+            "description": "Optional webhook URL to send the payload to instead of the stored configuration"
+          }
+        },
+        "type": "object",
+        "title": "RetryRunWebhookRequest"
       },
       "RunEngine": {
         "type": "string",
