@@ -17,7 +17,7 @@ from yarl import URL
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
 from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime
-from skyvern.forge.sdk.api.aws import AsyncAWSClient, aws_client
+from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.utils.url_validators import encode_url
 
 LOG = structlog.get_logger()
@@ -97,6 +97,12 @@ def validate_download_url(url: str) -> bool:
                 return True
             return False
 
+        # Allow Azure URIs for Skyvern uploads container
+        if scheme == "azure":
+            if url.startswith(f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/o_"):
+                return True
+            return False
+
         # Allow file:// URLs only in local environment
         if scheme == "file":
             if settings.ENV != "local":
@@ -129,20 +135,45 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
                 url = f"https://drive.google.com/uc?export=download&id={file_id}"
                 LOG.info("Converting Google Drive link to direct download", url=url)
 
-        # Check if URL is an S3 URI
-        if url.startswith(f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"):
-            LOG.info("Downloading Skyvern file from S3", url=url)
-            client = AsyncAWSClient()
-            return await download_from_s3(client, url)
+        # Check if URL is a cloud storage URI (S3 or Azure)
+        parsed = urlparse(url)
+        if parsed.scheme == "s3":
+            uploads_prefix = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"
+            if url.startswith(uploads_prefix):
+                LOG.info("Downloading Skyvern file from S3", url=url)
+                from skyvern.forge import app
+
+                data = await app.STORAGE.download_uploaded_file(url)
+                if data is None:
+                    raise Exception(f"Failed to download file from S3: {url}")
+                filename = url.split("/")[-1]
+                temp_file = create_named_temporary_file(delete=False, file_name=filename)
+                LOG.info(f"Downloaded file to {temp_file.name}")
+                temp_file.write(data)
+                return temp_file.name
+        elif parsed.scheme == "azure":
+            uploads_prefix = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/o_"
+            if url.startswith(uploads_prefix):
+                LOG.info("Downloading Skyvern file from Azure Blob Storage", url=url)
+                from skyvern.forge import app
+
+                data = await app.STORAGE.download_uploaded_file(url)
+                if data is None:
+                    raise Exception(f"Failed to download file from Azure Blob Storage: {url}")
+                filename = url.split("/")[-1]
+                temp_file = create_named_temporary_file(delete=False, file_name=filename)
+                LOG.info(f"Downloaded file to {temp_file.name}")
+                temp_file.write(data)
+                return temp_file.name
 
         # Check if URL is a file:// URI
         # we only support to download local files when the environment is local
         # and the file is in the skyvern downloads directory
         if url.startswith("file://") and settings.ENV == "local":
-            file_path = parse_uri_to_path(url)
-            if file_path.startswith(f"{REPO_ROOT_DIR}/downloads"):
+            local_path = parse_uri_to_path(url)
+            if local_path.startswith(f"{REPO_ROOT_DIR}/downloads"):
                 LOG.info("Downloading file from local file system", url=url)
-                return file_path
+                return local_path
 
         async with aiohttp.ClientSession(raise_for_status=True) as session:
             LOG.info("Starting to download file", url=url)
@@ -256,18 +287,21 @@ def list_downloading_files_in_directory(
 
 
 async def wait_for_download_finished(downloading_files: list[str], timeout: float = BROWSER_DOWNLOAD_TIMEOUT) -> None:
+    from skyvern.forge import app
+
     cur_downloading_files = downloading_files
     try:
         async with asyncio.timeout(timeout):
             while len(cur_downloading_files) > 0:
                 new_downloading_files: list[str] = []
                 for path in cur_downloading_files:
-                    if path.startswith("s3://"):
-                        try:
-                            await aws_client.get_object_info(path)
-                        except Exception:
+                    # Check for cloud storage URIs (S3 or Azure)
+                    parsed = urlparse(path)
+                    if parsed.scheme in ("s3", "azure"):
+                        if not await app.STORAGE.file_exists(path):
                             LOG.debug(
-                                "downloading file is not found in s3, means the file finished downloading", path=path
+                                "downloading file is not found in cloud storage, means the file finished downloading",
+                                path=path,
                             )
                             continue
                     else:
