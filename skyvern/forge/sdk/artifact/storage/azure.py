@@ -300,16 +300,34 @@ class AzureStorage(BaseStorage):
 
         file_infos: list[FileInfo] = []
         for key in object_keys:
+            # Playwright's record_video_dir should only contain .webm files.
+            # Filter defensively in case of unexpected files.
+            key_lower = key.lower()
+            if not (key_lower.endswith(".webm") or key_lower.endswith(".mp4")):
+                LOG.warning(
+                    "Skipping recording file with unsupported extension",
+                    uri=key,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                )
+                continue
+
             metadata = {}
             modified_at: datetime | None = None
+            content_length: int | None = None
             # Get metadata (including checksum)
             try:
                 object_info = await self.async_client.get_object_info(key)
                 if object_info:
                     metadata = object_info.get("Metadata", {})
                     modified_at = object_info.get("LastModified")
+                    content_length = object_info.get("ContentLength") or object_info.get("Size")
             except Exception:
                 LOG.exception("Recording object info retrieval failed", uri=key)
+
+            # Skip zero-byte objects (if any incompleted uploads)
+            if content_length == 0:
+                continue
 
             # Create FileInfo object
             filename = os.path.basename(key)
@@ -328,6 +346,9 @@ class AzureStorage(BaseStorage):
             )
             file_infos.append(file_info)
 
+        # Prefer the newest recording first (Azure list order is not guaranteed).
+        # Treat None as "oldest".
+        file_infos.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
         return file_infos
 
     async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
