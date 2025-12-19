@@ -34,7 +34,7 @@ def read_retry(retries: int = 3) -> Callable:
                         LOG.error("SQLAlchemyError after all retries", exc_info=True, attempt=attempt)
                         raise
 
-                    backoff_time = 0.1 * (2**attempt)
+                    backoff_time = 0.2 * (2**attempt)
                     LOG.warning(
                         "SQLAlchemyError retrying",
                         attempt=attempt,
