@@ -6,6 +6,7 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.azure import StandardBlobTier
+from skyvern.forge.sdk.api.real_azure import RealAsyncAzureStorageClient
 from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
 
 # Test constants
@@ -226,8 +227,6 @@ class TestAzureStorageContentType:
         date: str | None,
     ) -> None:
         """Test that RealAsyncAzureStorageClient sets correct content type based on extension."""
-        from skyvern.forge.sdk.api.real_azure import RealAsyncAzureStorageClient
-
         test_file = tmp_path / filename
         test_file.write_bytes(b"test content")
 

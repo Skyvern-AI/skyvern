@@ -17,6 +17,7 @@ from yarl import URL
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
 from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime
+from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.utils.url_validators import encode_url
 
@@ -141,8 +142,6 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
             uploads_prefix = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"
             if url.startswith(uploads_prefix):
                 LOG.info("Downloading Skyvern file from S3", url=url)
-                from skyvern.forge import app
-
                 data = await app.STORAGE.download_uploaded_file(url)
                 if data is None:
                     raise Exception(f"Failed to download file from S3: {url}")
@@ -155,8 +154,6 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
             uploads_prefix = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/o_"
             if url.startswith(uploads_prefix):
                 LOG.info("Downloading Skyvern file from Azure Blob Storage", url=url)
-                from skyvern.forge import app
-
                 data = await app.STORAGE.download_uploaded_file(url)
                 if data is None:
                     raise Exception(f"Failed to download file from Azure Blob Storage: {url}")
@@ -287,8 +284,6 @@ def list_downloading_files_in_directory(
 
 
 async def wait_for_download_finished(downloading_files: list[str], timeout: float = BROWSER_DOWNLOAD_TIMEOUT) -> None:
-    from skyvern.forge import app
-
     cur_downloading_files = downloading_files
     try:
         async with asyncio.timeout(timeout):
