@@ -172,3 +172,50 @@ class BaseStorage(ABC):
         self, *, organization_id: str, filename: str, fileObj: BinaryIO
     ) -> tuple[str, str] | None:
         pass
+
+    @abstractmethod
+    async def sync_browser_session_file(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        local_file_path: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> str:
+        pass
+
+    @abstractmethod
+    async def delete_browser_session_file(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def browser_session_file_exists(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> bool:
+        pass
+
+    @abstractmethod
+    async def download_uploaded_file(self, uri: str) -> bytes | None:
+        pass
+
+    @abstractmethod
+    async def file_exists(self, uri: str) -> bool:
+        pass
+
+    @property
+    @abstractmethod
+    def storage_type(self) -> str:
+        pass

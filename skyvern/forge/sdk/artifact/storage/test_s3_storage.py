@@ -221,3 +221,229 @@ class TestS3StorageStore:
         await s3_storage.store_artifact(artifact, test_data)
         _assert_object_content(boto3_test_client, artifact.uri, test_data)
         _assert_object_meta(boto3_test_client, artifact.uri)
+
+
+TEST_BROWSER_SESSION_ID = "bs_test_123"
+
+
+@pytest.mark.asyncio
+class TestS3StorageBrowserSessionFiles:
+    """Test S3Storage browser session file methods."""
+
+    async def test_sync_browser_session_file_with_date(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
+    ) -> None:
+        """Test syncing a file with date in path (videos/har)."""
+        test_data = b"fake video data"
+        test_file = tmp_path / "recording.webm"
+        test_file.write_bytes(test_data)
+
+        uri = await s3_storage.sync_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="videos",
+            local_file_path=str(test_file),
+            remote_path="recording.webm",
+            date="2025-01-15",
+        )
+
+        expected_uri = f"s3://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/browser_sessions/{TEST_BROWSER_SESSION_ID}/videos/2025-01-15/recording.webm"
+        assert uri == expected_uri
+        _assert_object_content(boto3_test_client, uri, test_data)
+        _assert_object_meta(boto3_test_client, uri)
+
+    async def test_sync_browser_session_file_without_date(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
+    ) -> None:
+        """Test syncing a file without date (downloads category)."""
+        test_data = b"fake download data"
+        test_file = tmp_path / "document.pdf"
+        test_file.write_bytes(test_data)
+
+        uri = await s3_storage.sync_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="downloads",
+            local_file_path=str(test_file),
+            remote_path="document.pdf",
+            date=None,
+        )
+
+        expected_uri = f"s3://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/browser_sessions/{TEST_BROWSER_SESSION_ID}/downloads/document.pdf"
+        assert uri == expected_uri
+        _assert_object_content(boto3_test_client, uri, test_data)
+
+    async def test_browser_session_file_exists_returns_true(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
+    ) -> None:
+        """Test browser_session_file_exists returns True for existing file."""
+        test_file = tmp_path / "exists.webm"
+        test_file.write_bytes(b"test data")
+
+        await s3_storage.sync_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="videos",
+            local_file_path=str(test_file),
+            remote_path="exists.webm",
+            date="2025-01-15",
+        )
+
+        exists = await s3_storage.browser_session_file_exists(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="videos",
+            remote_path="exists.webm",
+            date="2025-01-15",
+        )
+        assert exists is True
+
+    async def test_browser_session_file_exists_returns_false(self, s3_storage: S3Storage) -> None:
+        """Test browser_session_file_exists returns False for non-existent file."""
+        exists = await s3_storage.browser_session_file_exists(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="videos",
+            remote_path="nonexistent.webm",
+            date="2025-01-15",
+        )
+        assert exists is False
+
+    async def test_delete_browser_session_file(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
+    ) -> None:
+        """Test deleting a browser session file."""
+        test_file = tmp_path / "to_delete.webm"
+        test_file.write_bytes(b"test data")
+
+        await s3_storage.sync_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="videos",
+            local_file_path=str(test_file),
+            remote_path="to_delete.webm",
+            date="2025-01-15",
+        )
+
+        exists_before = await s3_storage.browser_session_file_exists(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="videos",
+            remote_path="to_delete.webm",
+            date="2025-01-15",
+        )
+        assert exists_before is True
+
+        await s3_storage.delete_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="videos",
+            remote_path="to_delete.webm",
+            date="2025-01-15",
+        )
+
+        exists_after = await s3_storage.browser_session_file_exists(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="videos",
+            remote_path="to_delete.webm",
+            date="2025-01-15",
+        )
+        assert exists_after is False
+
+    async def test_file_exists_returns_true(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
+    ) -> None:
+        """Test file_exists returns True for existing file."""
+        test_file = tmp_path / "test.txt"
+        test_file.write_bytes(b"test data")
+
+        uri = await s3_storage.sync_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="downloads",
+            local_file_path=str(test_file),
+            remote_path="test.txt",
+        )
+
+        exists = await s3_storage.file_exists(uri)
+        assert exists is True
+
+    async def test_file_exists_returns_false(self, s3_storage: S3Storage) -> None:
+        """Test file_exists returns False for non-existent file."""
+        uri = f"s3://{TEST_BUCKET}/nonexistent/path/file.txt"
+        exists = await s3_storage.file_exists(uri)
+        assert exists is False
+
+    async def test_download_uploaded_file(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
+    ) -> None:
+        """Test downloading an uploaded file."""
+        test_data = b"uploaded file content"
+        test_file = tmp_path / "uploaded.pdf"
+        test_file.write_bytes(test_data)
+
+        uri = await s3_storage.sync_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="downloads",
+            local_file_path=str(test_file),
+            remote_path="uploaded.pdf",
+        )
+
+        downloaded = await s3_storage.download_uploaded_file(uri)
+        assert downloaded == test_data
+
+    async def test_download_uploaded_file_nonexistent(self, s3_storage: S3Storage) -> None:
+        """Test downloading a non-existent file returns None."""
+        uri = f"s3://{TEST_BUCKET}/nonexistent/path/file.txt"
+        downloaded = await s3_storage.download_uploaded_file(uri)
+        assert downloaded is None
+
+    def test_storage_type_property(self, s3_storage: S3Storage) -> None:
+        """Test storage_type returns 's3'."""
+        assert s3_storage.storage_type == "s3"
+
+
+CONTENT_TYPE_TEST_CASES = [
+    # (filename, expected_content_type, artifact_type, date)
+    ("video.webm", "video/webm", "videos", "2025-01-15"),
+    ("data.json", "application/json", "har", "2025-01-15"),
+    ("network.har", "application/json", "har", "2025-01-15"),
+    ("screenshot.png", "image/png", "downloads", None),
+    ("output.txt", "text/plain", "downloads", None),
+    ("debug.log", "text/plain", "downloads", None),
+]
+
+
+@pytest.mark.asyncio
+class TestS3StorageContentType:
+    """Test S3Storage content type guessing."""
+
+    @pytest.mark.parametrize("filename,expected_content_type,artifact_type,date", CONTENT_TYPE_TEST_CASES)
+    async def test_content_type_guessing(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        tmp_path: Path,
+        filename: str,
+        expected_content_type: str,
+        artifact_type: str,
+        date: str | None,
+    ) -> None:
+        """Test that files get correct content type based on extension."""
+        test_file = tmp_path / filename
+        test_file.write_bytes(b"test content")
+
+        uri = await s3_storage.sync_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type=artifact_type,
+            local_file_path=str(test_file),
+            remote_path=filename,
+            date=date,
+        )
+
+        s3uri = S3Uri(uri)
+        obj_meta = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=s3uri.key)
+        assert obj_meta["ContentType"] == expected_content_type

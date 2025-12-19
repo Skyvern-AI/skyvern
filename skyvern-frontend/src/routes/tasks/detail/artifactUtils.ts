@@ -2,10 +2,11 @@ import { ArtifactApiResponse, TaskApiResponse } from "@/api/types";
 import { artifactApiBaseUrl } from "@/util/env";
 
 export function getImageURL(artifact: ArtifactApiResponse): string {
+  if (artifact.signed_url) {
+    return artifact.signed_url;
+  }
   if (artifact.uri.startsWith("file://")) {
     return `${artifactApiBaseUrl}/artifact/image?path=${artifact.uri.slice(7)}`;
-  } else if (artifact.uri.startsWith("s3://") && artifact.signed_url) {
-    return artifact.signed_url;
   }
   return artifact.uri;
 }

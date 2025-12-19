@@ -16,6 +16,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.real_azure import RealAzureClientFactory
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
@@ -104,6 +105,8 @@ def create_forge_app() -> ForgeApp:
 
     if settings.SKYVERN_STORAGE_TYPE == "s3":
         StorageFactory.set_storage(S3Storage())
+    elif settings.SKYVERN_STORAGE_TYPE == "azureblob":
+        StorageFactory.set_storage(AzureStorage())
     app.STORAGE = StorageFactory.get_storage()
     app.CACHE = CacheFactory.get_cache()
     app.ARTIFACT_MANAGER = ArtifactManager()
