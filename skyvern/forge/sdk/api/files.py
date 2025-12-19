@@ -20,6 +20,14 @@ from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaiti
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.utils.url_validators import encode_url
 
+_HTTP_SCHEMES = {"http", "https"}
+
+_S3_PREFIX = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"
+
+_AZURE_PREFIX = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/o_"
+
+_ALLOWED_FILE_PREFIX = f"{REPO_ROOT_DIR}/downloads"
+
 LOG = structlog.get_logger()
 
 
@@ -84,24 +92,24 @@ def validate_download_url(url: str) -> bool:
         True if valid, False otherwise.
     """
     try:
-        parsed_url = urlparse(url)
-        scheme = parsed_url.scheme.lower()
+        # Directly extract scheme by splitting, minimizes urlparse cost early
+        scheme_end = url.find(":")
+        if scheme_end == -1:
+            return False
+        # Only scheme, not full authority
+        scheme = url[:scheme_end].lower()
 
-        # Allow http/https URLs (includes Google Drive which uses https)
-        if scheme in ("http", "https"):
+        if scheme in _HTTP_SCHEMES:
             return True
 
         # Allow S3 URIs for Skyvern uploads bucket
         if scheme == "s3":
-            if url.startswith(f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"):
-                return True
-            return False
+            # Use faster 'startswith' with prebuilt prefix
+            return url.startswith(_S3_PREFIX)
 
         # Allow Azure URIs for Skyvern uploads container
         if scheme == "azure":
-            if url.startswith(f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/o_"):
-                return True
-            return False
+            return url.startswith(_AZURE_PREFIX)
 
         # Allow file:// URLs only in local environment
         if scheme == "file":
@@ -111,8 +119,8 @@ def validate_download_url(url: str) -> bool:
             # Validate the file path is within allowed directories
             try:
                 file_path = parse_uri_to_path(url)
-                allowed_prefix = f"{REPO_ROOT_DIR}/downloads"
-                if not file_path.startswith(allowed_prefix):
+                # Use global precomputed allowed prefix
+                if not file_path.startswith(_ALLOWED_FILE_PREFIX):
                     return False
                 return True
             except ValueError:
@@ -405,6 +413,13 @@ def clean_up_skyvern_temp_dir() -> None:
 
 
 def parse_uri_to_path(uri: str) -> str:
+    # Fast path for a common case: avoid re-parsing if the string looks like 'file://'
+    if not uri.startswith("file://"):
+        raise ValueError(f"Invalid URI scheme (prefix missing): {uri}")
+    # The 7th character is where the path/netloc should begin
+    # urlparse parses file:// URIs as scheme='file', netloc=(host), path=(rest)
+    # For file:///path: netloc='' and path='/path'
+    # For file://host/path: netloc='host', path='/path'
     parsed_uri = urlparse(uri)
     if parsed_uri.scheme != "file":
         raise ValueError(f"Invalid URI scheme: {parsed_uri.scheme} expected: file")
