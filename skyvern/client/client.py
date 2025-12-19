@@ -6,6 +6,7 @@ import datetime as dt
 import typing
 
 import httpx
+from . import core
 from .core.client_wrapper import AsyncClientWrapper, SyncClientWrapper
 from .core.request_options import RequestOptions
 from .environment import SkyvernEnvironment
@@ -19,6 +20,7 @@ from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.get_run_response import GetRunResponse
 from .types.proxy_location import ProxyLocation
+from .types.retry_run_webhook_request import RetryRunWebhookRequest
 from .types.run_engine import RunEngine
 from .types.run_sdk_action_request_action import RunSdkActionRequestAction
 from .types.run_sdk_action_response import RunSdkActionResponse
@@ -30,6 +32,7 @@ from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExt
 from .types.task_run_request_proxy_location import TaskRunRequestProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
+from .types.upload_file_response import UploadFileResponse
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .types.workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
@@ -39,7 +42,6 @@ from .types.workflow_status import WorkflowStatus
 
 if typing.TYPE_CHECKING:
     from .scripts.client import AsyncScriptsClient, ScriptsClient
-    from .workflows.client import AsyncWorkflowsClient, WorkflowsClient
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
 
@@ -110,7 +112,6 @@ class Skyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
-        self._workflows: typing.Optional[WorkflowsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
 
     @property
@@ -793,7 +794,7 @@ class Skyvern:
         self,
         run_id: str,
         *,
-        webhook_url: typing.Optional[str] = None,
+        request: typing.Optional[RetryRunWebhookRequest] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.Optional[typing.Any]:
         """
@@ -803,6 +804,8 @@ class Skyvern:
         ----------
         run_id : str
             The id of the task run or the workflow run.
+
+        request : typing.Optional[RetryRunWebhookRequest]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -814,16 +817,17 @@ class Skyvern:
 
         Examples
         --------
-        from skyvern import Skyvern
+        from skyvern import RetryRunWebhookRequest, Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
         client.retry_run_webhook(
             run_id="tsk_123",
+            request=RetryRunWebhookRequest(),
         )
         """
-        _response = self._raw_client.retry_run_webhook(run_id, webhook_url=webhook_url, request_options=request_options)
+        _response = self._raw_client.retry_run_webhook(run_id, request=request, request_options=request_options)
         return _response.data
 
     def get_run_timeline(
@@ -857,6 +861,35 @@ class Skyvern:
         )
         """
         _response = self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    def upload_file(
+        self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
+    ) -> UploadFileResponse:
+        """
+        Parameters
+        ----------
+        file : core.File
+            See core.File for more documentation
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        UploadFileResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.upload_file()
+        """
+        _response = self._raw_client.upload_file(file=file, request_options=request_options)
         return _response.data
 
     def list_browser_profiles(
@@ -1861,14 +1894,6 @@ class Skyvern:
         return _response.data
 
     @property
-    def workflows(self):
-        if self._workflows is None:
-            from .workflows.client import WorkflowsClient  # noqa: E402
-
-            self._workflows = WorkflowsClient(client_wrapper=self._client_wrapper)
-        return self._workflows
-
-    @property
     def scripts(self):
         if self._scripts is None:
             from .scripts.client import ScriptsClient  # noqa: E402
@@ -1943,7 +1968,6 @@ class AsyncSkyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
-        self._workflows: typing.Optional[AsyncWorkflowsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
 
     @property
@@ -2708,7 +2732,7 @@ class AsyncSkyvern:
         self,
         run_id: str,
         *,
-        webhook_url: typing.Optional[str] = None,
+        request: typing.Optional[RetryRunWebhookRequest] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.Optional[typing.Any]:
         """
@@ -2718,6 +2742,8 @@ class AsyncSkyvern:
         ----------
         run_id : str
             The id of the task run or the workflow run.
+
+        request : typing.Optional[RetryRunWebhookRequest]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2731,7 +2757,7 @@ class AsyncSkyvern:
         --------
         import asyncio
 
-        from skyvern import AsyncSkyvern
+        from skyvern import AsyncSkyvern, RetryRunWebhookRequest
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2741,14 +2767,13 @@ class AsyncSkyvern:
         async def main() -> None:
             await client.retry_run_webhook(
                 run_id="tsk_123",
+                request=RetryRunWebhookRequest(),
             )
 
 
         asyncio.run(main())
         """
-        _response = await self._raw_client.retry_run_webhook(
-            run_id, webhook_url=webhook_url, request_options=request_options
-        )
+        _response = await self._raw_client.retry_run_webhook(run_id, request=request, request_options=request_options)
         return _response.data
 
     async def get_run_timeline(
@@ -2790,6 +2815,43 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    async def upload_file(
+        self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
+    ) -> UploadFileResponse:
+        """
+        Parameters
+        ----------
+        file : core.File
+            See core.File for more documentation
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        UploadFileResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.upload_file()
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.upload_file(file=file, request_options=request_options)
         return _response.data
 
     async def list_browser_profiles(
@@ -3956,14 +4018,6 @@ class AsyncSkyvern:
             request_options=request_options,
         )
         return _response.data
-
-    @property
-    def workflows(self):
-        if self._workflows is None:
-            from .workflows.client import AsyncWorkflowsClient  # noqa: E402
-
-            self._workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
-        return self._workflows
 
     @property
     def scripts(self):

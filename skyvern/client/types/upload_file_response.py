@@ -3,27 +3,20 @@
 import typing
 
 import pydantic
+import typing_extensions
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from ..core.serialization import FieldMetadata
 
 
-class PromptAction(UniversalBaseModel):
+class UploadFileResponse(UniversalBaseModel):
+    s3uri: typing_extensions.Annotated[str, FieldMetadata(alias="s3_uri")] = pydantic.Field()
     """
-    Prompt action parameters.
-    """
-
-    prompt: str = pydantic.Field()
-    """
-    The prompt to send to the LLM
+    S3 URI where the file was uploaded
     """
 
-    response_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = pydantic.Field(default=None)
+    presigned_url: str = pydantic.Field()
     """
-    Optional JSON schema to structure the response
-    """
-
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = pydantic.Field(default=None)
-    """
-    Optional model configuration
+    Presigned URL to access the uploaded file
     """
 
     if IS_PYDANTIC_V2:
