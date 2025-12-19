@@ -1,6 +1,33 @@
 from typing import Protocol, Self
+from urllib.parse import urlparse
+
+from azure.storage.blob import StandardBlobTier
 
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential
+
+
+class AzureUri:
+    """Parse azure://{container}/{blob_path} URIs."""
+
+    def __init__(self, uri: str) -> None:
+        self._parsed = urlparse(uri, allow_fragments=False)
+
+    @property
+    def container(self) -> str:
+        return self._parsed.netloc
+
+    @property
+    def blob_path(self) -> str:
+        if self._parsed.query:
+            return self._parsed.path.lstrip("/") + "?" + self._parsed.query
+        return self._parsed.path.lstrip("/")
+
+    @property
+    def uri(self) -> str:
+        return self._parsed.geturl()
+
+    def __str__(self) -> str:
+        return self.uri
 
 
 class AsyncAzureVaultClient(Protocol):
@@ -68,21 +95,24 @@ class AsyncAzureVaultClient(Protocol):
 
 
 class AsyncAzureStorageClient(Protocol):
-    """Protocol defining the interface for Azure Storage clients.
+    """Protocol defining the interface for Azure Storage clients."""
 
-    This client provides methods to interact with Azure Blob Storage for file operations.
-    """
-
-    async def upload_file_from_path(self, container_name: str, blob_name: str, file_path: str) -> None:
+    async def upload_file_from_path(
+        self,
+        uri: str,
+        file_path: str,
+        tier: StandardBlobTier = StandardBlobTier.HOT,
+        tags: dict[str, str] | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> None:
         """Upload a file from the local filesystem to Azure Blob Storage.
 
         Args:
-            container_name: The name of the Azure Blob container
-            blob_name: The name to give the blob in storage
+            uri: The azure:// URI for the blob (azure://container/blob_path)
             file_path: The local path to the file to upload
-
-        Raises:
-            Exception: If the upload fails
+            tier: The storage tier for the blob
+            tags: Optional tags to attach to the blob
+            metadata: Optional metadata to attach to the blob
         """
         ...
 

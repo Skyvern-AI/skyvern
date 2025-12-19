@@ -2603,9 +2603,8 @@ class FileUploadBlock(Block):
                     blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
                     azure_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
                     uploaded_uris.append(azure_uri)
-                    await azure_client.upload_file_from_path(
-                        container_name=self.azure_blob_container_name or "", blob_name=blob_name, file_path=file_path
-                    )
+                    uri = f"azure://{self.azure_blob_container_name or ''}/{blob_name}"
+                    await azure_client.upload_file_from_path(uri, file_path)
                 LOG.info("FileUploadBlock: File(s) uploaded to Azure Blob Storage", file_path=self.path)
             else:
                 # This case should ideally be caught by the initial validation

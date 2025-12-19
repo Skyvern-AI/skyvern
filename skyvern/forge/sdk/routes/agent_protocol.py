@@ -1294,15 +1294,9 @@ async def get_artifact(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
-        if signed_urls:
-            artifact.signed_url = signed_urls[0]
-        else:
-            LOG.warning(
-                "Failed to get signed url for artifact",
-                artifact_id=artifact_id,
-            )
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
+    if signed_urls:
+        artifact.signed_url = signed_urls[0]
     return artifact
 
 
@@ -1334,23 +1328,10 @@ async def get_run_artifacts(
     # Ensure we have a list of artifacts (since group_by_type=False, this will always be a list)
     artifacts_list = artifacts if isinstance(artifacts, list) else []
 
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        # Get signed URLs for all artifacts
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
-
-        if signed_urls and len(signed_urls) == len(artifacts_list):
-            for i, artifact in enumerate(artifacts_list):
-                if hasattr(artifact, "signed_url"):
-                    artifact.signed_url = signed_urls[i]
-        elif signed_urls:
-            LOG.warning(
-                "Mismatch between artifacts and signed URLs count",
-                artifacts_count=len(artifacts_list),
-                urls_count=len(signed_urls),
-                run_id=run_id,
-            )
-        else:
-            LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
+    if signed_urls and len(signed_urls) == len(artifacts_list):
+        for i, artifact in enumerate(artifacts_list):
+            artifact.signed_url = signed_urls[i]
 
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts_list])
 
@@ -1976,17 +1957,10 @@ async def get_artifacts(
     }
     artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
 
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-        if signed_urls:
-            for i, artifact in enumerate(artifacts):
-                artifact.signed_url = signed_urls[i]
-        else:
-            LOG.warning(
-                "Failed to get signed urls for artifacts",
-                entity_type=entity_type,
-                entity_id=entity_id,
-            )
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
+    if signed_urls:
+        for i, artifact in enumerate(artifacts):
+            artifact.signed_url = signed_urls[i]
 
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
@@ -2021,17 +1995,10 @@ async def get_step_artifacts(
         step_id,
         organization_id=current_org.organization_id,
     )
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-        if signed_urls:
-            for i, artifact in enumerate(artifacts):
-                artifact.signed_url = signed_urls[i]
-        else:
-            LOG.warning(
-                "Failed to get signed urls for artifacts",
-                task_id=task_id,
-                step_id=step_id,
-            )
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
+    if signed_urls:
+        for i, artifact in enumerate(artifacts):
+            artifact.signed_url = signed_urls[i]
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
