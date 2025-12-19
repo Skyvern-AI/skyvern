@@ -26,6 +26,7 @@ from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.get_run_response import GetRunResponse
 from .types.proxy_location import ProxyLocation
+from .types.retry_run_webhook_request import RetryRunWebhookRequest
 from .types.run_engine import RunEngine
 from .types.run_sdk_action_request_action import RunSdkActionRequestAction
 from .types.run_sdk_action_response import RunSdkActionResponse
@@ -959,7 +960,11 @@ class RawSkyvern:
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
     def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+        self,
+        run_id: str,
+        *,
+        request: typing.Optional[RetryRunWebhookRequest] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[typing.Optional[typing.Any]]:
         """
         Retry sending the webhook for a run
@@ -968,6 +973,8 @@ class RawSkyvern:
         ----------
         run_id : str
             The id of the task run or the workflow run.
+
+        request : typing.Optional[RetryRunWebhookRequest]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -980,7 +987,14 @@ class RawSkyvern:
         _response = self._client_wrapper.httpx_client.request(
             f"v1/runs/{jsonable_encoder(run_id)}/retry_webhook",
             method="POST",
+            json=convert_and_respect_annotation_metadata(
+                object_=request, annotation=RetryRunWebhookRequest, direction="write"
+            ),
+            headers={
+                "content-type": "application/json",
+            },
             request_options=request_options,
+            omit=OMIT,
         )
         try:
             if _response is None or not _response.text.strip():
@@ -2133,6 +2147,131 @@ class RawSkyvern:
                 "azure_vault_username_key": azure_vault_username_key,
                 "azure_vault_password_key": azure_vault_password_key,
                 "azure_vault_totp_secret_key": azure_vault_totp_secret_key,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[WorkflowRunResponse]:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[WorkflowRunResponse]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/run/tasks/download_files",
+            method="POST",
+            json={
+                "url": url,
+                "webhook_url": webhook_url,
+                "proxy_location": proxy_location,
+                "totp_identifier": totp_identifier,
+                "totp_url": totp_url,
+                "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
+                "browser_address": browser_address,
+                "extra_http_headers": extra_http_headers,
+                "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
+                "navigation_goal": navigation_goal,
+                "download_suffix": download_suffix,
+                "download_timeout": download_timeout,
+                "max_steps_per_run": max_steps_per_run,
             },
             headers={
                 "content-type": "application/json",
@@ -3408,7 +3547,11 @@ class AsyncRawSkyvern:
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
     async def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+        self,
+        run_id: str,
+        *,
+        request: typing.Optional[RetryRunWebhookRequest] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[typing.Optional[typing.Any]]:
         """
         Retry sending the webhook for a run
@@ -3417,6 +3560,8 @@ class AsyncRawSkyvern:
         ----------
         run_id : str
             The id of the task run or the workflow run.
+
+        request : typing.Optional[RetryRunWebhookRequest]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3429,7 +3574,14 @@ class AsyncRawSkyvern:
         _response = await self._client_wrapper.httpx_client.request(
             f"v1/runs/{jsonable_encoder(run_id)}/retry_webhook",
             method="POST",
+            json=convert_and_respect_annotation_metadata(
+                object_=request, annotation=RetryRunWebhookRequest, direction="write"
+            ),
+            headers={
+                "content-type": "application/json",
+            },
             request_options=request_options,
+            omit=OMIT,
         )
         try:
             if _response is None or not _response.text.strip():
@@ -4582,6 +4734,131 @@ class AsyncRawSkyvern:
                 "azure_vault_username_key": azure_vault_username_key,
                 "azure_vault_password_key": azure_vault_password_key,
                 "azure_vault_totp_secret_key": azure_vault_totp_secret_key,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[WorkflowRunResponse]:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[WorkflowRunResponse]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/run/tasks/download_files",
+            method="POST",
+            json={
+                "url": url,
+                "webhook_url": webhook_url,
+                "proxy_location": proxy_location,
+                "totp_identifier": totp_identifier,
+                "totp_url": totp_url,
+                "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
+                "browser_address": browser_address,
+                "extra_http_headers": extra_http_headers,
+                "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
+                "navigation_goal": navigation_goal,
+                "download_suffix": download_suffix,
+                "download_timeout": download_timeout,
+                "max_steps_per_run": max_steps_per_run,
             },
             headers={
                 "content-type": "application/json",

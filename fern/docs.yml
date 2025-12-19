@@ -172,6 +172,8 @@ navigation:
               - POST /v1/runs/{run_id}/cancel
               - POST /v1/runs/{run_id}/retry_webhook
               - POST /v1/run/tasks/login
+              - endpoint: POST /v1/run/tasks/download_files
+                hidden: true
               - GET /v1/runs/{run_id}/timeline
           - section: Workflows
             contents:

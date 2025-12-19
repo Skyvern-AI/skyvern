@@ -1207,7 +1207,7 @@ describe("SkyvernClient", () => {
             .build();
 
         await expect(async () => {
-            return await client.retryRunWebhook("run_id");
+            return await client.retryRunWebhook("run_id", undefined);
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
@@ -2505,6 +2505,142 @@ describe("SkyvernClient", () => {
         await expect(async () => {
             return await client.login({
                 credential_type: "skyvern",
+            });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("download_files (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { navigation_goal: "navigation_goal" };
+        const rawResponseBody = {
+            run_id: "tsk_123",
+            status: "created",
+            output: { key: "value" },
+            downloaded_files: [
+                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+            ],
+            recording_url: "recording_url",
+            screenshot_urls: ["screenshot_urls"],
+            failure_reason: "failure_reason",
+            created_at: "2025-01-01T00:00:00Z",
+            modified_at: "2025-01-01T00:05:00Z",
+            queued_at: "2024-01-15T09:30:00Z",
+            started_at: "2024-01-15T09:30:00Z",
+            finished_at: "2024-01-15T09:30:00Z",
+            app_url: "app_url",
+            browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
+            max_screenshot_scrolls: 1,
+            script_run: { ai_fallback_triggered: true },
+            errors: [{ key: "value" }],
+            run_with: "run_with",
+            ai_fallback: true,
+            run_request: {
+                workflow_id: "wpid_123",
+                parameters: { key: "value" },
+                title: "title",
+                proxy_location: "RESIDENTIAL",
+                webhook_url: "webhook_url",
+                totp_url: "totp_url",
+                totp_identifier: "totp_identifier",
+                browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
+                max_screenshot_scrolls: 1,
+                extra_http_headers: { key: "value" },
+                browser_address: "browser_address",
+                ai_fallback: true,
+                run_with: "run_with",
+            },
+        };
+        server
+            .mockEndpoint()
+            .post("/v1/run/tasks/download_files")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.downloadFiles({
+            navigation_goal: "navigation_goal",
+        });
+        expect(response).toEqual({
+            run_id: "tsk_123",
+            status: "created",
+            output: {
+                key: "value",
+            },
+            downloaded_files: [
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    modified_at: "2024-01-15T09:30:00Z",
+                },
+            ],
+            recording_url: "recording_url",
+            screenshot_urls: ["screenshot_urls"],
+            failure_reason: "failure_reason",
+            created_at: "2025-01-01T00:00:00Z",
+            modified_at: "2025-01-01T00:05:00Z",
+            queued_at: "2024-01-15T09:30:00Z",
+            started_at: "2024-01-15T09:30:00Z",
+            finished_at: "2024-01-15T09:30:00Z",
+            app_url: "app_url",
+            browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
+            max_screenshot_scrolls: 1,
+            script_run: {
+                ai_fallback_triggered: true,
+            },
+            errors: [
+                {
+                    key: "value",
+                },
+            ],
+            run_with: "run_with",
+            ai_fallback: true,
+            run_request: {
+                workflow_id: "wpid_123",
+                parameters: {
+                    key: "value",
+                },
+                title: "title",
+                proxy_location: "RESIDENTIAL",
+                webhook_url: "webhook_url",
+                totp_url: "totp_url",
+                totp_identifier: "totp_identifier",
+                browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
+                max_screenshot_scrolls: 1,
+                extra_http_headers: {
+                    key: "value",
+                },
+                browser_address: "browser_address",
+                ai_fallback: true,
+                run_with: "run_with",
+            },
+        });
+    });
+
+    test("download_files (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { navigation_goal: "navigation_goal" };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/run/tasks/download_files")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.downloadFiles({
+                navigation_goal: "navigation_goal",
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });

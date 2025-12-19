@@ -20,6 +20,7 @@ from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.get_run_response import GetRunResponse
 from .types.proxy_location import ProxyLocation
+from .types.retry_run_webhook_request import RetryRunWebhookRequest
 from .types.run_engine import RunEngine
 from .types.run_sdk_action_request_action import RunSdkActionRequestAction
 from .types.run_sdk_action_response import RunSdkActionResponse
@@ -790,7 +791,11 @@ class Skyvern:
         return _response.data
 
     def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+        self,
+        run_id: str,
+        *,
+        request: typing.Optional[RetryRunWebhookRequest] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.Optional[typing.Any]:
         """
         Retry sending the webhook for a run
@@ -799,6 +804,8 @@ class Skyvern:
         ----------
         run_id : str
             The id of the task run or the workflow run.
+
+        request : typing.Optional[RetryRunWebhookRequest]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -810,16 +817,17 @@ class Skyvern:
 
         Examples
         --------
-        from skyvern import Skyvern
+        from skyvern import RetryRunWebhookRequest, Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
         client.retry_run_webhook(
             run_id="tsk_123",
+            request=RetryRunWebhookRequest(),
         )
         """
-        _response = self._raw_client.retry_run_webhook(run_id, request_options=request_options)
+        _response = self._raw_client.retry_run_webhook(run_id, request=request, request_options=request_options)
         return _response.data
 
     def get_run_timeline(
@@ -1555,6 +1563,110 @@ class Skyvern:
             azure_vault_username_key=azure_vault_username_key,
             azure_vault_password_key=azure_vault_password_key,
             azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.download_files(
+            navigation_goal="navigation_goal",
+        )
+        """
+        _response = self._raw_client.download_files(
+            navigation_goal=navigation_goal,
+            url=url,
+            webhook_url=webhook_url,
+            proxy_location=proxy_location,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
+            browser_address=browser_address,
+            extra_http_headers=extra_http_headers,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            download_suffix=download_suffix,
+            download_timeout=download_timeout,
+            max_steps_per_run=max_steps_per_run,
             request_options=request_options,
         )
         return _response.data
@@ -2617,7 +2729,11 @@ class AsyncSkyvern:
         return _response.data
 
     async def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+        self,
+        run_id: str,
+        *,
+        request: typing.Optional[RetryRunWebhookRequest] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.Optional[typing.Any]:
         """
         Retry sending the webhook for a run
@@ -2626,6 +2742,8 @@ class AsyncSkyvern:
         ----------
         run_id : str
             The id of the task run or the workflow run.
+
+        request : typing.Optional[RetryRunWebhookRequest]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2639,7 +2757,7 @@ class AsyncSkyvern:
         --------
         import asyncio
 
-        from skyvern import AsyncSkyvern
+        from skyvern import AsyncSkyvern, RetryRunWebhookRequest
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2649,12 +2767,13 @@ class AsyncSkyvern:
         async def main() -> None:
             await client.retry_run_webhook(
                 run_id="tsk_123",
+                request=RetryRunWebhookRequest(),
             )
 
 
         asyncio.run(main())
         """
-        _response = await self._raw_client.retry_run_webhook(run_id, request_options=request_options)
+        _response = await self._raw_client.retry_run_webhook(run_id, request=request, request_options=request_options)
         return _response.data
 
     async def get_run_timeline(
@@ -3522,6 +3641,118 @@ class AsyncSkyvern:
             azure_vault_username_key=azure_vault_username_key,
             azure_vault_password_key=azure_vault_password_key,
             azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def download_files(
+        self,
+        *,
+        navigation_goal: str,
+        url: typing.Optional[str] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
+        download_suffix: typing.Optional[str] = OMIT,
+        download_timeout: typing.Optional[float] = OMIT,
+        max_steps_per_run: typing.Optional[int] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Download a file from a website by navigating and clicking download buttons
+
+        Parameters
+        ----------
+        navigation_goal : str
+            Instructions for navigating to and downloading the file
+
+        url : typing.Optional[str]
+            Website URL
+
+        webhook_url : typing.Optional[str]
+            Webhook URL to send status updates
+
+        proxy_location : typing.Optional[ProxyLocation]
+            Proxy location to use
+
+        totp_identifier : typing.Optional[str]
+            Identifier for TOTP (Time-based One-Time Password) if required
+
+        totp_url : typing.Optional[str]
+            TOTP URL to fetch one-time passwords
+
+        browser_session_id : typing.Optional[str]
+            ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this run
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            Additional HTTP headers to include in requests
+
+        max_screenshot_scrolling_times : typing.Optional[int]
+            Maximum number of times to scroll for screenshots
+
+        download_suffix : typing.Optional[str]
+            Suffix or complete filename for the downloaded file
+
+        download_timeout : typing.Optional[float]
+            Timeout in seconds for the download operation
+
+        max_steps_per_run : typing.Optional[int]
+            Maximum number of steps to execute
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.download_files(
+                navigation_goal="navigation_goal",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.download_files(
+            navigation_goal=navigation_goal,
+            url=url,
+            webhook_url=webhook_url,
+            proxy_location=proxy_location,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
+            browser_address=browser_address,
+            extra_http_headers=extra_http_headers,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            download_suffix=download_suffix,
+            download_timeout=download_timeout,
+            max_steps_per_run=max_steps_per_run,
             request_options=request_options,
         )
         return _response.data
