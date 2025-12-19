@@ -63,7 +63,7 @@ const headersTooltip =
 const bodyTooltip =
   "Request body as JSON object. Only used for POST, PUT, PATCH methods.";
 const filesTooltip =
-  'Files to upload as multipart/form-data. Dictionary mapping field names to file paths/URLs. Supports HTTP/HTTPS URLs, S3 URIs (s3://), or limited local file access. Example: {"file": "https://example.com/file.pdf"} or {"document": "s3://bucket/path/file.pdf"}';
+  'Files to upload as multipart/form-data. Dictionary mapping field names to file paths/URLs. Supports HTTP/HTTPS URLs, S3 URIs (s3://), Azure blob URIs (azure://), or limited local file access. Example: {"file": "https://example.com/file.pdf"} or {"document": "s3://bucket/path/file.pdf"}';
 const timeoutTooltip = "Request timeout in seconds.";
 const followRedirectsTooltip =
   "Whether to automatically follow HTTP redirects.";
