@@ -21,6 +21,7 @@ from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.cache.factory import CacheFactory
+from skyvern.forge.sdk.core.rate_limiter import NoopRateLimiter, RateLimiter
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
@@ -50,6 +51,7 @@ class ForgeApp:
     ARTIFACT_MANAGER: ArtifactManager
     BROWSER_MANAGER: BrowserManager
     EXPERIMENTATION_PROVIDER: BaseExperimentationProvider
+    RATE_LIMITER: RateLimiter
     LLM_API_HANDLER: LLMAPIHandler
     OPENAI_CLIENT: AsyncOpenAI | AsyncAzureOpenAI
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
@@ -107,6 +109,7 @@ def create_forge_app() -> ForgeApp:
     app.ARTIFACT_MANAGER = ArtifactManager()
     app.BROWSER_MANAGER = RealBrowserManager()
     app.EXPERIMENTATION_PROVIDER = NoOpExperimentationProvider()
+    app.RATE_LIMITER = NoopRateLimiter()
 
     app.LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(settings.LLM_KEY)
     app.OPENAI_CLIENT = AsyncOpenAI(

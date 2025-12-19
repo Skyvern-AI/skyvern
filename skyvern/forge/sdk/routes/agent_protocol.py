@@ -162,6 +162,7 @@ async def run_task(
 ) -> TaskRunResponse:
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1
@@ -347,6 +348,7 @@ async def run_workflow(
     await PermissionCheckerFactory.get_instance().check(
         current_org, browser_session_id=workflow_run_request.browser_session_id
     )
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
     workflow_id = workflow_run_request.workflow_id
     context = skyvern_context.ensure_context()
     request_id = context.request_id
@@ -1623,6 +1625,7 @@ async def run_task_v1(
 ) -> CreateTaskResponse:
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     created_task = await task_v1_service.run_task(
         task=task,
@@ -2086,6 +2089,7 @@ async def run_workflow_legacy(
         current_org,
         browser_session_id=workflow_request.browser_session_id,
     )
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     try:
         workflow_run = await workflow_service.run_workflow(
@@ -2667,6 +2671,7 @@ async def run_task_v2(
             max_steps_override=x_max_steps_override,
         )
     await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
+    await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
 
     try:
         task_v2 = await task_v2_service.initialize_task_v2(

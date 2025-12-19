@@ -24,6 +24,15 @@ class DisabledBlockExecutionError(SkyvernHTTPException):
         super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
 
 
+class RateLimitExceeded(SkyvernHTTPException):
+    def __init__(self, organization_id: str, max_requests: int, window_seconds: int):
+        message = (
+            f"Rate limit exceeded for organization {organization_id}. "
+            f"Maximum {max_requests} requests per {window_seconds} seconds allowed."
+        )
+        super().__init__(message, status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+
+
 class InvalidOpenAIResponseFormat(SkyvernException):
     def __init__(self, message: str | None = None):
         super().__init__(f"Invalid response format: {message}")
