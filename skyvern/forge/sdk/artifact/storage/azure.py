@@ -325,7 +325,7 @@ class AzureStorage(BaseStorage):
             except Exception:
                 LOG.exception("Recording object info retrieval failed", uri=key)
 
-            # Skip zero-byte objects (if any incompleted uploads)
+            # Skip zero-byte objects (if any incomplete uploads)
             if content_length == 0:
                 continue
 
