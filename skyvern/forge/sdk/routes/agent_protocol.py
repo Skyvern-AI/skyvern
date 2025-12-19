@@ -1295,7 +1295,7 @@ async def get_artifact(
             detail=f"Artifact not found {artifact_id}",
         )
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
-    if signed_urls:
+    if signed_urls and len(signed_urls) == 1:
         artifact.signed_url = signed_urls[0]
     return artifact
 
@@ -1958,7 +1958,7 @@ async def get_artifacts(
     artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
 
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-    if signed_urls:
+    if signed_urls and len(signed_urls) == len(artifacts):
         for i, artifact in enumerate(artifacts):
             artifact.signed_url = signed_urls[i]
 
@@ -1996,7 +1996,7 @@ async def get_step_artifacts(
         organization_id=current_org.organization_id,
     )
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-    if signed_urls:
+    if signed_urls and len(signed_urls) == len(artifacts):
         for i, artifact in enumerate(artifacts):
             artifact.signed_url = signed_urls[i]
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
