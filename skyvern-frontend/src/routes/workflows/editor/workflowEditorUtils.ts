@@ -3254,6 +3254,7 @@ function convertBlocksToBlockYAML(
           block_type: "file_url_parser",
           file_url: block.file_url,
           file_type: block.file_type,
+          json_schema: block.json_schema,
         };
         return blockYaml;
       }
@@ -3298,6 +3299,7 @@ function convertBlocksToBlockYAML(
           url: block.url,
           headers: block.headers,
           body: block.body,
+          files: block.files,
           timeout: block.timeout,
           follow_redirects: block.follow_redirects,
           parameter_keys: block.parameters.map((p) => p.key),
