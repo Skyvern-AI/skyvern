@@ -54,6 +54,9 @@ type Props = {
 
 function Artifact({ type, artifacts }: Props) {
   function fetchArtifact(artifact: ArtifactApiResponse) {
+    if (artifact.signed_url) {
+      return axios.get(artifact.signed_url).then((response) => response.data);
+    }
     if (artifact.uri.startsWith("file://")) {
       const endpoint = getEndpoint(type);
       return artifactApiClient
@@ -63,9 +66,6 @@ function Artifact({ type, artifacts }: Props) {
           },
         })
         .then((response) => response.data);
-    }
-    if (artifact.uri.startsWith("s3://") && artifact.signed_url) {
-      return axios.get(artifact.signed_url).then((response) => response.data);
     }
   }
 
