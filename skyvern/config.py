@@ -54,7 +54,6 @@ class Settings(BaseSettings):
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
-    # Database settings
     DATABASE_STRING: str = (
         "postgresql+asyncpg://skyvern@localhost/skyvern"
         if platform.system() == "Windows"
@@ -63,8 +62,6 @@ class Settings(BaseSettings):
     DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
-    DB_DISABLE_PREPARED_STATEMENTS: bool = False
-
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
