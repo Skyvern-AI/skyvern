@@ -33,8 +33,8 @@ import {
 import { useSettingsStore } from "@/store/SettingsStore";
 import {
   environment,
-  wssBaseUrl,
   newWssBaseUrl,
+  legacyWssBaseUrl,
   getRuntimeApiKey,
 } from "@/util/env";
 import { cn } from "@/util/utils";
@@ -286,9 +286,9 @@ function BrowserStream({
           entity === "browserSession"
             ? `${newWssBaseUrl}/stream/vnc/browser_session/${runId}?${wsParams}`
             : entity === "task"
-              ? `${wssBaseUrl}/stream/vnc/task/${runId}?${wsParams}`
+              ? `${legacyWssBaseUrl}/stream/vnc/task/${runId}?${wsParams}`
               : entity === "workflow"
-                ? `${wssBaseUrl}/stream/vnc/workflow_run/${runId}?${wsParams}`
+                ? `${legacyWssBaseUrl}/stream/vnc/workflow_run/${runId}?${wsParams}`
                 : null;
 
         if (!vncUrl) {
@@ -390,9 +390,9 @@ function BrowserStream({
         entity === "browserSession"
           ? `${newWssBaseUrl}/stream/messages/browser_session/${runId}?${wsParams}`
           : entity === "task"
-            ? `${wssBaseUrl}/stream/messages/task/${runId}?${wsParams}`
+            ? `${legacyWssBaseUrl}/stream/messages/task/${runId}?${wsParams}`
             : entity === "workflow"
-              ? `${wssBaseUrl}/stream/messages/workflow_run/${runId}?${wsParams}`
+              ? `${legacyWssBaseUrl}/stream/messages/workflow_run/${runId}?${wsParams}`
               : null;
 
       if (!messageUrl) {
