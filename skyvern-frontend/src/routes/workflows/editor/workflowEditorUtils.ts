@@ -2352,6 +2352,19 @@ function getOrderedChildrenBlocks(
     return false;
   };
 
+  // This prevents nested loop children from being added to the parent loop.
+  const isInsideIncludedLoop = (nodeId: string): boolean => {
+    let current = nodesById.get(nodeId);
+    while (current?.parentId) {
+      const parent = nodesById.get(current.parentId);
+      if (parent?.type === "loop" && includedIds.has(parent.id)) {
+        return true;
+      }
+      current = parent;
+    }
+    return false;
+  };
+
   const parentNode = nodes.find((node) => node.id === parentId);
   if (!parentNode) {
     return [];
@@ -2408,6 +2421,9 @@ function getOrderedChildrenBlocks(
       return;
     }
     if (!hasAncestor(node.id, parentId)) {
+      return;
+    }
+    if (isInsideIncludedLoop(node.id)) {
       return;
     }
 
@@ -3254,6 +3270,7 @@ function convertBlocksToBlockYAML(
           block_type: "file_url_parser",
           file_url: block.file_url,
           file_type: block.file_type,
+          json_schema: block.json_schema,
         };
         return blockYaml;
       }
@@ -3298,6 +3315,7 @@ function convertBlocksToBlockYAML(
           url: block.url,
           headers: block.headers,
           body: block.body,
+          files: block.files,
           timeout: block.timeout,
           follow_redirects: block.follow_redirects,
           parameter_keys: block.parameters.map((p) => p.key),

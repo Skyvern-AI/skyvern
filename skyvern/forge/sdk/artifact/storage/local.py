@@ -160,11 +160,11 @@ class LocalStorage(BaseStorage):
             )
             return None
 
-    async def get_share_link(self, artifact: Artifact) -> str:
-        return artifact.uri
+    async def get_share_link(self, artifact: Artifact) -> str | None:
+        return None
 
-    async def get_share_links(self, artifacts: list[Artifact]) -> list[str]:
-        return [artifact.uri for artifact in artifacts]
+    async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
+        return None
 
     async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
         return
@@ -346,3 +346,98 @@ class LocalStorage(BaseStorage):
         raise NotImplementedError(
             "Legacy file storage is not implemented for LocalStorage. Please use a different storage backend."
         )
+
+    def _build_browser_session_path(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> Path:
+        """Build the local path for a browser session file."""
+        base = (
+            Path(self.artifact_path)
+            / settings.ENV
+            / organization_id
+            / "browser_sessions"
+            / browser_session_id
+            / artifact_type
+        )
+        if date:
+            return base / date / remote_path
+        return base / remote_path
+
+    async def sync_browser_session_file(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        local_file_path: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> str:
+        """Sync a file from local browser session to local storage."""
+        target_path = self._build_browser_session_path(
+            organization_id, browser_session_id, artifact_type, remote_path, date
+        )
+        if WINDOWS:
+            target_path = target_path.with_name(_windows_safe_filename(target_path.name))
+        self._create_directories_if_not_exists(target_path)
+        shutil.copy2(local_file_path, target_path)
+        return f"file://{target_path}"
+
+    async def delete_browser_session_file(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> None:
+        """Delete a file from browser session storage in local filesystem."""
+        target_path = self._build_browser_session_path(
+            organization_id, browser_session_id, artifact_type, remote_path, date
+        )
+        try:
+            if target_path.exists():
+                target_path.unlink()
+        except Exception:
+            LOG.exception("Failed to delete local browser session file", path=str(target_path))
+
+    async def browser_session_file_exists(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> bool:
+        """Check if a file exists in browser session storage in local filesystem."""
+        target_path = self._build_browser_session_path(
+            organization_id, browser_session_id, artifact_type, remote_path, date
+        )
+        return target_path.exists()
+
+    async def download_uploaded_file(self, uri: str) -> bytes | None:
+        """Download a user-uploaded file from local filesystem."""
+        try:
+            file_path = parse_uri_to_path(uri)
+            with open(file_path, "rb") as f:
+                return f.read()
+        except Exception:
+            LOG.exception("Failed to read local file", uri=uri)
+            return None
+
+    async def file_exists(self, uri: str) -> bool:
+        """Check if a file exists at the given local URI."""
+        try:
+            file_path = parse_uri_to_path(uri)
+            return os.path.exists(file_path)
+        except Exception:
+            return False
+
+    @property
+    def storage_type(self) -> str:
+        """Returns 'file' as the storage type."""
+        return "file"

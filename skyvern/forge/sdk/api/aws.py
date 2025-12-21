@@ -1,4 +1,5 @@
 from enum import StrEnum
+from mimetypes import add_type, guess_type
 from typing import IO, Any
 from urllib.parse import urlparse
 
@@ -11,6 +12,10 @@ from types_boto3_s3.client import S3Client
 from types_boto3_secretsmanager.client import SecretsManagerClient
 
 from skyvern.config import settings
+
+# Register custom mime types for mimetypes guessing
+add_type("application/json", ".har")
+add_type("text/plain", ".log")
 
 LOG = structlog.get_logger()
 
@@ -188,6 +193,10 @@ class AsyncAWSClient:
                     extra_args["Tagging"] = self._create_tag_string(tags)
                 if content_type:
                     extra_args["ContentType"] = content_type
+                else:
+                    guessed_type, _ = guess_type(file_path)
+                    if guessed_type:
+                        extra_args["ContentType"] = guessed_type
                 await client.upload_file(
                     Filename=file_path,
                     Bucket=parsed_uri.bucket,

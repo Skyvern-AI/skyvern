@@ -54,7 +54,6 @@ class Settings(BaseSettings):
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
-    # Database settings
     DATABASE_STRING: str = (
         "postgresql+asyncpg://skyvern@localhost/skyvern"
         if platform.system() == "Windows"
@@ -63,8 +62,6 @@ class Settings(BaseSettings):
     DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
-    DB_DISABLE_PREPARED_STATEMENTS: bool = False
-
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
@@ -90,23 +87,26 @@ class Settings(BaseSettings):
 
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
-    GENERATE_PRESIGNED_URLS: bool = False
+
+    # Supported storage types: local, s3cloud, azureblob
+    SKYVERN_STORAGE_TYPE: str = "local"
+
+    # S3/AWS settings
+    AWS_REGION: str = "us-east-1"
+    MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+    PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
-
-    # Supported storage types: local, s3
-    SKYVERN_STORAGE_TYPE: str = "local"
-
-    # S3 bucket settings
-    AWS_REGION: str = "us-east-1"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
-    MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
-    PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
 
     # Azure Blob Storage settings
     AZURE_STORAGE_ACCOUNT_NAME: str | None = None
     AZURE_STORAGE_ACCOUNT_KEY: str | None = None
+    AZURE_STORAGE_CONTAINER_ARTIFACTS: str = "skyvern-artifacts"
+    AZURE_STORAGE_CONTAINER_SCREENSHOTS: str = "skyvern-screenshots"
+    AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
+    AZURE_STORAGE_CONTAINER_UPLOADS: str = "skyvern-uploads"
 
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"

@@ -3,23 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import (
-    Connection,
-    and_,
-    asc,
-    case,
-    delete,
-    distinct,
-    event,
-    exists,
-    func,
-    or_,
-    pool,
-    select,
-    tuple_,
-    update,
-)
-from sqlalchemy.engine.url import make_url
+from sqlalchemy import and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import (
     SQLAlchemyError,
 )
@@ -172,58 +156,25 @@ def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     return result
 
 
-def _connect_args_for_driver(database_string: str) -> dict[str, Any]:
-    driver = make_url(database_string).drivername  # "postgresql+psycopg" or "postgresql+asyncpg"
-    args: dict[str, Any] = {}
+DB_CONNECT_ARGS: dict[str, Any] = {}
 
-    if settings.DB_DISABLE_PREPARED_STATEMENTS:
-        if driver == "postgresql+psycopg":
-            # psycopg3: completely disable prepared statements (None vs 0)
-            # 0 disables caching but still uses prepared statements
-            # None completely disables prepared statement usage
-            args["prepare_threshold"] = None
-        elif driver == "postgresql+asyncpg":
-            # asyncpg: disable statement cache (prepared statements)
-            args["statement_cache_size"] = 0
-        else:
-            LOG.warning(
-                "The database driver might not be well optimized or supported by skyvern: {driver}", driver=driver
-            )
-
-    return args
-
-
-def _install_statement_timeout(engine: AsyncEngine, timeout_ms: int) -> None:
-    if not timeout_ms or timeout_ms <= 0:
-        return
-
-    timeout_value = int(timeout_ms)
-
-    # Works for direct AND poolers because it's not a startup parameter.
-    # Applies per-transaction, which is the most reliable behavior with transaction pooling.
-    @event.listens_for(engine.sync_engine, "begin")
-    def _set_timeout(conn: Connection) -> None:
-        # Use a unique comment with object id to prevent psycopg3 from reusing prepared statement names,
-        # which can cause "prepared statement already exists" errors with connection poolers.
-        sql = f"SET LOCAL statement_timeout = {timeout_value} /* {id(conn)} */"
-        conn.exec_driver_sql(sql)
-
-
-def make_async_engine(database_string: str) -> AsyncEngine:
-    engine = create_async_engine(
-        database_string,
-        json_serializer=_custom_json_serializer,
-        connect_args=_connect_args_for_driver(database_string),
-        poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
-    )
-
-    _install_statement_timeout(engine, settings.DATABASE_STATEMENT_TIMEOUT_MS)
-    return engine
+if "postgresql+psycopg" in settings.DATABASE_STRING:
+    DB_CONNECT_ARGS = {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"}
+elif "postgresql+asyncpg" in settings.DATABASE_STRING:
+    DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
 
 
 class AgentDB(BaseAlchemyDB):
     def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
-        super().__init__(db_engine or make_async_engine(database_string))
+        super().__init__(
+            db_engine
+            or create_async_engine(
+                database_string,
+                json_serializer=_custom_json_serializer,
+                connect_args=DB_CONNECT_ARGS,
+                poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
+            )
+        )
         self.debug_enabled = debug_enabled
 
     def is_retryable_error(self, error: SQLAlchemyError) -> bool:
@@ -818,6 +769,34 @@ class AgentDB(BaseAlchemyDB):
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    async def bulk_update_tasks(
+        self,
+        task_ids: list[str],
+        status: TaskStatus | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        """Bulk update tasks by their IDs.
+
+        Args:
+            task_ids: List of task IDs to update
+            status: Optional status to set for all tasks
+            failure_reason: Optional failure reason to set for all tasks
+        """
+        if not task_ids:
+            return
+
+        async with self.Session() as session:
+            update_values = {}
+            if status:
+                update_values["status"] = status.value
+            if failure_reason:
+                update_values["failure_reason"] = failure_reason
+
+            if update_values:
+                update_stmt = update(TaskModel).where(TaskModel.task_id.in_(task_ids)).values(**update_values)
+                await session.execute(update_stmt)
+                await session.commit()
 
     async def get_tasks(
         self,
@@ -2657,6 +2636,38 @@ class AgentDB(BaseAlchemyDB):
                 return convert_to_workflow_run(workflow_run)
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
+
+    async def bulk_update_workflow_runs(
+        self,
+        workflow_run_ids: list[str],
+        status: WorkflowRunStatus | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        """Bulk update workflow runs by their IDs.
+
+        Args:
+            workflow_run_ids: List of workflow run IDs to update
+            status: Optional status to set for all workflow runs
+            failure_reason: Optional failure reason to set for all workflow runs
+        """
+        if not workflow_run_ids:
+            return
+
+        async with self.Session() as session:
+            update_values = {}
+            if status:
+                update_values["status"] = status.value
+            if failure_reason:
+                update_values["failure_reason"] = failure_reason
+
+            if update_values:
+                update_stmt = (
+                    update(WorkflowRunModel)
+                    .where(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
+                    .values(**update_values)
+                )
+                await session.execute(update_stmt)
+                await session.commit()
 
     async def clear_workflow_run_failure_reason(self, workflow_run_id: str, organization_id: str) -> WorkflowRun:
         async with self.Session() as session:

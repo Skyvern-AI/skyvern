@@ -1693,9 +1693,9 @@ class WorkflowService:
                 continue
 
             block_output_parameter["created_at"] = output_parameter.created_at
-            labels_to_outputs[label] = block_output_parameter
+            labels_to_outputs[label] = block_output_parameter  # type: ignore[assignment]
 
-        return labels_to_outputs
+        return labels_to_outputs  # type: ignore[return-value]
 
     async def get_workflows_by_permanent_ids(
         self,

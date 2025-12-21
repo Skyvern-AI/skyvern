@@ -235,10 +235,9 @@ class S3Storage(BaseStorage):
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
-        uri = f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
-        return [
-            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
-        ]
+        bucket = settings.AWS_S3_BUCKET_ARTIFACTS
+        uri = f"s3://{bucket}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        return [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
 
     async def get_shared_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
@@ -281,18 +280,16 @@ class S3Storage(BaseStorage):
     async def list_downloading_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
-        uri = f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
-        files = [
-            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
-        ]
+        bucket = settings.AWS_S3_BUCKET_ARTIFACTS
+        uri = f"s3://{bucket}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        files = [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
         return [file for file in files if file.endswith(BROWSER_DOWNLOADING_SUFFIX)]
 
     async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
         """List all recording files for a browser session from S3."""
-        uri = f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
-        return [
-            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
-        ]
+        bucket = settings.AWS_S3_BUCKET_ARTIFACTS
+        uri = f"s3://{bucket}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
+        return [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
 
     async def get_shared_recordings_in_browser_session(
         self, organization_id: str, browser_session_id: str
@@ -385,14 +382,15 @@ class S3Storage(BaseStorage):
             )
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
-        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
+        bucket = settings.AWS_S3_BUCKET_UPLOADS
+        uri = f"s3://{bucket}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         object_keys = await self.async_client.list_files(uri=uri)
         if len(object_keys) == 0:
             return []
 
         file_infos: list[FileInfo] = []
         for key in object_keys:
-            object_uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{key}"
+            object_uri = f"s3://{bucket}/{key}"
 
             # Get metadata (including checksum)
             metadata = await self.async_client.get_file_metadata(object_uri, log_exception=False)
@@ -467,3 +465,78 @@ class S3Storage(BaseStorage):
             )
             return None
         return presigned_urls[0], uploaded_s3_uri
+
+    def _build_browser_session_uri(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> str:
+        """Build the S3 URI for a browser session file."""
+        base = f"s3://{self.bucket}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/{artifact_type}"
+        if date:
+            return f"{base}/{date}/{remote_path}"
+        return f"{base}/{remote_path}"
+
+    async def sync_browser_session_file(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        local_file_path: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> str:
+        """Sync a file from local browser session to S3."""
+        uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
+        sc = await self._get_storage_class_for_org(organization_id)
+        tags = await self._get_tags_for_org(organization_id)
+        await self.async_client.upload_file_from_path(uri, local_file_path, storage_class=sc, tags=tags)
+        return uri
+
+    async def delete_browser_session_file(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> None:
+        """Delete a file from browser session storage in S3."""
+        uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
+        await self.async_client.delete_file(uri, log_exception=True)
+
+    async def browser_session_file_exists(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> bool:
+        """Check if a file exists in browser session storage in S3."""
+        uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
+        try:
+            info = await self.async_client.get_object_info(uri)
+            return info is not None
+        except Exception:
+            return False
+
+    async def download_uploaded_file(self, uri: str) -> bytes | None:
+        """Download a user-uploaded file from S3."""
+        return await self.async_client.download_file(uri, log_exception=False)
+
+    async def file_exists(self, uri: str) -> bool:
+        """Check if a file exists at the given S3 URI."""
+        try:
+            info = await self.async_client.get_object_info(uri)
+            return info is not None
+        except Exception:
+            return False
+
+    @property
+    def storage_type(self) -> str:
+        """Returns 's3' as the storage type."""
+        return "s3"

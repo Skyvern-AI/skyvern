@@ -1207,7 +1207,7 @@ describe("SkyvernClient", () => {
             .build();
 
         await expect(async () => {
-            return await client.retryRunWebhook("run_id");
+            return await client.retryRunWebhook("run_id", undefined);
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 

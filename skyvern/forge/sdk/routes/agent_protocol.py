@@ -162,6 +162,7 @@ async def run_task(
 ) -> TaskRunResponse:
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1
@@ -347,6 +348,7 @@ async def run_workflow(
     await PermissionCheckerFactory.get_instance().check(
         current_org, browser_session_id=workflow_run_request.browser_session_id
     )
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
     workflow_id = workflow_run_request.workflow_id
     context = skyvern_context.ensure_context()
     request_id = context.request_id
@@ -1292,15 +1294,9 @@ async def get_artifact(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
-        if signed_urls:
-            artifact.signed_url = signed_urls[0]
-        else:
-            LOG.warning(
-                "Failed to get signed url for artifact",
-                artifact_id=artifact_id,
-            )
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
+    if signed_urls and len(signed_urls) == 1:
+        artifact.signed_url = signed_urls[0]
     return artifact
 
 
@@ -1332,23 +1328,10 @@ async def get_run_artifacts(
     # Ensure we have a list of artifacts (since group_by_type=False, this will always be a list)
     artifacts_list = artifacts if isinstance(artifacts, list) else []
 
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        # Get signed URLs for all artifacts
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
-
-        if signed_urls and len(signed_urls) == len(artifacts_list):
-            for i, artifact in enumerate(artifacts_list):
-                if hasattr(artifact, "signed_url"):
-                    artifact.signed_url = signed_urls[i]
-        elif signed_urls:
-            LOG.warning(
-                "Mismatch between artifacts and signed URLs count",
-                artifacts_count=len(artifacts_list),
-                urls_count=len(signed_urls),
-                run_id=run_id,
-            )
-        else:
-            LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
+    if signed_urls and len(signed_urls) == len(artifacts_list):
+        for i, artifact in enumerate(artifacts_list):
+            artifact.signed_url = signed_urls[i]
 
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts_list])
 
@@ -1623,6 +1606,7 @@ async def run_task_v1(
 ) -> CreateTaskResponse:
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     created_task = await task_v1_service.run_task(
         task=task,
@@ -1973,17 +1957,10 @@ async def get_artifacts(
     }
     artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
 
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-        if signed_urls:
-            for i, artifact in enumerate(artifacts):
-                artifact.signed_url = signed_urls[i]
-        else:
-            LOG.warning(
-                "Failed to get signed urls for artifacts",
-                entity_type=entity_type,
-                entity_id=entity_id,
-            )
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
+    if signed_urls and len(signed_urls) == len(artifacts):
+        for i, artifact in enumerate(artifacts):
+            artifact.signed_url = signed_urls[i]
 
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
@@ -2018,17 +1995,10 @@ async def get_step_artifacts(
         step_id,
         organization_id=current_org.organization_id,
     )
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-        if signed_urls:
-            for i, artifact in enumerate(artifacts):
-                artifact.signed_url = signed_urls[i]
-        else:
-            LOG.warning(
-                "Failed to get signed urls for artifacts",
-                task_id=task_id,
-                step_id=step_id,
-            )
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
+    if signed_urls and len(signed_urls) == len(artifacts):
+        for i, artifact in enumerate(artifacts):
+            artifact.signed_url = signed_urls[i]
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
@@ -2086,6 +2056,7 @@ async def run_workflow_legacy(
         current_org,
         browser_session_id=workflow_request.browser_session_id,
     )
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     try:
         workflow_run = await workflow_service.run_workflow(
@@ -2667,6 +2638,7 @@ async def run_task_v2(
             max_steps_override=x_max_steps_override,
         )
     await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
+    await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
 
     try:
         task_v2 = await task_v2_service.initialize_task_v2(
