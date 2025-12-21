@@ -318,6 +318,7 @@ class Settings(BaseSettings):
     ENABLE_OLLAMA: bool = False
     OLLAMA_SERVER_URL: str | None = None
     OLLAMA_MODEL: str | None = None
+    OLLAMA_SUPPORTS_VISION: bool = False
 
     # OPENROUTER
     ENABLE_OPENROUTER: bool = False

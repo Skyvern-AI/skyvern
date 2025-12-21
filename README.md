@@ -546,10 +546,11 @@ Recommended `LLM_KEY`: `GEMINI_2.5_PRO_PREVIEW`, `GEMINI_2.5_FLASH_PREVIEW`
 | `ENABLE_OLLAMA`| Register local models via Ollama | Boolean | `true`, `false` |
 | `OLLAMA_SERVER_URL` | URL for your Ollama server | String | `http://host.docker.internal:11434` |
 | `OLLAMA_MODEL` | Ollama model name to load | String | `qwen2.5:7b-instruct` |
+| `OLLAMA_SUPPORTS_VISION` | Enable vision support | Boolean | `true`, `false` |
 
 Recommended `LLM_KEY`: `OLLAMA`
 
-Note: Ollama does not support vision yet.
+Note: Set `OLLAMA_SUPPORTS_VISION=true` for vision models like qwen3-vl, llava, etc.
 
 ##### OpenRouter
 | Variable | Description| Type | Sample Value|
