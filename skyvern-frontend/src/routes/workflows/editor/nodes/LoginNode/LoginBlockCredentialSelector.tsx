@@ -65,6 +65,7 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
   const isCloud = useContext(CloudContext);
   const { data: credentials = [], isFetching } = useCredentialsQuery({
     enabled: isCloud,
+    page_size: 100,
   });
 
   if (isCloud && isFetching) {
