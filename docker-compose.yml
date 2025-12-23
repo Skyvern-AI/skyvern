@@ -97,6 +97,7 @@ services:
     # - ENABLE_OLLAMA=true
     # - OLLAMA_MODEL=qwen2.5:7b-instruct
     # - OLLAMA_SERVER_URL=http://host.docker.internal:11434
+    # - OLLAMA_SUPPORTS_VISION=false
     # Open Router Support:
     # - ENABLE_OPENROUTER=true
     # - LLM_KEY=OPENROUTER

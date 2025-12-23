@@ -33,9 +33,13 @@ OLLAMA_SERVER_URL=http://localhost:11434
 
 # Model name in Ollama (check with `ollama list`)
 OLLAMA_MODEL=llama3.1
+
+# Enable vision support for multimodal models (qwen3-vl, llava, etc.)
+OLLAMA_SUPPORTS_VISION=false
 ```
 
 > Note: Ollama may not support `max_completion_tokens` — Skyvern handles this internally.
+> Set `OLLAMA_SUPPORTS_VISION=true` if using a vision model like qwen3-vl or llava.
 
 ---
 
@@ -119,5 +123,5 @@ curl -s http://localhost:4000/v1/models   -H "Authorization: Bearer sk-test" | j
 
 ## Internal References
 
-- Ollama vars: `ENABLE_OLLAMA`, `OLLAMA_SERVER_URL`, `OLLAMA_MODEL`
+- Ollama vars: `ENABLE_OLLAMA`, `OLLAMA_SERVER_URL`, `OLLAMA_MODEL`, `OLLAMA_SUPPORTS_VISION`
 - OpenAI-compatible vars: `ENABLE_OPENAI_COMPATIBLE`, `OPENAI_COMPATIBLE_MODEL_NAME`, `OPENAI_COMPATIBLE_API_KEY`, `OPENAI_COMPATIBLE_API_BASE`, `OPENAI_COMPATIBLE_API_VERSION`, `OPENAI_COMPATIBLE_SUPPORTS_VISION`, `OPENAI_COMPATIBLE_REASONING_EFFORT`
