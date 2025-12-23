@@ -383,6 +383,15 @@ async def run_workflow(
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    # Hydrate workflow title from workflow_run.workflow_id
+    workflow = await app.WORKFLOW_SERVICE.get_workflow(
+        workflow_id=workflow_run.workflow_id,
+        organization_id=current_org.organization_id,
+    )
+    workflow_run_request_hydrated = workflow_run_request
+    if workflow:
+        workflow_run_request_hydrated = workflow_run_request.model_copy(update={"title": workflow.title})
+
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
         run_type=RunType.workflow_run,
@@ -391,7 +400,7 @@ async def run_workflow(
         failure_reason=workflow_run.failure_reason,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
-        run_request=workflow_run_request,
+        run_request=workflow_run_request_hydrated,
         downloaded_files=None,
         recording_url=None,
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
