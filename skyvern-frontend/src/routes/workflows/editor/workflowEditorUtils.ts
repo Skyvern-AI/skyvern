@@ -1925,6 +1925,11 @@ function findNextBlockLabel(
       return null;
     }
 
+    // If this node itself is a conditional, prefer its own merge label
+    if (currentNode.type === "conditional") {
+      return currentNode.data.mergeLabel ?? null;
+    }
+
     const conditionalNodeId = currentNode.data.conditionalNodeId;
     if (!conditionalNodeId) {
       return null;
