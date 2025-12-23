@@ -211,7 +211,8 @@ await page.click("#download-button")
 ## Advanced Usage
 
 ### Control your own browser (Chrome)
-> ⚠️ WARNING: Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser. ⚠️
+> [!WARNING]
+> Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser.
 
 1. Just With Python Code
 ```python
@@ -316,7 +317,8 @@ skyvern stop server
    ```
 3. Navigate to `http://localhost:8080` in your browser to start using the UI
 
-> **Important:** Only one Postgres container can run on port 5432 at a time. If you switch from the CLI-managed Postgres to Docker Compose, you must first remove the original container:
+> [!Important]
+> Only one Postgres container can run on port 5432 at a time. If you switch from the CLI-managed Postgres to Docker Compose, you must first remove the original container:
 > ```bash
 > docker rm -f postgresql-container
 > ```
