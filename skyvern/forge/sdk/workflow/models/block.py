@@ -2078,6 +2078,7 @@ class TextPromptBlock(Block):
         parameter_values: dict[str, Any],
         workflow_run_id: str,
         organization_id: str | None = None,
+        workflow_run_block_id: str | None = None,
     ) -> dict[str, Any]:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
@@ -2102,12 +2103,34 @@ class TextPromptBlock(Block):
             + json.dumps(self.json_schema, indent=2)
             + "\n```\n\n"
         )
+
+        workflow_run_block = None
+        artifacts_to_persist: list[tuple[ArtifactType, bytes]] = []
+        if workflow_run_block_id:
+            try:
+                workflow_run_block = await app.DATABASE.get_workflow_run_block(workflow_run_block_id, organization_id)
+                if workflow_run_block:
+                    artifacts_to_persist.append((ArtifactType.LLM_PROMPT, prompt.encode("utf-8")))
+            except Exception as e:
+                LOG.error("Failed to fetch workflow_run_block for TextPromptBlock artifacts", error=e)
+
         LOG.info(
             "TextPromptBlock: Sending prompt to LLM",
             prompt=prompt,
             llm_key=self.llm_key,
         )
         response = await llm_api_handler(prompt=prompt, prompt_name="text-prompt")
+
+        if workflow_run_block:
+            artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
+            try:
+                await app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts(
+                    workflow_run_block=workflow_run_block,
+                    artifacts=artifacts_to_persist,
+                )
+            except Exception as e:
+                LOG.error("Failed to save TextPromptBlock artifacts", error=e)
+
         LOG.info("TextPromptBlock: Received response from LLM", response=response)
         return response
 
@@ -2170,7 +2193,13 @@ class TextPromptBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
-        response = await self.send_prompt(self.prompt, parameter_values, workflow_run_id, organization_id)
+        response = await self.send_prompt(
+            self.prompt,
+            parameter_values,
+            workflow_run_id,
+            organization_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
         return await self.build_block_result(
             success=True,
