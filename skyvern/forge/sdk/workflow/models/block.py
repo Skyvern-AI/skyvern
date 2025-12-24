@@ -4318,6 +4318,43 @@ class BranchEvaluationContext:
         self.block_label = block_label
         self.template_renderer = template_renderer
 
+    def build_llm_safe_context_snapshot(self) -> dict[str, Any]:
+        """
+        Build a non-secret context blob for LLM-facing branch evaluation.
+
+        Secrets are stripped/masked; only params/outputs/environment and cached
+        block metadata are included so the LLM can ground purely natural language
+        expressions without requiring inline templating.
+        """
+        if self.workflow_run_context is None:
+            return {}
+
+        ctx = self.workflow_run_context
+
+        # Start from the recorded values (params, outputs, env, block outputs)
+        snapshot: dict[str, Any] = ctx.values.copy()
+
+        # Add block metadata (e.g., loop indices/current_item) without mutating originals
+        snapshot["blocks_metadata"] = ctx.blocks_metadata.copy()
+
+        # Ensure the common namespaces exist
+        snapshot.setdefault("params", snapshot.get("params", {}))
+        snapshot.setdefault("outputs", snapshot.get("outputs", {}))
+        snapshot.setdefault("environment", snapshot.get("environment", {}))
+        snapshot.setdefault("env", snapshot.get("environment", {}))
+        snapshot.setdefault("llm", snapshot.get("llm", {}))
+
+        # Standard workflow identifiers for additional context
+        snapshot.setdefault("workflow_title", ctx.workflow_title)
+        snapshot.setdefault("workflow_id", ctx.workflow_id)
+        snapshot.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
+        snapshot.setdefault("workflow_run_id", ctx.workflow_run_id)
+
+        # Mask any real secret values that may have leaked into values
+        snapshot = ctx.mask_secrets_in_data(snapshot)
+
+        return snapshot
+
     def build_template_data(self) -> dict[str, Any]:
         """Build Jinja template data mirroring block parameter rendering context."""
         if self.workflow_run_context is None:
@@ -4560,6 +4597,8 @@ class ConditionalBlock(Block):
             raise ValueError("organization_id is required to evaluate natural language branches")
 
         workflow_run_context = evaluation_context.workflow_run_context
+        context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
+        context_snapshot_json = json.dumps(context_snapshot, default=str)
 
         rendered_branch_criteria: list[dict[str, Any]] = []
         for idx, branch in enumerate(branches):
@@ -4578,6 +4617,7 @@ class ConditionalBlock(Block):
         extraction_goal = prompt_engine.load_prompt(
             "conditional-prompt-branch-evaluation",
             branch_criteria=branch_criteria_payload,
+            context_snapshot=context_snapshot_json,
         )
 
         data_schema = {
