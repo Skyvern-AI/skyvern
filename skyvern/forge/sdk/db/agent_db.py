@@ -4543,7 +4543,9 @@ class AgentDB(BaseAlchemyDB):
         extensions: list[Extensions] | None = None,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
-        extensions_str: list[str] | None = [extension.value for extension in extensions] if extensions else None
+        extensions_str: list[str] | None = (
+            [extension.value for extension in extensions] if extensions is not None else None
+        )
         try:
             async with self.Session() as session:
                 browser_session = PersistentBrowserSessionModel(
