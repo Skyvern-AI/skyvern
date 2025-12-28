@@ -5206,6 +5206,21 @@
               "https://app.skyvern.com/browser-session/pbs_123456"
             ]
           },
+          "extensions": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Extensions"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extensions",
+            "description": "A list of extensions installed in the browser session."
+          },
           "vnc_streaming_supported": {
             "type": "boolean",
             "title": "Vnc Streaming Supported",
@@ -5938,6 +5953,21 @@
               }
             ],
             "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n"
+          },
+          "extensions": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Extensions"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extensions",
+            "description": "A list of extensions to install in the browser session."
           }
         },
         "type": "object",
@@ -6627,6 +6657,14 @@
           "url"
         ],
         "title": "DownloadToS3BlockYAML"
+      },
+      "Extensions": {
+        "type": "string",
+        "enum": [
+          "ad-blocker",
+          "captcha-solver"
+        ],
+        "title": "Extensions"
       },
       "ExtractAction": {
         "properties": {
