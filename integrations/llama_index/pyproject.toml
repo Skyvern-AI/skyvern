@@ -8,6 +8,7 @@ readme = "README.md"
 dependencies = [
     "skyvern>=0.2.0",
     "llama-index>=0.12.19,<0.13",
+    "urllib3>=2.6.0",
 ]
 
 [build-system]
