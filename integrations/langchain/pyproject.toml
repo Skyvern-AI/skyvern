@@ -9,6 +9,8 @@ readme = "README.md"
 dependencies = [
     "skyvern>=0.2.0",
     "langchain>=0.3.19,<0.4",
+    "langchain-core>=0.3.81",
+    "urllib3>=2.6.0",
 ]
 
 [build-system]
