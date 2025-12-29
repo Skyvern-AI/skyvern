@@ -1,6 +1,6 @@
 [project]
 name = "skyvern-llamaindex"
-version = "0.2.1"
+version = "0.2.2"
 description = "Skyvern integration for LlamaIndex"
 authors = [{ name = "lawyzheng", email = "lawy@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
