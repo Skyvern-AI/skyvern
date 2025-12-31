@@ -73,7 +73,9 @@ function CredentialsModal({ onCredentialCreated }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { isOpen, type, setIsOpen } = useCredentialModalState();
-  const { data: credentials } = useCredentialsQuery();
+  const { data: credentials } = useCredentialsQuery({
+    page_size: 100,
+  });
   const [passwordCredentialValues, setPasswordCredentialValues] = useState(
     PASSWORD_CREDENTIAL_INITIAL_VALUES,
   );

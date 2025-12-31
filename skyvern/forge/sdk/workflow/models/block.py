@@ -2078,6 +2078,7 @@ class TextPromptBlock(Block):
         parameter_values: dict[str, Any],
         workflow_run_id: str,
         organization_id: str | None = None,
+        workflow_run_block_id: str | None = None,
     ) -> dict[str, Any]:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
@@ -2102,12 +2103,34 @@ class TextPromptBlock(Block):
             + json.dumps(self.json_schema, indent=2)
             + "\n```\n\n"
         )
+
+        workflow_run_block = None
+        artifacts_to_persist: list[tuple[ArtifactType, bytes]] = []
+        if workflow_run_block_id:
+            try:
+                workflow_run_block = await app.DATABASE.get_workflow_run_block(workflow_run_block_id, organization_id)
+                if workflow_run_block:
+                    artifacts_to_persist.append((ArtifactType.LLM_PROMPT, prompt.encode("utf-8")))
+            except Exception as e:
+                LOG.error("Failed to fetch workflow_run_block for TextPromptBlock artifacts", error=e)
+
         LOG.info(
             "TextPromptBlock: Sending prompt to LLM",
             prompt=prompt,
             llm_key=self.llm_key,
         )
         response = await llm_api_handler(prompt=prompt, prompt_name="text-prompt")
+
+        if workflow_run_block:
+            artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
+            try:
+                await app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts(
+                    workflow_run_block=workflow_run_block,
+                    artifacts=artifacts_to_persist,
+                )
+            except Exception as e:
+                LOG.error("Failed to save TextPromptBlock artifacts", error=e)
+
         LOG.info("TextPromptBlock: Received response from LLM", response=response)
         return response
 
@@ -2170,7 +2193,13 @@ class TextPromptBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
-        response = await self.send_prompt(self.prompt, parameter_values, workflow_run_id, organization_id)
+        response = await self.send_prompt(
+            self.prompt,
+            parameter_values,
+            workflow_run_id,
+            organization_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
         return await self.build_block_result(
             success=True,
@@ -4283,9 +4312,48 @@ class BranchEvaluationContext:
         *,
         workflow_run_context: WorkflowRunContext | None = None,
         block_label: str | None = None,
+        template_renderer: Callable[[str], str] | None = None,
     ) -> None:
         self.workflow_run_context = workflow_run_context
         self.block_label = block_label
+        self.template_renderer = template_renderer
+
+    def build_llm_safe_context_snapshot(self) -> dict[str, Any]:
+        """
+        Build a non-secret context blob for LLM-facing branch evaluation.
+
+        Secrets are stripped/masked; only params/outputs/environment and cached
+        block metadata are included so the LLM can ground purely natural language
+        expressions without requiring inline templating.
+        """
+        if self.workflow_run_context is None:
+            return {}
+
+        ctx = self.workflow_run_context
+
+        # Start from the recorded values (params, outputs, env, block outputs)
+        snapshot: dict[str, Any] = ctx.values.copy()
+
+        # Add block metadata (e.g., loop indices/current_item) without mutating originals
+        snapshot["blocks_metadata"] = ctx.blocks_metadata.copy()
+
+        # Ensure the common namespaces exist
+        snapshot.setdefault("params", snapshot.get("params", {}))
+        snapshot.setdefault("outputs", snapshot.get("outputs", {}))
+        snapshot.setdefault("environment", snapshot.get("environment", {}))
+        snapshot.setdefault("env", snapshot.get("environment", {}))
+        snapshot.setdefault("llm", snapshot.get("llm", {}))
+
+        # Standard workflow identifiers for additional context
+        snapshot.setdefault("workflow_title", ctx.workflow_title)
+        snapshot.setdefault("workflow_id", ctx.workflow_id)
+        snapshot.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
+        snapshot.setdefault("workflow_run_id", ctx.workflow_run_id)
+
+        # Mask any real secret values that may have leaked into values
+        snapshot = ctx.mask_secrets_in_data(snapshot)
+
+        return snapshot
 
     def build_template_data(self) -> dict[str, Any]:
         """Build Jinja template data mirroring block parameter rendering context."""
@@ -4402,28 +4470,36 @@ class JinjaBranchCriteria(BranchCriteria):
     criteria_type: Literal["jinja2_template"] = "jinja2_template"
 
     async def evaluate(self, context: BranchEvaluationContext) -> bool:
-        # Build the template context explicitly to avoid surprises in templates.
-        template_data = context.build_template_data()
+        # Prefer the renderer provided by the caller (matches block parameter rendering),
+        # otherwise build a minimal sandboxed renderer using the evaluation context.
+        if context.template_renderer:
+            try:
+                rendered = context.template_renderer(self.expression)
+            except MissingJinjaVariables:
+                # Let upstream MissingJinjaVariables bubble as-is.
+                raise
+            except Exception as exc:  # pragma: no cover - caught for robustness
+                raise FailedToFormatJinjaStyleParameter(self.expression, str(exc)) from exc
+        else:
+            template_data = context.build_template_data()
+            sandbox_env = (
+                SandboxedEnvironment(undefined=StrictUndefined)
+                if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict"
+                else SandboxedEnvironment()
+            )
 
-        try:
-            template = jinja_sandbox_env.from_string(self.expression)
-        except Exception as exc:
-            raise FailedToFormatJinjaStyleParameter(
-                template=self.expression,
-                msg=str(exc),
-            ) from exc
+            try:
+                missing_vars = get_missing_variables(self.expression, template_data)
+                if missing_vars:
+                    raise MissingJinjaVariables(self.expression, missing_vars)
 
-        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
-            if missing := get_missing_variables(self.expression, template_data):
-                raise MissingJinjaVariables(template=self.expression, variables=missing)
-
-        try:
-            rendered = template.render(template_data)
-        except Exception as exc:
-            raise FailedToFormatJinjaStyleParameter(
-                template=self.expression,
-                msg=str(exc),
-            ) from exc
+                template = sandbox_env.from_string(self.expression)
+                rendered = template.render(template_data)
+            except MissingJinjaVariables:
+                raise
+            except Exception as exc:
+                # Covers syntax errors and rendering issues
+                raise FailedToFormatJinjaStyleParameter(self.expression, str(exc)) from exc
 
         return _evaluate_truthy_string(rendered)
 
@@ -4521,35 +4597,15 @@ class ConditionalBlock(Block):
             raise ValueError("organization_id is required to evaluate natural language branches")
 
         workflow_run_context = evaluation_context.workflow_run_context
-        template_data = evaluation_context.build_template_data()
+        context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
+        context_snapshot_json = json.dumps(context_snapshot, default=str)
 
         rendered_branch_criteria: list[dict[str, Any]] = []
         for idx, branch in enumerate(branches):
             expression = branch.criteria.expression if branch.criteria else ""
-            rendered_expression = expression
-
-            # Allow Jinja templating inside natural language branch expressions so users can
-            # mix free text with dynamic values (e.g., "If response: {{ foo.bar }}").
-            if "{{" in expression and "}}" in expression:
-                try:
-                    template = jinja_sandbox_env.from_string(expression)
-                except Exception as exc:
-                    raise FailedToFormatJinjaStyleParameter(
-                        template=expression,
-                        msg=str(exc),
-                    ) from exc
-
-                if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
-                    if missing := get_missing_variables(expression, template_data):
-                        raise MissingJinjaVariables(template=expression, variables=missing)
-
-                try:
-                    rendered_expression = template.render(template_data)
-                except Exception as exc:
-                    raise FailedToFormatJinjaStyleParameter(
-                        template=expression,
-                        msg=str(exc),
-                    ) from exc
+            rendered_expression = (
+                evaluation_context.template_renderer(expression) if evaluation_context.template_renderer else expression
+            )
 
             rendered_branch_criteria.append({"index": idx, "expression": rendered_expression})
 
@@ -4561,6 +4617,7 @@ class ConditionalBlock(Block):
         extraction_goal = prompt_engine.load_prompt(
             "conditional-prompt-branch-evaluation",
             branch_criteria=branch_criteria_payload,
+            context_snapshot=context_snapshot_json,
         )
 
         data_schema = {
@@ -4668,6 +4725,14 @@ class ConditionalBlock(Block):
         evaluation_context = BranchEvaluationContext(
             workflow_run_context=workflow_run_context,
             block_label=self.label,
+            template_renderer=(
+                lambda potential_template: self.format_block_parameter_template_from_workflow_run_context(
+                    potential_template,
+                    workflow_run_context,
+                )
+            )
+            if workflow_run_context
+            else None,
         )
 
         matched_branch = None

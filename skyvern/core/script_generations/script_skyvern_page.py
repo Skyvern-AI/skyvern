@@ -411,12 +411,13 @@ class ScriptSkyvernPage(SkyvernPage):
             task_id = context.task_id
             workflow_run_id = context.workflow_run_id
             organization_id = context.organization_id
-            value = get_actual_value_of_parameter_if_secret(workflow_run_id, value)
+            original_value = value
+            value = get_actual_value_of_parameter_if_secret(workflow_run_id, original_value)
 
             # support TOTP secret and internal it to TOTP code
             is_totp_value = value == "BW_TOTP" or value == "OP_TOTP" or value == "AZ_TOTP"
             if is_totp_value:
-                value = generate_totp_value(context.workflow_run_id, value)
+                value = generate_totp_value(context.workflow_run_id, original_value)
             elif (totp_identifier or totp_url) and organization_id:
                 totp_value = await poll_otp_value(
                     organization_id=organization_id,
