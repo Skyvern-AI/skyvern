@@ -32,6 +32,13 @@ class RunWebhookReplayRequest(BaseModel):
     )
 
 
+class RetryRunWebhookRequest(BaseModel):
+    webhook_url: str | None = Field(
+        None,
+        description="Optional webhook URL to send the payload to instead of the stored configuration",
+    )
+
+
 class RunWebhookReplayResponse(BaseModel):
     run_id: str = Field(..., description="Identifier of the run that was replayed")
     run_type: str = Field(..., description="Run type associated with the payload")

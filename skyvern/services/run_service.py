@@ -1,12 +1,12 @@
 from fastapi import HTTPException, status
 
 from skyvern.config import settings
-from skyvern.exceptions import TaskNotFound, WorkflowRunNotFound
+from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.runs import RunEngine, RunResponse, RunType, TaskRunRequest, TaskRunResponse
-from skyvern.services import task_v1_service, task_v2_service, workflow_service
+from skyvern.services import task_v1_service, task_v2_service, webhook_service, workflow_service
 
 
 async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
@@ -147,7 +147,12 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
         )
 
 
-async def retry_run_webhook(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:
+async def retry_run_webhook(
+    run_id: str,
+    organization_id: str | None = None,
+    api_key: str | None = None,
+    webhook_url: str | None = None,
+) -> None:
     """Retry sending the webhook for a run."""
 
     run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
@@ -156,6 +161,17 @@ async def retry_run_webhook(run_id: str, organization_id: str | None = None, api
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Run not found {run_id}",
         )
+
+    if webhook_url:
+        if not organization_id:
+            raise OrganizationNotFound(organization_id="")
+        await webhook_service.replay_run_webhook(
+            organization_id=organization_id,
+            run_id=run_id,
+            target_url=webhook_url,
+            api_key=api_key,
+        )
+        return
 
     if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars]:
         task = await app.DATABASE.get_task(run_id, organization_id=organization_id)

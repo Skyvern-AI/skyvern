@@ -5,12 +5,12 @@ from typing import Any
 
 import structlog
 from fastapi import HTTPException
-from pypdf import PdfReader
 
 from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 
 LOG = structlog.get_logger(__name__)
@@ -133,7 +133,11 @@ class PDFImportService:
         return raw
 
     def extract_text_from_pdf(self, file_contents: bytes, file_name: str) -> str:
-        """Extract text from PDF file contents. Raises HTTPException if invalid."""
+        """Extract text from PDF file contents. Raises HTTPException if invalid.
+
+        Uses the shared PDF parsing utility that tries pypdf first,
+        then falls back to pdfplumber if pypdf fails.
+        """
         LOG.info("Extracting text from PDF", filename=file_name)
 
         # Save the uploaded file to a temporary location
@@ -142,14 +146,10 @@ class PDFImportService:
             temp_file_path = temp_file.name
 
         try:
-            reader = PdfReader(temp_file_path)
-            sop_text = ""
-            for page_num, page in enumerate(reader.pages, 1):
-                page_text = page.extract_text() or ""
-                sop_text += page_text + "\n"
-                LOG.debug("Extracted text from page", page=page_num, text_length=len(page_text))
+            # Use the shared PDF parsing utility
+            sop_text = extract_pdf_file(temp_file_path, file_identifier=file_name)
 
-            LOG.info("PDF text extraction complete", total_text_length=len(sop_text))
+            LOG.info("PDF text extraction complete", filename=file_name, total_text_length=len(sop_text))
 
             if not sop_text.strip():
                 raise HTTPException(status_code=400, detail="No readable content found in the PDF.")

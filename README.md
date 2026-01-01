@@ -141,6 +141,73 @@ task = await skyvern.run_task(prompt="Find the top post on hackernews today")
 print(task)
 ```
 
+## SDK
+
+**Installation:**
+- Python: `pip install skyvern` then run `skyvern quickstart` for local setup
+- TypeScript: `npm install @skyvern/client`
+
+Skyvern provides SDKs for both Python and TypeScript to integrate browser automation into your applications.
+
+### Python SDK
+
+```python
+from skyvern import Skyvern
+
+# Connect to Skyvern Cloud
+skyvern = Skyvern(api_key="your-api-key")
+
+# Or run locally
+skyvern = Skyvern.local()
+
+# Launch a cloud browser
+browser = await skyvern.launch_cloud_browser()
+page = await browser.get_working_page()
+
+# Use AI-powered actions for complex workflows
+await page.agent.run_task("Navigate to the most recent invoice and download it")
+
+# Or mix with Playwright actions
+await page.goto("https://example.com")
+await page.click("#button")
+```
+
+### TypeScript SDK
+
+```typescript
+import { Skyvern } from "@skyvern/client";
+
+// Connect to Skyvern Cloud
+const skyvern = new Skyvern({ apiKey: "your-api-key" });
+
+// Launch a cloud browser
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+
+// Use AI-powered actions for complex workflows
+await page.agent.runTask("Navigate to the most recent invoice and download it");
+
+// Or mix with Playwright actions
+await page.goto("https://example.com");
+await page.click("#button");
+```
+
+Skyvern enhances Playwright methods with AI capabilities. Use regular Playwright syntax with a `prompt` parameter to make any action AI-powered:
+
+```python
+# Traditional Playwright - uses selectors
+await page.click("#submit-button")
+
+# AI-augmented Playwright - uses natural language
+await page.click(prompt="Click on the Submit button")
+await page.fill(prompt="Enter email address", value="user@example.com")
+
+# Mix both approaches in the same workflow
+await page.goto("https://example.com/dashboard")
+await page.click(prompt="Click on the most recent unpaid invoice")
+await page.click("#download-button")
+```
+
 ## Advanced Usage
 
 ### Control your own browser (Chrome)
@@ -481,10 +548,11 @@ Recommended `LLM_KEY`: `GEMINI_2.5_PRO_PREVIEW`, `GEMINI_2.5_FLASH_PREVIEW`
 | `ENABLE_OLLAMA`| Register local models via Ollama | Boolean | `true`, `false` |
 | `OLLAMA_SERVER_URL` | URL for your Ollama server | String | `http://host.docker.internal:11434` |
 | `OLLAMA_MODEL` | Ollama model name to load | String | `qwen2.5:7b-instruct` |
+| `OLLAMA_SUPPORTS_VISION` | Enable vision support | Boolean | `true`, `false` |
 
 Recommended `LLM_KEY`: `OLLAMA`
 
-Note: Ollama does not support vision yet.
+Note: Set `OLLAMA_SUPPORTS_VISION=true` for vision models like qwen3-vl, llava, etc.
 
 ##### OpenRouter
 | Variable | Description| Type | Sample Value|

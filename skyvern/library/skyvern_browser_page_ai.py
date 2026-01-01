@@ -275,7 +275,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             url=self._page.url,
             action=RunSdkActionRequestAction_Prompt(
                 prompt=prompt,
-                schema=schema,
+                response_schema=schema,
                 model=model,
             ),
             browser_session_id=self._browser.browser_session_id,

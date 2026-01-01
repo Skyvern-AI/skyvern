@@ -150,6 +150,7 @@ async def _load_cached_script_block_sources(
             run_signature=script_block.run_signature,
             workflow_run_id=script_block.workflow_run_id,
             workflow_run_block_id=script_block.workflow_run_block_id,
+            input_fields=script_block.input_fields,
         )
 
     return cached_blocks

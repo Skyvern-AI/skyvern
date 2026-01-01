@@ -112,9 +112,11 @@ from skyvern.schemas.runs import (
     RunType,
     TaskRunRequest,
     TaskRunResponse,
+    UploadFileResponse,
     WorkflowRunRequest,
     WorkflowRunResponse,
 )
+from skyvern.schemas.webhooks import RetryRunWebhookRequest
 from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest, WorkflowRequest, WorkflowStatus
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.services.pdf_import_service import pdf_import_service
@@ -160,6 +162,7 @@ async def run_task(
 ) -> TaskRunResponse:
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1
@@ -345,6 +348,7 @@ async def run_workflow(
     await PermissionCheckerFactory.get_instance().check(
         current_org, browser_session_id=workflow_run_request.browser_session_id
     )
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
     workflow_id = workflow_run_request.workflow_id
     context = skyvern_context.ensure_context()
     request_id = context.request_id
@@ -379,6 +383,15 @@ async def run_workflow(
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    # Hydrate workflow title from workflow_run.workflow_id
+    workflow = await app.WORKFLOW_SERVICE.get_workflow(
+        workflow_id=workflow_run.workflow_id,
+        organization_id=current_org.organization_id,
+    )
+    workflow_run_request_hydrated = workflow_run_request
+    if workflow:
+        workflow_run_request_hydrated = workflow_run_request.model_copy(update={"title": workflow.title})
+
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
         run_type=RunType.workflow_run,
@@ -387,7 +400,7 @@ async def run_workflow(
         failure_reason=workflow_run.failure_reason,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
-        run_request=workflow_run_request,
+        run_request=workflow_run_request_hydrated,
         downloaded_files=None,
         recording_url=None,
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
@@ -1290,15 +1303,9 @@ async def get_artifact(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
-        if signed_urls:
-            artifact.signed_url = signed_urls[0]
-        else:
-            LOG.warning(
-                "Failed to get signed url for artifact",
-                artifact_id=artifact_id,
-            )
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
+    if signed_urls and len(signed_urls) == 1:
+        artifact.signed_url = signed_urls[0]
     return artifact
 
 
@@ -1330,23 +1337,10 @@ async def get_run_artifacts(
     # Ensure we have a list of artifacts (since group_by_type=False, this will always be a list)
     artifacts_list = artifacts if isinstance(artifacts, list) else []
 
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        # Get signed URLs for all artifacts
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
-
-        if signed_urls and len(signed_urls) == len(artifacts_list):
-            for i, artifact in enumerate(artifacts_list):
-                if hasattr(artifact, "signed_url"):
-                    artifact.signed_url = signed_urls[i]
-        elif signed_urls:
-            LOG.warning(
-                "Mismatch between artifacts and signed URLs count",
-                artifacts_count=len(artifacts_list),
-                urls_count=len(signed_urls),
-                run_id=run_id,
-            )
-        else:
-            LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
+    if signed_urls and len(signed_urls) == len(artifacts_list):
+        for i, artifact in enumerate(artifacts_list):
+            artifact.signed_url = signed_urls[i]
 
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts_list])
 
@@ -1371,11 +1365,17 @@ async def get_run_artifacts(
 @base_router.post("/runs/{run_id}/retry_webhook/", include_in_schema=False)
 async def retry_run_webhook(
     run_id: str = Path(..., description="The id of the task run or the workflow run.", examples=["tsk_123", "wr_123"]),
+    request: RetryRunWebhookRequest | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
     analytics.capture("skyvern-oss-agent-run-retry-webhook")
-    await run_service.retry_run_webhook(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+    await run_service.retry_run_webhook(
+        run_id,
+        organization_id=current_org.organization_id,
+        api_key=x_api_key,
+        webhook_url=request.webhook_url if request else None,
+    )
 
 
 @base_router.get(
@@ -1615,6 +1615,7 @@ async def run_task_v1(
 ) -> CreateTaskResponse:
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     created_task = await task_v1_service.run_task(
         task=task,
@@ -1965,17 +1966,10 @@ async def get_artifacts(
     }
     artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
 
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-        if signed_urls:
-            for i, artifact in enumerate(artifacts):
-                artifact.signed_url = signed_urls[i]
-        else:
-            LOG.warning(
-                "Failed to get signed urls for artifacts",
-                entity_type=entity_type,
-                entity_id=entity_id,
-            )
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
+    if signed_urls and len(signed_urls) == len(artifacts):
+        for i, artifact in enumerate(artifacts):
+            artifact.signed_url = signed_urls[i]
 
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
@@ -2010,17 +2004,10 @@ async def get_step_artifacts(
         step_id,
         organization_id=current_org.organization_id,
     )
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-        if signed_urls:
-            for i, artifact in enumerate(artifacts):
-                artifact.signed_url = signed_urls[i]
-        else:
-            LOG.warning(
-                "Failed to get signed urls for artifacts",
-                task_id=task_id,
-                step_id=step_id,
-            )
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
+    if signed_urls and len(signed_urls) == len(artifacts):
+        for i, artifact in enumerate(artifacts):
+            artifact.signed_url = signed_urls[i]
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
@@ -2078,6 +2065,7 @@ async def run_workflow_legacy(
         current_org,
         browser_session_id=workflow_request.browser_session_id,
     )
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     try:
         workflow_run = await workflow_service.run_workflow(
@@ -2383,6 +2371,7 @@ async def get_workflows(
 @base_router.put(
     "/workflows/{workflow_permanent_id}/template",
     tags=["Workflows"],
+    include_in_schema=False,
 )
 async def set_workflow_template_status(
     workflow_permanent_id: str,
@@ -2607,32 +2596,29 @@ async def get_api_keys(
     return GetOrganizationAPIKeysResponse(api_keys=api_keys)
 
 
-@legacy_base_router.post(
+@base_router.post(
     "/upload_file",
-    tags=["server"],
+    tags=["Files"],
     openapi_extra={
         "x-fern-sdk-method-name": "upload_file",
     },
+    include_in_schema=True,
+    response_model=UploadFileResponse,
 )
-@legacy_base_router.post(
-    "/upload_file/",
-    include_in_schema=False,
-)
+@base_router.post("/upload_file/", include_in_schema=False)
+@legacy_base_router.post("/upload_file", include_in_schema=False)
+@legacy_base_router.post("/upload_file/", include_in_schema=False)
 async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
     current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> Response:
+) -> UploadFileResponse:
     uris = await app.STORAGE.save_legacy_file(
         organization_id=current_org.organization_id, filename=file.filename, fileObj=file.file
     )
     if not uris:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
     presigned_url, uploaded_s3_uri = uris
-    return ORJSONResponse(
-        content={"s3_uri": uploaded_s3_uri, "presigned_url": presigned_url},
-        status_code=200,
-        media_type="application/json",
-    )
+    return UploadFileResponse(s3_uri=uploaded_s3_uri, presigned_url=presigned_url)
 
 
 @legacy_v2_router.post(
@@ -2661,6 +2647,7 @@ async def run_task_v2(
             max_steps_override=x_max_steps_override,
         )
     await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
+    await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
 
     try:
         task_v2 = await task_v2_service.initialize_task_v2(

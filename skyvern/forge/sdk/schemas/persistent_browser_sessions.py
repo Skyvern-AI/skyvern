@@ -26,6 +26,11 @@ def is_final_status(status: str | None) -> bool:
     return status in FINAL_STATUSES
 
 
+class Extensions(StrEnum):
+    AdBlocker = "ad-blocker"
+    CaptchaSolver = "captcha-solver"
+
+
 class PersistentBrowserSession(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -43,6 +48,7 @@ class PersistentBrowserSession(BaseModel):
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
+    extensions: list[Extensions] | None = None
 
 
 class AddressablePersistentBrowserSession(PersistentBrowserSession):

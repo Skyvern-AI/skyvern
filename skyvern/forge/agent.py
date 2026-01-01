@@ -6,6 +6,7 @@ import os
 import random
 import re
 import string
+import uuid
 from asyncio.exceptions import CancelledError
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -51,6 +52,7 @@ from skyvern.exceptions import (
     MissingBrowserStatePage,
     MissingExtractActionsResponse,
     NoTOTPVerificationCodeFound,
+    PDFEmbedBase64DecodeError,
     ScrapingFailed,
     SkyvernException,
     StepTerminationError,
@@ -77,6 +79,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE, LLM_PROVIDER_ERROR_TYPE
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
+from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
@@ -110,6 +113,7 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     CompleteVerifyResult,
     DecisiveAction,
+    DownloadFileAction,
     ExtractAction,
     GotoUrlAction,
     ReloadPageAction,
@@ -1035,16 +1039,73 @@ class ForgeAgent:
                     if json_response is None:
                         raise MissingExtractActionsResponse()
                     try:
-                        otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
-                            task, step, scraped_page, browser_state, json_response
-                        )
-                        if otp_actions:
-                            detailed_agent_step_output.llm_response = otp_json_response
-                            actions = otp_actions
+                        if pdf_embed_src := scraped_page.check_pdf_viewer_embed():
+                            LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
+                            pdf_bytes: bytes | None = None
+                            download_url: str | None = None
+
+                            # Check if the embed src is a data URI with base64 encoded PDF
+                            # Format: data:application/pdf[;charset=...];base64,<base64_data>
+                            if pdf_embed_src.startswith("data:application/pdf"):
+                                # Use more precise regex to extract base64 data after the base64, prefix
+                                # This pattern matches: data:application/pdf[;optional_params];base64,<data>
+                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_embed_src, re.S)
+                                if not m:
+                                    raise PDFEmbedBase64DecodeError(
+                                        pdf_embed_src=pdf_embed_src,
+                                        reason="Failed to extract base64 data from PDF embed src. Expected format: data:application/pdf[;charset=...];base64,<data>",
+                                    )
+
+                                base64_data = m.group(1)
+                                LOG.info(
+                                    "Found base64 data in PDF embed src",
+                                    step_id=step.step_id,
+                                    base64_data_length=len(base64_data),
+                                )
+
+                                # Decode base64 data with error handling
+                                try:
+                                    pdf_bytes = base64.b64decode(base64_data, validate=True)
+                                except Exception as e:
+                                    raise PDFEmbedBase64DecodeError(
+                                        pdf_embed_src=pdf_embed_src,
+                                        reason=f"Failed to decode base64 data: {str(e)}",
+                                    ) from e
+                            else:
+                                # If not a data URI, treat it as a URL
+                                LOG.info(
+                                    "Found PDF embed src as URL (not base64 data)",
+                                    step_id=step.step_id,
+                                    download_url=pdf_embed_src,
+                                )
+                                download_url = pdf_embed_src
+
+                            actions = [
+                                DownloadFileAction(
+                                    reasoning="Downloading the file from the PDF viewer.",
+                                    organization_id=task.organization_id,
+                                    workflow_run_id=task.workflow_run_id,
+                                    task_id=task.task_id,
+                                    step_id=step.step_id,
+                                    step_order=step.order,
+                                    action_order=0,
+                                    file_name=f"{uuid.uuid4()}.pdf",
+                                    byte=pdf_bytes,
+                                    download_url=download_url,
+                                    download=True,
+                                )
+                            ]
                         else:
-                            actions = parse_actions(
-                                task, step.step_id, step.order, scraped_page, json_response["actions"]
+                            otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
+                                task, step, scraped_page, browser_state, json_response
                             )
+                            if otp_actions:
+                                detailed_agent_step_output.llm_response = otp_json_response
+                                actions = otp_actions
+                            else:
+                                actions = parse_actions(
+                                    task, step.step_id, step.order, scraped_page, json_response["actions"]
+                                )
 
                         if context:
                             context.pop_totp_code(task.task_id)
@@ -1762,6 +1823,11 @@ class ForgeAgent:
                 persist_artifacts=False,
             )
 
+            if scraped_page.check_pdf_viewer_embed():
+                next_step.is_speculative = False
+                LOG.info("Skipping speculative extract-actions for PDF viewer page", step_id=current_step.step_id)
+                return None
+
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 task.llm_key,
                 default=app.LLM_API_HANDLER,
@@ -1815,41 +1881,55 @@ class ForgeAgent:
 
         LOG.debug("Persisting speculative LLM metadata")
 
+        artifacts = []
         if metadata.prompt:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=metadata.prompt.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_PROMPT,
-                screenshots=screenshots,
-                step=step,
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=metadata.prompt.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_PROMPT,
+                    screenshots=screenshots,
+                    step=step,
+                )
             )
 
         if metadata.llm_request_json:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=metadata.llm_request_json.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_REQUEST,
-                step=step,
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=metadata.llm_request_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_REQUEST,
+                    step=step,
+                )
             )
 
         if metadata.llm_response_json:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=metadata.llm_response_json.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE,
-                step=step,
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=metadata.llm_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE,
+                    step=step,
+                )
             )
 
         if metadata.parsed_response_json:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=metadata.parsed_response_json.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                step=step,
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=metadata.parsed_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                    step=step,
+                )
             )
 
         if metadata.rendered_response_json:
-            await app.ARTIFACT_MANAGER.create_llm_artifact(
-                data=metadata.rendered_response_json.encode("utf-8"),
-                artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                step=step,
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=metadata.rendered_response_json.encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                    step=step,
+                )
             )
+
+        if artifacts:
+            await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
 
         incremental_cost = metadata.llm_cost if metadata.llm_cost and metadata.llm_cost > 0 else None
         incremental_input_tokens = (
@@ -2132,6 +2212,7 @@ class ForgeAgent:
         if engine in CUA_ENGINES:
             scrolling_number = 0
 
+        artifacts: list[BulkArtifactCreationRequest | None] = []
         try:
             # get current x, y position of the page
             x: int | None = None
@@ -2149,11 +2230,13 @@ class ForgeAgent:
             if skyvern_frame and x is not None and y is not None:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
                 LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                data=screenshot,
-            )
+                artifacts.append(
+                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                        data=screenshot,
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        step=step,
+                    )
+                )
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -2163,13 +2246,21 @@ class ForgeAgent:
         try:
             skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
             html = await skyvern_frame.get_content()
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.HTML_ACTION,
-                data=html.encode(),
+            artifacts.append(
+                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=html.encode(),
+                    artifact_type=ArtifactType.HTML_ACTION,
+                    step=step,
+                )
             )
         except Exception:
             LOG.exception("Failed to record html after action")
+
+        if artifacts:
+            try:
+                await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
+            except Exception:
+                LOG.warning("Failed to bulk create artifacts after action", exc_info=True)
 
         try:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(

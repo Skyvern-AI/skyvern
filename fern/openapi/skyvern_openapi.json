@@ -1061,6 +1061,23 @@
             "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/RetryRunWebhookRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Request"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1191,33 +1208,14 @@
         ]
       }
     },
-    "/v1/workflows/{workflow_permanent_id}/template": {
-      "put": {
+    "/v1/upload_file": {
+      "post": {
         "tags": [
-          "Workflows"
+          "Files"
         ],
-        "summary": "Set Workflow Template Status",
-        "description": "Set or unset a workflow as a template.\n\nTemplate status is stored at the workflow_permanent_id level (not per-version),\nmeaning all versions of a workflow share the same template status.",
-        "operationId": "set_workflow_template_status_v1_workflows__workflow_permanent_id__template_put",
+        "summary": "Upload File",
+        "operationId": "upload_file_v1_upload_file_post",
         "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Workflow Permanent Id"
-            }
-          },
-          {
-            "name": "is_template",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "boolean",
-              "title": "Is Template"
-            }
-          },
           {
             "name": "x-api-key",
             "in": "header",
@@ -1237,15 +1235,23 @@
             "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_file_v1_upload_file_post"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Set Workflow Template Status V1 Workflows  Workflow Permanent Id  Template Put"
+                  "$ref": "#/components/schemas/UploadFileResponse"
                 }
               }
             }
@@ -1260,7 +1266,8 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "upload_file"
       }
     },
     "/v1/browser_profiles": {
@@ -3431,6 +3438,17 @@
             ],
             "title": "Totp Timing Info"
           },
+          "has_mini_agent": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Has Mini Agent"
+          },
           "created_at": {
             "anyOf": [
               {
@@ -4883,6 +4901,20 @@
         ],
         "title": "BlockType"
       },
+      "Body_upload_file_v1_upload_file_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "format": "binary",
+            "title": "File"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_upload_file_v1_upload_file_post"
+      },
       "BranchCondition": {
         "properties": {
           "id": {
@@ -5173,6 +5205,21 @@
             "examples": [
               "https://app.skyvern.com/browser-session/pbs_123456"
             ]
+          },
+          "extensions": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Extensions"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extensions",
+            "description": "A list of extensions installed in the browser session."
           },
           "vnc_streaming_supported": {
             "type": "boolean",
@@ -5906,6 +5953,21 @@
               }
             ],
             "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n"
+          },
+          "extensions": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Extensions"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extensions",
+            "description": "A list of extensions to install in the browser session."
           }
         },
         "type": "object",
@@ -6595,6 +6657,14 @@
           "url"
         ],
         "title": "DownloadToS3BlockYAML"
+      },
+      "Extensions": {
+        "type": "string",
+        "enum": [
+          "ad-blocker",
+          "captcha-solver"
+        ],
+        "title": "Extensions"
       },
       "ExtractAction": {
         "properties": {
@@ -11441,7 +11511,7 @@
             "title": "Prompt",
             "description": "The prompt to send to the LLM"
           },
-          "schema": {
+          "response_schema": {
             "anyOf": [
               {
                 "additionalProperties": true,
@@ -11451,7 +11521,7 @@
                 "type": "null"
               }
             ],
-            "title": "Schema",
+            "title": "Response Schema",
             "description": "Optional JSON schema to structure the response"
           },
           "model": {
@@ -11536,6 +11606,24 @@
           "NONE"
         ],
         "title": "ProxyLocation"
+      },
+      "RetryRunWebhookRequest": {
+        "properties": {
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url",
+            "description": "Optional webhook URL to send the payload to instead of the stored configuration"
+          }
+        },
+        "type": "object",
+        "title": "RetryRunWebhookRequest"
       },
       "RunEngine": {
         "type": "string",
@@ -14295,6 +14383,26 @@
         "type": "object",
         "title": "UploadFileAction",
         "description": "Upload file action parameters."
+      },
+      "UploadFileResponse": {
+        "properties": {
+          "s3_uri": {
+            "type": "string",
+            "title": "S3 Uri",
+            "description": "S3 URI where the file was uploaded"
+          },
+          "presigned_url": {
+            "type": "string",
+            "title": "Presigned Url",
+            "description": "Presigned URL to access the uploaded file"
+          }
+        },
+        "type": "object",
+        "required": [
+          "s3_uri",
+          "presigned_url"
+        ],
+        "title": "UploadFileResponse"
       },
       "UploadToS3Block": {
         "properties": {

@@ -2,7 +2,6 @@ import { SquareIcon, PlusIcon } from "@radix-ui/react-icons";
 import { ReactNode } from "react";
 
 import { RadialMenu } from "@/components/RadialMenu";
-import { useIsSkyvernUser } from "@/hooks/useIsSkyvernUser";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
@@ -33,13 +32,8 @@ function WorkflowAddMenu({
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
   const settingsStore = useSettingsStore();
-  const isSkyvernUser = useIsSkyvernUser();
 
-  if (
-    !isSkyvernUser ||
-    !debugStore.isDebugMode ||
-    !settingsStore.isUsingABrowser
-  ) {
+  if (!debugStore.isDebugMode || !settingsStore.isUsingABrowser) {
     return <>{children}</>;
   }
 

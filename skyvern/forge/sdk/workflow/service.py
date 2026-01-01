@@ -624,6 +624,7 @@ class WorkflowService:
                 context_parameters,
                 secret_parameters,
                 block_outputs,
+                workflow,
             )
         except Exception as e:
             LOG.exception(
@@ -709,7 +710,7 @@ class WorkflowService:
             browser_profile_id=browser_profile_id,
             block_labels=block_labels,
             block_outputs=block_outputs,
-            workflow_script=workflow_script,
+            script=workflow_script,
         )
 
         if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
@@ -758,93 +759,89 @@ class WorkflowService:
         browser_profile_id: str | None = None,
         block_labels: list[str] | None = None,
         block_outputs: dict[str, Any] | None = None,
-        workflow_script: WorkflowScript | None = None,
+        script: Script | None = None,
     ) -> tuple[WorkflowRun, set[str]]:
         organization_id = organization.organization_id
         workflow_run_id = workflow_run.workflow_run_id
         top_level_blocks = workflow.workflow_definition.blocks
         all_blocks = get_all_blocks(top_level_blocks)
 
-        # Load script blocks if workflow_script is provided
+        # Load script blocks if script is provided
         script_blocks_by_label: dict[str, Any] = {}
         loaded_script_module = None
         blocks_to_update: set[str] = set()
 
         is_script_run = self.should_run_script(workflow, workflow_run)
 
-        if workflow_script:
+        if script:
             LOG.info(
                 "Loading script blocks for workflow execution",
                 workflow_run_id=workflow_run_id,
-                script_id=workflow_script.script_id,
+                script_id=script.script_id,
+                script_revision_id=script.script_revision_id,
             )
+            context = skyvern_context.ensure_context()
+            context.script_id = script.script_id
+            context.script_revision_id = script.script_revision_id
             try:
-                # Load script blocks from database
-                script = await app.DATABASE.get_script(
-                    script_id=workflow_script.script_id,
+                script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+                    script_revision_id=script.script_revision_id,
                     organization_id=organization_id,
                 )
-                if script:
-                    script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+
+                # Create mapping from block label to script block
+                for script_block in script_blocks:
+                    if script_block.run_signature:
+                        script_blocks_by_label[script_block.script_block_label] = script_block
+
+                if is_script_run:
+                    # load the script files
+                    script_files = await app.DATABASE.get_script_files(
                         script_revision_id=script.script_revision_id,
                         organization_id=organization_id,
                     )
+                    await script_service.load_scripts(script, script_files)
 
-                    # Create mapping from block label to script block
-                    for script_block in script_blocks:
-                        if script_block.run_signature:
-                            script_blocks_by_label[script_block.script_block_label] = script_block
-
-                    if is_script_run:
-                        # load the script files
-                        script_files = await app.DATABASE.get_script_files(
-                            script_revision_id=script.script_revision_id,
-                            organization_id=organization_id,
+                    script_path = os.path.join(settings.TEMP_PATH, script.script_id, "main.py")
+                    if os.path.exists(script_path):
+                        # setup script run
+                        parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+                            workflow_run_id=workflow_run.workflow_run_id
                         )
-                        await script_service.load_scripts(script, script_files)
+                        script_parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
 
-                        script_path = os.path.join(settings.TEMP_PATH, workflow_script.script_id, "main.py")
-                        if os.path.exists(script_path):
-                            # setup script run
-                            parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
-                                workflow_run_id=workflow_run.workflow_run_id
+                        spec = importlib.util.spec_from_file_location("user_script", script_path)
+                        if spec and spec.loader:
+                            loaded_script_module = importlib.util.module_from_spec(spec)
+                            spec.loader.exec_module(loaded_script_module)
+                            await skyvern.setup(
+                                script_parameters,
+                                generated_parameter_cls=loaded_script_module.GeneratedWorkflowParameters,
                             )
-                            script_parameters = {
-                                wf_param.key: run_param.value for wf_param, run_param in parameter_tuples
-                            }
-
-                            spec = importlib.util.spec_from_file_location("user_script", script_path)
-                            if spec and spec.loader:
-                                loaded_script_module = importlib.util.module_from_spec(spec)
-                                spec.loader.exec_module(loaded_script_module)
-                                await skyvern.setup(
-                                    script_parameters,
-                                    generated_parameter_cls=loaded_script_module.GeneratedWorkflowParameters,
-                                )
-                                LOG.info(
-                                    "Successfully loaded script module",
-                                    script_id=workflow_script.script_id,
-                                    block_count=len(script_blocks_by_label),
-                                )
-                        else:
-                            LOG.warning(
-                                "Script file not found at path",
-                                script_path=script_path,
-                                script_id=workflow_script.script_id,
+                            LOG.info(
+                                "Successfully loaded script module",
+                                script_id=script.script_id,
+                                block_count=len(script_blocks_by_label),
                             )
+                    else:
+                        LOG.warning(
+                            "Script file not found at path",
+                            script_path=script_path,
+                            script_id=script.script_id,
+                        )
             except Exception as e:
                 LOG.warning(
                     "Failed to load script blocks, will fallback to normal execution",
                     error=str(e),
                     exc_info=True,
                     workflow_run_id=workflow_run_id,
-                    script_id=workflow_script.script_id,
+                    script_id=script.script_id,
                 )
                 script_blocks_by_label = {}
                 loaded_script_module = None
 
         # Mark workflow as running with appropriate engine
-        run_with = "code" if workflow_script and is_script_run and script_blocks_by_label else "agent"
+        run_with = "code" if script and is_script_run and script_blocks_by_label else "agent"
         await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id, run_with=run_with)
 
         if block_labels and len(block_labels):
@@ -1349,8 +1346,11 @@ class WorkflowService:
                 return
             if target not in label_to_block:
                 raise InvalidWorkflowDefinition(f"Block {source} references unknown next_block_label {target}")
-            adjacency[source].add(target)
-            incoming[target] += 1
+            # Only increment incoming count if this is a new edge
+            # (multiple branches of a conditional block may point to the same target)
+            if target not in adjacency[source]:
+                adjacency[source].add(target)
+                incoming[target] += 1
 
         for label, block in label_to_block.items():
             if isinstance(block, ConditionalBlock):
@@ -1693,9 +1693,9 @@ class WorkflowService:
                 continue
 
             block_output_parameter["created_at"] = output_parameter.created_at
-            labels_to_outputs[label] = block_output_parameter
+            labels_to_outputs[label] = block_output_parameter  # type: ignore[assignment]
 
-        return labels_to_outputs
+        return labels_to_outputs  # type: ignore[return-value]
 
     async def get_workflows_by_permanent_ids(
         self,
@@ -2731,7 +2731,13 @@ class WorkflowService:
             await self.persist_video_data(browser_state, workflow, workflow_run)
             if tasks:
                 await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
-            if workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir:
+            # Skip workflow-scoped session save when using browser_profile_id to avoid conflicts
+            # (profile persistence is handled separately via the profile storage)
+            if (
+                workflow.persist_browser_session
+                and browser_state.browser_artifacts.browser_session_dir
+                and not workflow_run.browser_profile_id
+            ):
                 await app.STORAGE.store_browser_session(
                     workflow_run.organization_id,
                     workflow.workflow_permanent_id,

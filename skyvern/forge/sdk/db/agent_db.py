@@ -3,30 +3,17 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import (
-    Connection,
-    and_,
-    asc,
-    case,
-    delete,
-    distinct,
-    event,
-    exists,
-    func,
-    or_,
-    pool,
-    select,
-    tuple_,
-    update,
+from sqlalchemy import and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
+from sqlalchemy.exc import (
+    SQLAlchemyError,
 )
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
 from skyvern.exceptions import BrowserProfileNotFound, WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB, read_retry
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
@@ -107,7 +94,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     Organization,
     OrganizationAuthToken,
 )
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserSession
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
@@ -169,61 +156,30 @@ def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     return result
 
 
-def _connect_args_for_driver(database_string: str) -> dict[str, Any]:
-    driver = make_url(database_string).drivername  # "postgresql+psycopg" or "postgresql+asyncpg"
-    args: dict[str, Any] = {}
+DB_CONNECT_ARGS: dict[str, Any] = {}
 
-    if settings.DB_DISABLE_PREPARED_STATEMENTS:
-        if driver == "postgresql+psycopg":
-            # psycopg3: completely disable prepared statements (None vs 0)
-            # 0 disables caching but still uses prepared statements
-            # None completely disables prepared statement usage
-            args["prepare_threshold"] = None
-        elif driver == "postgresql+asyncpg":
-            # asyncpg: disable statement cache (prepared statements)
-            args["statement_cache_size"] = 0
-        else:
-            LOG.warning(
-                "The database driver might not be well optimized or supported by skyvern: {driver}", driver=driver
-            )
-
-    return args
+if "postgresql+psycopg" in settings.DATABASE_STRING:
+    DB_CONNECT_ARGS = {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"}
+elif "postgresql+asyncpg" in settings.DATABASE_STRING:
+    DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
 
 
-def _install_statement_timeout(engine: AsyncEngine, timeout_ms: int) -> None:
-    if not timeout_ms or timeout_ms <= 0:
-        return
-
-    timeout_value = int(timeout_ms)
-
-    # Works for direct AND poolers because it's not a startup parameter.
-    # Applies per-transaction, which is the most reliable behavior with transaction pooling.
-    @event.listens_for(engine.sync_engine, "begin")
-    def _set_timeout(conn: Connection) -> None:
-        # Use a unique comment with object id to prevent psycopg3 from reusing prepared statement names,
-        # which can cause "prepared statement already exists" errors with connection poolers.
-        sql = f"SET LOCAL statement_timeout = {timeout_value} /* {id(conn)} */"
-        conn.exec_driver_sql(sql)
-
-
-def make_async_engine(database_string: str) -> AsyncEngine:
-    engine = create_async_engine(
-        database_string,
-        json_serializer=_custom_json_serializer,
-        connect_args=_connect_args_for_driver(database_string),
-        poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
-    )
-
-    _install_statement_timeout(engine, settings.DATABASE_STATEMENT_TIMEOUT_MS)
-    return engine
-
-
-class AgentDB:
+class AgentDB(BaseAlchemyDB):
     def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
-        super().__init__()
+        super().__init__(
+            db_engine
+            or create_async_engine(
+                database_string,
+                json_serializer=_custom_json_serializer,
+                connect_args=DB_CONNECT_ARGS,
+                poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
+            )
+        )
         self.debug_enabled = debug_enabled
-        self.engine = db_engine or make_async_engine(database_string)
-        self.Session = async_sessionmaker(bind=self.engine)
+
+    def is_retryable_error(self, error: SQLAlchemyError) -> bool:
+        error_msg = str(error).lower()
+        return "server closed the connection" in error_msg
 
     async def create_task(
         self,
@@ -371,29 +327,56 @@ class AgentDB:
             LOG.exception("UnexpectedError")
             raise
 
-    async def get_task(self, task_id: str, organization_id: str | None = None) -> Task | None:
-        """Get a task by its id"""
+    async def bulk_create_artifacts(
+        self,
+        artifact_models: list[ArtifactModel],
+    ) -> list[Artifact]:
+        """
+        Bulk create multiple artifacts in a single database transaction.
+
+        Args:
+            artifact_models: List of ArtifactModel instances to insert
+
+        Returns:
+            List of created Artifact objects
+        """
+        if not artifact_models:
+            return []
+
         try:
             async with self.Session() as session:
-                if task_obj := (
-                    await session.scalars(
-                        select(TaskModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
-                    )
-                ).first():
-                    return convert_to_task(task_obj, self.debug_enabled)
-                else:
-                    LOG.info(
-                        "Task not found",
-                        task_id=task_id,
-                        organization_id=organization_id,
-                    )
-                    return None
+                session.add_all(artifact_models)
+                await session.commit()
+
+                # Refresh all artifacts to get their created_at and modified_at values
+                for artifact in artifact_models:
+                    await session.refresh(artifact)
+
+                return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifact_models]
         except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
+            LOG.exception("SQLAlchemyError during bulk artifact creation")
             raise
         except Exception:
-            LOG.error("UnexpectedError", exc_info=True)
+            LOG.exception("UnexpectedError during bulk artifact creation")
             raise
+
+    @read_retry()
+    async def get_task(self, task_id: str, organization_id: str | None = None) -> Task | None:
+        """Get a task by its id"""
+        async with self.Session() as session:
+            if task_obj := (
+                await session.scalars(
+                    select(TaskModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
+                )
+            ).first():
+                return convert_to_task(task_obj, self.debug_enabled)
+            else:
+                LOG.info(
+                    "Task not found",
+                    task_id=task_id,
+                    organization_id=organization_id,
+                )
+                return None
 
     async def get_tasks_by_ids(
         self,
@@ -786,6 +769,34 @@ class AgentDB:
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    async def bulk_update_tasks(
+        self,
+        task_ids: list[str],
+        status: TaskStatus | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        """Bulk update tasks by their IDs.
+
+        Args:
+            task_ids: List of task IDs to update
+            status: Optional status to set for all tasks
+            failure_reason: Optional failure reason to set for all tasks
+        """
+        if not task_ids:
+            return
+
+        async with self.Session() as session:
+            update_values = {}
+            if status:
+                update_values["status"] = status.value
+            if failure_reason:
+                update_values["failure_reason"] = failure_reason
+
+            if update_values:
+                update_stmt = update(TaskModel).where(TaskModel.task_id.in_(task_ids)).values(**update_values)
+                await session.execute(update_stmt)
+                await session.commit()
 
     async def get_tasks(
         self,
@@ -2626,6 +2637,38 @@ class AgentDB:
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
 
+    async def bulk_update_workflow_runs(
+        self,
+        workflow_run_ids: list[str],
+        status: WorkflowRunStatus | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        """Bulk update workflow runs by their IDs.
+
+        Args:
+            workflow_run_ids: List of workflow run IDs to update
+            status: Optional status to set for all workflow runs
+            failure_reason: Optional failure reason to set for all workflow runs
+        """
+        if not workflow_run_ids:
+            return
+
+        async with self.Session() as session:
+            update_values = {}
+            if status:
+                update_values["status"] = status.value
+            if failure_reason:
+                update_values["failure_reason"] = failure_reason
+
+            if update_values:
+                update_stmt = (
+                    update(WorkflowRunModel)
+                    .where(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
+                    .values(**update_values)
+                )
+                await session.execute(update_stmt)
+                await session.commit()
+
     async def clear_workflow_run_failure_reason(self, workflow_run_id: str, organization_id: str) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -2725,6 +2768,7 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    @read_retry()
     async def get_workflow_run(
         self,
         workflow_run_id: str,
@@ -2732,21 +2776,17 @@ class AgentDB:
         job_id: str | None = None,
         status: WorkflowRunStatus | None = None,
     ) -> WorkflowRun | None:
-        try:
-            async with self.Session() as session:
-                get_workflow_run_query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id)
-                if organization_id:
-                    get_workflow_run_query = get_workflow_run_query.filter_by(organization_id=organization_id)
-                if job_id:
-                    get_workflow_run_query = get_workflow_run_query.filter_by(job_id=job_id)
-                if status:
-                    get_workflow_run_query = get_workflow_run_query.filter_by(status=status.value)
-                if workflow_run := (await session.scalars(get_workflow_run_query)).first():
-                    return convert_to_workflow_run(workflow_run)
-                return None
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
+        async with self.Session() as session:
+            get_workflow_run_query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id)
+            if organization_id:
+                get_workflow_run_query = get_workflow_run_query.filter_by(organization_id=organization_id)
+            if job_id:
+                get_workflow_run_query = get_workflow_run_query.filter_by(job_id=job_id)
+            if status:
+                get_workflow_run_query = get_workflow_run_query.filter_by(status=status.value)
+            if workflow_run := (await session.scalars(get_workflow_run_query)).first():
+                return convert_to_workflow_run(workflow_run)
+            return None
 
     async def get_last_queued_workflow_run(
         self,
@@ -3789,6 +3829,7 @@ class AgentDB:
             await session.execute(stmt)
             await session.commit()
 
+    @read_retry()
     async def get_task_v2(self, task_v2_id: str, organization_id: str | None = None) -> TaskV2 | None:
         async with self.Session() as session:
             if task_v2 := (
@@ -4441,6 +4482,7 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    @read_retry()
     async def get_persistent_browser_session_by_runnable_id(
         self, runnable_id: str, organization_id: str | None = None
     ) -> PersistentBrowserSession | None:
@@ -4461,12 +4503,6 @@ class AgentDB:
                 return None
         except NotFoundError:
             LOG.error("NotFoundError", exc_info=True)
-            raise
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
-        except Exception:
-            LOG.error("UnexpectedError", exc_info=True)
             raise
 
     async def get_persistent_browser_session(
@@ -4504,8 +4540,12 @@ class AgentDB:
         runnable_id: str | None = None,
         timeout_minutes: int | None = None,
         proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
+        extensions: list[Extensions] | None = None,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
+        extensions_str: list[str] | None = (
+            [extension.value for extension in extensions] if extensions is not None else None
+        )
         try:
             async with self.Session() as session:
                 browser_session = PersistentBrowserSessionModel(
@@ -4514,6 +4554,7 @@ class AgentDB:
                     runnable_id=runnable_id,
                     timeout_minutes=timeout_minutes,
                     proxy_location=_serialize_proxy_location(proxy_location),
+                    extensions=extensions_str,
                 )
                 session.add(browser_session)
                 await session.commit()

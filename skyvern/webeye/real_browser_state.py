@@ -187,6 +187,7 @@ class RealBrowserState(BrowserState):
             for http_page in self.browser_context.pages
             if (
                 http_page.url == "about:blank"
+                or http_page.url == ":"  # sometimes the page url is ":", which is the blank page
                 or http_page.url == "chrome-error://chromewebdata/"
                 or urlparse(http_page.url).scheme in ["http", "https"]
             )
