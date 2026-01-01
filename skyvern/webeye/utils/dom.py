@@ -886,6 +886,8 @@ class SkyvernElement:
             target_y: int | None = None
 
             rect = await self.get_rect(timeout=timeout)
+            element_x: int | None = None
+            element_y: int | None = None
             if rect is not None:
                 element_x = rect["x"] if rect["x"] > 0 else None
                 element_y = rect["y"] if rect["y"] > 0 else None

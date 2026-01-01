@@ -926,6 +926,7 @@ class BaseTaskBlock(Block):
                 current_retry += 1
                 will_retry = current_retry <= self.max_retries
                 retry_message = f", retrying task {current_retry}/{self.max_retries}" if will_retry else ""
+                downloaded_files = []
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                         downloaded_files = await app.STORAGE.get_downloaded_files(
@@ -2078,6 +2079,7 @@ class TextPromptBlock(Block):
         parameter_values: dict[str, Any],
         workflow_run_id: str,
         organization_id: str | None = None,
+        workflow_run_block_id: str | None = None,
     ) -> dict[str, Any]:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
@@ -2102,12 +2104,34 @@ class TextPromptBlock(Block):
             + json.dumps(self.json_schema, indent=2)
             + "\n```\n\n"
         )
+
+        workflow_run_block = None
+        artifacts_to_persist: list[tuple[ArtifactType, bytes]] = []
+        if workflow_run_block_id:
+            try:
+                workflow_run_block = await app.DATABASE.get_workflow_run_block(workflow_run_block_id, organization_id)
+                if workflow_run_block:
+                    artifacts_to_persist.append((ArtifactType.LLM_PROMPT, prompt.encode("utf-8")))
+            except Exception as e:
+                LOG.error("Failed to fetch workflow_run_block for TextPromptBlock artifacts", error=e)
+
         LOG.info(
             "TextPromptBlock: Sending prompt to LLM",
             prompt=prompt,
             llm_key=self.llm_key,
         )
         response = await llm_api_handler(prompt=prompt, prompt_name="text-prompt")
+
+        if workflow_run_block:
+            artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
+            try:
+                await app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts(
+                    workflow_run_block=workflow_run_block,
+                    artifacts=artifacts_to_persist,
+                )
+            except Exception as e:
+                LOG.error("Failed to save TextPromptBlock artifacts", error=e)
+
         LOG.info("TextPromptBlock: Received response from LLM", response=response)
         return response
 
@@ -2170,7 +2194,13 @@ class TextPromptBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
-        response = await self.send_prompt(self.prompt, parameter_values, workflow_run_id, organization_id)
+        response = await self.send_prompt(
+            self.prompt,
+            parameter_values,
+            workflow_run_id,
+            organization_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
         return await self.build_block_result(
             success=True,
@@ -4289,6 +4319,43 @@ class BranchEvaluationContext:
         self.block_label = block_label
         self.template_renderer = template_renderer
 
+    def build_llm_safe_context_snapshot(self) -> dict[str, Any]:
+        """
+        Build a non-secret context blob for LLM-facing branch evaluation.
+
+        Secrets are stripped/masked; only params/outputs/environment and cached
+        block metadata are included so the LLM can ground purely natural language
+        expressions without requiring inline templating.
+        """
+        if self.workflow_run_context is None:
+            return {}
+
+        ctx = self.workflow_run_context
+
+        # Start from the recorded values (params, outputs, env, block outputs)
+        snapshot: dict[str, Any] = ctx.values.copy()
+
+        # Add block metadata (e.g., loop indices/current_item) without mutating originals
+        snapshot["blocks_metadata"] = ctx.blocks_metadata.copy()
+
+        # Ensure the common namespaces exist
+        snapshot.setdefault("params", snapshot.get("params", {}))
+        snapshot.setdefault("outputs", snapshot.get("outputs", {}))
+        snapshot.setdefault("environment", snapshot.get("environment", {}))
+        snapshot.setdefault("env", snapshot.get("environment", {}))
+        snapshot.setdefault("llm", snapshot.get("llm", {}))
+
+        # Standard workflow identifiers for additional context
+        snapshot.setdefault("workflow_title", ctx.workflow_title)
+        snapshot.setdefault("workflow_id", ctx.workflow_id)
+        snapshot.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
+        snapshot.setdefault("workflow_run_id", ctx.workflow_run_id)
+
+        # Mask any real secret values that may have leaked into values
+        snapshot = ctx.mask_secrets_in_data(snapshot)
+
+        return snapshot
+
     def build_template_data(self) -> dict[str, Any]:
         """Build Jinja template data mirroring block parameter rendering context."""
         if self.workflow_run_context is None:
@@ -4531,6 +4598,8 @@ class ConditionalBlock(Block):
             raise ValueError("organization_id is required to evaluate natural language branches")
 
         workflow_run_context = evaluation_context.workflow_run_context
+        context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
+        context_snapshot_json = json.dumps(context_snapshot, default=str)
 
         rendered_branch_criteria: list[dict[str, Any]] = []
         for idx, branch in enumerate(branches):
@@ -4549,6 +4618,7 @@ class ConditionalBlock(Block):
         extraction_goal = prompt_engine.load_prompt(
             "conditional-prompt-branch-evaluation",
             branch_criteria=branch_criteria_payload,
+            context_snapshot=context_snapshot_json,
         )
 
         data_schema = {

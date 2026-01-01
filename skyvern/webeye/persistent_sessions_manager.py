@@ -13,6 +13,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    Extensions,
     PersistentBrowserSession,
     PersistentBrowserSessionStatus,
     is_final_status,
@@ -256,6 +257,7 @@ class PersistentSessionsManager:
         runnable_type: str | None = None,
         timeout_minutes: int | None = None,
         proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
+        extensions: list[Extensions] | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
 
@@ -270,6 +272,7 @@ class PersistentSessionsManager:
             runnable_id=runnable_id,
             timeout_minutes=timeout_minutes,
             proxy_location=proxy_location,
+            extensions=extensions,
         )
 
         return browser_session_db
