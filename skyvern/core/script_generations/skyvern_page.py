@@ -408,6 +408,7 @@ class SkyvernPage(Page):
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
             error_to_raise = None
+            original_value = value
             if selector:
                 try:
                     value = await self.get_actual_value(
@@ -417,7 +418,7 @@ class SkyvernPage(Page):
                     )
                     locator = self.page.locator(selector)
                     await handler_utils.input_sequentially(locator, value, timeout=timeout)
-                    return value
+                    return original_value
                 except Exception as e:
                     error_to_raise = e
                     selector = None
@@ -435,7 +436,7 @@ class SkyvernPage(Page):
             if error_to_raise:
                 raise error_to_raise
             else:
-                return value
+                return original_value
         elif ai == "proactive" and intention:
             return await self._ai.ai_input_text(
                 selector=selector,
