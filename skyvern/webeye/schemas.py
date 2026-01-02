@@ -10,7 +10,7 @@ from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserSession
 
 LOG = structlog.get_logger()
 
@@ -45,6 +45,10 @@ class BrowserSessionResponse(BaseModel):
         None,
         description="Url for the browser session page",
         examples=["https://app.skyvern.com/browser-session/pbs_123456"],
+    )
+    extensions: list[Extensions] | None = Field(
+        None,
+        description="A list of extensions installed in the browser session.",
     )
     vnc_streaming_supported: bool = Field(False, description="Whether the browser session supports VNC streaming")
     download_path: str | None = Field(None, description="The path where the browser session downloads files")
@@ -126,4 +130,5 @@ class BrowserSessionResponse(BaseModel):
             download_path=download_path,
             downloaded_files=downloaded_files,
             recordings=recordings,
+            extensions=browser_session.extensions,
         )

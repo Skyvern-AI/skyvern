@@ -14,7 +14,7 @@ from skyvern.exceptions import (
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -135,7 +135,7 @@ async def test_webhook(
     )
     api_key = api_key_obj.token if api_key_obj else "test_api_key_placeholder"
 
-    headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key)
+    signed_data = generate_skyvern_webhook_signature(payload=payload, api_key=api_key)
 
     # Send the webhook request
     status_code = None
@@ -146,8 +146,8 @@ async def test_webhook(
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 validated_url,
-                content=payload,
-                headers=headers,
+                content=signed_data.signed_payload,
+                headers=signed_data.headers,
                 timeout=httpx.Timeout(10.0),
             )
             status_code = response.status_code
@@ -190,7 +190,7 @@ async def test_webhook(
         status_code=status_code,
         latency_ms=latency_ms,
         response_body=response_body,
-        headers_sent=headers,
+        headers_sent=signed_data.headers,
         error=error,
     )
 

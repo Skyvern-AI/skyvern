@@ -32,8 +32,9 @@ export interface WorkflowRunRequest {
      * - US-FL: Florida
      * - US-WA: Washington
      * - NONE: No proxy
+     *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
      */
-    proxy_location?: Skyvern.ProxyLocation;
+    proxy_location?: WorkflowRunRequest.ProxyLocation;
     /** URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions. */
     webhook_url?: string;
     /**
@@ -46,6 +47,8 @@ export interface WorkflowRunRequest {
     totp_identifier?: string;
     /** ID of a Skyvern browser session to reuse, having it continue from the current screen state */
     browser_session_id?: string;
+    /** ID of a browser profile to reuse for this workflow run */
+    browser_profile_id?: string;
     /** The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot. */
     max_screenshot_scrolls?: number;
     /** The extra HTTP headers for the requests in browser. */
@@ -56,4 +59,34 @@ export interface WorkflowRunRequest {
     ai_fallback?: boolean;
     /** Whether to run the workflow with agent or code. */
     run_with?: string;
+}
+
+export namespace WorkflowRunRequest {
+    /**
+     *
+     * Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+     *
+     * Available geotargeting options:
+     * - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
+     * - RESIDENTIAL_ES: Spain
+     * - RESIDENTIAL_IE: Ireland
+     * - RESIDENTIAL_GB: United Kingdom
+     * - RESIDENTIAL_IN: India
+     * - RESIDENTIAL_JP: Japan
+     * - RESIDENTIAL_FR: France
+     * - RESIDENTIAL_DE: Germany
+     * - RESIDENTIAL_NZ: New Zealand
+     * - RESIDENTIAL_ZA: South Africa
+     * - RESIDENTIAL_AR: Argentina
+     * - RESIDENTIAL_AU: Australia
+     * - RESIDENTIAL_ISP: ISP proxy
+     * - US-CA: California
+     * - US-NY: New York
+     * - US-TX: Texas
+     * - US-FL: Florida
+     * - US-WA: Washington
+     * - NONE: No proxy
+     *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
+     */
+    export type ProxyLocation = Skyvern.ProxyLocation | Skyvern.GeoTarget | Record<string, unknown>;
 }

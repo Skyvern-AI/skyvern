@@ -1,4 +1,6 @@
 import {
+  BookmarkFilledIcon,
+  BookmarkIcon,
   ChevronDownIcon,
   ChevronUpIcon,
   ClockIcon,
@@ -19,14 +21,19 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Input } from "@/components/ui/input";
-import { useUser } from "@/hooks/useUser";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
+import { getClient } from "@/api/AxiosClient";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { AxiosError } from "axios";
+import { toast } from "@/components/ui/use-toast";
 import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
 import { useCreateWorkflowMutation } from "../hooks/useCreateWorkflowMutation";
 import { convert } from "./workflowEditorUtils";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
@@ -41,6 +48,7 @@ type Props = {
   cacheKeyValues: CacheKeyValuesResponse | undefined;
   cacheKeyValuesPanelOpen: boolean;
   isGeneratingCode?: boolean;
+  isTemplate?: boolean;
   parametersPanelOpen: boolean;
   saving: boolean;
   showAllCode: boolean;
@@ -61,6 +69,7 @@ function WorkflowHeader({
   cacheKeyValues,
   cacheKeyValuesPanelOpen,
   isGeneratingCode,
+  isTemplate,
   parametersPanelOpen,
   saving,
   showAllCode,
@@ -83,12 +92,47 @@ function WorkflowHeader({
   const createWorkflowMutation = useCreateWorkflowMutation();
   const { data: workflowRun } = useWorkflowRunQuery();
   const debugStore = useDebugStore();
+  const recordingStore = useRecordingStore();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
-  const user = useUser().get();
   const [chosenCacheKeyValue, setChosenCacheKeyValue] = useState<string | null>(
     cacheKeyValue ?? null,
   );
+
+  const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
+
+  const templateMutation = useMutation({
+    mutationFn: async (newIsTemplate: boolean) => {
+      // Template endpoint only exists on /v1 (no /api prefix)
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return client.put(
+        `/workflows/${workflowPermanentId}/template?is_template=${newIsTemplate}`,
+      );
+    },
+    onSuccess: (_, newIsTemplate) => {
+      queryClient.invalidateQueries({
+        queryKey: ["workflows"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["orgTemplates"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflow", workflowPermanentId],
+      });
+      toast({
+        title: newIsTemplate ? "Saved as template" : "Removed from templates",
+        variant: "success",
+      });
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Failed to update template status",
+        description: error.message,
+      });
+    },
+  });
 
   const dom: Dom = {
     input: useRef<HTMLInputElement>(null),
@@ -107,6 +151,11 @@ function WorkflowHeader({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheKeyValue]);
 
+  const isRecording = recordingStore.isRecording;
+
+  const shouldShowCacheControls =
+    !isRecording && !isGeneratingCode && (cacheKeyValues?.total_count ?? 0) > 0;
+
   if (!globalWorkflows) {
     return null; // this should be loaded already by some other components
   }
@@ -123,7 +172,7 @@ function WorkflowHeader({
     >
       <div className="flex h-full items-center">
         <EditableNodeTitle
-          editable={true}
+          editable={!isRecording}
           onChange={(newTitle) => {
             setTitle(newTitle);
             workflowChangesStore.setHasChanges(true);
@@ -134,79 +183,77 @@ function WorkflowHeader({
         />
       </div>
       <div className="flex h-full items-center justify-end gap-4">
-        {user &&
-          !isGeneratingCode &&
-          (cacheKeyValues?.total_count ?? 0) > 0 && (
-            <>
-              {debugStore.isDebugMode && (
-                <Button
-                  className="pl-2 pr-3"
-                  size="lg"
-                  variant={!showAllCode ? "tertiary" : "default"}
-                  onClick={handleShowAllCode}
-                >
-                  <CodeIcon className="mr-2 h-6 w-6" />
-                  Show Code
-                </Button>
-              )}
-              <div
-                tabIndex={1}
-                className="flex max-w-[10rem] items-center justify-center gap-1 rounded-md border border-input pr-1 focus-within:ring-1 focus-within:ring-ring"
+        {shouldShowCacheControls && (
+          <>
+            {debugStore.isDebugMode && (
+              <Button
+                className="pl-2 pr-3"
+                size="lg"
+                variant={!showAllCode ? "tertiary" : "default"}
+                onClick={handleShowAllCode}
               >
-                <Input
-                  ref={dom.input}
-                  className="focus-visible:transparent focus-visible:none h-[2.75rem] text-ellipsis whitespace-nowrap border-none focus-visible:outline-none focus-visible:ring-0"
-                  onChange={(e) => {
-                    setChosenCacheKeyValue(e.target.value);
-                    onCacheKeyValuesFilter(e.target.value);
-                  }}
-                  onMouseDown={() => {
-                    if (!cacheKeyValuesPanelOpen) {
-                      onCacheKeyValuesClick();
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      const numFiltered = cacheKeyValues?.values?.length ?? 0;
+                <CodeIcon className="mr-2 h-6 w-6" />
+                Show Code
+              </Button>
+            )}
+            <div
+              tabIndex={1}
+              className="flex max-w-[10rem] items-center justify-center gap-1 rounded-md border border-input pr-1 focus-within:ring-1 focus-within:ring-ring"
+            >
+              <Input
+                ref={dom.input}
+                className="focus-visible:transparent focus-visible:none h-[2.75rem] text-ellipsis whitespace-nowrap border-none focus-visible:outline-none focus-visible:ring-0"
+                onChange={(e) => {
+                  setChosenCacheKeyValue(e.target.value);
+                  onCacheKeyValuesFilter(e.target.value);
+                }}
+                onMouseDown={() => {
+                  if (!cacheKeyValuesPanelOpen) {
+                    onCacheKeyValuesClick();
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    const numFiltered = cacheKeyValues?.values?.length ?? 0;
 
-                      if (numFiltered === 1) {
-                        const first = cacheKeyValues?.values?.[0];
-                        if (first) {
-                          setChosenCacheKeyValue(first);
-                          onCacheKeyValueAccept(first);
-                        }
-                        return;
+                    if (numFiltered === 1) {
+                      const first = cacheKeyValues?.values?.[0];
+                      if (first) {
+                        setChosenCacheKeyValue(first);
+                        onCacheKeyValueAccept(first);
                       }
-
-                      setChosenCacheKeyValue(chosenCacheKeyValue);
-                      onCacheKeyValueAccept(chosenCacheKeyValue);
+                      return;
                     }
-                    onCacheKeyValuesKeydown(e);
-                  }}
-                  placeholder="Code Key Value"
-                  value={chosenCacheKeyValue ?? undefined}
-                  onBlur={(e) => {
-                    onCacheKeyValuesBlurred(e.target.value);
-                    setChosenCacheKeyValue(e.target.value);
+
+                    setChosenCacheKeyValue(chosenCacheKeyValue);
+                    onCacheKeyValueAccept(chosenCacheKeyValue);
+                  }
+                  onCacheKeyValuesKeydown(e);
+                }}
+                placeholder="Code Key Value"
+                value={chosenCacheKeyValue ?? undefined}
+                onBlur={(e) => {
+                  onCacheKeyValuesBlurred(e.target.value);
+                  setChosenCacheKeyValue(e.target.value);
+                }}
+              />
+              {cacheKeyValuesPanelOpen ? (
+                <ChevronUpIcon
+                  className="h-6 w-6 cursor-pointer"
+                  onClick={onCacheKeyValuesClick}
+                />
+              ) : (
+                <ChevronDownIcon
+                  className="h-6 w-6 cursor-pointer"
+                  onClick={() => {
+                    dom.input.current?.focus();
+                    onCacheKeyValuesClick();
                   }}
                 />
-                {cacheKeyValuesPanelOpen ? (
-                  <ChevronUpIcon
-                    className="h-6 w-6 cursor-pointer"
-                    onClick={onCacheKeyValuesClick}
-                  />
-                ) : (
-                  <ChevronDownIcon
-                    className="h-6 w-6 cursor-pointer"
-                    onClick={() => {
-                      dom.input.current?.focus();
-                      onCacheKeyValuesClick();
-                    }}
-                  />
-                )}
-              </div>
-            </>
-          )}
+              )}
+            </div>
+          </>
+        )}
         {isGeneratingCode && (
           <Button
             className="size-10 min-w-[6rem]"
@@ -248,7 +295,7 @@ function WorkflowHeader({
                     size="icon"
                     variant={debugStore.isDebugMode ? "default" : "tertiary"}
                     className="size-10 min-w-[2.5rem]"
-                    disabled={workflowRunIsRunningOrQueued}
+                    disabled={workflowRunIsRunningOrQueued || isRecording}
                     onClick={() => {
                       if (debugStore.isDebugMode) {
                         navigate(`/workflows/${workflowPermanentId}/edit`);
@@ -278,7 +325,7 @@ function WorkflowHeader({
                     size="icon"
                     variant="tertiary"
                     className="size-10 min-w-[2.5rem]"
-                    disabled={isGlobalWorkflow}
+                    disabled={isGlobalWorkflow || isRecording}
                     onClick={() => {
                       onSave();
                     }}
@@ -293,11 +340,45 @@ function WorkflowHeader({
                 <TooltipContent>Save</TooltipContent>
               </Tooltip>
             </TooltipProvider>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    disabled={
+                      isRecording || templateMutation.isPending || saving
+                    }
+                    size="icon"
+                    variant={isTemplate ? "default" : "tertiary"}
+                    className="size-10 min-w-[2.5rem]"
+                    onClick={() => {
+                      const newIsTemplate = !isTemplate;
+                      if (newIsTemplate) {
+                        // When saving AS template, save the workflow first
+                        onSave();
+                      }
+                      templateMutation.mutate(newIsTemplate);
+                    }}
+                  >
+                    {templateMutation.isPending ? (
+                      <ReloadIcon className="size-6 animate-spin" />
+                    ) : isTemplate ? (
+                      <BookmarkFilledIcon className="size-6" />
+                    ) : (
+                      <BookmarkIcon className="size-6" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {isTemplate ? "Remove from Templates" : "Save as Template"}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             {!workflowRunIsRunningOrQueued && (
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
+                      disabled={isRecording}
                       size="icon"
                       variant="tertiary"
                       className="size-10 min-w-[2.5rem]"
@@ -312,7 +393,12 @@ function WorkflowHeader({
                 </Tooltip>
               </TooltipProvider>
             )}
-            <Button variant="tertiary" size="lg" onClick={onParametersClick}>
+            <Button
+              disabled={isRecording}
+              variant="tertiary"
+              size="lg"
+              onClick={onParametersClick}
+            >
               <span className="mr-2">Parameters</span>
               {parametersPanelOpen ? (
                 <ChevronUpIcon className="h-6 w-6" />
@@ -321,6 +407,7 @@ function WorkflowHeader({
               )}
             </Button>
             <Button
+              disabled={isRecording}
               size="lg"
               onClick={() => {
                 onRun?.();

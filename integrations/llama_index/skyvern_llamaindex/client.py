@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from skyvern_llamaindex.settings import settings
 
 from skyvern import Skyvern
+from skyvern.client import SkyvernEnvironment
 from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.schemas.runs import RunEngine
@@ -57,7 +58,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
     ):
         self.engine = engine
         self.run_task_timeout_seconds = run_task_timeout_seconds
-        self.client = Skyvern(base_url=base_url, api_key=api_key)
+        self.client = Skyvern(environment=SkyvernEnvironment.CLOUD, base_url=base_url, api_key=api_key)
 
     async def run_task(
         self,

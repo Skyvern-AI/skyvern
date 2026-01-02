@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .docs import docs_app
-from .init_command import init, init_browser
+from .init_command import init_browser, init_env
 from .quickstart import quickstart_app
 from .run_commands import run_app
 from .status import status_app
@@ -46,7 +46,7 @@ def init_callback(
 ) -> None:
     """Run full initialization when no subcommand is provided."""
     if ctx.invoked_subcommand is None:
-        init(no_postgres=no_postgres)
+        init_env(no_postgres=no_postgres)
 
 
 @init_app.command(name="browser")

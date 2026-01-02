@@ -15,6 +15,8 @@ import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
+import { useRecordingStore } from "@/store/useRecordingStore";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { editable, label } = data;
@@ -28,9 +30,14 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const update = useUpdate<TextPromptNode["data"]>({ id, editable });
+  const recordingStore = useRecordingStore();
 
   return (
-    <div>
+    <div
+      className={cn({
+        "pointer-events-none opacity-50": recordingStore.isRecording,
+      })}
+    >
       <Handle
         type="source"
         position={Position.Bottom}
@@ -75,6 +82,7 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
           </div>
 
           <WorkflowBlockInputTextarea
+            aiImprove={AI_IMPROVE_CONFIGS.textPrompt.prompt}
             nodeId={id}
             onChange={(value) => {
               update({ prompt: value });

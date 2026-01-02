@@ -19,6 +19,8 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import { useRerender } from "@/hooks/useRerender";
+import { useRecordingStore } from "@/store/useRecordingStore";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 const instructionsTooltip =
   "Instructions shown to the user for review. Explain what needs to be reviewed and what action should be taken.";
@@ -37,6 +39,7 @@ function HumanInteractionNode({
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
+  const recordingStore = useRecordingStore();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const thisBlockIsTargetted =
@@ -47,7 +50,11 @@ function HumanInteractionNode({
   const rerender = useRerender({ prefix: "accordian" });
 
   return (
-    <div>
+    <div
+      className={cn({
+        "pointer-events-none opacity-50": recordingStore.isRecording,
+      })}
+    >
       <Handle
         type="source"
         position={Position.Bottom}
@@ -77,6 +84,17 @@ function HumanInteractionNode({
           nodeId={id}
           totpIdentifier={null}
           totpUrl={null}
+          transmutations={{
+            blockTitle: "Validation",
+            self: "human",
+            others: [
+              {
+                label: "agent",
+                reason: "Convert to automated agent validation",
+                nodeName: "validation",
+              },
+            ],
+          }}
           type={type}
         />
         <div
@@ -158,6 +176,7 @@ function HumanInteractionNode({
             <div className="space-y-2">
               <Label className="text-xs text-slate-300">Body</Label>
               <WorkflowBlockInputTextarea
+                aiImprove={AI_IMPROVE_CONFIGS.humanInteraction.body}
                 nodeId={id}
                 onChange={(value) => {
                   update({ body: value });

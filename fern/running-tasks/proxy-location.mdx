@@ -1,0 +1,108 @@
+---
+title: Proxy & Geo Targeting
+slug: running-tasks/proxy-location
+---
+
+Skyvern Cloud routes browser traffic through a global pool of **residential proxies**. By default, workflows and tasks run from a random US residential IP (`RESIDENTIAL`). Override that per run when you need localized content, geo-fenced features, or tighter fraud protections.
+
+> This feature is only available in **Skyvern Cloud** today.
+
+## Country presets
+
+Pass any of the following enum values to `proxy_location`. Each value pins the run to a residential pool in that country.
+
+| Proxy value | Region |
+| --- | --- |
+| `RESIDENTIAL` | Random US residential IP (default) |
+| `RESIDENTIAL_ISP` | United States ISP proxy pool (static IPs, useful for sites that distrust rotating pools) |
+| `RESIDENTIAL_AR` | Argentina |
+| `RESIDENTIAL_AU` | Australia |
+| `RESIDENTIAL_BR` | Brazil |
+| `RESIDENTIAL_CA` | Canada |
+| `RESIDENTIAL_DE` | Germany |
+| `RESIDENTIAL_ES` | Spain |
+| `RESIDENTIAL_FR` | France |
+| `RESIDENTIAL_GB` | United Kingdom |
+| `RESIDENTIAL_IE` | Ireland |
+| `RESIDENTIAL_IN` | India |
+| `RESIDENTIAL_IT` | Italy |
+| `RESIDENTIAL_JP` | Japan |
+| `RESIDENTIAL_MX` | Mexico |
+| `RESIDENTIAL_NL` | Netherlands |
+| `RESIDENTIAL_NZ` | New Zealand |
+| `RESIDENTIAL_TR` | Türkiye |
+| `RESIDENTIAL_ZA` | South Africa |
+| `NONE` | Disable proxy routing (traffic originates from Skyvern’s US datacenters) |
+
+## GeoTarget format (states & cities)
+
+For any location that is **not** listed above—such as a specific US state or city—send a `GeoTarget` object instead of an enum. This is the same structure used in the UI’s GeoTarget picker.
+
+```json
+{
+  "country": "US",
+  "subdivision": "CA",
+  "city": "Los Angeles"
+}
+```
+
+Field meanings:
+
+- `country` (required): ISO 3166-1 alpha-2 code (e.g., `US`, `GB`)
+- `subdivision` (optional): ISO 3166-2 code for a state/province (e.g., `CA`, `NY`, `BC`)
+- `city` (optional): Free-form city name
+
+Examples:
+
+- **Any US state:** `{"country": "US", "subdivision": "IL"}`
+- **US city:** `{"country": "US", "subdivision": "NY", "city": "New York City"}`
+- **Country-only targeting:** `{"country": "DE"}` (useful when the country is not available as a preset yet)
+
+When a subdivision or city is not available in the proxy pool, the run fails with `NoProxyAvailable`. Choose a broader target (e.g., country-only) or retry later.
+
+## Per-run overrides
+
+`proxy_location` can be stored on the workflow definition, but every run (UI or API) can override it. The override only applies to that run and does **not** mutate the workflow.
+
+### cURL
+
+```bash
+curl -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "wpid_workflow_permanent_id",
+    "proxy_location": {
+      "country": "US",
+      "subdivision": "CA"
+    }
+  }'
+```
+
+### Python SDK
+
+```python
+from skyvern import Skyvern
+
+client = Skyvern(api_key="YOUR_API_KEY")
+
+# Run with a GeoTarget (California)
+client.run_workflow(
+    workflow_id="wpid_workflow_permanent_id",
+    proxy_location={"country": "US", "subdivision": "CA"},
+)
+
+# Run with the ISP pool
+client.run_workflow(
+    workflow_id="wpid_workflow_permanent_id",
+    proxy_location="RESIDENTIAL_ISP",
+)
+```
+
+## Availability & troubleshooting
+
+- Proxy availability depends on upstream partners. During spikes, certain cities may be temporarily unavailable.
+- If you receive `NoProxyAvailable`, retry with a broader GeoTarget (city → state → country) or switch to `RESIDENTIAL_ISP`.
+- `proxy_location: "NONE"` is useful for testing because it removes proxy routing entirely.
+
+Need something that is not listed here? Reach out to support so we can prioritize new pools.

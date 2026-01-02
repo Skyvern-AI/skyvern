@@ -9,9 +9,10 @@ export interface Workflow {
     workflow_permanent_id: string;
     version: number;
     is_saved_task: boolean;
+    is_template?: boolean;
     description?: string;
     workflow_definition: Skyvern.WorkflowDefinition;
-    proxy_location?: Skyvern.ProxyLocation;
+    proxy_location?: Workflow.ProxyLocation;
     webhook_callback_url?: string;
     totp_verification_url?: string;
     totp_identifier?: string;
@@ -25,7 +26,13 @@ export interface Workflow {
     cache_key?: string;
     run_sequentially?: boolean;
     sequential_key?: string;
+    folder_id?: string;
+    import_error?: string;
     created_at: string;
     modified_at: string;
     deleted_at?: string;
+}
+
+export namespace Workflow {
+    export type ProxyLocation = Skyvern.ProxyLocation | Skyvern.GeoTarget | Record<string, unknown>;
 }

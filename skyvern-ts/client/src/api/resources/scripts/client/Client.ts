@@ -48,7 +48,7 @@ export class Scripts {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/scripts/${core.url.encodePathParam(scriptId)}/run`,
             ),
             method: "POST",

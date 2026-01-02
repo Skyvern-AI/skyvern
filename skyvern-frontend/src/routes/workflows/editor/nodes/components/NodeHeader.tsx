@@ -6,6 +6,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
+import { NoticeMe } from "@/components/NoticeMe";
 import { StatusBadge } from "@/components/StatusBadge";
 import { toast } from "@/components/ui/use-toast";
 import { useLogging } from "@/hooks/useLogging";
@@ -15,6 +16,7 @@ import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
@@ -28,6 +30,7 @@ import {
 import { getInitialValues } from "@/routes/workflows/utils";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
 import {
@@ -45,14 +48,27 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { workflowBlockTitle } from "../types";
+import { MicroDropdown } from "./MicroDropdown";
+
+interface Transmutations {
+  blockTitle: string;
+  self: string;
+  others: {
+    label: string;
+    reason: string;
+    nodeName: string;
+  }[];
+}
 
 interface Props {
   blockLabel: string; // today, this + wpid act as the identity of a block
   disabled?: boolean;
   editable: boolean;
+  extraActions?: React.ReactNode;
   nodeId: string;
   totpIdentifier: string | null;
   totpUrl: string | null;
+  transmutations?: Transmutations;
   type: WorkflowBlockType;
 }
 
@@ -141,9 +157,11 @@ function NodeHeader({
   blockLabel,
   disabled = false,
   editable,
+  extraActions,
   nodeId,
   totpIdentifier,
   totpUrl,
+  transmutations,
   type,
 }: Props) {
   const log = useLogging();
@@ -154,6 +172,7 @@ function NodeHeader({
   } = useParams();
   const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
+  const recordingStore = useRecordingStore();
   const { closeWorkflowPanel } = useWorkflowPanelStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -162,6 +181,7 @@ function NodeHeader({
   });
   const blockTitle = workflowBlockTitle[type];
   const deleteNodeCallback = useDeleteNodeCallback();
+  const transmuteNodeCallback = useTransmuteNodeCallback();
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
@@ -187,6 +207,8 @@ function NodeHeader({
 
   const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
+
+  const isRecording = recordingStore.isRecording;
 
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
@@ -510,10 +532,40 @@ function NodeHeader({
               titleClassName="text-base"
               inputClassName="text-base"
             />
-            <span className="text-xs text-slate-400">{blockTitle}</span>
+
+            {transmutations && transmutations.others.length ? (
+              <div className="flex items-center gap-1">
+                <span className="text-xs text-slate-400">
+                  {transmutations.blockTitle}
+                </span>
+                <NoticeMe trigger="viewport">
+                  <MicroDropdown
+                    selections={[
+                      transmutations.self,
+                      ...transmutations.others.map((t) => t.label),
+                    ]}
+                    selected={transmutations.self}
+                    onChange={(label) => {
+                      const transmutation = transmutations.others.find(
+                        (t) => t.label === label,
+                      );
+
+                      if (!transmutation) {
+                        return;
+                      }
+
+                      transmuteNodeCallback(nodeId, transmutation.nodeName);
+                    }}
+                  />
+                </NoticeMe>
+              </div>
+            ) : (
+              <span className="text-xs text-slate-400">{blockTitle}</span>
+            )}
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
+          {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
               <button className="rounded p-1 hover:bg-red-500 hover:text-black disabled:opacity-50">
@@ -545,7 +597,8 @@ function NodeHeader({
                     "pointer-events-none fill-gray-500 text-gray-500":
                       workflowRunIsRunningOrQueued ||
                       !workflowPermanentId ||
-                      debugSession === undefined,
+                      debugSession === undefined ||
+                      isRecording,
                   })}
                   onClick={() => {
                     handleOnPlay();

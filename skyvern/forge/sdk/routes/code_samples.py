@@ -160,6 +160,24 @@ await skyvern.login({
     onepassword_item_id: "1PASSWORD ITEM ID"
 });
 """
+DOWNLOAD_FILES_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+await skyvern.download_files(
+    url="https://example.com/downloads",
+    navigation_goal="Navigate to the downloads page and click the 'Download PDF' button",
+    download_suffix="report.pdf"
+)
+"""
+DOWNLOAD_FILES_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+await skyvern.downloadFiles({
+    url: "https://example.com/downloads",
+    navigation_goal: "Navigate to the downloads page and click the 'Download PDF' button",
+    download_suffix: "report.pdf"
+});
+"""
 
 # Workflows
 CREATE_WORKFLOW_CODE_SAMPLE_CURL = """curl -X POST https://api.skyvern.com/v1/workflows \
@@ -228,7 +246,6 @@ workflow_definition:
       parameter_keys: []
       totp_identifier: null
       totp_verification_url: null
-      cache_actions: false
       complete_criterion: ""
       terminate_criterion: ""
       include_action_history_in_verification: false
@@ -242,7 +259,6 @@ workflow_definition:
       max_retries: 0
       max_steps_per_run: null
       parameter_keys: []
-      cache_actions: false
 '
 """
 CREATE_WORKFLOW_CODE_SAMPLE_PYTHON = """
@@ -305,7 +321,6 @@ workflow_definition = {
                 "parameter_keys": [],
                 "totp_identifier": None,
                 "totp_verification_url": None,
-                "cache_actions": False,
                 "complete_criterion": "",
                 "terminate_criterion": "",
                 "include_action_history_in_verification": False,
@@ -321,7 +336,6 @@ workflow_definition = {
                 "max_retries": 0,
                 "max_steps_per_run": None,
                 "parameter_keys": [],
-                "cache_actions": False,
             },
         ],
     },
@@ -391,7 +405,6 @@ const workflowDefinition = {
                 parameter_keys: [],
                 totp_identifier: null,
                 totp_verification_url: null,
-                cache_actions: false,
                 complete_criterion: "",
                 terminate_criterion: "",
                 include_action_history_in_verification: false
@@ -407,7 +420,6 @@ const workflowDefinition = {
                 max_retries: 0,
                 max_steps_per_run: null,
                 parameter_keys: [],
-                cache_actions: false
             }
         ]
     }
@@ -484,7 +496,6 @@ workflow_definition:
       parameter_keys: []
       totp_identifier: null
       totp_verification_url: null
-      cache_actions: false
       complete_criterion: ""
       terminate_criterion: ""
       include_action_history_in_verification: false
@@ -498,7 +509,6 @@ workflow_definition:
       max_retries: 0
       max_steps_per_run: null
       parameter_keys: []
-      cache_actions: false
 '
 """
 UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON = """
@@ -560,7 +570,6 @@ updated_workflow_definition = {
                 "parameter_keys": [],
                 "totp_identifier": None,
                 "totp_verification_url": None,
-                "cache_actions": False,
                 "complete_criterion": "",
                 "terminate_criterion": "",
                 "include_action_history_in_verification": False,
@@ -576,7 +585,6 @@ updated_workflow_definition = {
                 "max_retries": 0,
                 "max_steps_per_run": None,
                 "parameter_keys": [],
-                "cache_actions": False,
             },
         ],
     },
@@ -645,7 +653,6 @@ const updatedWorkflowDefinition = {
                 parameter_keys: [],
                 totp_identifier: null,
                 totp_verification_url: null,
-                cache_actions: false,
                 complete_criterion: "",
                 terminate_criterion: "",
                 include_action_history_in_verification: false
@@ -660,8 +667,7 @@ const updatedWorkflowDefinition = {
                 data_schema: null,
                 max_retries: 0,
                 max_steps_per_run: null,
-                parameter_keys: [],
-                cache_actions: false
+                parameter_keys: []
             }
         ]
     }
@@ -846,4 +852,74 @@ GET_BROWSER_SESSIONS_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern
 const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 const browserSessions = await skyvern.getBrowserSessions();
 console.log(browserSessions);
+"""
+
+# Browser Profiles
+CREATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+# Create a browser profile from a persistent browser session
+browser_profile = await skyvern.browser_profiles.create_browser_profile(
+    name="My Profile",
+    browser_session_id="pbs_123",
+)
+print(browser_profile)
+
+# Or create from a workflow run with persist_browser_session=True
+browser_profile = await skyvern.browser_profiles.create_browser_profile(
+    name="My Profile",
+    workflow_run_id="wr_123",
+)
+print(browser_profile)
+"""
+CREATE_BROWSER_PROFILE_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+// Create a browser profile from a persistent browser session
+const browserProfile = await skyvern.browserProfiles.createBrowserProfile({
+    name: "My Profile",
+    browser_session_id: "pbs_123",
+});
+console.log(browserProfile);
+
+// Or create from a workflow run with persist_browser_session=True
+const browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({
+    name: "My Profile",
+    workflow_run_id: "wr_123",
+});
+console.log(browserProfile2);
+"""
+GET_BROWSER_PROFILES_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+browser_profiles = await skyvern.browser_profiles.list_browser_profiles()
+print(browser_profiles)
+"""
+GET_BROWSER_PROFILES_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const browserProfiles = await skyvern.browserProfiles.listBrowserProfiles();
+console.log(browserProfiles);
+"""
+GET_BROWSER_PROFILE_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+browser_profile = await skyvern.browser_profiles.get_browser_profile("bp_123")
+print(browser_profile)
+"""
+GET_BROWSER_PROFILE_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const browserProfile = await skyvern.browserProfiles.getBrowserProfile("bp_123");
+console.log(browserProfile);
+"""
+DELETE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+await skyvern.browser_profiles.delete_browser_profile("bp_123")
+"""
+DELETE_BROWSER_PROFILE_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+await skyvern.browserProfiles.deleteBrowserProfile("bp_123");
 """

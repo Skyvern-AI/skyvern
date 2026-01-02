@@ -4,6 +4,7 @@
 export const SkyvernForgeSdkSchemasCredentialsCredentialType = {
     Password: "password",
     CreditCard: "credit_card",
+    Secret: "secret",
 } as const;
 export type SkyvernForgeSdkSchemasCredentialsCredentialType =
     (typeof SkyvernForgeSdkSchemasCredentialsCredentialType)[keyof typeof SkyvernForgeSdkSchemasCredentialsCredentialType];

@@ -3,9 +3,13 @@
 import type * as Skyvern from "../index.js";
 
 export interface TaskBlockYaml {
+    /** Author-facing identifier; must be unique per workflow. */
     label: string;
+    /** Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]. */
+    next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    next_loop_on_failure?: boolean;
     url?: string;
     title?: string;
     engine?: Skyvern.RunEngine;
@@ -20,7 +24,6 @@ export interface TaskBlockYaml {
     download_suffix?: string;
     totp_verification_url?: string;
     totp_identifier?: string;
-    cache_actions?: boolean;
     disable_cache?: boolean;
     complete_criterion?: string;
     terminate_criterion?: string;

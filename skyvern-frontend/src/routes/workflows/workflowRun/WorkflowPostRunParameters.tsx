@@ -1,4 +1,5 @@
-import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import { useMemo } from "react";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { CodeEditor } from "../components/CodeEditor";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { useActiveWorkflowRunItem } from "./useActiveWorkflowRunItem";
@@ -6,28 +7,30 @@ import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuer
 import { isAction, isWorkflowRunBlock } from "../types/workflowRunTypes";
 import { findBlockSurroundingAction } from "./workflowTimelineUtils";
 import { TaskBlockParameters } from "./TaskBlockParameters";
-import { isTaskVariantBlock, WorkflowBlockTypes } from "../types/workflowTypes";
+import {
+  isTaskVariantBlock,
+  WorkflowBlockTypes,
+  type WorkflowBlock,
+  type WorkflowBlockType,
+} from "../types/workflowTypes";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
 import { SendEmailBlockParameters } from "./blockInfo/SendEmailBlockInfo";
 import { ProxyLocation } from "@/api/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
+import { CodeBlockParameters } from "./blockInfo/CodeBlockParameters";
+import { TextPromptBlockParameters } from "./blockInfo/TextPromptBlockParameters";
+import { GotoUrlBlockParameters } from "./blockInfo/GotoUrlBlockParameters";
+import { FileDownloadBlockParameters } from "./blockInfo/FileDownloadBlockParameters";
 
 function WorkflowPostRunParameters() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
   const [activeItem] = useActiveWorkflowRunItem();
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+    useWorkflowRunWithWorkflowQuery();
   const parameters = workflowRun?.parameters ?? {};
-
-  if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
-    return <div>Loading workflow parameters...</div>;
-  }
-
-  if (!workflowRun || !workflowRunTimeline) {
-    return null;
-  }
+  const workflow = workflowRun?.workflow;
 
   function getActiveBlock() {
     if (!workflowRunTimeline) {
@@ -45,19 +48,37 @@ function WorkflowPostRunParameters() {
   }
 
   const activeBlock = getActiveBlock();
-  const isTaskV2 = workflowRun.task_v2 !== null;
+  const activeBlockLabel = activeBlock?.label ?? null;
+  const definitionBlock = useMemo(() => {
+    if (!workflow || !activeBlockLabel) {
+      return null;
+    }
+    return findWorkflowBlockByLabel(
+      workflow.workflow_definition.blocks,
+      activeBlockLabel,
+    );
+  }, [workflow, activeBlockLabel]);
+  const isTaskV2 = Boolean(workflowRun?.task_v2);
 
   const webhookCallbackUrl = isTaskV2
-    ? workflowRun.task_v2?.webhook_callback_url
-    : workflowRun.webhook_callback_url;
+    ? workflowRun?.task_v2?.webhook_callback_url ?? null
+    : workflowRun?.webhook_callback_url ?? null;
 
   const proxyLocation = isTaskV2
-    ? workflowRun.task_v2?.proxy_location
-    : workflowRun.proxy_location;
+    ? workflowRun?.task_v2?.proxy_location ?? null
+    : workflowRun?.proxy_location ?? null;
 
   const extraHttpHeaders = isTaskV2
-    ? workflowRun.task_v2?.extra_http_headers
-    : workflowRun.extra_http_headers;
+    ? workflowRun?.task_v2?.extra_http_headers ?? null
+    : workflowRun?.extra_http_headers ?? null;
+
+  if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
+    return <div>Loading workflow parameters...</div>;
+  }
+
+  if (!workflowRun || !workflowRunTimeline) {
+    return null;
+  }
 
   return (
     <div className="space-y-5">
@@ -66,6 +87,27 @@ function WorkflowPostRunParameters() {
           <div className="space-y-4">
             <h1 className="text-lg font-bold">Block Parameters</h1>
             <TaskBlockParameters block={activeBlock} />
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.FileDownload &&
+      isBlockOfType(definitionBlock, WorkflowBlockTypes.FileDownload) ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">File Download Settings</h1>
+            <FileDownloadBlockParameters
+              prompt={
+                activeBlock.navigation_goal ??
+                definitionBlock.navigation_goal ??
+                null
+              }
+              downloadSuffix={definitionBlock.download_suffix ?? null}
+              downloadTimeout={definitionBlock.download_timeout ?? null}
+              errorCodeMapping={definitionBlock.error_code_mapping ?? null}
+              maxRetries={definitionBlock.max_retries ?? null}
+              maxStepsPerRun={definitionBlock.max_steps_per_run ?? null}
+            />
           </div>
         </div>
       ) : null}
@@ -102,6 +144,50 @@ function WorkflowPostRunParameters() {
                 maxHeight="200px"
               />
             </div>
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.Code &&
+      isBlockOfType(definitionBlock, WorkflowBlockTypes.Code) ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Code Block</h1>
+            <CodeBlockParameters
+              code={definitionBlock.code}
+              parameters={definitionBlock.parameters}
+            />
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.TextPrompt &&
+      isBlockOfType(definitionBlock, WorkflowBlockTypes.TextPrompt) ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Text Prompt Block</h1>
+            <TextPromptBlockParameters
+              prompt={activeBlock.prompt ?? definitionBlock.prompt ?? ""}
+              llmKey={definitionBlock.llm_key}
+              jsonSchema={definitionBlock.json_schema}
+              parameters={definitionBlock.parameters}
+            />
+          </div>
+        </div>
+      ) : null}
+      {activeBlock && activeBlock.block_type === WorkflowBlockTypes.URL ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Go To URL Block</h1>
+            <GotoUrlBlockParameters
+              url={
+                activeBlock.url ??
+                (isBlockOfType(definitionBlock, WorkflowBlockTypes.URL)
+                  ? definitionBlock.url
+                  : "")
+              }
+              continueOnFailure={activeBlock.continue_on_failure}
+            />
           </div>
         </div>
       ) : null}
@@ -192,3 +278,31 @@ function WorkflowPostRunParameters() {
 }
 
 export { WorkflowPostRunParameters };
+
+function findWorkflowBlockByLabel(
+  blocks: Array<WorkflowBlock>,
+  label: string,
+): WorkflowBlock | null {
+  for (const block of blocks) {
+    if (block.label === label) {
+      return block;
+    }
+    if (
+      block.block_type === WorkflowBlockTypes.ForLoop &&
+      block.loop_blocks.length > 0
+    ) {
+      const nested = findWorkflowBlockByLabel(block.loop_blocks, label);
+      if (nested) {
+        return nested;
+      }
+    }
+  }
+  return null;
+}
+
+function isBlockOfType<T extends WorkflowBlockType>(
+  block: WorkflowBlock | null,
+  type: T,
+): block is Extract<WorkflowBlock, { block_type: T }> {
+  return block?.block_type === type;
+}

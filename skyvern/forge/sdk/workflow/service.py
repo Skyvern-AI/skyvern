@@ -5,11 +5,14 @@ import os
 import textwrap
 import uuid
 from collections import deque
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 import httpx
 import structlog
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 import skyvern
 from skyvern import analytics
@@ -18,6 +21,7 @@ from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.exceptions import (
     BlockNotFound,
+    BrowserProfileNotFound,
     BrowserSessionNotFound,
     CannotUpdateWorkflowDueToCodeCache,
     FailedToSendWebhook,
@@ -26,13 +30,15 @@ from skyvern.exceptions import (
     ScriptTerminationException,
     SkyvernException,
     WorkflowNotFound,
+    WorkflowNotFoundForWorkflowRun,
     WorkflowRunNotFound,
+    WorkflowRunParameterPersistenceError,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -53,7 +59,9 @@ from skyvern.forge.sdk.workflow.exceptions import (
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BlockTypeVar,
+    BranchCondition,
     CodeBlock,
+    ConditionalBlock,
     DownloadToS3Block,
     ExtractionBlock,
     FileDownloadBlock,
@@ -62,9 +70,11 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     HttpRequestBlock,
     HumanInteractionBlock,
+    JinjaBranchCriteria,
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
+    PromptBranchCriteria,
     SendEmailBlock,
     TaskBlock,
     TaskV2Block,
@@ -102,8 +112,14 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunResponseBase,
     WorkflowRunStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
-from skyvern.schemas.scripts import ScriptStatus, WorkflowScript
+from skyvern.schemas.runs import (
+    ProxyLocationInput,
+    RunStatus,
+    RunType,
+    WorkflowRunRequest,
+    WorkflowRunResponse,
+)
+from skyvern.schemas.scripts import Script, ScriptBlock, ScriptStatus, WorkflowScript
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     BlockResult,
@@ -115,12 +131,43 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
-from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
 
 DEFAULT_FIRST_BLOCK_LABEL = "block_1"
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
+
+CacheInvalidationReason = Literal["updated_block", "new_block", "removed_block"]
+BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
+    BlockType.TASK,
+    BlockType.TaskV2,
+    BlockType.ACTION,
+    BlockType.NAVIGATION,
+    BlockType.EXTRACTION,
+    BlockType.LOGIN,
+    BlockType.FILE_DOWNLOAD,
+}
+
+
+@dataclass
+class CacheInvalidationPlan:
+    reason: CacheInvalidationReason | None = None
+    label: str | None = None
+    previous_index: int | None = None
+    new_index: int | None = None
+    block_labels_to_disable: list[str] = field(default_factory=list)
+
+    @property
+    def has_targets(self) -> bool:
+        return bool(self.block_labels_to_disable)
+
+
+@dataclass
+class CachedScriptBlocks:
+    workflow_script: WorkflowScript
+    script: Script
+    blocks_to_clear: list[ScriptBlock]
 
 
 def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) -> dict[str, Any]:
@@ -147,6 +194,8 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
         "onepassword_credential_parameter_id",
         "azure_vault_credential_parameter_id",
         "disable_cache",
+        "next_block_label",
+        "version",
     ]
 
     # Use BFS to recursively remove fields from all nested objects
@@ -178,6 +227,134 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
 
 
 class WorkflowService:
+    @staticmethod
+    def _determine_cache_invalidation(
+        previous_blocks: list[dict[str, Any]],
+        new_blocks: list[dict[str, Any]],
+    ) -> CacheInvalidationPlan:
+        """Return which block index triggered the change and the labels that need cache invalidation."""
+        plan = CacheInvalidationPlan()
+
+        prev_labels: list[str] = []
+        for blocks in previous_blocks:
+            label = blocks.get("label")
+            if label and isinstance(label, str):
+                prev_labels.append(label)
+        new_labels: list[str] = []
+        for blocks in new_blocks:
+            label = blocks.get("label")
+            if label and isinstance(label, str):
+                new_labels.append(label)
+
+        for idx, (prev_block, new_block) in enumerate(zip(previous_blocks, new_blocks)):
+            prev_label = prev_block.get("label")
+            new_label = new_block.get("label")
+            if prev_label and prev_label == new_label and prev_block != new_block:
+                plan.reason = "updated_block"
+                plan.label = new_label
+                plan.previous_index = idx
+                break
+
+        if plan.reason is None:
+            previous_label_set = set(prev_labels)
+            for idx, label in enumerate(new_labels):
+                if label and label not in previous_label_set:
+                    plan.reason = "new_block"
+                    plan.label = label
+                    plan.new_index = idx
+                    plan.previous_index = min(idx, len(prev_labels))
+                    break
+
+        if plan.reason is None:
+            new_label_set = set(new_labels)
+            for idx, label in enumerate(prev_labels):
+                if label not in new_label_set:
+                    plan.reason = "removed_block"
+                    plan.label = label
+                    plan.previous_index = idx
+                    break
+
+        if plan.reason == "removed_block":
+            new_label_set = set(new_labels)
+            plan.block_labels_to_disable = [label for label in prev_labels if label and label not in new_label_set]
+        elif plan.previous_index is not None:
+            plan.block_labels_to_disable = prev_labels[plan.previous_index :]
+
+        return plan
+
+    async def _partition_cached_blocks(
+        self,
+        *,
+        organization_id: str,
+        candidates: Sequence[WorkflowScript],
+        block_labels_to_disable: Sequence[str],
+    ) -> tuple[list[CachedScriptBlocks], list[CachedScriptBlocks]]:
+        """Split cached scripts into published vs draft buckets and collect blocks that should be cleared."""
+        cached_groups: list[CachedScriptBlocks] = []
+        published_groups: list[CachedScriptBlocks] = []
+        target_labels = set(block_labels_to_disable)
+
+        for candidate in candidates:
+            script = await app.DATABASE.get_script(
+                script_id=candidate.script_id,
+                organization_id=organization_id,
+            )
+            if not script:
+                continue
+
+            script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+                script_revision_id=script.script_revision_id,
+                organization_id=organization_id,
+            )
+            blocks_to_clear = [
+                block for block in script_blocks if block.script_block_label in target_labels and block.run_signature
+            ]
+            if not blocks_to_clear:
+                continue
+
+            group = CachedScriptBlocks(workflow_script=candidate, script=script, blocks_to_clear=blocks_to_clear)
+            if candidate.status == ScriptStatus.published:
+                published_groups.append(group)
+            else:
+                cached_groups.append(group)
+
+        return cached_groups, published_groups
+
+    async def _clear_cached_block_groups(
+        self,
+        *,
+        organization_id: str,
+        workflow: Workflow,
+        previous_workflow: Workflow,
+        plan: CacheInvalidationPlan,
+        groups: Sequence[CachedScriptBlocks],
+    ) -> None:
+        """Remove cached run signatures for the supplied block groups to force regeneration."""
+        for group in groups:
+            for block in group.blocks_to_clear:
+                await app.DATABASE.update_script_block(
+                    script_block_id=block.script_block_id,
+                    organization_id=organization_id,
+                    clear_run_signature=True,
+                )
+
+            LOG.info(
+                "Cleared cached script blocks after workflow block change",
+                workflow_id=workflow.workflow_id,
+                workflow_permanent_id=previous_workflow.workflow_permanent_id,
+                organization_id=organization_id,
+                previous_version=previous_workflow.version,
+                new_version=workflow.version,
+                invalidate_reason=plan.reason,
+                invalidate_label=plan.label,
+                invalidate_index_prev=plan.previous_index,
+                invalidate_index_new=plan.new_index,
+                script_id=group.script.script_id,
+                script_revision_id=group.script.script_revision_id,
+                cleared_block_labels=[block.script_block_label for block in group.blocks_to_clear],
+                cleared_block_count=len(group.blocks_to_clear),
+            )
+
     @staticmethod
     def _collect_extracted_information(value: Any) -> list[Any]:
         """Recursively collect extracted_information values from nested outputs."""
@@ -239,6 +416,7 @@ class WorkflowService:
             workflow_request.proxy_location = workflow.proxy_location
         if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
             workflow_request.webhook_callback_url = workflow.webhook_callback_url
+
         # Create the workflow run and set skyvern context
         workflow_run = await self.create_workflow_run(
             workflow_request=workflow_request,
@@ -286,30 +464,54 @@ class WorkflowService:
         # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
         all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
         try:
+            missing_parameters: list[str] = []
             for workflow_parameter in all_workflow_parameters:
                 if workflow_request.data and workflow_parameter.key in workflow_request.data:
                     request_body_value = workflow_request.data[workflow_parameter.key]
+                    if self._is_missing_required_value(workflow_parameter, request_body_value):
+                        missing_parameters.append(workflow_parameter.key)
+                        continue
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                         await self._validate_credential_id(str(request_body_value), organization)
-                    await self.create_workflow_run_parameter(
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        workflow_parameter=workflow_parameter,
-                        value=request_body_value,
-                    )
+                    try:
+                        await self.create_workflow_run_parameter(
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            workflow_parameter=workflow_parameter,
+                            value=request_body_value,
+                        )
+                    except SQLAlchemyError as parameter_error:
+                        raise WorkflowRunParameterPersistenceError(
+                            parameter_key=workflow_parameter.key,
+                            workflow_id=workflow.workflow_permanent_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            reason=self._format_parameter_persistence_error(parameter_error),
+                        ) from parameter_error
                 elif workflow_parameter.default_value is not None:
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                         await self._validate_credential_id(str(workflow_parameter.default_value), organization)
-                    await self.create_workflow_run_parameter(
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        workflow_parameter=workflow_parameter,
-                        value=workflow_parameter.default_value,
-                    )
+                    try:
+                        await self.create_workflow_run_parameter(
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            workflow_parameter=workflow_parameter,
+                            value=workflow_parameter.default_value,
+                        )
+                    except SQLAlchemyError as parameter_error:
+                        raise WorkflowRunParameterPersistenceError(
+                            parameter_key=workflow_parameter.key,
+                            workflow_id=workflow.workflow_permanent_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            reason=self._format_parameter_persistence_error(parameter_error),
+                        ) from parameter_error
                 else:
-                    raise MissingValueForParameter(
-                        parameter_key=workflow_parameter.key,
-                        workflow_id=workflow.workflow_permanent_id,
-                        workflow_run_id=workflow_run.workflow_run_id,
-                    )
+                    missing_parameters.append(workflow_parameter.key)
+
+            if missing_parameters:
+                missing_list = ", ".join(sorted(missing_parameters))
+                raise MissingValueForParameter(
+                    parameter_key=missing_list,
+                    workflow_id=workflow.workflow_permanent_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
         except Exception as e:
             LOG.exception(
                 f"Error while setting up workflow run {workflow_run.workflow_run_id}",
@@ -325,15 +527,60 @@ class WorkflowService:
             )
             raise e
 
-        if workflow_request.browser_session_id:
-            await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
-                browser_session_id=workflow_request.browser_session_id,
-                runnable_type="workflow_run",
-                runnable_id=workflow_run.workflow_run_id,
-                organization_id=organization.organization_id,
-            )
-
         return workflow_run
+
+    @staticmethod
+    def _format_parameter_persistence_error(error: SQLAlchemyError) -> str:
+        if isinstance(error, IntegrityError):
+            return "value cannot be null"
+        return "database error while saving parameter value"
+
+    @staticmethod
+    def _is_missing_required_value(workflow_parameter: WorkflowParameter, value: Any) -> bool:
+        """
+        Determine if a provided value should be treated as missing for a required parameter.
+
+        Rules:
+        - None/null is always missing.
+        - String parameters may be empty strings (per UI behavior).
+        - JSON parameters treat empty/whitespace-only strings as missing.
+        - Boolean/integer/float parameters treat empty strings as missing.
+        - File URL treats empty strings, empty dicts, or dicts with empty s3uri as missing.
+        - Credential ID treats empty/whitespace-only strings as missing.
+        """
+
+        if value is None:
+            return True
+
+        param_type = workflow_parameter.workflow_parameter_type
+
+        if param_type == WorkflowParameterType.STRING:
+            return False
+
+        if param_type == WorkflowParameterType.JSON:
+            return isinstance(value, str) and value.strip() == ""
+
+        if param_type in (
+            WorkflowParameterType.BOOLEAN,
+            WorkflowParameterType.INTEGER,
+            WorkflowParameterType.FLOAT,
+        ):
+            return isinstance(value, str) and value.strip() == ""
+
+        if param_type == WorkflowParameterType.FILE_URL:
+            if isinstance(value, str):
+                return value.strip() == ""
+            if isinstance(value, dict):
+                if not value:
+                    return True
+                if "s3uri" in value:
+                    return not bool(value.get("s3uri"))
+            return False
+
+        if param_type == WorkflowParameterType.CREDENTIAL_ID:
+            return isinstance(value, str) and value.strip() == ""
+
+        return False
 
     async def auto_create_browser_session_if_needed(
         self,
@@ -341,7 +588,7 @@ class WorkflowService:
         workflow: Workflow,
         *,
         browser_session_id: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
     ) -> PersistentBrowserSession | None:
         if browser_session_id:  # the user has supplied an id, so no need to create one
             return None
@@ -387,6 +634,7 @@ class WorkflowService:
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        browser_profile_id = workflow_run.browser_profile_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
         # Set workflow run status to running, create workflow run parameters
@@ -431,6 +679,7 @@ class WorkflowService:
                 context_parameters,
                 secret_parameters,
                 block_outputs,
+                workflow,
             )
         except Exception as e:
             LOG.exception(
@@ -455,12 +704,14 @@ class WorkflowService:
             )
             return workflow_run
 
-        browser_session = await self.auto_create_browser_session_if_needed(
-            organization.organization_id,
-            workflow,
-            browser_session_id=browser_session_id,
-            proxy_location=workflow_run.proxy_location,
-        )
+        browser_session = None
+        if not browser_profile_id:
+            browser_session = await self.auto_create_browser_session_if_needed(
+                organization.organization_id,
+                workflow,
+                browser_session_id=browser_session_id,
+                proxy_location=workflow_run.proxy_location,
+            )
 
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
@@ -470,6 +721,34 @@ class WorkflowService:
                 browser_session_id=browser_session_id,
             )
 
+        if browser_session_id:
+            try:
+                await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                    browser_session_id=browser_session_id,
+                    runnable_type="workflow_run",
+                    runnable_id=workflow_run_id,
+                    organization_id=organization.organization_id,
+                )
+            except Exception as e:
+                LOG.exception(
+                    "Failed to begin browser session for workflow run",
+                    browser_session_id=browser_session_id,
+                    workflow_run_id=workflow_run_id,
+                )
+                failure_reason = f"Failed to begin browser session for workflow run: {str(e)}"
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=failure_reason,
+                )
+                await self.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    api_key=api_key,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=close_browser_on_completion,
+                )
+                return workflow_run
+
         # Check if there's a related workflow script that should be used instead
         workflow_script, _ = await workflow_script_service.get_workflow_script(workflow, workflow_run, block_labels)
         current_context = skyvern_context.current()
@@ -478,18 +757,15 @@ class WorkflowService:
                 current_context.generate_script = False
             if workflow_run.code_gen:
                 current_context.generate_script = True
-        is_script_run = self.should_run_script(workflow, workflow_run)
-        # Unified execution: execute blocks one by one, using script code when available
-        if is_script_run is False:
-            workflow_script = None
-        workflow_run = await self._execute_workflow_blocks(
+        workflow_run, blocks_to_update = await self._execute_workflow_blocks(
             workflow=workflow,
             workflow_run=workflow_run,
             organization=organization,
             browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
             block_labels=block_labels,
             block_outputs=block_outputs,
-            workflow_script=workflow_script,
+            script=workflow_script,
         )
 
         if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
@@ -510,6 +786,7 @@ class WorkflowService:
                     workflow=workflow,
                     workflow_run=workflow_run,
                     block_labels=block_labels,
+                    blocks_to_update=blocks_to_update,
                 )
             else:
                 LOG.info(
@@ -534,49 +811,53 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         organization: Organization,
         browser_session_id: str | None = None,
+        browser_profile_id: str | None = None,
         block_labels: list[str] | None = None,
         block_outputs: dict[str, Any] | None = None,
-        workflow_script: WorkflowScript | None = None,
-    ) -> WorkflowRun:
+        script: Script | None = None,
+    ) -> tuple[WorkflowRun, set[str]]:
         organization_id = organization.organization_id
         workflow_run_id = workflow_run.workflow_run_id
         top_level_blocks = workflow.workflow_definition.blocks
         all_blocks = get_all_blocks(top_level_blocks)
 
-        # Load script blocks if workflow_script is provided
+        # Load script blocks if script is provided
         script_blocks_by_label: dict[str, Any] = {}
         loaded_script_module = None
+        blocks_to_update: set[str] = set()
 
-        if workflow_script:
+        is_script_run = self.should_run_script(workflow, workflow_run)
+
+        if script:
             LOG.info(
                 "Loading script blocks for workflow execution",
                 workflow_run_id=workflow_run_id,
-                script_id=workflow_script.script_id,
+                script_id=script.script_id,
+                script_revision_id=script.script_revision_id,
             )
+            context = skyvern_context.ensure_context()
+            context.script_id = script.script_id
+            context.script_revision_id = script.script_revision_id
             try:
-                # Load script blocks from database
-                script = await app.DATABASE.get_script(
-                    script_id=workflow_script.script_id,
+                script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+                    script_revision_id=script.script_revision_id,
                     organization_id=organization_id,
                 )
-                if script:
+
+                # Create mapping from block label to script block
+                for script_block in script_blocks:
+                    if script_block.run_signature:
+                        script_blocks_by_label[script_block.script_block_label] = script_block
+
+                if is_script_run:
+                    # load the script files
                     script_files = await app.DATABASE.get_script_files(
                         script_revision_id=script.script_revision_id,
                         organization_id=organization_id,
                     )
                     await script_service.load_scripts(script, script_files)
 
-                    script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
-                        script_revision_id=script.script_revision_id,
-                        organization_id=organization_id,
-                    )
-
-                    # Create mapping from block label to script block
-                    for script_block in script_blocks:
-                        if script_block.run_signature:
-                            script_blocks_by_label[script_block.script_block_label] = script_block
-
-                    script_path = os.path.join(settings.TEMP_PATH, workflow_script.script_id, "main.py")
+                    script_path = os.path.join(settings.TEMP_PATH, script.script_id, "main.py")
                     if os.path.exists(script_path):
                         # setup script run
                         parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
@@ -594,14 +875,14 @@ class WorkflowService:
                             )
                             LOG.info(
                                 "Successfully loaded script module",
-                                script_id=workflow_script.script_id,
+                                script_id=script.script_id,
                                 block_count=len(script_blocks_by_label),
                             )
                     else:
                         LOG.warning(
                             "Script file not found at path",
                             script_path=script_path,
-                            script_id=workflow_script.script_id,
+                            script_id=script.script_id,
                         )
             except Exception as e:
                 LOG.warning(
@@ -609,13 +890,13 @@ class WorkflowService:
                     error=str(e),
                     exc_info=True,
                     workflow_run_id=workflow_run_id,
-                    script_id=workflow_script.script_id,
+                    script_id=script.script_id,
                 )
                 script_blocks_by_label = {}
                 loaded_script_module = None
 
         # Mark workflow as running with appropriate engine
-        run_with = "code" if script_blocks_by_label else "agent"
+        run_with = "code" if script and is_script_run and script_blocks_by_label else "agent"
         await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id, run_with=run_with)
 
         if block_labels and len(block_labels):
@@ -641,277 +922,522 @@ class WorkflowService:
         if not blocks:
             raise SkyvernException(f"No blocks found for the given block labels: {block_labels}")
 
+        workflow_version = workflow.workflow_definition.version or 1
+        if workflow_version >= 2 and not block_labels:
+            return await self._execute_workflow_blocks_dag(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                organization=organization,
+                browser_session_id=browser_session_id,
+                script_blocks_by_label=script_blocks_by_label,
+                loaded_script_module=loaded_script_module,
+                is_script_run=is_script_run,
+                blocks_to_update=blocks_to_update,
+            )
+
         #
         # Execute workflow blocks
         blocks_cnt = len(blocks)
         block_result = None
         for block_idx, block in enumerate(blocks):
-            try:
-                if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                ):
-                    workflow_run = refreshed_workflow_run
-                    if workflow_run.status == WorkflowRunStatus.canceled:
-                        LOG.info(
-                            "Workflow run is canceled, stopping execution inside workflow execution loop",
-                            workflow_run_id=workflow_run_id,
-                            block_idx=block_idx,
-                            block_type=block.block_type,
-                            block_label=block.label,
-                        )
-                        break
+            (
+                workflow_run,
+                blocks_to_update,
+                block_result,
+                should_stop,
+                _,
+            ) = await self._execute_single_block(
+                block=block,
+                block_idx=block_idx,
+                blocks_cnt=blocks_cnt,
+                workflow_run=workflow_run,
+                organization=organization,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+                script_blocks_by_label=script_blocks_by_label,
+                loaded_script_module=loaded_script_module,
+                is_script_run=is_script_run,
+                blocks_to_update=blocks_to_update,
+            )
 
-                    if workflow_run.status == WorkflowRunStatus.timed_out:
-                        LOG.info(
-                            "Workflow run is timed out, stopping execution inside workflow execution loop",
-                            workflow_run_id=workflow_run_id,
-                            block_idx=block_idx,
-                            block_type=block.block_type,
-                            block_label=block.label,
-                        )
-                        break
+            if should_stop:
+                break
+        return workflow_run, blocks_to_update
 
-                parameters = block.get_all_parameters(workflow_run_id)
-                await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
-                    workflow_run_id, parameters, organization
+    async def _execute_workflow_blocks_dag(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        organization: Organization,
+        browser_session_id: str | None,
+        script_blocks_by_label: dict[str, Any],
+        loaded_script_module: Any,
+        is_script_run: bool,
+        blocks_to_update: set[str],
+    ) -> tuple[WorkflowRun, set[str]]:
+        try:
+            start_label, label_to_block, default_next_map = self._build_workflow_graph(
+                workflow.workflow_definition.blocks
+            )
+        except InvalidWorkflowDefinition as exc:
+            LOG.error("Workflow graph validation failed", error=str(exc), workflow_id=workflow.workflow_id)
+            workflow_run = await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run.workflow_run_id,
+                failure_reason=str(exc),
+            )
+            return workflow_run, blocks_to_update
+
+        visited_labels: set[str] = set()
+        current_label = start_label
+        block_idx = 0
+        total_blocks = len(label_to_block)
+
+        while current_label:
+            block = label_to_block.get(current_label)
+            if not block:
+                LOG.error(
+                    "Unable to find block with label in workflow graph",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    current_label=current_label,
                 )
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason=f"Unable to find block with label {current_label}",
+                )
+                break
+
+            (
+                workflow_run,
+                blocks_to_update,
+                block_result,
+                should_stop,
+                branch_metadata,
+            ) = await self._execute_single_block(
+                block=block,
+                block_idx=block_idx,
+                blocks_cnt=total_blocks,
+                workflow_run=workflow_run,
+                organization=organization,
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_session_id=browser_session_id,
+                script_blocks_by_label=script_blocks_by_label,
+                loaded_script_module=loaded_script_module,
+                is_script_run=is_script_run,
+                blocks_to_update=blocks_to_update,
+            )
+
+            visited_labels.add(current_label)
+            if should_stop:
+                break
+
+            next_label = None
+            if block.block_type == BlockType.CONDITIONAL:
+                next_label = (branch_metadata or {}).get("next_block_label")
+            else:
+                next_label = default_next_map.get(block.label)
+
+            if not next_label:
                 LOG.info(
-                    f"Executing root block {block.block_type} at index {block_idx}/{blocks_cnt - 1} for workflow run {workflow_run_id}",
-                    block_type=block.block_type,
-                    workflow_run_id=workflow_run_id,
-                    block_idx=block_idx,
-                    block_type_var=block.block_type,
+                    "DAG traversal reached terminal node",
+                    workflow_run_id=workflow_run.workflow_run_id,
                     block_label=block.label,
-                    model=block.model,
                 )
+                break
 
-                # Try executing with script code if available
-                block_executed_with_code = False
-                valid_to_run_code = block.label and block.label in script_blocks_by_label and not block.disable_cache
-                if valid_to_run_code:
-                    script_block = script_blocks_by_label[block.label]
+            if next_label not in label_to_block:
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason=f"Next block label {next_label} not found in workflow definition",
+                )
+                break
+
+            if next_label in visited_labels:
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason=f"Cycle detected while traversing workflow definition at block {next_label}",
+                )
+                break
+
+            block_idx += 1
+            current_label = next_label
+
+        return workflow_run, blocks_to_update
+
+    async def _execute_single_block(
+        self,
+        *,
+        block: BlockTypeVar,
+        block_idx: int,
+        blocks_cnt: int,
+        workflow_run: WorkflowRun,
+        organization: Organization,
+        workflow_run_id: str,
+        browser_session_id: str | None,
+        script_blocks_by_label: dict[str, Any],
+        loaded_script_module: Any,
+        is_script_run: bool,
+        blocks_to_update: set[str],
+    ) -> tuple[WorkflowRun, set[str], BlockResult | None, bool, dict[str, Any] | None]:
+        organization_id = organization.organization_id
+        workflow_run_block_result: BlockResult | None = None
+        branch_metadata: dict[str, Any] | None = None
+        block_executed_with_code = False
+
+        try:
+            if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            ):
+                workflow_run = refreshed_workflow_run
+                if workflow_run.status == WorkflowRunStatus.canceled:
                     LOG.info(
-                        "Attempting to execute block with script code",
+                        "Workflow run is canceled, stopping execution inside workflow execution loop",
+                        workflow_run_id=workflow_run_id,
+                        block_idx=block_idx,
+                        block_type=block.block_type,
                         block_label=block.label,
-                        run_signature=script_block.run_signature,
                     )
+                    return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
+
+                if workflow_run.status == WorkflowRunStatus.timed_out:
+                    LOG.info(
+                        "Workflow run is timed out, stopping execution inside workflow execution loop",
+                        workflow_run_id=workflow_run_id,
+                        block_idx=block_idx,
+                        block_type=block.block_type,
+                        block_label=block.label,
+                    )
+                    return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
+
+            parameters = block.get_all_parameters(workflow_run_id)
+            await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
+                workflow_run_id, parameters, organization
+            )
+            LOG.info(
+                f"Executing root block {block.block_type} at index {block_idx}/{blocks_cnt - 1} for workflow run {workflow_run_id}",
+                block_type=block.block_type,
+                workflow_run_id=workflow_run_id,
+                block_idx=block_idx,
+                block_type_var=block.block_type,
+                block_label=block.label,
+                model=block.model,
+            )
+
+            valid_to_run_code = (
+                is_script_run and block.label and block.label in script_blocks_by_label and not block.disable_cache
+            )
+            if valid_to_run_code:
+                script_block = script_blocks_by_label[block.label]
+                LOG.info(
+                    "Attempting to execute block with script code",
+                    block_label=block.label,
+                    run_signature=script_block.run_signature,
+                )
+                try:
+                    vars_dict = vars(loaded_script_module) if loaded_script_module else {}
+                    exec_globals = {
+                        **vars_dict,
+                        "skyvern": skyvern,
+                        "__builtins__": __builtins__,
+                    }
+
+                    assert script_block.run_signature is not None
+                    normalized_signature = textwrap.dedent(script_block.run_signature).strip()
+                    indented_signature = textwrap.indent(normalized_signature, "        ")
+                    wrapper_code = f"async def __run_signature_wrapper():\n    return (\n{indented_signature}\n    )\n"
+
+                    LOG.debug("Executing run_signature wrapper", wrapper_code=wrapper_code)
+
                     try:
-                        # Execute the run signature and capture the return value
-                        vars_dict = vars(loaded_script_module) if loaded_script_module else {}
-                        exec_globals = {
-                            **vars_dict,
-                            "skyvern": skyvern,
-                            "__builtins__": __builtins__,
-                        }
-
-                        # Use exec to handle multi-line run_signature statements
-                        # Create an async function and execute it
-
-                        # Dedent first to normalize indentation, then re-indent for function body
-                        assert script_block.run_signature is not None
-                        normalized_signature = textwrap.dedent(script_block.run_signature).strip()
-                        # Add 8 spaces (2 levels: function + return statement)
-                        indented_signature = textwrap.indent(normalized_signature, "        ")
-
-                        # Build the wrapper function
-                        wrapper_code = (
-                            f"async def __run_signature_wrapper():\n    return (\n{indented_signature}\n    )\n"
-                        )
-
-                        LOG.debug("Executing run_signature wrapper", wrapper_code=wrapper_code)
-
-                        try:
-                            exec_code = compile(wrapper_code, "<run_signature>", "exec")
-                            exec(exec_code, exec_globals)
-                            output_value = await exec_globals["__run_signature_wrapper"]()
-                        except ScriptTerminationException as e:
-                            LOG.warning(
-                                "Script termination",
-                                block_label=block.label,
-                                error=str(e),
-                                exc_info=True,
-                            )
-
-                        # Execution succeeded - get the block result from the workflow run blocks
-                        # The script execution should have created the workflow run block
-                        workflow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
-                            workflow_run_id=workflow_run_id,
-                            organization_id=organization_id,
-                        )
-                        # Find the most recent block with matching label
-                        matching_blocks = [b for b in workflow_run_blocks if b.label == block.label]
-                        if matching_blocks:
-                            latest_block = max(matching_blocks, key=lambda b: b.created_at)
-
-                            # Construct BlockResult from the workflow_run_block
-                            block_result = BlockResult(
-                                success=latest_block.status == BlockStatus.completed,
-                                failure_reason=latest_block.failure_reason,
-                                output_parameter=block.output_parameter,
-                                output_parameter_value=latest_block.output,
-                                status=BlockStatus(latest_block.status) if latest_block.status else BlockStatus.failed,
-                                workflow_run_block_id=latest_block.workflow_run_block_id,
-                            )
-                            block_executed_with_code = True
-                            LOG.info(
-                                "Successfully executed block with script code",
-                                block_label=block.label,
-                                block_status=block_result.status,
-                                has_output=output_value is not None,
-                            )
-                        else:
-                            LOG.warning(
-                                "Block executed with code but no workflow run block found",
-                                block_label=block.label,
-                            )
-                            # Fallback to AI execution
-                            block_executed_with_code = False
-                    except Exception as e:
+                        exec_code = compile(wrapper_code, "<run_signature>", "exec")
+                        exec(exec_code, exec_globals)
+                        output_value = await exec_globals["__run_signature_wrapper"]()
+                    except ScriptTerminationException as e:
                         LOG.warning(
-                            "Failed to execute block with script code, falling back to AI",
+                            "Script termination",
                             block_label=block.label,
                             error=str(e),
                             exc_info=True,
                         )
-                        block_executed_with_code = False
 
-                # Execute with AI if code execution was not attempted or failed
-                if not block_executed_with_code:
-                    LOG.info(
-                        "Executing block with AI",
-                        block_label=block.label,
-                        block_type=block.block_type,
-                    )
-                    block_result = await block.execute_safe(
+                    workflow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
                         workflow_run_id=workflow_run_id,
                         organization_id=organization_id,
-                        browser_session_id=browser_session_id,
                     )
-                if not block_result:
-                    workflow_run = await self.mark_workflow_run_as_failed(
-                        workflow_run_id=workflow_run_id, failure_reason="Block result is None"
-                    )
-                    break
-                if block_result.status == BlockStatus.canceled:
-                    LOG.info(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was canceled for workflow run {workflow_run_id}, cancelling workflow run",
-                        block_type=block.block_type,
-                        workflow_run_id=workflow_run_id,
-                        block_idx=block_idx,
-                        block_result=block_result,
-                        block_type_var=block.block_type,
-                        block_label=block.label,
-                    )
-                    workflow_run = await self.mark_workflow_run_as_canceled(workflow_run_id=workflow_run_id)
-                    break
-                elif block_result.status == BlockStatus.failed:
-                    LOG.error(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed for workflow run {workflow_run_id}",
-                        block_type=block.block_type,
-                        workflow_run_id=workflow_run_id,
-                        block_idx=block_idx,
-                        block_result=block_result,
-                        block_type_var=block.block_type,
-                        block_label=block.label,
-                    )
-                    if not block.continue_on_failure:
-                        failure_reason = (
-                            f"{block.block_type} block failed. failure reason: {block_result.failure_reason}"
+                    matching_blocks = [b for b in workflow_run_blocks if b.label == block.label]
+                    if matching_blocks:
+                        latest_block = max(matching_blocks, key=lambda b: b.created_at)
+                        workflow_run_block_result = BlockResult(
+                            success=latest_block.status == BlockStatus.completed,
+                            failure_reason=latest_block.failure_reason,
+                            output_parameter=block.output_parameter,
+                            output_parameter_value=latest_block.output,
+                            status=BlockStatus(latest_block.status) if latest_block.status else BlockStatus.failed,
+                            workflow_run_block_id=latest_block.workflow_run_block_id,
                         )
-                        workflow_run = await self.mark_workflow_run_as_failed(
-                            workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                        block_executed_with_code = True
+                        LOG.info(
+                            "Successfully executed block with script code",
+                            block_label=block.label,
+                            block_status=workflow_run_block_result.status,
+                            has_output=output_value is not None,
                         )
-                        break
-
+                    else:
+                        LOG.warning(
+                            "Block executed with code but no workflow run block found",
+                            block_label=block.label,
+                        )
+                        block_executed_with_code = False
+                except Exception as e:
                     LOG.warning(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed but will continue executing the workflow run {workflow_run_id}",
-                        block_type=block.block_type,
-                        workflow_run_id=workflow_run_id,
-                        block_idx=block_idx,
-                        block_result=block_result,
-                        continue_on_failure=block.continue_on_failure,
-                        block_type_var=block.block_type,
+                        "Failed to execute block with script code, falling back to AI",
                         block_label=block.label,
+                        error=str(e),
+                        exc_info=True,
                     )
+                    block_executed_with_code = False
 
-                elif block_result.status == BlockStatus.terminated:
-                    LOG.info(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, marking workflow run as terminated",
-                        block_type=block.block_type,
-                        workflow_run_id=workflow_run_id,
-                        block_idx=block_idx,
-                        block_result=block_result,
-                        block_type_var=block.block_type,
-                        block_label=block.label,
-                    )
-
-                    if not block.continue_on_failure:
-                        failure_reason = f"{block.block_type} block terminated. Reason: {block_result.failure_reason}"
-                        workflow_run = await self.mark_workflow_run_as_terminated(
-                            workflow_run_id=workflow_run_id, failure_reason=failure_reason
-                        )
-                        break
-
-                    LOG.warning(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
-                        block_type=block.block_type,
-                        workflow_run_id=workflow_run_id,
-                        block_idx=block_idx,
-                        block_result=block_result,
-                        continue_on_failure=block.continue_on_failure,
-                        block_type_var=block.block_type,
-                        block_label=block.label,
-                    )
-
-                elif block_result.status == BlockStatus.timed_out:
-                    LOG.info(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, marking workflow run as failed",
-                        block_type=block.block_type,
-                        workflow_run_id=workflow_run_id,
-                        block_idx=block_idx,
-                        block_result=block_result,
-                        block_type_var=block.block_type,
-                        block_label=block.label,
-                    )
-
-                    if not block.continue_on_failure:
-                        failure_reason = f"{block.block_type} block timed out. Reason: {block_result.failure_reason}"
-                        workflow_run = await self.mark_workflow_run_as_failed(
-                            workflow_run_id=workflow_run_id, failure_reason=failure_reason
-                        )
-                        break
-
-                    LOG.warning(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, but will continue executing the workflow run",
-                        block_type=block.block_type,
-                        workflow_run_id=workflow_run_id,
-                        block_idx=block_idx,
-                        block_result=block_result,
-                        continue_on_failure=block.continue_on_failure,
-                        block_type_var=block.block_type,
-                        block_label=block.label,
-                    )
-
-            except Exception as e:
-                LOG.exception(
-                    f"Error while executing workflow run {workflow_run_id}",
-                    workflow_run_id=workflow_run_id,
-                    block_idx=block_idx,
-                    block_type=block.block_type,
+            if not block_executed_with_code:
+                LOG.info(
+                    "Executing block",
                     block_label=block.label,
+                    block_type=block.block_type,
+                )
+                workflow_run_block_result = await block.execute_safe(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
                 )
 
-                exception_message = f"Unexpected error: {str(e)}"
-                if isinstance(e, SkyvernException):
-                    exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+            # Extract branch metadata for conditional blocks
+            if isinstance(block, ConditionalBlock) and workflow_run_block_result:
+                branch_metadata = cast(dict[str, Any] | None, workflow_run_block_result.output_parameter_value)
 
-                failure_reason = f"{block.block_type} block failed. failure reason: {exception_message}"
+            if not workflow_run_block_result:
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run_id, failure_reason="Block result is None"
+                )
+                return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
+
+            if (
+                not block_executed_with_code
+                and block.label
+                and block.label not in script_blocks_by_label
+                and workflow_run_block_result.status == BlockStatus.completed
+                and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+            ):
+                blocks_to_update.add(block.label)
+
+            workflow_run, should_stop = await self._handle_block_result_status(
+                block=block,
+                block_idx=block_idx,
+                blocks_cnt=blocks_cnt,
+                block_result=workflow_run_block_result,
+                workflow_run=workflow_run,
+                workflow_run_id=workflow_run_id,
+            )
+            return workflow_run, blocks_to_update, workflow_run_block_result, should_stop, branch_metadata
+
+        except Exception as e:
+            LOG.exception(
+                f"Error while executing workflow run {workflow_run_id}",
+                workflow_run_id=workflow_run_id,
+                block_idx=block_idx,
+                block_type=block.block_type,
+                block_label=block.label,
+            )
+
+            exception_message = f"Unexpected error: {str(e)}"
+            if isinstance(e, SkyvernException):
+                exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+
+            failure_reason = f"{block.block_type} block failed. failure reason: {exception_message}"
+            workflow_run = await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run_id, failure_reason=failure_reason
+            )
+            return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
+
+    async def _handle_block_result_status(
+        self,
+        *,
+        block: BlockTypeVar,
+        block_idx: int,
+        blocks_cnt: int,
+        block_result: BlockResult,
+        workflow_run: WorkflowRun,
+        workflow_run_id: str,
+    ) -> tuple[WorkflowRun, bool]:
+        if block_result.status == BlockStatus.canceled:
+            LOG.info(
+                f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was canceled for workflow run {workflow_run_id}, cancelling workflow run",
+                block_type=block.block_type,
+                workflow_run_id=workflow_run_id,
+                block_idx=block_idx,
+                block_result=block_result,
+                block_type_var=block.block_type,
+                block_label=block.label,
+            )
+            workflow_run = await self.mark_workflow_run_as_canceled(workflow_run_id=workflow_run_id)
+            return workflow_run, True
+        if block_result.status == BlockStatus.failed:
+            LOG.error(
+                f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed for workflow run {workflow_run_id}",
+                block_type=block.block_type,
+                workflow_run_id=workflow_run_id,
+                block_idx=block_idx,
+                block_result=block_result,
+                block_type_var=block.block_type,
+                block_label=block.label,
+            )
+            if not block.continue_on_failure:
+                failure_reason = f"{block.block_type} block failed. failure reason: {block_result.failure_reason}"
                 workflow_run = await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run_id, failure_reason=failure_reason
                 )
-                break
-        return workflow_run
+                return workflow_run, True
+
+            LOG.warning(
+                f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed but will continue executing the workflow run {workflow_run_id}",
+                block_type=block.block_type,
+                workflow_run_id=workflow_run_id,
+                block_idx=block_idx,
+                block_result=block_result,
+                continue_on_failure=block.continue_on_failure,
+                block_type_var=block.block_type,
+                block_label=block.label,
+            )
+            return workflow_run, False
+
+        if block_result.status == BlockStatus.terminated:
+            LOG.info(
+                f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, marking workflow run as terminated",
+                block_type=block.block_type,
+                workflow_run_id=workflow_run_id,
+                block_idx=block_idx,
+                block_result=block_result,
+                block_type_var=block.block_type,
+                block_label=block.label,
+            )
+
+            if not block.continue_on_failure:
+                failure_reason = f"{block.block_type} block terminated. Reason: {block_result.failure_reason}"
+                workflow_run = await self.mark_workflow_run_as_terminated(
+                    workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                )
+                return workflow_run, True
+
+            LOG.warning(
+                f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
+                block_type=block.block_type,
+                workflow_run_id=workflow_run_id,
+                block_idx=block_idx,
+                block_result=block_result,
+                continue_on_failure=block.continue_on_failure,
+                block_type_var=block.block_type,
+                block_label=block.label,
+            )
+            return workflow_run, False
+
+        if block_result.status == BlockStatus.timed_out:
+            LOG.info(
+                f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, marking workflow run as failed",
+                block_type=block.block_type,
+                workflow_run_id=workflow_run_id,
+                block_idx=block_idx,
+                block_result=block_result,
+                block_type_var=block.block_type,
+                block_label=block.label,
+            )
+
+            if not block.continue_on_failure:
+                failure_reason = f"{block.block_type} block timed out. Reason: {block_result.failure_reason}"
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                )
+                return workflow_run, True
+
+            LOG.warning(
+                f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, but will continue executing the workflow run",
+                block_type=block.block_type,
+                workflow_run_id=workflow_run_id,
+                block_idx=block_idx,
+                block_result=block_result,
+                continue_on_failure=block.continue_on_failure,
+                block_type_var=block.block_type,
+                block_label=block.label,
+            )
+            return workflow_run, False
+
+        return workflow_run, False
+
+    def _build_workflow_graph(
+        self,
+        blocks: list[BlockTypeVar],
+    ) -> tuple[str, dict[str, BlockTypeVar], dict[str, str | None]]:
+        all_blocks = blocks
+        label_to_block: dict[str, BlockTypeVar] = {}
+        default_next_map: dict[str, str | None] = {}
+
+        for block in all_blocks:
+            if block.label in label_to_block:
+                raise InvalidWorkflowDefinition(f"Duplicate block label detected: {block.label}")
+            label_to_block[block.label] = block
+            default_next_map[block.label] = block.next_block_label
+
+        # Only apply sequential defaulting if there are no conditional blocks
+        # Conditional blocks break sequential ordering since they have multiple branches
+        has_conditional_blocks = any(isinstance(block, ConditionalBlock) for block in all_blocks)
+        if not has_conditional_blocks:
+            for idx, block in enumerate(blocks[:-1]):
+                if default_next_map.get(block.label) is None:
+                    default_next_map[block.label] = blocks[idx + 1].label
+
+        adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
+        incoming: dict[str, int] = {label: 0 for label in label_to_block}
+
+        def _add_edge(source: str, target: str | None) -> None:
+            if not target:
+                return
+            if target not in label_to_block:
+                raise InvalidWorkflowDefinition(f"Block {source} references unknown next_block_label {target}")
+            # Only increment incoming count if this is a new edge
+            # (multiple branches of a conditional block may point to the same target)
+            if target not in adjacency[source]:
+                adjacency[source].add(target)
+                incoming[target] += 1
+
+        for label, block in label_to_block.items():
+            if isinstance(block, ConditionalBlock):
+                for branch in block.ordered_branches:
+                    _add_edge(label, branch.next_block_label)
+            else:
+                _add_edge(label, default_next_map.get(label))
+
+        roots = [label for label, count in incoming.items() if count == 0]
+        if not roots:
+            raise InvalidWorkflowDefinition("No entry block found for workflow definition")
+        if len(roots) > 1:
+            raise InvalidWorkflowDefinition(
+                f"Multiple entry blocks detected ({', '.join(sorted(roots))}); only one entry block is supported."
+            )
+
+        # Kahn's algorithm for cycle detection
+        queue: deque[str] = deque([roots[0]])
+        visited_count = 0
+        in_degree = dict(incoming)
+        while queue:
+            node = queue.popleft()
+            visited_count += 1
+            for neighbor in adjacency[node]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+
+        if visited_count != len(label_to_block):
+            raise InvalidWorkflowDefinition("Workflow definition contains a cycle; DAG traversal is required.")
+
+        return roots[0], label_to_block, default_next_map
 
     async def create_workflow(
         self,
@@ -919,7 +1445,7 @@ class WorkflowService:
         title: str,
         workflow_definition: WorkflowDefinition,
         description: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
@@ -936,6 +1462,7 @@ class WorkflowService:
         ai_fallback: bool | None = None,
         run_sequentially: bool = False,
         sequential_key: str | None = None,
+        folder_id: str | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -959,6 +1486,7 @@ class WorkflowService:
             ai_fallback=False if ai_fallback is None else ai_fallback,
             run_sequentially=run_sequentially,
             sequential_key=sequential_key,
+            folder_id=folder_id,
         )
 
     async def create_workflow_from_prompt(
@@ -968,7 +1496,7 @@ class WorkflowService:
         totp_identifier: str | None = None,
         totp_verification_url: str | None = None,
         webhook_callback_url: str | None = None,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         max_iterations: int | None = None,
@@ -1106,6 +1634,40 @@ class WorkflowService:
 
         return workflow
 
+    async def set_template_status(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        is_template: bool,
+    ) -> dict[str, Any]:
+        """
+        Set or unset a workflow as a template.
+
+        Template status is stored in a separate workflow_templates table keyed by
+        workflow_permanent_id, since template status is a property of the workflow
+        identity, not a specific version.
+
+        Returns a dict with the result since we're not updating the workflow itself.
+        """
+        # Verify workflow exists and belongs to org
+        await self.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+
+        if is_template:
+            await app.DATABASE.add_workflow_template(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+        else:
+            await app.DATABASE.remove_workflow_template(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+
+        return {"workflow_permanent_id": workflow_permanent_id, "is_template": is_template}
+
     async def get_workflow_versions_by_permanent_id(
         self,
         workflow_permanent_id: str,
@@ -1122,6 +1684,23 @@ class WorkflowService:
             exclude_deleted=exclude_deleted,
         )
         return workflows
+
+    async def get_workflow_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        exclude_deleted: bool = True,
+    ) -> Workflow:
+        workflow = await app.DATABASE.get_workflow_for_workflow_run(
+            workflow_run_id,
+            organization_id=organization_id,
+            exclude_deleted=exclude_deleted,
+        )
+
+        if not workflow:
+            raise WorkflowNotFoundForWorkflowRun(workflow_run_id=workflow_run_id)
+
+        return workflow
 
     async def get_block_outputs_for_debug_session(
         self,
@@ -1169,9 +1748,9 @@ class WorkflowService:
                 continue
 
             block_output_parameter["created_at"] = output_parameter.created_at
-            labels_to_outputs[label] = block_output_parameter
+            labels_to_outputs[label] = block_output_parameter  # type: ignore[assignment]
 
-        return labels_to_outputs
+        return labels_to_outputs  # type: ignore[return-value]
 
     async def get_workflows_by_permanent_ids(
         self,
@@ -1198,14 +1777,17 @@ class WorkflowService:
         page_size: int = 10,
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
+        only_templates: bool = False,
         search_key: str | None = None,
+        folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
 
         Args:
-            search_key: Unified search term for title and parameter metadata (replaces title/parameter).
+            search_key: Unified search term for title, folder name, and parameter metadata.
+            folder_id: Filter workflows by folder ID.
         """
         return await app.DATABASE.get_workflows_by_organization_id(
             organization_id=organization_id,
@@ -1213,7 +1795,9 @@ class WorkflowService:
             page_size=page_size,
             only_saved_tasks=only_saved_tasks,
             only_workflows=only_workflows,
+            only_templates=only_templates,
             search_key=search_key,
+            folder_id=folder_id,
             statuses=statuses,
         )
 
@@ -1253,6 +1837,8 @@ class WorkflowService:
             ignore_version=workflow.version,
         )
 
+        current_definition: dict[str, Any] = {}
+        new_definition: dict[str, Any] = {}
         if previous_valid_workflow:
             current_definition = _get_workflow_definition_core_data(previous_valid_workflow.workflow_definition)
             new_definition = _get_workflow_definition_core_data(workflow_definition)
@@ -1261,10 +1847,99 @@ class WorkflowService:
             has_changes = False
 
         if previous_valid_workflow and has_changes and delete_script:
+            plan = self._determine_cache_invalidation(
+                previous_blocks=current_definition.get("blocks", []),
+                new_blocks=new_definition.get("blocks", []),
+            )
             candidates = await app.DATABASE.get_workflow_scripts_by_permanent_id(
                 organization_id=organization_id,
                 workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
             )
+
+            if plan.has_targets:
+                cached_groups, published_groups = await self._partition_cached_blocks(
+                    organization_id=organization_id,
+                    candidates=candidates,
+                    block_labels_to_disable=plan.block_labels_to_disable,
+                )
+
+                if not cached_groups and not published_groups:
+                    LOG.info(
+                        "Workflow definition changed, no cached script blocks found after workflow block change",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                        organization_id=organization_id,
+                        previous_version=previous_valid_workflow.version,
+                        new_version=workflow.version,
+                        invalidate_reason=plan.reason,
+                        invalidate_label=plan.label,
+                        invalidate_index_prev=plan.previous_index,
+                        invalidate_index_new=plan.new_index,
+                        block_labels_to_disable=plan.block_labels_to_disable,
+                    )
+                    return
+
+                if published_groups and not delete_code_cache_is_ok:
+                    LOG.info(
+                        "Workflow definition changed, asking user if clearing published cached blocks is ok",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                        organization_id=organization_id,
+                        previous_version=previous_valid_workflow.version,
+                        new_version=workflow.version,
+                        invalidate_reason=plan.reason,
+                        invalidate_label=plan.label,
+                        invalidate_index_prev=plan.previous_index,
+                        invalidate_index_new=plan.new_index,
+                        block_labels_to_disable=plan.block_labels_to_disable,
+                        to_clear_published_cnt=len(published_groups),
+                        to_clear_non_published_cnt=len(cached_groups),
+                    )
+
+                    raise CannotUpdateWorkflowDueToCodeCache(
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                    )
+
+                try:
+                    groups_to_clear = [*cached_groups, *published_groups]
+                    await self._clear_cached_block_groups(
+                        organization_id=organization_id,
+                        workflow=workflow,
+                        previous_workflow=previous_valid_workflow,
+                        plan=plan,
+                        groups=groups_to_clear,
+                    )
+                except Exception as e:
+                    LOG.error(
+                        "Failed to clear cached script blocks after workflow block change",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                        organization_id=organization_id,
+                        previous_version=previous_valid_workflow.version,
+                        new_version=workflow.version,
+                        invalidate_reason=plan.reason,
+                        invalidate_label=plan.label,
+                        invalidate_index_prev=plan.previous_index,
+                        invalidate_index_new=plan.new_index,
+                        error=str(e),
+                    )
+
+                return
+
+            if plan.previous_index is not None:
+                LOG.info(
+                    "Workflow definition changed, no cached script blocks exist to clear for workflow block change",
+                    workflow_id=workflow.workflow_id,
+                    workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                    organization_id=organization_id,
+                    previous_version=previous_valid_workflow.version,
+                    new_version=workflow.version,
+                    invalidate_reason=plan.reason,
+                    invalidate_label=plan.label,
+                    invalidate_index_prev=plan.previous_index,
+                    invalidate_index_new=plan.new_index,
+                )
+                return
 
             to_delete_published = [script for script in candidates if script.status == ScriptStatus.published]
             to_delete = [script for script in candidates if script.status != ScriptStatus.published]
@@ -1394,7 +2069,7 @@ class WorkflowService:
         debug_session_id: str | None = None,
         code_gen: bool | None = None,
     ) -> WorkflowRun:
-        # validate the browser session id
+        # validate the browser session or profile id
         if workflow_request.browser_session_id:
             browser_session = await app.DATABASE.get_persistent_browser_session(
                 session_id=workflow_request.browser_session_id,
@@ -1403,11 +2078,23 @@ class WorkflowService:
             if not browser_session:
                 raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
 
+        if workflow_request.browser_profile_id:
+            browser_profile = await app.DATABASE.get_browser_profile(
+                workflow_request.browser_profile_id,
+                organization_id=organization_id,
+            )
+            if not browser_profile:
+                raise BrowserProfileNotFound(
+                    profile_id=workflow_request.browser_profile_id,
+                    organization_id=organization_id,
+                )
+
         return await app.DATABASE.create_workflow_run(
             workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
             organization_id=organization_id,
             browser_session_id=workflow_request.browser_session_id,
+            browser_profile_id=workflow_request.browser_profile_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
@@ -1454,7 +2141,8 @@ class WorkflowService:
                 duration_seconds=duration_seconds,
                 workflow_run_status=workflow_run.status,
                 organization_id=workflow_run.organization_id,
-                run_with=run_with,
+                run_with=workflow_run.run_with,
+                ai_fallback=workflow_run.ai_fallback,
             )
         return workflow_run
 
@@ -1465,7 +2153,7 @@ class WorkflowService:
             workflow_status="completed",
         )
 
-        # Add workflow completion tag to Laminar trace
+        # Add workflow completion tag to trace
         TraceManager.add_task_completion_tag(WorkflowRunStatus.completed)
 
         return await self._update_workflow_run_status(
@@ -1487,7 +2175,7 @@ class WorkflowService:
             failure_reason=failure_reason,
         )
 
-        # Add workflow failure tag to Laminar trace
+        # Add workflow failure tag to trace
         TraceManager.add_task_completion_tag(WorkflowRunStatus.failed)
 
         return await self._update_workflow_run_status(
@@ -1498,17 +2186,25 @@ class WorkflowService:
         )
 
     async def mark_workflow_run_as_running(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
-        LOG.info(
-            f"Marking workflow run {workflow_run_id} as running",
-            workflow_run_id=workflow_run_id,
-            workflow_status="running",
-            run_with=run_with,
-        )
-        return await self._update_workflow_run_status(
+        workflow_run = await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.running,
             run_with=run_with,
         )
+        start_time = (
+            workflow_run.started_at.replace(tzinfo=UTC)
+            if workflow_run.started_at
+            else workflow_run.created_at.replace(tzinfo=UTC)
+        )
+        queued_seconds = (start_time - workflow_run.created_at.replace(tzinfo=UTC)).total_seconds()
+        LOG.info(
+            f"Marked workflow run {workflow_run_id} as running",
+            workflow_run_id=workflow_run_id,
+            workflow_status="running",
+            run_with=run_with,
+            queued_seconds=queued_seconds,
+        )
+        return workflow_run
 
     async def mark_workflow_run_as_terminated(
         self,
@@ -1523,7 +2219,7 @@ class WorkflowService:
             failure_reason=failure_reason,
         )
 
-        # Add workflow terminated tag to Laminar trace
+        # Add workflow terminated tag to trace
         TraceManager.add_task_completion_tag(WorkflowRunStatus.terminated)
 
         return await self._update_workflow_run_status(
@@ -1540,7 +2236,7 @@ class WorkflowService:
             workflow_status="canceled",
         )
 
-        # Add workflow canceled tag to Laminar trace
+        # Add workflow canceled tag to trace
         TraceManager.add_task_completion_tag(WorkflowRunStatus.canceled)
 
         return await self._update_workflow_run_status(
@@ -1561,7 +2257,7 @@ class WorkflowService:
             workflow_status="timed_out",
         )
 
-        # Add workflow timed out tag to Laminar trace
+        # Add workflow timed out tag to trace
         TraceManager.add_task_completion_tag(WorkflowRunStatus.timed_out)
 
         return await self._update_workflow_run_status(
@@ -1790,6 +2486,111 @@ class WorkflowService:
     async def get_tasks_by_workflow_run_id(self, workflow_run_id: str) -> list[Task]:
         return await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
 
+    async def get_recent_task_screenshot_urls(
+        self,
+        *,
+        organization_id: str | None,
+        task_id: str | None = None,
+        task_v2_id: str | None = None,
+        limit: int = 3,
+    ) -> list[str]:
+        """Return the latest action/final screenshot URLs for a task (v1 or v2)."""
+
+        artifact_types = [ArtifactType.SCREENSHOT_ACTION, ArtifactType.SCREENSHOT_FINAL]
+
+        artifacts: list[Artifact] = []
+        if task_id:
+            artifacts = (
+                await app.DATABASE.get_latest_n_artifacts(
+                    task_id=task_id,
+                    artifact_types=artifact_types,
+                    organization_id=organization_id,
+                    n=limit,
+                )
+                or []
+            )
+        elif task_v2_id:
+            action_artifacts = await app.DATABASE.get_artifacts_by_entity_id(
+                organization_id=organization_id,
+                artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                task_v2_id=task_v2_id,
+                limit=limit,
+            )
+            final_artifacts = await app.DATABASE.get_artifacts_by_entity_id(
+                organization_id=organization_id,
+                artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                task_v2_id=task_v2_id,
+                limit=limit,
+            )
+            artifacts = sorted(
+                (action_artifacts or []) + (final_artifacts or []),
+                key=lambda artifact: artifact.created_at,
+                reverse=True,
+            )[:limit]
+
+        if not artifacts:
+            return []
+
+        return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
+
+    async def get_recent_workflow_screenshot_urls(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        limit: int = 3,
+        workflow_run_tasks: list[Task] | None = None,
+    ) -> list[str]:
+        """Return latest screenshots across recent tasks in a workflow run."""
+
+        screenshot_artifacts: list[Artifact] = []
+        seen_artifact_ids: set[str] = set()
+
+        if workflow_run_tasks is None:
+            workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
+
+        for task in workflow_run_tasks[::-1]:
+            artifact = await app.DATABASE.get_latest_artifact(
+                task_id=task.task_id,
+                artifact_types=[ArtifactType.SCREENSHOT_ACTION, ArtifactType.SCREENSHOT_FINAL],
+                organization_id=organization_id,
+            )
+            if artifact:
+                screenshot_artifacts.append(artifact)
+                seen_artifact_ids.add(artifact.artifact_id)
+            if len(screenshot_artifacts) >= limit:
+                break
+
+        if len(screenshot_artifacts) < limit:
+            action_artifacts = await app.DATABASE.get_artifacts_by_entity_id(
+                organization_id=organization_id,
+                artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                workflow_run_id=workflow_run_id,
+                limit=limit,
+            )
+            final_artifacts = await app.DATABASE.get_artifacts_by_entity_id(
+                organization_id=organization_id,
+                artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                workflow_run_id=workflow_run_id,
+                limit=limit,
+            )
+            # Support runs that may not have Task rows (e.g., task_v2-only executions)
+            for artifact in sorted(
+                (action_artifacts or []) + (final_artifacts or []),
+                key=lambda artifact: artifact.created_at,
+                reverse=True,
+            ):
+                if artifact.artifact_id in seen_artifact_ids:
+                    continue
+                screenshot_artifacts.append(artifact)
+                seen_artifact_ids.add(artifact.artifact_id)
+                if len(screenshot_artifacts) >= limit:
+                    break
+
+        if not screenshot_artifacts:
+            return []
+
+        return await app.ARTIFACT_MANAGER.get_share_links(screenshot_artifacts) or []
+
     async def build_workflow_run_status_response_by_workflow_id(
         self,
         workflow_run_id: str,
@@ -1827,33 +2628,36 @@ class WorkflowService:
             organization_id=organization_id,
         )
         workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
-        screenshot_artifacts = []
-        screenshot_urls: list[str] | None = None
-        # get the last screenshot for the last 3 tasks of the workflow run
-        for task in workflow_run_tasks[::-1]:
-            screenshot_artifact = await app.DATABASE.get_latest_artifact(
-                task_id=task.task_id,
-                artifact_types=[
-                    ArtifactType.SCREENSHOT_ACTION,
-                    ArtifactType.SCREENSHOT_FINAL,
-                ],
-                organization_id=organization_id,
-            )
-            if screenshot_artifact:
-                screenshot_artifacts.append(screenshot_artifact)
-            if len(screenshot_artifacts) >= 3:
-                break
-        if screenshot_artifacts:
-            screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(screenshot_artifacts)
+        screenshot_urls: list[str] | None = await self.get_recent_workflow_screenshot_urls(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_run_tasks=workflow_run_tasks,
+        )
+        screenshot_urls = screenshot_urls or None
 
         recording_url = None
-        recording_artifact = await app.DATABASE.get_artifact_for_run(
-            run_id=task_v2.observer_cruise_id if task_v2 else workflow_run_id,
-            artifact_type=ArtifactType.RECORDING,
-            organization_id=organization_id,
-        )
-        if recording_artifact:
-            recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+        # Get recording url from browser session first,
+        # if not found, get the recording url from the artifacts
+        if workflow_run.browser_session_id:
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
+                        organization_id=workflow_run.organization_id,
+                        browser_session_id=workflow_run.browser_session_id,
+                    )
+                    # FIXME: we only support one recording for now
+                    recording_url = recordings[0].url if recordings else None
+            except asyncio.TimeoutError:
+                LOG.warning("Timeout getting recordings", browser_session_id=workflow_run.browser_session_id)
+
+        if recording_url is None:
+            recording_artifact = await app.DATABASE.get_artifact_for_run(
+                run_id=task_v2.observer_cruise_id if task_v2 else workflow_run_id,
+                artifact_type=ArtifactType.RECORDING,
+                organization_id=organization_id,
+            )
+            if recording_artifact:
+                recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         downloaded_files: list[FileInfo] = []
         downloaded_file_urls: list[str] | None = None
@@ -1948,6 +2752,7 @@ class WorkflowService:
             total_cost=total_cost,
             workflow_title=workflow.title,
             browser_session_id=workflow_run.browser_session_id,
+            browser_profile_id=workflow_run.browser_profile_id,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             task_v2=task_v2,
             browser_address=workflow_run.browser_address,
@@ -1981,7 +2786,13 @@ class WorkflowService:
             await self.persist_video_data(browser_state, workflow, workflow_run)
             if tasks:
                 await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
-            if workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir:
+            # Skip workflow-scoped session save when using browser_profile_id to avoid conflicts
+            # (profile persistence is handled separately via the profile storage)
+            if (
+                workflow.persist_browser_session
+                and browser_state.browser_artifacts.browser_session_dir
+                and not workflow_run.browser_profile_id
+            ):
                 await app.STORAGE.store_browser_session(
                     workflow_run.organization_id,
                     workflow.workflow_permanent_id,
@@ -2048,10 +2859,8 @@ class WorkflowService:
             return
 
         # build new schema for backward compatible webhook payload
-        app_url = (
-            f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
-            f"{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}"
-        )
+        app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
+
         workflow_run_response = WorkflowRunResponse(
             run_id=workflow_run.workflow_run_id,
             run_type=RunType.workflow_run,
@@ -2077,12 +2886,11 @@ class WorkflowService:
             ),
             errors=workflow_run_status_response.errors,
         )
-        payload_dict = json.loads(workflow_run_status_response.model_dump_json())
+        payload_dict: dict = json.loads(workflow_run_status_response.model_dump_json())
         workflow_run_response_dict = json.loads(workflow_run_response.model_dump_json())
         payload_dict.update(workflow_run_response_dict)
-        payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
-        headers = generate_skyvern_webhook_headers(
-            payload=payload,
+        signed_data = generate_skyvern_webhook_signature(
+            payload=payload_dict,
             api_key=api_key,
         )
         LOG.info(
@@ -2090,13 +2898,16 @@ class WorkflowService:
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
-            payload=payload,
-            headers=headers,
+            payload=signed_data.signed_payload,
+            headers=signed_data.headers,
         )
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    url=workflow_run.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
+                    url=workflow_run.webhook_callback_url,
+                    data=signed_data.signed_payload,
+                    headers=signed_data.headers,
+                    timeout=httpx.Timeout(30.0),
                 )
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
@@ -2115,7 +2926,7 @@ class WorkflowService:
                     "Webhook failed",
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
-                    webhook_data=payload,
+                    webhook_data=signed_data.signed_payload,
                     resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
@@ -2391,8 +3202,12 @@ class WorkflowService:
             blocks.append(block)
             block_label_mapping[block.label] = block
 
-        # Set the blocks for the workflow definition
-        workflow_definition = WorkflowDefinition(parameters=parameters.values(), blocks=blocks)
+        # Set the blocks for the workflow definition and derive DAG version metadata
+        dag_version = workflow_definition_yaml.version
+        if dag_version is None:
+            dag_version = 2 if WorkflowService._has_dag_metadata(workflow_definition_yaml.blocks) else 1
+
+        workflow_definition = WorkflowDefinition(parameters=parameters.values(), blocks=blocks, version=dag_version)
 
         LOG.info(
             f"Created workflow from request, title: {title}",
@@ -2421,13 +3236,18 @@ class WorkflowService:
         )
         new_workflow_id: str | None = None
 
+        if workflow_permanent_id:
+            # Would return 404: WorkflowNotFound to the client if wpid does not match the organization
+            existing_latest_workflow = await self.get_workflow_by_permanent_id(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                exclude_deleted=False,
+            )
+        else:
+            existing_latest_workflow = None
+
         try:
-            if workflow_permanent_id:
-                existing_latest_workflow = await self.get_workflow_by_permanent_id(
-                    workflow_permanent_id=workflow_permanent_id,
-                    organization_id=organization_id,
-                    exclude_deleted=False,
-                )
+            if existing_latest_workflow:
                 existing_version = existing_latest_workflow.version
 
                 # NOTE: it's only potential, as it may be immediately deleted!
@@ -2444,7 +3264,7 @@ class WorkflowService:
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,
-                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
@@ -2453,6 +3273,7 @@ class WorkflowService:
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,
                     sequential_key=request.sequential_key,
+                    folder_id=existing_latest_workflow.folder_id,
                 )
             else:
                 # NOTE: it's only potential, as it may be immediately deleted!
@@ -2476,6 +3297,7 @@ class WorkflowService:
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,
                     sequential_key=request.sequential_key,
+                    folder_id=request.folder_id,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = potential_workflow.workflow_id
@@ -2544,11 +3366,26 @@ class WorkflowService:
         return output_parameters
 
     @staticmethod
+    def _build_block_kwargs(
+        block_yaml: BLOCK_YAML_TYPES,
+        output_parameter: OutputParameter,
+    ) -> dict[str, Any]:
+        return {
+            "label": block_yaml.label,
+            "next_block_label": block_yaml.next_block_label,
+            "output_parameter": output_parameter,
+            "continue_on_failure": block_yaml.continue_on_failure,
+            "next_loop_on_failure": block_yaml.next_loop_on_failure,
+            "model": block_yaml.model,
+        }
+
+    @staticmethod
     async def block_yaml_to_block(
         block_yaml: BLOCK_YAML_TYPES,
         parameters: dict[str, PARAMETER_TYPE],
     ) -> BlockTypeVar:
         output_parameter = cast(OutputParameter, parameters[f"{block_yaml.label}_output"])
+        base_kwargs = WorkflowService._build_block_kwargs(block_yaml, output_parameter)
         if block_yaml.block_type == BlockType.TASK:
             task_block_parameters = (
                 [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
@@ -2556,25 +3393,21 @@ class WorkflowService:
                 else []
             )
             return TaskBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 parameters=task_block_parameters,
-                output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
                 data_extraction_goal=block_yaml.data_extraction_goal,
                 data_schema=block_yaml.data_schema,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
                 complete_on_download=block_yaml.complete_on_download,
                 download_suffix=block_yaml.download_suffix,
-                continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
-                cache_actions=block_yaml.cache_actions,
                 disable_cache=block_yaml.disable_cache,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
@@ -2601,32 +3434,61 @@ class WorkflowService:
                     loop_over_parameter = parameters[trimmed_key]
 
             if loop_over_parameter is None and not block_yaml.loop_variable_reference:
-                raise Exception("Loop value parameter is required for for loop block")
+                raise InvalidWorkflowDefinition(
+                    f"For loop block '{block_yaml.label}' requires either loop_over_parameter_key or loop_variable_reference"
+                )
 
             return ForLoopBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 loop_over=loop_over_parameter,
                 loop_variable_reference=block_yaml.loop_variable_reference,
                 loop_blocks=loop_blocks,
-                output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
                 complete_if_empty=block_yaml.complete_if_empty,
+            )
+        elif block_yaml.block_type == BlockType.CONDITIONAL:
+            branch_conditions = []
+            for branch in block_yaml.branch_conditions:
+                branch_criteria = None
+                if branch.criteria:
+                    if branch.criteria.criteria_type == "prompt":
+                        branch_criteria = PromptBranchCriteria(
+                            criteria_type=branch.criteria.criteria_type,
+                            expression=branch.criteria.expression,
+                            description=branch.criteria.description,
+                        )
+                    else:
+                        branch_criteria = JinjaBranchCriteria(
+                            criteria_type=branch.criteria.criteria_type,
+                            expression=branch.criteria.expression,
+                            description=branch.criteria.description,
+                        )
+
+                branch_conditions.append(
+                    BranchCondition(
+                        criteria=branch_criteria,
+                        next_block_label=branch.next_block_label,
+                        description=branch.description,
+                        is_default=branch.is_default,
+                    )
+                )
+
+            return ConditionalBlock(
+                **base_kwargs,
+                branch_conditions=branch_conditions,
             )
         elif block_yaml.block_type == BlockType.CODE:
             return CodeBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 code=block_yaml.code,
                 parameters=(
                     [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
                     if block_yaml.parameter_keys
                     else []
                 ),
-                output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.TEXT_PROMPT:
             return TextPromptBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 llm_key=block_yaml.llm_key,
                 prompt=block_yaml.prompt,
                 parameters=(
@@ -2635,28 +3497,20 @@ class WorkflowService:
                     else []
                 ),
                 json_schema=block_yaml.json_schema,
-                output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
-                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.DOWNLOAD_TO_S3:
             return DownloadToS3Block(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 url=block_yaml.url,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.UPLOAD_TO_S3:
             return UploadToS3Block(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 path=block_yaml.path,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.FILE_UPLOAD:
             return FileUploadBlock(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 storage_type=block_yaml.storage_type,
                 s3_bucket=block_yaml.s3_bucket,
                 aws_access_key_id=block_yaml.aws_access_key_id,
@@ -2666,12 +3520,10 @@ class WorkflowService:
                 azure_storage_account_key=block_yaml.azure_storage_account_key,
                 azure_blob_container_name=block_yaml.azure_blob_container_name,
                 path=block_yaml.path,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.SEND_EMAIL:
             return SendEmailBlock(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 smtp_host=parameters[block_yaml.smtp_host_secret_parameter_key],
                 smtp_port=parameters[block_yaml.smtp_port_secret_parameter_key],
                 smtp_username=parameters[block_yaml.smtp_username_secret_parameter_key],
@@ -2681,26 +3533,19 @@ class WorkflowService:
                 subject=block_yaml.subject,
                 body=block_yaml.body,
                 file_attachments=block_yaml.file_attachments or [],
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.FILE_URL_PARSER:
             return FileParserBlock(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 file_url=block_yaml.file_url,
                 file_type=block_yaml.file_type,
                 json_schema=block_yaml.json_schema,
-                continue_on_failure=block_yaml.continue_on_failure,
-                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.PDF_PARSER:
             return PDFParserBlock(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 file_url=block_yaml.file_url,
                 json_schema=block_yaml.json_schema,
-                continue_on_failure=block_yaml.continue_on_failure,
-                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.VALIDATION:
             validation_block_parameters = (
@@ -2710,21 +3555,19 @@ class WorkflowService:
             )
 
             if not block_yaml.complete_criterion and not block_yaml.terminate_criterion:
-                raise Exception("Both complete criterion and terminate criterion are empty")
+                raise InvalidWorkflowDefinition(
+                    f"Validation block '{block_yaml.label}' requires at least one of complete_criterion or terminate_criterion"
+                )
 
             return ValidationBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 task_type=TaskType.validation,
                 parameters=validation_block_parameters,
-                output_parameter=output_parameter,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
                 error_code_mapping=block_yaml.error_code_mapping,
-                continue_on_failure=block_yaml.continue_on_failure,
                 # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
                 max_steps_per_run=2,
-                disable_cache=block_yaml.disable_cache,
-                model=block_yaml.model,
             )
 
         elif block_yaml.block_type == BlockType.ACTION:
@@ -2735,26 +3578,22 @@ class WorkflowService:
             )
 
             if not block_yaml.navigation_goal:
-                raise Exception("empty action instruction")
+                raise InvalidWorkflowDefinition(f"Action block '{block_yaml.label}' requires navigation_goal")
 
             return ActionBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 task_type=TaskType.action,
                 parameters=action_block_parameters,
-                output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
                 complete_on_download=block_yaml.complete_on_download,
                 download_suffix=block_yaml.download_suffix,
-                continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
-                cache_actions=block_yaml.cache_actions,
                 disable_cache=block_yaml.disable_cache,
                 # DO NOT run complete verification for action block
                 complete_verification=False,
@@ -2768,23 +3607,19 @@ class WorkflowService:
                 else []
             )
             return NavigationBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 parameters=navigation_block_parameters,
-                output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
                 complete_on_download=block_yaml.complete_on_download,
                 download_suffix=block_yaml.download_suffix,
-                continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
-                cache_actions=block_yaml.cache_actions,
                 disable_cache=block_yaml.disable_cache,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
@@ -2794,8 +3629,7 @@ class WorkflowService:
 
         elif block_yaml.block_type == BlockType.HUMAN_INTERACTION:
             return HumanInteractionBlock(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 instructions=block_yaml.instructions,
                 positive_descriptor=block_yaml.positive_descriptor,
                 negative_descriptor=block_yaml.negative_descriptor,
@@ -2814,19 +3648,15 @@ class WorkflowService:
                 else []
             )
             return ExtractionBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 parameters=extraction_block_parameters,
-                output_parameter=output_parameter,
                 data_extraction_goal=block_yaml.data_extraction_goal,
                 data_schema=block_yaml.data_schema,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
-                continue_on_failure=block_yaml.continue_on_failure,
-                cache_actions=block_yaml.cache_actions,
                 disable_cache=block_yaml.disable_cache,
                 complete_verification=False,
             )
@@ -2838,21 +3668,17 @@ class WorkflowService:
                 else []
             )
             return LoginBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 parameters=login_block_parameters,
-                output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
-                continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
-                cache_actions=block_yaml.cache_actions,
                 disable_cache=block_yaml.disable_cache,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
@@ -2864,10 +3690,8 @@ class WorkflowService:
                 raise InvalidWaitBlockTime(settings.WORKFLOW_WAIT_BLOCK_MAX_SEC)
 
             return WaitBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 wait_sec=block_yaml.wait_sec,
-                continue_on_failure=block_yaml.continue_on_failure,
-                output_parameter=output_parameter,
             )
 
         elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
@@ -2877,39 +3701,33 @@ class WorkflowService:
                 else []
             )
             return FileDownloadBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 parameters=file_download_block_parameters,
-                output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
                 download_suffix=block_yaml.download_suffix,
-                continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
-                cache_actions=block_yaml.cache_actions,
                 disable_cache=block_yaml.disable_cache,
                 complete_on_download=True,
                 complete_verification=True,
+                include_action_history_in_verification=True,
                 download_timeout=block_yaml.download_timeout,
             )
         elif block_yaml.block_type == BlockType.TaskV2:
             return TaskV2Block(
-                label=block_yaml.label,
+                **base_kwargs,
                 prompt=block_yaml.prompt,
                 url=block_yaml.url,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 max_iterations=block_yaml.max_iterations,
                 max_steps=block_yaml.max_steps,
-                disable_cache=block_yaml.disable_cache,
-                model=block_yaml.model,
-                output_parameter=output_parameter,
             )
         elif block_yaml.block_type == BlockType.HTTP_REQUEST:
             http_request_block_parameters = (
@@ -2918,22 +3736,20 @@ class WorkflowService:
                 else []
             )
             return HttpRequestBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 method=block_yaml.method,
                 url=block_yaml.url,
                 headers=block_yaml.headers,
                 body=block_yaml.body,
+                files=block_yaml.files,
                 timeout=block_yaml.timeout,
                 follow_redirects=block_yaml.follow_redirects,
                 parameters=http_request_block_parameters,
-                output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.GOTO_URL:
             return UrlBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
-                output_parameter=output_parameter,
                 complete_verification=False,
             )
 
@@ -2943,7 +3759,7 @@ class WorkflowService:
         self,
         organization: Organization,
         title: str,
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         run_with: str | None = None,
@@ -3028,13 +3844,17 @@ class WorkflowService:
         workflow: Workflow,
         workflow_run: WorkflowRun,
         block_labels: list[str] | None = None,
+        blocks_to_update: set[str] | None = None,
     ) -> None:
         code_gen = workflow_run.code_gen
+        blocks_to_update = set(blocks_to_update or [])
+
         LOG.info(
             "Generate script?",
             block_labels=block_labels,
             code_gen=code_gen,
             workflow_run_id=workflow_run.workflow_run_id,
+            blocks_to_update=list(blocks_to_update),
         )
 
         if block_labels and not code_gen:
@@ -3047,16 +3867,90 @@ class WorkflowService:
             workflow_run,
             block_labels,
         )
+
         if existing_script:
+            cached_block_labels: set[str] = set()
+            script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+                script_revision_id=existing_script.script_revision_id,
+                organization_id=workflow.organization_id,
+            )
+            for script_block in script_blocks:
+                if script_block.script_block_label:
+                    cached_block_labels.add(script_block.script_block_label)
+
+            should_cache_block_labels = {
+                block.label
+                for block in workflow.workflow_definition.blocks
+                if block.label and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+            }
+            should_cache_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
+            cached_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
+
+            if cached_block_labels != should_cache_block_labels:
+                missing_labels = should_cache_block_labels - cached_block_labels
+                if missing_labels:
+                    blocks_to_update.update(missing_labels)
+                # Always rebuild the orchestrator if the definition changed
+                blocks_to_update.add(settings.WORKFLOW_START_BLOCK_LABEL)
+
+            should_regenerate = bool(blocks_to_update) or bool(code_gen)
+
+            if not should_regenerate:
+                LOG.info(
+                    "Workflow script already up to date; skipping regeneration",
+                    workflow_id=workflow.workflow_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    cache_key_value=rendered_cache_key_value,
+                    script_id=existing_script.script_id,
+                    script_revision_id=existing_script.script_revision_id,
+                    run_with=workflow_run.run_with,
+                )
+                return
+
             LOG.info(
-                "Found cached script for workflow. Skipping script generation",
+                "deleting old workflow script and generating new script",
                 workflow_id=workflow.workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
                 cache_key_value=rendered_cache_key_value,
                 script_id=existing_script.script_id,
                 script_revision_id=existing_script.script_revision_id,
                 run_with=workflow_run.run_with,
+                blocks_to_update=list(blocks_to_update),
+                code_gen=code_gen,
             )
+
+            # delete the existing workflow scripts if any
+            await app.DATABASE.delete_workflow_scripts_by_permanent_id(
+                organization_id=workflow.organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                script_ids=[existing_script.script_id],
+            )
+
+            # create a new script
+            regenerated_script = await app.DATABASE.create_script(
+                organization_id=workflow.organization_id,
+                run_id=workflow_run.workflow_run_id,
+            )
+
+            await workflow_script_service.generate_workflow_script(
+                workflow_run=workflow_run,
+                workflow=workflow,
+                script=regenerated_script,
+                rendered_cache_key_value=rendered_cache_key_value,
+                cached_script=existing_script,
+                updated_block_labels=blocks_to_update,
+            )
+            aio_task_primary_key = f"{regenerated_script.script_id}_{regenerated_script.version}"
+            if aio_task_primary_key in app.ARTIFACT_MANAGER.upload_aiotasks_map:
+                aio_tasks = app.ARTIFACT_MANAGER.upload_aiotasks_map[aio_task_primary_key]
+                if aio_tasks:
+                    await asyncio.gather(*aio_tasks)
+                else:
+                    LOG.warning(
+                        "No upload aio tasks found for regenerated script",
+                        script_id=regenerated_script.script_id,
+                        version=regenerated_script.version,
+                    )
             return
 
         created_script = await app.DATABASE.create_script(
@@ -3069,6 +3963,8 @@ class WorkflowService:
             workflow=workflow,
             script=created_script,
             rendered_cache_key_value=rendered_cache_key_value,
+            cached_script=None,
+            updated_block_labels=None,
         )
         aio_task_primary_key = f"{created_script.script_id}_{created_script.version}"
         if aio_task_primary_key in app.ARTIFACT_MANAGER.upload_aiotasks_map:
@@ -3093,4 +3989,13 @@ class WorkflowService:
             return False
         if workflow.run_with == "code":
             return True
+        return False
+
+    @staticmethod
+    def _has_dag_metadata(block_yamls: list[BLOCK_YAML_TYPES]) -> bool:
+        for block_yaml in block_yamls:
+            if block_yaml.next_block_label:
+                return True
+            if isinstance(block_yaml, ForLoopBlockYAML) and WorkflowService._has_dag_metadata(block_yaml.loop_blocks):
+                return True
         return False

@@ -1,10 +1,10 @@
 import { Status } from "@/api/types";
-import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useEffect, useState } from "react";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useParams } from "react-router-dom";
+import { useFirstParam } from "@/hooks/useFirstParam";
 import { getRuntimeApiKey } from "@/util/env";
 import { toast } from "@/components/ui/use-toast";
 import { useQueryClient } from "@tanstack/react-query";
@@ -25,12 +25,14 @@ const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
 
 function WorkflowRunStream(props?: Props) {
   const alwaysShowStream = props?.alwaysShowStream ?? false;
-  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunId = useFirstParam("workflowRunId", "runId");
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const showStream =
     alwaysShowStream || (workflowRun && statusIsNotFinalized(workflowRun));
   const credentialGetter = useCredentialGetter();
-  const { workflowRunId, workflowPermanentId } = useParams();
+  const workflow = workflowRun?.workflow;
+  const workflowPermanentId = workflow?.workflow_permanent_id;
   const queryClient = useQueryClient();
 
   useEffect(() => {
@@ -72,6 +74,9 @@ function WorkflowRunStream(props?: Props) {
             });
             queryClient.invalidateQueries({
               queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
+            });
+            queryClient.invalidateQueries({
+              queryKey: ["workflowRun", workflowRunId],
             });
             queryClient.invalidateQueries({
               queryKey: ["workflowTasks", workflowRunId],

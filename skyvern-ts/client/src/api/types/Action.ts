@@ -34,7 +34,9 @@ export interface Action {
     option?: Skyvern.SelectOption;
     is_checked?: boolean;
     verified?: boolean;
+    click_context?: Skyvern.ClickContext;
     totp_timing_info?: Record<string, unknown>;
+    has_mini_agent?: boolean;
     created_at?: string;
     modified_at?: string;
     created_by?: string;

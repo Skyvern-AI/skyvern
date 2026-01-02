@@ -7,6 +7,10 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 
 
 class RunSdkActionResponse(UniversalBaseModel):
+    """
+    Response from running an SDK action.
+    """
+
     workflow_run_id: str = pydantic.Field()
     """
     The workflow run ID used for this action

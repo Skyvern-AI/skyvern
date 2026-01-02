@@ -1,11 +1,27 @@
 import hashlib
 import hmac
+import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Union
 
 from jose import jwt
 
 from skyvern.config import settings
+
+
+def _normalize_numbers(x: Any) -> Any:
+    if isinstance(x, float):
+        return int(x) if x.is_integer() else x
+    if isinstance(x, dict):
+        return {k: _normalize_numbers(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_normalize_numbers(v) for v in x]
+    return x
+
+
+def _normalize_json_dumps(payload: dict) -> str:
+    return json.dumps(_normalize_numbers(payload), separators=(",", ":"), ensure_ascii=False)
 
 
 def create_access_token(
@@ -43,11 +59,25 @@ def generate_skyvern_signature(
     return hash_obj.hexdigest()
 
 
-def generate_skyvern_webhook_headers(payload: str, api_key: str) -> dict[str, str]:
-    signature = generate_skyvern_signature(payload=payload, api_key=api_key)
+@dataclass
+class WebhookSignature:
+    timestamp: str
+    signature: str
+    signed_payload: str
+    headers: dict[str, str]
+
+
+def generate_skyvern_webhook_signature(payload: dict, api_key: str) -> WebhookSignature:
+    payload_str = _normalize_json_dumps(payload)
+    signature = generate_skyvern_signature(payload=payload_str, api_key=api_key)
     timestamp = str(int(datetime.utcnow().timestamp()))
-    return {
-        "x-skyvern-timestamp": timestamp,
-        "x-skyvern-signature": signature,
-        "Content-Type": "application/json",
-    }
+    return WebhookSignature(
+        timestamp=timestamp,
+        signature=signature,
+        signed_payload=payload_str,
+        headers={
+            "x-skyvern-timestamp": timestamp,
+            "x-skyvern-signature": signature,
+            "Content-Type": "application/json",
+        },
+    )

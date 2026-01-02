@@ -8,6 +8,7 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
 
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.utils import migrate_db
 from skyvern.utils.env_paths import resolve_backend_env_path
 
@@ -18,9 +19,9 @@ from .llm_setup import setup_llm_providers, update_or_add_env_var
 from .mcp import setup_local_organization, setup_mcp
 
 
-def init(
+def init_env(
     no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
-) -> None:
+) -> bool:
     """Interactive initialization command for Skyvern."""
     console.print(
         Panel(
@@ -31,11 +32,12 @@ def init(
     )
     console.print("[italic]This wizard will help you set up Skyvern.[/italic]")
 
-    run_local = Confirm.ask(
-        "Would you like to run Skyvern [bold blue]locally[/bold blue] or in the [bold purple]cloud[/bold purple]?",
-        default=False,
+    infra_choice = Prompt.ask(
+        "Would you like to run Skyvern [bold blue]local[/bold blue]ly or in the [bold purple]cloud[/bold purple]?",
         choices=["local", "cloud"],
     )
+
+    run_local = infra_choice == "local"
 
     if run_local:
         setup_postgresql(no_postgres)
@@ -44,6 +46,7 @@ def init(
         console.print("✅ [green]Database migration complete.[/green]")
 
         console.print("🔑 [bold blue]Generating local organization API key...[/bold blue]")
+        start_forge_app()
         api_key = asyncio.run(setup_local_organization())
         if api_key:
             console.print("✅ [green]Local organization API key generated.[/green]")
@@ -52,7 +55,7 @@ def init(
 
         backend_env_path = resolve_backend_env_path()
         if backend_env_path.exists():
-            console.print(f"💡 [{backend_env_path}] file already exists.", style="yellow")
+            console.print(f"💡 [{backend_env_path}] file already exists.", style="yellow", markup=False)
             redo_llm_setup = Confirm.ask(
                 "Do you want to go through [bold yellow]LLM provider setup again[/bold yellow]?",
                 default=False,
@@ -102,7 +105,7 @@ def init(
             api_key = Prompt.ask("Please re-enter your Skyvern API key", password=True)
             if not api_key:
                 console.print("[bold red]Error: API key cannot be empty. Aborting initialization.[/bold red]")
-                return
+                return False
         update_or_add_env_var("SKYVERN_BASE_URL", base_url)
 
     analytics_id_input = Prompt.ask("Please enter your email for analytics (press enter to skip)", default="")
@@ -131,6 +134,8 @@ def init(
         console.print("\n🎉 [bold green]Skyvern setup complete![/bold green]")
         console.print("[bold]To start using Skyvern, run:[/bold]")
         console.print(Padding("skyvern run server", (1, 4), style="reverse green"))
+
+    return run_local
 
 
 def init_browser() -> None:

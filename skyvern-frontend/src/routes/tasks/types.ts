@@ -51,3 +51,7 @@ export function statusIsRunningOrQueued({
 }): boolean {
   return status === Status.Queued || status === Status.Running;
 }
+
+export function statusIsCancellable({ status }: { status: Status }): boolean {
+  return statusIsNotFinalized({ status });
+}

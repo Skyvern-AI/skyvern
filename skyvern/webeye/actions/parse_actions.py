@@ -21,11 +21,13 @@ from skyvern.webeye.actions.actions import (
     Action,
     CheckboxAction,
     ClickAction,
+    ClickContext,
     ClosePageAction,
     CompleteAction,
     DownloadFileAction,
     DragAction,
     GotoUrlAction,
+    HoverAction,
     InputOrSelectContext,
     InputTextAction,
     KeypressAction,
@@ -41,7 +43,7 @@ from skyvern.webeye.actions.actions import (
     VerificationCodeAction,
     WaitAction,
 )
-from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 LOG = structlog.get_logger()
 
@@ -97,7 +99,15 @@ def parse_action(
 
     if action_type == ActionType.CLICK:
         file_url = action["file_url"] if "file_url" in action else None
-        return ClickAction(**base_action_dict, file_url=file_url, download=action.get("download", False))
+        click_context = action.get("click_context", None)
+        if click_context:
+            click_context = ClickContext.model_validate(click_context)
+        return ClickAction(
+            **base_action_dict,
+            file_url=file_url,
+            download=action.get("download", False),
+            click_context=click_context,
+        )
 
     if action_type == ActionType.INPUT_TEXT:
         context_dict = action.get("context", {})
@@ -145,6 +155,7 @@ def parse_action(
                 index=index,
             ),
             input_or_select_context=input_or_select_context,
+            download=action.get("download", False),
         )
 
     if action_type == ActionType.CHECKBOX:
@@ -155,6 +166,9 @@ def parse_action(
 
     if action_type == ActionType.WAIT:
         return WaitAction(**base_action_dict)
+
+    if action_type == ActionType.HOVER:
+        return HoverAction(**base_action_dict, hold_seconds=action.get("hold_seconds", 0) or 0)
 
     if action_type == ActionType.COMPLETE:
         return CompleteAction(
@@ -769,6 +783,9 @@ async def generate_cua_fallback_actions(
     LOG.info("Fallback action response", action_response=action_response)
     skyvern_action_type = action_response.get("action")
     useful_information = action_response.get("useful_information")
+
+    # use 'other' action as fallback in the 'cua-fallback-action' prompt
+    # it can avoid LLM returning unreasonable actions, and fallback to use 'wait' action in agent instead
     action = WaitAction(
         seconds=5,
         reasoning=reasoning,

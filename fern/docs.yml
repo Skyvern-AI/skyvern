@@ -1,6 +1,6 @@
 instances:
   - url: skyvern.docs.buildwithfern.com/docs
-    custom-domain: www.skyvern.com/docs
+    custom-domain: skyvern.com/docs
 title: Skyvern
 favicon: images/skyvern_favicon_small.png
 logo:
@@ -17,7 +17,6 @@ colors:
 analytics:
   posthog:
     api-key: ${POSTHOG_API_KEY}
-js: ./tracking.js
 layout:
   page-width: 1504px
   header-height: 75px
@@ -83,6 +82,8 @@ navigation:
             path: running-tasks/cancel-runs.mdx
           - page: Webhooks FAQ
             path: running-tasks/webhooks-faq.mdx
+          - page: Proxy & Geo Targeting
+            path: running-tasks/proxy-location.mdx
           - page: Advanced Settings for tasks
             hidden: true
             path: running-tasks/advanced-features.mdx
@@ -131,10 +132,14 @@ navigation:
             path: credentials/totp.mdx
           - page: Bitwarden
             path: credentials/bitwarden.mdx
+          - page: Custom Credential Service
+            path: credentials/custom-credential-service.mdx
       - section: Browser Sessions (Beta)
         contents:
           - page: Introduction
             path: browser-sessions/introduction.mdx
+          - page: Browser Profiles
+            path: browser-sessions/browser-profiles.mdx
       - section: Observability
         contents:
           - page: Overview
@@ -167,6 +172,8 @@ navigation:
               - POST /v1/runs/{run_id}/cancel
               - POST /v1/runs/{run_id}/retry_webhook
               - POST /v1/run/tasks/login
+              - endpoint: POST /v1/run/tasks/download_files
+                hidden: true
               - GET /v1/runs/{run_id}/timeline
           - section: Workflows
             contents:
@@ -185,6 +192,12 @@ navigation:
               - GET /v1/browser_sessions/{browser_session_id}
               - POST /v1/browser_sessions/{browser_session_id}/close
               - GET /v1/browser_sessions
+          - section: Browser Profiles
+            contents:
+              - POST /v1/browser_profiles
+              - GET /v1/browser_profiles
+              - GET /v1/browser_profiles/{profile_id}
+              - DELETE /v1/browser_profiles/{profile_id}
           - section: Credentials
             contents:
               - POST /v1/credentials
@@ -192,10 +205,14 @@ navigation:
               - POST /v1/credentials/{credential_id}/delete
               - GET /v1/credentials
               - POST /v1/credentials/totp
+              - GET /v1/credentials/totp
           - section: Artifacts
             contents:
               - GET /v1/artifacts/{artifact_id}
               - GET /v1/runs/{run_id}/artifacts
+          - section: Files
+            contents:
+              - POST /v1/upload_file
           - section: Scripts
             hidden: true
             contents:
@@ -215,3 +232,4 @@ navigation:
   - tab: demo
 experimental:
   openapi-parser-v3: true
+  dynamic-snippets: true

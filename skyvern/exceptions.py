@@ -24,6 +24,15 @@ class DisabledBlockExecutionError(SkyvernHTTPException):
         super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
 
 
+class RateLimitExceeded(SkyvernHTTPException):
+    def __init__(self, organization_id: str, max_requests: int, window_seconds: int):
+        message = (
+            f"Rate limit exceeded for organization {organization_id}. "
+            f"Maximum {max_requests} requests per {window_seconds} seconds allowed."
+        )
+        super().__init__(message, status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+
+
 class InvalidOpenAIResponseFormat(SkyvernException):
     def __init__(self, message: str | None = None):
         super().__init__(f"Invalid response format: {message}")
@@ -82,6 +91,11 @@ class MissingElement(SkyvernException):
         )
 
 
+class MissingExtractActionsResponse(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("extract-actions response missing")
+
+
 class MultipleElementsFound(SkyvernException):
     def __init__(self, num: int, selector: str | None = None, element_id: str | None = None):
         super().__init__(
@@ -97,6 +111,14 @@ class MissingFileUrl(SkyvernException):
 class ImaginaryFileUrl(SkyvernException):
     def __init__(self, file_url: str) -> None:
         super().__init__(f"File url {file_url} is imaginary.")
+
+
+class DownloadedFileNotFound(SkyvernException):
+    def __init__(self, downloaded_path: str, download_url: str | None = None) -> None:
+        message = f"Downloaded file does not exist at path: {downloaded_path}. This may indicate the download failed silently or the file was removed."
+        if download_url:
+            message += f" Download URL: {download_url}"
+        super().__init__(message)
 
 
 class MissingBrowserState(SkyvernException):
@@ -168,6 +190,17 @@ class WorkflowNotFound(SkyvernHTTPException):
         )
 
 
+class WorkflowNotFoundForWorkflowRun(SkyvernHTTPException):
+    def __init__(
+        self,
+        workflow_run_id: str | None = None,
+    ) -> None:
+        super().__init__(
+            f"Workflow not found for workflow run {workflow_run_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
 class WorkflowRunNotFound(SkyvernHTTPException):
     def __init__(self, workflow_run_id: str) -> None:
         super().__init__(f"WorkflowRun {workflow_run_id} not found", status_code=status.HTTP_404_NOT_FOUND)
@@ -178,6 +211,14 @@ class MissingValueForParameter(SkyvernHTTPException):
         super().__init__(
             f"Missing value for parameter {parameter_key} in workflow run {workflow_run_id} of workflow {workflow_id}",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class WorkflowRunParameterPersistenceError(SkyvernException):
+    def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str, reason: str) -> None:
+        super().__init__(
+            f"Failed to persist workflow parameter '{parameter_key}' for workflow run {workflow_run_id} "
+            f"of workflow {workflow_id}. Reason: {reason}"
         )
 
 
@@ -248,11 +289,6 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
         super().__init__(
             f"Unknown error while creating browser context for {browser_type}. Exception type: {type(exception)} Exception message: {str(exception)}"
         )
-
-
-class BrowserStateMissingPage(SkyvernException):
-    def __init__(self) -> None:
-        super().__init__("BrowserState is missing the main page")
 
 
 class OrganizationNotFound(SkyvernHTTPException):
@@ -480,6 +516,11 @@ class InputActionOnSelect2Dropdown(SkyvernException):
 class FailToClick(SkyvernException):
     def __init__(self, element_id: str, msg: str, anchor: str = "self"):
         super().__init__(f"Failed to click({anchor}). element_id={element_id}, error_msg={msg}")
+
+
+class FailToHover(SkyvernException):
+    def __init__(self, element_id: str, msg: str):
+        super().__init__(f"Failed to hover. element_id={element_id}, error_msg={msg}")
 
 
 class FailToSelectByLabel(SkyvernException):
@@ -766,8 +807,8 @@ class LLMCallerNotFoundError(SkyvernException):
 
 
 class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str) -> None:
-        super().__init__(f"Browser session {browser_session_id} is already occupied")
+    def __init__(self, browser_session_id: str, runnable_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
 
 
 class BrowserSessionNotRenewable(SkyvernException):
@@ -786,6 +827,14 @@ class BrowserSessionNotFound(SkyvernHTTPException):
             f"Browser session {browser_session_id} does not exist or is not live.",
             status_code=status.HTTP_404_NOT_FOUND,
         )
+
+
+class BrowserProfileNotFound(SkyvernHTTPException):
+    def __init__(self, profile_id: str, organization_id: str | None = None) -> None:
+        message = f"Browser profile {profile_id} not found"
+        if organization_id:
+            message += f" for organization {organization_id}"
+        super().__init__(message, status_code=status.HTTP_404_NOT_FOUND)
 
 
 class CannotUpdateWorkflowDueToCodeCache(SkyvernException):
@@ -839,3 +888,38 @@ class AzureConfigurationError(AzureBaseError):
 class ScriptTerminationException(SkyvernException):
     def __init__(self, reason: str | None = None) -> None:
         super().__init__(reason)
+
+
+class InvalidSchemaError(SkyvernException):
+    def __init__(self, message: str, validation_errors: list[str] | None = None):
+        self.message = message
+        self.validation_errors = validation_errors or []
+        super().__init__(self.message)
+
+
+class PDFEmbedBase64DecodeError(SkyvernException):
+    """Raised when failed to extract or decode base64 data from PDF embed src attribute."""
+
+    def __init__(self, pdf_embed_src: str | None = None, reason: str | None = None):
+        self.pdf_embed_src = pdf_embed_src
+        self.reason = reason
+        message = "Failed to extract or decode base64 data from PDF embed src"
+        if reason:
+            message += f". Reason: {reason}"
+        if pdf_embed_src:
+            # Truncate long base64 strings for logging
+            src_preview = pdf_embed_src[:100] + "..." if len(pdf_embed_src) > 100 else pdf_embed_src
+            message += f". PDF embed src: {src_preview}"
+        super().__init__(message)
+
+
+class PDFParsingError(SkyvernException):
+    """Raised when PDF parsing fails with all available parsers."""
+
+    def __init__(self, file_identifier: str, pypdf_error: str, pdfplumber_error: str):
+        self.file_identifier = file_identifier
+        self.pypdf_error = pypdf_error
+        self.pdfplumber_error = pdfplumber_error
+        super().__init__(
+            f"Failed to parse PDF '{file_identifier}'. pypdf error: {pypdf_error}; pdfplumber error: {pdfplumber_error}"
+        )

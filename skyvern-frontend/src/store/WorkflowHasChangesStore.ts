@@ -19,6 +19,7 @@ import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYaml
 type SaveData = {
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
+  workflowDefinitionVersion: number;
   title: string;
   settings: WorkflowSettings;
   workflow: WorkflowApiResponse;
@@ -36,6 +37,10 @@ type WorkflowHasChangesStore = {
   setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => void;
   setShowConfirmCodeCacheDeletion: (show: boolean) => void;
 };
+
+interface WorkflowSaveOpts {
+  status?: string;
+}
 
 const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
   return {
@@ -62,7 +67,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
   };
 });
 
-const useWorkflowSave = () => {
+const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const {
@@ -135,11 +140,12 @@ const useWorkflowSave = () => {
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
         workflow_definition: {
+          version: saveData.workflowDefinitionVersion,
           parameters: saveData.parameters,
           blocks: saveData.blocks,
         },
         is_saved_task: saveData.workflow.is_saved_task,
-        status: saveData.workflow.status,
+        status: opts?.status ?? saveData.workflow.status,
         run_sequentially: saveData.settings.runSequentially,
         sequential_key: saveData.settings.sequentialKey,
       };

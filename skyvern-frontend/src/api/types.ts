@@ -1,3 +1,5 @@
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+
 export const ArtifactType = {
   Recording: "recording",
   ActionScreenshot: "screenshot_action",
@@ -54,7 +56,17 @@ export const ProxyLocation = {
   None: "NONE",
 } as const;
 
-export type ProxyLocation = (typeof ProxyLocation)[keyof typeof ProxyLocation];
+export type LegacyProxyLocation =
+  (typeof ProxyLocation)[keyof typeof ProxyLocation];
+
+export type GeoTarget = {
+  country: string;
+  subdivision?: string;
+  city?: string;
+  isISP?: boolean;
+};
+
+export type ProxyLocation = LegacyProxyLocation | GeoTarget | null;
 
 export type ArtifactApiResponse = {
   created_at: string;
@@ -225,12 +237,37 @@ export interface AzureClientSecretCredentialResponse {
   token: AzureOrganizationAuthToken;
 }
 
+export interface CustomCredentialServiceConfig {
+  api_base_url: string;
+  api_token: string;
+}
+
+export interface CustomCredentialServiceOrganizationAuthToken {
+  id: string;
+  organization_id: string;
+  token: string; // JSON string containing CustomCredentialServiceConfig
+  created_at: string;
+  modified_at: string;
+  token_type: string;
+  valid: boolean;
+}
+
+export interface CreateCustomCredentialServiceConfigRequest {
+  config: CustomCredentialServiceConfig;
+}
+
+export interface CustomCredentialServiceConfigResponse {
+  token: CustomCredentialServiceOrganizationAuthToken;
+}
+
 // TODO complete this
 export const ActionTypes = {
   InputText: "input_text",
   Click: "click",
+  Hover: "hover",
   SelectOption: "select_option",
   UploadFile: "upload_file",
+  DownloadFile: "download_file",
   complete: "complete",
   wait: "wait",
   terminate: "terminate",
@@ -255,8 +292,10 @@ export const ReadableActionTypes: {
 } = {
   input_text: "Input Text",
   click: "Click",
+  hover: "Hover",
   select_option: "Select Option",
   upload_file: "Upload File",
+  download_file: "Download File",
   complete: "Complete",
   wait: "Wait",
   terminate: "Terminate",
@@ -374,6 +413,32 @@ export type WorkflowRunStatusApiResponse = {
   max_screenshot_scrolls: number | null;
 };
 
+export type WorkflowRunStatusApiResponseWithWorkflow = {
+  workflow_id: string;
+  workflow_run_id: string;
+  status: Status;
+  proxy_location: ProxyLocation | null;
+  webhook_callback_url: string | null;
+  extra_http_headers: Record<string, string> | null;
+  created_at: string;
+  finished_at: string;
+  modified_at: string;
+  parameters: Record<string, unknown>;
+  screenshot_urls: Array<string> | null;
+  recording_url: string | null;
+  outputs: Record<string, unknown> | null;
+  failure_reason: string | null;
+  webhook_failure_reason: string | null;
+  downloaded_file_urls: Array<string> | null;
+  total_steps: number | null;
+  total_cost: number | null;
+  task_v2: TaskV2 | null;
+  workflow_title: string | null;
+  browser_session_id: string | null;
+  max_screenshot_scrolls: number | null;
+  workflow: WorkflowApiResponse;
+};
+
 export type TaskGenerationApiResponse = {
   suggested_title: string | null;
   url: string | null;
@@ -437,29 +502,51 @@ export type CreditCardCredentialApiResponse = {
   brand: string;
 };
 
+export type SecretCredentialResponse = {
+  secret_label?: string | null;
+};
+
 export type CredentialApiResponse = {
   credential_id: string;
-  credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse;
-  credential_type: "password" | "credit_card";
+  credential:
+    | PasswordCredentialApiResponse
+    | CreditCardCredentialApiResponse
+    | SecretCredentialResponse;
+  credential_type: "password" | "credit_card" | "secret";
   name: string;
 };
 
 export function isPasswordCredential(
-  credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse,
+  credential:
+    | PasswordCredentialApiResponse
+    | CreditCardCredentialApiResponse
+    | SecretCredentialResponse,
 ): credential is PasswordCredentialApiResponse {
   return "username" in credential;
 }
 
 export function isCreditCardCredential(
-  credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse,
+  credential:
+    | PasswordCredentialApiResponse
+    | CreditCardCredentialApiResponse
+    | SecretCredentialResponse,
 ): credential is CreditCardCredentialApiResponse {
   return "last_four" in credential;
 }
 
+export function isSecretCredential(
+  credential:
+    | PasswordCredentialApiResponse
+    | CreditCardCredentialApiResponse
+    | SecretCredentialResponse,
+): credential is SecretCredentialResponse {
+  return !("username" in credential) && !("last_four" in credential);
+}
+
 export type CreateCredentialRequest = {
   name: string;
-  credential_type: "password" | "credit_card";
-  credential: PasswordCredential | CreditCardCredential;
+  credential_type: "password" | "credit_card" | "secret";
+  credential: PasswordCredential | CreditCardCredential | SecretCredential;
 };
 
 export type PasswordCredential = {
@@ -467,6 +554,7 @@ export type PasswordCredential = {
   password: string;
   totp: string | null;
   totp_type: "authenticator" | "email" | "text" | "none";
+  totp_identifier?: string | null;
 };
 
 export type CreditCardCredential = {
@@ -476,6 +564,40 @@ export type CreditCardCredential = {
   card_exp_year: string;
   card_brand: string;
   card_holder_name: string;
+};
+
+export type SecretCredential = {
+  secret_value: string;
+  secret_label?: string | null;
+};
+
+export const OtpType = {
+  Totp: "totp",
+  MagicLink: "magic_link",
+} as const;
+
+export type OtpType = (typeof OtpType)[keyof typeof OtpType];
+
+export type TotpCode = {
+  totp_code_id: string;
+  totp_identifier: string | null;
+  code: string;
+  content: string;
+  workflow_run_id: string | null;
+  workflow_id: string | null;
+  task_id: string | null;
+  source: string | null;
+  otp_type: OtpType | null;
+  expired_at: string | null;
+  created_at: string;
+  modified_at: string;
+};
+
+export type TotpCodeListParams = {
+  totp_identifier?: string;
+  workflow_run_id?: string;
+  otp_type?: OtpType;
+  limit?: number;
 };
 
 export type ModelsResponse = {

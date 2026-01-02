@@ -51,6 +51,7 @@
     "clsx": "^2.1.0",
     "cmdk": "^1.0.0",
     "cors": "^2.8.5",
+    "country-state-city": "^3.2.1",
     "cross-spawn": "^7.0.6",
     "embla-carousel-react": "^8.0.0",
     "express": "^4.21.2",
@@ -93,7 +94,7 @@
     "prettier-plugin-tailwindcss": "^0.6.5",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.5.3",
-    "vite": "^5.4.19",
+    "vite": "^5.4.21",
     "vitest": "^3.2.4"
   },
   "lint-staged": {

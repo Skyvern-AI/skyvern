@@ -2,8 +2,6 @@ import uuid
 from typing import Annotated, Literal, Union
 
 import structlog
-from azure.identity.aio import ClientSecretCredential
-from fastapi import HTTPException
 from pydantic import BaseModel, Field, TypeAdapter
 
 from skyvern.forge import app
@@ -12,13 +10,11 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
     CredentialItem,
-    CredentialResponse,
     CredentialType,
     CredentialVaultType,
     CreditCardCredential,
-    CreditCardCredentialResponse,
     PasswordCredential,
-    PasswordCredentialResponse,
+    SecretCredential,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 
@@ -41,18 +37,18 @@ class AzureCredentialVaultService(CredentialVaultService):
         card_brand: str
         card_holder_name: str
 
+    class _SecretCredentialDataImage(BaseModel):
+        type: Literal["secret"]
+        secret_value: str
+        secret_label: str | None = None
+
     _CredentialDataImage = Annotated[
-        Union[_PasswordCredentialDataImage, _CreditCardCredentialDataImage], Field(discriminator="type")
+        Union[_PasswordCredentialDataImage, _CreditCardCredentialDataImage, _SecretCredentialDataImage],
+        Field(discriminator="type"),
     ]
 
-    def __init__(self, tenant_id: str, client_id: str, client_secret: str, vault_name: str):
-        self._client = AsyncAzureVaultClient(
-            ClientSecretCredential(
-                tenant_id=tenant_id,
-                client_id=client_id,
-                client_secret=client_secret,
-            )
-        )
+    def __init__(self, client: AsyncAzureVaultClient, vault_name: str):
+        self._client = client
         self._vault_name = vault_name
 
     async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
@@ -107,17 +103,6 @@ class AzureCredentialVaultService(CredentialVaultService):
                 error=str(e),
             )
 
-    async def get_credential(self, organization_id: str, credential_id: str) -> CredentialResponse:
-        credential = await app.DATABASE.get_credential(credential_id=credential_id, organization_id=organization_id)
-        if not credential:
-            raise HTTPException(status_code=404, detail="Credential not found")
-
-        return _convert_to_response(credential)
-
-    async def get_credentials(self, organization_id: str, page: int, page_size: int) -> list[CredentialResponse]:
-        credentials = await app.DATABASE.get_credentials(organization_id, page=page, page_size=page_size)
-        return [_convert_to_response(credential) for credential in credentials]
-
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         secret_json_str = await self._client.get_secret(secret_name=db_credential.item_id, vault_name=self._vault_name)
         if secret_json_str is None:
@@ -150,13 +135,20 @@ class AzureCredentialVaultService(CredentialVaultService):
                 name=db_credential.name,
                 credential_type=CredentialType.CREDIT_CARD,
             )
+        elif isinstance(data, AzureCredentialVaultService._SecretCredentialDataImage):
+            return CredentialItem(
+                item_id=db_credential.item_id,
+                credential=SecretCredential(secret_value=data.secret_value, secret_label=data.secret_label),
+                name=db_credential.name,
+                credential_type=CredentialType.SECRET,
+            )
         else:
             raise TypeError(f"Invalid credential type: {type(data)}")
 
     async def _create_azure_secret_item(
         self,
         organization_id: str,
-        credential: PasswordCredential | CreditCardCredential,
+        credential: PasswordCredential | CreditCardCredential | SecretCredential,
     ) -> str:
         if isinstance(credential, PasswordCredential):
             data = AzureCredentialVaultService._PasswordCredentialDataImage(
@@ -175,6 +167,12 @@ class AzureCredentialVaultService(CredentialVaultService):
                 card_brand=credential.card_brand,
                 card_holder_name=credential.card_holder_name,
             )
+        elif isinstance(credential, SecretCredential):
+            data = AzureCredentialVaultService._SecretCredentialDataImage(
+                type="secret",
+                secret_value=credential.secret_value,
+                secret_label=credential.secret_label,
+            )
         else:
             raise TypeError(f"Invalid credential type: {type(credential)}")
 
@@ -186,30 +184,3 @@ class AzureCredentialVaultService(CredentialVaultService):
             secret_name=secret_name,
             secret_value=secret_value,
         )
-
-
-def _convert_to_response(credential: Credential) -> CredentialResponse:
-    if credential.credential_type == CredentialType.PASSWORD:
-        credential_response = PasswordCredentialResponse(
-            username=credential.username or credential.credential_id,
-            totp_type=credential.totp_type,
-        )
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=credential.credential_type,
-            name=credential.name,
-        )
-    elif credential.credential_type == CredentialType.CREDIT_CARD:
-        credential_response = CreditCardCredentialResponse(
-            last_four=credential.card_last4 or "****",
-            brand=credential.card_brand or "Card Brand",
-        )
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=credential.credential_type,
-            name=credential.name,
-        )
-    else:
-        raise HTTPException(status_code=400, detail="Credential type not supported")

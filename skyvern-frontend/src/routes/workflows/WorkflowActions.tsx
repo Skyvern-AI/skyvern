@@ -16,6 +16,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuPortal,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -24,6 +25,8 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import {
+  BookmarkFilledIcon,
+  BookmarkIcon,
   CopyIcon,
   DotsHorizontalIcon,
   DownloadIcon,
@@ -84,12 +87,55 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["folders"],
+      });
       onSuccessfullyDeleted?.();
     },
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
         title: "Failed to delete workflow",
+        description: error.message,
+      });
+    },
+  });
+
+  const templateMutation = useMutation({
+    mutationFn: async ({
+      workflowPermanentId,
+      isTemplate,
+    }: {
+      workflowPermanentId: string;
+      isTemplate: boolean;
+    }) => {
+      // Template endpoint only exists on /v1 (no /api prefix)
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return client.put(
+        `/workflows/${workflowPermanentId}/template?is_template=${isTemplate}`,
+      );
+    },
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["workflows"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["orgTemplates"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflow", variables.workflowPermanentId],
+      });
+      toast({
+        title: variables.isTemplate
+          ? "Saved as template"
+          : "Removed from templates",
+        variant: "success",
+      });
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Failed to update template status",
         description: error.message,
       });
     },
@@ -120,6 +166,26 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
             <CopyIcon className="mr-2 h-4 w-4" />
             Clone Workflow
           </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={() => {
+              templateMutation.mutate({
+                workflowPermanentId: workflow.workflow_permanent_id,
+                isTemplate: !workflow.is_template,
+              });
+            }}
+            className="p-2"
+            disabled={templateMutation.isPending}
+          >
+            {workflow.is_template ? (
+              <BookmarkFilledIcon className="mr-2 h-4 w-4" />
+            ) : (
+              <BookmarkIcon className="mr-2 h-4 w-4" />
+            )}
+            {workflow.is_template
+              ? "Remove from Templates"
+              : "Save as Template"}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
           <DropdownMenuSub>
             <DropdownMenuSubTrigger>
               <DownloadIcon className="mr-2 h-4 w-4" />

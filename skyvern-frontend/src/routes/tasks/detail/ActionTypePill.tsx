@@ -1,5 +1,10 @@
 import { ActionType, ReadableActionTypes } from "@/api/types";
-import { CursorArrowIcon, InputIcon } from "@radix-ui/react-icons";
+import {
+  CursorArrowIcon,
+  HandIcon,
+  DownloadIcon,
+  InputIcon,
+} from "@radix-ui/react-icons";
 
 type Props = {
   actionType: ActionType;
@@ -7,7 +12,9 @@ type Props = {
 
 const icons: Partial<Record<ActionType, React.ReactNode>> = {
   click: <CursorArrowIcon className="h-4 w-4" />,
+  hover: <HandIcon className="h-4 w-4" />,
   input_text: <InputIcon className="h-4 w-4" />,
+  download_file: <DownloadIcon className="h-4 w-4" />,
 };
 
 function ActionTypePill({ actionType }: Props) {

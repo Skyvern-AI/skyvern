@@ -6,19 +6,17 @@ import {
 } from "@/components/ui/accordion";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useCallback } from "react";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
+import { NodeHeader } from "../components/NodeHeader";
+import { NodeTabs } from "../components/NodeTabs";
+import type { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
 import type { HttpRequestNode as HttpRequestNodeType } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Switch } from "@/components/ui/switch";
 import { placeholders, helpTooltips } from "../../helpContent";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
-import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
@@ -33,11 +31,19 @@ import {
 } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { CodeIcon, PlusIcon, MagicWandIcon } from "@radix-ui/react-icons";
+import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 import { CurlImportDialog } from "./CurlImportDialog";
 import { QuickHeadersDialog } from "./QuickHeadersDialog";
 import { MethodBadge, UrlValidator, RequestPreview } from "./HttpUtils";
 import { useRerender } from "@/hooks/useRerender";
+import { useRecordingStore } from "@/store/useRecordingStore";
+import { cn } from "@/util/utils";
 
 const httpMethods = [
   "GET",
@@ -56,17 +62,18 @@ const headersTooltip =
   "HTTP headers to include with the request as JSON object.";
 const bodyTooltip =
   "Request body as JSON object. Only used for POST, PUT, PATCH methods.";
+const filesTooltip =
+  'Files to upload as multipart/form-data. Dictionary mapping field names to file paths/URLs. Supports HTTP/HTTPS URLs, S3 URIs (s3://), Azure blob URIs (azure://), or limited local file access. Example: {"file": "https://example.com/file.pdf"} or {"document": "s3://bucket/path/file.pdf"}';
 const timeoutTooltip = "Request timeout in seconds.";
 const followRedirectsTooltip =
   "Whether to automatically follow HTTP redirects.";
 
-function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
+function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
   const { editable } = data;
-  const [label, setLabel] = useNodeLabelChangeHandler({
+  const [label] = useNodeLabelChangeHandler({
     id,
     initialValue: data.label,
   });
-  const deleteNodeCallback = useDeleteNodeCallback();
   const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
@@ -111,12 +118,41 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
   );
 
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+  const recordingStore = useRecordingStore();
 
   const showBodyEditor =
     data.method !== "GET" && data.method !== "HEAD" && data.method !== "DELETE";
 
+  const handleAddParameterToBody = useCallback(
+    (parameterKey: string) => {
+      const parameterSyntax = `{{ ${parameterKey} }}`;
+      const currentBody = data.body || "{}";
+      try {
+        const parsed = JSON.parse(currentBody);
+        // Add as a new field with unique key
+        const existingKeys = Object.keys(parsed);
+        let keyIndex = existingKeys.length + 1;
+        let newKey = `param_${keyIndex}`;
+        while (existingKeys.includes(newKey)) {
+          keyIndex++;
+          newKey = `param_${keyIndex}`;
+        }
+        parsed[newKey] = parameterSyntax;
+        update({ body: JSON.stringify(parsed, null, 2) });
+      } catch {
+        // If invalid JSON, reset to valid JSON with the parameter
+        update({ body: JSON.stringify({ param_1: parameterSyntax }, null, 2) });
+      }
+    },
+    [data.body, update],
+  );
+
   return (
-    <div>
+    <div
+      className={cn({
+        "pointer-events-none opacity-50": recordingStore.isRecording,
+      })}
+    >
       <Handle
         type="source"
         position={Position.Bottom}
@@ -130,27 +166,14 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
         className="opacity-0"
       />
       <div className="w-[36rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <header className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={WorkflowBlockTypes.HttpRequest}
-                className="size-6"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">HTTP Request Block</span>
-            </div>
-          </div>
-          <div className="flex gap-2">
-            {/* Quick Action Buttons */}
+        <NodeHeader
+          blockLabel={label}
+          editable={editable}
+          nodeId={id}
+          totpIdentifier={null}
+          totpUrl={null}
+          type={type as WorkflowBlockType}
+          extraActions={
             <CurlImportDialog onImport={handleCurlImport}>
               <Button
                 variant="outline"
@@ -162,14 +185,8 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                 Import cURL
               </Button>
             </CurlImportDialog>
-
-            <NodeActionMenu
-              onDelete={() => {
-                deleteNodeCallback(id);
-              }}
-            />
-          </div>
-        </header>
+          }
+        />
 
         <div className="space-y-4">
           {/* Method and URL Section */}
@@ -262,9 +279,30 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
           {/* Body Section */}
           {showBodyEditor && (
             <div className="space-y-2">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">Body</Label>
-                <HelpTooltip content={bodyTooltip} />
+              <div className="flex items-center justify-between">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Body</Label>
+                  <HelpTooltip content={bodyTooltip} />
+                </div>
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      disabled={!editable}
+                    >
+                      <PlusIcon className="mr-1 h-3 w-3" />
+                      Add Parameter
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[22rem]">
+                    <WorkflowBlockParameterSelect
+                      nodeId={id}
+                      onAdd={handleAddParameterToBody}
+                    />
+                  </PopoverContent>
+                </Popover>
               </div>
               <CodeEditor
                 className="w-full"
@@ -280,12 +318,34 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
             </div>
           )}
 
+          {/* Files Section */}
+          {showBodyEditor && (
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">Files</Label>
+                <HelpTooltip content={filesTooltip} />
+              </div>
+              <CodeEditor
+                className="w-full"
+                language="json"
+                value={data.files}
+                onChange={(value) => {
+                  update({ files: value || "{}" });
+                }}
+                readOnly={!editable}
+                minHeight="80px"
+                maxHeight="160px"
+              />
+            </div>
+          )}
+
           {/* Request Preview */}
           <RequestPreview
             method={data.method}
             url={data.url}
             headers={data.headers}
             body={data.body}
+            files={data.files}
           />
         </div>
 
@@ -392,6 +452,11 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                 authentication and content headers
               </li>
               <li>
+                Password credential: {"{{ my_credential.username }}"} /{" "}
+                {"{{ my_credential.password }}"}
+              </li>
+              <li>Secret credential: {"{{ my_secret.secret_value }}"}</li>
+              <li>
                 The request will return response data including status, headers,
                 and body
               </li>
@@ -399,6 +464,8 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
             </ul>
           </div>
         </div>
+
+        <NodeTabs blockLabel={label} />
       </div>
     </div>
   );

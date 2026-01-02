@@ -8,6 +8,10 @@ from .click_action_data import ClickActionData
 
 
 class ClickAction(UniversalBaseModel):
+    """
+    Click action parameters.
+    """
+
     selector: typing.Optional[str] = pydantic.Field(default=None)
     """
     CSS selector for the element

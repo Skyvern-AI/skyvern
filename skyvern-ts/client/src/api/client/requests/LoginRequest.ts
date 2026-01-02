@@ -9,13 +9,9 @@ import type * as Skyvern from "../../index.js";
  *     }
  */
 export interface LoginRequest {
-    /** Where to get the credential from */
-    credential_type: Skyvern.SkyvernSchemasRunBlocksCredentialType;
-    /** Website url */
+    /** Website URL */
     url?: string;
-    /** Login instructions. Skyvern has default prompt/instruction for login if this field is not provided. */
-    prompt?: string;
-    /** Webhook URL to send login status updates */
+    /** Webhook URL to send status updates */
     webhook_url?: string;
     /** Proxy location to use */
     proxy_location?: Skyvern.ProxyLocation;
@@ -25,12 +21,18 @@ export interface LoginRequest {
     totp_url?: string;
     /** ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456` */
     browser_session_id?: string;
+    /** ID of a browser profile to reuse for this run */
+    browser_profile_id?: string;
     /** The CDP address for the task. */
     browser_address?: string;
     /** Additional HTTP headers to include in requests */
     extra_http_headers?: Record<string, string | undefined>;
     /** Maximum number of times to scroll for screenshots */
     max_screenshot_scrolling_times?: number;
+    /** Where to get the credential from */
+    credential_type: Skyvern.SkyvernSchemasRunBlocksCredentialType;
+    /** Login instructions. Skyvern has default prompt/instruction for login if this field is not provided. */
+    prompt?: string;
     /** ID of the Skyvern credential to use for login. */
     credential_id?: string;
     /** Bitwarden collection ID. You can find it in the Bitwarden collection URL. e.g. `https://vault.bitwarden.com/vaults/collection_id/items` */

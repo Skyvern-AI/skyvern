@@ -7,13 +7,24 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 
 
 class HttpRequestBlockYaml(UniversalBaseModel):
-    label: str
+    label: str = pydantic.Field()
+    """
+    Author-facing identifier; must be unique per workflow.
+    """
+
+    next_block_label: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]].
+    """
+
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     method: typing.Optional[str] = None
     url: typing.Optional[str] = None
     headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     body: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    files: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     timeout: typing.Optional[int] = None
     follow_redirects: typing.Optional[bool] = None
     parameter_keys: typing.Optional[typing.List[str]] = None

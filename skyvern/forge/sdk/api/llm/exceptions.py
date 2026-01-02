@@ -1,5 +1,9 @@
 from skyvern.exceptions import SkyvernException
 
+# Exception type name constants
+LLM_PROVIDER_ERROR_TYPE = "LLMProviderError"
+LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE = "LLMProviderErrorRetryableTask"
+
 
 class BaseLLMError(SkyvernException):
     pass
@@ -18,6 +22,11 @@ class EmptyLLMResponseError(BaseLLMError):
 class InvalidLLMResponseFormat(BaseLLMError):
     def __init__(self, response: str) -> None:
         super().__init__(f"LLM response content is not a valid JSON: {response}")
+
+
+class InvalidLLMResponseType(BaseLLMError):
+    def __init__(self, response_type: str) -> None:
+        super().__init__(f"LLM response content is expected to be a dict, but got {response_type}")
 
 
 class DuplicateCustomLLMProviderError(BaseLLMError):

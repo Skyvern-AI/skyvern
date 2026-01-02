@@ -29,11 +29,18 @@ class SkyvernContext:
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
     max_screenshot_scrolls: int | None = None
+    browser_container_ip: str | None = None
+    browser_container_task_arn: str | None = None
 
     # feature flags
     enable_parse_select_in_extract: bool = False
     use_prompt_caching: bool = False
     cached_static_prompt: str | None = None
+    vertex_cache_name: str | None = None  # Vertex AI cache resource name for explicit caching
+    vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
+    vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
+    prompt_caching_settings: dict[str, bool] | None = None
+    enable_speed_optimizations: bool = False
 
     # script run context
     script_id: str | None = None
@@ -55,11 +62,18 @@ class SkyvernContext:
     # next blocks won't consider the page as a magic link page
     magic_link_pages: dict[str, Page] = field(default_factory=dict)
 
+    # parallel verification optimization
+    # stores pre-scraped data for next step to avoid re-scraping
+    next_step_pre_scraped_data: dict[str, Any] | None = None
+    speculative_plans: dict[str, Any] = field(default_factory=dict)
+
     """
     Example output value:
     {"loop_value": "str", "output_parameter": "the key of the parameter", "output_value": Any}
     """
     generate_script: bool = True
+    action_ai_overrides: dict[str, dict[int, str]] = field(default_factory=dict)
+    action_counters: dict[str, int] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id})"

@@ -1,4 +1,4 @@
-"""Utilities for collecting and formatting experiment data for Laminar tracing."""
+"""Utilities for collecting and formatting experiment data for tracing."""
 
 from typing import TYPE_CHECKING, Any
 
@@ -44,7 +44,7 @@ async def collect_experiment_metadata(
         experimentation_provider: The experimentation provider to use for fetching experiment data.
 
     Returns:
-        Dictionary containing experiment data that can be added to Laminar traces.
+        Dictionary containing experiment data that can be added to traces.
     """
     # Get the current context
     context = skyvern_context.current()
@@ -66,7 +66,7 @@ async def collect_experiment_metadata(
             "LLM_NAME",
             "LLM_SECONDARY_NAME",
             # Add more experiment flags as needed
-            "PROMPT_CACHING_ENABLED",
+            "PROMPT_CACHING_OPTIMIZATION",
             "THINKING_BUDGET_OPTIMIZATION",
         ]
 

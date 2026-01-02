@@ -3,11 +3,15 @@
 import type * as Skyvern from "../index.js";
 
 export interface SendEmailBlock {
+    /** Author-facing identifier for a block; unique within a workflow. */
     label: string;
+    /** Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted. */
+    next_block_label?: string;
     output_parameter: Skyvern.OutputParameter;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    next_loop_on_failure?: boolean;
     smtp_host: Skyvern.AwsSecretParameter;
     smtp_port: Skyvern.AwsSecretParameter;
     smtp_username: Skyvern.AwsSecretParameter;

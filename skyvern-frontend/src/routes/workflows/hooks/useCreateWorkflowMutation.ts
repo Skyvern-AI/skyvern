@@ -29,6 +29,9 @@ function useCreateWorkflowMutation() {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["folders"],
+      });
       navigate(`/workflows/${response.data.workflow_permanent_id}/debug`);
     },
   });

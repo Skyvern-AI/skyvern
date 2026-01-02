@@ -1,7 +1,7 @@
 import { AxiosError } from "axios";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
-import { useForm } from "react-hook-form";
+import { type FieldErrors, useForm } from "react-hook-form";
 import { useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
@@ -42,13 +42,14 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
-import { apiBaseUrl } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
+import * as env from "@/util/env";
 
 // Utility function to omit specified keys from an object
 function omit<T extends Record<string, unknown>, K extends keyof T>(
@@ -98,6 +99,34 @@ function parseValuesForWorkflowRun(
       ) {
         return [key, value.s3uri];
       }
+      // Convert boolean values to strings for backend storage
+      if (
+        parameter?.workflow_parameter_type === "boolean" &&
+        typeof value === "boolean"
+      ) {
+        return [key, String(value)];
+      }
+      if (parameter?.workflow_parameter_type === "string") {
+        if (value === null || value === undefined) {
+          return [key, ""];
+        }
+        return [key, String(value)];
+      }
+
+      if (
+        parameter?.workflow_parameter_type === "integer" ||
+        parameter?.workflow_parameter_type === "float"
+      ) {
+        if (
+          value === null ||
+          value === undefined ||
+          (typeof value === "number" && Number.isNaN(value))
+        ) {
+          return [key, ""];
+        }
+        return [key, String(value)];
+      }
+
       return [key, value];
     }),
   );
@@ -167,6 +196,25 @@ function getRunWorkflowRequestBody(
   return body;
 }
 
+// Transform RunWorkflowRequestBody to match WorkflowRunRequest schema for Runs API v2
+function transformToWorkflowRunRequest(
+  body: RunWorkflowRequestBody,
+  workflowId: string,
+) {
+  const { data, webhook_callback_url, ...rest } = body;
+  const transformed: Record<string, unknown> = {
+    workflow_id: workflowId,
+    parameters: data,
+    ...rest,
+  };
+
+  if (webhook_callback_url) {
+    transformed.webhook_url = webhook_callback_url;
+  }
+
+  return transformed;
+}
+
 type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
@@ -191,10 +239,12 @@ function RunWorkflowForm({
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
 
   const form = useForm<RunWorkflowFormType>({
+    mode: "onTouched",
+    reValidateMode: "onChange",
     defaultValues: {
       ...initialValues,
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
-      proxyLocation: initialSettings.proxyLocation,
+      proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
@@ -228,7 +278,9 @@ function RunWorkflowForm({
         queryKey: ["runs"],
       });
       navigate(
-        `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
+        env.useNewRunsUrl
+          ? `/runs/${response.data.workflow_run_id}`
+          : `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
       );
     },
     onError: (error: AxiosError) => {
@@ -246,6 +298,7 @@ function RunWorkflowForm({
     unknown
   > | null>(null);
   const [cacheKeyValue, setCacheKeyValue] = useState<string>("");
+  const [isFormReset, setIsFormReset] = useState(false);
   const cacheKey = workflow?.cache_key ?? "default";
 
   useEffect(() => {
@@ -275,10 +328,41 @@ function RunWorkflowForm({
     setHasCode(Object.keys(blockScripts ?? {}).length > 0);
   }, [blockScripts]);
 
+  // Watch form changes and update run parameters without triggering validation
   useEffect(() => {
-    onChange(form.getValues());
+    const subscription = form.watch((values) => {
+      onChange(values as RunWorkflowFormType);
+    });
+    return () => subscription.unsubscribe();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form]);
+  }, []);
+
+  // Reset form with initial values after all fields are registered
+  useEffect(() => {
+    form.reset({
+      ...initialValues,
+      webhookCallbackUrl: initialSettings.webhookCallbackUrl,
+      proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
+      browserSessionId: null,
+      cdpAddress: initialSettings.cdpAddress,
+      maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
+      extraHttpHeaders: initialSettings.extraHttpHeaders
+        ? JSON.stringify(initialSettings.extraHttpHeaders)
+        : null,
+      runWithCode: workflow?.run_with === "code",
+      aiFallback: workflow?.ai_fallback ?? true,
+    });
+    setIsFormReset(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Trigger validation after form is reset and re-rendered
+  useEffect(() => {
+    if (isFormReset) {
+      form.trigger();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isFormReset]);
 
   // if we're coming from debugger, block scripts may already be cached; let's ensure we bust it
   // on mount
@@ -338,6 +422,22 @@ function RunWorkflowForm({
     setRunParameters(parsedParameters);
   }
 
+  const handleInvalid = (errors: FieldErrors<RunWorkflowFormType>) => {
+    const hasBlockingErrors = workflowParameters.some(
+      (param) =>
+        (param.workflow_parameter_type === "boolean" ||
+          param.workflow_parameter_type === "integer" ||
+          param.workflow_parameter_type === "float" ||
+          param.workflow_parameter_type === "file_url" ||
+          param.workflow_parameter_type === "json") &&
+        errors[param.key],
+    );
+
+    if (!hasBlockingErrors) {
+      onSubmit(form.getValues());
+    }
+  };
+
   if (!workflowPermanentId || !workflow) {
     return <div>Invalid workflow</div>;
   }
@@ -345,8 +445,7 @@ function RunWorkflowForm({
   return (
     <Form {...form}>
       <form
-        onChange={form.handleSubmit(onChange)}
-        onSubmit={form.handleSubmit(onSubmit)}
+        onSubmit={form.handleSubmit(onSubmit, handleInvalid)}
         className="space-y-8"
       >
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
@@ -361,19 +460,74 @@ function RunWorkflowForm({
                 name={parameter.key}
                 rules={{
                   validate: (value) => {
-                    if (
-                      parameter.workflow_parameter_type === "json" &&
-                      typeof value === "string"
-                    ) {
-                      try {
-                        JSON.parse(value);
-                        return true;
-                      } catch (e) {
-                        return "Invalid JSON";
+                    if (parameter.workflow_parameter_type === "json") {
+                      if (value === null || value === undefined) {
+                        return "This field is required";
                       }
+                      if (typeof value === "string") {
+                        const trimmed = value.trim();
+                        if (trimmed === "") {
+                          return "This field is required";
+                        }
+                        try {
+                          JSON.parse(trimmed);
+                          return true;
+                        } catch (e) {
+                          return "Invalid JSON";
+                        }
+                      }
+                      return;
                     }
-                    if (value === null) {
-                      return "This field is required";
+
+                    // Boolean parameters are required - show error and block submission
+                    if (parameter.workflow_parameter_type === "boolean") {
+                      if (value === null || value === undefined) {
+                        return "This field is required";
+                      }
+                      return;
+                    }
+
+                    // Numeric parameters are required - show error and block submission
+                    if (
+                      parameter.workflow_parameter_type === "integer" ||
+                      parameter.workflow_parameter_type === "float"
+                    ) {
+                      if (
+                        value === null ||
+                        value === undefined ||
+                        Number.isNaN(value)
+                      ) {
+                        return "This field is required";
+                      }
+                      return;
+                    }
+
+                    if (parameter.workflow_parameter_type === "file_url") {
+                      if (
+                        value === null ||
+                        value === undefined ||
+                        (typeof value === "string" && value.trim() === "") ||
+                        (typeof value === "object" &&
+                          value !== null &&
+                          "s3uri" in value &&
+                          !value.s3uri)
+                      ) {
+                        return "This field is required";
+                      }
+                      return;
+                    }
+
+                    // For string parameters, show warning but don't block
+                    if (
+                      parameter.workflow_parameter_type === "string" &&
+                      (value === null || value === "")
+                    ) {
+                      return "Warning: you left this field empty";
+                    }
+
+                    // For all other non-boolean types, show warning but don't block
+                    if (value === null || value === undefined) {
+                      return "Warning: you left this field empty";
                     }
                   },
                 }}
@@ -381,7 +535,7 @@ function RunWorkflowForm({
                   return (
                     <FormItem>
                       <div className="flex gap-16">
-                        <FormLabel>
+                        <FormLabel className="!text-slate-50">
                           <div className="w-72">
                             <div className="flex items-center gap-2 text-lg">
                               {parameter.key}
@@ -401,11 +555,27 @@ function RunWorkflowForm({
                             <WorkflowParameterInput
                               type={parameter.workflow_parameter_type}
                               value={field.value}
-                              onChange={field.onChange}
+                              onChange={(value) => {
+                                field.onChange(value);
+                                form.trigger(parameter.key);
+                              }}
                             />
                           </FormControl>
                           {form.formState.errors[parameter.key] && (
-                            <div className="text-destructive">
+                            <div
+                              className={`text-xs ${
+                                parameter.workflow_parameter_type ===
+                                  "boolean" ||
+                                parameter.workflow_parameter_type ===
+                                  "integer" ||
+                                parameter.workflow_parameter_type === "float" ||
+                                parameter.workflow_parameter_type ===
+                                  "file_url" ||
+                                parameter.workflow_parameter_type === "json"
+                                  ? "text-destructive"
+                                  : "text-warning"
+                              }`}
+                            >
                               {form.formState.errors[parameter.key]?.message}
                             </div>
                           )}
@@ -807,14 +977,22 @@ function RunWorkflowForm({
                 values,
                 workflowParameters,
               );
+              const transformedBody = transformToWorkflowRunRequest(
+                body,
+                workflowPermanentId,
+              );
+
+              // Build headers - x-max-steps-override is optional and can be added manually if needed
+              const headers: Record<string, string> = {
+                "Content-Type": "application/json",
+                "x-api-key": apiCredential ?? "<your-api-key>",
+              };
+
               return {
                 method: "POST",
-                url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-                body,
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                },
+                url: `${runsApiBaseUrl}/run/workflows`,
+                body: transformedBody,
+                headers,
               } satisfies ApiCommandOptions;
             }}
           />

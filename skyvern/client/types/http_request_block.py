@@ -11,15 +11,26 @@ from .output_parameter import OutputParameter
 
 
 class HttpRequestBlock(UniversalBaseModel):
-    label: str
+    label: str = pydantic.Field()
+    """
+    Author-facing identifier for a block; unique within a workflow.
+    """
+
+    next_block_label: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted.
+    """
+
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
     method: typing.Optional[str] = None
     url: typing.Optional[str] = None
     headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     body: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    files: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     timeout: typing.Optional[int] = None
     follow_redirects: typing.Optional[bool] = None
     parameters: typing.Optional[typing.List[HttpRequestBlockParametersItem]] = None

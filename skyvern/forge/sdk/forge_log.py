@@ -1,4 +1,5 @@
 import logging
+from types import TracebackType
 
 import structlog
 from structlog.typing import EventDict
@@ -45,6 +46,10 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
             event_dict["task_v2_id"] = context.task_v2_id
         if context.browser_session_id:
             event_dict["browser_session_id"] = context.browser_session_id
+        if context.browser_container_ip:
+            event_dict["browser_container_ip"] = context.browser_container_ip
+        if context.browser_container_task_arn:
+            event_dict["browser_container_task_arn"] = context.browser_container_task_arn
 
     # Add env to the log
     event_dict["env"] = settings.ENV
@@ -117,6 +122,154 @@ class CustomConsoleRenderer(structlog.dev.ConsoleRenderer):
             return f"{file_section_colored} {rendered}"
 
 
+def add_error_processor(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """
+    A custom processor extending error logs with additional info
+    """
+    import sys  # noqa: PLC0415
+
+    exc_info = event_dict.get("exc_info")
+
+    if exc_info:
+        if exc_info is True:
+            exc_info = sys.exc_info()
+
+        if isinstance(exc_info, tuple) and len(exc_info) >= 2:
+            exc_type = exc_info[0]
+            exc_traceback: TracebackType | None = exc_info[2] if len(exc_info) >= 3 else None
+
+            if exc_type is not None:
+                # Get the fully qualified exception name (module.ClassName)
+                error_type = (
+                    f"{exc_type.__module__}.{exc_type.__name__}"
+                    if hasattr(exc_type, "__module__")
+                    else exc_type.__name__
+                )
+                event_dict["error_type"] = error_type
+
+                # Categorize the exception
+                category = _categorize_exception(exc_type, exc_type.__name__)
+                event_dict["error_category"] = category
+
+                # Generate exception hash from stack trace (stable identifier)
+                if exc_traceback is not None:
+                    exc_hash = _generate_exception_hash(exc_type, exc_traceback)
+                    event_dict["exception_hash"] = exc_hash
+
+    return event_dict
+
+
+def _generate_exception_hash(exc_type: type, tb: TracebackType) -> str:
+    """
+    Generate a stable hash for an exception based on:
+    - Exception type
+    - Stack trace (filename, line number, function name)
+
+    Excludes dynamic data like error messages to ensure the same
+    error from the same location always produces the same hash.
+    """
+    import hashlib  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    hasher = hashlib.sha256()
+
+    hasher.update(f"{exc_type.__module__}.{exc_type.__name__}".encode())
+
+    current_tb: TracebackType | None = tb
+    while current_tb is not None:
+        frame = current_tb.tb_frame
+        code = frame.f_code
+
+        filename = Path(code.co_filename).name
+        lineno = current_tb.tb_lineno
+        func_name = code.co_name
+        hasher.update(f"{filename}:{lineno}:{func_name}".encode())
+
+        current_tb = current_tb.tb_next
+
+    return hasher.hexdigest()[:16]
+
+
+def _categorize_exception(exc_type: type, exc_name: str) -> str:
+    """
+    Categorize an exception into TRANSIENT, BUG, or ERROR.
+
+    TRANSIENT: Network/IO errors that might succeed on retry
+    BUG: Programming errors indicating bugs
+    ERROR: Everything else
+    """
+    # Check if it's a subclass of known exception types
+    # TRANSIENT - IO and network related errors
+    transient_exceptions = (
+        IOError,
+        OSError,
+        ConnectionError,
+        TimeoutError,
+        ConnectionRefusedError,
+        ConnectionAbortedError,
+        ConnectionResetError,
+        BrokenPipeError,
+    )
+
+    # BUG - Programming errors that indicate bugs
+    bug_exceptions = (
+        ZeroDivisionError,
+        AttributeError,
+        TypeError,
+        KeyError,
+        IndexError,
+        NameError,
+        AssertionError,
+        NotImplementedError,
+        RecursionError,
+        UnboundLocalError,
+        IndentationError,
+        SyntaxError,
+    )
+
+    # Check for common HTTP/network library exceptions by name
+    # (to avoid import dependencies)
+    transient_patterns = [
+        "HTTPError",
+        "RequestException",
+        "Timeout",
+        "ConnectionError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "ProxyError",
+        "SSLError",
+        "ChunkedEncodingError",
+        "ContentDecodingError",
+        "StreamConsumedError",
+        "RetryError",
+        "MaxRetryError",
+        "URLError",
+        "ProtocolError",
+    ]
+
+    # Check if exception is a subclass of transient exceptions
+    try:
+        if issubclass(exc_type, transient_exceptions):
+            return "TRANSIENT"
+    except TypeError:
+        pass
+
+    # Check if exception is a subclass of bug exceptions
+    try:
+        if issubclass(exc_type, bug_exceptions):
+            return "BUG"
+    except TypeError:
+        pass
+
+    # Check exception name against patterns
+    for pattern in transient_patterns:
+        if pattern in exc_name:
+            return "TRANSIENT"
+
+    # Default to ERROR for everything else
+    return "ERROR"
+
+
 def setup_logger() -> None:
     """
     Setup the logger with the specified format
@@ -155,7 +308,7 @@ def setup_logger() -> None:
         processors=[
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
-            # structlog.processors.dict_tracebacks,
+            add_error_processor,
             structlog.processors.format_exc_info,
         ]
         + additional_processors

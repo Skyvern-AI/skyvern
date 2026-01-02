@@ -18,7 +18,7 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.utils.url_validators import validate_url
 
 
@@ -69,7 +69,7 @@ class TaskBase(BaseModel):
             }
         ],
     )
-    proxy_location: ProxyLocation | None = Field(
+    proxy_location: ProxyLocationInput = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING,
     )
@@ -154,8 +154,8 @@ class TaskRequest(TaskBase):
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
     def validate_optional_urls(cls, url: str | None) -> str | None:
-        if url is None:
-            return None
+        if not url:
+            return url
 
         return validate_url(url)
 
@@ -323,7 +323,7 @@ class Task(TaskBase):
             raise ValueError(f"status_requires_failure_reason({status},{self.task_id}")
 
         if status.requires_extracted_info() and self.data_extraction_goal and extracted_information is None:
-            raise ValueError(f"status_requires_extracted_information({status},{self.task_id}")
+            raise ValueError(f"status_requires_extracted_information({status},{self.task_id})")
 
         if status.cant_have_extracted_info() and extracted_information is not None:
             raise ValueError(f"status_cant_have_extracted_information({self.task_id})")
@@ -397,9 +397,16 @@ class TaskOutput(BaseModel):
     errors: list[dict[str, Any]] = []
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None  # For backward compatibility
+    task_screenshots: list[str] | None = None
+    workflow_screenshots: list[str] | None = None
 
     @staticmethod
-    def from_task(task: Task, downloaded_files: list[FileInfo] | None = None) -> TaskOutput:
+    def from_task(
+        task: Task,
+        downloaded_files: list[FileInfo] | None = None,
+        task_screenshots: list[str] | None = None,
+        workflow_screenshots: list[str] | None = None,
+    ) -> TaskOutput:
         # For backward compatibility, extract just the URLs from FileInfo objects
         downloaded_file_urls = [file_info.url for file_info in downloaded_files] if downloaded_files else None
 
@@ -411,6 +418,8 @@ class TaskOutput(BaseModel):
             errors=task.errors,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
+            task_screenshots=task_screenshots,
+            workflow_screenshots=workflow_screenshots,
         )
 
 

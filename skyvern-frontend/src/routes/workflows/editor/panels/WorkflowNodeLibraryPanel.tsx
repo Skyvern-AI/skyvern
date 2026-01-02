@@ -84,20 +84,24 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Validation Block",
-    description: "Validate completion criteria",
+    title: "AI or Human Validation",
+    description: "Have an AI or Human validate the state of the screen",
   },
-  {
-    nodeType: "human_interaction",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.HumanInteraction}
-        className="size-6"
-      />
-    ),
-    title: "Human Interaction Block",
-    description: "Validate via human interaction",
-  },
+  /**
+   * The Human Interaction block can be had via a transmutation of the
+   * Validation block.
+   */
+  // {
+  //   nodeType: "human_interaction",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.HumanInteraction}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "Human Interaction Block",
+  //   description: "Validate via human interaction",
+  // },
   // {
   //   nodeType: "task",
   //   icon: (
@@ -130,6 +134,17 @@ const nodeLibraryItems: Array<{
     ),
     title: "Text Prompt Block",
     description: "Process text with LLM",
+  },
+  {
+    nodeType: "conditional",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Conditional}
+        className="size-6"
+      />
+    ),
+    title: "Conditional Block",
+    description: "Branch execution based on conditions",
   },
   {
     nodeType: "sendEmail",
@@ -370,39 +385,44 @@ function WorkflowNodeLibraryPanel({
           <ScrollAreaViewport className="h-full">
             <div className="space-y-2">
               {filteredItems.length > 0 ? (
-                filteredItems.map((item) => (
-                  <div
-                    key={item.nodeType}
-                    className="flex cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
-                    onClick={() => {
-                      onNodeClick({
-                        nodeType: item.nodeType,
-                        next: workflowPanelData?.next ?? null,
-                        parent: workflowPanelData?.parent,
-                        previous: workflowPanelData?.previous ?? null,
-                        connectingEdgeType:
-                          workflowPanelData?.connectingEdgeType ??
-                          "edgeWithAddButton",
-                      });
-                      closeWorkflowPanel();
-                    }}
-                  >
-                    <div className="flex gap-2">
-                      <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
-                        {item.icon}
+                filteredItems.map((item) => {
+                  const itemContent = (
+                    <div
+                      key={item.nodeType}
+                      className={`flex items-center justify-between rounded-sm bg-slate-elevation4 p-4 ${"cursor-pointer hover:bg-slate-elevation5"}`}
+                      onClick={() => {
+                        onNodeClick({
+                          nodeType: item.nodeType,
+                          next: workflowPanelData?.next ?? null,
+                          parent: workflowPanelData?.parent,
+                          previous: workflowPanelData?.previous ?? null,
+                          connectingEdgeType:
+                            workflowPanelData?.connectingEdgeType ??
+                            "edgeWithAddButton",
+                          branch: workflowPanelData?.branchContext,
+                        });
+                        closeWorkflowPanel();
+                      }}
+                    >
+                      <div className="flex gap-2">
+                        <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
+                          {item.icon}
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <span className="max-w-64 truncate text-base">
+                            {item.title}
+                          </span>
+                          <span className="text-xs text-slate-400">
+                            {item.description}
+                          </span>
+                        </div>
                       </div>
-                      <div className="flex flex-col gap-1">
-                        <span className="max-w-64 truncate text-base">
-                          {item.title}
-                        </span>
-                        <span className="text-xs text-slate-400">
-                          {item.description}
-                        </span>
-                      </div>
+                      <PlusIcon className="size-6 shrink-0" />
                     </div>
-                    <PlusIcon className="size-6 shrink-0" />
-                  </div>
-                ))
+                  );
+
+                  return itemContent;
+                })
               ) : (
                 <div className="p-4 text-center text-sm text-slate-400">
                   No results found

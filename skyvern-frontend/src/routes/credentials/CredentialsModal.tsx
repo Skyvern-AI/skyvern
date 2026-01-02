@@ -10,6 +10,7 @@ import {
   CredentialModalTypes,
 } from "./useCredentialModalState";
 import { PasswordCredentialContent } from "./PasswordCredentialContent";
+import { SecretCredentialContent } from "./SecretCredentialContent";
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { CreditCardCredentialContent } from "./CreditCardCredentialContent";
@@ -28,6 +29,7 @@ const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   password: "",
   totp: "",
   totp_type: "none" as "none" | "authenticator" | "email" | "text",
+  totp_identifier: "",
 };
 
 const CREDIT_CARD_CREDENTIAL_INITIAL_VALUES = {
@@ -37,6 +39,12 @@ const CREDIT_CARD_CREDENTIAL_INITIAL_VALUES = {
   cardCode: "",
   cardBrand: "",
   cardHolderName: "",
+};
+
+const SECRET_CREDENTIAL_INITIAL_VALUES = {
+  name: "",
+  secretLabel: "",
+  secretValue: "",
 };
 
 // Function to generate a unique credential name
@@ -65,12 +73,17 @@ function CredentialsModal({ onCredentialCreated }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { isOpen, type, setIsOpen } = useCredentialModalState();
-  const { data: credentials } = useCredentialsQuery();
+  const { data: credentials } = useCredentialsQuery({
+    page_size: 100,
+  });
   const [passwordCredentialValues, setPasswordCredentialValues] = useState(
     PASSWORD_CREDENTIAL_INITIAL_VALUES,
   );
   const [creditCardCredentialValues, setCreditCardCredentialValues] = useState(
     CREDIT_CARD_CREDENTIAL_INITIAL_VALUES,
+  );
+  const [secretCredentialValues, setSecretCredentialValues] = useState(
+    SECRET_CREDENTIAL_INITIAL_VALUES,
   );
 
   // Set default name when modal opens
@@ -87,12 +100,17 @@ function CredentialsModal({ onCredentialCreated }: Props) {
         ...prev,
         name: defaultName,
       }));
+      setSecretCredentialValues((prev) => ({
+        ...prev,
+        name: defaultName,
+      }));
     }
   }, [isOpen, credentials]);
 
   function reset() {
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
     setCreditCardCredentialValues(CREDIT_CARD_CREDENTIAL_INITIAL_VALUES);
+    setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
   }
 
   const createCredentialMutation = useMutation({
@@ -127,7 +145,9 @@ function CredentialsModal({ onCredentialCreated }: Props) {
     const name =
       type === CredentialModalTypes.PASSWORD
         ? passwordCredentialValues.name.trim()
-        : creditCardCredentialValues.name.trim();
+        : type === CredentialModalTypes.CREDIT_CARD
+          ? creditCardCredentialValues.name.trim()
+          : secretCredentialValues.name.trim();
     if (name === "") {
       toast({
         title: "Error",
@@ -141,6 +161,7 @@ function CredentialsModal({ onCredentialCreated }: Props) {
       const username = passwordCredentialValues.username.trim();
       const password = passwordCredentialValues.password.trim();
       const totp = passwordCredentialValues.totp.trim();
+      const totpIdentifier = passwordCredentialValues.totp_identifier.trim();
 
       if (username === "" || password === "") {
         toast({
@@ -158,6 +179,7 @@ function CredentialsModal({ onCredentialCreated }: Props) {
           password,
           totp: totp === "" ? null : totp,
           totp_type: passwordCredentialValues.totp_type,
+          totp_identifier: totpIdentifier === "" ? null : totpIdentifier,
         },
       });
     } else if (type === CredentialModalTypes.CREDIT_CARD) {
@@ -216,8 +238,54 @@ function CredentialsModal({ onCredentialCreated }: Props) {
           card_holder_name: cardHolderName,
         },
       });
+    } else if (type === CredentialModalTypes.SECRET) {
+      const secretValue = secretCredentialValues.secretValue.trim();
+      const secretLabel = secretCredentialValues.secretLabel.trim();
+
+      if (secretValue === "") {
+        toast({
+          title: "Error",
+          description: "Secret value is required",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      createCredentialMutation.mutate({
+        name,
+        credential_type: "secret",
+        credential: {
+          secret_value: secretValue,
+          secret_label: secretLabel === "" ? null : secretLabel,
+        },
+      });
     }
   };
+
+  const credentialContent = (() => {
+    if (type === CredentialModalTypes.PASSWORD) {
+      return (
+        <PasswordCredentialContent
+          values={passwordCredentialValues}
+          onChange={setPasswordCredentialValues}
+        />
+      );
+    }
+    if (type === CredentialModalTypes.CREDIT_CARD) {
+      return (
+        <CreditCardCredentialContent
+          values={creditCardCredentialValues}
+          onChange={setCreditCardCredentialValues}
+        />
+      );
+    }
+    return (
+      <SecretCredentialContent
+        values={secretCredentialValues}
+        onChange={setSecretCredentialValues}
+      />
+    );
+  })();
 
   return (
     <Dialog
@@ -233,17 +301,7 @@ function CredentialsModal({ onCredentialCreated }: Props) {
         <DialogHeader>
           <DialogTitle className="font-bold">Add Credential</DialogTitle>
         </DialogHeader>
-        {type === CredentialModalTypes.PASSWORD ? (
-          <PasswordCredentialContent
-            values={passwordCredentialValues}
-            onChange={setPasswordCredentialValues}
-          />
-        ) : (
-          <CreditCardCredentialContent
-            values={creditCardCredentialValues}
-            onChange={setCreditCardCredentialValues}
-          />
-        )}
+        {credentialContent}
         <DialogFooter>
           <Button
             onClick={handleSave}

@@ -9,6 +9,10 @@ from .extract_action_extract_schema import ExtractActionExtractSchema
 
 
 class ExtractAction(UniversalBaseModel):
+    """
+    Extract data action parameters.
+    """
+
     prompt: typing.Optional[str] = pydantic.Field(default=None)
     """
     Extraction prompt

@@ -20,7 +20,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
-from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -37,7 +37,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, RunEngine, RunType, TaskRunRequest, TaskRunResponse
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     PARAMETER_YAML_TYPES,
@@ -55,14 +55,16 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
-from skyvern.webeye.browser_factory import BrowserState
-from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
+from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 RANDOM_STRING_POOL = string.ascii_letters + string.digits
-DEFAULT_MAX_ITERATIONS = 13
+# Maximum number of planning iterations for TaskV2
+# This limits how many times the LLM can plan and execute actions
+DEFAULT_MAX_ITERATIONS = 50
 
 MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete:
 ```{mini_goal}```
@@ -148,7 +150,7 @@ async def initialize_task_v2(
     organization: Organization,
     user_prompt: str,
     user_url: str | None = None,
-    proxy_location: ProxyLocation | None = None,
+    proxy_location: ProxyLocationInput = None,
     totp_identifier: str | None = None,
     totp_verification_url: str | None = None,
     webhook_callback_url: str | None = None,
@@ -553,7 +555,9 @@ async def run_task_v2_helper(
     current_url: str | None = None
 
     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-        workflow_run=workflow_run, browser_session_id=browser_session_id
+        workflow_run=workflow_run,
+        browser_session_id=browser_session_id,
+        browser_profile_id=workflow_run.browser_profile_id,
     )
 
     page = await browser_state.get_working_page()
@@ -572,6 +576,10 @@ async def run_task_v2_helper(
     url = str(task_v2.url)
 
     max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
+
+    # When TaskV2 is inside a loop, each loop iteration should get fresh attempts
+    # This is managed at the ForLoop level by calling run_task_v2 for each iteration
+    # The DEFAULT_MAX_ITERATIONS limit applies to this single TaskV2 execution
     for i in range(DEFAULT_MAX_ITERATIONS):
         # validate the task execution
         await app.AGENT_FUNCTION.validate_task_execution(
@@ -609,7 +617,9 @@ async def run_task_v2_helper(
         # Always ensure browser_state is available at the start of the loop
         fallback_url = settings.TASK_BLOCKED_SITE_FALLBACK_URL
         browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-            workflow_run=workflow_run, browser_session_id=browser_session_id
+            workflow_run=workflow_run,
+            browser_session_id=browser_session_id,
+            browser_profile_id=workflow_run.browser_profile_id,
         )
 
         fallback_occurred = False
@@ -623,6 +633,7 @@ async def run_task_v2_helper(
                     script_id=task_v2.script_id,
                     organization_id=organization_id,
                     extra_http_headers=task_v2.extra_http_headers,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
             else:
                 await browser_state.navigate_to_url(page, url)
@@ -646,7 +657,7 @@ async def run_task_v2_helper(
                 # Page failed to load properly, fallback to Google
                 if page:
                     try:
-                        await page.goto(fallback_url, timeout=15000)
+                        await page.goto(fallback_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                         fallback_occurred = True
                     except Exception:
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
@@ -671,10 +682,9 @@ async def run_task_v2_helper(
                 )
         else:
             try:
-                scraped_page = await scrape_website(
-                    browser_state,
-                    url,
-                    app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                scraped_page = await browser_state.scrape_website(
+                    url=url,
+                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
                     scrape_exclude=app.scrape_exclude,
                 )
                 if page is None:
@@ -895,11 +905,11 @@ async def run_task_v2_helper(
                     workflow_run=workflow_run,
                     url=url,
                     browser_session_id=browser_session_id,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
-                scraped_page = await scrape_website(
-                    browser_state,
-                    url,
-                    app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                scraped_page = await browser_state.scrape_website(
+                    url=url,
+                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
                     scrape_exclude=app.scrape_exclude,
                 )
                 completion_screenshots = scraped_page.screenshots
@@ -980,17 +990,16 @@ async def run_task_v2_helper(
             )
             return workflow, workflow_run, task_v2
     else:
+        # Loop completed without early exit - task exceeded max iterations
         LOG.info(
-            "Task v2 failed - run out of iterations",
+            "Task v2 failed - exceeded maximum iterations",
             max_iterations=DEFAULT_MAX_ITERATIONS,
-            max_steps=max_steps,
             workflow_run_id=workflow_run_id,
         )
-        failure_reason = await _summarize_max_steps_failure_reason(task_v2, organization_id, browser_state)
         task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
-            failure_reason=f"Max iterations reached. Possible failure reasons: {failure_reason}",
+            failure_reason=f"Task exceeded maximum of {DEFAULT_MAX_ITERATIONS} planning iterations. Consider simplifying the task or breaking it into smaller steps.",
             organization_id=organization_id,
         )
 
@@ -1087,6 +1096,8 @@ async def _set_up_workflow_context(workflow: Workflow, workflow_run_id: str, org
         workflow_output_parameters,
         [],
         [],
+        None,
+        workflow,
     )
 
 
@@ -1516,7 +1527,7 @@ async def mark_task_v2_as_failed(
             workflow_run_id, failure_reason=failure_reason or "Skyvern task 2.0 failed"
         )
 
-    # Add task failure tag to Laminar trace
+    # Add task failure tag to trace
     TraceManager.add_task_completion_tag("failed")
 
     await send_task_v2_webhook(task_v2)
@@ -1540,7 +1551,7 @@ async def mark_task_v2_as_completed(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
-    # Add task completion tag to Laminar trace
+    # Add task completion tag to trace
     TraceManager.add_task_completion_tag("completed")
 
     await send_task_v2_webhook(task_v2)
@@ -1560,7 +1571,7 @@ async def mark_task_v2_as_canceled(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
 
-    # Add task canceled tag to Laminar trace
+    # Add task canceled tag to trace
     TraceManager.add_task_completion_tag("canceled")
 
     await send_task_v2_webhook(task_v2)
@@ -1581,7 +1592,7 @@ async def mark_task_v2_as_terminated(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(workflow_run_id, failure_reason)
 
-    # Add task terminated tag to Laminar trace
+    # Add task terminated tag to trace
     TraceManager.add_task_completion_tag("terminated")
 
     await send_task_v2_webhook(task_v2)
@@ -1602,7 +1613,7 @@ async def mark_task_v2_as_timed_out(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
 
-    # Add task timed out tag to Laminar trace
+    # Add task timed out tag to trace
     TraceManager.add_task_completion_tag("timed_out")
 
     await send_task_v2_webhook(task_v2)
@@ -1758,11 +1769,8 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
             )
 
     app_url = None
-    if task_v2.workflow_run_id and task_v2.workflow_permanent_id:
-        app_url = (
-            f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
-            f"{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}"
-        )
+    if task_v2.workflow_run_id:
+        app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{task_v2.workflow_run_id}"
 
     return TaskRunResponse(
         run_id=task_v2.observer_cruise_id,
@@ -1817,18 +1825,23 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         payload_json = task_v2.model_dump_json(by_alias=True)
         payload_dict = json.loads(payload_json)
         payload_dict.update(json.loads(task_run_response_json))
-        payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
-        headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
+        signed_data = generate_skyvern_webhook_signature(payload=payload_dict, api_key=api_key.token)
+        payload = signed_data.signed_payload
+        headers = signed_data.headers
         LOG.info(
             "Sending task v2 response to webhook callback url",
             task_v2_id=task_v2.observer_cruise_id,
             webhook_callback_url=task_v2.webhook_callback_url,
-            payload=payload,
-            headers=headers,
+            payload_length=len(payload),
+            header_keys=sorted(headers.keys()),
         )
-        resp = await httpx.AsyncClient().post(
-            task_v2.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
-        )
+        timeout = httpx.Timeout(30.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                task_v2.webhook_callback_url,
+                data=payload,
+                headers=headers,
+            )
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Task v2 webhook sent successfully",

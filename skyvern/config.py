@@ -1,7 +1,11 @@
+import logging
+import platform
+from typing import Any
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
-from skyvern.constants import SKYVERN_DIR
+from skyvern.constants import REPO_ROOT_DIR, SKYVERN_DIR
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 # NOTE: _DEFAULT_ENV_FILES resolves .env paths at import time and assumes
@@ -14,6 +18,9 @@ _DEFAULT_ENV_FILES = (
     resolve_backend_env_path(".env.staging"),
     resolve_backend_env_path(".env.prod"),
 )
+
+
+LOG = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -32,9 +39,10 @@ class Settings(BaseSettings):
     HAR_PATH: str | None = "./har"
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"
+    DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
-    BROWSER_LOADING_TIMEOUT_MS: int = 90000
+    BROWSER_LOADING_TIMEOUT_MS: int = 60000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
     OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_STEPS_PER_RUN: int = 10
@@ -46,7 +54,12 @@ class Settings(BaseSettings):
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
-    DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
+    DATABASE_STRING: str = (
+        "postgresql+asyncpg://skyvern@localhost/skyvern"
+        if platform.system() == "Windows"
+        else "postgresql+psycopg://skyvern@localhost/skyvern"
+    )
+    DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
@@ -74,23 +87,26 @@ class Settings(BaseSettings):
 
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
-    GENERATE_PRESIGNED_URLS: bool = False
+
+    # Supported storage types: local, s3cloud, azureblob
+    SKYVERN_STORAGE_TYPE: str = "local"
+
+    # S3/AWS settings
+    AWS_REGION: str = "us-east-1"
+    MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+    PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
-
-    # Supported storage types: local, s3
-    SKYVERN_STORAGE_TYPE: str = "local"
-
-    # S3 bucket settings
-    AWS_REGION: str = "us-east-1"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
-    MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
-    PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
 
     # Azure Blob Storage settings
     AZURE_STORAGE_ACCOUNT_NAME: str | None = None
     AZURE_STORAGE_ACCOUNT_KEY: str | None = None
+    AZURE_STORAGE_CONTAINER_ARTIFACTS: str = "skyvern-artifacts"
+    AZURE_STORAGE_CONTAINER_SCREENSHOTS: str = "skyvern-screenshots"
+    AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
+    AZURE_STORAGE_CONTAINER_UPLOADS: str = "skyvern-uploads"
 
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
@@ -107,6 +123,8 @@ class Settings(BaseSettings):
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
+    BROWSER_LOGS_ENABLED: bool = True
+    BROWSER_MAX_PAGES_NUMBER: int = 10
 
     # Add extension folders name here to load extension in your browser
     EXTENSIONS_BASE_PATH: str = "./extensions"
@@ -268,6 +286,19 @@ class Settings(BaseSettings):
     AZURE_GPT5_NANO_API_BASE: str | None = None
     AZURE_GPT5_NANO_API_VERSION: str = "2025-04-01-preview"
 
+    # AZURE gpt-5.1
+    ENABLE_AZURE_GPT5_1: bool = False
+    AZURE_GPT5_1_DEPLOYMENT: str = "gpt-5.1"
+    AZURE_GPT5_1_API_KEY: str | None = None
+    AZURE_GPT5_1_API_BASE: str | None = None
+    AZURE_GPT5_1_API_VERSION: str = "2025-04-01-preview"
+    # AZURE gpt-5.2
+    ENABLE_AZURE_GPT5_2: bool = False
+    AZURE_GPT5_2_DEPLOYMENT: str = "gpt-5.2"
+    AZURE_GPT5_2_API_KEY: str | None = None
+    AZURE_GPT5_2_API_BASE: str | None = None
+    AZURE_GPT5_2_API_VERSION: str = "2025-04-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
@@ -287,6 +318,7 @@ class Settings(BaseSettings):
     ENABLE_OLLAMA: bool = False
     OLLAMA_SERVER_URL: str | None = None
     OLLAMA_MODEL: str | None = None
+    OLLAMA_SUPPORTS_VISION: bool = False
 
     # OPENROUTER
     ENABLE_OPENROUTER: bool = False
@@ -327,6 +359,10 @@ class Settings(BaseSettings):
     # The Azure Key Vault name to store credentials
     AZURE_CREDENTIAL_VAULT: str | None = None
 
+    # Custom Credential Service Settings
+    CUSTOM_CREDENTIAL_API_BASE_URL: str | None = None
+    CUSTOM_CREDENTIAL_API_TOKEN: str | None = None
+
     # Skyvern Auth Bitwarden Settings
     SKYVERN_AUTH_BITWARDEN_CLIENT_ID: str | None = None
     SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET: str | None = None
@@ -361,7 +397,7 @@ class Settings(BaseSettings):
 
     # Trace settings
     TRACE_ENABLED: bool = False
-    TRACE_PROVIDER: str = "lmnr"
+    TRACE_PROVIDER: str = ""
     TRACE_PROVIDER_HOST: str | None = None
     TRACE_PROVIDER_API_KEY: str = "fillmein"
 
@@ -400,12 +436,15 @@ class Settings(BaseSettings):
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
+                "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
+                "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
                 "gemini-2.5-flash-lite": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
                     "label": "Gemini 2.5 Flash Lite",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
+                "azure/gpt-5.2": {"llm_key": "AZURE_OPENAI_GPT5_2", "label": "GPT 5.2"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
                 "us.anthropic.claude-opus-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
@@ -436,12 +475,15 @@ class Settings(BaseSettings):
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
+                "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
+                "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
                 "gemini-2.5-flash-lite": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
                     "label": "Gemini 2.5 Flash Lite",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
+                "azure/gpt-5.2": {"llm_key": "AZURE_OPENAI_GPT5_2", "label": "GPT 5.2"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
                 "us.anthropic.claude-opus-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
@@ -456,6 +498,29 @@ class Settings(BaseSettings):
                     "label": "Anthropic Claude 4.5 Haiku",
                 },
             }
+
+    def model_post_init(self, __context: Any) -> None:  # type: ignore[override]
+        super().model_post_init(__context)
+        if platform.system() != "Windows":
+            return
+
+        scheme, sep, remainder = self.DATABASE_STRING.partition("://")
+        if not sep:
+            return
+
+        dialect, driver_sep, driver = scheme.partition("+")
+        if not driver_sep or driver not in {"psycopg", "psycopg2"}:
+            return
+
+        updated_string = f"{dialect}+asyncpg://{remainder}"
+        if updated_string == self.DATABASE_STRING:
+            return
+
+        LOG.warning(
+            "Detected Windows environment: switching DATABASE_STRING driver from psycopg to asyncpg "
+            "for compatibility with the Proactor event loop policy."
+        )
+        object.__setattr__(self, "DATABASE_STRING", updated_string)
 
     def is_cloud_environment(self) -> bool:
         """

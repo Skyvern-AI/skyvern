@@ -1,12 +1,12 @@
 from fastapi import HTTPException, status
 
 from skyvern.config import settings
-from skyvern.exceptions import TaskNotFound, WorkflowRunNotFound
+from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.runs import RunEngine, RunResponse, RunType, TaskRunRequest, TaskRunResponse
-from skyvern.services import task_v1_service, task_v2_service, workflow_service
+from skyvern.services import task_v1_service, task_v2_service, webhook_service, workflow_service
 
 
 async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
@@ -86,8 +86,7 @@ async def cancel_task_v1(task_id: str, organization_id: str | None = None, api_k
     if not task:
         raise TaskNotFound(task_id=task_id)
     task = await app.agent.update_task(task, status=TaskStatus.canceled)
-    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=organization_id)
-    await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=api_key)
+    await app.agent.execute_task_webhook(task=task, api_key=api_key)
 
 
 async def cancel_task_v2(task_id: str, organization_id: str | None = None) -> None:
@@ -148,7 +147,12 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
         )
 
 
-async def retry_run_webhook(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:
+async def retry_run_webhook(
+    run_id: str,
+    organization_id: str | None = None,
+    api_key: str | None = None,
+    webhook_url: str | None = None,
+) -> None:
     """Retry sending the webhook for a run."""
 
     run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
@@ -158,13 +162,24 @@ async def retry_run_webhook(run_id: str, organization_id: str | None = None, api
             detail=f"Run not found {run_id}",
         )
 
+    if webhook_url:
+        if not organization_id:
+            raise OrganizationNotFound(organization_id="")
+        await webhook_service.replay_run_webhook(
+            organization_id=organization_id,
+            run_id=run_id,
+            target_url=webhook_url,
+            api_key=api_key,
+        )
+        return
+
     if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars]:
         task = await app.DATABASE.get_task(run_id, organization_id=organization_id)
         if not task:
             raise TaskNotFound(task_id=run_id)
         latest_step = await app.DATABASE.get_latest_step(run_id, organization_id=organization_id)
         if latest_step:
-            await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=api_key)
+            await app.agent.execute_task_webhook(task=task, api_key=api_key)
     elif run.task_run_type == RunType.task_v2:
         task_v2 = await app.DATABASE.get_task_v2(run_id, organization_id=organization_id)
         if not task_v2:

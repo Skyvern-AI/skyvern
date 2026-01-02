@@ -2,16 +2,17 @@ import { StepNavigation } from "./StepNavigation";
 import { StepArtifacts } from "./StepArtifacts";
 import { useQuery } from "@tanstack/react-query";
 import { StepApiResponse } from "@/api/types";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { apiPathPrefix } from "@/util/env";
+import { useFirstParam } from "@/hooks/useFirstParam";
 
 function StepArtifactsLayout() {
   const [searchParams, setSearchParams] = useSearchParams();
   const step = Number(searchParams.get("step")) || 0;
   const credentialGetter = useCredentialGetter();
-  const { taskId } = useParams();
+  const taskId = useFirstParam("taskId", "runId");
 
   const {
     data: steps,

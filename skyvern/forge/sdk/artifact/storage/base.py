@@ -124,6 +124,14 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
+        """Store a browser profile from a directory."""
+
+    @abstractmethod
+    async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
+        """Retrieve a browser profile to a temporary directory."""
+
+    @abstractmethod
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
@@ -163,4 +171,51 @@ class BaseStorage(ABC):
     async def save_legacy_file(
         self, *, organization_id: str, filename: str, fileObj: BinaryIO
     ) -> tuple[str, str] | None:
+        pass
+
+    @abstractmethod
+    async def sync_browser_session_file(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        local_file_path: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> str:
+        pass
+
+    @abstractmethod
+    async def delete_browser_session_file(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def browser_session_file_exists(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: str,
+        remote_path: str,
+        date: str | None = None,
+    ) -> bool:
+        pass
+
+    @abstractmethod
+    async def download_uploaded_file(self, uri: str) -> bytes | None:
+        pass
+
+    @abstractmethod
+    async def file_exists(self, uri: str) -> bool:
+        pass
+
+    @property
+    @abstractmethod
+    def storage_type(self) -> str:
         pass

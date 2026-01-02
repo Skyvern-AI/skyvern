@@ -102,6 +102,7 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
                 for action in actions:
                     action_dump = action.model_dump()
                     action_dump["xpath"] = action.get_xpath()
+                    action_dump["has_mini_agent"] = action.has_mini_agent
                     if (
                         "data_extraction_goal" in final_dump
                         and final_dump["data_extraction_goal"]
@@ -155,6 +156,11 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
             else:
                 LOG.warning(f"Task v2 block {run_block.label} does not have a child workflow run id")
 
+        final_dump["workflow_run_id"] = workflow_run_id
+        if run_block:
+            final_dump["workflow_run_block_id"] = run_block.workflow_run_block_id
+        else:
+            final_dump["workflow_run_block_id"] = None
         workflow_block_dump.append(final_dump)
 
     return CodeGenInput(

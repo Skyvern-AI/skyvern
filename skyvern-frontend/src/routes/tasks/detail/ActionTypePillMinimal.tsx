@@ -2,6 +2,8 @@ import { ActionType, ReadableActionTypes } from "@/api/types";
 import {
   CheckCircledIcon,
   CursorArrowIcon,
+  HandIcon,
+  DownloadIcon,
   InputIcon,
   QuestionMarkIcon,
 } from "@radix-ui/react-icons";
@@ -13,8 +15,10 @@ type Props = {
 
 const icons: Partial<Record<ActionType, React.ReactNode>> = {
   click: <CursorArrowIcon className="h-4 w-4" />,
+  hover: <HandIcon className="h-4 w-4" />,
   complete: <CheckCircledIcon className="h-4 w-4" />,
   input_text: <InputIcon className="h-4 w-4" />,
+  download_file: <DownloadIcon className="h-4 w-4" />,
 };
 
 function ActionTypePillMinimal({ actionType }: Props) {

@@ -23,8 +23,8 @@ from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.services import workflow_script_service
 from skyvern.webeye.actions.action_types import POST_ACTION_EXECUTION_ACTION_TYPES
 from skyvern.webeye.actions.actions import Action
-from skyvern.webeye.browser_factory import BrowserState
-from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
+from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -329,13 +329,6 @@ async def _convert_css_shape_to_string(
                 )
                 return None
 
-            if not await locater.is_visible(timeout=settings.BROWSER_ACTION_TIMEOUT_MS):
-                LOG.info(
-                    "element is not visible on the page, going to abort conversion",
-                    element_id=element_id,
-                    key=shape_key,
-                )
-
             skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
 
             _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
@@ -495,6 +488,9 @@ class AgentFunction:
     async def post_step_execution(self, task: Task, step: Step) -> None:
         return
 
+    async def post_cache_step_execution(self, task: Task, step: Step) -> None:
+        return
+
     async def generate_async_operations(
         self,
         organization: Organization,
@@ -571,8 +567,30 @@ class AgentFunction:
                 if "children" in queue_ele:
                     queue.extend(queue_ele["children"])
 
-            # Convert all eligible SVGs in parallel
-            if eligible_svgs:
+            # SPEED OPTIMIZATION: Skip SVG conversion when using economy tree
+            # Economy tree removes SVGs, so no point converting them
+            #
+            # COORDINATION: Use the same enable_speed_optimizations decision from context
+            # that was set in agent.py BEFORE scraping. This ensures SVG conversion skip
+            # is perfectly coordinated with economy tree selection.
+            skip_svg_conversion = False
+            if eligible_svgs and task and step:
+                # Get the optimization decision from context (set before scraping in agent.py)
+                current_context = skyvern_context.current()
+                enable_speed_optimizations = current_context.enable_speed_optimizations if current_context else False
+
+                if enable_speed_optimizations and step.retry_index == 0:
+                    skip_svg_conversion = True
+                    LOG.info(
+                        "Speed optimization: Skipping SVG conversion (will use economy tree)",
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        workflow_run_id=task.workflow_run_id,
+                        svg_count=len(eligible_svgs),
+                    )
+
+            # Convert all eligible SVGs in parallel (unless skipped by optimization)
+            if eligible_svgs and not skip_svg_conversion:
                 await asyncio.gather(*[_convert_svg_to_string(element, task, step) for element, frame in eligible_svgs])
 
             return element_tree
@@ -621,4 +639,5 @@ class AgentFunction:
         )
 
     async def post_action_execution(self, action: Action) -> None:
-        asyncio.create_task(self._post_action_execution(action))
+        return
+        # asyncio.create_task(self._post_action_execution(action))

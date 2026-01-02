@@ -25,6 +25,13 @@ const constants = {
   SkyvernOptimized: "Skyvern Optimized",
 } as const;
 
+const deprecatedModelNames = new Set<string>([
+  "gemini-2.5-flash-lite",
+  "azure/gpt-4.1",
+  "azure/o3",
+  "claude-haiku-4-5-20251001",
+]);
+
 function ModelSelector({
   clearable = true,
   value,
@@ -41,16 +48,31 @@ function ModelSelector({
     },
   });
 
-  const models = availableModels?.models ?? {};
-  const reverseMap = Object.entries(models).reduce(
-    (acc, [key, value]) => {
-      acc[value] = key;
+  const rawModels = availableModels?.models ?? {};
+  const models = Object.fromEntries(
+    Object.entries(rawModels).map(([modelName, label]) => [
+      modelName,
+      deprecatedModelNames.has(modelName) ? `${label} (deprecated)` : label,
+    ]),
+  );
+
+  const visibleEntries = Object.entries(models).filter(
+    ([modelName]) =>
+      !deprecatedModelNames.has(modelName) || value?.model_name === modelName,
+  );
+
+  const reverseMap = visibleEntries.reduce(
+    (acc, [modelName, label]) => {
+      acc[label] = modelName;
       return acc;
     },
     {} as Record<string, string>,
   );
   const labels = Object.keys(reverseMap);
-  const chosen = value ? models[value.model_name] : constants.SkyvernOptimized;
+
+  const chosen = value
+    ? models[value.model_name] ?? constants.SkyvernOptimized
+    : constants.SkyvernOptimized;
   const choices = [constants.SkyvernOptimized, ...labels];
 
   return (
