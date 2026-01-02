@@ -368,7 +368,7 @@ class RealBrowserManager(BrowserManager):
             if task_browser_state is None:
                 continue
             try:
-                await task_browser_state.close()
+                await task_browser_state.close(close_browser_on_completion=close_browser_on_completion)
             except Exception:
                 LOG.info(
                     "Failed to close the browser state from the task block, might because it's already closed.",
