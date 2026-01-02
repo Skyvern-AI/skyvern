@@ -20,7 +20,7 @@ def start_forge_app() -> ForgeApp:
                 raise RuntimeError(f"Missing configure_app function in {module}")
 
             configure_app_fn(force_app_instance)
-        LOG.info(
+        LOG.debug(
             "Additional modules loaded to set up api app",
             modules=settings.ADDITIONAL_MODULES,
         )
