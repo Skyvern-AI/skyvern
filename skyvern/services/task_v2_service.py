@@ -1096,6 +1096,8 @@ async def _set_up_workflow_context(workflow: Workflow, workflow_run_id: str, org
         workflow_output_parameters,
         [],
         [],
+        None,
+        workflow,
     )
 
 

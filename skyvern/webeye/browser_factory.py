@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol, cast
 from urllib.parse import parse_qsl, urlparse
 
 import psutil
@@ -26,6 +26,7 @@ from skyvern.constants import (
     SKYVERN_DIR,
 )
 from skyvern.exceptions import UnknownBrowserType, UnknownErrorWhileCreatingBrowserContext
+from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
@@ -420,7 +421,33 @@ async def _create_headless_chromium(
             apply_download_behaviour=True,
         )
 
-    user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+    # Check for browser_profile_id and load from storage if available
+    browser_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
+    organization_id_for_profile = cast(str | None, kwargs.get("organization_id"))
+    user_data_dir: str | None = None
+
+    if browser_profile_id and organization_id_for_profile:
+        profile_dir = await app.STORAGE.retrieve_browser_profile(
+            organization_id=organization_id_for_profile,
+            profile_id=browser_profile_id,
+        )
+        if profile_dir:
+            user_data_dir = profile_dir
+            LOG.info(
+                "Using browser profile",
+                browser_profile_id=browser_profile_id,
+                profile_dir=profile_dir,
+            )
+        else:
+            LOG.warning(
+                "Browser profile not found, using temp directory",
+                browser_profile_id=browser_profile_id,
+                organization_id=organization_id_for_profile,
+            )
+
+    if not user_data_dir:
+        user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
         user_data_dir=user_data_dir,
@@ -437,7 +464,10 @@ async def _create_headless_chromium(
         }
     )
 
-    browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
+    browser_artifacts = BrowserContextFactory.build_browser_artifacts(
+        har_path=browser_args["record_har_path"],
+        browser_session_dir=user_data_dir,
+    )
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     return browser_context, browser_artifacts, None
 
@@ -456,7 +486,33 @@ async def _create_headful_chromium(
             apply_download_behaviour=True,
         )
 
-    user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+    # Check for browser_profile_id and load from storage if available
+    browser_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
+    organization_id_for_profile = cast(str | None, kwargs.get("organization_id"))
+    user_data_dir: str | None = None
+
+    if browser_profile_id and organization_id_for_profile:
+        profile_dir = await app.STORAGE.retrieve_browser_profile(
+            organization_id=organization_id_for_profile,
+            profile_id=browser_profile_id,
+        )
+        if profile_dir:
+            user_data_dir = profile_dir
+            LOG.info(
+                "Using browser profile",
+                browser_profile_id=browser_profile_id,
+                profile_dir=profile_dir,
+            )
+        else:
+            LOG.warning(
+                "Browser profile not found, using temp directory",
+                browser_profile_id=browser_profile_id,
+                organization_id=organization_id_for_profile,
+            )
+
+    if not user_data_dir:
+        user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
         user_data_dir=user_data_dir,
@@ -473,7 +529,10 @@ async def _create_headful_chromium(
             "headless": False,
         }
     )
-    browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
+    browser_artifacts = BrowserContextFactory.build_browser_artifacts(
+        har_path=browser_args["record_har_path"],
+        browser_session_dir=user_data_dir,
+    )
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     return browser_context, browser_artifacts, None
 

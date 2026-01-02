@@ -134,18 +134,32 @@ function layoutUtil(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
   options: Dagre.configUnion = {},
+  allNodes?: Array<AppNode>,
 ): { nodes: Array<AppNode>; edges: Array<Edge> } {
   const g = new Dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}));
   g.setGraph({ rankdir: "TB", ...options });
 
   edges.forEach((edge) => g.setEdge(edge.source, edge.target));
-  nodes.forEach((node) =>
+  nodes.forEach((node) => {
+    // For loop/conditional nodes without measurements, use computed width
+    let width = node.measured?.width ?? 0;
+    let height = node.measured?.height ?? 0;
+
+    if (
+      (node.type === "loop" || node.type === "conditional") &&
+      !node.measured?.width
+    ) {
+      // Use full nodes array for nesting calculation
+      width = getLoopNodeWidth(node, allNodes ?? nodes);
+      height = 300; // Reasonable default height
+    }
+
     g.setNode(node.id, {
       ...node,
-      width: node.measured?.width ?? 0,
-      height: node.measured?.height ?? 0,
-    }),
-  );
+      width,
+      height,
+    });
+  });
 
   Dagre.layout(g);
 
@@ -251,11 +265,10 @@ function layout(
   loopNodes.forEach((node, index) => {
     const childNodes = nodes.filter((n) => n.parentId === node.id && !n.hidden);
     const childNodeIds = new Set(childNodes.map((child) => child.id));
+    // Include edges even if marked hidden, as long as both nodes are visible
+    // (edges might be hidden from branch switches but need to be used for layout)
     const childEdges = edges.filter(
-      (edge) =>
-        !edge.hidden &&
-        childNodeIds.has(edge.source) &&
-        childNodeIds.has(edge.target),
+      (edge) => childNodeIds.has(edge.source) && childNodeIds.has(edge.target),
     );
     const maxChildWidth = Math.max(
       ...childNodes.map((node) => node.measured?.width ?? 0),
@@ -266,10 +279,15 @@ function layout(
       ...n,
       position: { x: 0, y: 0 },
     }));
-    const layouted = layoutUtil(childNodesWithResetPositions, childEdges, {
-      marginx: (loopNodeWidth - maxChildWidth) / 2,
-      marginy: 225,
-    });
+    const layouted = layoutUtil(
+      childNodesWithResetPositions,
+      childEdges,
+      {
+        marginx: (loopNodeWidth - maxChildWidth) / 2,
+        marginy: 225,
+      },
+      nodes,
+    );
     loopNodeChildren[index] = layouted.nodes;
   });
 
@@ -283,14 +301,24 @@ function layout(
   conditionalNodes.forEach((node, index) => {
     const childNodes = nodes.filter((n) => n.parentId === node.id && !n.hidden);
     const childNodeIds = new Set(childNodes.map((child) => child.id));
-    const childEdges = edges.filter(
-      (edge) =>
-        !edge.hidden &&
-        childNodeIds.has(edge.source) &&
-        childNodeIds.has(edge.target),
-    );
+    // Include edges, but skip hidden edges completely (they're hidden for a reason - inactive branches)
+    const childEdges = edges.filter((edge) => {
+      if (!childNodeIds.has(edge.source) || !childNodeIds.has(edge.target)) {
+        return false;
+      }
+      // Exclude hidden edges from layout
+      if (edge.hidden) {
+        return false;
+      }
+      return true;
+    });
+    // Use computed width for loop nodes, measured width for others
     const maxChildWidth = Math.max(
-      ...childNodes.map((node) => node.measured?.width ?? 0),
+      ...childNodes.map((child) =>
+        child.type === "loop"
+          ? getLoopNodeWidth(child, nodes)
+          : child.measured?.width ?? 0,
+      ),
     );
     const conditionalNodeWidth = getLoopNodeWidth(node, nodes);
 
@@ -300,10 +328,15 @@ function layout(
       position: { x: 0, y: 0 },
     }));
 
-    const layouted = layoutUtil(childNodesWithResetPositions, childEdges, {
-      marginx: (conditionalNodeWidth - maxChildWidth) / 2,
-      marginy: 225,
-    });
+    const layouted = layoutUtil(
+      childNodesWithResetPositions,
+      childEdges,
+      {
+        marginx: (conditionalNodeWidth - maxChildWidth) / 2,
+        marginy: 225,
+      },
+      nodes,
+    );
 
     conditionalNodeChildren[index] = layouted.nodes;
   });
@@ -311,11 +344,10 @@ function layout(
   const topLevelNodes = nodes.filter((node) => !node.parentId && !node.hidden);
   const topLevelNodeIds = new Set(topLevelNodes.map((node) => node.id));
 
+  // Include edges even if marked hidden, as long as both nodes are visible
   const layoutEdges = edges.filter(
     (edge) =>
-      !edge.hidden &&
-      topLevelNodeIds.has(edge.source) &&
-      topLevelNodeIds.has(edge.target),
+      topLevelNodeIds.has(edge.source) && topLevelNodeIds.has(edge.target),
   );
 
   const syntheticEdges: Array<Edge> = [];
@@ -343,15 +375,53 @@ function layout(
   const topLevelNodesLayout = layoutUtil(
     topLevelNodes,
     layoutEdges.concat(syntheticEdges),
+    {},
+    nodes,
   );
 
   // Collect all hidden nodes to preserve them
   const hiddenNodes = nodes.filter((node) => node.hidden);
 
-  const finalNodes = topLevelNodesLayout.nodes
-    .concat(loopNodeChildren.flat())
+  // Combine all layouted nodes and sort by nesting depth to ensure parents come before children
+  const allLayoutedNodes = topLevelNodesLayout.nodes
     .concat(conditionalNodeChildren.flat())
-    .concat(hiddenNodes);
+    .concat(loopNodeChildren.flat());
+
+  // Sort by depth: top-level first, then depth-1, depth-2, etc.
+  const nodeDepths = new Map<string, number>();
+  const computeDepth = (nodeId: string): number => {
+    if (nodeDepths.has(nodeId)) {
+      return nodeDepths.get(nodeId)!;
+    }
+    // Look in both layouted nodes and full nodes array to find parents
+    let node = allLayoutedNodes.find((n) => n.id === nodeId);
+    if (!node) {
+      node = nodes.find((n) => n.id === nodeId);
+    }
+    if (!node) {
+      // Node doesn't exist anywhere, treat as top-level
+      nodeDepths.set(nodeId, 0);
+      return 0;
+    }
+    if (!node.parentId) {
+      // Node exists but has no parent
+      nodeDepths.set(nodeId, 0);
+      return 0;
+    }
+    const depth = computeDepth(node.parentId) + 1;
+    nodeDepths.set(nodeId, depth);
+    return depth;
+  };
+
+  allLayoutedNodes.forEach((node) => computeDepth(node.id));
+
+  const sortedNodes = allLayoutedNodes.sort((a, b) => {
+    const depthA = nodeDepths.get(a.id) ?? 0;
+    const depthB = nodeDepths.get(b.id) ?? 0;
+    return depthA - depthB;
+  });
+
+  const finalNodes = sortedNodes.concat(hiddenNodes);
 
   return {
     nodes: finalNodes,
@@ -938,12 +1008,22 @@ function reconstructConditionalStructure(
     if (block.block_type !== "conditional") {
       if (block.block_type === "for_loop") {
         // Recursively handle conditionals inside loops
-        reconstructConditionalStructure(
+        const recursiveResult = reconstructConditionalStructure(
           block.loop_blocks,
           newNodes,
           labelToNodeMap,
           blocksByLabel,
         );
+        // Merge edges from recursive call
+        newEdges.push(...recursiveResult.edges);
+        // Merge nodes from recursive call (deduplicate by id)
+        const existingNodeIds = new Set(newNodes.map((n) => n.id));
+        recursiveResult.nodes.forEach((node) => {
+          if (!existingNodeIds.has(node.id)) {
+            newNodes.push(node);
+            existingNodeIds.add(node.id);
+          }
+        });
       }
       return;
     }
@@ -1312,8 +1392,12 @@ function getElements(
     }
   });
 
-  const loopBlocks = data.filter((d) => d.block.block_type === "for_loop");
+  const loopBlocks = data.filter(
+    (d): d is typeof d & { block: ForLoopBlock } =>
+      d.block.block_type === "for_loop",
+  );
   loopBlocks.forEach((block) => {
+    const loopBlock = block.block;
     const startNodeId = nanoid();
     nodes.push(
       startNode(
@@ -1327,32 +1411,67 @@ function getElements(
         block.id,
       ),
     );
-    const children = data.filter((b) => b.parentId === block.id);
+
+    // Collect labels that belong to conditional branches inside this loop so we
+    // don't chain them as top-level loop children (they are handled by the
+    // conditional's own edges).
+    const branchLabels = new Set<string>();
+    const collectBranchLabels = (loopChildren: Array<WorkflowBlock>) => {
+      loopChildren.forEach((child) => {
+        if (child.block_type === "conditional") {
+          child.branch_conditions.forEach((branch) => {
+            collectLabelsForBranch(
+              branch.next_block_label,
+              child.next_block_label ?? null,
+              blocksByLabel,
+            ).forEach((label) => branchLabels.add(label));
+          });
+        }
+        if (child.block_type === "for_loop") {
+          collectBranchLabels(child.loop_blocks);
+        }
+      });
+    };
+    collectBranchLabels(loopBlock.loop_blocks);
+
+    // Only keep loop children that are not part of any conditional branch.
+    const children = data.filter(
+      (b) => b.parentId === block.id && !branchLabels.has(b.block.label),
+    );
     const adderNodeId = nanoid();
+
     if (children.length === 0) {
       edges.push(defaultEdge(startNodeId, adderNodeId));
     } else {
-      const firstChild = children.find((c) => c.previous === null)!;
-      edges.push(edgeWithAddButton(startNodeId, firstChild.id));
-
-      // Chain loop children based on their next pointers
       const childById = new Map<string, (typeof children)[number]>();
       children.forEach((c) => childById.set(c.id, c));
+
+      const firstChild =
+        children.find(
+          (c) => c.previous === null || !childById.has(c.previous),
+        ) ?? children[0]!;
+      edges.push(edgeWithAddButton(startNodeId, firstChild.id));
+
       let current = firstChild;
-      while (current?.next) {
-        const nextChild = childById.get(current.next);
+      let lastChild = firstChild;
+      while (current) {
+        const nextChild = current.next ? childById.get(current.next) : null;
         if (!nextChild) {
           break;
         }
         edges.push(edgeWithAddButton(current.id, nextChild.id));
+        lastChild = nextChild;
         current = nextChild;
       }
+
+      nodes.push(nodeAdderNode(adderNodeId, block.id));
+      if (lastChild) {
+        edges.push(defaultEdge(lastChild.id, adderNodeId));
+      }
+      return;
     }
-    const lastChild = children.find((c) => c.next === null);
+
     nodes.push(nodeAdderNode(adderNodeId, block.id));
-    if (lastChild) {
-      edges.push(defaultEdge(lastChild.id, adderNodeId));
-    }
   });
 
   // Reconstruct conditional hierarchy and create conditional edges
@@ -1806,6 +1925,11 @@ function findNextBlockLabel(
       return null;
     }
 
+    // If this node itself is a conditional, prefer its own merge label
+    if (currentNode.type === "conditional") {
+      return currentNode.data.mergeLabel ?? null;
+    }
+
     const conditionalNodeId = currentNode.data.conditionalNodeId;
     if (!conditionalNodeId) {
       return null;
@@ -2219,6 +2343,33 @@ function getOrderedChildrenBlocks(
   edges: Array<Edge>,
   parentId: string,
 ): Array<BlockYAML> {
+  const nodesById = new Map(nodes.map((n) => [n.id, n]));
+  const includedIds = new Set<string>();
+
+  const hasAncestor = (nodeId: string | null, ancestorId: string): boolean => {
+    let current = nodeId ? nodesById.get(nodeId) : undefined;
+    while (current) {
+      if (current.parentId === ancestorId) {
+        return true;
+      }
+      current = current.parentId ? nodesById.get(current.parentId) : undefined;
+    }
+    return false;
+  };
+
+  // This prevents nested loop children from being added to the parent loop.
+  const isInsideIncludedLoop = (nodeId: string): boolean => {
+    let current = nodesById.get(nodeId);
+    while (current?.parentId) {
+      const parent = nodesById.get(current.parentId);
+      if (parent?.type === "loop" && includedIds.has(parent.id)) {
+        return true;
+      }
+      current = parent;
+    }
+    return false;
+  };
+
   const parentNode = nodes.find((node) => node.id === parentId);
   if (!parentNode) {
     return [];
@@ -2240,6 +2391,7 @@ function getOrderedChildrenBlocks(
   const children: Array<BlockYAML> = [];
   let currentNode: WorkflowBlockNode | undefined = firstChild;
   while (currentNode) {
+    includedIds.add(currentNode.id);
     if (currentNode.type === "loop") {
       const loopChildren = getOrderedChildrenBlocks(
         nodes,
@@ -2264,6 +2416,41 @@ function getOrderedChildrenBlocks(
     const next = nodes.find((node) => node.id === nextId);
     currentNode = next && isWorkflowBlockNode(next) ? next : undefined;
   }
+
+  // Add any additional workflow block nodes that belong under this parent (e.g., conditional branches)
+  nodes.forEach((node) => {
+    if (!isWorkflowBlockNode(node)) {
+      return;
+    }
+    if (includedIds.has(node.id)) {
+      return;
+    }
+    if (!hasAncestor(node.id, parentId)) {
+      return;
+    }
+    if (isInsideIncludedLoop(node.id)) {
+      return;
+    }
+
+    if (node.type === "loop") {
+      const loopChildren = getOrderedChildrenBlocks(nodes, edges, node.id);
+      children.push({
+        block_type: "for_loop",
+        label: node.data.label,
+        continue_on_failure: node.data.continueOnFailure,
+        next_loop_on_failure: node.data.nextLoopOnFailure,
+        loop_blocks: loopChildren,
+        loop_variable_reference: node.data.loopVariableReference,
+        complete_if_empty: node.data.completeIfEmpty,
+      });
+      includedIds.add(node.id);
+      return;
+    }
+
+    children.push(getWorkflowBlock(node, nodes, edges));
+    includedIds.add(node.id);
+  });
+
   return children;
 }
 
@@ -2271,6 +2458,20 @@ function getWorkflowBlocksUtil(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
 ): Array<BlockYAML> {
+  const nodesById = new Map(nodes.map((n) => [n.id, n]));
+
+  const isInsideLoop = (nodeId: string): boolean => {
+    let current = nodesById.get(nodeId);
+    while (current?.parentId) {
+      const parent = nodesById.get(current.parentId);
+      if (parent?.type === "loop") {
+        return true;
+      }
+      current = parent;
+    }
+    return false;
+  };
+
   return nodes.flatMap((node) => {
     // Skip utility nodes
     if (node.type === "start" || node.type === "nodeAdder") {
@@ -2280,6 +2481,11 @@ function getWorkflowBlocksUtil(
     // Check if this node is inside a conditional branch
     const isConditionalBranchNode =
       isWorkflowBlockNode(node) && node.data.conditionalNodeId;
+
+    // If this node is inside any loop, it will be emitted through that loop's loop_blocks
+    if (isInsideLoop(node.id)) {
+      return [];
+    }
 
     // Skip nodes with parentId UNLESS they're in a conditional branch
     // (loop children should be filtered out, conditional branch children should stay)
@@ -3069,6 +3275,7 @@ function convertBlocksToBlockYAML(
           block_type: "file_url_parser",
           file_url: block.file_url,
           file_type: block.file_type,
+          json_schema: block.json_schema,
         };
         return blockYaml;
       }
@@ -3113,6 +3320,7 @@ function convertBlocksToBlockYAML(
           url: block.url,
           headers: block.headers,
           body: block.body,
+          files: block.files,
           timeout: block.timeout,
           follow_redirects: block.follow_redirects,
           parameter_keys: block.parameters.map((p) => p.key),

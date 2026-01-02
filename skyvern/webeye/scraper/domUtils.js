@@ -962,7 +962,8 @@ function isInteractable(element, hoverStylesMap) {
     tagName === "li" &&
     (className.includes("ui-menu-item") ||
       className.includes("dropdown-item") ||
-      className === "option")
+      className === "option" ||
+      className.includes("rddlItem"))
   ) {
     return true;
   }
@@ -1042,6 +1043,15 @@ function isInteractable(element, hoverStylesMap) {
     }
   } catch (e) {
     _jsConsoleError("Error checking angular click event:", e);
+  }
+
+  // consider <div tabindex="0"> as interactable
+  if (
+    tagName.toLowerCase() === "div" &&
+    element.hasAttribute("tabindex") &&
+    element.getAttribute("tabindex").toLowerCase() === "0"
+  ) {
+    return true;
   }
 
   return false;
@@ -1794,6 +1804,16 @@ async function buildElementTree(
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (tagName === "div" && isDOMNodeRepresentDiv(element)) {
         elementObj = await buildElementObject(frame, element, interactable);
+      } else if (
+        tagName === "embed" &&
+        element.getAttribute("type")?.toLowerCase() === "application/pdf"
+      ) {
+        elementObj = await buildElementObject(
+          frame,
+          element,
+          interactable,
+          true,
+        );
       } else if (
         getElementText(element).length > 0 &&
         getElementText(element).length <= 5000

@@ -26,8 +26,8 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "1.0.3",
-                    "User-Agent": "@skyvern/client/1.0.3",
+                    "X-Fern-SDK-Version": "1.0.6",
+                    "User-Agent": "@skyvern/client/1.0.6",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
@@ -399,6 +399,7 @@ export class SkyvernClient {
      *         page_size: 1,
      *         only_saved_tasks: true,
      *         only_workflows: true,
+     *         only_templates: true,
      *         search_key: "search_key",
      *         title: "title",
      *         folder_id: "folder_id",
@@ -421,6 +422,7 @@ export class SkyvernClient {
             page_size: pageSize,
             only_saved_tasks: onlySavedTasks,
             only_workflows: onlyWorkflows,
+            only_templates: onlyTemplates,
             search_key: searchKey,
             title,
             folder_id: folderId,
@@ -442,6 +444,10 @@ export class SkyvernClient {
 
         if (onlyWorkflows != null) {
             _queryParams.only_workflows = onlyWorkflows.toString();
+        }
+
+        if (onlyTemplates != null) {
+            _queryParams.only_templates = onlyTemplates.toString();
         }
 
         if (searchKey != null) {
@@ -936,6 +942,7 @@ export class SkyvernClient {
      * Retry sending the webhook for a run
      *
      * @param {string} runId - The id of the task run or the workflow run.
+     * @param {Skyvern.RetryRunWebhookRequest} request
      * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
      *
      * @throws {@link Skyvern.UnprocessableEntityError}
@@ -945,13 +952,15 @@ export class SkyvernClient {
      */
     public retryRunWebhook(
         runId: string,
+        request?: Skyvern.RetryRunWebhookRequest,
         requestOptions?: SkyvernClient.RequestOptions,
     ): core.HttpResponsePromise<unknown> {
-        return core.HttpResponsePromise.fromPromise(this.__retryRunWebhook(runId, requestOptions));
+        return core.HttpResponsePromise.fromPromise(this.__retryRunWebhook(runId, request, requestOptions));
     }
 
     private async __retryRunWebhook(
         runId: string,
+        request?: Skyvern.RetryRunWebhookRequest,
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<unknown>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
@@ -968,7 +977,10 @@ export class SkyvernClient {
             ),
             method: "POST",
             headers: _headers,
+            contentType: "application/json",
             queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request != null ? request : undefined,
             timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
             maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
             abortSignal: requestOptions?.abortSignal,
@@ -1082,6 +1094,91 @@ export class SkyvernClient {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /v1/runs/{run_id}/timeline.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * @param {Skyvern.BodyUploadFileV1UploadFilePost} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     import { createReadStream } from "fs";
+     *     await client.uploadFile({
+     *         file: fs.createReadStream("/path/to/your/file")
+     *     })
+     */
+    public uploadFile(
+        request: Skyvern.BodyUploadFileV1UploadFilePost,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.UploadFileResponse> {
+        return core.HttpResponsePromise.fromPromise(this.__uploadFile(request, requestOptions));
+    }
+
+    private async __uploadFile(
+        request: Skyvern.BodyUploadFileV1UploadFilePost,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.UploadFileResponse>> {
+        const _request = await core.newFormData();
+        await _request.appendFile("file", request.file);
+        const _maybeEncodedRequest = await _request.getRequest();
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({
+                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
+                ..._maybeEncodedRequest.headers,
+            }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "v1/upload_file",
+            ),
+            method: "POST",
+            headers: _headers,
+            queryParameters: requestOptions?.queryParams,
+            requestType: "file",
+            duplex: _maybeEncodedRequest.duplex,
+            body: _maybeEncodedRequest.body,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.UploadFileResponse, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/upload_file.");
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,

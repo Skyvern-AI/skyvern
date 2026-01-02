@@ -6,6 +6,7 @@ import datetime as dt
 import typing
 
 import httpx
+from . import core
 from .core.client_wrapper import AsyncClientWrapper, SyncClientWrapper
 from .core.request_options import RequestOptions
 from .environment import SkyvernEnvironment
@@ -19,6 +20,7 @@ from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.get_run_response import GetRunResponse
 from .types.proxy_location import ProxyLocation
+from .types.retry_run_webhook_request import RetryRunWebhookRequest
 from .types.run_engine import RunEngine
 from .types.run_sdk_action_request_action import RunSdkActionRequestAction
 from .types.run_sdk_action_response import RunSdkActionResponse
@@ -30,6 +32,7 @@ from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExt
 from .types.task_run_request_proxy_location import TaskRunRequestProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
+from .types.upload_file_response import UploadFileResponse
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .types.workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
@@ -500,6 +503,7 @@ class Skyvern:
         page_size: typing.Optional[int] = None,
         only_saved_tasks: typing.Optional[bool] = None,
         only_workflows: typing.Optional[bool] = None,
+        only_templates: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
         folder_id: typing.Optional[str] = None,
@@ -526,6 +530,8 @@ class Skyvern:
         only_saved_tasks : typing.Optional[bool]
 
         only_workflows : typing.Optional[bool]
+
+        only_templates : typing.Optional[bool]
 
         search_key : typing.Optional[str]
             Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
@@ -560,6 +566,7 @@ class Skyvern:
             page_size=1,
             only_saved_tasks=True,
             only_workflows=True,
+            only_templates=True,
             search_key="search_key",
             title="title",
             folder_id="folder_id",
@@ -571,6 +578,7 @@ class Skyvern:
             page_size=page_size,
             only_saved_tasks=only_saved_tasks,
             only_workflows=only_workflows,
+            only_templates=only_templates,
             search_key=search_key,
             title=title,
             folder_id=folder_id,
@@ -783,7 +791,11 @@ class Skyvern:
         return _response.data
 
     def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+        self,
+        run_id: str,
+        *,
+        request: typing.Optional[RetryRunWebhookRequest] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.Optional[typing.Any]:
         """
         Retry sending the webhook for a run
@@ -792,6 +804,8 @@ class Skyvern:
         ----------
         run_id : str
             The id of the task run or the workflow run.
+
+        request : typing.Optional[RetryRunWebhookRequest]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -803,16 +817,17 @@ class Skyvern:
 
         Examples
         --------
-        from skyvern import Skyvern
+        from skyvern import RetryRunWebhookRequest, Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
         client.retry_run_webhook(
             run_id="tsk_123",
+            request=RetryRunWebhookRequest(),
         )
         """
-        _response = self._raw_client.retry_run_webhook(run_id, request_options=request_options)
+        _response = self._raw_client.retry_run_webhook(run_id, request=request, request_options=request_options)
         return _response.data
 
     def get_run_timeline(
@@ -846,6 +861,35 @@ class Skyvern:
         )
         """
         _response = self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    def upload_file(
+        self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
+    ) -> UploadFileResponse:
+        """
+        Parameters
+        ----------
+        file : core.File
+            See core.File for more documentation
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        UploadFileResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.upload_file()
+        """
+        _response = self._raw_client.upload_file(file=file, request_options=request_options)
         return _response.data
 
     def list_browser_profiles(
@@ -2347,6 +2391,7 @@ class AsyncSkyvern:
         page_size: typing.Optional[int] = None,
         only_saved_tasks: typing.Optional[bool] = None,
         only_workflows: typing.Optional[bool] = None,
+        only_templates: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
         folder_id: typing.Optional[str] = None,
@@ -2373,6 +2418,8 @@ class AsyncSkyvern:
         only_saved_tasks : typing.Optional[bool]
 
         only_workflows : typing.Optional[bool]
+
+        only_templates : typing.Optional[bool]
 
         search_key : typing.Optional[str]
             Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
@@ -2412,6 +2459,7 @@ class AsyncSkyvern:
                 page_size=1,
                 only_saved_tasks=True,
                 only_workflows=True,
+                only_templates=True,
                 search_key="search_key",
                 title="title",
                 folder_id="folder_id",
@@ -2426,6 +2474,7 @@ class AsyncSkyvern:
             page_size=page_size,
             only_saved_tasks=only_saved_tasks,
             only_workflows=only_workflows,
+            only_templates=only_templates,
             search_key=search_key,
             title=title,
             folder_id=folder_id,
@@ -2680,7 +2729,11 @@ class AsyncSkyvern:
         return _response.data
 
     async def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+        self,
+        run_id: str,
+        *,
+        request: typing.Optional[RetryRunWebhookRequest] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.Optional[typing.Any]:
         """
         Retry sending the webhook for a run
@@ -2689,6 +2742,8 @@ class AsyncSkyvern:
         ----------
         run_id : str
             The id of the task run or the workflow run.
+
+        request : typing.Optional[RetryRunWebhookRequest]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2702,7 +2757,7 @@ class AsyncSkyvern:
         --------
         import asyncio
 
-        from skyvern import AsyncSkyvern
+        from skyvern import AsyncSkyvern, RetryRunWebhookRequest
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2712,12 +2767,13 @@ class AsyncSkyvern:
         async def main() -> None:
             await client.retry_run_webhook(
                 run_id="tsk_123",
+                request=RetryRunWebhookRequest(),
             )
 
 
         asyncio.run(main())
         """
-        _response = await self._raw_client.retry_run_webhook(run_id, request_options=request_options)
+        _response = await self._raw_client.retry_run_webhook(run_id, request=request, request_options=request_options)
         return _response.data
 
     async def get_run_timeline(
@@ -2759,6 +2815,43 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    async def upload_file(
+        self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
+    ) -> UploadFileResponse:
+        """
+        Parameters
+        ----------
+        file : core.File
+            See core.File for more documentation
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        UploadFileResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.upload_file()
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.upload_file(file=file, request_options=request_options)
         return _response.data
 
     async def list_browser_profiles(

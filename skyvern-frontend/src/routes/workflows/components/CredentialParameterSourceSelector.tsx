@@ -22,7 +22,9 @@ type Props = {
 };
 
 function CredentialParameterSourceSelector({ value, onChange }: Props) {
-  const { data: credentials, isFetching } = useCredentialsQuery();
+  const { data: credentials, isFetching } = useCredentialsQuery({
+    page_size: 100, // Reasonable limit for dropdown selector
+  });
   const { setIsOpen, setType } = useCredentialModalState();
   const { parameters: workflowParameters } = useWorkflowParametersStore();
   const workflowParametersOfTypeCredentialId = workflowParameters.filter(

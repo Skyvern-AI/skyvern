@@ -172,6 +172,8 @@ navigation:
               - POST /v1/runs/{run_id}/cancel
               - POST /v1/runs/{run_id}/retry_webhook
               - POST /v1/run/tasks/login
+              - endpoint: POST /v1/run/tasks/download_files
+                hidden: true
               - GET /v1/runs/{run_id}/timeline
           - section: Workflows
             contents:
@@ -208,6 +210,9 @@ navigation:
             contents:
               - GET /v1/artifacts/{artifact_id}
               - GET /v1/runs/{run_id}/artifacts
+          - section: Files
+            contents:
+              - POST /v1/upload_file
           - section: Scripts
             hidden: true
             contents:
@@ -227,3 +232,4 @@ navigation:
   - tab: demo
 experimental:
   openapi-parser-v3: true
+  dynamic-snippets: true

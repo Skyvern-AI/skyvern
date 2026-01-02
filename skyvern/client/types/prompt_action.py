@@ -3,9 +3,7 @@
 import typing
 
 import pydantic
-import typing_extensions
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from ..core.serialization import FieldMetadata
 
 
 class PromptAction(UniversalBaseModel):
@@ -18,9 +16,7 @@ class PromptAction(UniversalBaseModel):
     The prompt to send to the LLM
     """
 
-    schema_: typing_extensions.Annotated[
-        typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]], FieldMetadata(alias="schema")
-    ] = pydantic.Field(default=None)
+    response_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = pydantic.Field(default=None)
     """
     Optional JSON schema to structure the response
     """

@@ -14,7 +14,6 @@ import {
 import type { Node } from "@xyflow/react";
 
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   DropdownMenu,
@@ -39,6 +38,7 @@ import {
 } from "./types";
 import type { BranchCondition } from "../../../types/workflowTypes";
 import { HelpTooltip } from "@/components/HelpTooltip";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 
 function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   const nodes = useNodes<AppNode>();
@@ -186,7 +186,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
           return { ...edge, hidden: shouldHide };
         }
 
-        // Also hide edges connected to hidden nodes (cascading)
+        // Hide edges connected to hidden nodes
         const sourceNode = updatedNodesSnapshot.find(
           (n: AppNode) => n.id === edge.source,
         );
@@ -195,6 +195,22 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
         );
         if (sourceNode?.hidden || targetNode?.hidden) {
           return { ...edge, hidden: true };
+        }
+
+        // Unhide edges when both nodes are visible, but ONLY if they're not conditional branch edges
+        // (Conditional branch edges should stay hidden if they're for inactive branches)
+        if (
+          sourceNode &&
+          targetNode &&
+          !sourceNode.hidden &&
+          !targetNode.hidden
+        ) {
+          const isConditionalBranchEdge =
+            edgeData?.conditionalNodeId && edgeData?.conditionalBranchId;
+          if (!isConditionalBranchEdge) {
+            // Regular edge (e.g., loop's START → adder) - unhide when nodes are visible
+            return { ...edge, hidden: false };
+          }
         }
 
         return edge;
@@ -666,21 +682,22 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
                     </Label>
                     {!activeBranch.is_default && (
                       <HelpTooltip
-                        content={`Jinja: {{ y > 100 }}\nNatural language: y is greater than 100`}
+                        content={`Jinja: {{ y > 100 }}\nNatural language: y is greater than 100\nJinja+Natural language: {{ y }} is greater than 100`}
                       />
                     )}
                   </div>
-                  <Input
+                  <WorkflowBlockInput
+                    nodeId={id}
                     value={
                       activeBranch.is_default
                         ? "Executed when no other condition matches"
                         : activeBranch.criteria?.expression ?? ""
                     }
                     disabled={!data.editable || activeBranch.is_default}
-                    onChange={(event) => {
-                      handleExpressionChange(event.target.value);
+                    onChange={(value) => {
+                      handleExpressionChange(value);
                     }}
-                    placeholder="Enter condition to evaluate (Jinja or natural language)"
+                    placeholder="Enter condition to evaluate (Jinja, natural language, or both)"
                   />
                 </div>
               )}
