@@ -682,7 +682,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
                     </Label>
                     {!activeBranch.is_default && (
                       <HelpTooltip
-                        content={`Jinja: {{ y > 100 }}\nNatural language: y is greater than 100`}
+                        content={`Jinja: {{ y > 100 }}\nNatural language: y is greater than 100\nJinja+Natural language: {{ y }} is greater than 100`}
                       />
                     )}
                   </div>
@@ -697,7 +697,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
                     onChange={(value) => {
                       handleExpressionChange(value);
                     }}
-                    placeholder="Enter condition to evaluate (Jinja or natural language)"
+                    placeholder="Enter condition to evaluate (Jinja, natural language, or both)"
                   />
                 </div>
               )}

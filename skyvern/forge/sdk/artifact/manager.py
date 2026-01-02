@@ -305,6 +305,45 @@ class ArtifactManager:
             path=path,
         )
 
+    async def create_workflow_run_block_artifacts(
+        self,
+        workflow_run_block: WorkflowRunBlock,
+        artifacts: list[tuple[ArtifactType, bytes]],
+    ) -> list[str]:
+        """
+        Bulk-create artifacts for a workflow run block in a single DB round-trip.
+        """
+        if not artifacts:
+            return []
+
+        artifact_batch: list[ArtifactBatchData] = []
+        for artifact_type, data in artifacts:
+            artifact_id = generate_artifact_id()
+            uri = app.STORAGE.build_workflow_run_block_uri(
+                organization_id=workflow_run_block.organization_id,
+                artifact_id=artifact_id,
+                workflow_run_block=workflow_run_block,
+                artifact_type=artifact_type,
+            )
+            artifact_batch.append(
+                ArtifactBatchData(
+                    artifact_model=self._build_artifact_model(
+                        artifact_id=artifact_id,
+                        artifact_type=artifact_type,
+                        uri=uri,
+                        organization_id=workflow_run_block.organization_id,
+                        workflow_run_block_id=workflow_run_block.workflow_run_block_id,
+                        workflow_run_id=workflow_run_block.workflow_run_id,
+                    ),
+                    data=data,
+                )
+            )
+
+        request = BulkArtifactCreationRequest(
+            artifacts=artifact_batch, primary_key=workflow_run_block.workflow_run_block_id
+        )
+        return await self._bulk_create_artifacts(request)
+
     async def create_ai_suggestion_artifact(
         self,
         ai_suggestion: AISuggestion,

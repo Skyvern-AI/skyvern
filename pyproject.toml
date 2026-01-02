@@ -199,11 +199,3 @@ skyvern = "skyvern.cli.commands:cli_app"
 
 [tool.pytest.ini_options]
 norecursedirs = ["eval"]
-
-[tool.codeflash]
-# All paths are relative to this pyproject.toml's directory.
-module-root = "skyvern"
-tests-root = "codeflash-tests"
-test-framework = "pytest"
-ignore-paths = ["skyvern/client"]
-formatter-cmds = ["ruff check --exit-zero --fix $file", "ruff format $file"]

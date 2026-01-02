@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import ProxyLocation
 
@@ -20,6 +21,11 @@ class CreateBrowserSessionRequest(BaseModel):
     proxy_location: ProxyLocation | None = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING,
+    )
+
+    extensions: list[Extensions] | None = Field(
+        default=None,
+        description="A list of extensions to install in the browser session.",
     )
 
 
