@@ -33,7 +33,8 @@ export const getInitialValues = (
             acc[curr.key] = curr.default_value;
             return acc;
           }
-          acc[curr.key] = null;
+          // For string parameters, keep empty string instead of null to match run form behavior
+          acc[curr.key] = curr.workflow_parameter_type === "string" ? "" : null;
           return acc;
         },
         {} as Record<string, unknown>,
