@@ -93,16 +93,16 @@ Additionally, for Windows:
 
 ### 1. Install Skyvern
 
-```bash
+
 pip install skyvern
-```
+
 
 ### 2. Run Skyvern
 This is most helpful for first time run (db setup, db migrations etc).
 
-```bash
+
 skyvern quickstart
-```
+
 
 ### 3. Run task
 
@@ -110,25 +110,25 @@ skyvern quickstart
 
 Start the Skyvern service and UI (when DB is up and running)
 
-```bash
+
 skyvern run all
-```
+
 
 Go to http://localhost:8080 and use the UI to run a task
 
 #### Code
 
-```python
+
 from skyvern import Skyvern
 
 skyvern = Skyvern()
 task = await skyvern.run_task(prompt="Find the top post on hackernews today")
 print(task)
-```
+
 Skyvern starts running the task in a browser that pops up and closes it when the task is done. You will be able to view the task from http://localhost:8080/history
 
 You can also run a task on different targets:
-```python
+
 from skyvern import Skyvern
 
 # Run on Skyvern Cloud
@@ -139,7 +139,7 @@ skyvern = Skyvern(base_url="http://localhost:8000", api_key="LOCAL SKYVERN API K
 
 task = await skyvern.run_task(prompt="Find the top post on hackernews today")
 print(task)
-```
+
 
 ## SDK
 
@@ -215,7 +215,7 @@ await page.click("#download-button")
 > Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser.
 
 1. Just With Python Code
-```python
+
 from skyvern import Skyvern
 
 # The path to your Chrome browser. This example path is for Mac.
@@ -228,34 +228,34 @@ skyvern = Skyvern(
 task = await skyvern.run_task(
     prompt="Find the top post on hackernews today",
 )
-```
+
 
 2. With Skyvern Service
 
 Add two variables to your .env file:
-```bash
+
 # The path to your Chrome browser. This example path is for Mac.
 CHROME_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 BROWSER_TYPE=cdp-connect
-```
+
 
 Restart Skyvern service `skyvern run all` and run the task through UI or code
 
 ### Run Skyvern with any remote browser
 Grab the cdp connection url and pass it to Skyvern
 
-```python
+
 from skyvern import Skyvern
 
 skyvern = Skyvern(cdp_url="your cdp connection url")
 task = await skyvern.run_task(
     prompt="Find the top post on hackernews today",
 )
-```
+
 
 ### Get consistent output schema from your run
 You can do this by adding the `data_extraction_schema` parameter:
-```python
+
 from skyvern import Skyvern
 
 skyvern = Skyvern()
@@ -279,12 +279,12 @@ task = await skyvern.run_task(
         }
     }
 )
-```
+
 
 ### Helpful commands to debug issues
 
 
-```bash
+
 # Launch the Skyvern Server Separately*
 skyvern run server
 
@@ -302,7 +302,7 @@ skyvern stop ui
 
 # Stop the Skyvern Server Separately
 skyvern stop server
-```
+
 
 ## Docker Compose setup
 
@@ -484,6 +484,8 @@ Make sure to have [uv](https://docs.astral.sh/uv/getting-started/installation/) 
 
 More extensive documentation can be found on our [📕 docs page](https://www.skyvern.com/docs). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
 
+If you want to chat with the skyvern repository to get a high level overview of how it is structured, how to build off it, and how to resolve usage questions, check out [Code Sage](https://sage.storia.ai?utm_source=github&utm_medium=referral&utm_campaign=skyvern-readme).
+
 # Supported LLMs
 | Provider | Supported Models |
 | -------- | ------- |
@@ -494,7 +496,7 @@ More extensive documentation can be found on our [📕 docs page](https://www.sk
 | Gemini | Gemini 2.5 Pro and flash, Gemini 2.0 |
 | Ollama | Run any locally hosted model via [Ollama](https://github.com/ollama/ollama) |
 | OpenRouter | Access models through [OpenRouter](https://openrouter.ai) |
-| OpenAI-compatible | Any custom API endpoint that follows OpenAI's API format (via [liteLLM](https://docs.litellm.ai/docs/providers/openai_compatible)) |
+| OpenAI-compatible | Any custom API endpoint that follows OpenAI's API format (via [liteLLM](https://docs.litellm.ai/docs/providers/openai_compatible)), including CometAPI |
 
 #### Environment Variables
 
@@ -567,16 +569,18 @@ Recommended `LLM_KEY`: `OPENROUTER`
 ##### OpenAI-Compatible
 | Variable | Description| Type | Sample Value|
 | -------- | ------- | ------- | ------- |
-| `ENABLE_OPENAI_COMPATIBLE`| Register a custom OpenAI-compatible API endpoint | Boolean | `true`, `false` |
-| `OPENAI_COMPATIBLE_MODEL_NAME` | Model name for OpenAI-compatible endpoint | String | `yi-34b`, `gpt-3.5-turbo`, `mistral-large`, etc.|
-| `OPENAI_COMPATIBLE_API_KEY` | API key for OpenAI-compatible endpoint | String | `sk-1234567890`|
-| `OPENAI_COMPATIBLE_API_BASE` | Base URL for OpenAI-compatible endpoint | String | `https://api.together.xyz/v1`, `http://localhost:8000/v1`, etc.|
+| `ENABLE_OPENAI_COMPATIBLE`| Register a custom OpenAI-compatible API endpoint (e.g., CometAPI) | Boolean | `true`, `false` |
+| `OPENAI_COMPATIBLE_MODEL_NAME` | Model name for OpenAI-compatible endpoint (e.g., `cometapi/gpt-4o`, `yi-34b`, `gpt-3.5-turbo`, `mistral-large`, etc.) | String | `cometapi/gpt-4o`|
+| `OPENAI_COMPATIBLE_API_KEY` | API key for OpenAI-compatible endpoint (e.g., CometAPI API Key) | String | `sk-comet-1234567890`|
+| `OPENAI_COMPATIBLE_API_BASE` | Base URL for OpenAI-compatible endpoint (e.g., `https://api.cometapi.com`, `https://api.together.xyz/v1`, `http://localhost:8000/v1`, etc.) | String | `https://api.cometapi.com`|
 | `OPENAI_COMPATIBLE_API_VERSION` | API version for OpenAI-compatible endpoint, optional| String | `2023-05-15`|
 | `OPENAI_COMPATIBLE_MAX_TOKENS` | Maximum tokens for completion, optional| Integer | `4096`, `8192`, etc.|
 | `OPENAI_COMPATIBLE_TEMPERATURE` | Temperature setting, optional| Float | `0.0`, `0.5`, `0.7`, etc.|
-| `OPENAI_COMPATIBLE_SUPPORTS_VISION` | Whether model supports vision, optional| Boolean | `true`, `false`|
+| `OPENAI_COMPATIBLE_SUPPORTS_VISION` | Whether model supports vision, optional (e.g., `true` for CometAPI multimodal models) | Boolean | `true`, `false`|
 
 Supported LLM Key: `OPENAI_COMPATIBLE`
+
+Note: For CometAPI, you can also use `https://api.cometapi.com/v1` or `https://api.cometapi.com/v1/chat/completions` as `OPENAI_COMPATIBLE_API_BASE`.
 
 ##### General LLM Configuration
 | Variable | Description| Type | Sample Value|
