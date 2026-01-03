@@ -196,20 +196,31 @@ def create_forge_app() -> ForgeApp:
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
     app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = BitwardenCredentialVaultService()
-    app.AZURE_CREDENTIAL_VAULT_SERVICE = (
-        AzureCredentialVaultService(
-            app.AZURE_CLIENT_FACTORY.create_from_client_secret(
+
+    # Azure Credential Vault Service
+    # If running a workload on Azure and using workload identity (the common case for AKS or Azure VMs),
+    # use DefaultAzureCredential when a client secret is not provided.
+    # If explicit credentials are configured use ClientSecretCredential instead.
+    if settings.AZURE_CREDENTIAL_VAULT:
+        if settings.AZURE_CLIENT_SECRET:
+            # Explicit client secret authentication
+            azure_vault_client = app.AZURE_CLIENT_FACTORY.create_from_client_secret(
                 AzureClientSecretCredential(
                     tenant_id=settings.AZURE_TENANT_ID,  # type: ignore
                     client_id=settings.AZURE_CLIENT_ID,  # type: ignore
                     client_secret=settings.AZURE_CLIENT_SECRET,  # type: ignore
                 )
-            ),
+            )
+        else:
+            # Workload Identity / DefaultAzureCredential
+            azure_vault_client = app.AZURE_CLIENT_FACTORY.create_default()
+
+        app.AZURE_CREDENTIAL_VAULT_SERVICE = AzureCredentialVaultService(
+            azure_vault_client,
             vault_name=settings.AZURE_CREDENTIAL_VAULT,  # type: ignore[arg-type]
         )
-        if settings.AZURE_CREDENTIAL_VAULT
-        else None
-    )
+    else:
+        app.AZURE_CREDENTIAL_VAULT_SERVICE = None
     app.CUSTOM_CREDENTIAL_VAULT_SERVICE = (
         CustomCredentialVaultService(
             CustomCredentialAPIClient(
