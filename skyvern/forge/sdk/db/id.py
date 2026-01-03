@@ -25,6 +25,9 @@ SEQUENCE_MAX = (2**SEQUENCE_BITS) - 1
 _sequence_start = None
 SEQUENCE_COUNTER = itertools.count()
 _worker_hash = None
+_current_timestamp = None  # Track current second for overflow detection
+_sequence_overflow = 0  # Increments when >1024 IDs generated in one second
+_sequence_count = 0  # Count IDs in current second
 
 # prefix
 ACTION_PREFIX = "act"
@@ -261,12 +264,27 @@ def generate_script_block_id() -> str:
 def generate_id() -> int:
     """
     generate a 64-bit int ID
+
+    Handles >1024 IDs per second by adding overflow counter to worker hash.
+    Safe for asyncio (no threading concerns - function is atomic).
     """
+    global _current_timestamp, _sequence_overflow, _sequence_count
+
     create_at = current_time() - BASE_EPOCH
     sequence = _increment_and_get_sequence()
 
+    if _current_timestamp != create_at:
+        _current_timestamp = create_at
+        _sequence_overflow = 0
+        _sequence_count = 0
+
+    _sequence_count += 1
+
+    if _sequence_count > SEQUENCE_MAX + 1:
+        _sequence_overflow = (_sequence_count - 1) // (SEQUENCE_MAX + 1)
+
     time_part = _mask_shift(create_at, TIMESTAMP_BITS, TIMESTAMP_SHIFT)
-    worker_part = _mask_shift(_get_worker_hash(), WORKER_ID_BITS, WORKER_ID_SHIFT)
+    worker_part = _mask_shift(_get_worker_hash() + _sequence_overflow, WORKER_ID_BITS, WORKER_ID_SHIFT)
     sequence_part = _mask_shift(sequence, SEQUENCE_BITS, SEQUENCE_SHIFT)
     version_part = _mask_shift(VERSION, VERSION_BITS, VERSION_SHIFT)
 
@@ -278,7 +296,7 @@ def _increment_and_get_sequence() -> int:
     if _sequence_start is None:
         _sequence_start = random.randint(0, SEQUENCE_MAX)
 
-    return (_sequence_start + next(SEQUENCE_COUNTER)) % SEQUENCE_MAX
+    return (_sequence_start + next(SEQUENCE_COUNTER)) & SEQUENCE_MAX
 
 
 def current_time() -> int:
