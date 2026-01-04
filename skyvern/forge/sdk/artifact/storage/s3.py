@@ -236,7 +236,7 @@ class S3Storage(BaseStorage):
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
         bucket = settings.AWS_S3_BUCKET_ARTIFACTS
-        uri = f"s3://{bucket}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
         return [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
 
     async def get_shared_downloaded_files_in_browser_session(
@@ -281,14 +281,14 @@ class S3Storage(BaseStorage):
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
         bucket = settings.AWS_S3_BUCKET_ARTIFACTS
-        uri = f"s3://{bucket}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
         files = [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
         return [file for file in files if file.endswith(BROWSER_DOWNLOADING_SUFFIX)]
 
     async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
         """List all recording files for a browser session from S3."""
         bucket = settings.AWS_S3_BUCKET_ARTIFACTS
-        uri = f"s3://{bucket}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
+        uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
         return [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=uri)]
 
     async def get_shared_recordings_in_browser_session(
@@ -475,7 +475,7 @@ class S3Storage(BaseStorage):
         date: str | None = None,
     ) -> str:
         """Build the S3 URI for a browser session file."""
-        base = f"s3://{self.bucket}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/{artifact_type}"
+        base = f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/{artifact_type}"
         if date:
             return f"{base}/{date}/{remote_path}"
         return f"{base}/{remote_path}"
