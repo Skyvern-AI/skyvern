@@ -1,6 +1,7 @@
 import base64
 
 import structlog
+from cachetools import TTLCache
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
@@ -16,6 +17,23 @@ from skyvern.services import script_service
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
+
+# Cache for workflow scripts - only stores non-None results
+_workflow_script_cache: TTLCache[tuple, "Script"] = TTLCache(maxsize=128, ttl=60 * 60)
+
+
+def _make_workflow_script_cache_key(
+    organization_id: str,
+    workflow_permanent_id: str,
+    cache_key_value: str,
+    workflow_run_id: str | None = None,
+    cache_key: str | None = None,
+    statuses: list[ScriptStatus] | None = None,
+) -> tuple:
+    """Create a hashable cache key from the function arguments."""
+    # Convert list to tuple for hashability
+    statuses_key = tuple(statuses) if statuses else None
+    return (organization_id, workflow_permanent_id, cache_key_value, workflow_run_id, cache_key, statuses_key)
 
 
 async def generate_or_update_pending_workflow_script(
@@ -78,11 +96,12 @@ async def get_workflow_script(
             return None, rendered_cache_key_value
 
         # Check if there are existing cached scripts for this workflow + cache_key_value
-        existing_script = await app.DATABASE.get_workflow_script_by_cache_key_value(
+        existing_script = await get_workflow_script_by_cache_key_value(
             organization_id=workflow.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=rendered_cache_key_value,
             statuses=[status],
+            use_cache=True,
         )
 
         if existing_script:
@@ -105,6 +124,54 @@ async def get_workflow_script(
             exc_info=True,
         )
         return None, rendered_cache_key_value
+
+
+async def get_workflow_script_by_cache_key_value(
+    organization_id: str,
+    workflow_permanent_id: str,
+    cache_key_value: str,
+    workflow_run_id: str | None = None,
+    cache_key: str | None = None,
+    statuses: list[ScriptStatus] | None = None,
+    use_cache: bool = False,
+) -> Script | None:
+    if use_cache:
+        cache_key_tuple = _make_workflow_script_cache_key(
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            cache_key_value=cache_key_value,
+            workflow_run_id=workflow_run_id,
+            cache_key=cache_key,
+            statuses=statuses,
+        )
+        # Check cache first
+        if cache_key_tuple in _workflow_script_cache:
+            return _workflow_script_cache[cache_key_tuple]
+
+        # Cache miss - fetch from database
+        result = await app.DATABASE.get_workflow_script_by_cache_key_value(
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            cache_key_value=cache_key_value,
+            workflow_run_id=workflow_run_id,
+            cache_key=cache_key,
+            statuses=statuses,
+        )
+
+        # Only cache non-None results
+        if result is not None:
+            _workflow_script_cache[cache_key_tuple] = result
+
+        return result
+
+    return await app.DATABASE.get_workflow_script_by_cache_key_value(
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=cache_key_value,
+        workflow_run_id=workflow_run_id,
+        cache_key=cache_key,
+        statuses=statuses,
+    )
 
 
 async def _load_cached_script_block_sources(

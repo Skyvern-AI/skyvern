@@ -639,5 +639,4 @@ class AgentFunction:
         )
 
     async def post_action_execution(self, action: Action) -> None:
-        return
-        # asyncio.create_task(self._post_action_execution(action))
+        asyncio.create_task(self._post_action_execution(action))
