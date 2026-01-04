@@ -1,5 +1,6 @@
 **/videos
 **/artifacts
+postgres-data
 !skyvern/client/artifacts
 **/traces
 **/inputs

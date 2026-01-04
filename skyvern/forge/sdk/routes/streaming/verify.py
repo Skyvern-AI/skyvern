@@ -46,17 +46,6 @@ async def verify_browser_session(
     Verify the browser session exists, and is usable.
     """
 
-    if settings.ENV == "local":
-        dummy_browser_session = AddressablePersistentBrowserSession(
-            persistent_browser_session_id=browser_session_id,
-            organization_id=organization_id,
-            browser_address="0.0.0.0:9223",
-            created_at=datetime.now(),
-            modified_at=datetime.now(),
-        )
-
-        return dummy_browser_session
-
     browser_session = await app.DATABASE.get_persistent_browser_session(browser_session_id, organization_id)
 
     if not browser_session:
@@ -92,25 +81,43 @@ async def verify_browser_session(
     browser_address = browser_session.browser_address
 
     if not browser_address:
-        LOG.info(
-            "Waiting for browser session address.",
-            browser_session_id=browser_session_id,
-            organization_id=organization_id,
-        )
-
-        try:
-            browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
-                session_id=browser_session_id,
-                organization_id=organization_id,
-            )
-        except Exception as ex:
+        # In local mode with VNC, use a default browser address immediately (skip polling)
+        if settings.ENV == "local" and browser_session.vnc_port:
+            browser_address = "0.0.0.0:9223"
             LOG.info(
-                "Browser session address not found for browser session.",
+                "Using default browser address for local VNC mode.",
                 browser_session_id=browser_session_id,
                 organization_id=organization_id,
-                ex=ex,
+                browser_address=browser_address,
+                vnc_port=browser_session.vnc_port,
             )
-            return None
+        else:
+            LOG.info(
+                "Waiting for browser session address.",
+                browser_session_id=browser_session_id,
+                organization_id=organization_id,
+            )
+
+            try:
+                browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
+                    session_id=browser_session_id,
+                    organization_id=organization_id,
+                )
+            except Exception as ex:
+                LOG.debug(
+                    "Exception getting browser address.",
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                    ex=ex,
+                )
+
+            if not browser_address:
+                LOG.info(
+                    "Browser session address not found for browser session.",
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                )
+                return None
 
     try:
         addressable_browser_session = AddressablePersistentBrowserSession(
@@ -184,27 +191,6 @@ async def verify_workflow_run(
     with it.
     """
 
-    if settings.ENV == "local":
-        dummy_workflow_run = WorkflowRun(
-            workflow_id="123",
-            workflow_permanent_id="wpid_123",
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            status=WorkflowRunStatus.running,
-            created_at=datetime.now(),
-            modified_at=datetime.now(),
-        )
-
-        dummy_browser_session = AddressablePersistentBrowserSession(
-            persistent_browser_session_id=workflow_run_id,
-            organization_id=organization_id,
-            browser_address="0.0.0.0:9223",
-            created_at=datetime.now(),
-            modified_at=datetime.now(),
-        )
-
-        return dummy_workflow_run, dummy_browser_session
-
     workflow_run = await app.DATABASE.get_workflow_run(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
@@ -255,23 +241,41 @@ async def verify_workflow_run(
     browser_address = browser_session.browser_address
 
     if not browser_address:
-        LOG.info(
-            "Waiting for browser session address.", workflow_run_id=workflow_run_id, organization_id=organization_id
-        )
-
-        try:
-            browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
-                session_id=browser_session.persistent_browser_session_id,
-                organization_id=organization_id,
-            )
-        except Exception as ex:
+        # In local mode with VNC, use a default browser address immediately (skip polling)
+        if settings.ENV == "local" and browser_session.vnc_port:
+            browser_address = "0.0.0.0:9223"
             LOG.info(
-                "Browser session address not found for workflow run.",
+                "Using default browser address for local VNC mode.",
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
-                ex=ex,
+                browser_address=browser_address,
+                vnc_port=browser_session.vnc_port,
             )
-            return workflow_run, None
+        else:
+            LOG.info(
+                "Waiting for browser session address.", workflow_run_id=workflow_run_id, organization_id=organization_id
+            )
+
+            try:
+                browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
+                    session_id=browser_session.persistent_browser_session_id,
+                    organization_id=organization_id,
+                )
+            except Exception as ex:
+                LOG.debug(
+                    "Exception getting browser address.",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    ex=ex,
+                )
+
+            if not browser_address:
+                LOG.info(
+                    "Browser session address not found for workflow run.",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+                return workflow_run, None
 
     try:
         addressable_browser_session = AddressablePersistentBrowserSession(

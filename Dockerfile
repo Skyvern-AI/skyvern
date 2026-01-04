@@ -15,7 +15,7 @@ RUN pip install --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 RUN playwright install-deps
 RUN playwright install
-RUN apt-get install -y xauth x11-apps netpbm gpg ca-certificates && apt-get clean
+RUN apt-get install -y xauth x11-apps netpbm gpg ca-certificates x11vnc novnc && apt-get clean
 
 COPY .nvmrc /app/.nvmrc
 COPY nodesource-repo.gpg.key /tmp/nodesource-repo.gpg.key

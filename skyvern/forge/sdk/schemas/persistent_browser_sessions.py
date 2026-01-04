@@ -49,6 +49,9 @@ class PersistentBrowserSession(BaseModel):
     modified_at: datetime
     deleted_at: datetime | None = None
     extensions: list[Extensions] | None = None
+    display_number: int | None = None
+    vnc_port: int | None = None
+    interactor: str | None = "agent"
 
 
 class AddressablePersistentBrowserSession(PersistentBrowserSession):

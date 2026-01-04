@@ -275,6 +275,21 @@ class PersistentSessionsManager:
             extensions=extensions,
         )
 
+        # Start VNC for this session
+        from skyvern.webeye.vnc_manager import VncManager
+
+        display, vnc_port = await VncManager.start_vnc_for_session(
+            session_id=browser_session_db.persistent_browser_session_id
+        )
+
+        # Update the session with VNC info
+        browser_session_db = await self.database.update_persistent_browser_session(
+            browser_session_db.persistent_browser_session_id,
+            organization_id=organization_id,
+            display_number=display,
+            vnc_port=vnc_port,
+        )
+
         return browser_session_db
 
     async def occupy_browser_session(
@@ -310,6 +325,11 @@ class PersistentSessionsManager:
 
     async def close_session(self, organization_id: str, browser_session_id: str) -> None:
         """Close a specific browser session."""
+        # Stop VNC for this session
+        from skyvern.webeye.vnc_manager import VncManager
+
+        await VncManager.stop_vnc_for_session(browser_session_id)
+
         browser_session = self._browser_sessions.get(browser_session_id)
         if browser_session:
             LOG.info(

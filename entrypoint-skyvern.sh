@@ -39,24 +39,13 @@ if [ ! -f ".streamlit/secrets.toml" ]; then
     echo ".streamlit/secrets.toml file updated with organization details."
 fi
 
-_kill_xvfb_on_term() {
-  kill -TERM $xvfb
-}
-
-# Setup a trap to catch SIGTERM and relay it to child processes
-trap _kill_xvfb_on_term TERM
-
-echo "Starting Xvfb..."
-# delete the lock file if any
-rm -f /tmp/.X99-lock
-# Set display environment variable
+# Start a default Xvfb display for workflows that don't create browser sessions
+# VncManager will create additional displays for browser sessions with VNC
+echo "Starting default Xvfb on display :99..."
+Xvfb :99 -screen 0 ${BROWSER_WIDTH:-1920}x${BROWSER_HEIGHT:-1080}x24 &
 export DISPLAY=:99
-# Start Xvfb
-Xvfb :99 -screen 0 1920x1080x16 &
-xvfb=$!
 
-DISPLAY=:99 xterm 2>/dev/null &
 python run_streaming.py > /dev/null &
 
-# Run the command and pass in all three arguments
+# Run the main application
 python -m skyvern.forge
