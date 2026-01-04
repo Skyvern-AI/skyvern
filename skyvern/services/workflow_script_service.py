@@ -1,6 +1,8 @@
 import base64
 
 import structlog
+from asyncache import cached
+from cachetools import TTLCache
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
@@ -105,6 +107,53 @@ async def get_workflow_script(
             exc_info=True,
         )
         return None, rendered_cache_key_value
+
+
+async def get_workflow_script_by_cache_key_value(
+    organization_id: str,
+    workflow_permanent_id: str,
+    cache_key_value: str,
+    workflow_run_id: str | None = None,
+    cache_key: str | None = None,
+    statuses: list[ScriptStatus] | None = None,
+    use_cache: bool = False,
+) -> Script | None:
+    if use_cache:
+        return await get_workflow_script_by_cache_key_value_cached(
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            cache_key_value=cache_key_value,
+            workflow_run_id=workflow_run_id,
+            cache_key=cache_key,
+            statuses=statuses,
+        )
+    return await app.DATABASE.get_workflow_script_by_cache_key_value(
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=cache_key_value,
+        workflow_run_id=workflow_run_id,
+        cache_key=cache_key,
+        statuses=statuses,
+    )
+
+
+@cached(cache=TTLCache(maxsize=128, ttl=60 * 60))
+async def get_workflow_script_by_cache_key_value_cached(
+    organization_id: str,
+    workflow_permanent_id: str,
+    cache_key_value: str,
+    workflow_run_id: str | None = None,
+    cache_key: str | None = None,
+    statuses: list[ScriptStatus] | None = None,
+) -> Script | None:
+    return await app.DATABASE.get_workflow_script_by_cache_key_value(
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=cache_key_value,
+        workflow_run_id=workflow_run_id,
+        cache_key=cache_key,
+        statuses=statuses,
+    )
 
 
 async def _load_cached_script_block_sources(
