@@ -715,11 +715,38 @@ class BaseTaskBlock(Block):
             if is_first_task:
                 # the first task block will create the browser state and do the navigation
                 try:
+                    # Get persist_browser_session from workflow context
+                    # If this is a sub-workflow, check the parent workflow for the setting
+                    workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                    persist_browser_session = False
+                    session_workflow_permanent_id = workflow_run.workflow_permanent_id
+
+                    # First check current workflow
+                    if workflow_run_context.workflow and workflow_run_context.workflow.persist_browser_session:
+                        persist_browser_session = True
+                        session_workflow_permanent_id = workflow_run.workflow_permanent_id
+                    # If not set, check parent workflow (for sub-workflows created by task_v2)
+                    elif workflow_run.parent_workflow_run_id:
+                        try:
+                            parent_context = self.get_workflow_run_context(workflow_run.parent_workflow_run_id)
+                            if parent_context.workflow and parent_context.workflow.persist_browser_session:
+                                persist_browser_session = True
+                                # Use parent's workflow_permanent_id for session directory
+                                session_workflow_permanent_id = parent_context.workflow.workflow_permanent_id
+                        except Exception as e:
+                            LOG.warning(
+                                "Could not get parent workflow context",
+                                parent_workflow_run_id=workflow_run.parent_workflow_run_id,
+                                error=str(e),
+                            )
+
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                         workflow_run=workflow_run,
                         url=self.url,
                         browser_session_id=browser_session_id,
                         browser_profile_id=workflow_run.browser_profile_id,
+                        persist_browser_session=persist_browser_session,
+                        workflow_permanent_id=session_workflow_permanent_id,
                     )
                     working_page = await browser_state.get_working_page()
                     if not working_page:
@@ -1900,12 +1927,39 @@ async def wrapper():
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
+            # Get persist_browser_session from workflow context
+            # If this is a sub-workflow, check the parent workflow for the setting
+            workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+            persist_browser_session = False
+            session_workflow_permanent_id = workflow_run.workflow_permanent_id
+
+            # First check current workflow
+            if workflow_run_context.workflow and workflow_run_context.workflow.persist_browser_session:
+                persist_browser_session = True
+                session_workflow_permanent_id = workflow_run.workflow_permanent_id
+            # If not set, check parent workflow (for sub-workflows created by task_v2)
+            elif workflow_run.parent_workflow_run_id:
+                try:
+                    parent_context = self.get_workflow_run_context(workflow_run.parent_workflow_run_id)
+                    if parent_context.workflow and parent_context.workflow.persist_browser_session:
+                        persist_browser_session = True
+                        # Use parent's workflow_permanent_id for session directory
+                        session_workflow_permanent_id = parent_context.workflow.workflow_permanent_id
+                except Exception as e:
+                    LOG.warning(
+                        "Could not get parent workflow context for code block",
+                        parent_workflow_run_id=workflow_run.parent_workflow_run_id,
+                        error=str(e),
+                    )
+
             try:
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                     workflow_run=workflow_run,
                     url=None,  # Code block doesn't need to navigate to a URL initially
                     browser_session_id=browser_session_id,
                     browser_profile_id=workflow_run.browser_profile_id,
+                    persist_browser_session=persist_browser_session,
+                    workflow_permanent_id=session_workflow_permanent_id,
                 )
                 # Ensure the browser state has a working page
                 await browser_state.check_and_fix_state(

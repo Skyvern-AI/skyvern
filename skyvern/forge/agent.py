@@ -2283,11 +2283,43 @@ class ForgeAgent:
         browser_session_id: str | None = None,
     ) -> tuple[Step, BrowserState, DetailedAgentStepOutput]:
         if workflow_run:
+            # Check for persist_browser_session - first in current workflow, then in parent
+            persist_browser_session = False
+            session_workflow_permanent_id = workflow_run.workflow_permanent_id
+
+            try:
+                workflow = await app.WORKFLOW_SERVICE.get_workflow(
+                    workflow_run.workflow_id, organization_id=workflow_run.organization_id
+                )
+                if workflow and workflow.persist_browser_session:
+                    persist_browser_session = True
+                    session_workflow_permanent_id = workflow.workflow_permanent_id
+                elif workflow_run.parent_workflow_run_id:
+                    # Check parent workflow for persist_browser_session
+                    parent_workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                        workflow_run.parent_workflow_run_id, organization_id=workflow_run.organization_id
+                    )
+                    if parent_workflow_run:
+                        parent_workflow = await app.WORKFLOW_SERVICE.get_workflow(
+                            parent_workflow_run.workflow_id, organization_id=workflow_run.organization_id
+                        )
+                        if parent_workflow and parent_workflow.persist_browser_session:
+                            persist_browser_session = True
+                            session_workflow_permanent_id = parent_workflow.workflow_permanent_id
+            except Exception as e:
+                LOG.warning(
+                    "Could not get workflow for persist_browser_session in initialize_execution_state",
+                    workflow_id=workflow_run.workflow_id,
+                    error=str(e),
+                )
+
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                 workflow_run=workflow_run,
                 url=task.url,
                 browser_session_id=browser_session_id,
                 browser_profile_id=workflow_run.browser_profile_id,
+                persist_browser_session=persist_browser_session,
+                workflow_permanent_id=session_workflow_permanent_id,
             )
         else:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_task(

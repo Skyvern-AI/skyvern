@@ -202,13 +202,28 @@ class LocalStorage(BaseStorage):
         )
 
         # Copy all files from the directory to the stored folder
+        # Skip special files that cannot be copied (sockets, lock files, etc.)
+        skip_files = {"SingletonSocket", "SingletonLock", "SingletonCookie"}
         for root, _, files in os.walk(source_directory):
             for file in files:
+                if file in skip_files:
+                    continue
                 source_file_path = Path(root) / file
+                # Skip non-regular files (sockets, devices, etc.)
+                if not source_file_path.is_file():
+                    continue
                 relative_path = source_file_path.relative_to(source_directory)
                 target_file_path = stored_folder_path / relative_path
                 self._create_directories_if_not_exists(target_file_path)
-                shutil.copy2(source_file_path, target_file_path)
+                try:
+                    shutil.copy2(source_file_path, target_file_path)
+                except OSError as e:
+                    # Skip files that cannot be copied (e.g., sockets, special devices)
+                    LOG.debug(
+                        "Skipping file that cannot be copied",
+                        file=str(source_file_path),
+                        error=str(e),
+                    )
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
         stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
