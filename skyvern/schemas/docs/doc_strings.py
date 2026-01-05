@@ -23,6 +23,7 @@ Available geotargeting options:
 - RESIDENTIAL_FR: France
 - RESIDENTIAL_DE: Germany
 - RESIDENTIAL_NZ: New Zealand
+- RESIDENTIAL_PH: Philippines
 - RESIDENTIAL_ZA: South Africa
 - RESIDENTIAL_AR: Argentina
 - RESIDENTIAL_AU: Australia
