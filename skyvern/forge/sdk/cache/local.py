@@ -9,7 +9,7 @@ class LocalCache(BaseCache):
     def __init__(self) -> None:
         # Use a regular dict to store (value, expiration_timestamp) tuples
         self._cache: dict[str, tuple[Any, float]] = {}
-        self._lock = asyncio.Lock()  # Async lock for thread-safe access
+        self._lock = asyncio.Lock()  # Async lock for task-safe access within event loop
         self._default_ttl_seconds = CACHE_EXPIRE_TIME.total_seconds()
 
     def _normalize_expiration(self, ex: Union[int, timedelta, None]) -> float:
@@ -19,10 +19,8 @@ class LocalCache(BaseCache):
 
         if isinstance(ex, timedelta):
             ttl_seconds = ex.total_seconds()
-        elif isinstance(ex, int):
+        else:  # isinstance(ex, int)
             ttl_seconds = float(ex)
-        else:
-            ttl_seconds = self._default_ttl_seconds
 
         return datetime.now().timestamp() + ttl_seconds
 
