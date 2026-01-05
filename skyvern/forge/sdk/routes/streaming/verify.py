@@ -83,7 +83,7 @@ async def verify_browser_session(
     if not browser_address:
         # In local mode with VNC, use a default browser address immediately (skip polling)
         if settings.ENV == "local" and browser_session.vnc_port:
-            browser_address = "0.0.0.0:9223"
+            browser_address = "http://localhost:9222"
             LOG.info(
                 "Using default browser address for local VNC mode.",
                 browser_session_id=browser_session_id,
@@ -243,7 +243,7 @@ async def verify_workflow_run(
     if not browser_address:
         # In local mode with VNC, use a default browser address immediately (skip polling)
         if settings.ENV == "local" and browser_session.vnc_port:
-            browser_address = "0.0.0.0:9223"
+            browser_address = "http://localhost:9222"
             LOG.info(
                 "Using default browser address for local VNC mode.",
                 workflow_run_id=workflow_run_id,
@@ -262,7 +262,7 @@ async def verify_workflow_run(
                     organization_id=organization_id,
                 )
             except Exception as ex:
-                LOG.debug(
+                LOG.warning(
                     "Exception getting browser address.",
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,

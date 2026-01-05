@@ -168,10 +168,17 @@ class VncChannel:
     def __post_init__(self, initial_interactor: Interactor) -> None:
         # Read interactor from browser_session if available, otherwise use initial_interactor
         if self.browser_session and self.browser_session.interactor:
-            self._interactor = self.browser_session.interactor  # type: ignore
-            LOG.info(f"{self.class_name} Restored interactor from session: {self._interactor}",
-                     browser_session_id=self.browser_session.persistent_browser_session_id,
-                     organization_id=self.organization_id)
+            stored = self.browser_session.interactor
+            if stored in ("agent", "user"):
+                self._interactor = stored  # type: ignore[assignment]
+                LOG.info(f"{self.class_name} Restored interactor from session: {self._interactor}",
+                         browser_session_id=self.browser_session.persistent_browser_session_id,
+                         organization_id=self.organization_id)
+            else:
+                LOG.warning(f"{self.class_name} Invalid interactor value in database: {stored}, using default",
+                            browser_session_id=self.browser_session.persistent_browser_session_id,
+                            organization_id=self.organization_id)
+                self._interactor = initial_interactor
         else:
             self._interactor = initial_interactor
         add_vnc_channel(self)
@@ -205,7 +212,7 @@ class VncChannel:
 
     async def set_interactor_async(self, value: Interactor) -> None:
         """Set the interactor and persist to database."""
-        from skyvern.forge import app
+        from skyvern.forge import app  # noqa: PLC0415
 
         self._interactor = value
         LOG.info(f"{self.class_name} Setting interactor to {value}", **self.identity)
@@ -220,9 +227,9 @@ class VncChannel:
                 )
                 LOG.info(f"{self.class_name} Persisted interactor to database: {value}",
                          browser_session_id=self.browser_session.persistent_browser_session_id)
-            except Exception as e:
-                LOG.error(f"{self.class_name} Failed to persist interactor to database",
-                          error=str(e), **self.identity)
+            except Exception:
+                LOG.exception(f"{self.class_name} Failed to persist interactor to database",
+                              **self.identity)
 
     @property
     def is_open(self) -> bool:

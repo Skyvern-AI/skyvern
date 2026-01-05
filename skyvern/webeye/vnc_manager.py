@@ -4,6 +4,7 @@ import asyncio
 import os
 import subprocess
 from dataclasses import dataclass
+from typing import ClassVar
 
 import structlog
 
@@ -22,9 +23,10 @@ class VncProcess:
 
 
 class VncManager:
-    _instances: dict[str, VncProcess] = {}
-    _used_displays: set[int] = set()
-    _used_ports: set[int] = set()
+    _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+    _instances: ClassVar[dict[str, VncProcess]] = {}
+    _used_displays: ClassVar[set[int]] = set()
+    _used_ports: ClassVar[set[int]] = set()
 
     # Start at 100 because :99 is the default display started in entrypoint
     BASE_DISPLAY = 100
@@ -55,8 +57,9 @@ class VncManager:
         Returns:
             tuple[int, int]: (display_number, vnc_port)
         """
-        display = cls.allocate_display()
-        vnc_port = cls.allocate_port()
+        async with cls._lock:
+            display = cls.allocate_display()
+            vnc_port = cls.allocate_port()
         rfb_port = 5900 + (display - cls.BASE_DISPLAY)
 
         LOG.info(
@@ -80,6 +83,9 @@ class VncManager:
             stderr=subprocess.DEVNULL,
         )
         await asyncio.sleep(0.5)
+        if xvfb.poll() is not None:
+            LOG.error("Xvfb failed to start", display=display, returncode=xvfb.returncode)
+            raise RuntimeError(f"Xvfb failed to start on display :{display}")
 
         # Set DISPLAY environment variable for the browser to use
         # Use the first available display (lowest number) as the default
@@ -116,6 +122,10 @@ class VncManager:
             stderr=subprocess.DEVNULL,
         )
         await asyncio.sleep(0.3)
+        if x11vnc.poll() is not None:
+            LOG.error("x11vnc failed to start", display=display, returncode=x11vnc.returncode)
+            xvfb.terminate()
+            raise RuntimeError(f"x11vnc failed to start on display :{display}")
 
         # Start websockify
         # Note: We don't use --daemon flag because Popen already runs in background.
@@ -130,6 +140,12 @@ class VncManager:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        await asyncio.sleep(0.2)
+        if websockify.poll() is not None:
+            LOG.error("websockify failed to start", vnc_port=vnc_port, returncode=websockify.returncode)
+            x11vnc.terminate()
+            xvfb.terminate()
+            raise RuntimeError(f"websockify failed to start on port {vnc_port}")
 
         cls._instances[session_id] = VncProcess(
             display_number=display,
@@ -164,7 +180,8 @@ class VncManager:
             vnc_port=vnc.vnc_port,
         )
 
-        # Terminate processes in reverse order
+        # Terminate processes in reverse order of startup (websockify → x11vnc → Xvfb)
+        # This ensures clean teardown: disconnect clients first, then VNC server, then X server
         for proc in [vnc.websockify_process, vnc.x11vnc_process, vnc.xvfb_process]:
             if proc is None:
                 continue

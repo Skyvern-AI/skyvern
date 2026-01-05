@@ -276,7 +276,7 @@ class PersistentSessionsManager:
         )
 
         # Start VNC for this session
-        from skyvern.webeye.vnc_manager import VncManager
+        from skyvern.webeye.vnc_manager import VncManager  # noqa: PLC0415
 
         display, vnc_port = await VncManager.start_vnc_for_session(
             session_id=browser_session_db.persistent_browser_session_id
@@ -326,7 +326,7 @@ class PersistentSessionsManager:
     async def close_session(self, organization_id: str, browser_session_id: str) -> None:
         """Close a specific browser session."""
         # Stop VNC for this session
-        from skyvern.webeye.vnc_manager import VncManager
+        from skyvern.webeye.vnc_manager import VncManager  # noqa: PLC0415
 
         await VncManager.stop_vnc_for_session(browser_session_id)
 

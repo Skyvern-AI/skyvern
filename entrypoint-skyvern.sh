@@ -39,11 +39,9 @@ if [ ! -f ".streamlit/secrets.toml" ]; then
     echo ".streamlit/secrets.toml file updated with organization details."
 fi
 
-# Start a default Xvfb display for workflows that don't create browser sessions
+# Start base VNC display (Xvfb on :99)
 # VncManager will create additional displays for browser sessions with VNC
-echo "Starting default Xvfb on display :99..."
-Xvfb :99 -screen 0 ${BROWSER_WIDTH:-1920}x${BROWSER_HEIGHT:-1080}x24 &
-export DISPLAY=:99
+source /app/scripts/start_vnc_streaming.sh
 
 python run_streaming.py > /dev/null &
 

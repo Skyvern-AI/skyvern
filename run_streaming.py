@@ -62,7 +62,7 @@ async def run() -> None:
         png_file_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
 
         # Get the display number for this session
-        display = ":99"  # default
+        display = os.environ.get("SKYVERN_DEFAULT_DISPLAY", ":99")
         try:
             browser_session = None
             if workflow_run_id:

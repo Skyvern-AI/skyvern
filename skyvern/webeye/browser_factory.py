@@ -226,7 +226,6 @@ class BrowserContextFactory:
             "--disk-cache-size=1",
             "--start-maximized",
             "--kiosk-printing",
-            "--disable-gpu",  # Force software rendering for x11vnc compatibility
         ]
 
         if cdp_port:
@@ -403,6 +402,12 @@ def _get_cdp_port(kwargs: dict) -> int | None:
     return None
 
 
+def _apply_display_env(browser_args: dict[str, Any], display_number: int | None) -> None:
+    """Set DISPLAY environment variable for VNC support."""
+    if display_number:
+        browser_args["env"] = {**os.environ, "DISPLAY": f":{display_number}"}
+
+
 def _is_port_in_use(port: int) -> bool:
     """Check if a port is already in use."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -491,9 +496,11 @@ async def _create_headless_chromium(
     )
 
     # Set DISPLAY environment variable for the browser process (for VNC support)
-    display_number = kwargs.get("display_number")
-    if display_number:
-        browser_args["env"] = {**os.environ, "DISPLAY": f":{display_number}"}
+    _apply_display_env(browser_args, kwargs.get("display_number"))
+
+    # Clean up stale Chrome lock files if using a persistent user_data_dir
+    if browser_session_dir or browser_profile_id:
+        cleanup_stale_chrome_lock_files(user_data_dir)
 
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     return browser_context, browser_artifacts, None
@@ -562,9 +569,11 @@ async def _create_headful_chromium(
     )
 
     # Set DISPLAY environment variable for the browser process (for VNC support)
-    display_number = kwargs.get("display_number")
-    if display_number:
-        browser_args["env"] = {**os.environ, "DISPLAY": f":{display_number}"}
+    _apply_display_env(browser_args, kwargs.get("display_number"))
+
+    # Clean up stale Chrome lock files if using a persistent user_data_dir
+    if browser_session_dir or browser_profile_id:
+        cleanup_stale_chrome_lock_files(user_data_dir)
 
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     return browser_context, browser_artifacts, None
@@ -596,6 +605,120 @@ def is_valid_chromium_user_data_dir(directory: str) -> bool:
     preferences_file = os.path.join(default_dir, "Preferences")
 
     return os.path.isdir(directory) and os.path.isdir(default_dir) and os.path.isfile(preferences_file)
+
+
+def cleanup_stale_chrome_lock_files(user_data_dir: str) -> bool:
+    """Clean up stale Chrome lock files from a user data directory.
+
+    Chrome creates lock files (SingletonLock, SingletonSocket, SingletonCookie) to prevent
+    multiple instances from using the same profile. If Chrome crashes or doesn't shut down
+    cleanly, these lock files may remain and prevent new browser instances from launching.
+
+    This function checks if the lock files are stale (no Chrome process is using the directory)
+    and removes them if so.
+
+    Returns True if lock files were cleaned up, False otherwise.
+    """
+    singleton_lock = os.path.join(user_data_dir, "SingletonLock")
+    singleton_socket = os.path.join(user_data_dir, "SingletonSocket")
+    singleton_cookie = os.path.join(user_data_dir, "SingletonCookie")
+
+    # Check if any lock files exist
+    lock_files_exist = any(
+        os.path.exists(f) or os.path.islink(f) for f in [singleton_lock, singleton_socket, singleton_cookie]
+    )
+
+    if not lock_files_exist:
+        return False
+
+    LOG.info("Chrome lock files detected", user_data_dir=user_data_dir)
+
+    # Check if SingletonLock is a symlink and extract PID from it
+    # On Linux, SingletonLock is typically a symlink like "localhost:12345-1234567890" where 12345 is the hostname
+    # and 1234567890 is the PID, or it can point to a path containing the PID
+    active_chrome_found = False
+
+    if os.path.islink(singleton_lock):
+        try:
+            link_target = os.readlink(singleton_lock)
+            # Try to extract PID from the link target
+            # Format can be like "localhost:12345-1234567890" or similar
+            parts = link_target.split("-")
+            if len(parts) >= 2:
+                try:
+                    pid = int(parts[-1])
+                    if psutil.pid_exists(pid):
+                        try:
+                            proc = psutil.Process(pid)
+                            # Check if it's actually a Chrome/Chromium process
+                            proc_name = proc.name().lower()
+                            if any(name in proc_name for name in ["chrome", "chromium"]):
+                                active_chrome_found = True
+                                LOG.info(
+                                    "Active Chrome process found using this profile",
+                                    pid=pid,
+                                    user_data_dir=user_data_dir,
+                                )
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                except ValueError:
+                    pass
+        except OSError:
+            pass
+
+    # Also check for any Chrome process that might be using this user-data-dir
+    if not active_chrome_found:
+        try:
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    proc_name = proc.info.get("name", "").lower()
+                    if any(name in proc_name for name in ["chrome", "chromium"]):
+                        cmdline = proc.info.get("cmdline") or []
+                        cmdline_str = " ".join(cmdline)
+                        if user_data_dir in cmdline_str:
+                            active_chrome_found = True
+                            LOG.info(
+                                "Active Chrome process found with matching user-data-dir",
+                                pid=proc.pid,
+                                user_data_dir=user_data_dir,
+                            )
+                            break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            LOG.warning("Error while checking for active Chrome processes", exc_info=True)
+
+    if active_chrome_found:
+        LOG.warning(
+            "Cannot clean up lock files - active Chrome process is using this profile",
+            user_data_dir=user_data_dir,
+        )
+        return False
+
+    # No active Chrome process found - clean up stale lock files
+    cleaned = False
+    for lock_file in [singleton_lock, singleton_socket, singleton_cookie]:
+        try:
+            if os.path.islink(lock_file):
+                os.unlink(lock_file)
+                LOG.info("Removed stale Chrome lock file (symlink)", lock_file=lock_file)
+                cleaned = True
+            elif os.path.exists(lock_file):
+                if os.path.isfile(lock_file):
+                    os.remove(lock_file)
+                elif os.path.isdir(lock_file):
+                    shutil.rmtree(lock_file)
+                else:
+                    os.unlink(lock_file)
+                LOG.info("Removed stale Chrome lock file", lock_file=lock_file)
+                cleaned = True
+        except OSError as e:
+            LOG.warning("Failed to remove Chrome lock file", lock_file=lock_file, error=str(e))
+
+    if cleaned:
+        LOG.info("Cleaned up stale Chrome lock files", user_data_dir=user_data_dir)
+
+    return cleaned
 
 
 async def _create_cdp_connection_browser(
