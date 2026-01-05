@@ -441,7 +441,7 @@ async def get_workflow_script_blocks(
     cache_key = block_script_request.cache_key or workflow.cache_key or ""
     status = block_script_request.status
 
-    script = await app.DATABASE.get_workflow_script_by_cache_key_value(
+    script = await workflow_script_service.get_workflow_script_by_cache_key_value(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         workflow_run_id=block_script_request.workflow_run_id,

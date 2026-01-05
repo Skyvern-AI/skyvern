@@ -2187,7 +2187,7 @@ async def handle_scroll_action(
 ) -> list[ActionResult]:
     if action.x and action.y:
         await page.mouse.move(action.x, action.y)
-    await page.evaluate(f"window.scrollBy({action.scroll_x}, {action.scroll_y})")
+    await page.mouse.wheel(action.scroll_x, action.scroll_y)
     return [ActionSuccess()]
 
 
