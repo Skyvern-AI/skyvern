@@ -51,6 +51,8 @@ from skyvern.forge.sdk.db.id import (
     generate_task_v2_id,
     generate_thought_id,
     generate_totp_code_id,
+    generate_workflow_copilot_chat_id,
+    generate_workflow_copilot_chat_message_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
@@ -1081,3 +1083,40 @@ class ScriptBlockModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+
+
+class WorkflowCopilotChatModel(Base):
+    __tablename__ = "workflow_copilot_chats"
+
+    workflow_copilot_chat_id = Column(String, primary_key=True, default=generate_workflow_copilot_chat_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False, index=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class WorkflowCopilotChatMessageModel(Base):
+    __tablename__ = "workflow_copilot_chat_messages"
+
+    workflow_copilot_chat_message_id = Column(
+        String, primary_key=True, default=generate_workflow_copilot_chat_message_id
+    )
+    workflow_copilot_chat_id = Column(String, nullable=False, index=True)
+    organization_id = Column(String, nullable=False)
+    sender = Column(String, nullable=False)
+    content = Column(UnicodeText, nullable=False)
+    global_llm_context = Column(UnicodeText, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )

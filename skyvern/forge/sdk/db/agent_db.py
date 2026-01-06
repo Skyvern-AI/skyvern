@@ -47,6 +47,8 @@ from skyvern.forge.sdk.db.models import (
     TaskV2Model,
     ThoughtModel,
     TOTPCodeModel,
+    WorkflowCopilotChatMessageModel,
+    WorkflowCopilotChatModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunBlockModel,
@@ -72,6 +74,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_task,
     convert_to_task_v2,
     convert_to_workflow,
+    convert_to_workflow_copilot_chat_message,
     convert_to_workflow_parameter,
     convert_to_workflow_run,
     convert_to_workflow_run_block,
@@ -100,6 +103,11 @@ from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChat,
+    WorkflowCopilotChatMessage,
+    WorkflowCopilotChatSender,
+)
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -3639,6 +3647,91 @@ class AgentDB(BaseAlchemyDB):
             await session.commit()
             await session.refresh(new_ai_suggestion)
             return AISuggestion.model_validate(new_ai_suggestion)
+
+    async def create_workflow_copilot_chat(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            new_chat = WorkflowCopilotChatModel(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            session.add(new_chat)
+            await session.commit()
+            await session.refresh(new_chat)
+            return WorkflowCopilotChat.model_validate(new_chat)
+
+    async def create_workflow_copilot_chat_message(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        sender: WorkflowCopilotChatSender,
+        content: str,
+        global_llm_context: str | None = None,
+    ) -> WorkflowCopilotChatMessage:
+        async with self.Session() as session:
+            new_message = WorkflowCopilotChatMessageModel(
+                workflow_copilot_chat_id=workflow_copilot_chat_id,
+                organization_id=organization_id,
+                sender=sender,
+                content=content,
+                global_llm_context=global_llm_context,
+            )
+            session.add(new_message)
+            await session.commit()
+            await session.refresh(new_message)
+            return convert_to_workflow_copilot_chat_message(new_message, self.debug_enabled)
+
+    async def get_workflow_copilot_chat_messages(
+        self,
+        workflow_copilot_chat_id: str,
+    ) -> list[WorkflowCopilotChatMessage]:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowCopilotChatMessageModel)
+                .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                .order_by(WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc())
+            )
+            messages = (await session.scalars(query)).all()
+            return [convert_to_workflow_copilot_chat_message(message, self.debug_enabled) for message in messages]
+
+    async def get_workflow_copilot_chat_by_id(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+    ) -> WorkflowCopilotChat | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowCopilotChatModel)
+                .filter(WorkflowCopilotChatModel.organization_id == organization_id)
+                .filter(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                .order_by(WorkflowCopilotChatModel.created_at.desc())
+                .limit(1)
+            )
+            chat = (await session.scalars(query)).first()
+            if not chat:
+                return None
+            return WorkflowCopilotChat.model_validate(chat)
+
+    async def get_latest_workflow_copilot_chat(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> WorkflowCopilotChat | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowCopilotChatModel)
+                .filter(WorkflowCopilotChatModel.organization_id == organization_id)
+                .filter(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+                .order_by(WorkflowCopilotChatModel.created_at.desc())
+                .limit(1)
+            )
+            chat = (await session.scalars(query)).first()
+            if not chat:
+                return None
+            return WorkflowCopilotChat.model_validate(chat)
 
     async def get_task_generation_by_prompt_hash(
         self,

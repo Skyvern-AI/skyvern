@@ -1,0 +1,625 @@
+SKYVERN WORKFLOW YAML KNOWLEDGE BASE
+
+This document provides comprehensive information about Skyvern Workflow YAML structure and blocks. Use this to understand how to construct, modify, and validate workflow definitions.
+
+** WORKFLOW STRUCTURE OVERVIEW **
+
+A Skyvern workflow is defined in YAML format with the following top-level structure
+for a workflow definition (embedded under workflow_definition in full specs):
+
+title: "<workflow title>"
+description: "<optional description>"
+workflow_definition:
+  version: 2 # IMPORTANT: Always use version 2
+  parameters: []
+  blocks: []
+webhook_callback_url: "<optional_https_url>" # Optional: Webhook URL to receive workflow run updates
+
+Key Concepts:
+- Workflows consist of sequential or conditional blocks that represent specific tasks
+- Each block has a unique label for identification and navigation
+- Blocks can reference workflow parameters using Jinja2 templating
+- Block execution is defined by next_block_label on every non-terminal block
+
+** WORKFLOW PARAMETERS **
+
+Parameters provide input values and credentials to workflows. They are defined in the "parameters" list.
+
+Common Parameter Types:
+
+* WORKFLOW PARAMETERS (user inputs)
+parameter_type: workflow
+key: <unique_key>
+workflow_parameter_type: <string|integer|float|boolean|json|file_url|credential_id>
+description: <optional description>
+default_value: <optional default>
+
+Example:
+parameters:
+  - parameter_type: workflow
+    key: search_query
+    workflow_parameter_type: string
+    description: "Search term to use"
+    default_value: "example"
+
+* OUTPUT PARAMETERS (block outputs)
+parameter_type: output
+key: <unique_key>
+description: <optional description>
+
+* CREDENTIAL PARAMETERS
+parameter_type: workflow
+workflow_parameter_type: credential_id
+key: <unique_key>
+default_value: <credential_id>
+
+Using Parameters in Blocks:
+- Reference using Jinja2: {{ param_key }}
+- List parameter_keys in blocks that use them
+- Parameters are resolved before block execution. ALL PARAMETER KEYS REFERENCED IN BLOCKS MUST FIRST BE DEFINED IN THE WORKFLOW PARAMETERS LIST
+
+Example:
+workflow_definition:
+  version: 2
+  parameters:
+    - key: topics_count
+      description: null
+      parameter_type: workflow
+      workflow_parameter_type: integer
+      default_value: "3"
+  blocks:
+    - label: block_1
+      block_type: task_v2
+      prompt: Give me top {{topics_count}} news items
+      url: https://news.ycombinator.com/
+      next_block_label: null
+
+** COMMON BLOCK FIELDS **
+
+All blocks inherit these base fields:
+
+block_type: <type>              # Required: Defines the block type
+label: <unique_label>           # Required: Unique identifier for this block
+next_block_label: <label|null>  # Required: Label of next block; use null only for terminal blocks
+continue_on_failure: false      # Optional: Continue workflow if block fails
+next_loop_on_failure: false     # Optional: Continue to next loop iteration on failure (for loop blocks only)
+model: {}                       # Optional: Override model settings for this block
+
+Important Rules:
+- Labels must be unique within a workflow
+- Labels cannot be empty or contain only whitespace
+- next_block_label is required for all non-terminal blocks
+- Use next_block_label for explicit flow control
+- Set next_block_label to null to mark the end of a flow
+- continue_on_failure allows graceful error handling
+
+** TASK BLOCK (task) **
+
+Purpose: Navigate to a URL, perform actions based on natural language goals, and optionally extract data.
+
+Structure:
+block_type: task
+label: <unique_label>
+url: <starting_url>                            # Optional: URL to navigate to; omit to continue on current page
+title: str                                     # Required: The title of the block
+navigation_goal: <action_description>          # Optional: What actions to perform
+data_extraction_goal: <extraction_description> # Optional: What data to extract
+data_schema: <json_schema>                     # Optional: Schema for extracted data
+error_code_mapping: {}                         # Optional: Map errors to custom codes
+max_retries: 0                                 # Optional: Number of retry attempts
+max_steps_per_run: null                        # Optional: Limit steps per execution
+parameter_keys: []                             # Optional: Parameters used in this block
+complete_on_download: false                    # Optional: Complete when file downloads
+download_suffix: null                          # Optional: Downloaded file name
+totp_verification_url: null                    # Optional: TOTP verification URL
+disable_cache: false                           # Optional: Disable caching
+complete_criterion: null                       # Optional: Condition to mark complete
+terminate_criterion: null                      # Optional: Condition to terminate
+complete_verification: true                    # Optional: Verify completion
+include_action_history_in_verification: false  # Optional: Include history in verification
+
+Use Cases:
+- Fill out forms on websites
+- Navigate complex multi-step processes
+- Extract structured data from pages
+- Combine navigation and extraction in one step
+
+Example:
+blocks:
+  - block_type: task
+    label: search_and_extract
+    next_block_label: null
+    url: "https://example.com/search"
+    navigation_goal: "Search for {{ query }} and click the first result"
+    data_extraction_goal: "Extract the product name, price, and availability"
+    data_schema:
+      type: object
+      properties:
+        name: {type: string}
+        price: {type: number}
+        available: {type: boolean}
+    parameter_keys:
+      - query
+    max_retries: 2
+
+** URL BLOCK (goto_url) **
+
+Purpose: Navigate directly to a URL without any additional instructions.
+
+Structure:
+block_type: goto_url
+label: <unique_label>
+url: <target_url>                       # Required: URL to navigate to
+error_code_mapping: {}                  # Optional: Custom error codes
+max_retries: 0                          # Optional: Retry attempts
+parameter_keys: []                      # Optional: Parameters used
+
+Use Cases:
+- Jump to a known page before a task block
+- Reset the browser state to a specific URL
+- Split URL navigation from subsequent actions
+
+Example:
+blocks:
+  - block_type: goto_url
+    label: open_cart
+    next_block_label: null
+    url: "https://example.com/cart"
+
+** ACTION BLOCK (action) **
+
+Purpose: Perform a single focused action on the current page without data extraction.
+
+Structure:
+block_type: action
+label: <unique_label>
+navigation_goal: <action_description>  # Required: Single action to perform
+url: <starting_url>                    # Optional: URL to start from
+error_code_mapping: {}                 # Optional: Custom error codes
+max_retries: 0                         # Optional: Retry attempts
+parameter_keys: []                     # Optional: Parameters used
+complete_on_download: false            # Optional: Complete on download
+download_suffix: null                  # Optional: Download file name
+totp_verification_url: null            # Optional: TOTP verification URL
+totp_identifier: null                  # Optional: TOTP identifier
+disable_cache: false                   # Optional: Disable cache
+
+Use Cases:
+- Click a specific button or link
+- Fill a single field or selection
+- Trigger a download with one action
+
+Example:
+blocks:
+  - block_type: action
+    label: accept_terms
+    next_block_label: null
+    url: "https://example.com/checkout"
+    navigation_goal: "Check the terms checkbox"
+    max_retries: 1
+
+** TASK V2 BLOCK (task_v2) **
+
+Purpose: Task block that can handle complex, multi-step workflows using a single natural language prompt. Can handle more complex scenarios than task blocks but may be slightly slower.
+
+Structure:
+block_type: task_v2
+label: <unique_label>
+prompt: <natural_language_instruction>  # Required: What to do
+url: <starting_url>                     # Optional: URL to navigate to; omit to continue on current page
+disable_cache: false                    # Optional: Disable caching
+
+Use Cases:
+- Complex, multi-step workflows that can be described in natural language
+- Scenarios requiring multiple actions and decision-making
+- General-purpose automation with flexible requirements
+- When you need to handle more complex scenarios and are okay with potentially slower execution
+
+Differences from Task Block:
+- Uses single "prompt" field instead of separate "navigation_goal" and "data_extraction_goal"
+- Can handle more complex scenarios and longer sequences of actions
+- May be slightly slower than task blocks
+- No data_schema (extraction format described in prompt)
+- More flexible configuration
+
+Example:
+blocks:
+  - block_type: task_v2
+    label: simple_booking
+    next_block_label: null
+    url: "https://booking.example.com"
+    prompt: "Book a flight from {{ origin }} to {{ destination }} on {{ date }}. Return the booking confirmation number."
+    max_iterations: 10
+
+** LOGIN BLOCK (login) **
+
+Purpose: Handle authentication flows including username/password and TOTP/2FA.
+
+Structure:
+block_type: login
+label: <unique_label>
+url: <login_page_url>           # Optional: Login page URL
+title: str                      # Required: The title of the block
+navigation_goal: null           # Optional: Additional navigation after login
+error_code_mapping: {}          # Optional: Custom error codes
+max_retries: 0                  # Optional: Retry attempts
+max_steps_per_run: null         # Optional: Step limit
+parameter_keys: []              # Required: Should include credential parameters
+complete_criterion: null        # Optional: Completion condition
+terminate_criterion: null       # Optional: Termination condition
+complete_verification: true     # Optional: Verify successful login
+
+Use Cases:
+- Login to websites with username/password
+- Handle 2FA/TOTP authentication
+- Manage credential-protected workflows
+- Session initialization
+
+Important Notes:
+- Credentials should be stored as parameters (credential, bitwarden_login_credential, etc.)
+- TOTP is automatically handled if the credential parameter has TOTP configured
+
+Example:
+parameters:
+  - parameter_type: workflow
+    workflow_parameter_type: credential_id
+    key: my_credentials
+    default_value: "cred_uuid_here"
+blocks:
+  - block_type: login
+    label: login_to_portal
+    next_block_label: null
+    url: "https://portal.example.com/login"
+    parameter_keys:
+      - my_credentials # This must match a 'key' from the parameters list above
+    complete_criterion: "Current URL is 'https://portal.example.com/dashboard'"
+    max_retries: 2
+
+** EXTRACTION BLOCK (extraction) **
+
+Purpose: Extract structured data from the current page without navigation.
+
+Structure:
+block_type: extraction
+label: <unique_label>
+title: str                               # Required: The title of the block
+data_extraction_goal: <what_to_extract>  # Required: Description of data to extract
+data_schema: <json_schema>               # Optional: Structure of extracted data
+url: <page_url>                          # Optional: URL to navigate to first
+max_retries: 0                           # Optional: Retry attempts
+max_steps_per_run: null                  # Optional: Step limit
+parameter_keys: []                       # Optional: Parameters used
+disable_cache: false                     # Optional: Disable cache
+Use Cases:
+- Extract structured data after other blocks
+- Parse tables, lists, or forms
+- Collect multiple data points from a page
+- Data mining from web pages
+
+Data Schema Formats:
+* JSON Schema object:
+   data_schema:
+     type: object
+     properties:
+       field1: {type: string}
+       field2: {type: number}
+
+* JSON Schema array:
+   data_schema:
+     type: array
+     items:
+       type: object
+       properties:
+         name: {type: string}
+
+* String format (for simple extractions):
+   data_schema: "csv_string"
+
+Example:
+blocks:
+  - block_type: extraction
+    label: extract_product_list
+    next_block_label: null
+    data_extraction_goal: "Extract all products with their names, prices, and stock status"
+    data_schema:
+      type: array
+      items:
+        type: object
+        properties:
+          product_name: {type: string}
+          price: {type: number}
+          in_stock: {type: boolean}
+          rating: {type: number}
+    max_retries: 1
+
+** PARAMETER TEMPLATING **
+
+All string fields in blocks support Jinja2 templating to reference parameters.
+
+Syntax (preferred):
+{{ param_key }}
+
+Examples:
+
+* In URL:
+url: "https://example.com/search?q={{ search_term }}"
+
+* In goals:
+navigation_goal: "Search for {{ product_name }} and filter by {{ category }}"
+
+* In data extraction:
+data_extraction_goal: "Extract {{ field_name }} from the results"
+
+* Complex expressions:
+navigation_goal: "Enter {{ first_name }} {{ last_name }} in the name field"
+
+* In schemas (as descriptions):
+data_schema:
+  type: object
+  properties:
+    query_result:
+      type: string
+      description: "Result for query: {{ query }}"
+
+** ERROR HANDLING AND RETRIES **
+
+Error Code Mapping:
+Map internal errors to custom error codes for easier handling:
+
+error_code_mapping:
+  "ElementNotFound": "ELEMENT_MISSING"
+  "TimeoutError": "PAGE_TIMEOUT"
+  "NavigationFailed": "NAV_ERROR"
+
+Retry Configuration:
+max_retries: 3  # Block will retry up to 3 times on failure
+
+Conditional Continuation:
+continue_on_failure: true  # Workflow continues even if block fails
+
+Loop Continuation:
+next_loop_on_failure: true  # Skip to next iteration in loops
+
+Completion Criteria:
+complete_criterion: "URL contains '/success'"  # Condition for success
+terminate_criterion: "Element with text 'Error' exists"  # Condition to stop
+
+** WORKFLOW EXECUTION FLOW **
+
+Sequential Execution:
+blocks:
+  - block_type: goto_url
+    label: step1
+    next_block_label: step2
+    url: "https://example.com/start"
+  - block_type: extraction
+    label: step2
+    next_block_label: step3
+  - block_type: task
+    label: step3
+    next_block_label: null
+# Executes: step1 → step2 → step3
+
+Explicit Flow Control (Skip blocks):
+blocks:
+  - block_type: goto_url
+    label: login
+    next_block_label: extract_data
+    url: "https://app.example.com/login"
+  - block_type: task
+    label: handle_error
+    next_block_label: null
+  - block_type: extraction
+    label: extract_data
+    next_block_label: null
+# Executes: login → extract_data (skips handle_error)
+
+Error Recovery Flow:
+blocks:
+  - block_type: task
+    label: primary_task
+    next_block_label: verify_result
+    continue_on_failure: true
+  - block_type: validation
+    label: verify_result
+    next_block_label: null
+
+** BEST PRACTICES **
+
+* Naming Conventions:
+   - Use descriptive labels: "login_to_portal" not "step1"
+   - Use snake_case for labels and parameter keys
+   - Make labels unique and meaningful
+
+* Goal Writing:
+   - Be specific: "Click the blue 'Submit' button" vs "Submit the form"
+   - Include context: "After clicking Search, wait for results to load"
+   - Natural language: Write as you would instruct a human
+
+* Parameter Usage:
+   - Always list parameter_keys when using parameters in a block
+   - Validate parameter types match usage
+   - Provide default values for optional parameters
+
+* Error Handling:
+   - Set appropriate max_retries for flaky operations
+   - Use complete_criterion for validation
+   - Map errors to meaningful codes for debugging
+
+* Data Extraction:
+   - Always provide data_schema for structured extraction
+   - Use specific extraction goals
+   - Handle arrays vs objects appropriately
+
+* Performance:
+   - Use disable_cache: true for dynamic content
+   - Set max_steps_per_run to prevent infinite loops
+   - Combine navigation and extraction in task blocks when possible
+
+* Security:
+   - Never hardcode credentials in workflows
+   - Use credential parameters for sensitive data
+   - Use AWS secrets or vault integrations
+
+** COMMON PATTERNS **
+
+Pattern 1: Login → Navigate → Extract
+parameters:
+  - parameter_type: workflow
+    workflow_parameter_type: credential_id
+    key: my_credentials
+    default_value: "uuid"
+  - parameter_type: output
+    key: extracted_data
+blocks:
+  - block_type: login
+    label: authenticate
+    next_block_label: go_to_reports
+    url: "https://app.example.com/login"
+    parameter_keys: [my_credentials]
+  - block_type: task
+    label: go_to_reports
+    next_block_label: get_report_data
+    navigation_goal: "Navigate to Reports section"
+  - block_type: extraction
+    label: get_report_data
+    next_block_label: null
+    data_extraction_goal: "Extract all report entries"
+    data_schema:
+      type: array
+      items: {type: object}
+
+Pattern 2: Search with Dynamic Input
+parameters:
+  - parameter_type: workflow
+    key: search_query
+    workflow_parameter_type: string
+blocks:
+  - block_type: task_v2
+    label: search_and_extract
+    next_block_label: null
+    url: "https://example.com"
+    prompt: "Search for '{{ search_query }}' and extract the first 10 results with titles and URLs"
+
+Pattern 3: Multi-Step Form Filling
+blocks:
+  - block_type: goto_url
+    label: open_form
+    next_block_label: fill_personal_info
+    url: "https://forms.example.com/application"
+  - block_type: task
+    label: fill_personal_info
+    next_block_label: fill_address
+    navigation_goal: "Fill in name as {{ name }}, email as {{ email }}"
+    parameter_keys: [name, email]
+  - block_type: task
+    label: fill_address
+    next_block_label: submit
+    navigation_goal: "Fill in address fields and click Continue"
+    parameter_keys: [address, city, zip]
+  - block_type: task
+    label: submit
+    next_block_label: null
+    navigation_goal: "Review information and click Submit"
+
+Pattern 4: Conditional Extraction
+blocks:
+  - block_type: task
+    label: search_product
+    next_block_label: check_availability
+    navigation_goal: "Search for {{ product }}"
+  - block_type: extraction
+    label: check_availability
+    next_block_label: add_to_cart
+    data_extraction_goal: "Check if product is in stock"
+    data_schema:
+      type: object
+      properties:
+        in_stock: {type: boolean}
+  - block_type: task
+    label: add_to_cart
+    next_block_label: null
+    navigation_goal: "If product is in stock, add to cart"
+
+** VALIDATION RULES **
+
+Workflow-Level:
+- All block labels must be unique
+- Parameters referenced in blocks must be defined
+- next_block_label must point to existing block labels or be null
+- The last block in execution flow should have next_block_label: null
+
+Block-Level:
+- label is required and cannot be empty
+- block_type must be a valid type
+- For task blocks: either navigation_goal or data_extraction_goal should be present
+- For extraction blocks: data_extraction_goal is required
+- For action blocks: navigation_goal is required
+- For login blocks: parameter_keys should include credentials
+
+Parameter-Level:
+- key must be unique across parameters
+- key cannot contain whitespace
+- parameter_type must be valid
+- Referenced keys (like source_parameter_key) must exist
+
+** COMPLETE WORKFLOW EXAMPLE **
+
+title: E-commerce Product Search and Purchase
+description: Search for a product, extract details, and add to cart
+workflow_definition:
+  version: 2
+  parameters:
+    - parameter_type: workflow
+      key: product_name
+      workflow_parameter_type: string
+      description: "Product to search for"
+    - parameter_type: workflow
+      key: max_price
+      workflow_parameter_type: float
+      description: "Maximum price willing to pay"
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: account_creds
+      default_value: "cred_12345"
+    - parameter_type: output
+      key: product_details
+      description: "Extracted product information"
+  blocks:
+    - block_type: login
+      label: login_to_store
+      next_block_label: search_and_filter
+      url: "https://shop.example.com/login"
+      parameter_keys:
+        - account_creds
+      complete_criterion: "URL contains '/dashboard'"
+
+    - block_type: task
+      label: search_and_filter
+      next_block_label: get_product_info
+      url: "https://shop.example.com/search"
+      navigation_goal: "Search for {{ product_name }} and filter results by price under ${{ max_price }}"
+      parameter_keys:
+        - product_name
+        - max_price
+      max_retries: 2
+
+    - block_type: extraction
+      label: get_product_info
+      next_block_label: add_to_cart
+      data_extraction_goal: "Extract product name, price, rating, and availability"
+      data_schema:
+        type: object
+        properties:
+          name: {type: string}
+          price: {type: number}
+          rating: {type: number}
+          available: {type: boolean}
+
+    - block_type: task_v2
+      label: add_to_cart
+      next_block_label: null
+      prompt: "Click on the first available product and add it to cart"
+      max_iterations: 5
+
+END OF KNOWLEDGE BASE
