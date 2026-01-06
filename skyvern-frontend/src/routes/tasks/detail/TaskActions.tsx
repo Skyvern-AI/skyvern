@@ -237,6 +237,7 @@ function TaskActions() {
           {activeSelection === "stream" ? getStream() : null}
           {typeof activeSelection === "number" && activeAction ? (
             <ActionScreenshot
+              artifactId={activeAction.screenshotArtifactId ?? undefined}
               stepId={activeAction.stepId}
               index={activeAction.index}
               taskStatus={task?.status}
