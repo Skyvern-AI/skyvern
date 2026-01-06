@@ -560,6 +560,26 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_action_count_for_step(self, step_id: str, task_id: str, organization_id: str) -> int:
+        """Get count of actions for a step. Uses composite index for efficiency."""
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(func.count())
+                    .select_from(ActionModel)
+                    .where(ActionModel.organization_id == organization_id)
+                    .where(ActionModel.task_id == task_id)
+                    .where(ActionModel.step_id == step_id)
+                )
+                result = await session.scalar(query)
+                return result or 0
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_first_step(self, task_id: str, organization_id: str | None = None) -> Step | None:
         try:
             async with self.Session() as session:
