@@ -127,6 +127,7 @@ function useActions({ id }: Props): {
             stepId: action.step_id ?? "",
             index: index,
             created_by: action.created_by,
+            screenshotArtifactId: action.screenshot_artifact_id ?? undefined,
           };
         });
 
