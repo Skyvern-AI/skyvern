@@ -680,6 +680,7 @@ class ActionModel(Base):
     action_json = Column(JSON, nullable=True)
     input_or_select_context = Column(JSON, nullable=True)
     confidence_float = Column(Numeric, nullable=True)
+    screenshot_artifact_id = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

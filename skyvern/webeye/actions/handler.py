@@ -409,7 +409,8 @@ class ActionHandler:
                 page=page,
                 action=action,
             )
-            await app.DATABASE.create_action(action=action)
+            persisted_action = await app.DATABASE.create_action(action=action)
+            action.action_id = persisted_action.action_id
             return results
 
         context = skyvern_context.current()
@@ -529,7 +530,8 @@ class ActionHandler:
                     # close the extra page
                     await pages_after_download[-1].close()
 
-            await app.DATABASE.create_action(action=action)
+            persisted_action = await app.DATABASE.create_action(action=action)
+            action.action_id = persisted_action.action_id
 
     @staticmethod
     async def _handle_action(
