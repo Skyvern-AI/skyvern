@@ -3871,6 +3871,7 @@ class AgentDB(BaseAlchemyDB):
                 element_id=action.element_id,
                 skyvern_element_hash=action.skyvern_element_hash,
                 skyvern_element_data=action.skyvern_element_data,
+                screenshot_artifact_id=action.screenshot_artifact_id,
                 action_json=action.model_dump(),
                 confidence_float=action.confidence_float,
                 created_by=action.created_by,
@@ -3879,6 +3880,17 @@ class AgentDB(BaseAlchemyDB):
             await session.commit()
             await session.refresh(new_action)
             return Action.model_validate(new_action)
+
+    async def update_action_screenshot_artifact_id(
+        self, *, organization_id: str, action_id: str, screenshot_artifact_id: str
+    ) -> None:
+        async with self.Session() as session:
+            await session.execute(
+                update(ActionModel)
+                .where(ActionModel.action_id == action_id, ActionModel.organization_id == organization_id)
+                .values(screenshot_artifact_id=screenshot_artifact_id)
+            )
+            await session.commit()
 
     async def update_action_reasoning(
         self,

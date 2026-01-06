@@ -709,6 +709,7 @@ def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) ->
         "element_id": element_id,
         "skyvern_element_hash": action_model.skyvern_element_hash,
         "skyvern_element_data": action_model.skyvern_element_data,
+        "screenshot_artifact_id": action_model.screenshot_artifact_id,
         "created_at": action_model.created_at,
         "modified_at": action_model.modified_at,
     }
