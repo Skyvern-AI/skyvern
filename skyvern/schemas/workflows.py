@@ -510,6 +510,7 @@ class FileDownloadBlockYAML(BlockYAML):
     totp_identifier: str | None = None
     disable_cache: bool = False
     download_timeout: float | None = None
+    skip_if_already_downloaded: bool = False
 
 
 class UrlBlockYAML(BlockYAML):
