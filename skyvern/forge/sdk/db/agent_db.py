@@ -2679,8 +2679,8 @@ class AgentDB(BaseAlchemyDB):
                 if browser_session_id:
                     workflow_run.browser_session_id = browser_session_id
                 await session.commit()
-                await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
+                await session.refresh(workflow_run)
                 return convert_to_workflow_run(workflow_run)
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
