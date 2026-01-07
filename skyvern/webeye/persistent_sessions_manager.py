@@ -16,6 +16,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     Extensions,
     PersistentBrowserSession,
     PersistentBrowserSessionStatus,
+    PersistentBrowserType,
     is_final_status,
 )
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -258,6 +259,7 @@ class PersistentSessionsManager:
         timeout_minutes: int | None = None,
         proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
         extensions: list[Extensions] | None = None,
+        browser_type: PersistentBrowserType | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
 
@@ -273,6 +275,7 @@ class PersistentSessionsManager:
             timeout_minutes=timeout_minutes,
             proxy_location=proxy_location,
             extensions=extensions,
+            browser_type=browser_type,
         )
 
         return browser_session_db
