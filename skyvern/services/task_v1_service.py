@@ -126,10 +126,13 @@ async def get_task_v1_response(task_id: str, organization_id: str | None = None)
     if not task_obj:
         raise TaskNotFound(task_id=task_id)
 
+    # get step count efficiently via COUNT query
+    step_count = await app.DATABASE.get_task_step_count(task_id, organization_id)
+
     # get latest step
     latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=organization_id)
     if not latest_step:
-        return await app.agent.build_task_response(task=task_obj)
+        return await app.agent.build_task_response(task=task_obj, step_count=step_count)
 
     failure_reason: str | None = None
     if task_obj.status == TaskStatus.failed and (latest_step.output or task_obj.failure_reason):
@@ -148,5 +151,9 @@ async def get_task_v1_response(task_id: str, organization_id: str | None = None)
             if len(action_results_string) > 0:
                 failure_reason += "(Exceptions: " + str(action_results_string) + ")"
     return await app.agent.build_task_response(
-        task=task_obj, last_step=latest_step, failure_reason=failure_reason, need_browser_log=True
+        task=task_obj,
+        last_step=latest_step,
+        failure_reason=failure_reason,
+        need_browser_log=True,
+        step_count=step_count,
     )
