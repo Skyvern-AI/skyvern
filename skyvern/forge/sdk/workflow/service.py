@@ -593,23 +593,25 @@ class WorkflowService:
         if browser_session_id:  # the user has supplied an id, so no need to create one
             return None
 
+        # Always create a browser session for VNC support
         workflow_definition = workflow.workflow_definition
         blocks = workflow_definition.blocks
         human_interaction_blocks = [block for block in blocks if block.block_type == BlockType.HUMAN_INTERACTION]
 
+        # Calculate timeout based on human interaction blocks if present, otherwise use default
         if human_interaction_blocks:
             timeouts = [getattr(block, "timeout_seconds", 60 * 60) for block in human_interaction_blocks]
             timeout_seconds = sum(timeouts) + 60 * 60
+        else:
+            timeout_seconds = 60 * 60  # Default 1 hour timeout
 
-            browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-                organization_id=organization_id,
-                timeout_minutes=timeout_seconds // 60,
-                proxy_location=proxy_location,
-            )
+        browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            organization_id=organization_id,
+            timeout_minutes=timeout_seconds // 60,
+            proxy_location=proxy_location,
+        )
 
-            return browser_session
-
-        return None
+        return browser_session
 
     @TraceManager.traced_async(ignore_inputs=["organization", "api_key"])
     async def execute_workflow(

@@ -61,9 +61,26 @@ async def run() -> None:
         os.makedirs(f"{get_skyvern_temp_dir()}/{organization_id}", exist_ok=True)
         png_file_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
 
+        # Get the display number for this session
+        display = os.environ.get("SKYVERN_DEFAULT_DISPLAY", ":99")
+        try:
+            browser_session = None
+            if workflow_run_id:
+                browser_session = await app.DATABASE.get_persistent_browser_session_by_runnable_id(
+                    workflow_run_id, organization_id
+                )
+            elif task_id:
+                browser_session = await app.DATABASE.get_persistent_browser_session_by_runnable_id(
+                    task_id, organization_id
+                )
+            if browser_session and browser_session.display_number:
+                display = f":{browser_session.display_number}"
+        except Exception:
+            LOG.debug("Failed to get display number for session, using default", display=display)
+
         # run subprocess to take screenshot
         subprocess.run(
-            f"xwd -root | xwdtopnm 2>/dev/null | pnmtopng > {png_file_path}", shell=True, env={"DISPLAY": ":99"}
+            f"xwd -root | xwdtopnm 2>/dev/null | pnmtopng > {png_file_path}", shell=True, env={"DISPLAY": display}
         )
 
         try:

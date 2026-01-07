@@ -166,7 +166,21 @@ class VncChannel:
     workflow_run: WorkflowRun | None = None
 
     def __post_init__(self, initial_interactor: Interactor) -> None:
-        self.interactor = initial_interactor
+        # Read interactor from browser_session if available, otherwise use initial_interactor
+        if self.browser_session and self.browser_session.interactor:
+            stored = self.browser_session.interactor
+            if stored in ("agent", "user"):
+                self._interactor = stored  # type: ignore[assignment]
+                LOG.info(f"{self.class_name} Restored interactor from session: {self._interactor}",
+                         browser_session_id=self.browser_session.persistent_browser_session_id,
+                         organization_id=self.organization_id)
+            else:
+                LOG.warning(f"{self.class_name} Invalid interactor value in database: {stored}, using default",
+                            browser_session_id=self.browser_session.persistent_browser_session_id,
+                            organization_id=self.organization_id)
+                self._interactor = initial_interactor
+        else:
+            self._interactor = initial_interactor
         add_vnc_channel(self)
 
     @property
@@ -195,6 +209,27 @@ class VncChannel:
         self._interactor = value
 
         LOG.info(f"{self.class_name} Setting interactor to {value}", **self.identity)
+
+    async def set_interactor_async(self, value: Interactor) -> None:
+        """Set the interactor and persist to database."""
+        from skyvern.forge import app  # noqa: PLC0415
+
+        self._interactor = value
+        LOG.info(f"{self.class_name} Setting interactor to {value}", **self.identity)
+
+        # Persist to database if we have a browser session
+        if self.browser_session:
+            try:
+                await app.DATABASE.update_persistent_browser_session(
+                    browser_session_id=self.browser_session.persistent_browser_session_id,
+                    organization_id=self.organization_id,
+                    interactor=value,
+                )
+                LOG.info(f"{self.class_name} Persisted interactor to database: {value}",
+                         browser_session_id=self.browser_session.persistent_browser_session_id)
+            except Exception:
+                LOG.exception(f"{self.class_name} Failed to persist interactor to database",
+                              **self.identity)
 
     @property
     def is_open(self) -> bool:
@@ -293,7 +328,11 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
     class_name = vnc_channel.class_name
 
     if browser_session:
-        if browser_session.ip_address:
+        # Use the session's vnc_port if available (local VNC mode)
+        if browser_session.vnc_port:
+            vnc_url = f"ws://localhost:{browser_session.vnc_port}"
+        elif browser_session.ip_address:
+            # Cloud mode with IP address
             if ":" in browser_session.ip_address:
                 ip, _ = browser_session.ip_address.split(":")
                 vnc_url = f"ws://{ip}:{vnc_channel.vnc_port}"
@@ -307,9 +346,6 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
             vnc_url = f"ws://{host}:{vnc_channel.vnc_port}"
     else:
         raise Exception(f"{class_name} No browser session associated with vnc channel.")
-
-    # NOTE(jdo:streaming-local-dev)
-    # vnc_url = "ws://localhost:6080"
 
     LOG.info(
         f"{class_name} Connecting to vnc url.",

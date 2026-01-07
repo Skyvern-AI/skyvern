@@ -4699,6 +4699,9 @@ class AgentDB(BaseAlchemyDB):
         status: str | None = None,
         timeout_minutes: int | None = None,
         organization_id: str | None = None,
+        display_number: int | None = None,
+        vnc_port: int | None = None,
+        interactor: str | None = None,
     ) -> PersistentBrowserSession:
         try:
             async with self.Session() as session:
@@ -4715,8 +4718,17 @@ class AgentDB(BaseAlchemyDB):
 
                 if status:
                     persistent_browser_session.status = status
+                    # Set started_at when status changes to "running"
+                    if status == "running" and persistent_browser_session.started_at is None:
+                        persistent_browser_session.started_at = datetime.utcnow()
                 if timeout_minutes:
                     persistent_browser_session.timeout_minutes = timeout_minutes
+                if display_number is not None:
+                    persistent_browser_session.display_number = display_number
+                if vnc_port is not None:
+                    persistent_browser_session.vnc_port = vnc_port
+                if interactor is not None:
+                    persistent_browser_session.interactor = interactor
 
                 await session.commit()
                 await session.refresh(persistent_browser_session)

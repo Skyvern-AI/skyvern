@@ -457,7 +457,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         **message_channel.identity,
                     )
                     return
-                vnc_channel.interactor = "agent"
+                await vnc_channel.set_interactor_async("agent")
 
             case MessageKind.END_EXFILTRATION:
                 if exfiltration_channel is None:
@@ -487,7 +487,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         **message_channel.identity,
                     )
                     return
-                vnc_channel.interactor = "user"
+                await vnc_channel.set_interactor_async("user")
 
             case _:
                 t.assert_never(message.kind)
