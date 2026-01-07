@@ -16,6 +16,7 @@ export type FileDownloadNodeData = NodeBaseData & {
   engine: RunEngine | null;
   disableCache: boolean;
   downloadTimeout: number | null;
+  skipIfAlreadyDownloaded: boolean;
 };
 
 export type FileDownloadNode = Node<FileDownloadNodeData, "fileDownload">;
@@ -38,6 +39,7 @@ export const fileDownloadNodeDefaultData: FileDownloadNodeData = {
   engine: RunEngine.SkyvernV1,
   model: null,
   downloadTimeout: null,
+  skipIfAlreadyDownloaded: false,
 } as const;
 
 export function isFileDownloadNode(node: Node): node is FileDownloadNode {

@@ -671,6 +671,7 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           engine: block.engine ?? RunEngine.SkyvernV1,
           downloadTimeout: block.download_timeout ?? null, // seconds
+          skipIfAlreadyDownloaded: block.skip_if_already_downloaded ?? false,
         },
       };
     }
@@ -2206,6 +2207,7 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
         download_timeout: node.data.downloadTimeout, // seconds
+        skip_if_already_downloaded: node.data.skipIfAlreadyDownloaded ?? false,
       };
     }
     case "sendEmail": {
@@ -3203,6 +3205,7 @@ function convertBlocksToBlockYAML(
           disable_cache: block.disable_cache ?? false,
           engine: block.engine,
           download_timeout: null, // seconds
+          skip_if_already_downloaded: block.skip_if_already_downloaded ?? false,
         };
         return blockYaml;
       }
