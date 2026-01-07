@@ -94,6 +94,7 @@ async def create_browser_session(
         timeout_minutes=browser_session_request.timeout,
         proxy_location=browser_session_request.proxy_location,
         extensions=browser_session_request.extensions,
+        browser_type=browser_session_request.browser_type,
     )
     return await BrowserSessionResponse.from_browser_session(browser_session)
 
