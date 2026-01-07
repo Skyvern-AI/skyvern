@@ -97,7 +97,11 @@ from skyvern.forge.sdk.schemas.organizations import (
     Organization,
     OrganizationAuthToken,
 )
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    Extensions,
+    PersistentBrowserSession,
+    PersistentBrowserType,
+)
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
@@ -4666,6 +4670,7 @@ class AgentDB(BaseAlchemyDB):
         timeout_minutes: int | None = None,
         proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
         extensions: list[Extensions] | None = None,
+        browser_type: PersistentBrowserType | None = None,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         extensions_str: list[str] | None = (
@@ -4680,6 +4685,7 @@ class AgentDB(BaseAlchemyDB):
                     timeout_minutes=timeout_minutes,
                     proxy_location=_serialize_proxy_location(proxy_location),
                     extensions=extensions_str,
+                    browser_type=browser_type.value if browser_type else None,
                 )
                 session.add(browser_session)
                 await session.commit()

@@ -855,6 +855,7 @@ class PersistentBrowserSessionModel(Base):
     ecs_task_arn = Column(String, nullable=True)
     proxy_location = Column(String, nullable=True)
     extensions = Column(JSON, nullable=True)
+    browser_type = Column(String, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
