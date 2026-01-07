@@ -3406,11 +3406,13 @@ class ForgeAgent:
         last_step: Step | None = None,
         failure_reason: str | None = None,
         need_browser_log: bool = False,
+        step_count: int | None = None,
     ) -> TaskResponse:
         # no last step means the task didn't start, so we don't have any other artifacts
         if last_step is None:
             return task.to_task_response(
                 failure_reason=failure_reason,
+                step_count=step_count,
             )
 
         screenshot_url = None
@@ -3512,6 +3514,7 @@ class ForgeAgent:
             browser_console_log_url=browser_console_log_url,
             downloaded_files=downloaded_files,
             failure_reason=failure_reason,
+            step_count=step_count,
         )
 
     async def cleanup_browser_and_create_artifacts(

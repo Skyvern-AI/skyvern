@@ -1799,6 +1799,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
             error_code_mapping=task_v2.error_code_mapping,
         ),
         errors=workflow_run_resp.errors if workflow_run_resp else None,
+        step_count=workflow_run_resp.step_count if workflow_run_resp else None,
     )
 
 

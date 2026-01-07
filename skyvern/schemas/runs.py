@@ -607,6 +607,10 @@ class BaseRunResponse(BaseModel):
         default=None,
         description="The errors for the run",
     )
+    step_count: int | None = Field(
+        default=None,
+        description="Total number of steps executed in this run",
+    )
 
 
 class TaskRunResponse(BaseRunResponse):

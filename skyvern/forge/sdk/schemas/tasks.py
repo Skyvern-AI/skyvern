@@ -339,6 +339,7 @@ class Task(TaskBase):
         browser_console_log_url: str | None = None,
         downloaded_files: list[FileInfo] | None = None,
         failure_reason: str | None = None,
+        step_count: int | None = None,
     ) -> TaskResponse:
         return TaskResponse(
             request=self,
@@ -362,6 +363,7 @@ class Task(TaskBase):
             max_steps_per_run=self.max_steps_per_run,
             workflow_run_id=self.workflow_run_id,
             max_screenshot_scrolls=self.max_screenshot_scrolls,
+            step_count=step_count,
         )
 
 
@@ -387,6 +389,7 @@ class TaskResponse(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     max_screenshot_scrolls: int | None = None
+    step_count: int | None = None
 
 
 class TaskOutput(BaseModel):
