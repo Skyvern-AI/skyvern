@@ -44,7 +44,7 @@ async def _get_debug_artifact(organization_id: str, workflow_run_id: str) -> Art
     artifacts = await app.DATABASE.get_artifacts_for_run(
         run_id=workflow_run_id, organization_id=organization_id, artifact_types=[ArtifactType.VISIBLE_ELEMENTS_TREE]
     )
-    return artifacts[0] if isinstance(artifacts, list) else None
+    return artifacts[0] if isinstance(artifacts, list) and artifacts else None
 
 
 async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None) -> RunInfo | None:
