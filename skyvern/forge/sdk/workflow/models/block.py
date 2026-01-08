@@ -318,6 +318,8 @@ class Block(BaseModel, abc.ABC):
         if "workflow_run_id" not in template_data:
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
 
+        template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
+
         if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
             if missing_variables := get_missing_variables(potential_template, template_data):
                 raise MissingJinjaVariables(
