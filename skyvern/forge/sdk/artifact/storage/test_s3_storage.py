@@ -35,7 +35,7 @@ class S3StorageForTests(S3Storage):
     async def _get_tags_for_org(self, organization_id: str) -> dict[str, str]:
         return {"dummy": f"org-{organization_id}", "test": "jerry"}
 
-    async def _get_storage_class_for_org(self, organization_id: str) -> S3StorageClass:
+    async def _get_storage_class_for_org(self, organization_id: str, bucket: str) -> S3StorageClass:
         return S3StorageClass.ONEZONE_IA
 
 
