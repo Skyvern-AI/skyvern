@@ -4,6 +4,7 @@ from typing import Generator
 
 import boto3
 import pytest
+import zstandard as zstd
 from freezegun import freeze_time
 from moto.server import ThreadedMotoServer
 from types_boto3_s3.client import S3Client
@@ -478,7 +479,6 @@ class TestS3StorageHARCompression:
         self, s3_storage: S3Storage, boto3_test_client: S3Client
     ) -> None:
         """Test that HAR artifacts are compressed with zstd and URI is updated."""
-        import zstandard as zstd
 
         # Create sample HAR JSON data (easily compressible)
         har_data = b'{"log": {"version": "1.2", "entries": [{"request": {}, "response": {}}]}}'
