@@ -2949,6 +2949,229 @@
         },
         "x-fern-sdk-method-name": "run_sdk_action"
       }
+    },
+    "/api/v1/billing/checkout": {
+      "post": {
+        "summary": "Create Checkout Session",
+        "description": "Create a Stripe Checkout Session for subscribing to a tier.\n\nFrontend should redirect the user to the returned URL.\nAfter successful checkout, Stripe will send a webhook that we handle\nto store the subscription and initialize billing state.\n\nReturns 400 if org already has an active subscription (use portal instead).",
+        "operationId": "create_checkout_session_api_v1_billing_checkout_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckoutSubscriptionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckoutSessionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/billing/portal": {
+      "post": {
+        "summary": "Create Portal Session",
+        "description": "Create a Stripe Customer Portal session for managing subscription.\n\nFrontend should redirect the user to the returned URL.\nThe portal allows users to:\n- Update payment methods\n- Upgrade/downgrade plans\n- Cancel subscription\n- View invoices",
+        "operationId": "create_portal_session_api_v1_billing_portal_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalSessionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/billing/state": {
+      "get": {
+        "summary": "Get Organization Billing",
+        "operationId": "get_organization_billing_api_v1_billing_state_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/BillingStateResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Get Organization Billing Api V1 Billing State Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/billing/change-tier": {
+      "post": {
+        "summary": "Change Tier",
+        "description": "Change the subscription tier (upgrade or downgrade).\n\nThis swaps the tier price while keeping metered items unchanged.\nStripe will fire a customer.subscription.updated webhook which\nupdates the billing state automatically.",
+        "operationId": "change_tier_api_v1_billing_change_tier_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeTierRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeTierResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3277,6 +3500,17 @@
               }
             ],
             "title": "Skyvern Element Data"
+          },
+          "screenshot_artifact_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Screenshot Artifact Id"
           },
           "tool_call_id": {
             "anyOf": [
@@ -4379,6 +4613,96 @@
         ],
         "title": "AzureVaultCredentialParameterYAML"
       },
+      "BillingStateResponse": {
+        "properties": {
+          "billing_id": {
+            "type": "string",
+            "title": "Billing Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "plan_tier": {
+            "$ref": "#/components/schemas/PlanTier"
+          },
+          "current_period_start": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Period Start"
+          },
+          "current_period_end": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Period End"
+          },
+          "included_credits_this_period": {
+            "type": "integer",
+            "title": "Included Credits This Period"
+          },
+          "credits_consumed_this_period": {
+            "type": "integer",
+            "title": "Credits Consumed This Period"
+          },
+          "cached_credits_consumed_this_period": {
+            "type": "integer",
+            "title": "Cached Credits Consumed This Period"
+          },
+          "overage_enabled": {
+            "type": "boolean",
+            "title": "Overage Enabled"
+          },
+          "browser_uptime_seconds_consumed": {
+            "type": "integer",
+            "title": "Browser Uptime Seconds Consumed"
+          },
+          "credits_remaining": {
+            "type": "integer",
+            "title": "Credits Remaining"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "billing_id",
+          "organization_id",
+          "plan_tier",
+          "current_period_start",
+          "current_period_end",
+          "included_credits_this_period",
+          "credits_consumed_this_period",
+          "cached_credits_consumed_this_period",
+          "overage_enabled",
+          "browser_uptime_seconds_consumed",
+          "credits_remaining",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "BillingStateResponse"
+      },
       "BitwardenCreditCardDataParameter": {
         "properties": {
           "parameter_type": {
@@ -5221,6 +5545,17 @@
             "title": "Extensions",
             "description": "A list of extensions installed in the browser session."
           },
+          "browser_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PersistentBrowserType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The type of browser used for the session."
+          },
           "vnc_streaming_supported": {
             "type": "boolean",
             "title": "Vnc Streaming Supported",
@@ -5330,6 +5665,66 @@
         ],
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
+      },
+      "ChangeTierRequest": {
+        "properties": {
+          "tier": {
+            "$ref": "#/components/schemas/PlanTier"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tier"
+        ],
+        "title": "ChangeTierRequest"
+      },
+      "ChangeTierResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "tier": {
+            "type": "string",
+            "title": "Tier"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "tier"
+        ],
+        "title": "ChangeTierResponse"
+      },
+      "CheckoutSessionResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "url"
+        ],
+        "title": "CheckoutSessionResponse"
+      },
+      "CheckoutSubscriptionRequest": {
+        "properties": {
+          "tier": {
+            "$ref": "#/components/schemas/PlanTier"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tier"
+        ],
+        "title": "CheckoutSubscriptionRequest"
       },
       "ClickAction": {
         "properties": {
@@ -5952,7 +6347,7 @@
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n"
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n"
           },
           "extensions": {
             "anyOf": [
@@ -5968,6 +6363,17 @@
             ],
             "title": "Extensions",
             "description": "A list of extensions to install in the browser session."
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PersistentBrowserType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The type of browser to use for the session."
           }
         },
         "type": "object",
@@ -11498,6 +11904,37 @@
         "title": "PasswordCredentialResponse",
         "description": "Response model for password credentials, containing only the username."
       },
+      "PersistentBrowserType": {
+        "type": "string",
+        "enum": [
+          "msedge",
+          "chrome"
+        ],
+        "title": "PersistentBrowserType"
+      },
+      "PlanTier": {
+        "type": "string",
+        "enum": [
+          "free",
+          "hobby",
+          "pro"
+        ],
+        "title": "PlanTier",
+        "description": "Self-serve subscription tiers. Enterprise customers use manual billing (bypass)."
+      },
+      "PortalSessionResponse": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "PortalSessionResponse"
+      },
       "PromptAction": {
         "properties": {
           "type": {
@@ -11602,6 +12039,7 @@
           "RESIDENTIAL_MX",
           "RESIDENTIAL_IT",
           "RESIDENTIAL_NL",
+          "RESIDENTIAL_PH",
           "RESIDENTIAL_ISP",
           "NONE"
         ],
@@ -13125,7 +13563,7 @@
               }
             ],
             "title": "Proxy Location",
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "data_extraction_schema": {
@@ -13572,6 +14010,18 @@
             ],
             "title": "Errors",
             "description": "The errors for the run"
+          },
+          "step_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Count",
+            "description": "Total number of steps executed in this run"
           },
           "run_type": {
             "type": "string",
@@ -17042,7 +17492,7 @@
               }
             ],
             "title": "Proxy Location",
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "webhook_url": {
@@ -17428,6 +17878,18 @@
             ],
             "title": "Errors",
             "description": "The errors for the run"
+          },
+          "step_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Count",
+            "description": "Total number of steps executed in this run"
           },
           "run_type": {
             "type": "string",
