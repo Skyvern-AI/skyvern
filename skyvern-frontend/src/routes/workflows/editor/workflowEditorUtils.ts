@@ -2398,11 +2398,14 @@ function getOrderedChildrenBlocks(
         edges,
         currentNode.id,
       );
+      // Compute next_block_label for nested loops (same as regular blocks)
+      const nextBlockLabel = findNextBlockLabel(currentNode.id, nodes, edges);
       children.push({
         block_type: "for_loop",
         label: currentNode.data.label,
         continue_on_failure: currentNode.data.continueOnFailure,
         next_loop_on_failure: currentNode.data.nextLoopOnFailure,
+        next_block_label: nextBlockLabel,
         loop_blocks: loopChildren,
         loop_variable_reference: currentNode.data.loopVariableReference,
         complete_if_empty: currentNode.data.completeIfEmpty,
