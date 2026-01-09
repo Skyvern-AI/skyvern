@@ -4368,6 +4368,19 @@ class BranchEvaluationContext:
         # Add block metadata (e.g., loop indices/current_item) without mutating originals
         snapshot["blocks_metadata"] = ctx.blocks_metadata.copy()
 
+        # Copy loop variables (current_value, current_index, current_item) to top level
+        # Required for pure NatLang expressions like "current_value['date']" to work
+        # Without this, current_value is buried in blocks_metadata.{block_label}.current_value
+        # and the LLM can't find it when evaluating natural language expressions
+        if self.block_label:
+            block_metadata = ctx.get_block_metadata(self.block_label)
+            if "current_value" in block_metadata:
+                snapshot["current_value"] = block_metadata["current_value"]
+            if "current_index" in block_metadata:
+                snapshot["current_index"] = block_metadata["current_index"]
+            if "current_item" in block_metadata:
+                snapshot["current_item"] = block_metadata["current_item"]
+
         # Ensure the common namespaces exist
         snapshot.setdefault("params", snapshot.get("params", {}))
         snapshot.setdefault("outputs", snapshot.get("outputs", {}))
@@ -4548,6 +4561,34 @@ class PromptBranchCriteria(BranchCriteria):
         return True
 
 
+def _is_pure_jinja_expression(expression: str) -> bool:
+    """
+    Determine if an expression is a pure Jinja template (single block) vs Jinja+NatLang (mixed).
+
+    Pure Jinja: "{{ A == B }}" - single Jinja block, should be evaluated server-side
+    Jinja+NatLang: "{{ A }} is same as {{ B }}" - multiple Jinja blocks mixed with natural language
+
+    Returns True only for pure Jinja expressions that can be evaluated to boolean server-side.
+    """
+    if not expression:
+        return False
+
+    stripped = expression.strip()
+
+    # Must start with {{ and end with }}
+    if not (stripped.startswith("{{") and stripped.endswith("}}")):
+        return False
+
+    # Count the number of {{ occurrences
+    # If there's more than one, it's Jinja+NatLang (e.g., "{{ A }} is same as {{ B }}")
+    jinja_open_count = stripped.count("{{")
+    if jinja_open_count > 1:
+        return False
+
+    # Single {{ and ends with }} - this is pure Jinja
+    return True
+
+
 class BranchCondition(BaseModel):
     """Represents a single conditional branch edge within a ConditionalBlock."""
 
@@ -4564,7 +4605,7 @@ class BranchCondition(BaseModel):
             if criteria_type is None:
                 # Infer criteria type from expression format
                 expression = condition_obj.criteria.get("expression", "")
-                if expression.startswith("{{") and expression.endswith("}}"):
+                if _is_pure_jinja_expression(expression):
                     criteria_type = "jinja2_template"
                 else:
                     criteria_type = "prompt"
@@ -4579,7 +4620,7 @@ class BranchCondition(BaseModel):
         if condition_obj.criteria and isinstance(condition_obj.criteria, BranchCriteria):
             expression = condition_obj.criteria.expression
             criteria_dict = condition_obj.criteria.model_dump()
-            if expression and expression.startswith("{{") and expression.endswith("}}"):
+            if _is_pure_jinja_expression(expression):
                 criteria_dict["criteria_type"] = "jinja2_template"
                 condition_obj.criteria = JinjaBranchCriteria(**criteria_dict)
             else:
@@ -4623,121 +4664,212 @@ class ConditionalBlock(Block):
         workflow_run_id: str,
         workflow_run_block_id: str,
         organization_id: str | None = None,
+        browser_session_id: str | None = None,
     ) -> list[bool]:
+        """
+        Evaluate natural language branch conditions using a single ExtractionBlock.
+
+        All prompt-based conditions are batched into ONE LLM call for performance.
+        Jinja parts ({{ }}) are pre-rendered before sending to LLM.
+
+        ExtractionBlock provides:
+        - Browser/page access for expressions like "comment count > 100"
+        - UI visibility (shows up in workflow timeline with prompt/response)
+        - Proper LLM integration with data_schema
+        """
         if organization_id is None:
             raise ValueError("organization_id is required to evaluate natural language branches")
 
-        workflow_run_context = evaluation_context.workflow_run_context
-        context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
-        context_snapshot_json = json.dumps(context_snapshot, default=str)
+        if not branches:
+            return []
 
-        rendered_branch_criteria: list[dict[str, Any]] = []
+        workflow_run_context = evaluation_context.workflow_run_context
+
+        # Step 1: Pre-render all expressions (resolve any Jinja {{ }} parts)
+        rendered_expressions: list[str] = []
+        has_any_pure_natlang = False
+
         for idx, branch in enumerate(branches):
             expression = branch.criteria.expression if branch.criteria else ""
-            rendered_expression = (
-                evaluation_context.template_renderer(expression) if evaluation_context.template_renderer else expression
+            has_jinja = "{{" in expression
+
+            if has_jinja:
+                try:
+                    rendered_expression = (
+                        evaluation_context.template_renderer(expression)
+                        if evaluation_context.template_renderer
+                        else expression
+                    )
+                except Exception as render_exc:
+                    LOG.error(
+                        "Conditional branch expression rendering FAILED",
+                        block_label=self.label,
+                        branch_index=idx,
+                        original_expression=expression,
+                        error=str(render_exc),
+                        exc_info=True,
+                    )
+                    rendered_expression = expression
+            else:
+                rendered_expression = expression
+                has_any_pure_natlang = True
+
+            LOG.info(
+                "Conditional branch expression rendering",
+                block_label=self.label,
+                branch_index=idx,
+                original_expression=expression,
+                rendered_expression=rendered_expression,
+                has_jinja=has_jinja,
+                expression_changed=expression != rendered_expression,
             )
 
-            rendered_branch_criteria.append({"index": idx, "expression": rendered_expression})
+            rendered_expressions.append(rendered_expression)
 
-        branch_criteria_payload = [
-            {"index": criterion["index"], "expression": criterion["expression"]}
-            for criterion in rendered_branch_criteria
-        ]
+        # Step 2: Build extraction goal with all conditions
+        # Include context only if there are pure NatLang expressions that need variable resolution
+        if has_any_pure_natlang:
+            context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
+            context_json = json.dumps(context_snapshot, default=str)
+        else:
+            context_json = None
 
         extraction_goal = prompt_engine.load_prompt(
             "conditional-prompt-branch-evaluation",
-            branch_criteria=branch_criteria_payload,
-            context_snapshot=context_snapshot_json,
+            conditions=rendered_expressions,
+            context_json=context_json,
         )
 
+        # Step 3: Build schema for array of boolean results
         data_schema = {
             "type": "object",
             "properties": {
-                "branch_results": {
+                "results": {
                     "type": "array",
-                    "description": "Boolean results for each natural language branch in order.",
                     "items": {"type": "boolean"},
+                    "description": (
+                        "Array of boolean results for each condition in the same order. "
+                        "TRUE if the condition is satisfied, FALSE otherwise."
+                    ),
+                    "minItems": len(branches),
+                    "maxItems": len(branches),
                 }
             },
-            "required": ["branch_results"],
+            "required": ["results"],
         }
 
+        # Step 4: Create and execute single ExtractionBlock
         output_param = OutputParameter(
             output_parameter_id=str(uuid.uuid4()),
-            key=f"prompt_branch_eval_{generate_random_string()}",
+            key=f"conditional_branch_eval_{generate_random_string()}",
             workflow_id=self.output_parameter.workflow_id,
             created_at=datetime.now(),
             modified_at=datetime.now(),
             parameter_type=ParameterType.OUTPUT,
-            description="Prompt branch evaluation result",
+            description=f"Conditional branch evaluation results ({len(branches)} conditions)",
         )
 
         extraction_block = ExtractionBlock(
-            label=f"prompt_branch_eval_{generate_random_string()}",
+            label=f"conditional_branch_eval_{generate_random_string()}",
             data_extraction_goal=extraction_goal,
             data_schema=data_schema,
             output_parameter=output_param,
         )
 
-        extraction_result = await extraction_block.execute(
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
+        LOG.info(
+            "Conditional branch ExtractionBlock created (batched)",
+            block_label=self.label,
+            num_conditions=len(branches),
+            extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
+            has_browser_session=browser_session_id is not None,
+            has_context=context_json is not None,
         )
 
-        if not extraction_result.success:
-            raise ValueError(f"Prompt branch evaluation failed: {extraction_result.failure_reason}")
-
-        output_value = extraction_result.output_parameter_value
-        if workflow_run_context:
-            try:
-                await extraction_block.record_output_parameter_value(
-                    workflow_run_context=workflow_run_context,
-                    workflow_run_id=workflow_run_id,
-                    value=output_value,
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to record prompt branch evaluation output",
-                    workflow_run_id=workflow_run_id,
-                    block_label=self.label,
-                    exc_info=True,
-                )
-
-        extracted_info: Any | None = None
-        if isinstance(output_value, dict):
-            extracted_info = output_value.get("extracted_information")
-
-        if isinstance(extracted_info, list) and len(extracted_info) == 1:
-            extracted_info = extracted_info[0]
-
-        if not isinstance(extracted_info, dict):
-            raise ValueError("Prompt branch evaluation returned no extracted_information payload")
-
-        branch_results_raw = extracted_info.get("branch_results")
-        if not isinstance(branch_results_raw, list):
-            raise ValueError("Prompt branch evaluation did not return branch_results list")
-
-        branch_results: list[bool] = []
-        for result in branch_results_raw:
-            if isinstance(result, bool):
-                branch_results.append(result)
-            else:
-                evaluated_result = _evaluate_truthy_string(str(result))
-                LOG.warning(
-                    "Prompt branch evaluation returned non-boolean result",
-                    result=result,
-                    evaluated_result=evaluated_result,
-                )
-                branch_results.append(evaluated_result)
-
-        if len(branch_results) != len(branches):
-            raise ValueError(
-                f"Prompt branch evaluation returned {len(branch_results)} results for {len(branches)} branches"
+        try:
+            extraction_result = await extraction_block.execute(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
             )
 
-        return branch_results
+            if not extraction_result.success:
+                LOG.error(
+                    "Conditional branch ExtractionBlock failed",
+                    block_label=self.label,
+                    failure_reason=extraction_result.failure_reason,
+                )
+                raise ValueError(f"Branch evaluation failed: {extraction_result.failure_reason}")
+
+            # Record output parameter value if workflow context available
+            if workflow_run_context:
+                try:
+                    await extraction_block.record_output_parameter_value(
+                        workflow_run_context=workflow_run_context,
+                        workflow_run_id=workflow_run_id,
+                        value=extraction_result.output_parameter_value,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to record conditional branch evaluation output",
+                        workflow_run_id=workflow_run_id,
+                        block_label=self.label,
+                        exc_info=True,
+                    )
+
+            # Step 5: Extract the boolean results array
+            output_value = extraction_result.output_parameter_value
+            results_array: list[bool] = []
+
+            if isinstance(output_value, dict):
+                # Check if results is in extracted_information (standard ExtractionBlock output)
+                extracted_info = output_value.get("extracted_information")
+                if isinstance(extracted_info, dict):
+                    raw_results = extracted_info.get("results")
+                else:
+                    # Fallback: try direct access
+                    raw_results = output_value.get("results")
+
+                if isinstance(raw_results, list):
+                    for idx, result in enumerate(raw_results):
+                        if isinstance(result, bool):
+                            results_array.append(result)
+                        else:
+                            evaluated_result = _evaluate_truthy_string(str(result))
+                            LOG.warning(
+                                "Prompt branch evaluation returned non-boolean result",
+                                branch_index=idx,
+                                result=result,
+                                evaluated_result=evaluated_result,
+                            )
+                            results_array.append(evaluated_result)
+                else:
+                    raise ValueError(f"Expected array of results, got: {type(raw_results)}")
+            else:
+                raise ValueError(f"Unexpected output format: {type(output_value)}")
+
+            LOG.info(
+                "Conditional branch evaluation results",
+                block_label=self.label,
+                results=results_array,
+                raw_output=output_value,
+            )
+
+            if len(results_array) != len(branches):
+                raise ValueError(
+                    f"Prompt branch evaluation returned {len(results_array)} results for {len(branches)} branches"
+                )
+
+            return results_array
+
+        except Exception as exc:
+            LOG.error(
+                "Conditional branch ExtractionBlock execution failed",
+                block_label=self.label,
+                error=str(exc),
+                exc_info=True,
+            )
+            raise ValueError(f"Prompt branch evaluation failed: {str(exc)}") from exc
 
     async def execute(  # noqa: D401
         self,
@@ -4781,6 +4913,7 @@ class ConditionalBlock(Block):
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    browser_session_id=browser_session_id,
                 )
                 prompt_results_by_id = {
                     branch.id: result for branch, result in zip(natural_language_branches, prompt_results, strict=False)
