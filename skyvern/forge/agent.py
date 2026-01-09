@@ -68,6 +68,7 @@ from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.files import (
+    calculate_sha256_for_file,
     get_path_for_workflow_download_directory,
     list_downloading_files_in_directory,
     list_files_in_directory,
@@ -159,6 +160,65 @@ class ActionLinkedNode:
 class ForgeAgent:
     def __init__(self) -> None:
         self.async_operation_pool = AsyncOperationPool()
+
+    async def _get_downloaded_files_from_previous_runs(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+        current_workflow_run_id: str,
+        max_runs_to_check: int = 10,
+    ) -> list[FileInfo]:
+        """
+        Get all downloaded files from previous workflow runs for the same workflow.
+        This is used to check if files have already been downloaded to avoid re-downloading.
+        """
+        try:
+            # Get previous workflow runs (excluding the current one)
+            previous_runs = await app.DATABASE.get_workflow_runs_for_workflow_permanent_id(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                page=1,
+                page_size=max_runs_to_check,
+                status=[WorkflowRunStatus.completed],
+            )
+
+            all_downloaded_files: list[FileInfo] = []
+            for run in previous_runs:
+                # Skip the current run
+                if run.workflow_run_id == current_workflow_run_id:
+                    continue
+
+                try:
+                    # Get downloaded files for this run
+                    downloaded_files = await app.STORAGE.get_downloaded_files(
+                        organization_id=organization_id,
+                        run_id=run.workflow_run_id,
+                    )
+                    all_downloaded_files.extend(downloaded_files)
+                except Exception as e:
+                    LOG.warning(
+                        "Failed to get downloaded files for previous run",
+                        workflow_run_id=run.workflow_run_id,
+                        error=str(e),
+                        exc_info=True,
+                    )
+                    continue
+
+            LOG.info(
+                "Retrieved downloaded files from previous runs",
+                workflow_permanent_id=workflow_permanent_id,
+                num_previous_runs=len(previous_runs),
+                total_files_found=len(all_downloaded_files),
+            )
+            return all_downloaded_files
+        except Exception as e:
+            LOG.warning(
+                "Failed to get downloaded files from previous runs",
+                workflow_permanent_id=workflow_permanent_id,
+                error=str(e),
+                exc_info=True,
+            )
+            return []
 
     async def create_task_and_step_from_block(
         self,
@@ -544,6 +604,20 @@ class ForgeAgent:
                     list_files_after = list_files_after + browser_session_downloaded_files_after
                 if len(list_files_after) > len(list_files_before):
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
+
+                    # Check for duplicate files if skip_if_already_downloaded is enabled
+                    previous_downloaded_files: list[FileInfo] = []
+                    if task_block.skip_if_already_downloaded and workflow_run:
+                        previous_downloaded_files = await self._get_downloaded_files_from_previous_runs(
+                            workflow_permanent_id=workflow_run.workflow_permanent_id,
+                            organization_id=organization.organization_id,
+                            current_workflow_run_id=task.workflow_run_id,
+                        )
+
+                    # Track files that are duplicates and should be skipped
+                    duplicate_files: list[str] = []
+                    files_to_process: list[str] = []
+
                     for file in files_to_rename:
                         if file.startswith("s3://"):
                             file_data = await aws_client.download_file(file, log_exception=False)
@@ -563,6 +637,55 @@ class ForgeAgent:
                             )
                             continue
 
+                        # Check if this file is a duplicate of a previously downloaded file
+                        is_duplicate = False
+                        if task_block.skip_if_already_downloaded and previous_downloaded_files:
+                            file_path = os.path.join(workflow_download_directory, file)
+                            if os.path.exists(file_path):
+                                try:
+                                    # Calculate checksum of the new file
+                                    new_file_checksum = calculate_sha256_for_file(file_path)
+
+                                    # Check if this checksum matches any previous file
+                                    for previous_file in previous_downloaded_files:
+                                        if previous_file.checksum and previous_file.checksum == new_file_checksum:
+                                            LOG.info(
+                                                "Skipping duplicate file (matched by checksum)",
+                                                file=file,
+                                                checksum=new_file_checksum,
+                                                previous_file_url=previous_file.url,
+                                                previous_file_filename=previous_file.filename,
+                                                task_id=task.task_id,
+                                                workflow_run_id=task.workflow_run_id,
+                                            )
+                                            is_duplicate = True
+                                            duplicate_files.append(file)
+                                            # Delete the duplicate file
+                                            try:
+                                                os.remove(file_path)
+                                            except Exception as e:
+                                                LOG.warning(
+                                                    "Failed to delete duplicate file",
+                                                    file=file,
+                                                    error=str(e),
+                                                    exc_info=True,
+                                                )
+                                            break
+                                except Exception as e:
+                                    LOG.warning(
+                                        "Failed to calculate checksum for file, processing anyway",
+                                        file=file,
+                                        error=str(e),
+                                        exc_info=True,
+                                    )
+
+                        if is_duplicate:
+                            continue
+
+                        files_to_process.append(file)
+
+                    # Process only non-duplicate files
+                    for file in files_to_process:
                         if task_block.download_suffix:
                             # Use download_suffix as the complete filename (without extension)
                             final_file_name = task_block.download_suffix
@@ -572,6 +695,7 @@ class ForgeAgent:
                             final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
 
                         # Check if file with this name already exists
+                        file_extension = Path(file).suffix
                         final_file_name = final_file_name
                         target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
                         counter = 1
@@ -589,6 +713,8 @@ class ForgeAgent:
                         num_files_before=len(list_files_before),
                         num_files_after=len(list_files_after),
                         new_files=files_to_rename,
+                        duplicate_files=duplicate_files if task_block.skip_if_already_downloaded else [],
+                        files_processed=len(files_to_process),
                     )
                     last_step = await self.update_step(step, is_last=True)
                     completed_task = await self.update_task(

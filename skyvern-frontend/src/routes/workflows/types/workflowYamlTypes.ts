@@ -291,6 +291,7 @@ export type FileDownloadBlockYAML = BlockYAMLBase & {
   disable_cache: boolean;
   engine: RunEngine | null;
   download_timeout?: number | null;
+  skip_if_already_downloaded?: boolean;
 };
 
 export type CodeBlockYAML = BlockYAMLBase & {

@@ -11,6 +11,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -303,6 +304,23 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       update({ disableCache });
                     }}
                   />
+                  <Separator />
+                  <div className="flex items-center justify-between">
+                    <div className="flex gap-2">
+                      <Label className="text-xs font-normal text-slate-300">
+                        Skip If Already Downloaded
+                      </Label>
+                      <HelpTooltip content="Skip downloading files that were already downloaded in previous workflow runs. Files are matched by SHA256 checksum." />
+                    </div>
+                    <div className="w-52">
+                      <Switch
+                        checked={data.skipIfAlreadyDownloaded}
+                        onCheckedChange={(checked) => {
+                          update({ skipIfAlreadyDownloaded: checked });
+                        }}
+                      />
+                    </div>
+                  </div>
                   <Separator />
                   <div className="space-y-2">
                     <div className="flex gap-2">

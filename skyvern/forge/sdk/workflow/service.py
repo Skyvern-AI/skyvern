@@ -3726,6 +3726,7 @@ class WorkflowService:
                 complete_verification=True,
                 include_action_history_in_verification=True,
                 download_timeout=block_yaml.download_timeout,
+                skip_if_already_downloaded=block_yaml.skip_if_already_downloaded,
             )
         elif block_yaml.block_type == BlockType.TaskV2:
             return TaskV2Block(

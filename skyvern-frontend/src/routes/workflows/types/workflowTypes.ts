@@ -514,6 +514,7 @@ export type WaitBlock = WorkflowBlockBase & {
 
 export type FileDownloadBlock = WorkflowBlockBase & {
   block_type: "file_download";
+  skip_if_already_downloaded?: boolean;
   url: string | null;
   title: string;
   navigation_goal: string | null;
