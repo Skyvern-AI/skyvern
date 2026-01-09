@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, memo } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useIsSkyvernUser } from "@/hooks/useIsSkyvernUser";
@@ -15,6 +15,39 @@ interface ChatMessage {
   content: string;
   timestamp?: string;
 }
+
+const formatChatTimestamp = (value: string) => {
+  let normalizedValue = value.replace(/\.(\d{3})\d*/, ".$1");
+  if (!normalizedValue.endsWith("Z")) {
+    normalizedValue += "Z";
+  }
+  return new Date(normalizedValue).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+};
+
+const MessageItem = memo(({ message }: { message: ChatMessage }) => {
+  return (
+    <div className="flex items-start gap-3">
+      <div
+        className={`flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold text-white ${
+          message.sender === "ai" ? "bg-blue-600" : "bg-purple-600"
+        }`}
+      >
+        {message.sender === "ai" ? "AI" : "U"}
+      </div>
+      <div className="relative flex-1 rounded-lg bg-slate-800 p-3 pr-12">
+        <p className="text-sm text-slate-200">{message.content}</p>
+        {message.timestamp ? (
+          <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-900/70 px-1.5 py-0.5 text-[10px] text-slate-400">
+            {formatChatTimestamp(message.timestamp)}
+          </span>
+        ) : null}
+      </div>
+    </div>
+  );
+});
 
 interface WorkflowCopilotChatProps {
   onWorkflowUpdate?: (workflowYaml: string) => void;
@@ -111,18 +144,6 @@ export function WorkflowCopilotChat({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
-
-  const formatChatTimestamp = (value: string) => {
-    let normalizedValue = value.replace(/\.(\d{3})\d*/, ".$1");
-    if (!normalizedValue.endsWith("Z")) {
-      normalizedValue += "Z";
-    }
-    return new Date(normalizedValue).toLocaleTimeString("en-US", {
-      hour: "numeric",
-      minute: "2-digit",
-    });
-  };
-
   const hasScrolledOnLoad = useRef(false);
 
   const scrollToBottom = (behavior: ScrollBehavior) => {
@@ -296,13 +317,19 @@ export function WorkflowCopilotChat({
         updated_workflow_yaml: string | null;
         request_time: string;
         response_time: string;
-      }>("/workflow/copilot/chat-post", {
-        workflow_permanent_id: workflowPermanentId,
-        workflow_copilot_chat_id: workflowCopilotChatId,
-        workflow_run_id: workflowRunId,
-        message: messageContent,
-        workflow_yaml: workflowYaml,
-      });
+      }>(
+        "/workflow/copilot/chat-post",
+        {
+          workflow_permanent_id: workflowPermanentId,
+          workflow_copilot_chat_id: workflowCopilotChatId,
+          workflow_run_id: workflowRunId,
+          message: messageContent,
+          workflow_yaml: workflowYaml,
+        },
+        {
+          timeout: 300000,
+        },
+      );
 
       setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
 
@@ -343,10 +370,6 @@ export function WorkflowCopilotChat({
         id: Date.now().toString(),
         sender: "ai",
         content: "Sorry, I encountered an error. Please try again.",
-        timestamp: new Date().toLocaleTimeString("en-US", {
-          hour: "numeric",
-          minute: "2-digit",
-        }),
       };
       setMessages((prev) => [...prev, errorMessage]);
     } finally {
@@ -563,29 +586,13 @@ export function WorkflowCopilotChat({
                 the target site, and any credentials it should use.
               </p>
               <p className="mt-2 text-slate-400">
-                Example: “Build a workflow visit hackernews and get top 3 news
-                items”
+                Example: "Build workflow to find the top post on hackernews
+                today"
               </p>
             </div>
           ) : null}
           {messages.map((message) => (
-            <div key={message.id} className="flex items-start gap-3">
-              <div
-                className={`flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold text-white ${
-                  message.sender === "ai" ? "bg-blue-600" : "bg-purple-600"
-                }`}
-              >
-                {message.sender === "ai" ? "AI" : "U"}
-              </div>
-              <div className="relative flex-1 rounded-lg bg-slate-800 p-3 pr-12">
-                <p className="text-sm text-slate-200">{message.content}</p>
-                {message.timestamp ? (
-                  <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-900/70 px-1.5 py-0.5 text-[10px] text-slate-400">
-                    {formatChatTimestamp(message.timestamp)}
-                  </span>
-                ) : null}
-              </div>
-            </div>
+            <MessageItem key={message.id} message={message} />
           ))}
           {isLoading && (
             <div className="flex items-start gap-3">
