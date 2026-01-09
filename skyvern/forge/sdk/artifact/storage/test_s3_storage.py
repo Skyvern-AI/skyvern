@@ -35,7 +35,7 @@ class S3StorageForTests(S3Storage):
     async def _get_tags_for_org(self, organization_id: str) -> dict[str, str]:
         return {"dummy": f"org-{organization_id}", "test": "jerry"}
 
-    async def _get_storage_class_for_org(self, organization_id: str, bucket: str) -> S3StorageClass:
+    async def _get_storage_class_for_org(self, organization_id: str) -> S3StorageClass:
         return S3StorageClass.ONEZONE_IA
 
 
@@ -447,3 +447,107 @@ class TestS3StorageContentType:
         s3uri = S3Uri(uri)
         obj_meta = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=s3uri.key)
         assert obj_meta["ContentType"] == expected_content_type
+
+
+@pytest.mark.asyncio
+class TestS3StorageHARCompression:
+    """Test S3Storage HAR file compression with zstd."""
+
+    def _create_har_artifact(self, s3_storage: S3Storage, step_id: str) -> Artifact:
+        """Helper method to create a HAR Artifact."""
+        artifact_id_val = generate_artifact_id()
+        step = create_fake_step(step_id)
+        uri = s3_storage.build_uri(
+            organization_id=TEST_ORGANIZATION_ID,
+            artifact_id=artifact_id_val,
+            step=step,
+            artifact_type=ArtifactType.HAR,
+        )
+        return Artifact(
+            artifact_id=artifact_id_val,
+            artifact_type=ArtifactType.HAR,
+            uri=uri,
+            organization_id=TEST_ORGANIZATION_ID,
+            step_id=step.step_id,
+            task_id=step.task_id,
+            created_at=datetime.utcnow(),
+            modified_at=datetime.utcnow(),
+        )
+
+    async def test_store_har_artifact_compresses_with_zstd(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        """Test that HAR artifacts are compressed with zstd and URI is updated."""
+        import zstandard as zstd
+
+        # Create sample HAR JSON data (easily compressible)
+        har_data = b'{"log": {"version": "1.2", "entries": [{"request": {}, "response": {}}]}}'
+        artifact = self._create_har_artifact(s3_storage, TEST_STEP_ID)
+        original_uri = artifact.uri
+
+        # Store the artifact
+        await s3_storage.store_artifact(artifact, har_data)
+
+        # Verify URI was updated to .har.zst
+        assert artifact.uri.endswith(".har.zst")
+        assert artifact.uri == original_uri.replace(".har", ".har.zst")
+
+        # Verify the stored data is compressed
+        s3uri = S3Uri(artifact.uri)
+        obj_response = boto3_test_client.get_object(Bucket=TEST_BUCKET, Key=s3uri.key)
+        stored_data = obj_response["Body"].read()
+
+        # Stored data should be different from original (compressed)
+        assert stored_data != har_data
+
+        # Verify we can decompress it back to original
+        dctx = zstd.ZstdDecompressor()
+        decompressed = dctx.decompress(stored_data)
+        assert decompressed == har_data
+
+    async def test_retrieve_har_artifact_decompresses_zstd(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        """Test that retrieving a .zst HAR artifact auto-decompresses it."""
+        # Create and store HAR artifact
+        har_data = b'{"log": {"version": "1.2", "creator": {"name": "test"}}}'
+        artifact = self._create_har_artifact(s3_storage, TEST_STEP_ID)
+
+        await s3_storage.store_artifact(artifact, har_data)
+
+        # Retrieve should auto-decompress
+        retrieved_data = await s3_storage.retrieve_artifact(artifact)
+        assert retrieved_data == har_data
+
+    async def test_non_har_artifact_not_compressed(self, s3_storage: S3Storage, boto3_test_client: S3Client) -> None:
+        """Test that non-HAR artifacts are NOT compressed."""
+        test_data = b"fake screenshot data"
+        artifact_id_val = generate_artifact_id()
+        step = create_fake_step(TEST_STEP_ID)
+        uri = s3_storage.build_uri(
+            organization_id=TEST_ORGANIZATION_ID,
+            artifact_id=artifact_id_val,
+            step=step,
+            artifact_type=ArtifactType.SCREENSHOT_LLM,
+        )
+        artifact = Artifact(
+            artifact_id=artifact_id_val,
+            artifact_type=ArtifactType.SCREENSHOT_LLM,
+            uri=uri,
+            organization_id=TEST_ORGANIZATION_ID,
+            step_id=step.step_id,
+            task_id=step.task_id,
+            created_at=datetime.utcnow(),
+            modified_at=datetime.utcnow(),
+        )
+
+        await s3_storage.store_artifact(artifact, test_data)
+
+        # URI should NOT have .zst extension
+        assert not artifact.uri.endswith(".zst")
+
+        # Stored data should be identical to original
+        s3uri = S3Uri(artifact.uri)
+        obj_response = boto3_test_client.get_object(Bucket=TEST_BUCKET, Key=s3uri.key)
+        stored_data = obj_response["Body"].read()
+        assert stored_data == test_data

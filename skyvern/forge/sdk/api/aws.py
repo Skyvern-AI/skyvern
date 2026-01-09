@@ -16,6 +16,7 @@ from skyvern.config import settings
 # Register custom mime types for mimetypes guessing
 add_type("application/json", ".har")
 add_type("text/plain", ".log")
+add_type("application/zstd", ".zst")
 
 LOG = structlog.get_logger()
 
@@ -27,7 +28,6 @@ class S3StorageClass(StrEnum):
     # INTELLIGENT_TIERING = "INTELLIGENT_TIERING"
     ONEZONE_IA = "ONEZONE_IA"
     GLACIER = "GLACIER"
-    GLACIER_IR = "GLACIER_IR"  # Glacier Instant Retrieval
     # DEEP_ARCHIVE = "DEEP_ARCHIVE"
     # OUTPOSTS = "OUTPOSTS"
     # STANDARD_IA = "STANDARD_IA"
