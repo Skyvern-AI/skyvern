@@ -211,6 +211,10 @@ class ScriptSkyvernPage(SkyvernPage):
             # Auto-create screenshot artifact after execution
             await self._create_screenshot_after_execution()
 
+            # Add a small buffer between cached actions to give slow pages time to settle
+            if settings.CACHED_ACTION_DELAY_SECONDS > 0:
+                await asyncio.sleep(settings.CACHED_ACTION_DELAY_SECONDS)
+
     async def _update_action_reasoning(
         self,
         action_id: str,

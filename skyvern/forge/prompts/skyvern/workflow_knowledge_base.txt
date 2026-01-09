@@ -93,18 +93,16 @@ Important Rules:
 - Set next_block_label to null to mark the end of a flow
 - continue_on_failure allows graceful error handling
 
-** TASK BLOCK (task) **
+** NAVIGATION BLOCK (navigation) **
 
-Purpose: Navigate to a URL, perform actions based on natural language goals, and optionally extract data.
+Purpose: Take actions to achieve a task. This is the "Browser Task" block in the UI.
 
 Structure:
-block_type: task
+block_type: navigation
 label: <unique_label>
 url: <starting_url>                            # Optional: URL to navigate to; omit to continue on current page
 title: str                                     # Required: The title of the block
-navigation_goal: <action_description>          # Optional: What actions to perform
-data_extraction_goal: <extraction_description> # Optional: What data to extract
-data_schema: <json_schema>                     # Optional: Schema for extracted data
+navigation_goal: <action_description>          # Required: What actions to perform
 error_code_mapping: {}                         # Optional: Map errors to custom codes
 max_retries: 0                                 # Optional: Number of retry attempts
 max_steps_per_run: null                        # Optional: Limit steps per execution
@@ -121,23 +119,16 @@ include_action_history_in_verification: false  # Optional: Include history in ve
 Use Cases:
 - Fill out forms on websites
 - Navigate complex multi-step processes
-- Extract structured data from pages
-- Combine navigation and extraction in one step
+- Prepare the page for a subsequent extraction block
+- Execute focused browser tasks with clear completion criteria
 
 Example:
 blocks:
-  - block_type: task
-    label: search_and_extract
+  - block_type: navigation
+    label: search_and_open
     next_block_label: null
     url: "https://example.com/search"
     navigation_goal: "Search for {{ query }} and click the first result"
-    data_extraction_goal: "Extract the product name, price, and availability"
-    data_schema:
-      type: object
-      properties:
-        name: {type: string}
-        price: {type: number}
-        available: {type: boolean}
     parameter_keys:
       - query
     max_retries: 2
@@ -155,7 +146,7 @@ max_retries: 0                          # Optional: Retry attempts
 parameter_keys: []                      # Optional: Parameters used
 
 Use Cases:
-- Jump to a known page before a task block
+- Jump to a known page before other blocks
 - Reset the browser state to a specific URL
 - Split URL navigation from subsequent actions
 
@@ -200,7 +191,7 @@ blocks:
 
 ** TASK V2 BLOCK (task_v2) **
 
-Purpose: Task block that can handle complex, multi-step workflows using a single natural language prompt. Can handle more complex scenarios than task blocks but may be slightly slower.
+Purpose: Achieve complex tasks with deep thinking using a single natural language prompt. Can handle more complex scenarios than navigation blocks but may be slightly slower.
 
 Structure:
 block_type: task_v2
@@ -215,10 +206,10 @@ Use Cases:
 - General-purpose automation with flexible requirements
 - When you need to handle more complex scenarios and are okay with potentially slower execution
 
-Differences from Task Block:
-- Uses single "prompt" field instead of separate "navigation_goal" and "data_extraction_goal"
+Differences from Navigation Block:
+- Uses single "prompt" field instead of "navigation_goal"
 - Can handle more complex scenarios and longer sequences of actions
-- May be slightly slower than task blocks
+- May be slightly slower than navigation blocks
 - No data_schema (extraction format described in prompt)
 - More flexible configuration
 
@@ -274,6 +265,32 @@ blocks:
       - my_credentials # This must match a 'key' from the parameters list above
     complete_criterion: "Current URL is 'https://portal.example.com/dashboard'"
     max_retries: 2
+
+** VALIDATION BLOCK (validation) **
+
+Purpose: Validate workflow state and decide whether to continue or terminate.
+
+Structure:
+block_type: validation
+label: <unique_label>
+complete_criterion: <success_condition>        # Optional: Condition for success
+terminate_criterion: <termination_condition>   # Optional: Condition to stop workflow
+error_code_mapping: {}                         # Optional: Map errors to custom codes
+parameter_keys: []                             # Optional: Parameters used in this block
+disable_cache: false                           # Optional: Disable caching
+
+Use Cases:
+- Confirm a successful navigation or submission
+- Stop the workflow when an error state appears
+- Validate content on the page before extracting data
+
+Example:
+blocks:
+  - block_type: validation
+    label: verify_submission
+    next_block_label: null
+    complete_criterion: "Page contains 'Thank you for your submission'"
+    terminate_criterion: "Page contains 'Error' or 'Try again'"
 
 ** EXTRACTION BLOCK (extraction) **
 
@@ -331,6 +348,204 @@ blocks:
           in_stock: {type: boolean}
           rating: {type: number}
     max_retries: 1
+
+** FILE DOWNLOAD BLOCK (file_download) **
+
+Purpose: Download files from a website. This is the "File Download Block" in the UI.
+
+Structure:
+block_type: file_download
+label: <unique_label>
+navigation_goal: <download_instruction>        # Required: How to trigger the download
+url: <starting_url>                            # Optional: URL to navigate to first
+title: str                                     # Optional: Title for the block
+engine: skyvern_v1                             # Optional: Run engine
+error_code_mapping: {}                         # Optional: Map errors to custom codes
+max_retries: 0                                 # Optional: Number of retry attempts
+max_steps_per_run: null                        # Optional: Limit steps per execution
+parameter_keys: []                             # Optional: Parameters used in this block
+download_suffix: null                          # Optional: Full filename for the download
+totp_verification_url: null                    # Optional: TOTP verification URL
+totp_identifier: null                          # Optional: TOTP identifier
+disable_cache: false                           # Optional: Disable caching
+download_timeout: null                         # Optional: Download timeout in seconds
+
+Use Cases:
+- Download invoices, receipts, or reports from a portal
+- Export data as CSV or PDF from a dashboard
+- Trigger file downloads that require navigation steps
+
+Example:
+blocks:
+  - block_type: file_download
+    label: download_report
+    next_block_label: null
+    url: "https://portal.example.com/reports"
+    navigation_goal: "Open the latest report and click Download as PDF"
+    download_suffix: "latest_report.pdf"
+
+** CLOUD STORAGE BLOCK (file_upload) **
+
+Purpose: Upload files to storage. This is the "Cloud Storage Block" in the UI.
+
+Structure:
+block_type: file_upload
+label: <unique_label>
+storage_type: <s3|azure>                       # Optional: Storage backend (default: s3)
+s3_bucket: <bucket_name>                       # Optional: S3 bucket name
+aws_access_key_id: <access_key_id>             # Optional: AWS access key id
+aws_secret_access_key: <secret_access_key>     # Optional: AWS secret access key
+region_name: <aws_region>                      # Optional: AWS region
+azure_storage_account_name: <account_name>     # Optional: Azure storage account
+azure_storage_account_key: <account_key>       # Optional: Azure storage account key
+azure_blob_container_name: <container_name>    # Optional: Azure blob container
+azure_folder_path: <folder_path>               # Optional: Azure folder path
+path: <local_or_workspace_path>                # Optional: File path to upload
+
+Use Cases:
+- Upload downloaded artifacts to S3
+- Publish files to Azure Blob Storage
+- Persist workflow outputs to storage
+
+Example:
+blocks:
+  - block_type: file_upload
+    label: upload_report
+    next_block_label: null
+    storage_type: s3
+    s3_bucket: "my-reports"
+    region_name: "us-west-2"
+    path: "/tmp/latest_report.pdf"
+
+** FILE PARSER BLOCK (file_url_parser) **
+
+Purpose: Parse PDFs, CSVs, and Excel files. This is the "File Parser Block" in the UI.
+
+Structure:
+block_type: file_url_parser
+label: <unique_label>
+file_url: <https_url_or_file_url>             # Required: URL to the file
+file_type: <pdf|csv|excel>                     # Required: File type
+json_schema: <json_schema>                     # Optional: Structure of parsed output
+
+Use Cases:
+- Parse a PDF invoice into structured fields
+- Extract rows from a CSV file
+- Read Excel sheets for downstream processing
+
+Example:
+blocks:
+  - block_type: file_url_parser
+    label: parse_invoice
+    next_block_label: null
+    file_url: "https://example.com/invoice.pdf"
+    file_type: pdf
+    json_schema:
+      type: object
+      properties:
+        invoice_id: {type: string}
+        total: {type: number}
+
+** SEND EMAIL BLOCK (send_email) **
+
+Purpose: Send email notifications. This is the "Send Email Block" in the UI.
+
+Structure:
+block_type: send_email
+label: <unique_label>
+smtp_host_secret_parameter_key: <param_key>     # Required: Secret parameter key for SMTP host
+smtp_port_secret_parameter_key: <param_key>     # Required: Secret parameter key for SMTP port
+smtp_username_secret_parameter_key: <param_key> # Required: Secret parameter key for SMTP username
+smtp_password_secret_parameter_key: <param_key> # Required: Secret parameter key for SMTP password
+sender: <email_address>                         # Required: Sender email address
+recipients: [<email_address>]                   # Required: Recipient list
+subject: <subject_line>                         # Required: Email subject
+body: <email_body>                              # Required: Email body
+file_attachments: [<file_path>]                 # Optional: Local file paths to attach
+
+Use Cases:
+- Notify a team when a workflow completes
+- Send extracted data summaries to stakeholders
+- Email reports or attachments
+
+Example:
+blocks:
+  - block_type: send_email
+    label: notify_ops
+    next_block_label: null
+    smtp_host_secret_parameter_key: smtp_host
+    smtp_port_secret_parameter_key: smtp_port
+    smtp_username_secret_parameter_key: smtp_user
+    smtp_password_secret_parameter_key: smtp_pass
+    sender: "automation@example.com"
+    recipients: ["ops@example.com"]
+    subject: "Daily report ready"
+    body: "The latest report is ready for review."
+    file_attachments: ["/tmp/latest_report.pdf"]
+
+** TEXT PROMPT BLOCK (text_prompt) **
+
+Purpose: Process text with LLM. This is the "Text Prompt Block" in the UI.
+
+Structure:
+block_type: text_prompt
+label: <unique_label>
+llm_key: <llm_key>                             # Optional: Model key override
+prompt: <text_prompt>                          # Required: Prompt to run
+parameter_keys: []                             # Optional: Parameters used in this block
+json_schema: <json_schema>                     # Optional: Structured output schema
+
+Use Cases:
+- Summarize extracted text or documents
+- Normalize free-form content into a schema
+- Generate classifications or tags
+
+Example:
+blocks:
+  - block_type: text_prompt
+    label: summarize_notes
+    next_block_label: null
+    prompt: "Summarize these notes: {{ notes }}"
+    json_schema:
+      type: object
+      properties:
+        summary: {type: string}
+        action_items: {type: array, items: {type: string}}
+    parameter_keys: [notes]
+
+** HTTP REQUEST BLOCK (http_request) **
+
+Purpose: Make HTTP API calls. This is the "HTTP Request Block" in the UI.
+
+Structure:
+block_type: http_request
+label: <unique_label>
+method: <GET|POST|PUT|PATCH|DELETE>            # Optional: HTTP method (default: GET)
+url: <https_url>                               # Optional: Target URL
+headers: {}                                    # Optional: HTTP headers
+body: {}                                       # Optional: JSON body (dict)
+files: {}                                      # Optional: Multipart files mapping
+timeout: 30                                    # Optional: Timeout in seconds
+follow_redirects: true                         # Optional: Follow redirects
+parameter_keys: []                             # Optional: Parameters used in this block
+
+Use Cases:
+- Call third-party APIs for enrichment
+- Post data to internal services
+- Upload files via multipart requests
+
+Example:
+blocks:
+  - block_type: http_request
+    label: lookup_customer
+    next_block_label: null
+    method: "POST"
+    url: "https://api.example.com/customers/search"
+    headers:
+      Authorization: "Bearer {{ api_token }}"
+    body:
+      email: "{{ customer_email }}"
+    parameter_keys: [api_token, customer_email]
 
 ** PARAMETER TEMPLATING **
 
@@ -395,9 +610,10 @@ blocks:
   - block_type: extraction
     label: step2
     next_block_label: step3
-  - block_type: task
+  - block_type: task_v2
     label: step3
     next_block_label: null
+    prompt: "Complete the final step on the page"
 # Executes: step1 → step2 → step3
 
 Explicit Flow Control (Skip blocks):
@@ -406,9 +622,10 @@ blocks:
     label: login
     next_block_label: extract_data
     url: "https://app.example.com/login"
-  - block_type: task
+  - block_type: task_v2
     label: handle_error
     next_block_label: null
+    prompt: "Handle the error state if it appears"
   - block_type: extraction
     label: extract_data
     next_block_label: null
@@ -416,10 +633,11 @@ blocks:
 
 Error Recovery Flow:
 blocks:
-  - block_type: task
+  - block_type: task_v2
     label: primary_task
     next_block_label: verify_result
     continue_on_failure: true
+    prompt: "Attempt the primary task on the page"
   - block_type: validation
     label: verify_result
     next_block_label: null
@@ -454,7 +672,7 @@ blocks:
 * Performance:
    - Use disable_cache: true for dynamic content
    - Set max_steps_per_run to prevent infinite loops
-   - Combine navigation and extraction in task blocks when possible
+   - Use task_v2 when a single prompt should include both actions and extraction requirements
 
 * Security:
    - Never hardcode credentials in workflows
@@ -477,7 +695,7 @@ blocks:
     next_block_label: go_to_reports
     url: "https://app.example.com/login"
     parameter_keys: [my_credentials]
-  - block_type: task
+  - block_type: navigation
     label: go_to_reports
     next_block_label: get_report_data
     navigation_goal: "Navigate to Reports section"
@@ -507,24 +725,24 @@ blocks:
     label: open_form
     next_block_label: fill_personal_info
     url: "https://forms.example.com/application"
-  - block_type: task
+  - block_type: navigation
     label: fill_personal_info
     next_block_label: fill_address
     navigation_goal: "Fill in name as {{ name }}, email as {{ email }}"
     parameter_keys: [name, email]
-  - block_type: task
+  - block_type: navigation
     label: fill_address
     next_block_label: submit
     navigation_goal: "Fill in address fields and click Continue"
     parameter_keys: [address, city, zip]
-  - block_type: task
+  - block_type: navigation
     label: submit
     next_block_label: null
     navigation_goal: "Review information and click Submit"
 
 Pattern 4: Conditional Extraction
 blocks:
-  - block_type: task
+  - block_type: navigation
     label: search_product
     next_block_label: check_availability
     navigation_goal: "Search for {{ product }}"
@@ -536,7 +754,7 @@ blocks:
       type: object
       properties:
         in_stock: {type: boolean}
-  - block_type: task
+  - block_type: navigation
     label: add_to_cart
     next_block_label: null
     navigation_goal: "If product is in stock, add to cart"
@@ -552,7 +770,7 @@ Workflow-Level:
 Block-Level:
 - label is required and cannot be empty
 - block_type must be a valid type
-- For task blocks: either navigation_goal or data_extraction_goal should be present
+- For navigation blocks: navigation_goal is required
 - For extraction blocks: data_extraction_goal is required
 - For action blocks: navigation_goal is required
 - For login blocks: parameter_keys should include credentials
@@ -594,7 +812,7 @@ workflow_definition:
         - account_creds
       complete_criterion: "URL contains '/dashboard'"
 
-    - block_type: task
+    - block_type: navigation
       label: search_and_filter
       next_block_label: get_product_info
       url: "https://shop.example.com/search"
