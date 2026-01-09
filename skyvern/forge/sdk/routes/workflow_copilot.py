@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -103,13 +104,34 @@ async def copilot_call_llm(
     )
 
     LOG.info(
-        "Calling LLM for workflow copilot",
-        prompt_length=len(llm_prompt),
+        "Calling LLM",
+        user_message=chat_request.message,
+        user_message_len=len(chat_request.message),
+        workflow_yaml_len=len(chat_request.workflow_yaml or ""),
+        chat_history_len=len(chat_history_text),
+        global_llm_context_len=len(global_llm_context or ""),
+        debug_run_info_len=len(debug_run_info_text),
+        workflow_knowledge_base_len=len(workflow_knowledge_base),
+        llm_prompt_len=len(llm_prompt),
+        llm_prompt=llm_prompt,
     )
+    llm_start_time = time.monotonic()
     llm_response = await app.LLM_API_HANDLER(
         prompt=llm_prompt,
         prompt_name="workflow-copilot",
         organization_id=organization_id,
+    )
+    LOG.info(
+        "LLM response",
+        duration_seconds=time.monotonic() - llm_start_time,
+        user_message_len=len(chat_request.message),
+        workflow_yaml_len=len(chat_request.workflow_yaml or ""),
+        chat_history_len=len(chat_history_text),
+        global_llm_context_len=len(global_llm_context or ""),
+        debug_run_info_len=len(debug_run_info_text),
+        workflow_knowledge_base_len=len(workflow_knowledge_base),
+        llm_response_len=len(llm_response),
+        llm_response=llm_response,
     )
 
     if isinstance(llm_response, dict) and "output" in llm_response:
