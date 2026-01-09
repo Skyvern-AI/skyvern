@@ -115,7 +115,7 @@ function useActions({ id }: Props): {
             return actions;
           })
           .flat()
-      : taskActions?.map((action) => {
+      : taskActions?.map((action, index) => {
           return {
             reasoning: action.reasoning ?? "",
             confidence: action.confidence_float ?? undefined,
@@ -125,8 +125,9 @@ function useActions({ id }: Props): {
               action.status === Status.Completed ||
               action.status === Status.Skipped,
             stepId: action.step_id ?? "",
-            index: action.action_order ?? 0,
+            index: index,
             created_by: action.created_by,
+            screenshotArtifactId: action.screenshot_artifact_id ?? undefined,
           };
         });
 

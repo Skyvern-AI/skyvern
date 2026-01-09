@@ -68,6 +68,9 @@ WORKFLOW_RUN_BLOCK_PREFIX = "wrb"
 WORKFLOW_RUN_PREFIX = "wr"
 WORKFLOW_SCRIPT_PREFIX = "ws"
 WORKFLOW_TEMPLATE_PREFIX = "wt"
+ORGANIZATION_BILLING_PREFIX = "ob"
+WORKFLOW_COPILOT_CHAT_PREFIX = "wcc"
+WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX = "wccm"
 
 
 def generate_workflow_id() -> str:
@@ -258,6 +261,21 @@ def generate_script_file_id() -> str:
 def generate_script_block_id() -> str:
     int_id = generate_id()
     return f"{SCRIPT_BLOCK_PREFIX}_{int_id}"
+
+
+def generate_billing_id() -> str:
+    int_id = generate_id()
+    return f"{ORGANIZATION_BILLING_PREFIX}_{int_id}"
+
+
+def generate_workflow_copilot_chat_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_COPILOT_CHAT_PREFIX}_{int_id}"
+
+
+def generate_workflow_copilot_chat_message_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX}_{int_id}"
 
 
 ############# Helper functions below ##############

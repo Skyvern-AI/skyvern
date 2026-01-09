@@ -70,6 +70,7 @@ import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
 } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
 import { cn } from "@/util/utils";
@@ -85,7 +86,11 @@ import { getWorkflowErrors, getElements } from "./workflowEditorUtils";
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
-import { WorkflowSettings } from "../types/workflowTypes";
+import {
+  WorkflowApiResponse,
+  WorkflowBlock,
+  WorkflowSettings,
+} from "../types/workflowTypes";
 import { ProxyLocation } from "@/api/types";
 import {
   nodeAdderNode,
@@ -94,8 +99,16 @@ import {
   generateNodeLabel,
   layout,
   startNode,
+  upgradeWorkflowBlocksV1toV2,
 } from "./workflowEditorUtils";
-import { constructCacheKeyValue } from "./utils";
+import { constructCacheKeyValue, getInitialParameters } from "./utils";
+import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
+import { WorkflowCopilotButton } from "./WorkflowCopilotButton";
+import { parse as parseYAML } from "yaml";
+import {
+  BlockYAML,
+  WorkflowCreateYAMLRequest,
+} from "../types/workflowYamlTypes";
 import "./workspace-styles.css";
 
 const Constants = {
@@ -226,7 +239,6 @@ function Workspace({
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
   const { getNodes, getEdges } = useReactFlow();
   const saveWorkflow = useWorkflowSave({ status: "published" });
-
   const { data: workflowRun } = useWorkflowRunQuery();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
 
@@ -235,6 +247,9 @@ function Workspace({
   const [toDeleteCacheKeyValue, setToDeleteCacheKeyValue] = useState<
     string | null
   >(null);
+  const [isCopilotOpen, setIsCopilotOpen] = useState(false);
+  const [copilotMessageCount, setCopilotMessageCount] = useState(0);
+  const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [
     openConfirmCacheKeyValueDeleteDialogue,
     setOpenConfirmCacheKeyValueDeleteDialogue,
@@ -1485,6 +1500,11 @@ function Workspace({
                       />
                     </div>
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                      <WorkflowCopilotButton
+                        ref={copilotButtonRef}
+                        messageCount={copilotMessageCount}
+                        onClick={() => setIsCopilotOpen((prev) => !prev)}
+                      />
                       <div className="flex items-center gap-2">
                         <GlobeIcon /> Live Browser
                       </div>
@@ -1514,9 +1534,18 @@ function Workspace({
                 {activeDebugSession &&
                   !activeDebugSession.vnc_streaming_supported && (
                     <div className="skyvern-screenshot-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                      <div className="aspect-video w-full">
-                        <WorkflowRunStream alwaysShowStream={true} />
+                      <div className="flex w-full flex-1 items-center justify-center">
+                        <div className="aspect-video w-full">
+                          <WorkflowRunStream alwaysShowStream={true} />
+                        </div>
                       </div>
+                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                        <WorkflowCopilotButton
+                          ref={copilotButtonRef}
+                          messageCount={copilotMessageCount}
+                          onClick={() => setIsCopilotOpen((prev) => !prev)}
+                        />
+                      </footer>
                     </div>
                   )}
 
@@ -1626,6 +1655,89 @@ function Workspace({
           </Splitter>
         </div>
       )}
+
+      <WorkflowCopilotChat
+        isOpen={isCopilotOpen}
+        onClose={() => setIsCopilotOpen(false)}
+        onMessageCountChange={setCopilotMessageCount}
+        buttonRef={copilotButtonRef}
+        onWorkflowUpdate={(workflowYaml) => {
+          try {
+            const parsedYaml = parseYAML(
+              workflowYaml,
+            ) as WorkflowCreateYAMLRequest;
+
+            const settings: WorkflowSettings = {
+              proxyLocation:
+                parsedYaml.proxy_location || ProxyLocation.Residential,
+              webhookCallbackUrl: parsedYaml.webhook_callback_url || "",
+              persistBrowserSession:
+                parsedYaml.persist_browser_session ?? false,
+              model: parsedYaml.model ?? null,
+              maxScreenshotScrolls: parsedYaml.max_screenshot_scrolls || 3,
+              extraHttpHeaders: parsedYaml.extra_http_headers
+                ? JSON.stringify(parsedYaml.extra_http_headers)
+                : null,
+              runWith: parsedYaml.run_with ?? null,
+              scriptCacheKey: parsedYaml.cache_key ?? null,
+              aiFallback: parsedYaml.ai_fallback ?? true,
+              runSequentially: parsedYaml.run_sequentially ?? false,
+              sequentialKey: parsedYaml.sequential_key ?? null,
+            };
+
+            // Convert YAML blocks to internal format
+            // YAML has parameter_keys (array of strings), internal format has parameters (array of objects)
+            let blocks = (parsedYaml.workflow_definition?.blocks || []).map(
+              (block: BlockYAML) => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const convertedBlock = { ...block } as any;
+
+                // Convert parameter_keys to parameters format
+                if ("parameter_keys" in block) {
+                  convertedBlock.parameters = (block.parameter_keys || []).map(
+                    (key: string) => ({
+                      key,
+                      parameter_type: "workflow",
+                    }),
+                  );
+                }
+
+                return convertedBlock;
+              },
+            ) as WorkflowBlock[];
+
+            // Auto-upgrade v1 workflows to v2 by assigning sequential next_block_label values
+            const workflowVersion =
+              parsedYaml.workflow_definition?.version ?? 1;
+            if (workflowVersion < 2) {
+              blocks = upgradeWorkflowBlocksV1toV2(blocks);
+            }
+
+            const elements = getElements(blocks, settings, true);
+
+            setNodes(elements.nodes);
+            setEdges(elements.edges);
+
+            const initialParameters = getInitialParameters({
+              workflow_definition: {
+                parameters: parsedYaml.workflow_definition?.parameters || [],
+              },
+            } as WorkflowApiResponse);
+            useWorkflowParametersStore
+              .getState()
+              .setParameters(initialParameters);
+
+            workflowChangesStore.setHasChanges(true);
+          } catch (error) {
+            console.error("Failed to parse and apply workflow YAML:", error);
+            toast({
+              title: "Update failed",
+              description: "Failed to parse workflow YAML. Please try again.",
+              variant: "destructive",
+            });
+          }
+        }}
+      />
     </div>
   );
 }

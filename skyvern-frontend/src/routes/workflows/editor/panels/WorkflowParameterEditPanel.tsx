@@ -73,7 +73,12 @@ function WorkflowParameterEditPanel({
   onSave,
   initialValues,
 }: Props) {
-  const reservedKeys = ["current_item", "current_value", "current_index"];
+  const reservedKeys = [
+    "current_item",
+    "current_value",
+    "current_index",
+    "workflow_run_outputs",
+  ];
   const isCloud = useContext(CloudContext);
   const isEditMode = !!initialValues;
   const [key, setKey] = useState(initialValues?.key ?? "");

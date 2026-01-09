@@ -9,18 +9,37 @@ import { statusIsNotFinalized } from "../types";
 import { apiPathPrefix } from "@/util/env";
 
 type Props = {
+  artifactId?: string;
   stepId: string;
   index: number;
   taskStatus?: Status; // to give a hint that screenshot may not be available if task is not finalized
 };
 
-function ActionScreenshot({ stepId, index, taskStatus }: Props) {
+function ActionScreenshot({ artifactId, stepId, index, taskStatus }: Props) {
   const credentialGetter = useCredentialGetter();
 
   const {
+    data: artifactById,
+    isLoading: isLoadingArtifactById,
+    isFetching: isFetchingArtifactById,
+  } = useQuery<ArtifactApiResponse>({
+    queryKey: ["artifact", artifactId],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return client
+        .get(`/artifacts/${artifactId}`)
+        .then((response) => response.data);
+    },
+    enabled: Boolean(artifactId),
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: 1,
+  });
+
+  const {
     data: artifacts,
-    isLoading,
-    isFetching,
+    isLoading: isLoadingStepArtifacts,
+    isFetching: isFetchingStepArtifacts,
   } = useQuery<Array<ArtifactApiResponse>>({
     queryKey: ["step", stepId, "artifacts"],
     queryFn: async () => {
@@ -39,14 +58,19 @@ function ActionScreenshot({ stepId, index, taskStatus }: Props) {
       }
       return false;
     },
+    enabled: !artifactId, // fallback path only when explicit artifact id is absent
   });
 
   const actionScreenshots = artifacts?.filter(
     (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
   );
 
-  // action screenshots are reverse ordered w.r.t action order
-  const screenshot = actionScreenshots?.[actionScreenshots.length - index - 1];
+  const screenshotFromStep =
+    actionScreenshots?.[actionScreenshots.length - index - 1];
+  const screenshot = artifactById ?? screenshotFromStep;
+
+  const isLoading = isLoadingArtifactById || isLoadingStepArtifacts;
+  const isFetching = isFetchingArtifactById || isFetchingStepArtifacts;
 
   if (isLoading) {
     return (

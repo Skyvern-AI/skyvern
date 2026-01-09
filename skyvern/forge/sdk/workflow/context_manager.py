@@ -174,6 +174,7 @@ class WorkflowRunContext:
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
+        self.workflow_run_outputs: dict[str, Any] = {}
         self._aws_client = aws_client
         self.organization_id: str | None = None
         self.include_secrets_in_templates: bool = False
@@ -895,6 +896,7 @@ class WorkflowRunContext:
                 LOG.warning(f"Parameter {block_label} already has a value in workflow run context, overwriting")
 
         self.values[block_label] = block_reference_value
+        self.workflow_run_outputs[block_label] = block_reference_value
 
     async def set_parameter_values_for_output_parameter_dependent_blocks(
         self,

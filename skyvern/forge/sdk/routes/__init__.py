@@ -9,6 +9,7 @@ from skyvern.forge.sdk.routes import run_blocks  # noqa: F401
 from skyvern.forge.sdk.routes import scripts  # noqa: F401
 from skyvern.forge.sdk.routes import sdk  # noqa: F401
 from skyvern.forge.sdk.routes import webhooks  # noqa: F401
+from skyvern.forge.sdk.routes import workflow_copilot  # noqa: F401
 from skyvern.forge.sdk.routes.streaming import messages  # noqa: F401
 from skyvern.forge.sdk.routes.streaming import screenshot  # noqa: F401
 from skyvern.forge.sdk.routes.streaming import vnc  # noqa: F401

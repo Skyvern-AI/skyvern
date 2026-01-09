@@ -52,6 +52,7 @@ export const ProxyLocation = {
   ResidentialMX: "RESIDENTIAL_MX",
   ResidentialIT: "RESIDENTIAL_IT",
   ResidentialNL: "RESIDENTIAL_NL",
+  ResidentialPH: "RESIDENTIAL_PH",
   ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;
@@ -327,6 +328,7 @@ export type ActionApiResponse = {
   option: Option | null;
   file_url: string | null;
   created_by: string | null;
+  screenshot_artifact_id?: string | null;
 };
 
 export type Action = {
@@ -338,6 +340,7 @@ export type Action = {
   stepId: string;
   index: number;
   created_by: string | null;
+  screenshotArtifactId?: string | null;
 };
 
 export type EvalKind = "workflow" | "task";
@@ -463,6 +466,7 @@ export type ActionsApiResponse = {
   response: string | null;
   created_by: string | null;
   text: string | null;
+  screenshot_artifact_id?: string | null;
 };
 
 export type TaskV2 = {

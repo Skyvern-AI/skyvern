@@ -113,6 +113,7 @@ class Action(BaseModel):
     element_id: Annotated[str, Field(coerce_numbers_to_str=True)] | None = None
     skyvern_element_hash: str | None = None
     skyvern_element_data: dict[str, Any] | None = None
+    screenshot_artifact_id: str | None = None
     tool_call_id: str | None = None
     xpath: str | None = None
 

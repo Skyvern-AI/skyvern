@@ -1231,8 +1231,8 @@ class ForgeAgent:
                         action_order=action_idx,
                     )
                     detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
-                    await app.DATABASE.create_action(action=action)
-                    await self.record_artifacts_after_action(task, step, browser_state, engine)
+                    action.action_id = (await app.DATABASE.create_action(action=action)).action_id
+                    await self.record_artifacts_after_action(task, step, browser_state, engine, action)
                     break
 
                 action = action_node.action
@@ -1319,7 +1319,7 @@ class ForgeAgent:
                         )
 
                 await asyncio.sleep(wait_time)
-                await self.record_artifacts_after_action(task, step, browser_state, engine)
+                await self.record_artifacts_after_action(task, step, browser_state, engine, action)
                 for result in results:
                     result.step_retry_number = step.retry_index
                     result.step_order = step.order
@@ -2192,6 +2192,7 @@ class ForgeAgent:
         step: Step,
         browser_state: BrowserState,
         engine: RunEngine,
+        action: Action,
     ) -> None:
         working_page = await browser_state.get_working_page()
         if not working_page:
@@ -2213,6 +2214,7 @@ class ForgeAgent:
             scrolling_number = 0
 
         artifacts: list[BulkArtifactCreationRequest | None] = []
+        screenshot_artifact_id: str | None = None
         try:
             # get current x, y position of the page
             x: int | None = None
@@ -2230,13 +2232,17 @@ class ForgeAgent:
             if skyvern_frame and x is not None and y is not None:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
                 LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
-                artifacts.append(
-                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                        data=screenshot,
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                        step=step,
-                    )
+                screenshot_request = await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=screenshot,
+                    artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                    step=step,
                 )
+                if screenshot_request:
+                    artifacts.append(screenshot_request)
+                    for artifact_data in screenshot_request.artifacts:
+                        if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
+                            screenshot_artifact_id = artifact_data.artifact_model.artifact_id
+                            break
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -2261,6 +2267,23 @@ class ForgeAgent:
                 await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
             except Exception:
                 LOG.warning("Failed to bulk create artifacts after action", exc_info=True)
+            else:
+                if screenshot_artifact_id and action.action_id and action.organization_id:
+                    try:
+                        # TODO: consider batching screenshot artifact updates to reduce per-action DB writes.
+                        await app.DATABASE.update_action_screenshot_artifact_id(
+                            organization_id=action.organization_id,
+                            action_id=action.action_id,
+                            screenshot_artifact_id=screenshot_artifact_id,
+                        )
+                        action.screenshot_artifact_id = screenshot_artifact_id
+                    except Exception:
+                        LOG.warning(
+                            "Failed to update action with screenshot artifact id",
+                            action_id=action.action_id,
+                            screenshot_artifact_id=screenshot_artifact_id,
+                            exc_info=True,
+                        )
 
         try:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
@@ -3383,11 +3406,13 @@ class ForgeAgent:
         last_step: Step | None = None,
         failure_reason: str | None = None,
         need_browser_log: bool = False,
+        step_count: int | None = None,
     ) -> TaskResponse:
         # no last step means the task didn't start, so we don't have any other artifacts
         if last_step is None:
             return task.to_task_response(
                 failure_reason=failure_reason,
+                step_count=step_count,
             )
 
         screenshot_url = None
@@ -3489,6 +3514,7 @@ class ForgeAgent:
             browser_console_log_url=browser_console_log_url,
             downloaded_files=downloaded_files,
             failure_reason=failure_reason,
+            step_count=step_count,
         )
 
     async def cleanup_browser_and_create_artifacts(
@@ -3757,7 +3783,7 @@ class ForgeAgent:
                 persisted_action.action_order = len(step.output.actions_and_results)
 
             action_results = await ActionHandler.handle_action(scraped_page, task, step, working_page, persisted_action)
-            await self.record_artifacts_after_action(task, step, browser_state, engine)
+            await self.record_artifacts_after_action(task, step, browser_state, engine, persisted_action)
             step.output.action_results.extend(action_results)
             step.output.actions_and_results.append((persisted_action, action_results))
             if isinstance(persisted_action, DecisiveAction) and persisted_action.errors:

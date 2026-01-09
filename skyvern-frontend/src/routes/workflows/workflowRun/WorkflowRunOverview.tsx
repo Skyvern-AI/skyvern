@@ -122,6 +122,7 @@ function WorkflowRunOverview() {
         !showStreamingBrowser &&
         isAction(selection) && (
           <ActionScreenshot
+            artifactId={selection.screenshot_artifact_id ?? undefined}
             index={selection.action_order ?? 0}
             stepId={selection.step_id ?? ""}
           />

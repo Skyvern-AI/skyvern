@@ -21,6 +21,7 @@ from skyvern.forge.sdk.db.models import (
     StepModel,
     TaskModel,
     TaskV2Model,
+    WorkflowCopilotChatMessageModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunBlockModel,
@@ -39,6 +40,7 @@ from skyvern.forge.sdk.schemas.organizations import (
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -215,6 +217,17 @@ def convert_to_task_v2(task_v2_model: TaskV2Model, debug_enabled: bool = False) 
     #  Deserialize proxy_location FIRST (string → GeoTarget), otherwise model_validate will fail for city/state proxy selections
     task_v2_data["proxy_location"] = _deserialize_proxy_location(task_v2_model.proxy_location)
     return TaskV2.model_validate(task_v2_data)
+
+
+def convert_to_workflow_copilot_chat_message(
+    message_model: WorkflowCopilotChatMessageModel, debug_enabled: bool = False
+) -> WorkflowCopilotChatMessageSchema:
+    if debug_enabled:
+        LOG.debug(
+            "Converting WorkflowCopilotChatMessage to WorkflowCopilotChatMessageSchema",
+            workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+        )
+    return WorkflowCopilotChatMessageSchema.model_validate(message_model)
 
 
 def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
@@ -696,6 +709,7 @@ def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) ->
         "element_id": element_id,
         "skyvern_element_hash": action_model.skyvern_element_hash,
         "skyvern_element_data": action_model.skyvern_element_data,
+        "screenshot_artifact_id": action_model.screenshot_artifact_id,
         "created_at": action_model.created_at,
         "modified_at": action_model.modified_at,
     }

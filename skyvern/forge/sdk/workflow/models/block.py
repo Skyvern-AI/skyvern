@@ -22,6 +22,7 @@ import filetype
 import pandas as pd
 import pyotp
 import structlog
+from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
@@ -316,6 +317,8 @@ class Block(BaseModel, abc.ABC):
             template_data["workflow_permanent_id"] = workflow_run_context.workflow_permanent_id
         if "workflow_run_id" not in template_data:
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
+
+        template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
 
         if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
             if missing_variables := get_missing_variables(potential_template, template_data):
@@ -3037,10 +3040,36 @@ class FileParserBlock(Block):
         else:
             return FileType.CSV  # Default to CSV for .csv and any other extensions
 
+    def _detect_file_encoding(self, file_path: str) -> str:
+        """Detect the encoding of a file using charset-normalizer with fallbacks.
+
+        Reads a sample of the file (first 64KB) to detect encoding efficiently.
+        Falls back through common encodings if detection fails.
+        """
+        sample_size = 65536  # 64KB sample for detection
+        with open(file_path, "rb") as f:
+            raw_data = f.read(sample_size)
+
+        result = from_bytes(raw_data)
+        best_match = result.best()
+        if best_match and best_match.encoding:
+            return best_match.encoding
+
+        for encoding in ["utf-8", "cp1252", "latin-1"]:
+            try:
+                raw_data.decode(encoding)
+                return encoding
+            except UnicodeDecodeError:
+                continue
+
+        # latin-1 always succeeds (1:1 byte mapping), so this is a safety fallback
+        return "latin-1"
+
     def validate_file_type(self, file_url_used: str, file_path: str) -> None:
         if self.file_type == FileType.CSV:
             try:
-                with open(file_path) as file:
+                encoding = self._detect_file_encoding(file_path)
+                with open(file_path, encoding=encoding, errors="replace") as file:
                     csv.Sniffer().sniff(file.read(1024))
             except csv.Error as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
@@ -3061,7 +3090,8 @@ class FileParserBlock(Block):
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
         """Parse CSV/TSV file and return list of dictionaries."""
         parsed_data = []
-        with open(file_path) as file:
+        encoding = self._detect_file_encoding(file_path)
+        with open(file_path, encoding=encoding, errors="replace") as file:
             # Try to detect the delimiter (comma for CSV, tab for TSV)
             sample = file.read(1024)
             file.seek(0)  # Reset file pointer

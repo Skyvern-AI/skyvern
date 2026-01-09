@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import typing
 
 import structlog
@@ -69,6 +70,7 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
     if not settings.LOG_RAW_API_REQUESTS:
         return await call_next(request)
 
+    start_time = time.monotonic()
     body_bytes = await request.body()
     # ensure downstream handlers can access body again
     try:
@@ -102,6 +104,7 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
             body=body_text,
             headers=sanitized_headers,
             error_body=error_body,
+            duration_seconds=time.monotonic() - start_time,
         )
         return response
     except Exception:
@@ -112,5 +115,6 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
             body=body_text,
             headers=sanitized_headers,
             exc_info=True,
+            duration_seconds=time.monotonic() - start_time,
         )
         raise

@@ -47,6 +47,8 @@ from skyvern.forge.sdk.db.models import (
     TaskV2Model,
     ThoughtModel,
     TOTPCodeModel,
+    WorkflowCopilotChatMessageModel,
+    WorkflowCopilotChatModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunBlockModel,
@@ -72,6 +74,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_task,
     convert_to_task_v2,
     convert_to_workflow,
+    convert_to_workflow_copilot_chat_message,
     convert_to_workflow_parameter,
     convert_to_workflow_run,
     convert_to_workflow_run_block,
@@ -94,12 +97,21 @@ from skyvern.forge.sdk.schemas.organizations import (
     Organization,
     OrganizationAuthToken,
 )
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    Extensions,
+    PersistentBrowserSession,
+    PersistentBrowserType,
+)
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChat,
+    WorkflowCopilotChatMessage,
+    WorkflowCopilotChatSender,
+)
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -501,6 +513,22 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_task_step_count(self, task_id: str, organization_id: str | None = None) -> int:
+        try:
+            async with self.Session() as session:
+                result = await session.scalar(
+                    select(func.count(StepModel.step_id))
+                    .filter_by(task_id=task_id)
+                    .filter_by(organization_id=organization_id)
+                )
+                return result or 0
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_task_actions(self, task_id: str, organization_id: str | None = None) -> list[Action]:
         try:
             async with self.Session() as session:
@@ -553,6 +581,26 @@ class AgentDB(BaseAlchemyDB):
                 actions = (await session.scalars(query)).all()
                 return [hydrate_action(action, empty_element_id=True) for action in actions]
 
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_action_count_for_step(self, step_id: str, task_id: str, organization_id: str) -> int:
+        """Get count of actions for a step. Uses composite index for efficiency."""
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(func.count())
+                    .select_from(ActionModel)
+                    .where(ActionModel.organization_id == organization_id)
+                    .where(ActionModel.task_id == task_id)
+                    .where(ActionModel.step_id == step_id)
+                )
+                result = await session.scalar(query)
+                return result or 0
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -2631,8 +2679,8 @@ class AgentDB(BaseAlchemyDB):
                 if browser_session_id:
                     workflow_run.browser_session_id = browser_session_id
                 await session.commit()
-                await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
+                await session.refresh(workflow_run)
                 return convert_to_workflow_run(workflow_run)
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
@@ -3620,6 +3668,91 @@ class AgentDB(BaseAlchemyDB):
             await session.refresh(new_ai_suggestion)
             return AISuggestion.model_validate(new_ai_suggestion)
 
+    async def create_workflow_copilot_chat(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            new_chat = WorkflowCopilotChatModel(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            session.add(new_chat)
+            await session.commit()
+            await session.refresh(new_chat)
+            return WorkflowCopilotChat.model_validate(new_chat)
+
+    async def create_workflow_copilot_chat_message(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        sender: WorkflowCopilotChatSender,
+        content: str,
+        global_llm_context: str | None = None,
+    ) -> WorkflowCopilotChatMessage:
+        async with self.Session() as session:
+            new_message = WorkflowCopilotChatMessageModel(
+                workflow_copilot_chat_id=workflow_copilot_chat_id,
+                organization_id=organization_id,
+                sender=sender,
+                content=content,
+                global_llm_context=global_llm_context,
+            )
+            session.add(new_message)
+            await session.commit()
+            await session.refresh(new_message)
+            return convert_to_workflow_copilot_chat_message(new_message, self.debug_enabled)
+
+    async def get_workflow_copilot_chat_messages(
+        self,
+        workflow_copilot_chat_id: str,
+    ) -> list[WorkflowCopilotChatMessage]:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowCopilotChatMessageModel)
+                .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                .order_by(WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc())
+            )
+            messages = (await session.scalars(query)).all()
+            return [convert_to_workflow_copilot_chat_message(message, self.debug_enabled) for message in messages]
+
+    async def get_workflow_copilot_chat_by_id(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+    ) -> WorkflowCopilotChat | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowCopilotChatModel)
+                .filter(WorkflowCopilotChatModel.organization_id == organization_id)
+                .filter(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                .order_by(WorkflowCopilotChatModel.created_at.desc())
+                .limit(1)
+            )
+            chat = (await session.scalars(query)).first()
+            if not chat:
+                return None
+            return WorkflowCopilotChat.model_validate(chat)
+
+    async def get_latest_workflow_copilot_chat(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> WorkflowCopilotChat | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowCopilotChatModel)
+                .filter(WorkflowCopilotChatModel.organization_id == organization_id)
+                .filter(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+                .order_by(WorkflowCopilotChatModel.created_at.desc())
+                .limit(1)
+            )
+            chat = (await session.scalars(query)).first()
+            if not chat:
+                return None
+            return WorkflowCopilotChat.model_validate(chat)
+
     async def get_task_generation_by_prompt_hash(
         self,
         user_prompt_hash: str,
@@ -3758,6 +3891,7 @@ class AgentDB(BaseAlchemyDB):
                 element_id=action.element_id,
                 skyvern_element_hash=action.skyvern_element_hash,
                 skyvern_element_data=action.skyvern_element_data,
+                screenshot_artifact_id=action.screenshot_artifact_id,
                 action_json=action.model_dump(),
                 confidence_float=action.confidence_float,
                 created_by=action.created_by,
@@ -3766,6 +3900,17 @@ class AgentDB(BaseAlchemyDB):
             await session.commit()
             await session.refresh(new_action)
             return Action.model_validate(new_action)
+
+    async def update_action_screenshot_artifact_id(
+        self, *, organization_id: str, action_id: str, screenshot_artifact_id: str
+    ) -> None:
+        async with self.Session() as session:
+            await session.execute(
+                update(ActionModel)
+                .where(ActionModel.action_id == action_id, ActionModel.organization_id == organization_id)
+                .values(screenshot_artifact_id=screenshot_artifact_id)
+            )
+            await session.commit()
 
     async def update_action_reasoning(
         self,
@@ -4541,6 +4686,7 @@ class AgentDB(BaseAlchemyDB):
         timeout_minutes: int | None = None,
         proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
         extensions: list[Extensions] | None = None,
+        browser_type: PersistentBrowserType | None = None,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         extensions_str: list[str] | None = (
@@ -4555,6 +4701,7 @@ class AgentDB(BaseAlchemyDB):
                     timeout_minutes=timeout_minutes,
                     proxy_location=_serialize_proxy_location(proxy_location),
                     extensions=extensions_str,
+                    browser_type=browser_type.value if browser_type else None,
                 )
                 session.add(browser_session)
                 await session.commit()
