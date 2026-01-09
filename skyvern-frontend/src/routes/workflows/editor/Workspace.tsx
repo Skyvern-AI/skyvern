@@ -1729,7 +1729,8 @@ function Workspace({
 
             workflowChangesStore.setHasChanges(true);
           } catch (error) {
-            console.error("Failed to parse and apply workflow YAML:", error);
+            console.error("Failed to parse and apply workflow YAML", error);
+            console.log("YAML:", workflowYaml);
             toast({
               title: "Update failed",
               description: "Failed to parse workflow YAML. Please try again.",
