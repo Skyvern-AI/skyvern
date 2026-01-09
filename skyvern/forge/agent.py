@@ -2699,8 +2699,11 @@ class ForgeAgent:
             except Exception as e:
                 LOG.debug("Failed to extract model name from config, using default", error=str(e))
 
-            # Normalize model name to the canonical Vertex identifier (e.g., gemini-2.5-pro)
-            match = re.search(r"(gemini-\d+(?:\.\d+)?-(?:flash-lite|flash|pro))", model_name, re.IGNORECASE)
+            # Normalize model name to the canonical Vertex identifier (e.g., gemini-2.5-pro).
+            # Preserve preview suffixes so we don't strip required identifiers (e.g., gemini-3-flash-preview).
+            match = re.search(
+                r"(gemini-\d+(?:\.\d+)?-(?:flash-lite|flash|pro)(?:-preview)?)", model_name, re.IGNORECASE
+            )
             if match:
                 model_name = match.group(1).lower()
 
