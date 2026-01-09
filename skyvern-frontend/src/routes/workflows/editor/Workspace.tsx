@@ -1534,9 +1534,18 @@ function Workspace({
                 {activeDebugSession &&
                   !activeDebugSession.vnc_streaming_supported && (
                     <div className="skyvern-screenshot-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                      <div className="aspect-video w-full">
-                        <WorkflowRunStream alwaysShowStream={true} />
+                      <div className="flex w-full flex-1 items-center justify-center">
+                        <div className="aspect-video w-full">
+                          <WorkflowRunStream alwaysShowStream={true} />
+                        </div>
                       </div>
+                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                        <WorkflowCopilotButton
+                          ref={copilotButtonRef}
+                          messageCount={copilotMessageCount}
+                          onClick={() => setIsCopilotOpen((prev) => !prev)}
+                        />
+                      </footer>
                     </div>
                   )}
 

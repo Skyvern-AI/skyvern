@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import BinaryIO
 
 import structlog
+import zstandard as zstd
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
@@ -101,17 +102,28 @@ class S3Storage(BaseStorage):
         return f"{self._build_base_uri(organization_id)}/scripts/{script_id}/{script_version}/{file_path}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
+        # We compress HAR files with zstd level 3 to reduce storage size.
+        # HARs are easily compressible because they are mostly JSON.
+        # Other artifacts are not compressed because they are not easily compressible.
+        uri = artifact.uri
+        if artifact.artifact_type == ArtifactType.HAR:
+            cctx = zstd.ZstdCompressor(level=3)
+            data = cctx.compress(data)
+            file_ext = FILE_EXTENTSION_MAP[artifact.artifact_type]
+            uri = uri.replace(f".{file_ext}", f".{file_ext}.zst")
+            artifact.uri = uri
+
         sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket)
         tags = await self._get_tags_for_org(artifact.organization_id)
         LOG.debug(
             "Storing artifact",
             artifact_id=artifact.artifact_id,
             organization_id=artifact.organization_id,
-            uri=artifact.uri,
+            uri=uri,
             storage_class=sc,
             tags=tags,
         )
-        await self.async_client.upload_file(artifact.uri, data, storage_class=sc, tags=tags)
+        await self.async_client.upload_file(uri, data, storage_class=sc, tags=tags)
 
     async def _get_storage_class_for_org(self, organization_id: str, bucket: str) -> S3StorageClass:
         return S3StorageClass.STANDARD
@@ -120,7 +132,12 @@ class S3Storage(BaseStorage):
         return {}
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
-        return await self.async_client.download_file(artifact.uri)
+        data = await self.async_client.download_file(artifact.uri)
+        # Decompress zstd-compressed files
+        if data and artifact.uri.endswith(".zst"):
+            dctx = zstd.ZstdDecompressor()
+            data = dctx.decompress(data)
+        return data
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
         share_urls = await self.async_client.create_presigned_urls([artifact.uri])
