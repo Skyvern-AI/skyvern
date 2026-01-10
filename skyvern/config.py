@@ -374,6 +374,7 @@ class Settings(BaseSettings):
     BITWARDEN_SERVER_PORT: int = 8002
 
     SVG_MAX_LENGTH: int = 100000
+    SVG_MAX_PARSING_ELEMENT_CNT: int = 3000
 
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_CODE_BLOCK: bool = True
