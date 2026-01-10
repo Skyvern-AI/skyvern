@@ -504,7 +504,7 @@ class AgentFunction:
         task: Task | None = None,
         step: Step | None = None,
     ) -> CleanupElementTreeFunc:
-        MAX_ELEMENT_CNT = 3000
+        MAX_ELEMENT_CNT = settings.SVG_MAX_PARSING_ELEMENT_CNT
 
         @TraceManager.traced_async(ignore_input=True)
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
