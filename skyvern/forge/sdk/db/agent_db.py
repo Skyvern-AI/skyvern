@@ -5806,9 +5806,16 @@ class AgentDB(BaseAlchemyDB):
         try:
             async with self.Session() as session:
                 # Build the query: join workflow_scripts with scripts
+                # Join on both script_id and organization_id to leverage uc_org_script_version index
                 query = (
                     select(ScriptModel)
-                    .join(WorkflowScriptModel, ScriptModel.script_id == WorkflowScriptModel.script_id)
+                    .join(
+                        WorkflowScriptModel,
+                        and_(
+                            ScriptModel.organization_id == WorkflowScriptModel.organization_id,
+                            ScriptModel.script_id == WorkflowScriptModel.script_id,
+                        ),
+                    )
                     .where(
                         WorkflowScriptModel.organization_id == organization_id,
                         WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
