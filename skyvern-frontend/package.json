@@ -54,6 +54,7 @@
     "country-state-city": "^3.2.1",
     "cross-spawn": "^7.0.6",
     "embla-carousel-react": "^8.0.0",
+    "@microsoft/fetch-event-source": "^2.0.1",
     "express": "^4.21.2",
     "fetch-to-curl": "^0.6.0",
     "nanoid": "^5.0.7",
