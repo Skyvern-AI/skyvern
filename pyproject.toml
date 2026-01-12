@@ -69,6 +69,7 @@ dependencies = [
     "python-calamine>=0.6.1",
     "urllib3>=2.6.0",
     "zstandard>=0.25.0",
+    "sse-starlette>=3.0.3,<4",
 ]
 
 [dependency-groups]
