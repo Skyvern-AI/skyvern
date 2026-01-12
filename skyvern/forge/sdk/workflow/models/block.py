@@ -107,6 +107,28 @@ else:
     jinja_sandbox_env = SandboxedEnvironment()
 
 
+# Sentinel marker for native JSON type injection via | json filter.
+_JSON_TYPE_MARKER = "__SKYVERN_RAW_JSON__"
+
+
+def _json_type_filter(value: Any) -> str:
+    """Jinja filter that marks a value for native JSON type injection.
+
+    Usage in templates: {{ some_bool | json }}
+
+    The filter serializes the value to JSON and wraps it with sentinel markers.
+    When _render_templates_in_json() detects these markers, it unwraps and
+    parses the JSON to get the native typed value (bool, int, list, etc.).
+
+    Args:
+        value: Any JSON-serializable value (bool, int, float, str, list, dict, None).
+    """
+    return f"{_JSON_TYPE_MARKER}{json.dumps(value)}{_JSON_TYPE_MARKER}"
+
+
+jinja_sandbox_env.filters["json"] = _json_type_filter
+
+
 # Mapping from TaskV2Status to the corresponding BlockStatus. Declared once at
 # import time so it is not recreated on each block execution.
 TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
@@ -4032,11 +4054,30 @@ class HttpRequestBlock(Block):
 
             This is required because HTTP request bodies are often deeply nested
             dict/list structures, and templates may appear at any depth.
+
+            Supports {{ expr | json }} filter for type-preserving JSON injection.
             """
             if isinstance(value, str):
-                return self.format_block_parameter_template_from_workflow_run_context(
+                rendered = self.format_block_parameter_template_from_workflow_run_context(
                     value, workflow_run_context, **template_kwargs
                 )
+
+                if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
+                    json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
+                    try:
+                        return json.loads(json_str)
+                    except json.JSONDecodeError:
+                        raise FailedToFormatJinjaStyleParameter(
+                            value, f"Raw JSON filter produced invalid JSON: {json_str}"
+                        )
+                elif _JSON_TYPE_MARKER in rendered:
+                    raise FailedToFormatJinjaStyleParameter(
+                        value,
+                        "The '| json' filter can only be used for complete value replacement. "
+                        "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
+                        "Remove the surrounding text or remove the '| json' filter.",
+                    )
+                return rendered
             if isinstance(value, list):
                 return [_render_templates_in_json(item) for item in value]
             if isinstance(value, dict):

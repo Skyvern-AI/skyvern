@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -5244,7 +5244,7 @@ requires-dist = [
     { name = "types-toml", specifier = ">=0.10.8.7,<0.11" },
     { name = "urllib3", specifier = ">=2.6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.24.0.post1,<0.25" },
-    { name = "websockets", specifier = "~=12.0" },
+    { name = "websockets", specifier = ">=12.0,<15.1" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
 
