@@ -8,6 +8,7 @@ import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { toast } from "@/components/ui/use-toast";
+import { getSseClient } from "@/api/sse";
 
 interface ChatMessage {
   id: string;
@@ -309,35 +310,42 @@ export function WorkflowCopilotChat({
         workflowYaml = convertToYAML(requestBody);
       }
 
-      const client = await getClient(credentialGetter, "sans-api-v1");
-
+      const client = await getSseClient(credentialGetter);
       const response = await client.post<{
-        workflow_copilot_chat_id: string;
-        message: string;
-        updated_workflow_yaml: string | null;
-        request_time: string;
-        response_time: string;
-      }>(
-        "/workflow/copilot/chat-post",
-        {
-          workflow_permanent_id: workflowPermanentId,
-          workflow_copilot_chat_id: workflowCopilotChatId,
-          workflow_run_id: workflowRunId,
-          message: messageContent,
-          workflow_yaml: workflowYaml,
-        },
-        {
-          timeout: 300000,
-        },
-      );
+        workflow_copilot_chat_id?: string;
+        message?: string;
+        updated_workflow_yaml?: string | null;
+        request_time?: string;
+        response_time?: string;
+        error?: string;
+      }>("/workflow/copilot/chat-post", {
+        workflow_permanent_id: workflowPermanentId,
+        workflow_copilot_chat_id: workflowCopilotChatId,
+        workflow_run_id: workflowRunId,
+        message: messageContent,
+        workflow_yaml: workflowYaml,
+      });
 
-      setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
+      if (response.error) {
+        throw new Error(response.error);
+      }
+
+      if (
+        !response.workflow_copilot_chat_id ||
+        !response.message ||
+        !response.request_time ||
+        !response.response_time
+      ) {
+        throw new Error("No response received.");
+      }
+
+      setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
 
       const aiMessage: ChatMessage = {
         id: Date.now().toString(),
         sender: "ai",
-        content: response.data.message || "I received your message.",
-        timestamp: response.data.response_time,
+        content: response.message || "I received your message.",
+        timestamp: response.response_time,
       };
 
       setMessages((prev) => [
@@ -345,16 +353,16 @@ export function WorkflowCopilotChat({
           message.id === userMessageId
             ? {
                 ...message,
-                timestamp: response.data.request_time,
+                timestamp: response.request_time,
               }
             : message,
         ),
         aiMessage,
       ]);
 
-      if (response.data.updated_workflow_yaml && onWorkflowUpdate) {
+      if (response.updated_workflow_yaml && onWorkflowUpdate) {
         try {
-          onWorkflowUpdate(response.data.updated_workflow_yaml);
+          onWorkflowUpdate(response.updated_workflow_yaml);
         } catch (updateError) {
           console.error("Failed to update workflow:", updateError);
           toast({
