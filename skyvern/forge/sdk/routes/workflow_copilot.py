@@ -12,6 +12,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.routes.run_blocks import DEFAULT_LOGIN_PROMPT
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -115,8 +116,12 @@ async def copilot_call_llm(
         llm_prompt_len=len(llm_prompt),
         llm_prompt=llm_prompt,
     )
+    llm_api_handler = (
+        await get_llm_handler_for_prompt_type("workflow-copilot", chat_request.workflow_permanent_id, organization_id)
+        or app.LLM_API_HANDLER
+    )
     llm_start_time = time.monotonic()
-    llm_response = await app.LLM_API_HANDLER(
+    llm_response = await llm_api_handler(
         prompt=llm_prompt,
         prompt_name="workflow-copilot",
         organization_id=organization_id,
