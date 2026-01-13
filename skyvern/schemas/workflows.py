@@ -539,6 +539,8 @@ class HttpRequestBlockYAML(BlockYAML):
     files: dict[str, str] | None = None  # Dictionary mapping field names to file paths/URLs for multipart file uploads
     timeout: int = 30
     follow_redirects: bool = True
+    download_filename: str | None = None
+    save_response_as_file: bool = False
 
     # Parameter keys for templating
     parameter_keys: list[str] | None = None

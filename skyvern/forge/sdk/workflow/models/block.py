@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
 from urllib.parse import quote, urlparse
 
+import aiohttp
 import filetype
 import pandas as pd
 import pyotp
@@ -38,6 +39,7 @@ from skyvern.constants import (
 from skyvern.exceptions import (
     AzureConfigurationError,
     ContextParameterValueNotFound,
+    DownloadFileMaxSizeExceeded,
     MissingBrowserState,
     MissingBrowserStatePage,
     PDFParsingError,
@@ -54,6 +56,7 @@ from skyvern.forge.sdk.api.files import (
     create_named_temporary_file,
     download_file,
     download_from_s3,
+    get_download_dir,
     get_path_for_workflow_download_directory,
     parse_uri_to_path,
 )
@@ -4003,6 +4006,8 @@ class HttpRequestBlock(Block):
     files: dict[str, str] | None = None  # Dictionary mapping field names to file paths for multipart file uploads
     timeout: int = 30
     follow_redirects: bool = True
+    download_filename: str | None = None
+    save_response_as_file: bool = False
 
     # Parameters for templating
     parameters: list[PARAMETER_TYPE] = []
@@ -4101,6 +4106,11 @@ class HttpRequestBlock(Block):
         if self.headers:
             self.headers = cast(dict[str, str], _render_templates_in_json(self.headers))
 
+        if self.download_filename:
+            self.download_filename = self.format_block_parameter_template_from_workflow_run_context(
+                self.download_filename, workflow_run_context, **template_kwargs
+            )
+
     def validate_url(self, url: str) -> bool:
         """Validate if the URL is properly formatted"""
         try:
@@ -4108,6 +4118,92 @@ class HttpRequestBlock(Block):
             return all([result.scheme, result.netloc])
         except Exception:
             return False
+
+    async def _execute_file_download(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> BlockResult:
+        if not self.url:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="URL is required for file download",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        try:
+            max_size_mb = settings.MAX_HTTP_DOWNLOAD_FILE_SIZE // (1024 * 1024)
+            output_dir = get_download_dir(workflow_run_id)
+            file_path = await download_file(
+                self.url,
+                max_size_mb=max_size_mb,
+                headers=self.headers,
+                output_dir=output_dir,
+                filename=self.download_filename,
+            )
+
+            response_data = {
+                "file_path": file_path,
+                "file_name": os.path.basename(file_path),
+                "file_size": os.path.getsize(file_path),
+            }
+
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response_data)
+
+            return await self.build_block_result(
+                success=True,
+                failure_reason=None,
+                output_parameter_value=response_data,
+                status=BlockStatus.completed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        except aiohttp.ClientResponseError as e:
+            error_data = {"error": f"HTTP {e.status}", "error_type": "http_error"}
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"HTTP {e.status}",
+                output_parameter_value=error_data,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except DownloadFileMaxSizeExceeded as e:
+            max_size_str = f"{e.max_size:.1f}"
+            error_data = {"error": f"File exceeds maximum size of {max_size_str}MB", "error_type": "file_too_large"}
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"File exceeds maximum size of {max_size_str}MB",
+                output_parameter_value=error_data,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except Exception as e:
+            error_data = {"error": str(e), "error_type": "unknown"}
+            LOG.warning(
+                "File download failed",
+                error=str(e),
+                url=self.url,
+                workflow_run_id=workflow_run_id,
+            )
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"File download failed: {str(e)}",
+                output_parameter_value=error_data,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
     async def execute(
         self,
@@ -4280,7 +4376,14 @@ class HttpRequestBlock(Block):
             # Update self.files with local file paths
             self.files = downloaded_files
 
-        # Execute HTTP request using the generic aiohttp_request function
+        if self.save_response_as_file:
+            return await self._execute_file_download(
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
         try:
             LOG.info(
                 "Executing HTTP request",
@@ -4292,7 +4395,6 @@ class HttpRequestBlock(Block):
                 files=self.files,
             )
 
-            # Use the generic aiohttp_request function
             status_code, response_headers, response_body = await aiohttp_request(
                 method=self.method,
                 url=self.url,
@@ -4304,22 +4406,18 @@ class HttpRequestBlock(Block):
             )
 
             response_data = {
-                # Response information
                 "status_code": status_code,
                 "response_headers": response_headers,
                 "response_body": response_body,
-                # Request information (what was sent)
                 "request_method": self.method,
                 "request_url": self.url,
                 "request_headers": self.headers,
                 "request_body": self.body,
-                # Backwards compatibility
                 "headers": response_headers,
                 "body": response_body,
                 "url": self.url,
             }
 
-            # Mask secrets in output to prevent credential exposure in DB/UI
             response_data = workflow_run_context.mask_secrets_in_data(response_data)
 
             LOG.info(
@@ -4331,14 +4429,14 @@ class HttpRequestBlock(Block):
                 response_data=response_data,
             )
 
-            # Determine success based on status code
             success = 200 <= status_code < 300
+            failure_reason = None if success else f"HTTP {status_code}: {response_data.get('response_body', '')}"
 
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response_data)
 
             return await self.build_block_result(
                 success=success,
-                failure_reason=None if success else f"HTTP {status_code}: {response_body}",
+                failure_reason=failure_reason,
                 output_parameter_value=response_data,
                 status=BlockStatus.completed if success else BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -4358,7 +4456,7 @@ class HttpRequestBlock(Block):
             )
         except Exception as e:
             error_data = {"error": str(e), "error_type": "unknown"}
-            LOG.warning(  # Changed from LOG.exception to LOG.warning as requested
+            LOG.warning(
                 "HTTP request failed with unexpected error",
                 error=str(e),
                 url=self.url,

@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+    MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
