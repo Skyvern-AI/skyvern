@@ -22,6 +22,7 @@ from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     AWSSecretParameterModel,
     AzureVaultCredentialParameterModel,
+    Base,
     BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
@@ -62,8 +63,6 @@ from skyvern.forge.sdk.db.utils import (
     _custom_json_serializer,
     convert_to_artifact,
     convert_to_aws_secret_parameter,
-    convert_to_bitwarden_login_credential_parameter,
-    convert_to_bitwarden_sensitive_information_parameter,
     convert_to_organization,
     convert_to_organization_auth_token,
     convert_to_output_parameter,
@@ -114,11 +113,13 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
+    PARAMETER_TYPE,
     AWSSecretParameter,
     AzureVaultCredentialParameter,
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
+    ContextParameter,
     CredentialParameter,
     OnePasswordCredentialParameter,
     OutputParameter,
@@ -3155,91 +3156,6 @@ class AgentDB(BaseAlchemyDB):
             await session.refresh(aws_secret_parameter)
             return convert_to_aws_secret_parameter(aws_secret_parameter)
 
-    async def create_bitwarden_login_credential_parameter(
-        self,
-        workflow_id: str,
-        bitwarden_client_id_aws_secret_key: str,
-        bitwarden_client_secret_aws_secret_key: str,
-        bitwarden_master_password_aws_secret_key: str,
-        key: str,
-        url_parameter_key: str | None = None,
-        description: str | None = None,
-        bitwarden_collection_id: str | None = None,
-        bitwarden_item_id: str | None = None,
-    ) -> BitwardenLoginCredentialParameter:
-        async with self.Session() as session:
-            bitwarden_login_credential_parameter = BitwardenLoginCredentialParameterModel(
-                workflow_id=workflow_id,
-                bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
-                bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
-                bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-                url_parameter_key=url_parameter_key,
-                key=key,
-                description=description,
-                bitwarden_collection_id=bitwarden_collection_id,
-                bitwarden_item_id=bitwarden_item_id,
-            )
-            session.add(bitwarden_login_credential_parameter)
-            await session.commit()
-            await session.refresh(bitwarden_login_credential_parameter)
-            return convert_to_bitwarden_login_credential_parameter(bitwarden_login_credential_parameter)
-
-    async def create_bitwarden_sensitive_information_parameter(
-        self,
-        workflow_id: str,
-        bitwarden_client_id_aws_secret_key: str,
-        bitwarden_client_secret_aws_secret_key: str,
-        bitwarden_master_password_aws_secret_key: str,
-        bitwarden_collection_id: str,
-        bitwarden_identity_key: str,
-        bitwarden_identity_fields: list[str],
-        key: str,
-        description: str | None = None,
-    ) -> BitwardenSensitiveInformationParameter:
-        async with self.Session() as session:
-            bitwarden_sensitive_information_parameter = BitwardenSensitiveInformationParameterModel(
-                workflow_id=workflow_id,
-                bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
-                bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
-                bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-                bitwarden_collection_id=bitwarden_collection_id,
-                bitwarden_identity_key=bitwarden_identity_key,
-                bitwarden_identity_fields=bitwarden_identity_fields,
-                key=key,
-                description=description,
-            )
-            session.add(bitwarden_sensitive_information_parameter)
-            await session.commit()
-            await session.refresh(bitwarden_sensitive_information_parameter)
-            return convert_to_bitwarden_sensitive_information_parameter(bitwarden_sensitive_information_parameter)
-
-    async def create_bitwarden_credit_card_data_parameter(
-        self,
-        workflow_id: str,
-        bitwarden_client_id_aws_secret_key: str,
-        bitwarden_client_secret_aws_secret_key: str,
-        bitwarden_master_password_aws_secret_key: str,
-        bitwarden_collection_id: str,
-        bitwarden_item_id: str,
-        key: str,
-        description: str | None = None,
-    ) -> BitwardenCreditCardDataParameter:
-        async with self.Session() as session:
-            bitwarden_credit_card_data_parameter = BitwardenCreditCardDataParameterModel(
-                workflow_id=workflow_id,
-                bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
-                bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
-                bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-                bitwarden_collection_id=bitwarden_collection_id,
-                bitwarden_item_id=bitwarden_item_id,
-                key=key,
-                description=description,
-            )
-            session.add(bitwarden_credit_card_data_parameter)
-            await session.commit()
-            await session.refresh(bitwarden_credit_card_data_parameter)
-            return BitwardenCreditCardDataParameter.model_validate(bitwarden_credit_card_data_parameter)
-
     async def create_output_parameter(
         self,
         workflow_id: str,
@@ -3256,6 +3172,134 @@ class AgentDB(BaseAlchemyDB):
             await session.commit()
             await session.refresh(output_parameter)
             return convert_to_output_parameter(output_parameter)
+
+    @staticmethod
+    def _convert_parameter_to_model(parameter: PARAMETER_TYPE) -> Base:
+        """Convert a parameter object to its corresponding SQLAlchemy model."""
+        if isinstance(parameter, WorkflowParameter):
+            default_value = (
+                json.dumps(parameter.default_value)
+                if parameter.workflow_parameter_type == WorkflowParameterType.JSON
+                else parameter.default_value
+            )
+            return WorkflowParameterModel(
+                workflow_parameter_id=parameter.workflow_parameter_id,
+                workflow_parameter_type=parameter.workflow_parameter_type.value,
+                key=parameter.key,
+                description=parameter.description,
+                workflow_id=parameter.workflow_id,
+                default_value=default_value,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, OutputParameter):
+            return OutputParameterModel(
+                output_parameter_id=parameter.output_parameter_id,
+                key=parameter.key,
+                description=parameter.description,
+                workflow_id=parameter.workflow_id,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, AWSSecretParameter):
+            return AWSSecretParameterModel(
+                aws_secret_parameter_id=parameter.aws_secret_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                aws_key=parameter.aws_key,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, BitwardenLoginCredentialParameter):
+            return BitwardenLoginCredentialParameterModel(
+                bitwarden_login_credential_parameter_id=parameter.bitwarden_login_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
+                bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
+                bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
+                bitwarden_collection_id=parameter.bitwarden_collection_id,
+                bitwarden_item_id=parameter.bitwarden_item_id,
+                url_parameter_key=parameter.url_parameter_key,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, BitwardenSensitiveInformationParameter):
+            return BitwardenSensitiveInformationParameterModel(
+                bitwarden_sensitive_information_parameter_id=parameter.bitwarden_sensitive_information_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
+                bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
+                bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
+                bitwarden_collection_id=parameter.bitwarden_collection_id,
+                bitwarden_identity_key=parameter.bitwarden_identity_key,
+                bitwarden_identity_fields=parameter.bitwarden_identity_fields,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, BitwardenCreditCardDataParameter):
+            return BitwardenCreditCardDataParameterModel(
+                bitwarden_credit_card_data_parameter_id=parameter.bitwarden_credit_card_data_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
+                bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
+                bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
+                bitwarden_collection_id=parameter.bitwarden_collection_id,
+                bitwarden_item_id=parameter.bitwarden_item_id,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, CredentialParameter):
+            return CredentialParameterModel(
+                credential_parameter_id=parameter.credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                credential_id=parameter.credential_id,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, OnePasswordCredentialParameter):
+            return OnePasswordCredentialParameterModel(
+                onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                vault_id=parameter.vault_id,
+                item_id=parameter.item_id,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, AzureVaultCredentialParameter):
+            return AzureVaultCredentialParameterModel(
+                azure_vault_credential_parameter_id=parameter.azure_vault_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                vault_name=parameter.vault_name,
+                username_key=parameter.username_key,
+                password_key=parameter.password_key,
+                totp_secret_key=parameter.totp_secret_key,
+                deleted_at=parameter.deleted_at,
+            )
+        else:
+            raise ValueError(f"Unsupported workflow definition parameter type: {type(parameter).__name__}")
+
+    async def save_workflow_definition_parameters(self, parameters: list[PARAMETER_TYPE]) -> None:
+        """Save multiple workflow definition parameters in a single transaction."""
+
+        # ContextParameter is not persisted
+        parameters_to_save = [p for p in parameters if not isinstance(p, ContextParameter)]
+        if not parameters_to_save:
+            return
+
+        async with self.Session() as session:
+            try:
+                for parameter in parameters_to_save:
+                    model = self._convert_parameter_to_model(parameter)
+                    session.add(model)
+                await session.commit()
+            except SQLAlchemyError:
+                LOG.error("SQLAlchemyError", exc_info=True)
+                raise
 
     async def get_workflow_output_parameters(self, workflow_id: str) -> list[OutputParameter]:
         try:
@@ -3282,93 +3326,6 @@ class AgentDB(BaseAlchemyDB):
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
-
-    async def create_credential_parameter(
-        self, workflow_id: str, key: str, credential_id: str, description: str | None = None
-    ) -> CredentialParameter:
-        async with self.Session() as session:
-            credential_parameter = CredentialParameterModel(
-                workflow_id=workflow_id,
-                key=key,
-                description=description,
-                credential_id=credential_id,
-            )
-            session.add(credential_parameter)
-            await session.commit()
-            await session.refresh(credential_parameter)
-            return CredentialParameter(
-                credential_parameter_id=credential_parameter.credential_parameter_id,
-                workflow_id=credential_parameter.workflow_id,
-                key=credential_parameter.key,
-                description=credential_parameter.description,
-                credential_id=credential_parameter.credential_id,
-                created_at=credential_parameter.created_at,
-                modified_at=credential_parameter.modified_at,
-                deleted_at=credential_parameter.deleted_at,
-            )
-
-    async def create_onepassword_credential_parameter(
-        self, workflow_id: str, key: str, vault_id: str, item_id: str, description: str | None = None
-    ) -> OnePasswordCredentialParameter:
-        async with self.Session() as session:
-            parameter = OnePasswordCredentialParameterModel(
-                workflow_id=workflow_id,
-                key=key,
-                description=description,
-                vault_id=vault_id,
-                item_id=item_id,
-            )
-            session.add(parameter)
-            await session.commit()
-            await session.refresh(parameter)
-            return OnePasswordCredentialParameter(
-                onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
-                workflow_id=parameter.workflow_id,
-                key=parameter.key,
-                description=parameter.description,
-                vault_id=parameter.vault_id,
-                item_id=parameter.item_id,
-                created_at=parameter.created_at,
-                modified_at=parameter.modified_at,
-                deleted_at=parameter.deleted_at,
-            )
-
-    async def create_azure_vault_credential_parameter(
-        self,
-        workflow_id: str,
-        key: str,
-        vault_name: str,
-        username_key: str,
-        password_key: str,
-        totp_secret_key: str | None = None,
-        description: str | None = None,
-    ) -> AzureVaultCredentialParameter:
-        async with self.Session() as session:
-            parameter = AzureVaultCredentialParameterModel(
-                workflow_id=workflow_id,
-                key=key,
-                description=description,
-                vault_name=vault_name,
-                username_key=username_key,
-                password_key=password_key,
-                totp_secret_key=totp_secret_key,
-            )
-            session.add(parameter)
-            await session.commit()
-            await session.refresh(parameter)
-            return AzureVaultCredentialParameter(
-                azure_vault_credential_parameter_id=parameter.azure_vault_credential_parameter_id,
-                workflow_id=parameter.workflow_id,
-                key=parameter.key,
-                description=parameter.description,
-                vault_name=parameter.vault_name,
-                username_key=parameter.username_key,
-                password_key=parameter.password_key,
-                totp_secret_key=parameter.totp_secret_key,
-                created_at=parameter.created_at,
-                modified_at=parameter.modified_at,
-                deleted_at=parameter.deleted_at,
-            )
 
     async def get_workflow_run_output_parameters(self, workflow_run_id: str) -> list[WorkflowRunOutputParameter]:
         try:
