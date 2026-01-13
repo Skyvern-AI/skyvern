@@ -153,14 +153,20 @@ The Skyvern Python CLI lets you run tasks in an emulated browser on your compute
 In the Python environment where you have the SDK installed, run:
 
 ```bash
-skyvern init
+skyvern run server
 ```
 
 This creates a `.env` file that contains your local `SKYVERN_API_KEY` among other settings.
 
+You can then run the local server with:
+
+```bash
+skyvern init
+```
+
 ### Step 2: Run a task
 
-Once you have Skyvern server running on a local port, `http://0.0.0.0:8000`
+Once you have Skyvern server running on a local port, such as `http://0.0.0.0:8000`, run the following python code:
 
 ```python
 from skyvern import Skyvern
