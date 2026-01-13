@@ -834,6 +834,8 @@ function convertToNode(
           timeout: block.timeout,
           followRedirects: block.follow_redirects,
           parameterKeys: block.parameters.map((p) => p.key),
+          downloadFilename: block.download_filename ?? "",
+          saveResponseAsFile: block.save_response_as_file ?? false,
         },
       };
     }
@@ -2325,6 +2327,8 @@ function getWorkflowBlock(
         timeout: node.data.timeout,
         follow_redirects: node.data.followRedirects,
         parameter_keys: node.data.parameterKeys,
+        download_filename: node.data.downloadFilename || null,
+        save_response_as_file: node.data.saveResponseAsFile,
       };
     }
     case "conditional": {
@@ -3327,6 +3331,7 @@ function convertBlocksToBlockYAML(
           timeout: block.timeout,
           follow_redirects: block.follow_redirects,
           parameter_keys: block.parameters.map((p) => p.key),
+          download_filename: block.download_filename,
         };
         return blockYaml;
       }
