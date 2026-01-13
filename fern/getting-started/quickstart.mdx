@@ -19,7 +19,7 @@ The fastest way to see Skyvern in action is through the web interface. No setup 
 
 ### Step 1: Write a prompt
 
-Open Skyvern Cloud and enter a task in the prompt box.
+Open [Skyvern Cloud](https://app.skyvern.com) and enter a task in the prompt box.
 
 Some example prompts:
 - "Go to hackernews.com and extract the titles of the top 3 posts."
@@ -42,7 +42,7 @@ You can watch the action log and livestream of the browser feed as the Skyvern a
 
 To call Skyvern Agents from your application, you'll need an API key.
 
-1. Go to Settings on Skyvern Cloud.
+1. Go to [Settings](https://app.skyvern.com/settings) on Skyvern Cloud.
 2. Copy your API key.
 
 ### Step 2: Install the Python SDK
@@ -73,7 +73,7 @@ pip install skyvern
 
 If you encounter Python version errors, consider using pipx. pipx installs Python CLI applications globally while still isolating them in virtual environments.
 
-If you don't have pipx installed, follow the official pipx installation instructions.
+If you don't have pipx installed, follow the [official pipx installation instructions](https://pipx.pypa.io/stable/installation/).
 
 ```bash
 pipx install skyvern
@@ -102,7 +102,7 @@ skyvern = Skyvern(api_key="YOUR API KEY")
 asyncio.run(skyvern.run_task(prompt="Find the top post on hackernews today"))
 ```
 
-The SDK handles browser provisioning, task execution, and result retrieval. More details can be found in the [SDK Reference].
+The SDK handles browser provisioning, task execution, and result retrieval. More details can be found in the [SDK Reference](/sdk-reference).
 
 ## Integrate with REST APIs
 
@@ -112,7 +112,7 @@ For JavaScript, TypeScript, or direct HTTP integrations, you can use the Skyvern
 
 To call Skyvern Agents from your application, you'll need an API key.
 
-1. Go to Settings on Skyvern Cloud.
+1. Go to [Settings](https://app.skyvern.com/settings) on Skyvern Cloud.
 2. Copy your API key.
 
 ### Step 2: Send a POST request
@@ -137,7 +137,7 @@ async function main() {
 main();
 ```
 
-Full endpoint documentation is available in the API Reference.
+Full endpoint documentation is available in the [API Reference](/api-reference).
 
 ## Optional: Run tasks with the Skyvern Agent locally
 
@@ -145,15 +145,15 @@ The Skyvern Python CLI lets you run tasks in an emulated browser on your compute
 
 **Prerequisites:**
 - Skyvern Python SDK installed
-- Docker installed and running. Get it here.
-- An OpenAI/Anthropic/Gemini API key. Get it here, here or here
+- Docker installed and running. [Get it here](https://www.docker.com/get-started/).
+- An OpenAI/Anthropic/Gemini API key. Get it [here](https://platform.openai.com/api-keys), [here](https://console.anthropic.com/) or [here](https://ai.google.dev/)
 
 ### Step 1: Run setup command to generate local configuration
 
 In the Python environment where you have the SDK installed, run:
 
 ```bash
-skyvern run server
+skyvern init
 ```
 
 This creates a `.env` file that contains your local `SKYVERN_API_KEY` among other settings.
@@ -161,7 +161,7 @@ This creates a `.env` file that contains your local `SKYVERN_API_KEY` among othe
 You can then run the local server with:
 
 ```bash
-skyvern init
+skyvern run server
 ```
 
 ### Step 2: Run a task
