@@ -9,11 +9,11 @@ logo:
   height: 28
 colors:
   accentPrimary:
-    dark: '#0D9373'
-    light: '#07C983'
+    dark: "#0D9373"
+    light: "#07C983"
   background:
-    dark: '#000000'
-    light: '#FFFFFF'
+    dark: "#000000"
+    light: "#FFFFFF"
 analytics:
   posthog:
     api-key: ${POSTHOG_API_KEY}
@@ -72,6 +72,10 @@ navigation:
             path: getting-started/skyvern-in-action.mdx
           - page: Prompting and Troubleshooting Guide
             path: getting-started/prompting-guide.mdx
+      - section: Cloud UI
+        contents:
+          - page: Getting Started
+            path: cloud/getting-started.mdx
       - section: Tasks
         contents:
           - page: Run Tasks
