@@ -96,11 +96,9 @@ async def aiohttp_request(
         async with session.request(method.upper(), **request_kwargs) as response:
             response_headers = dict(response.headers)
 
-            # Try to parse response as JSON
             try:
                 response_body = await response.json()
             except (aiohttp.ContentTypeError, Exception):
-                # If not JSON, get as text
                 response_body = await response.text()
 
             return response.status, response_headers, response_body

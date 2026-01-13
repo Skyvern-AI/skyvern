@@ -400,4 +400,6 @@ export type HttpRequestBlockYAML = BlockYAMLBase & {
   timeout: number;
   follow_redirects: boolean;
   parameter_keys?: Array<string> | null;
+  download_filename?: string | null;
+  save_response_as_file?: boolean;
 };

@@ -67,6 +67,8 @@ const filesTooltip =
 const timeoutTooltip = "Request timeout in seconds.";
 const followRedirectsTooltip =
   "Whether to automatically follow HTTP redirects.";
+const downloadFilenameTooltip =
+  "The complete filename (without extension) for downloaded files. Extension is automatically determined from the response Content-Type.";
 
 function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
   const { editable } = data;
@@ -430,6 +432,43 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
                       />
                     </div>
                   </div>
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-slate-300">
+                        Save Response as File
+                      </Label>
+                      <HelpTooltip content="When enabled, the response body will be saved as a file instead of being parsed as JSON/text." />
+                    </div>
+                    <Switch
+                      checked={data.saveResponseAsFile}
+                      onCheckedChange={(checked) => {
+                        update({ saveResponseAsFile: checked });
+                      }}
+                      disabled={!editable}
+                    />
+                  </div>
+                  {data.saveResponseAsFile && (
+                    <div className="space-y-2 border-l-2 border-slate-600 pl-4">
+                      <div className="flex gap-2">
+                        <Label className="text-xs text-slate-300">
+                          Download Filename
+                        </Label>
+                        <HelpTooltip content={downloadFilenameTooltip} />
+                      </div>
+                      <Input
+                        type="text"
+                        value={data.downloadFilename}
+                        onChange={(e) => {
+                          update({ downloadFilename: e.target.value });
+                        }}
+                        placeholder="Auto-generated from URL"
+                        className="nopan text-xs"
+                        disabled={!editable}
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
             </AccordionContent>

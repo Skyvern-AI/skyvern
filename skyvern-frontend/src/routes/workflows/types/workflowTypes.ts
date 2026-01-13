@@ -550,6 +550,8 @@ export type HttpRequestBlock = WorkflowBlockBase & {
   timeout: number;
   follow_redirects: boolean;
   parameters: Array<WorkflowParameter>;
+  download_filename: string | null;
+  save_response_as_file: boolean;
 };
 
 export type WorkflowDefinition = {

@@ -152,12 +152,15 @@ function WorkflowRunOutput() {
           <h1 className="text-lg font-bold">Workflow Run Downloaded Files</h1>
           <div className="space-y-2">
             {fileUrls.length > 0 ? (
-              fileUrls.map((url, index) => {
+              fileUrls.map((url) => {
+                // Extract filename from URL path, stripping query params from signed URLs
+                const urlPath = url.split("?")[0] ?? url;
+                const filename = urlPath.split("/").pop() || "download";
                 return (
                   <div key={url} title={url} className="flex gap-2">
                     <FileIcon className="size-6" />
                     <a href={url} className="underline underline-offset-4">
-                      <span>{`File ${index + 1}`}</span>
+                      <span>{filename}</span>
                     </a>
                   </div>
                 );

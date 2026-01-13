@@ -3752,6 +3752,8 @@ class WorkflowService:
                 files=block_yaml.files,
                 timeout=block_yaml.timeout,
                 follow_redirects=block_yaml.follow_redirects,
+                download_filename=block_yaml.download_filename,
+                save_response_as_file=block_yaml.save_response_as_file,
                 parameters=http_request_block_parameters,
             )
         elif block_yaml.block_type == BlockType.GOTO_URL:
