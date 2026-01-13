@@ -66,6 +66,8 @@ navigation:
         contents:
           - page: Introduction
             path: introduction.mdx
+          - page: Core Concepts
+            path: getting-started/core-concepts.mdx
           - page: Quickstart
             path: getting-started/quickstart.mdx
           - page: Skyvern In Action
