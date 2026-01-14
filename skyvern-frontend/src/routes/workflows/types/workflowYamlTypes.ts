@@ -27,6 +27,7 @@ export type WorkflowDefinitionYAML = {
   version?: number | null;
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
+  finally_block_label?: string | null;
 };
 
 export type ParameterYAML =

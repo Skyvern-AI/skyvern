@@ -558,6 +558,7 @@ export type WorkflowDefinition = {
   version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
+  finally_block_label?: string | null;
 };
 
 export type WorkflowApiResponse = {
@@ -603,6 +604,7 @@ export type WorkflowSettings = {
   aiFallback: boolean | null;
   runSequentially: boolean;
   sequentialKey: string | null;
+  finallyBlockLabel: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

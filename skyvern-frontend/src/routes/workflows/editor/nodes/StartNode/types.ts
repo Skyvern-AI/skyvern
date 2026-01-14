@@ -17,6 +17,7 @@ export type WorkflowStartNodeData = {
   aiFallback: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;
+  finallyBlockLabel: string | null;
   label: "__start_block__";
   showCode: boolean;
 };

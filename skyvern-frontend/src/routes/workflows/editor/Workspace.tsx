@@ -978,6 +978,8 @@ function Workspace({
       aiFallback: selectedVersion.ai_fallback ?? true,
       runSequentially: selectedVersion.run_sequentially ?? false,
       sequentialKey: selectedVersion.sequential_key ?? null,
+      finallyBlockLabel:
+        selectedVersion.workflow_definition?.finally_block_label ?? null,
     };
 
     const elements = getElements(
@@ -1683,6 +1685,8 @@ function Workspace({
               aiFallback: parsedYaml.ai_fallback ?? true,
               runSequentially: parsedYaml.run_sequentially ?? false,
               sequentialKey: parsedYaml.sequential_key ?? null,
+              finallyBlockLabel:
+                parsedYaml.workflow_definition?.finally_block_label ?? null,
             };
 
             // Convert YAML blocks to internal format

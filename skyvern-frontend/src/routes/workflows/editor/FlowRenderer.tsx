@@ -529,6 +529,20 @@ function FlowRenderer({
           },
         };
       }
+      // Clear finallyBlockLabel if the deleted block was the finally block
+      if (
+        node.type === "start" &&
+        node.data.withWorkflowSettings &&
+        node.data.finallyBlockLabel === deletedNodeLabel
+      ) {
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            finallyBlockLabel: null,
+          },
+        };
+      }
       return node;
     });
     workflowChangesStore.setHasChanges(true);

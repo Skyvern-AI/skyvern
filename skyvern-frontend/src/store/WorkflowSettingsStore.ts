@@ -12,6 +12,7 @@ export interface WorkflowSettingsState {
   model: WorkflowModel | null;
   maxScreenshotScrollingTimes: number | null;
   extraHttpHeaders: string | Record<string, unknown> | null;
+  finallyBlockLabel: string | null;
   setWorkflowSettings: (
     settings: Partial<
       Omit<
@@ -33,6 +34,7 @@ const defaultState: Omit<
   model: null,
   maxScreenshotScrollingTimes: null,
   extraHttpHeaders: null,
+  finallyBlockLabel: null,
 };
 
 export const useWorkflowSettingsStore = create<WorkflowSettingsState>(

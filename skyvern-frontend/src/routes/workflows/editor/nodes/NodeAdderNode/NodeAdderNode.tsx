@@ -7,6 +7,7 @@ import {
   BranchContext,
   useWorkflowPanelStore,
 } from "@/store/WorkflowPanelStore";
+import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import type { NodeBaseData } from "../types";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -23,6 +24,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
   const settingsStore = useSettingsStore();
+  const workflowSettingsStore = useWorkflowSettingsStore();
   const setWorkflowPanelState = useWorkflowPanelStore(
     (state) => state.setWorkflowPanelState,
   );
@@ -132,7 +134,10 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     workflowStatePanel.workflowPanelState.data?.parent ===
       (parentId || undefined);
 
-  const isDisabled = !isBusy && recordingStore.isRecording;
+  const isBlockedByFinally =
+    !parentId && Boolean(workflowSettingsStore.finallyBlockLabel);
+  const isDisabled =
+    isBlockedByFinally || (!isBusy && recordingStore.isRecording);
 
   const updateWorkflowPanelState = (
     active: boolean,
