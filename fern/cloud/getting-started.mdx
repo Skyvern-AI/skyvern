@@ -1,0 +1,158 @@
+---
+title: Getting Started
+slug: cloud/getting-started
+---
+
+# Getting Started
+
+Automate browser tasks in minutes with Skyvern's no-code workflow builder.
+
+Skyvern Cloud lets you build and run browser automations using Skyvern Agents without writing any code.
+
+Skyvern's AI agents can navigate to websites, search for information, fill out forms, click buttons, and extract data—all from a natural language prompt describing your goal.
+
+You can watch a realtime screenshare as it navigates websites and performs actions.
+
+This guide walks you through the interface and helps you run your first automation.
+
+## Opening Skyvern Cloud
+
+Visit [app.skyvern.com](https://app.skyvern.com) and sign-up or sign-in to your account.
+
+You'll land on the **Discover** page—your starting point for running automations.
+
+## Understanding the Interface
+
+The left sidebar organizes everything you need:
+
+- **Discover** — Run one-off tasks with a prompt and URL
+- **Workflows** — Create and manage reusable multi-step automations
+- **Runs** — View history of all past executions
+- **Browsers** — Manage active browser sessions
+- **Agents** — Pre-built templates for common use cases like contact forms, job applications, invoices, and government filings. These are ready-to-run workflows you can customize.
+- **Billing** — Usage and subscription management
+- **Credentials** — Securely store logins and passwords
+- **Settings** — API keys and account configuration
+
+### When to use the UI vs API/SDK
+
+The Cloud UI is ideal for building workflows visually, running one-off tasks, and monitoring executions. Use the API or SDK when you need to trigger automations programmatically or integrate Skyvern into your own applications.
+
+## Run Your First Task
+
+The fastest way to see Skyvern in action is to run a task directly from the Discover page.
+
+### Step 1: Enter your prompt
+
+<img src="../images/cloud/discover-page.png" />
+
+In the main input field, describe what you want to accomplish.
+
+<Tip title="Prompting tip" icon="lightbulb">
+Be specific about the goal, completion criteria, visual indicators, and all necessary data.
+</Tip>
+
+Check out our detailed [Prompting Guide](/prompting-guide).
+
+**Example prompts:**
+
+- "Find the top post on Hacker News and extract its title"
+- "Search for 'wireless headphones' on Amazon and get the first 3 product names and prices"
+- "Fill out the contact form on {url} with name: John Doe, email: john@example.com"
+
+You can also select one of the quick-action buttons below the input for common example tasks like "Add a product to cart" or "Get an insurance quote."
+
+### Step 2: Configure settings (optional)
+
+Click the gear icon to access additional options:
+
+- **Proxy Location** — This changes where your browser automations run. Use this to access websites blocked in a specific country.
+- **Browser Session ID** — Use this to set a common identifier between different workflows that require common login sessions or need cookies
+- **2FA Identifier** — Skyvern handles 2FA if you provide the identifier for a two-factor authentication (2FA) code. Use this to access accounts protected by 2FA.
+- **Publish Workflow** — This saves the current task run into a workflow template you can re-use later on
+- **Data Schema** — Use this to specify an output data schema to get structured output that you can use in multi-step automations
+
+### Step 3: Run the task
+
+Click the send button to start.
+
+In the background, Skyvern opens a browser, navigates to the URL you specified (or finds it using search), and interacts with the website component to get the job done.
+
+## Watch the Live Browser
+
+Once your task starts, you'll see the execution screen with two main panels:
+
+<img src="../images/cloud/live-browser-view.png" />
+
+**Left panel: Task configuration**
+
+Shows the block being executed with its URL and prompt. The status badge indicates whether the task is running, completed, or failed.
+
+**Right panel: Live Browser**
+
+A real-time view of the browser as Skyvern navigates. You'll see pages load, forms fill, and buttons click—exactly as if you were doing it yourself.
+
+The **"take control"** button lets you intervene and use the agent's browser yourself if it needs help with something unexpected, like a CAPTCHA or unusual login flow.
+
+## Review the Results
+
+After the task completes, you can go to the **Runs** page and open the latest task run.
+
+This is where you'll find everything Skyvern captured.
+
+<img src="../images/cloud/results-overview.png" />
+
+### Output
+
+The extracted data appears at the top in JSON format. This matches the schema you defined (or a sensible default if you didn't specify one).
+
+```json
+{
+  "top_post": {
+    "title": "Cowork: Claude Code for the rest of your work"
+  }
+}
+```
+
+### Overview
+
+View the browser screenshot, agent's thought process with decisions, and extraction results with detailed reasoning for each action taken
+
+### Output
+
+See the structured JSON output from the task, workflow run status information, and any downloaded files from the automation
+
+### Parameters
+
+Configure workflow settings including webhook callbacks, proxy location, HTTP headers, and the original task prompt used
+
+### Recording
+
+Watch a full video replay of the browser session showing exactly how the agent navigated and interacted with the website
+
+### Code
+
+Access the complete Python SDK code with workflow definitions, parameters, and extraction schemas to reproduce this task programmatically
+
+### AI Reasoning
+
+The right sidebar shows the agent's thought process, actions taken, tools used and data extracted.
+
+## What's Next?
+
+<CardGroup cols={2}>
+  <Card
+    title="Building a Workflow"
+    icon="workflow"
+    href="/cloud/building-workflows"
+  >
+    See how you can make a reusable, multi-step workflow
+  </Card>
+  <Card
+    title="Handling Log-ins"
+    icon="blocks"
+    href="/cloud/managing-credentials"
+  >
+    See how you can set your Agent to login to websites while doing an automation
+  </Card>
+</CardGroup>
