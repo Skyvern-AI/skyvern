@@ -43,6 +43,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
+    PrintPageBlock,
     PromptBranchCriteria,
     SendEmailBlock,
     TaskBlock,
@@ -728,6 +729,15 @@ def block_yaml_to_block(
             **base_kwargs,
             url=block_yaml.url,
             complete_verification=False,
+        )
+    elif block_yaml.block_type == BlockType.PRINT_PAGE:
+        return PrintPageBlock(
+            **base_kwargs,
+            include_timestamp=block_yaml.include_timestamp,
+            custom_filename=block_yaml.custom_filename,
+            format=block_yaml.format,
+            landscape=block_yaml.landscape,
+            print_background=block_yaml.print_background,
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")

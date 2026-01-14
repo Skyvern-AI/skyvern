@@ -113,7 +113,7 @@ class S3Storage(BaseStorage):
             uri = uri.replace(f".{file_ext}", f".{file_ext}.zst")
             artifact.uri = uri
 
-        sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket, len(data))
+        sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket)
         tags = await self._get_tags_for_org(artifact.organization_id)
         LOG.debug(
             "Storing artifact",
@@ -125,12 +125,7 @@ class S3Storage(BaseStorage):
         )
         await self.async_client.upload_file(uri, data, storage_class=sc, tags=tags)
 
-    async def _get_storage_class_for_org(
-        self,
-        organization_id: str,
-        bucket: str,
-        object_size_bytes: int | None = None,
-    ) -> S3StorageClass:
+    async def _get_storage_class_for_org(self, organization_id: str, bucket: str) -> S3StorageClass:
         return S3StorageClass.STANDARD
 
     async def _get_tags_for_org(self, organization_id: str) -> dict[str, str]:
@@ -152,7 +147,7 @@ class S3Storage(BaseStorage):
         return await self.async_client.create_presigned_urls([artifact.uri for artifact in artifacts])
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
-        sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket, os.path.getsize(path))
+        sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket)
         tags = await self._get_tags_for_org(artifact.organization_id)
         LOG.debug(
             "Storing artifact from path",
