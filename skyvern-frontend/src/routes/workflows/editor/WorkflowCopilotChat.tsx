@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, memo } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, memo } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useIsSkyvernUser } from "@/hooks/useIsSkyvernUser";
@@ -165,6 +165,10 @@ export function WorkflowCopilotChat({
   }, [messages.length, onMessageCountChange]);
 
   useEffect(() => {
+    if (!isOpen) {
+      hasScrolledOnLoad.current = false;
+      return;
+    }
     if (isLoadingHistory) {
       return;
     }
@@ -174,7 +178,7 @@ export function WorkflowCopilotChat({
       return;
     }
     scrollToBottom("smooth");
-  }, [messages, isLoading, isLoadingHistory]);
+  }, [messages, isLoading, isLoadingHistory, isOpen]);
 
   useEffect(() => {
     if (!workflowPermanentId) {
@@ -525,7 +529,7 @@ export function WorkflowCopilotChat({
   }, [size]);
 
   // Recalculate position when chat opens to align with button (only first time)
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (isOpen && buttonRef?.current && !hasInitializedPosition.current) {
       const newPosition = calculateDefaultPosition(
         size.width,
