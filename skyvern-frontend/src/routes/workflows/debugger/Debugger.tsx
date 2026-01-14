@@ -76,6 +76,8 @@ function Debugger() {
     aiFallback: workflow.ai_fallback ?? true,
     runSequentially: workflow.run_sequentially ?? false,
     sequentialKey: workflow.sequential_key ?? null,
+    finallyBlockLabel:
+      workflow.workflow_definition?.finally_block_label ?? null,
   };
 
   const elements = getElements(blocksToRender, settings, true);

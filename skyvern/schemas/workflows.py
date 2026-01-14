@@ -591,6 +591,7 @@ class WorkflowDefinitionYAML(BaseModel):
     version: int = 1
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
+    finally_block_label: str | None = None
 
     @model_validator(mode="after")
     def validate_unique_block_labels(cls, workflow: "WorkflowDefinitionYAML") -> "WorkflowDefinitionYAML":
@@ -602,6 +603,12 @@ class WorkflowDefinitionYAML(BaseModel):
             raise ValueError(
                 f"Block labels must be unique within a workflow. "
                 f"Found duplicate label(s): {', '.join(unique_duplicates)}"
+            )
+
+        if workflow.finally_block_label and workflow.finally_block_label not in labels:
+            raise ValueError(
+                f"finally_block_label '{workflow.finally_block_label}' does not reference a valid block. "
+                f"Available labels: {', '.join(labels) if labels else '(none)'}"
             )
 
         return workflow

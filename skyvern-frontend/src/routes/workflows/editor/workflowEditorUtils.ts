@@ -1373,6 +1373,7 @@ function getElements(
       showCode: false,
       runSequentially: settings.runSequentially,
       sequentialKey: settings.sequentialKey,
+      finallyBlockLabel: settings.finallyBlockLabel ?? null,
     }),
   );
 
@@ -2541,6 +2542,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     aiFallback: true,
     runSequentially: false,
     sequentialKey: null,
+    finallyBlockLabel: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -2566,6 +2568,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       aiFallback: data.aiFallback,
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
+      finallyBlockLabel: data.finallyBlockLabel ?? null,
     };
   }
   return defaultSettings;
@@ -3358,6 +3361,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       version: workflowDefinitionVersion,
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
+      finally_block_label: workflow.workflow_definition.finally_block_label,
     },
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,

@@ -302,7 +302,12 @@ def convert_workflow_definition(
     if dag_version is None:
         dag_version = 2 if _has_dag_metadata(workflow_definition_yaml.blocks) else 1
 
-    workflow_definition = WorkflowDefinition(parameters=parameters.values(), blocks=blocks, version=dag_version)
+    workflow_definition = WorkflowDefinition(
+        parameters=parameters.values(),
+        blocks=blocks,
+        version=dag_version,
+        finally_block_label=workflow_definition_yaml.finally_block_label,
+    )
 
     LOG.info(
         f"Created workflow from request, title: {title}",

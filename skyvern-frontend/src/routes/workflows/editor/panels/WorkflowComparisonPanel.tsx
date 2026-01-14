@@ -154,6 +154,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     aiFallback: version.ai_fallback ?? true,
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
+    finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
   };
 
   // Deep clone the blocks to ensure complete isolation from main editor
