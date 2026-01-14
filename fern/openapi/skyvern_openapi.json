@@ -9258,6 +9258,22 @@
             "title": "Follow Redirects",
             "default": true
           },
+          "download_filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Filename"
+          },
+          "save_response_as_file": {
+            "type": "boolean",
+            "title": "Save Response As File",
+            "default": false
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -9436,6 +9452,22 @@
             "type": "boolean",
             "title": "Follow Redirects",
             "default": true
+          },
+          "download_filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Filename"
+          },
+          "save_response_as_file": {
+            "type": "boolean",
+            "title": "Save Response As File",
+            "default": false
           },
           "parameter_keys": {
             "anyOf": [
