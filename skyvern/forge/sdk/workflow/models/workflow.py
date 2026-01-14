@@ -7,7 +7,11 @@ from typing_extensions import deprecated
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
-from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
+from skyvern.forge.sdk.workflow.exceptions import (
+    InvalidFinallyBlockLabel,
+    NonTerminalFinallyBlock,
+    WorkflowDefinitionHasDuplicateBlockLabels,
+)
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
@@ -54,6 +58,7 @@ class WorkflowDefinition(BaseModel):
     version: int = 1
     parameters: list[PARAMETER_TYPE]
     blocks: List[BlockTypeVar]
+    finally_block_label: str | None = None
 
     def validate(self) -> None:
         labels: set[str] = set()
@@ -66,6 +71,13 @@ class WorkflowDefinition(BaseModel):
 
         if duplicate_labels:
             raise WorkflowDefinitionHasDuplicateBlockLabels(duplicate_labels)
+
+        if self.finally_block_label:
+            if self.finally_block_label not in labels:
+                raise InvalidFinallyBlockLabel(self.finally_block_label, list(labels))
+            for block in self.blocks:
+                if block.label == self.finally_block_label and block.next_block_label is not None:
+                    raise NonTerminalFinallyBlock(self.finally_block_label)
 
 
 class Workflow(BaseModel):

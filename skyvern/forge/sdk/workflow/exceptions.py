@@ -20,6 +20,24 @@ class WorkflowDefinitionHasDuplicateBlockLabels(BaseWorkflowHTTPException):
         )
 
 
+class InvalidFinallyBlockLabel(BaseWorkflowHTTPException):
+    def __init__(self, finally_block_label: str, available_labels: list[str]) -> None:
+        super().__init__(
+            f"finally_block_label '{finally_block_label}' does not reference a valid block in the workflow. "
+            f"Available block labels: {', '.join(available_labels) if available_labels else '(none)'}",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
+class NonTerminalFinallyBlock(BaseWorkflowHTTPException):
+    def __init__(self, finally_block_label: str) -> None:
+        super().__init__(
+            f"finally_block_label '{finally_block_label}' must be a terminal block (next_block_label must be null). "
+            "Only blocks without a next_block_label can be used as finally blocks.",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
 class FailedToCreateWorkflow(BaseWorkflowHTTPException):
     def __init__(self, error_message: str) -> None:
         super().__init__(

@@ -737,33 +737,59 @@ class WorkflowService:
             script=workflow_script,
         )
 
+        # Check if there's a finally block configured
+        finally_block_label = workflow.workflow_definition.finally_block_label
+
         if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         ):
             workflow_run = refreshed_workflow_run
-            if workflow_run.status not in (
-                WorkflowRunStatus.canceled,
+
+        pre_finally_status = workflow_run.status
+        pre_finally_failure_reason = workflow_run.failure_reason
+
+        if pre_finally_status not in (
+            WorkflowRunStatus.canceled,
+            WorkflowRunStatus.failed,
+            WorkflowRunStatus.terminated,
+            WorkflowRunStatus.timed_out,
+        ):
+            await self.generate_script_if_needed(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                block_labels=block_labels,
+                blocks_to_update=blocks_to_update,
+            )
+
+        # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
+        should_run_finally = finally_block_label and pre_finally_status != WorkflowRunStatus.canceled
+        if should_run_finally:
+            # Temporarily set to running for terminal workflows (for frontend UX)
+            if pre_finally_status in (
                 WorkflowRunStatus.failed,
                 WorkflowRunStatus.terminated,
                 WorkflowRunStatus.timed_out,
             ):
-                workflow_run = await self.mark_workflow_run_as_completed(
+                workflow_run = await self._update_workflow_run_status(
                     workflow_run_id=workflow_run_id,
+                    status=WorkflowRunStatus.running,
+                    failure_reason=None,
                 )
-                await self.generate_script_if_needed(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                    block_labels=block_labels,
-                    blocks_to_update=blocks_to_update,
-                )
-            else:
-                LOG.info(
-                    "Workflow run is already timed_out, canceled, failed, or terminated, not marking as completed",
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_status=workflow_run.status,
-                    run_with=workflow_run.run_with,
-                )
+            await self._execute_finally_block_if_configured(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                organization=organization,
+                browser_session_id=browser_session_id,
+            )
+
+        workflow_run = await self._finalize_workflow_run_status(
+            workflow_run_id=workflow_run_id,
+            workflow_run=workflow_run,
+            pre_finally_status=pre_finally_status,
+            pre_finally_failure_reason=pre_finally_failure_reason,
+        )
+
         await self.clean_up_workflow(
             workflow=workflow,
             workflow_run=workflow_run,
@@ -1339,6 +1365,46 @@ class WorkflowService:
             return workflow_run, False
 
         return workflow_run, False
+
+    async def _execute_finally_block_if_configured(
+        self,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        organization: Organization,
+        browser_session_id: str | None,
+    ) -> None:
+        finally_block_label = workflow.workflow_definition.finally_block_label
+        if not finally_block_label:
+            return
+
+        label_to_block: dict[str, BlockTypeVar] = {block.label: block for block in workflow.workflow_definition.blocks}
+
+        block = label_to_block.get(finally_block_label)
+        if not block:
+            LOG.warning(
+                "Finally block label not found",
+                workflow_run_id=workflow_run.workflow_run_id,
+                finally_block_label=finally_block_label,
+            )
+            return
+
+        try:
+            parameters = block.get_all_parameters(workflow_run.workflow_run_id)
+            await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
+                workflow_run.workflow_run_id, parameters, organization
+            )
+            await block.execute_safe(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=organization.organization_id,
+                browser_session_id=browser_session_id,
+            )
+        except Exception as e:
+            LOG.warning(
+                "Finally block execution failed",
+                workflow_run_id=workflow_run.workflow_run_id,
+                block_label=block.label,
+                error=str(e),
+            )
 
     def _build_workflow_graph(
         self,
@@ -2130,6 +2196,35 @@ class WorkflowService:
             status=WorkflowRunStatus.completed,
             run_with=run_with,
         )
+
+    async def _finalize_workflow_run_status(
+        self,
+        workflow_run_id: str,
+        workflow_run: WorkflowRun,
+        pre_finally_status: WorkflowRunStatus,
+        pre_finally_failure_reason: str | None,
+    ) -> WorkflowRun:
+        """
+        Set final workflow run status based on pre-finally state.
+        Called unconditionally to ensure unified flow.
+        """
+        if pre_finally_status not in (
+            WorkflowRunStatus.canceled,
+            WorkflowRunStatus.failed,
+            WorkflowRunStatus.terminated,
+            WorkflowRunStatus.timed_out,
+        ):
+            return await self.mark_workflow_run_as_completed(workflow_run_id)
+
+        if workflow_run.status == WorkflowRunStatus.running:
+            # We temporarily set to running for finally block, restore terminal status
+            return await self._update_workflow_run_status(
+                workflow_run_id=workflow_run_id,
+                status=pre_finally_status,
+                failure_reason=pre_finally_failure_reason,
+            )
+
+        return workflow_run
 
     async def mark_workflow_run_as_failed(
         self,
