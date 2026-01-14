@@ -11,8 +11,8 @@ title: "<workflow title>"
 description: "<optional description>"
 workflow_definition:
   version: 2 # IMPORTANT: Always use version 2
-  parameters: []
   blocks: []
+  parameters: []
 webhook_callback_url: "<optional_https_url>" # Optional: Webhook URL to receive workflow run updates
 
 Key Concepts:
@@ -34,13 +34,18 @@ workflow_parameter_type: <string|integer|float|boolean|json|file_url|credential_
 description: <optional description>
 default_value: <optional default>
 
+Define exactly one parameters list under workflow_definition.
+
 Example:
-parameters:
-  - parameter_type: workflow
-    key: search_query
-    workflow_parameter_type: string
-    description: "Search term to use"
-    default_value: "example"
+workflow_definition:
+  version: 2
+  blocks: []
+  parameters:
+    - parameter_type: workflow
+      key: search_query
+      workflow_parameter_type: string
+      description: "Search term to use"
+      default_value: "example"
 
 * OUTPUT PARAMETERS (block outputs)
 parameter_type: output
@@ -61,18 +66,18 @@ Using Parameters in Blocks:
 Example:
 workflow_definition:
   version: 2
-  parameters:
-    - key: topics_count
-      description: null
-      parameter_type: workflow
-      workflow_parameter_type: integer
-      default_value: "3"
   blocks:
     - label: block_1
       block_type: task_v2
       prompt: Give me top {{topics_count}} news items
       url: https://news.ycombinator.com/
       next_block_label: null
+  parameters:
+    - key: topics_count
+      description: null
+      parameter_type: workflow
+      workflow_parameter_type: integer
+      default_value: "3"
 
 ** COMMON BLOCK FIELDS **
 
@@ -123,15 +128,21 @@ Use Cases:
 - Execute focused browser tasks with clear completion criteria
 
 Example:
-blocks:
-  - block_type: navigation
-    label: search_and_open
-    next_block_label: null
-    url: "https://example.com/search"
-    navigation_goal: "Search for {{ query }} and click the first result"
-    parameter_keys:
-      - query
-    max_retries: 2
+workflow_definition:
+  version: 2
+  blocks:
+    - block_type: navigation
+      label: search_and_open
+      next_block_label: null
+      url: "https://example.com/search"
+      navigation_goal: "Search for {{ query }} and click the first result"
+      parameter_keys:
+        - query
+      max_retries: 2
+  parameters:
+    - parameter_type: workflow
+      key: query
+      workflow_parameter_type: string
 
 ** URL BLOCK (goto_url) **
 
@@ -222,6 +233,82 @@ blocks:
     prompt: "Book a flight from {{ origin }} to {{ destination }} on {{ date }}. Return the booking confirmation number."
     max_iterations: 10
 
+** FOR LOOP BLOCK (for_loop) **
+
+Purpose: Iterate over a list of values and run a sequence of blocks for each item.
+
+Structure:
+block_type: for_loop
+label: <unique_label>
+loop_blocks: []                          # Required: Blocks to run for each iteration
+loop_over_parameter_key: <param_key>     # Optional: Parameter key that resolves to a list
+loop_variable_reference: <jinja|path>    # Optional: Jinja2 or output path to resolve a list
+complete_if_empty: false                 # Optional: Complete successfully when list is empty
+
+Important Notes:
+- Provide either loop_over_parameter_key or loop_variable_reference
+- Loop blocks must use next_block_label to chain within the loop
+- Each iteration exposes {{ current_value }}, {{ current_item }}, and {{ current_index }}
+
+Example:
+parameters:
+  - parameter_type: workflow
+    key: urls
+    workflow_parameter_type: json
+    default_value:
+      - "https://example.com/a"
+      - "https://example.com/b"
+blocks:
+  - block_type: for_loop
+    label: visit_urls
+    next_block_label: null
+    loop_over_parameter_key: urls
+    loop_blocks:
+      - block_type: goto_url
+        label: open_url
+        next_block_label: null
+        url: "{{ current_value }}"
+
+** CONDITIONAL BLOCK (conditional) **
+
+Purpose: Branch to different blocks based on ordered conditions.
+
+Structure:
+block_type: conditional
+label: <unique_label>
+branch_conditions: []                    # Required: Ordered list of branch conditions
+
+Branch Condition Structure:
+criteria:                               # Optional for default branch
+  criteria_type: <jinja2_template|prompt>  # Optional: inferred when omitted
+  expression: <expression>                # Required when criteria present
+  description: <optional description>
+next_block_label: <label|null>           # Optional: Label to execute when matched
+description: <optional description>
+is_default: false                        # Required when criteria is omitted
+
+Important Notes:
+- At least one branch is required
+- Branches are evaluated in order; first match wins
+- Only one default branch is allowed
+- Branches without criteria must set is_default: true
+
+Example:
+blocks:
+  - block_type: conditional
+    label: route_by_status
+    next_block_label: null
+    branch_conditions:
+      - criteria:
+          criteria_type: jinja2_template
+          expression: "{{ account_status == 'active' }}"
+        next_block_label: handle_active
+        description: "Active accounts"
+        is_default: false
+      - is_default: true
+        next_block_label: handle_inactive
+        description: "Fallback for all other states"
+
 ** LOGIN BLOCK (login) **
 
 Purpose: Handle authentication flows including username/password and TOTP/2FA.
@@ -251,20 +338,22 @@ Important Notes:
 - TOTP is automatically handled if the credential parameter has TOTP configured
 
 Example:
-parameters:
-  - parameter_type: workflow
-    workflow_parameter_type: credential_id
-    key: my_credentials
-    default_value: "cred_uuid_here"
-blocks:
-  - block_type: login
-    label: login_to_portal
-    next_block_label: null
-    url: "https://portal.example.com/login"
-    parameter_keys:
-      - my_credentials # This must match a 'key' from the parameters list above
-    complete_criterion: "Current URL is 'https://portal.example.com/dashboard'"
-    max_retries: 2
+workflow_definition:
+  version: 2
+  blocks:
+    - block_type: login
+      label: login_to_portal
+      next_block_label: null
+      url: "https://portal.example.com/login"
+      parameter_keys:
+        - my_credentials # This must match a 'key' from the parameters list above
+      complete_criterion: "Current URL is 'https://portal.example.com/dashboard'"
+      max_retries: 2
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: my_credentials
+      default_value: "cred_uuid_here"
 
 ** VALIDATION BLOCK (validation) **
 
@@ -291,6 +380,22 @@ blocks:
     next_block_label: null
     complete_criterion: "Page contains 'Thank you for your submission'"
     terminate_criterion: "Page contains 'Error' or 'Try again'"
+
+** WAIT BLOCK (wait) **
+
+Purpose: Pause workflow execution for a specified duration.
+
+Structure:
+block_type: wait
+label: <unique_label>
+wait_sec: <seconds>                     # Required: Number of seconds to wait
+
+Example:
+blocks:
+  - block_type: wait
+    label: wait_for_processing
+    next_block_label: check_results
+    wait_sec: 30
 
 ** EXTRACTION BLOCK (extraction) **
 
@@ -501,17 +606,23 @@ Use Cases:
 - Generate classifications or tags
 
 Example:
-blocks:
-  - block_type: text_prompt
-    label: summarize_notes
-    next_block_label: null
-    prompt: "Summarize these notes: {{ notes }}"
-    json_schema:
-      type: object
-      properties:
-        summary: {type: string}
-        action_items: {type: array, items: {type: string}}
-    parameter_keys: [notes]
+workflow_definition:
+  version: 2
+  blocks:
+    - block_type: text_prompt
+      label: summarize_notes
+      next_block_label: null
+      prompt: "Summarize these notes: {{ notes }}"
+      json_schema:
+        type: object
+        properties:
+          summary: {type: string}
+          action_items: {type: array, items: {type: string}}
+      parameter_keys: [notes]
+  parameters:
+    - parameter_type: workflow
+      key: notes
+      workflow_parameter_type: string
 
 ** HTTP REQUEST BLOCK (http_request) **
 
@@ -535,17 +646,26 @@ Use Cases:
 - Upload files via multipart requests
 
 Example:
-blocks:
-  - block_type: http_request
-    label: lookup_customer
-    next_block_label: null
-    method: "POST"
-    url: "https://api.example.com/customers/search"
-    headers:
-      Authorization: "Bearer {{ api_token }}"
-    body:
-      email: "{{ customer_email }}"
-    parameter_keys: [api_token, customer_email]
+workflow_definition:
+  version: 2
+  blocks:
+    - block_type: http_request
+      label: lookup_customer
+      next_block_label: null
+      method: "POST"
+      url: "https://api.example.com/customers/search"
+      headers:
+        Authorization: "Bearer {{ api_token }}"
+      body:
+        email: "{{ customer_email }}"
+      parameter_keys: [api_token, customer_email]
+  parameters:
+    - parameter_type: workflow
+      key: api_token
+      workflow_parameter_type: string
+    - parameter_type: workflow
+      key: customer_email
+      workflow_parameter_type: string
 
 ** PARAMETER TEMPLATING **
 
@@ -682,82 +802,107 @@ blocks:
 ** COMMON PATTERNS **
 
 Pattern 1: Login → Navigate → Extract
-parameters:
-  - parameter_type: workflow
-    workflow_parameter_type: credential_id
-    key: my_credentials
-    default_value: "uuid"
-  - parameter_type: output
-    key: extracted_data
-blocks:
-  - block_type: login
-    label: authenticate
-    next_block_label: go_to_reports
-    url: "https://app.example.com/login"
-    parameter_keys: [my_credentials]
-  - block_type: navigation
-    label: go_to_reports
-    next_block_label: get_report_data
-    navigation_goal: "Navigate to Reports section"
-  - block_type: extraction
-    label: get_report_data
-    next_block_label: null
-    data_extraction_goal: "Extract all report entries"
-    data_schema:
-      type: array
-      items: {type: object}
+workflow_definition:
+  version: 2
+  blocks:
+    - block_type: login
+      label: authenticate
+      next_block_label: go_to_reports
+      url: "https://app.example.com/login"
+      parameter_keys: [my_credentials]
+    - block_type: navigation
+      label: go_to_reports
+      next_block_label: get_report_data
+      navigation_goal: "Navigate to Reports section"
+    - block_type: extraction
+      label: get_report_data
+      next_block_label: null
+      data_extraction_goal: "Extract all report entries"
+      data_schema:
+        type: array
+        items: {type: object}
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: my_credentials
+      default_value: "uuid"
+    - parameter_type: output
+      key: extracted_data
 
 Pattern 2: Search with Dynamic Input
-parameters:
-  - parameter_type: workflow
-    key: search_query
-    workflow_parameter_type: string
-blocks:
-  - block_type: task_v2
-    label: search_and_extract
-    next_block_label: null
-    url: "https://example.com"
-    prompt: "Search for '{{ search_query }}' and extract the first 10 results with titles and URLs"
+workflow_definition:
+  version: 2
+  blocks:
+    - block_type: task_v2
+      label: search_and_extract
+      next_block_label: null
+      url: "https://example.com"
+      prompt: "Search for '{{ search_query }}' and extract the first 10 results with titles and URLs"
+  parameters:
+    - parameter_type: workflow
+      key: search_query
+      workflow_parameter_type: string
 
 Pattern 3: Multi-Step Form Filling
-blocks:
-  - block_type: goto_url
-    label: open_form
-    next_block_label: fill_personal_info
-    url: "https://forms.example.com/application"
-  - block_type: navigation
-    label: fill_personal_info
-    next_block_label: fill_address
-    navigation_goal: "Fill in name as {{ name }}, email as {{ email }}"
-    parameter_keys: [name, email]
-  - block_type: navigation
-    label: fill_address
-    next_block_label: submit
-    navigation_goal: "Fill in address fields and click Continue"
-    parameter_keys: [address, city, zip]
-  - block_type: navigation
-    label: submit
-    next_block_label: null
-    navigation_goal: "Review information and click Submit"
+workflow_definition:
+  version: 2
+  blocks:
+    - block_type: goto_url
+      label: open_form
+      next_block_label: fill_personal_info
+      url: "https://forms.example.com/application"
+    - block_type: navigation
+      label: fill_personal_info
+      next_block_label: fill_address
+      navigation_goal: "Fill in name as {{ name }}, email as {{ email }}"
+      parameter_keys: [name, email]
+    - block_type: navigation
+      label: fill_address
+      next_block_label: submit
+      navigation_goal: "Fill in address fields and click Continue"
+      parameter_keys: [address, city, zip]
+    - block_type: navigation
+      label: submit
+      next_block_label: null
+      navigation_goal: "Review information and click Submit"
+  parameters:
+    - parameter_type: workflow
+      key: name
+      workflow_parameter_type: string
+    - parameter_type: workflow
+      key: email
+      workflow_parameter_type: string
+    - parameter_type: workflow
+      key: address
+      workflow_parameter_type: string
+    - parameter_type: workflow
+      key: city
+      workflow_parameter_type: string
+    - parameter_type: workflow
+      key: zip
+      workflow_parameter_type: string
 
 Pattern 4: Conditional Extraction
-blocks:
-  - block_type: navigation
-    label: search_product
-    next_block_label: check_availability
-    navigation_goal: "Search for {{ product }}"
-  - block_type: extraction
-    label: check_availability
-    next_block_label: add_to_cart
-    data_extraction_goal: "Check if product is in stock"
-    data_schema:
-      type: object
-      properties:
-        in_stock: {type: boolean}
-  - block_type: navigation
-    label: add_to_cart
-    next_block_label: null
-    navigation_goal: "If product is in stock, add to cart"
+workflow_definition:
+  version: 2
+  blocks:
+    - block_type: navigation
+      label: search_product
+      next_block_label: check_availability
+      navigation_goal: "Search for {{ product }}"
+    - block_type: extraction
+      label: check_availability
+      next_block_label: add_to_cart
+      data_extraction_goal: "Check if product is in stock"
+      data_schema:
+        type: object
+        properties:
+          in_stock: {type: boolean}
+    - block_type: navigation
+      label: add_to_cart
+      next_block_label: null
+      navigation_goal: "If product is in stock, add to cart"
+  parameters: []
 
 ** VALIDATION RULES **
 
@@ -787,22 +932,6 @@ title: E-commerce Product Search and Purchase
 description: Search for a product, extract details, and add to cart
 workflow_definition:
   version: 2
-  parameters:
-    - parameter_type: workflow
-      key: product_name
-      workflow_parameter_type: string
-      description: "Product to search for"
-    - parameter_type: workflow
-      key: max_price
-      workflow_parameter_type: float
-      description: "Maximum price willing to pay"
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: account_creds
-      default_value: "cred_12345"
-    - parameter_type: output
-      key: product_details
-      description: "Extracted product information"
   blocks:
     - block_type: login
       label: login_to_store
@@ -839,5 +968,21 @@ workflow_definition:
       next_block_label: null
       prompt: "Click on the first available product and add it to cart"
       max_iterations: 5
+  parameters:
+    - parameter_type: workflow
+      key: product_name
+      workflow_parameter_type: string
+      description: "Product to search for"
+    - parameter_type: workflow
+      key: max_price
+      workflow_parameter_type: float
+      description: "Maximum price willing to pay"
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: account_creds
+      default_value: "cred_12345"
+    - parameter_type: output
+      key: product_details
+      description: "Extracted product information"
 
 END OF KNOWLEDGE BASE
