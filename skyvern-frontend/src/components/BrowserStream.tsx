@@ -37,7 +37,6 @@ import {
   newWssBaseUrl,
   getRuntimeApiKey,
 } from "@/util/env";
-import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 
 import { RotateThrough } from "./RotateThrough";
@@ -699,21 +698,14 @@ function BrowserStream({
       case "copied-text": {
         const text = message.text;
 
-        copyText(text)
-          .then((success) => {
-            if (success) {
-              toast({
-                title: "Copied to Clipboard",
-                description:
-                  "The text has been copied to your clipboard. NOTE: copy-paste only works in the web page - not in the browser (like the address bar).",
-              });
-            } else {
-              toast({
-                variant: "destructive",
-                title: "Failed to write to Clipboard",
-                description: "The text could not be copied to your clipboard.",
-              });
-            }
+        navigator.clipboard
+          .writeText(text)
+          .then(() => {
+            toast({
+              title: "Copied to Clipboard",
+              description:
+                "The text has been copied to your clipboard. NOTE: copy-paste only works in the web page - not in the browser (like the address bar).",
+            });
           })
           .catch((err) => {
             console.error("Failed to write to clipboard:", err);

@@ -2,16 +2,15 @@ import { useState } from "react";
 import { CheckIcon, CopyIcon } from "@radix-ui/react-icons";
 
 import { Button } from "@/components/ui/button";
-import { copyText } from "@/util/copyText";
 
 function CopyButton({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
 
-  const handleCopy = async () => {
+  const handleCopy = () => {
     if (copied) {
       return;
     }
-    await copyText(value);
+    window.navigator.clipboard.writeText(value);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };

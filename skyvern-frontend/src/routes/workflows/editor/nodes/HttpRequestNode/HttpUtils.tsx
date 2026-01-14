@@ -8,7 +8,6 @@ import {
 } from "@radix-ui/react-icons";
 import { useState } from "react";
 import { toast } from "@/components/ui/use-toast";
-import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 
 // HTTP Method Badge Component
@@ -141,16 +140,16 @@ export function CopyToCurlButton({
   };
 
   const handleCopy = async () => {
-    const curlCommand = generateCurlCommand();
-    const success = await copyText(curlCommand);
-    if (success) {
+    try {
+      const curlCommand = generateCurlCommand();
+      await navigator.clipboard.writeText(curlCommand);
       setCopied(true);
       toast({
         title: "Copied!",
         description: "cURL command copied to clipboard",
       });
       setTimeout(() => setCopied(false), 2000);
-    } else {
+    } catch (error) {
       toast({
         title: "Error",
         description: "Failed to copy cURL command",
