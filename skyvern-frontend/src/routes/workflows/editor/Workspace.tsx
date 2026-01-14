@@ -73,6 +73,7 @@ import {
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
+import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
@@ -196,8 +197,8 @@ function CopyAndExplainCode({ code }: { code: string }) {
 function CopyText({ className, text }: { className?: string; text: string }) {
   const [wasCopied, setWasCopied] = useState(false);
 
-  function handleCopy(code: string) {
-    navigator.clipboard.writeText(code);
+  async function handleCopy(code: string) {
+    await copyText(code);
     setWasCopied(true);
     setTimeout(() => setWasCopied(false), 2000);
   }
