@@ -41,6 +41,7 @@ class BlockType(StrEnum):
     PDF_PARSER = "pdf_parser"
     HTTP_REQUEST = "http_request"
     HUMAN_INTERACTION = "human_interaction"
+    PRINT_PAGE = "print_page"
 
 
 class BlockStatus(StrEnum):
@@ -66,6 +67,13 @@ class FileType(StrEnum):
     CSV = "csv"
     EXCEL = "excel"
     PDF = "pdf"
+
+
+class PDFFormat(StrEnum):
+    A4 = "A4"
+    LETTER = "Letter"
+    LEGAL = "Legal"
+    TABLOID = "Tabloid"
 
 
 class FileStorageType(StrEnum):
@@ -546,6 +554,15 @@ class HttpRequestBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class PrintPageBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.PRINT_PAGE] = BlockType.PRINT_PAGE  # type: ignore
+    include_timestamp: bool = True
+    custom_filename: str | None = None
+    format: PDFFormat = PDFFormat.A4
+    landscape: bool = False
+    print_background: bool = True
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -583,6 +600,7 @@ BLOCK_YAML_SUBCLASSES = (
     | TaskV2BlockYAML
     | HttpRequestBlockYAML
     | ConditionalBlockYAML
+    | PrintPageBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
