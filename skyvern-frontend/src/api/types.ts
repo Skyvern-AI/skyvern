@@ -14,6 +14,7 @@ export const ArtifactType = {
   HTMLScrape: "html_scrape",
   SkyvernLog: "skyvern_log",
   SkyvernLogRaw: "skyvern_log_raw",
+  PDF: "pdf",
 } as const;
 
 export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];

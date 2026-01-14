@@ -52,6 +52,9 @@ class ArtifactType(StrEnum):
     # Script files
     SCRIPT_FILE = "script_file"
 
+    # PDF files
+    PDF = "pdf"
+
 
 class Artifact(BaseModel):
     created_at: datetime = Field(

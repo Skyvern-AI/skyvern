@@ -46,6 +46,7 @@ import {
   URLBlockYAML,
   FileUploadBlockYAML,
   HttpRequestBlockYAML,
+  PrintPageBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -122,6 +123,7 @@ import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
 import { httpRequestNodeDefaultData } from "./nodes/HttpRequestNode/types";
+import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -836,6 +838,21 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           downloadFilename: block.download_filename ?? "",
           saveResponseAsFile: block.save_response_as_file ?? false,
+        },
+      };
+    }
+    case "print_page": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "printPage",
+        data: {
+          ...commonData,
+          includeTimestamp: block.include_timestamp ?? false,
+          customFilename: block.custom_filename ?? "",
+          format: block.format ?? "A4",
+          landscape: block.landscape ?? false,
+          printBackground: block.print_background ?? true,
         },
       };
     }
@@ -1877,6 +1894,17 @@ function createNode(
         },
       };
     }
+    case "printPage": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "printPage",
+        data: {
+          ...printPageNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "conditional": {
       const branches = createDefaultBranchConditions();
       return {
@@ -2330,6 +2358,17 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
         download_filename: node.data.downloadFilename || null,
         save_response_as_file: node.data.saveResponseAsFile,
+      };
+    }
+    case "printPage": {
+      return {
+        ...base,
+        block_type: "print_page",
+        include_timestamp: node.data.includeTimestamp,
+        custom_filename: node.data.customFilename || null,
+        format: node.data.format,
+        landscape: node.data.landscape,
+        print_background: node.data.printBackground,
       };
     }
     case "conditional": {
@@ -3335,6 +3374,18 @@ function convertBlocksToBlockYAML(
           follow_redirects: block.follow_redirects,
           parameter_keys: block.parameters.map((p) => p.key),
           download_filename: block.download_filename,
+        };
+        return blockYaml;
+      }
+      case "print_page": {
+        const blockYaml: PrintPageBlockYAML = {
+          ...base,
+          block_type: "print_page",
+          include_timestamp: block.include_timestamp,
+          custom_filename: block.custom_filename,
+          format: block.format,
+          landscape: block.landscape,
+          print_background: block.print_background,
         };
         return blockYaml;
       }
