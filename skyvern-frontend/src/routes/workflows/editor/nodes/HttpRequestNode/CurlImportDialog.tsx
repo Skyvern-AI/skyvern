@@ -21,6 +21,7 @@ import {
 } from "@radix-ui/react-icons";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
+import { copyText } from "@/util/copyText";
 
 type Props = {
   onImport: (data: {
@@ -156,12 +157,20 @@ export function CurlImportDialog({ onImport, children }: Props) {
     }
   };
 
-  const copyExample = (example: string) => {
-    navigator.clipboard.writeText(example);
-    toast({
-      title: "Copied",
-      description: "Example copied to clipboard",
-    });
+  const copyExample = async (example: string) => {
+    const success = await copyText(example);
+    if (success) {
+      toast({
+        title: "Copied",
+        description: "Example copied to clipboard",
+      });
+    } else {
+      toast({
+        title: "Error",
+        description: "Failed to copy example",
+        variant: "destructive",
+      });
+    }
   };
 
   return (
