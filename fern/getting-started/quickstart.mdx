@@ -1,213 +1,340 @@
 ---
-title: Quickstart
+title: API Quickstart
 slug: getting-started/quickstart
 ---
 
-# Quickstart
+Run your first browser automation in 5 minutes. By the end of this guide, you'll scrape the top post from Hacker News using Skyvern's AI agent.
 
-Run your first browser automation task with the Skyvern agent in the next 5 mins.
+<Note>
+Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started) instead — no code required.
+</Note>
 
-This guide covers:
-- Using the Cloud UI
-- Getting your API key
-- Installing the SDK
-- Running the agent locally
+## Step 1: Get your API key
 
-## Try Skyvern Cloud
+<img src="../images/get-api-key.png" alt="Get Skyvern API key" />
 
-The fastest way to see Skyvern in action is through the web interface. No setup required.
+Sign up at [app.skyvern.com](https://app.skyvern.com) and go to [Settings](https://app.skyvern.com/settings) to copy your API key.
 
-### Step 1: Write a prompt
+When you make API calls, Skyvern spins up a cloud browser, executes your task with AI, and returns the results. You can watch the browser live at any time.
 
-Open [Skyvern Cloud](https://app.skyvern.com) and enter a task in the prompt box.
+## Step 2: Install the SDK
 
-Some example prompts:
-- "Go to hackernews.com and extract the titles of the top 3 posts."
-- "Navigate to amazon.com, search for "wireless keyboard", and extract the name and price of the first 5 results."
-- "Go to Google Finance, search for "AAPL", and extract the current stock price."
-
-<img src="../images/quickstart/prompt-input.png" />
-
-### Step 2: Watch the agent work
-
-Click **Run**.
-
-You can watch the action log and livestream of the browser feed as the Skyvern agent navigates, clicks, and extracts data.
-
-<img src="../images/quickstart/agent-working.png" />
-
-## Integrate with Python SDK
-
-### Step 1: Get your API key
-
-To call Skyvern Agents from your application, you'll need an API key.
-
-1. Go to [Settings](https://app.skyvern.com/settings) on Skyvern Cloud.
-2. Copy your API key.
-
-### Step 2: Install the Python SDK
-
-<Tip title="Supported Python Versions" icon="fa-brands fa-python">
-Python 3.11, 3.12 and 3.13
-</Tip>
-
-#### Using pip
-
-Create a virtual environment and install the package:
-
-On Linux/macOS:
-```bash
-python -m venv skyvern-env
-source skyvern-env/bin/activate
+<CodeGroup>
+```bash Python
 pip install skyvern
 ```
 
-On Windows:
-```bash
-python -m venv skyvern-env
-skyvern-env\Scripts\activate
-pip install skyvern
+```bash TypeScript
+npm install @skyvern/client
 ```
+</CodeGroup>
 
-#### Using pipx
-
-If you encounter Python version errors, consider using pipx. pipx installs Python CLI applications globally while still isolating them in virtual environments.
-
-If you don't have pipx installed, follow the [official pipx installation instructions](https://pipx.pypa.io/stable/installation/).
+<Accordion title="Troubleshooting: Python version errors">
+The Skyvern SDK requires Python 3.11, 3.12, or 3.13. If you encounter version errors, try using pipx:
 
 ```bash
 pipx install skyvern
 ```
 
-To uninstall:
-```bash
-pipx uninstall skyvern
-```
+pipx installs Python packages in isolated environments while making them globally available.
+</Accordion>
 
-### Step 3: Run a task with the SDK
+## Step 3: Run your first task
 
-This code sends a task to Skyvern Cloud, which executes it in a cloud-hosted browser.
+Let's scrape the title of the #1 post on Hacker News. You only need two parameters:
 
-You can watch the task recording or see logs in Skyvern Cloud
+- **`prompt`** — Natural language instructions for what the AI should do. Be specific about the data you want extracted.
+- **`url`** — The starting page. Skyvern's AI will navigate from here based on your prompt.
 
-```python
-from skyvern import Skyvern
+The SDK uses async/await because Skyvern spins up a cloud browser and executes your task remotely, which can take 30-60 seconds.
+
+<CodeGroup>
+```python Python
+import os
 import asyncio
+from skyvern import Skyvern
 
-skyvern = Skyvern(api_key="YOUR API KEY")
+async def main():
+    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
 
-# OR pass the base_url to use any Skyvern service
-# skyvern = Skyvern(base_url="http://localhost:8000", api_key="YOUR API KEY")
+    result = await client.run_task(
+        prompt="Go to news.ycombinator.com and get the title of the #1 post",
+        url="https://news.ycombinator.com",
+    )
 
-asyncio.run(skyvern.run_task(prompt="Find the top post on hackernews today"))
+    print(f"Run ID: {result.run_id}")
+    print(f"Status: {result.status}")
+
+asyncio.run(main())
 ```
 
-The SDK handles browser provisioning, task execution, and result retrieval. More details can be found in the [SDK Reference](/sdk-reference).
-
-## Integrate with REST APIs
-
-For JavaScript, TypeScript, or direct HTTP integrations, you can use the Skyvern API.
-
-### Step 1: Get your API key
-
-To call Skyvern Agents from your application, you'll need an API key.
-
-1. Go to [Settings](https://app.skyvern.com/settings) on Skyvern Cloud.
-2. Copy your API key.
-
-### Step 2: Send a POST request
-
-Execute a task via TypeScript. Install the client: `npm install @skyvern/client`
-
-```typescript
+```typescript TypeScript
 import { SkyvernClient } from "@skyvern/client";
 
 async function main() {
   const client = new SkyvernClient({
-    apiKey: "YOUR_API_KEY",
+    apiKey: process.env.SKYVERN_API_KEY,
   });
-  
-  await client.runTask({
+
+  const result = await client.runTask({
     body: {
-      prompt: "Find the top 3 posts on Hacker News.",
+      prompt: "Go to news.ycombinator.com and get the title of the #1 post",
+      url: "https://news.ycombinator.com",
     },
   });
+
+  console.log(`Run ID: ${result.runId}`);
+  console.log(`Status: ${result.status}`);
 }
 
 main();
 ```
 
-Full endpoint documentation is available in the [API Reference](/api-reference).
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Go to news.ycombinator.com and get the title of the #1 post",
+    "url": "https://news.ycombinator.com"
+  }'
+```
+</CodeGroup>
 
-## Optional: Run tasks with the Skyvern Agent locally
+The response includes a `run_id` you'll use to check status and fetch results.
 
-The Skyvern Python CLI lets you run tasks in an emulated browser on your computer.
+## Step 4: Check the status
+
+Since tasks run asychronously, you have two options:
+
+1. **Polling** — Periodically check the task status (shown below)
+2. **Webhooks** — Get notified when the task completes ([see webhooks guide](/running-tasks/webhooks-faq))
+
+The code below polls every 5 seconds until the task reaches a terminal state. Once complete, `run.output` contains the extracted data as a dictionary.
+
+<CodeGroup>
+```python Python
+import os
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+    result = await client.run_task(
+        prompt="Go to news.ycombinator.com and get the title of the #1 post",
+        url="https://news.ycombinator.com",
+    )
+
+    run_id = result.run_id
+    print(f"Task started: {run_id}")
+
+    while True:
+        run = await client.get_run(run_id)
+        print(f"Status: {run.status}")
+
+        if run.status in ["completed", "failed", "terminated"]:
+            break
+
+        await asyncio.sleep(5)
+
+    print(f"Final status: {run.status}")
+    print(f"Output: {run.output}")
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+
+async function main() {
+  const client = new SkyvernClient({
+    apiKey: process.env.SKYVERN_API_KEY,
+  });
+
+  const result = await client.runTask({
+    body: {
+      prompt: "Go to news.ycombinator.com and get the title of the #1 post",
+      url: "https://news.ycombinator.com",
+    },
+  });
+
+  const runId = result.runId;
+  console.log(`Task started: ${runId}`);
+
+  while (true) {
+    const run = await client.getRun(runId);
+    console.log(`Status: ${run.status}`);
+
+    if (["completed", "failed", "terminated"].includes(run.status)) {
+      console.log(`Output: ${JSON.stringify(run.output)}`);
+      break;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
+}
+
+main();
+```
+
+```bash cURL
+curl -X GET "https://api.skyvern.com/v1/runs/RUN_ID" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+**Run states:**
+- `created` — Task initialized, not yet queued
+- `queued` — Waiting for an available browser
+- `running` — AI is navigating and executing
+- `completed` — Task finished successfully
+- `failed` — Task encountered an error
+- `terminated` — Task was manually stopped
+- `timed_out` — Task exceeded time limit
+- `canceled` — Task was cancelled before starting
+
+## Step 5: View your results
+
+When the task completes, you'll get a response like this:
+
+```json
+{
+  "run_id": "tsk_v2_484019301257171242",
+  "status": "completed",
+  "output": {
+    "post_title": "There's a ridiculous amount of tech in a disposable vape"
+  },
+  "recording_url": "https://skyvern-artifacts.s3.amazonaws.com/...",
+  "app_url": "https://app.skyvern.com/runs/wr_484019301257171248"
+}
+```
+
+The `output` contains whatever data the AI extracted based on your prompt. The `app_url` links to the Cloud UI where you can view the full run details.
+
+## Step 6: Watch the recording
+
+Every task is recorded. There are two ways to access recordings:
+
+### From the API response
+
+The `recording_url` field is included in every completed run response:
+
+```json
+{
+  "run_id": "r_abc123",
+  "status": "completed",
+  "recording_url": "https://app.skyvern.com/runs/r_abc123"
+}
+```
+
+### From the Cloud UI
+
+Navigate to [Runs](https://app.skyvern.com/runs) and click on your run to see the Recording tab.
+
+<img src="../images/visualizing_results/view_recording.png" alt="Recording tab in Skyvern Cloud" />
+
+### What you'll see
+
+- **Live browser view** — Watch the AI navigate in real-time
+- **Recording** — Full video replay of the session
+- **Actions** — Step-by-step breakdown with screenshots
+- **AI Reasoning** — See why the AI made each decision
+
+This is invaluable for debugging and understanding how Skyvern interprets your prompts.
+
+---
+
+## Run with a local browser
+
+You can run Skyvern with a browser on your own machine. This is useful for development, debugging, or automating internal tools on your local network.
 
 **Prerequisites:**
-- Skyvern Python SDK installed
-- Docker installed and running. [Get it here](https://www.docker.com/get-started/).
-- An OpenAI/Anthropic/Gemini API key. Get it [here](https://platform.openai.com/api-keys), [here](https://console.anthropic.com/) or [here](https://ai.google.dev/)
+- Skyvern SDK installed (`pip install skyvern`)
+- PostgreSQL database (local install or Docker)
+- An LLM API key (OpenAI, Anthropic, Azure OpenAI, Gemini, Ollama, or any OpenAI-compatible provider)
 
-### Step 1: Run setup command to generate local configuration
+<Note>
+Docker is optional. If you have PostgreSQL installed locally, Skyvern will detect and use it automatically. Use `skyvern init --no-postgres` to skip database setup entirely if you're managing PostgreSQL separately.
+</Note>
 
-In the Python environment where you have the SDK installed, run:
+### Set up local Skyvern
 
 ```bash
 skyvern init
 ```
 
-This creates a `.env` file that contains your local `SKYVERN_API_KEY` among other settings.
+This interactive wizard will:
+1. Set up your database (detects local PostgreSQL or uses Docker)
+2. Configure your LLM provider
+3. Choose browser mode (headless, headful, or connect to existing Chrome)
+4. Generate local API credentials
+5. Download the Chromium browser
 
-You can then run the local server with:
+### Start the local server
 
 ```bash
 skyvern run server
 ```
 
-### Step 2: Run a task
+### Run a task locally
 
-Once you have Skyvern server running on a local port, such as `http://0.0.0.0:8000`, run the following python code:
+The only difference from cloud is the `base_url` parameter pointing to your local server. The API is identical, so the same code works in both environments — develop locally, deploy to cloud without changes.
 
 ```python
-from skyvern import Skyvern
+import os
 import asyncio
+from skyvern import Skyvern
 
-skyvern = Skyvern(base_url="http://localhost:8000", api_key="YOUR LOCAL API KEY")
+async def main():
+    client = Skyvern(
+        base_url="http://localhost:8000",
+        api_key=os.getenv("SKYVERN_API_KEY")
+    )
 
-asyncio.run(skyvern.run_task(prompt="Find the top post on hackernews today"))
+    result = await client.run_task(
+        prompt="Go to news.ycombinator.com and get the title of the #1 post",
+        url="https://news.ycombinator.com",
+    )
+
+    print(f"Run ID: {result.run_id}")
+
+asyncio.run(main())
 ```
 
-This will open a browser window on your machine where Skyvern Agent will execute the task and close when completed. Recording and logs will be saved in the folder where Skyvern local server was initialized.
+A browser window will open on your machine (if you chose headful mode). Recordings and logs are saved in the directory where you started the server.
+
+---
 
 ## Next steps
 
 <CardGroup cols={2}>
   <Card
-    title="Automations"
-    icon="robot"
-    href="/automations"
+    title="Extract Structured Data"
+    icon="database"
+    href="/running-tasks/run-tasks"
   >
-    Learn how to extract structured data from Skyvern browser automation runs
+    Define a schema to get typed JSON output from your automations
   </Card>
   <Card
-    title="Authentication"
+    title="Handle Logins"
     icon="key"
-    href="/authentication"
+    href="/credentials/introduction"
   >
-    Learn how to store login credentials for workflows that involve signing-up or logging-in or even 2FA
+    Store credentials securely for sites that require authentication
   </Card>
   <Card
-    title="Core Concepts"
-    icon="book"
-    href="/getting-started/core-concepts"
+    title="Build Workflows"
+    icon="diagram-project"
+    href="/workflows/manage-workflows"
   >
-    Understand terms and concepts like Artifacts, Workflows and Tasks for agentic browser usage
+    Chain multiple steps together for complex automations
   </Card>
   <Card
-    title="Cookbook"
-    icon="utensils"
-    href="/cookbook"
+    title="Use Webhooks"
+    icon="webhook"
+    href="/running-tasks/webhooks-faq"
   >
-    See examples of complete workflows built with Skyvern
+    Get notified when tasks complete instead of polling
   </Card>
 </CardGroup>

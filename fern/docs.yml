@@ -36,6 +36,9 @@ tabs:
   home:
     display-name: Home
     icon: home
+  cloud-ui:
+    display-name: Cloud UI
+    icon: cloud
   api:
     display-name: API Reference
     icon: code
@@ -68,16 +71,12 @@ navigation:
             path: introduction.mdx
           - page: Core Concepts
             path: getting-started/core-concepts.mdx
-          - page: Quickstart
+          - page: API Quickstart
             path: getting-started/quickstart.mdx
           - page: Skyvern In Action
             path: getting-started/skyvern-in-action.mdx
           - page: Prompting and Troubleshooting Guide
             path: getting-started/prompting-guide.mdx
-      - section: Cloud UI
-        contents:
-          - page: Getting Started
-            path: cloud/getting-started.mdx
       - section: Tasks
         contents:
           - page: Run Tasks
@@ -164,6 +163,12 @@ navigation:
             path: integrations/workato.mdx
           - page: Ollama + LiteLLM
             path: integrations/ollama-litellm.mdx
+  - tab: cloud-ui
+    layout:
+      - section: Cloud UI
+        contents:
+          - page: Getting Started
+            path: cloud/getting-started.mdx
   - tab: api
     layout:
       - api: API Reference

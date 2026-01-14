@@ -1,12 +1,16 @@
-# Core Concepts
+---
+title: Core Concepts
+subtitle: The building blocks of Skyvern automations
+slug: getting-started/core-concepts
+---
 
-This page covers the foundational concepts you'll encounter when building with Skyvern.
+Skyvern has seven core concepts. Master these and you can build any browser automation.
 
 ---
 
 ## Tasks
 
-A **Task** is a single automation job. You give Skyvern a URL and a natural language prompt describing what you want to accomplish, and it navigates the browser to complete the goal.
+A **Task** is a single automation job—think of it as asking Skyvern to do one thing. You provide a prompt describing the goal, and Skyvern navigates the browser to complete it.
 
 ```python
 from skyvern import Skyvern
@@ -14,8 +18,8 @@ from skyvern import Skyvern
 skyvern = Skyvern(api_key="YOUR_API_KEY")
 
 result = await skyvern.run_task(
-    url="https://news.ycombinator.com",
     prompt="Find the top 3 posts on the front page",
+    url="https://news.ycombinator.com",
     data_extraction_schema={
         "type": "object",
         "properties": {
@@ -34,30 +38,38 @@ print(result.output)  # {"posts": ["Post 1", "Post 2", "Post 3"]}
 
 | Property | Description |
 |----------|-------------|
+| `prompt` | Natural language description of the goal (required) |
 | `url` | Starting URL for the task |
-| `prompt` | Natural language description of the goal |
 | `data_extraction_schema` | JSON Schema defining expected output structure |
-| `max_steps` | Maximum steps allowed |
-| `engine` | AI model (`skyvern-2.0`, `openai-cua`, `anthropic-cua`, etc.) |
+| `max_steps` | Maximum steps allowed (controls cost) |
+| `engine` | AI model to use (see [Engines](#engines) below) |
 | `browser_session_id` | Run in an existing browser session |
 | `webhook_url` | Callback URL for async completion |
 
-**When to use Tasks:**
-- One-off automations you won't repeat
-- Quick data extraction from a single page
-- Prototyping before building a workflow
-- Simple goals that don't require multiple stages
+**Use Tasks for:** one-off automations, quick data extraction, prototyping before building a workflow.
 
-For reusable, multi-step automations, use Workflows instead.
+When you need reusable, multi-step automations, use **Workflows** instead.
 
 ---
 
 ## Workflows
 
-A **Workflow** is a multi-step automation composed of blocks. Unlike tasks, workflows are reusable templates that can be versioned, published, and executed repeatedly with different parameters.
+A **Workflow** is a reusable template composed of blocks. Unlike tasks, workflows can be versioned, shared across your team, and executed repeatedly with different parameters.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        WORKFLOW                             │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐  │
+│  │ Navigate │ → │  Login   │ → │ Extract  │ → │ Download │  │
+│  │  Block   │   │  Block   │   │  Block   │   │  Block   │  │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────┘  │
+│                                                             │
+│  Parameters: {{search_query}}, {{max_price}}                │
+│  Each block can reference outputs from previous blocks      │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ```python
-# Run a workflow with parameters
 result = await skyvern.run_workflow(
     workflow_id="wpid_abc123",
     parameters={
@@ -69,51 +81,30 @@ result = await skyvern.run_workflow(
 print(result.output)
 ```
 
-Workflows support parameterization using Jinja syntax. Blocks can reference:
-- Workflow parameters: `{{search_query}}`
-- Previous block outputs: `{{extract_block.product_name}}`
+Workflows support Jinja templating:
+- Reference parameters: `{{search_query}}`
+- Reference previous block outputs: `{{extract_block.product_name}}`
 
-```
-┌─────────────────────────────────┐
-│           WORKFLOW              │
-├─────────────────────────────────┤
-│  Block 1: Navigate to site      │
-│            ↓                    │
-│  Block 2: Login                 │
-│            ↓                    │
-│  Block 3: Extract data          │
-│            ↓                    │
-│  Block 4: Download file         │
-└─────────────────────────────────┘
-```
+**Use Workflows for:** repeatable automations, multi-step processes, team-shared templates, complex logic with loops or conditionals.
 
-**When to use Workflows:**
-- Automations you'll run repeatedly with different inputs
-- Multi-step processes (login → navigate → extract → download)
-- Team-shared automations that need version control
-- Complex logic requiring loops, conditionals, or custom code
-
-**When to use Tasks instead:**
-- One-off jobs you won't repeat
-- Simple single-goal automations
-- Quick prototyping
-
+See [Workflow Blocks](/workflows/workflow-blocks-details) for the full block reference.
 
 ---
 
 ## Blocks
 
-**Blocks** are the building units of workflows. Each block type handles a specific automation task. Blocks execute sequentially, and each can produce outputs that subsequent blocks reference.
+Blocks are the building units of workflows. Each block performs one specific task, and blocks execute sequentially—each can reference outputs from previous blocks.
 
 ### Navigation & Interaction
 
 | Block | Purpose |
 |-------|---------|
-| **Navigation** | Navigate toward a goal using AI—Skyvern figures out the clicks and inputs |
+| **Navigation** | AI-guided navigation toward a goal—Skyvern figures out the clicks and inputs |
 | **Action** | Perform a single specific action (click, type, select, upload) |
-| **URL** | Navigate directly to a specific URL |
+| **Go to URL** | Navigate directly to a specific URL |
 | **Login** | Authenticate using stored credentials |
 | **Wait** | Pause execution for a specified duration |
+| **Human Interaction** | Pause for manual intervention (CAPTCHA, approval, etc.) |
 
 ### Data & Files
 
@@ -121,7 +112,7 @@ Workflows support parameterization using Jinja syntax. Blocks can reference:
 |-------|---------|
 | **Extract** | Pull structured data from a page into JSON |
 | **File Download** | Download files from websites |
-| **File Upload** | Upload files to S3 or other destinations |
+| **File Upload** | Upload files to form fields |
 | **File Parser** | Process PDFs, CSVs, and Excel files |
 | **PDF Parser** | Specialized PDF text extraction |
 
@@ -129,43 +120,46 @@ Workflows support parameterization using Jinja syntax. Blocks can reference:
 
 | Block | Purpose |
 |-------|---------|
-| **Validation** | Assert conditions; halt workflow on failure |
+| **Conditional** | Branch workflow based on conditions (if/else) |
 | **For Loop** | Repeat a sequence of blocks over a list |
+| **Validation** | Assert conditions; halt workflow on failure |
 | **Code** | Execute custom Python/Playwright scripts |
 
-### Communication
+### Communication & Integration
 
 | Block | Purpose |
 |-------|---------|
+| **HTTP Request** | Make API calls to external services |
 | **Text Prompt** | Text-only LLM prompt (no browser interaction) |
 | **Send Email** | Send email messages |
 
+For detailed block configuration, see [Workflow Blocks](/workflows/workflow-blocks-details).
 
 ---
 
 ## Runs
 
-A **Run** is an execution instance of a task or workflow. Every time you execute a task or workflow, Skyvern creates a run to track its progress and store outputs.
+Every time you execute a task or workflow, Skyvern creates a **Run** to track progress and store outputs.
+
+```
+                    ┌→ completed
+                    │
+created → queued → running ─┼→ failed
+                    │
+                    ├→ timed_out
+                    │
+                    └→ canceled
+```
 
 ```python
-# Run a task synchronously (blocks until complete)
 result = await skyvern.run_task(
-    url="https://example.com",
-    prompt="Extract the main heading"
+    prompt="Extract the main heading",
+    url="https://example.com"
 )
 
 print(result.run_id)   # "tsk_abc123"
 print(result.status)   # "completed"
 print(result.output)   # {"heading": "Welcome"}
-```
-
-**Lifecycle:**
-
-```
-created → queued → running ─┬→ completed
-                            ├→ failed
-                            ├→ timed_out
-                            └→ canceled
 ```
 
 **Run identifiers:**
@@ -185,206 +179,226 @@ created → queued → running ─┬→ completed
 | `failure_reason` | Error details if failed |
 | `step_count` | Number of steps taken |
 
-**Billing note:** You're billed per step. Use `max_steps` to cap costs. A step is one AI decision + action cycle.
+<Warning>
+**Billing:** You're billed per step. A step is one AI decision + action cycle. Use `max_steps` to cap costs during development.
+</Warning>
 
 ---
 
 ## Credentials
 
-**Credentials** provide secure storage for authentication data. Skyvern encrypts credentials at rest and in transit, and injects them directly into the browser during execution—**credentials are never sent to or seen by the LLM**.
+Credentials provide secure storage for authentication data. Skyvern encrypts credentials at rest and in transit, and injects them directly into the browser—**credentials are never sent to or seen by the LLM**.
 
-```python
-# Credentials are referenced by ID in workflows, not by value
-# The Login block handles injection automatically
-
-# In the Skyvern UI or API, you create a credential:
-# → credential_id: "cred_xyz789"
-
-# Then reference it in your workflow's Login block:
-# → credential_parameter: "cred_xyz789"
 ```
-
-**Security model:**
-1. You store credentials in Skyvern (or connect an external vault)
-2. Credentials are encrypted and never logged
-3. During execution, Skyvern injects values directly into form fields
-4. The LLM sees only that a login happened—never the actual secrets
+┌─────────────────────────────────────────────────────────────┐
+│                    SECURITY MODEL                           │
+│                                                             │
+│  You store credentials      Skyvern encrypts & stores       │
+│         │                            │                      │
+│         ▼                            ▼                      │
+│  ┌─────────────┐             ┌─────────────────┐            │
+│  │ Skyvern UI  │             │ Encrypted Vault │            │
+│  │ or API      │ ─────────── │ (or Bitwarden,  │            │
+│  └─────────────┘             │  1Password)     │            │
+│                              └────────┬────────┘            │
+│                                       │                     │
+│                                       ▼                     │
+│                              ┌─────────────────┐            │
+│                              │ Login Block     │            │
+│                              │ injects into    │            │
+│                              │ browser fields  │            │
+│                              └─────────────────┘            │
+│                                       │                     │
+│                    LLM sees: "login happened"               │
+│                    LLM never sees: actual credentials       │
+└─────────────────────────────────────────────────────────────┘
+```
 
 **Supported credential types:**
 - Usernames and passwords
 - TOTP codes (authenticator apps)
-- SMS/email verification codes
-- Credit cards (Visa, Mastercard)
+- Credit cards
 
-**External vault integrations:**
-- Bitwarden
-- 1Password
-- Custom HTTP APIs
-- *Coming soon:* LastPass, Keeper, Azure Key Vault, AWS Secrets Manager
+**Credential sources:**
+- **Skyvern** — Native encrypted storage
+- **Bitwarden** — Sync from your Bitwarden vault
+- **1Password** — Sync from your 1Password vault
+- **Azure Key Vault** — Enterprise secret management
+
+See [Credentials](/credentials/introduction) for setup instructions.
 
 ---
 
-## Browser Sessions
+## Browser Sessions & Profiles
 
-A **Browser Session** is a live browser instance that maintains state across multiple tasks or workflow runs. The session persists cookies, local storage, authentication, and navigation history in real-time.
+Skyvern offers two ways to manage browser state across runs:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                             │
+│   BROWSER SESSION                  BROWSER PROFILE          │
+│   (live, temporary)                (saved, reusable)        │
+│                                                             │
+│   ┌─────────────┐                 ┌─────────────┐           │
+│   │  Active     │   ──save──▶     │  Snapshot   │           │
+│   │  Browser    │                 │  of state   │           │
+│   │  Instance   │   ◀──restore──  │  (cookies,  │           │
+│   └─────────────┘                 │  storage)   │           │
+│                                   └─────────────┘           │
+│   • Expires after timeout         • Persists indefinitely  │
+│   • For real-time chaining        • For skipping login     │
+│   • Max 24 hours                  • Shared across team     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Browser Sessions
+
+A live browser instance that maintains state across multiple tasks. Use sessions when you need to chain tasks in real-time or allow human intervention.
 
 ```python
-# Create a session (lives for 60 minutes by default)
-browser_session = await skyvern.create_browser_session(timeout=120)
+# Create a session (default: 60 minutes, max: 24 hours)
+session = await skyvern.create_browser_session(timeout=120)
 
-# Run multiple tasks in the same session
+# Run tasks in the same session
 await skyvern.run_task(
-    url="https://example.com/login",
     prompt="Log in with the test account",
-    browser_session_id=browser_session.browser_session_id
+    url="https://example.com/login",
+    browser_session_id=session.browser_session_id
 )
 
 # Second task reuses the authenticated state
 await skyvern.run_task(
-    url="https://example.com/dashboard",
     prompt="Extract the account balance",
-    browser_session_id=browser_session.browser_session_id
+    url="https://example.com/dashboard",
+    browser_session_id=session.browser_session_id
 )
 
 # Clean up
 await skyvern.close_browser_session(
-    browser_session_id=browser_session.browser_session_id
+    browser_session_id=session.browser_session_id
 )
 ```
 
-**When to use Browser Sessions:**
-- Running multiple tasks that share authentication
-- Human-in-the-loop workflows needing live intervention
-- Chaining tasks without re-authenticating between each
+**Session limits:** 5 to 1,440 minutes (24 hours max). Default: 60 minutes.
 
-**Session limits:**
-- Timeout: 5 to 10,080 minutes (7 days max)
-- Default: 60 minutes
-- Available via API/SDK only (not in UI)
+### Browser Profiles
 
----
-
-## Browser Profiles
-
-A **Browser Profile** is a saved snapshot of browser state. Unlike sessions (which are live and temporary), profiles are persistent and reusable—perfect for skipping login steps in future runs.
+A saved snapshot of browser state. Unlike sessions, profiles persist indefinitely and can be reused across days or weeks—perfect for skipping login on repeated runs.
 
 ```python
-# Method 1: Create from a completed workflow run
-run = await skyvern.run_workflow(
-    workflow_id="wpid_login_flow",
-    persist_browser_session=True  # Keep state after completion
-)
-
-profile = skyvern.browser_profiles.create_browser_profile(
+# Create a profile from a completed run
+profile = await skyvern.browser_profiles.create_browser_profile(
     name="my-authenticated-profile",
     workflow_run_id=run.run_id
 )
 
-# Method 2: Create from an active session
-profile = skyvern.browser_profiles.create_browser_profile(
-    name="my-authenticated-profile",
-    browser_session_id=browser_session.browser_session_id
-)
-
-# Use the profile in future runs (skips login entirely)
+# Future runs restore the authenticated state
 await skyvern.run_workflow(
     workflow_id="wpid_extract_data",
-    browser_profile_id=profile.browser_profile_id  # Restores authenticated state
+    browser_profile_id=profile.browser_profile_id
 )
 ```
 
-**What's saved:**
-- Cookies and authentication tokens
-- Local storage and session storage
-- Browser preferences
+**What's saved:** Cookies, authentication tokens, local storage, session storage.
 
-**When to use Browser Profiles:**
-- Workflows that run daily/weekly on the same account
-- Sharing authenticated state across your team (profiles are org-scoped)
-- Avoiding repeated login steps and 2FA prompts
-
-**When to use Sessions instead:**
-- You need a live, interactive browser
-- State only needs to persist for the current session
-- You're chaining tasks in real-time
+See [Browser Sessions](/browser-sessions/introduction) for details.
 
 ---
 
 ## Artifacts
 
-**Artifacts** are the outputs generated during execution. Every run produces artifacts for observability, debugging, and audit trails.
+Every run generates artifacts for observability, debugging, and audit trails.
 
 ```python
-# Artifacts are included in the run response
 result = await skyvern.run_task(
-    url="https://example.com",
-    prompt="Download the quarterly report"
+    prompt="Download the quarterly report",
+    url="https://example.com"
 )
 
-# Access artifacts directly from the result
 print(result.recording_url)      # Full video of execution
 print(result.screenshot_urls)    # List of screenshot URLs
 print(result.downloaded_files)   # [{"url": "...", "checksum": "..."}]
 ```
 
-**Artifact types:**
+| Artifact | Description |
+|----------|-------------|
+| **Recordings** | End-to-end video of the entire run |
+| **Screenshots** | Captured after each action |
+| **Downloaded files** | Files retrieved during execution |
+| **Logs** | JSON-structured logs at step, task, and workflow levels |
+| **HAR files** | HTTP Archive data for network debugging |
 
-| Artifact | Description | Access |
-|----------|-------------|--------|
-| **Recordings** | End-to-end video of the entire run | `run.recording_url` |
-| **Screenshots** | Captured after each action | `run.screenshot_urls` |
-| **Downloaded files** | Files retrieved during execution | `run.downloaded_files` |
-| **Logs** | JSON-structured logs (step, task, workflow levels) | UI → Run History |
-| **HAR files** | HTTP Archive data for network debugging | UI → Run History |
-
-**In the Skyvern UI:**
-1. Go to **Run History**
-2. Click on a run
-3. View recordings, screenshots, and logs in the **Artifacts** tab
-
-Artifacts are stored in your configured storage (S3, Azure Blob, or local filesystem for self-hosted).
+In the Skyvern UI, go to **Runs** → click a run → view the **Actions** and **Recording** tabs.
 
 ---
 
-## How It All Fits Together
+## Engines
 
-**The execution hierarchy:**
+Skyvern supports multiple AI engines for task execution:
 
-```
-WORKFLOW (reusable template)
-    └── contains BLOCKS (sequential steps)
-            └── produces a RUN (execution instance)
-                    └── generates ARTIFACTS (recordings, screenshots, logs)
-```
+| Engine | Description |
+|--------|-------------|
+| `skyvern-2.0` | Latest Skyvern model (default, recommended) |
+| `skyvern-1.0` | Previous Skyvern model |
+| `openai-cua` | OpenAI Computer Use Agent |
+| `anthropic-cua` | Anthropic Computer Use Agent |
+| `ui-tars` | UI-TARS model |
 
-**State management:**
+Specify the engine when running a task:
 
-```
-BROWSER SESSION (live, temporary)
-    └── can be saved as → BROWSER PROFILE (persistent, reusable)
-```
-
-**Security layer:**
-
-```
-CREDENTIALS (encrypted, never exposed to LLM)
-    └── injected into → LOGIN BLOCK → authenticates the browser
+```python
+result = await skyvern.run_task(
+    prompt="Extract pricing data",
+    url="https://example.com",
+    engine="skyvern-2.0"
+)
 ```
 
-**Choosing the right approach:**
+---
 
-| Scenario | Use |
-|----------|-----|
-| One-off automation | Task |
-| Reusable multi-step process | Workflow |
-| Need live browser between runs | Browser Session |
-| Skip login on repeated runs | Browser Profile |
-| Store secrets securely | Credentials |
+## Quick Reference
+
+| I want to... | Use |
+|--------------|-----|
+| Run a one-off automation | [Task](#tasks) |
+| Build a reusable multi-step process | [Workflow](#workflows) |
+| Keep a browser open between tasks | [Browser Session](#browser-sessions) |
+| Skip login on repeated runs | [Browser Profile](#browser-profiles) |
+| Store secrets securely | [Credentials](#credentials) |
+| Debug a failed run | [Artifacts](#artifacts) |
 
 ---
 
 ## Next Steps
 
-- [Quickstart: Run your first task →](https://www.skyvern.com/docs/getting-started/quickstart)
-- [Build your first workflow →](https://www.skyvern.com/docs/workflows/run-workflows)
-- [API Reference →](https://www.skyvern.com/docs/api-reference)
+<CardGroup cols={2}>
+  <Card
+    title="API Quickstart"
+    icon="rocket"
+    href="/getting-started/quickstart"
+  >
+    Run your first task in 5 minutes
+  </Card>
+  <Card
+    title="Build Workflows"
+    icon="diagram-project"
+    href="/workflows/run-workflows"
+  >
+    Create multi-step automations
+  </Card>
+  <Card
+    title="Workflow Blocks"
+    icon="cube"
+    href="/workflows/workflow-blocks-details"
+  >
+    Full reference for all block types
+  </Card>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="/api-reference"
+  >
+    Complete API documentation
+  </Card>
+</CardGroup>
