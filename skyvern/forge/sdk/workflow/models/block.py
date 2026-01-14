@@ -11,13 +11,14 @@ import smtplib
 import textwrap
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
 from urllib.parse import quote, urlparse
 
+import aiofiles
 import aiohttp
 import filetype
 import pandas as pd
@@ -66,6 +67,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -4474,6 +4476,189 @@ class HttpRequestBlock(Block):
             )
 
 
+class PrintPageBlock(Block):
+    block_type: Literal[BlockType.PRINT_PAGE] = BlockType.PRINT_PAGE  # type: ignore
+
+    include_timestamp: bool = True
+    custom_filename: str | None = None
+    format: str = "A4"
+    landscape: bool = False
+    print_background: bool = True
+
+    VALID_FORMATS: ClassVar[set[str]] = {"A4", "Letter", "Legal", "Tabloid"}
+
+    def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
+        return []
+
+    @staticmethod
+    def _sanitize_filename(filename: str) -> str:
+        sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename)
+        sanitized = sanitized.strip(". ")
+        return sanitized[:200] if sanitized else "document"
+
+    def _build_pdf_options(self) -> dict[str, Any]:
+        pdf_format = self.format if self.format in self.VALID_FORMATS else "A4"
+        pdf_options: dict[str, Any] = {
+            "format": pdf_format,
+            "landscape": self.landscape,
+            "print_background": self.print_background,
+        }
+
+        if self.include_timestamp:
+            pdf_options["display_header_footer"] = True
+            pdf_options["header_template"] = (
+                '<div style="font-size:10px;width:100%;display:flex;justify-content:space-between;padding:0 10px;">'
+                '<span class="date"></span><span class="title"></span><span></span></div>'
+            )
+            pdf_options["footer_template"] = (
+                '<div style="font-size:10px;width:100%;display:flex;justify-content:space-between;padding:0 10px;">'
+                '<span class="url"></span><span></span><span><span class="pageNumber"></span>/<span class="totalPages"></span></span></div>'
+            )
+            pdf_options["margin"] = {"top": "40px", "bottom": "40px"}
+
+        return pdf_options
+
+    async def _upload_pdf_artifact(
+        self,
+        *,
+        pdf_bytes: bytes,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: WorkflowRunContext,
+        organization_id: str | None,
+    ) -> str | None:
+        artifact_org_id = organization_id or workflow_run_context.organization_id
+        if not artifact_org_id:
+            LOG.warning(
+                "PrintPageBlock: Missing organization_id, skipping artifact upload",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return None
+
+        try:
+            workflow_run_block = await app.DATABASE.get_workflow_run_block(
+                workflow_run_block_id,
+                organization_id=artifact_org_id,
+            )
+        except NotFoundError:
+            LOG.warning(
+                "PrintPageBlock: Workflow run block not found, skipping artifact upload",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=artifact_org_id,
+            )
+            return None
+
+        _, artifact_uri = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact_with_uri(
+            workflow_run_block=workflow_run_block,
+            artifact_type=ArtifactType.PDF,
+            data=pdf_bytes,
+        )
+        try:
+            await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([workflow_run_block.workflow_run_block_id])
+        except Exception:
+            LOG.warning(
+                "PrintPageBlock: Failed to upload PDF artifact",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block.workflow_run_block_id,
+                exc_info=True,
+            )
+            return None
+
+        return artifact_uri
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+        if not browser_state:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No browser state available",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        page = await browser_state.get_working_page()
+        if not page:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No page available",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        pdf_options = self._build_pdf_options()
+
+        try:
+            pdf_bytes = await page.pdf(**pdf_options)
+        except Exception as e:
+            error_msg = str(e)
+            if "pdf" in error_msg.lower() and ("not supported" in error_msg.lower() or "chromium" in error_msg.lower()):
+                error_msg = "PDF generation requires Chromium browser. Current browser does not support page.pdf()."
+            LOG.warning("PrintPageBlock: Failed to generate PDF", error=error_msg, workflow_run_id=workflow_run_id)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to generate PDF: {error_msg}",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        if self.custom_filename:
+            filename = self.format_block_parameter_template_from_workflow_run_context(
+                self.custom_filename, workflow_run_context
+            )
+            filename = self._sanitize_filename(filename)
+            if not filename.endswith(".pdf"):
+                filename += ".pdf"
+        else:
+            filename = f"page_{timestamp_str}.pdf"
+
+        # Save PDF to download directory so it appears in runs UI
+        download_dir = get_download_dir(workflow_run_id)
+        file_path = os.path.join(download_dir, filename)
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(pdf_bytes)
+
+        # Upload to artifact storage for downstream block access (e.g., File Extraction Block)
+        artifact_uri = await self._upload_pdf_artifact(
+            pdf_bytes=pdf_bytes,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_context=workflow_run_context,
+            organization_id=organization_id,
+        )
+
+        output = {
+            "filename": filename,
+            "file_path": file_path,
+            "size_bytes": len(pdf_bytes),
+            "artifact_uri": artifact_uri,
+        }
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
+
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=output,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
 class BranchEvaluationContext:
     """Collection of runtime data that BranchCriteria evaluators can consume."""
 
@@ -5246,6 +5431,7 @@ BlockSubclasses = Union[
     TaskV2Block,
     FileUploadBlock,
     HttpRequestBlock,
+    PrintPageBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

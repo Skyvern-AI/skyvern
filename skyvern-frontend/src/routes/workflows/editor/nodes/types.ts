@@ -66,4 +66,5 @@ export const workflowBlockTitle: {
   task_v2: "Browser Task v2",
   goto_url: "Go to URL",
   http_request: "HTTP Request",
+  print_page: "Print Page",
 };
