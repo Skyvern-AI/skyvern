@@ -144,9 +144,11 @@ Every time you execute a task or workflow, Skyvern creates a **Run** to track pr
 ```
                     ┌→ completed
                     │
-created → queued → running ─┼→ failed
+                    ├→ failed
                     │
-                    ├→ timed_out
+created → queued → running ─┼→ timed_out
+                    │
+                    ├→ terminated
                     │
                     └→ canceled
 ```

@@ -133,7 +133,7 @@ async def main():
         run = await client.get_run(run_id)
         print(f"Status: {run.status}")
 
-        if run.status in ["completed", "failed", "terminated"]:
+        if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
             break
 
         await asyncio.sleep(5)
@@ -166,7 +166,7 @@ async function main() {
     const run = await client.getRun(runId);
     console.log(`Status: ${run.status}`);
 
-    if (["completed", "failed", "terminated"].includes(run.status)) {
+    if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
       console.log(`Output: ${JSON.stringify(run.output)}`);
       break;
     }
@@ -222,9 +222,9 @@ The `recording_url` field is included in every completed run response:
 
 ```json
 {
-  "run_id": "r_abc123",
+  "run_id": "tsk_v2_484019301257171242",
   "status": "completed",
-  "recording_url": "https://app.skyvern.com/runs/r_abc123"
+  "recording_url": "https://skyvern-artifacts.s3.amazonaws.com/v1/production/.../recording.webm?AWSAccessKeyId=...&Signature=...&Expires=..."
 }
 ```
 
