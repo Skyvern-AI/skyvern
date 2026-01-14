@@ -337,23 +337,34 @@ function WorkflowParameterEditPanel({
           {type === "credential" && credentialType === "bitwarden" && (
             <>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">
-                  URL Parameter Key
-                </Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    URL Parameter Key
+                  </Label>
+                  <HelpTooltip content="Optional. The workflow parameter key that holds the URL. If provided, Skyvern will match the credential based on this URL." />
+                </div>
                 <Input
                   value={urlParameterKey}
                   onChange={(e) => setUrlParameterKey(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Collection ID</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Collection ID
+                  </Label>
+                  <HelpTooltip content="The Bitwarden collection ID. You can find this in the URL when viewing a collection in Bitwarden." />
+                </div>
                 <Input
                   value={bitwardenCollectionId}
                   onChange={(e) => setBitwardenCollectionId(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Item ID</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Item ID</Label>
+                  <HelpTooltip content="The Bitwarden item ID. You can find this in the URL when viewing the item in Bitwarden." />
+                </div>
                 <Input
                   value={bitwardenLoginCredentialItemId}
                   onChange={(e) =>
@@ -397,14 +408,20 @@ function WorkflowParameterEditPanel({
           {type === "credential" && credentialType === "azurevault" && (
             <>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Vault Name</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Vault Name</Label>
+                  <HelpTooltip content="The name of your Azure Key Vault instance." />
+                </div>
                 <Input
                   value={azureVaultName}
                   onChange={(e) => setAzureVaultName(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Username Key</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Username Key</Label>
+                  <HelpTooltip content="The secret name in Azure Key Vault that stores the username." />
+                </div>
                 <Input
                   autoComplete="off"
                   value={azureUsernameKey}
@@ -412,16 +429,22 @@ function WorkflowParameterEditPanel({
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Password Key</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Password Key</Label>
+                  <HelpTooltip content="The secret name in Azure Key Vault that stores the password." />
+                </div>
                 <Input
                   value={azurePasswordKey}
                   onChange={(e) => setAzurePasswordKey(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">
-                  TOTP Secret Key
-                </Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    TOTP Secret Key
+                  </Label>
+                  <HelpTooltip content="Optional. The secret name in Azure Key Vault that stores the TOTP secret for two-factor authentication." />
+                </div>
                 <Input
                   value={azureTotpSecretKey}
                   onChange={(e) => setAzureTotpKey(e.target.value)}
