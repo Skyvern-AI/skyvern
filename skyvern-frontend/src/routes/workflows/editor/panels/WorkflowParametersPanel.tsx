@@ -31,6 +31,10 @@ import {
   WorkflowEditorParameterTypes,
 } from "../../types/workflowTypes";
 import { getLabelForWorkflowParameterType } from "../workflowEditorUtils";
+import {
+  replaceVariableInNodes,
+  removeVariableFromNodes,
+} from "../referenceTracking";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
@@ -195,7 +199,14 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                                 );
                                 setHasChanges(true);
                                 setNodes((nodes) => {
-                                  return nodes.map((node) => {
+                                  // First, remove inline {{ parameter.key }} references
+                                  let updatedNodes = removeVariableFromNodes(
+                                    nodes,
+                                    parameter.key,
+                                  );
+
+                                  // Then, remove from parameterKeys arrays
+                                  return updatedNodes.map((node) => {
                                     // All node types that have parameterKeys
                                     if (
                                       node.type === "task" ||
@@ -279,6 +290,10 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                   type={operationPanelState.type}
                   initialValues={operationPanelState.parameter}
                   onSave={(editedParameter) => {
+                    const oldKey = operationPanelState.parameter?.key;
+                    const newKey = editedParameter.key;
+                    const keyChanged = oldKey && newKey && oldKey !== newKey;
+
                     setHasChanges(true);
                     setWorkflowParameters(
                       workflowParameters.map((parameter) => {
@@ -301,7 +316,13 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                       }),
                     );
                     setNodes((nodes) => {
-                      return nodes.map((node) => {
+                      // First, update inline {{ old_key }} references to {{ new_key }}
+                      let updatedNodes = keyChanged
+                        ? replaceVariableInNodes(nodes, oldKey, newKey)
+                        : nodes;
+
+                      // Then, update parameterKeys arrays
+                      return updatedNodes.map((node) => {
                         // All node types that have parameterKeys
                         if (
                           node.type === "task" ||

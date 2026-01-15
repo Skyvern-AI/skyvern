@@ -93,6 +93,7 @@ import {
 import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
+import { removeVariableFromNodes } from "./referenceTracking";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -490,8 +491,15 @@ function FlowRenderer({
       return;
     }
 
+    // First, remove inline {{ deleted_block_output }} references from all remaining nodes
+    const deletedOutputKey = getOutputParameterKey(deletedNodeLabel);
+    const nodesWithRemovedInlineRefs = removeVariableFromNodes(
+      newNodes,
+      deletedOutputKey,
+    );
+
     // if any node was using the output parameter of the deleted node, remove it from their parameter keys
-    const newNodesWithUpdatedParameters = newNodes.map((node) => {
+    const newNodesWithUpdatedParameters = nodesWithRemovedInlineRefs.map((node) => {
       if (node.type === "task") {
         return {
           ...node,
