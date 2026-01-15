@@ -109,6 +109,11 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
     if value.startswith("{"):
         try:
             data = json.loads(value)
+            # Handle malformed subdivision (e.g., boolean instead of string)
+            subdivision = data.get("subdivision")
+            if subdivision is not None and not isinstance(subdivision, str):
+                LOG.warning("Malformed subdivision in proxy_location", db_value=value, subdivision=subdivision)
+                data["subdivision"] = None
             result = GeoTarget.model_validate(data)
             LOG.info(
                 "Deserialized proxy_location as GeoTarget",
@@ -116,8 +121,8 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
                 result=str(result),
             )
             return result
-        except (json.JSONDecodeError, ValueError):
-            pass
+        except (json.JSONDecodeError, ValueError) as e:
+            LOG.warning("Failed to parse proxy_location as GeoTarget", db_value=value, error=str(e))
 
     # Try as ProxyLocation enum
     try:
