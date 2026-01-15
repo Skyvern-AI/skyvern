@@ -948,7 +948,7 @@ class DebugSessionModel(Base):
 
     debug_session_id = Column(String, primary_key=True, default=generate_debug_session_id)
     organization_id = Column(String, nullable=False)
-    browser_session_id = Column(String, nullable=False)
+    browser_session_id = Column(String, nullable=False, index=True)
     vnc_streaming_supported = Column(Boolean, nullable=True, server_default=sqlalchemy.true())
     workflow_permanent_id = Column(String, nullable=True)
     user_id = Column(String, nullable=True)  # comes from identity vendor (Clerk at time of writing)
