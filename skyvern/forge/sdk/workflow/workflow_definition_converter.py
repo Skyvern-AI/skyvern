@@ -85,10 +85,8 @@ LOG = structlog.get_logger()
 
 
 def convert_workflow_definition(
-    workflow_id: str,
     workflow_definition_yaml: WorkflowDefinitionYAML,
-    title: str,
-    organization_id: str,
+    workflow_id: str,
 ) -> WorkflowDefinition:
     # Create parameters from the request
     parameters: dict[str, PARAMETER_TYPE] = {}
@@ -311,11 +309,9 @@ def convert_workflow_definition(
     )
 
     LOG.info(
-        f"Created workflow from request, title: {title}",
+        "Created workflow from request",
         parameter_keys=[parameter.key for parameter in parameters.values()],
         block_labels=[block.label for block in blocks],
-        organization_id=organization_id,
-        title=title,
         workflow_id=workflow_id,
     )
 

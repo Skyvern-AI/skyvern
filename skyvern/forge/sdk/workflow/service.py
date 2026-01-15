@@ -2981,14 +2981,10 @@ class WorkflowService:
         self,
         workflow_id: str,
         workflow_definition_yaml: WorkflowDefinitionYAML,
-        title: str,
-        organization_id: str,
     ) -> WorkflowDefinition:
         workflow_definition = convert_workflow_definition(
-            workflow_id=workflow_id,
             workflow_definition_yaml=workflow_definition_yaml,
-            title=title,
-            organization_id=organization_id,
+            workflow_id=workflow_id,
         )
 
         await app.DATABASE.save_workflow_definition_parameters(workflow_definition.parameters)
@@ -3080,8 +3076,6 @@ class WorkflowService:
             workflow_definition = await self.make_workflow_definition(
                 potential_workflow.workflow_id,
                 request.workflow_definition,
-                request.title,
-                organization_id,
             )
 
             updated_workflow = await self.update_workflow_definition(

@@ -7,14 +7,16 @@ import { ReloadIcon, Cross2Icon } from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
+import { WorkflowDefinition } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
   WorkflowCopilotChatHistoryResponse,
   WorkflowCopilotProcessingUpdate,
-  WorkflowCopilotStreamError,
-  WorkflowCopilotStreamResponse,
+  WorkflowCopilotStreamErrorUpdate,
+  WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotChatSender,
+  WorkflowCopilotChatRequest,
 } from "./workflowCopilotTypes";
 
 interface ChatMessage {
@@ -26,8 +28,8 @@ interface ChatMessage {
 
 type WorkflowCopilotSsePayload =
   | WorkflowCopilotProcessingUpdate
-  | WorkflowCopilotStreamResponse
-  | WorkflowCopilotStreamError;
+  | WorkflowCopilotStreamResponseUpdate
+  | WorkflowCopilotStreamErrorUpdate;
 
 const formatChatTimestamp = (value: string) => {
   let normalizedValue = value.replace(/\.(\d{3})\d*/, ".$1");
@@ -65,7 +67,7 @@ const MessageItem = memo(({ message }: { message: ChatMessage }) => {
 });
 
 interface WorkflowCopilotChatProps {
-  onWorkflowUpdate?: (workflowYaml: string) => void;
+  onWorkflowUpdate?: (workflow: WorkflowDefinition) => void;
   isOpen?: boolean;
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
@@ -317,7 +319,17 @@ export function WorkflowCopilotChat({
 
     try {
       const saveData = getSaveData();
+      const workflowId = saveData?.workflow.workflow_id;
       let workflowYaml = "";
+
+      if (!workflowId) {
+        toast({
+          title: "Missing workflow",
+          description: "Workflow ID is required to chat.",
+          variant: "destructive",
+        });
+        return;
+      }
 
       if (saveData) {
         const extraHttpHeaders: Record<string, string> = {};
@@ -397,7 +409,9 @@ export function WorkflowCopilotChat({
         );
       };
 
-      const handleResponse = (response: WorkflowCopilotStreamResponse) => {
+      const handleResponse = (
+        response: WorkflowCopilotStreamResponseUpdate,
+      ) => {
         setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
 
         const aiMessage: ChatMessage = {
@@ -409,9 +423,9 @@ export function WorkflowCopilotChat({
 
         setMessages((prev) => [...prev, aiMessage]);
 
-        if (response.updated_workflow_yaml && onWorkflowUpdate) {
+        if (response.updated_workflow && onWorkflowUpdate) {
           try {
-            onWorkflowUpdate(response.updated_workflow_yaml);
+            onWorkflowUpdate(response.updated_workflow as WorkflowDefinition);
           } catch (updateError) {
             console.error("Failed to update workflow:", updateError);
             toast({
@@ -424,7 +438,7 @@ export function WorkflowCopilotChat({
         }
       };
 
-      const handleError = (payload: WorkflowCopilotStreamError) => {
+      const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
         const errorMessage: ChatMessage = {
           id: Date.now().toString(),
           sender: "ai",
@@ -437,12 +451,13 @@ export function WorkflowCopilotChat({
       await client.postStreaming<WorkflowCopilotSsePayload>(
         "/workflow/copilot/chat-post",
         {
+          workflow_id: workflowId,
           workflow_permanent_id: workflowPermanentId,
           workflow_copilot_chat_id: workflowCopilotChatId,
           workflow_run_id: workflowRunId,
           message: messageContent,
           workflow_yaml: workflowYaml,
-        },
+        } as WorkflowCopilotChatRequest,
         (payload) => {
           switch (payload.type) {
             case "processing_update":
