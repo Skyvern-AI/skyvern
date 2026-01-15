@@ -87,11 +87,7 @@ import { getWorkflowErrors, getElements } from "./workflowEditorUtils";
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
-import {
-  WorkflowApiResponse,
-  WorkflowBlock,
-  WorkflowSettings,
-} from "../types/workflowTypes";
+import { WorkflowApiResponse, WorkflowSettings } from "../types/workflowTypes";
 import { ProxyLocation } from "@/api/types";
 import {
   nodeAdderNode,
@@ -100,16 +96,10 @@ import {
   generateNodeLabel,
   layout,
   startNode,
-  upgradeWorkflowBlocksV1toV2,
 } from "./workflowEditorUtils";
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
-import { parse as parseYAML } from "yaml";
-import {
-  BlockYAML,
-  WorkflowCreateYAMLRequest,
-} from "../types/workflowYamlTypes";
 import "./workspace-styles.css";
 
 const Constants = {
@@ -1664,68 +1654,36 @@ function Workspace({
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
-        onWorkflowUpdate={(workflowYaml) => {
+        onWorkflowUpdate={(workflowData) => {
           try {
-            const parsedYaml = parseYAML(
-              workflowYaml,
-            ) as WorkflowCreateYAMLRequest;
+            const saveData = workflowChangesStore.getSaveData?.();
 
             const settings: WorkflowSettings = {
               proxyLocation:
-                parsedYaml.proxy_location || ProxyLocation.Residential,
-              webhookCallbackUrl: parsedYaml.webhook_callback_url || "",
+                saveData?.settings.proxyLocation || ProxyLocation.Residential,
+              webhookCallbackUrl: saveData?.settings.webhookCallbackUrl || "",
               persistBrowserSession:
-                parsedYaml.persist_browser_session ?? false,
-              model: parsedYaml.model ?? null,
-              maxScreenshotScrolls: parsedYaml.max_screenshot_scrolls || 3,
-              extraHttpHeaders: parsedYaml.extra_http_headers
-                ? JSON.stringify(parsedYaml.extra_http_headers)
-                : null,
-              runWith: parsedYaml.run_with ?? null,
-              scriptCacheKey: parsedYaml.cache_key ?? null,
-              aiFallback: parsedYaml.ai_fallback ?? true,
-              runSequentially: parsedYaml.run_sequentially ?? false,
-              sequentialKey: parsedYaml.sequential_key ?? null,
-              finallyBlockLabel:
-                parsedYaml.workflow_definition?.finally_block_label ?? null,
+                saveData?.settings.persistBrowserSession ?? false,
+              model: saveData?.settings.model ?? null,
+              maxScreenshotScrolls:
+                saveData?.settings.maxScreenshotScrolls || 3,
+              extraHttpHeaders: saveData?.settings.extraHttpHeaders ?? null,
+              runWith: saveData?.settings.runWith ?? null,
+              scriptCacheKey: saveData?.settings.scriptCacheKey ?? null,
+              aiFallback: saveData?.settings.aiFallback ?? true,
+              runSequentially: saveData?.settings.runSequentially ?? false,
+              sequentialKey: saveData?.settings.sequentialKey ?? null,
+              finallyBlockLabel: workflowData?.finally_block_label ?? null,
             };
 
-            // Convert YAML blocks to internal format
-            // YAML has parameter_keys (array of strings), internal format has parameters (array of objects)
-            let blocks = (parsedYaml.workflow_definition?.blocks || []).map(
-              (block: BlockYAML) => {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const convertedBlock = { ...block } as any;
-
-                // Convert parameter_keys to parameters format
-                if ("parameter_keys" in block) {
-                  convertedBlock.parameters = (block.parameter_keys || []).map(
-                    (key: string) => ({
-                      key,
-                      parameter_type: "workflow",
-                    }),
-                  );
-                }
-
-                return convertedBlock;
-              },
-            ) as WorkflowBlock[];
-
-            // Auto-upgrade v1 workflows to v2 by assigning sequential next_block_label values
-            const workflowVersion =
-              parsedYaml.workflow_definition?.version ?? 1;
-            if (workflowVersion < 2) {
-              blocks = upgradeWorkflowBlocksV1toV2(blocks);
-            }
-
-            const elements = getElements(blocks, settings, true);
+            const elements = getElements(workflowData.blocks, settings, true);
 
             setNodes(elements.nodes);
             setEdges(elements.edges);
 
             const initialParameters = getInitialParameters({
               workflow_definition: {
-                parameters: parsedYaml.workflow_definition?.parameters || [],
+                parameters: workflowData.parameters,
               },
             } as WorkflowApiResponse);
             useWorkflowParametersStore
@@ -1734,11 +1692,14 @@ function Workspace({
 
             workflowChangesStore.setHasChanges(true);
           } catch (error) {
-            console.error("Failed to parse and apply workflow YAML", error);
-            console.log("YAML:", workflowYaml);
+            console.error(
+              "Failed to parse and apply workflow",
+              error,
+              workflowData,
+            );
             toast({
               title: "Update failed",
-              description: "Failed to parse workflow YAML. Please try again.",
+              description: "Failed to apply workflow update. Please try again.",
               variant: "destructive",
             });
           }

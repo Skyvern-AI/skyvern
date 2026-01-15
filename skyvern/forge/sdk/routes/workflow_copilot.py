@@ -2,7 +2,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import AsyncGenerator
 
 import structlog
 import yaml
@@ -29,7 +29,13 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamResponseUpdate,
 )
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.schemas.workflows import LoginBlockYAML, WorkflowCreateYAMLRequest
+from skyvern.forge.sdk.workflow.models.parameter import ParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
+from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.workflows import (
+    LoginBlockYAML,
+    WorkflowCreateYAMLRequest,
+)
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
 CHAT_HISTORY_CONTEXT_MESSAGES = 10
@@ -88,7 +94,7 @@ async def copilot_call_llm(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str | None,
     debug_run_info_text: str,
-) -> tuple[str, str | None, str | None]:
+) -> tuple[str, WorkflowDefinition | None, str | None]:
     current_datetime = datetime.now(timezone.utc).isoformat()
 
     chat_history_text = ""
@@ -177,8 +183,8 @@ async def copilot_call_llm(
         global_llm_context = str(global_llm_context)
 
     if action_type == "REPLACE_WORKFLOW":
-        workflow_yaml = await _process_workflow_yaml(action_data)
-        return user_response, workflow_yaml, global_llm_context
+        updated_workflow = await _process_workflow_yaml(chat_request.workflow_id, action_data.get("workflow_yaml", ""))
+        return user_response, updated_workflow, global_llm_context
     elif action_type == "REPLY":
         return user_response, None, global_llm_context
     elif action_type == "ASK_QUESTION":
@@ -192,17 +198,11 @@ async def copilot_call_llm(
         return "I received your request but I'm not sure how to help. Could you rephrase?", None, None
 
 
-async def _process_workflow_yaml(action_data: dict[str, Any]) -> None | str:
-    workflow_yaml = action_data.get("workflow_yaml", "")
-
+async def _process_workflow_yaml(workflow_id: str, workflow_yaml: str) -> WorkflowDefinition:
     try:
         parsed_yaml = yaml.safe_load(workflow_yaml)
     except yaml.YAMLError as e:
-        LOG.error(
-            "Invalid YAML from LLM",
-            error=str(e),
-            yaml=f"\n{str(e)}\n{workflow_yaml}",
-        )
+        LOG.error("Invalid YAML from LLM", yaml=workflow_yaml, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"LLM generated invalid YAML: {str(e)}",
@@ -216,25 +216,28 @@ async def _process_workflow_yaml(action_data: dict[str, Any]) -> None | str:
             for block in blocks:
                 block["title"] = block.get("title", "")
 
-        workflow = WorkflowCreateYAMLRequest.model_validate(parsed_yaml)
+        workflow_yaml_request = WorkflowCreateYAMLRequest.model_validate(parsed_yaml)
 
         # Post-processing
-        for block in workflow.workflow_definition.blocks:
+        for block in workflow_yaml_request.workflow_definition.blocks:
             if isinstance(block, LoginBlockYAML) and not block.navigation_goal:
                 block.navigation_goal = DEFAULT_LOGIN_PROMPT
 
-        workflow_yaml = yaml.safe_dump(workflow.model_dump(mode="json"), sort_keys=False)
-    except Exception as e:
-        LOG.error(
-            "YAML from LLM does not conform to Skyvern workflow schema",
-            error=str(e),
-            yaml=f"\n{str(e)}\n{workflow_yaml}",
+        workflow_yaml_request.workflow_definition.parameters = [
+            p for p in workflow_yaml_request.workflow_definition.parameters if p.parameter_type != ParameterType.OUTPUT
+        ]
+
+        updated_workflow = convert_workflow_definition(
+            workflow_definition_yaml=workflow_yaml_request.workflow_definition,
+            workflow_id=workflow_id,
         )
+    except Exception as e:
+        LOG.error("YAML from LLM does not conform to Skyvern workflow schema", yaml=workflow_yaml, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"LLM generated YAML that doesn't match workflow schema: {str(e)}",
         )
-    return workflow_yaml
+    return updated_workflow
 
 
 @base_router.post("/workflow/copilot/chat-post", include_in_schema=False)
@@ -314,7 +317,7 @@ async def workflow_copilot_chat_post(
                 )
                 return
 
-            user_response, updated_workflow_yaml, updated_global_llm_context = await copilot_call_llm(
+            user_response, updated_workflow, updated_global_llm_context = await copilot_call_llm(
                 organization.organization_id,
                 chat_request,
                 convert_to_history_messages(chat_messages[-CHAT_HISTORY_CONTEXT_MESSAGES:]),
@@ -349,7 +352,7 @@ async def workflow_copilot_chat_post(
                     type=WorkflowCopilotStreamMessageType.RESPONSE,
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                     message=user_response,
-                    updated_workflow_yaml=updated_workflow_yaml,
+                    updated_workflow=updated_workflow.model_dump(mode="json") if updated_workflow else None,
                     response_time=assistant_message.created_at,
                 ).model_dump(mode="json"),
             )
