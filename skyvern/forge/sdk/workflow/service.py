@@ -437,6 +437,10 @@ class WorkflowService:
             for workflow_parameter in all_workflow_parameters:
                 if workflow_request.data and workflow_parameter.key in workflow_request.data:
                     request_body_value = workflow_request.data[workflow_parameter.key]
+                    # Fall back to default value if the request explicitly sends null
+                    # This supports API clients (e.g., n8n) that include the key with null value
+                    if request_body_value is None and workflow_parameter.default_value is not None:
+                        request_body_value = workflow_parameter.default_value
                     if self._is_missing_required_value(workflow_parameter, request_body_value):
                         missing_parameters.append(workflow_parameter.key)
                         continue
