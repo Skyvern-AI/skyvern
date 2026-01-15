@@ -141,7 +141,7 @@ function compareWorkflowBlocks(
 
 function getWorkflowElements(version: WorkflowVersion) {
   const settings: WorkflowSettings = {
-    proxyLocation: version.proxy_location || ProxyLocation.Residential,
+    proxyLocation: version.proxy_location ?? ProxyLocation.Residential,
     webhookCallbackUrl: version.webhook_callback_url || "",
     persistBrowserSession: version.persist_browser_session,
     model: version.model,

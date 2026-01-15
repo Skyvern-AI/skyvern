@@ -956,7 +956,7 @@ function Workspace({
     // Load the selected version into the main editor
     const settings: WorkflowSettings = {
       proxyLocation:
-        selectedVersion.proxy_location || ProxyLocation.Residential,
+        selectedVersion.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: selectedVersion.webhook_callback_url || "",
       persistBrowserSession: selectedVersion.persist_browser_session,
       model: selectedVersion.model,
@@ -1660,7 +1660,7 @@ function Workspace({
 
             const settings: WorkflowSettings = {
               proxyLocation:
-                saveData?.settings.proxyLocation || ProxyLocation.Residential,
+                saveData?.settings.proxyLocation ?? ProxyLocation.Residential,
               webhookCallbackUrl: saveData?.settings.webhookCallbackUrl || "",
               persistBrowserSession:
                 saveData?.settings.persistBrowserSession ?? false,
