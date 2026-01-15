@@ -103,8 +103,8 @@ import {
   upgradeWorkflowBlocksV1toV2,
 } from "./workflowEditorUtils";
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
-import { WorkflowCopilotButton } from "./WorkflowCopilotButton";
+import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
+import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
 import { parse as parseYAML } from "yaml";
 import {
   BlockYAML,
