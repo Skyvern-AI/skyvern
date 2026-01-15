@@ -2764,6 +2764,9 @@ class AgentDB(BaseAlchemyDB):
 
                 if search_key:
                     key_like = f"%{search_key}%"
+                    # Match workflow_run_id directly
+                    id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
+                    # Match parameter key, description, or value
                     param_exists = exists(
                         select(1)
                         .select_from(WorkflowRunParameterModel)
@@ -2782,7 +2785,7 @@ class AgentDB(BaseAlchemyDB):
                             )
                         )
                     )
-                    workflow_run_query = workflow_run_query.where(param_exists)
+                    workflow_run_query = workflow_run_query.where(or_(id_matches, param_exists))
 
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
