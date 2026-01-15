@@ -33,6 +33,7 @@ class WorkflowCopilotChatMessage(BaseModel):
 
 class WorkflowCopilotChatRequest(BaseModel):
     workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
+    workflow_id: str = Field(..., description="Workflow permanent ID for the chat")
     workflow_copilot_chat_id: str | None = Field(None, description="The chat ID to send the message to")
     workflow_run_id: str | None = Field(None, description="The workflow run ID to use for the context")
     message: str = Field(..., description="The message that user sends")
@@ -70,7 +71,7 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     )
     workflow_copilot_chat_id: str = Field(..., description="The chat ID")
     message: str = Field(..., description="The message sent to the user")
-    updated_workflow_yaml: str | None = Field(None, description="The updated workflow yaml")
+    updated_workflow: dict | None = Field(None, description="The updated workflow")
     response_time: datetime = Field(..., description="When the assistant message was created")
 
 
