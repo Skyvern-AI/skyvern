@@ -20,6 +20,7 @@ export interface WorkflowCopilotChatMessage {
 
 export interface WorkflowCopilotChatRequest {
   workflow_permanent_id: string;
+  workflow_id: string;
   workflow_copilot_chat_id?: string | null;
   workflow_run_id?: string | null;
   message: string;
@@ -48,15 +49,15 @@ export interface WorkflowCopilotProcessingUpdate {
   timestamp: string;
 }
 
-export interface WorkflowCopilotStreamResponse {
+export interface WorkflowCopilotStreamResponseUpdate {
   type: "response";
   workflow_copilot_chat_id: string;
   message: string;
-  updated_workflow_yaml?: string | null;
+  updated_workflow?: Record<string, unknown> | null;
   response_time: string;
 }
 
-export interface WorkflowCopilotStreamError {
+export interface WorkflowCopilotStreamErrorUpdate {
   type: "error";
   error: string;
 }
