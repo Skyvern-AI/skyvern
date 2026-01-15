@@ -5271,6 +5271,21 @@ class AgentDB(BaseAlchemyDB):
 
             return DebugSession.model_validate(model) if model else None
 
+    async def get_debug_session_by_browser_session_id(
+        self,
+        browser_session_id: str,
+        organization_id: str,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(browser_session_id=browser_session_id)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+            )
+            model = (await session.scalars(query)).first()
+            return DebugSession.model_validate(model) if model else None
+
     async def get_workflow_runs_by_debug_session_id(
         self,
         debug_session_id: str,
