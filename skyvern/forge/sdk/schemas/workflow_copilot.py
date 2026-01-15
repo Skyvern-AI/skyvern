@@ -39,14 +39,6 @@ class WorkflowCopilotChatRequest(BaseModel):
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
 
 
-class WorkflowCopilotChatResponse(BaseModel):
-    workflow_copilot_chat_id: str = Field(..., description="The chat ID")
-    message: str = Field(..., description="The message sent to the user")
-    updated_workflow_yaml: str | None = Field(None, description="The updated workflow yaml")
-    request_time: datetime = Field(..., description="When the request was received")
-    response_time: datetime = Field(..., description="When the assistant message was created")
-
-
 class WorkflowCopilotChatHistoryMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
@@ -56,3 +48,32 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
 class WorkflowCopilotChatHistoryResponse(BaseModel):
     workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
+
+
+class WorkflowCopilotStreamMessageType(StrEnum):
+    PROCESSING_UPDATE = "processing_update"
+    RESPONSE = "response"
+    ERROR = "error"
+
+
+class WorkflowCopilotProcessingUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.PROCESSING_UPDATE, description="Message type"
+    )
+    status: str = Field(..., description="Processing status text")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowCopilotStreamResponseUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.RESPONSE, description="Message type"
+    )
+    workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+    message: str = Field(..., description="The message sent to the user")
+    updated_workflow_yaml: str | None = Field(None, description="The updated workflow yaml")
+    response_time: datetime = Field(..., description="When the assistant message was created")
+
+
+class WorkflowCopilotStreamErrorUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(WorkflowCopilotStreamMessageType.ERROR, description="Message type")
+    error: str = Field(..., description="Error message")

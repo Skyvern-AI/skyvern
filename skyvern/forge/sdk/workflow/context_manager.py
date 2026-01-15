@@ -11,6 +11,7 @@ from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
     CredentialParameterNotFoundError,
+    ImaginarySecretValue,
     SkyvernException,
     WorkflowRunContextNotInitialized,
 )
@@ -51,6 +52,8 @@ LOG = structlog.get_logger()
 BlockMetadata = dict[str, str | int | float | bool | dict | list | None]
 
 jinja_sandbox_env = SandboxedEnvironment()
+
+RANDOM_SECRET_ID_PREFIX = "placeholder_"
 
 
 class WorkflowRunContext:
@@ -243,8 +246,15 @@ class WorkflowRunContext:
         assume it's an actual parameter value and return it.
 
         """
+        if len(self.secrets) == 0:
+            return None
         if isinstance(secret_id_or_value, str):
-            return self.secrets.get(secret_id_or_value)
+            if secret_id_or_value.startswith(RANDOM_SECRET_ID_PREFIX):
+                if secret_id_or_value not in self.secrets:
+                    raise ImaginarySecretValue(secret_id_or_value)
+                return self.secrets[secret_id_or_value]
+            else:
+                return self.secrets.get(secret_id_or_value)
         return None
 
     def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
@@ -292,7 +302,7 @@ class WorkflowRunContext:
 
     @staticmethod
     def generate_random_secret_id() -> str:
-        return f"placeholder_{generate_random_string()}"
+        return f"{RANDOM_SECRET_ID_PREFIX}{generate_random_string(length=4)}"
 
     async def _get_credential_vault_and_item_ids(self, credential_id: str) -> tuple[str, str]:
         """
