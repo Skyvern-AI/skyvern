@@ -716,8 +716,7 @@ def _collect_undefined_parameters(
     undefined_params: dict[str, list[str]] = {}
 
     for block_yaml in block_yamls:
-        # Check parameters for this block
-        if block_yaml.parameter_keys:
+        if hasattr(block_yaml, "parameter_keys") and block_yaml.parameter_keys:
             undefined_for_block = [param_key for param_key in block_yaml.parameter_keys if param_key not in parameters]
             if undefined_for_block:
                 undefined_params[block_yaml.label] = undefined_for_block
@@ -734,9 +733,8 @@ def _resolve_block_parameters(
     block_yaml: BLOCK_YAML_TYPES,
     parameters: dict[str, PARAMETER_TYPE],
 ) -> list[PARAMETER_TYPE]:
-    return (
-        [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys] if block_yaml.parameter_keys else []
-    )
+    parameter_keys = getattr(block_yaml, "parameter_keys", None)
+    return [parameters[parameter_key] for parameter_key in parameter_keys] if parameter_keys else []
 
 
 def _has_dag_metadata(block_yamls: list[BLOCK_YAML_TYPES]) -> bool:
