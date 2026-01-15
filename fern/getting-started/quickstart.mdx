@@ -232,7 +232,7 @@ The `recording_url` field is included in every completed run response:
 
 Navigate to [Runs](https://app.skyvern.com/runs) and click on your run to see the Recording tab.
 
-<img src="../images/visualizing_results/view_recording.png" alt="Recording tab in Skyvern Cloud" />
+<img src="../images/view-recording.png" alt="Recording tab in Skyvern Cloud" />
 
 ### What you'll see
 
@@ -264,6 +264,11 @@ Docker is optional. If you have PostgreSQL installed locally, Skyvern will detec
 skyvern init
 ```
 
+<p align="center">
+  <img src="../images/skyvern-init.gif" alt="Skyvern init interactive setup wizard" />
+</p>
+
+
 This interactive wizard will:
 1. Set up your database (detects local PostgreSQL or uses Docker)
 2. Configure your LLM provider
@@ -271,11 +276,37 @@ This interactive wizard will:
 4. Generate local API credentials
 5. Download the Chromium browser
 
+This will generate a .env file that stores your local configuration, LLM api keys and your local `BASE_URL` and `SKYVERN_API_KEY`:
+```.env
+ENV='local'
+ENABLE_OPENAI='true'
+OPENAI_API_KEY='<API_KEY>'
+...
+LLM_KEY='OPENAI_GPT4O'
+SECONDARY_LLM_KEY=''
+BROWSER_TYPE='chromium-headful'
+MAX_SCRAPING_RETRIES='0'
+VIDEO_PATH='./videos'
+BROWSER_ACTION_TIMEOUT_MS='5000'
+MAX_STEPS_PER_RUN='50'
+LOG_LEVEL='INFO'
+LITELLM_LOG='CRITICAL'
+DATABASE_STRING='postgresql+psycopg://skyvern@localhost/skyvern'
+PORT='8000'
+...
+SKYVERN_BASE_URL='http://localhost:8000'
+SKYVERN_API_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MTMzODQ2MDksInN1YiI6Im9fNDg0MjIwNjY3MzYzNzA2Njk4In0.Crwy0-y7hpMVSyhzNJGzDu_oaMvrK76RbRb7YhSo3YA'
+```
+
 ### Start the local server
 
 ```bash
 skyvern run server
 ```
+
+<p align="center">
+  <img src="../images/skyvern-run-server.gif" alt="Skyvern local server logs" />
+</p>
 
 ### Run a task locally
 
@@ -303,6 +334,10 @@ asyncio.run(main())
 ```
 
 A browser window will open on your machine (if you chose headful mode). Recordings and logs are saved in the directory where you started the server.
+
+<p align="center">
+  <img src="../images/skyvern-agent-local.gif" alt="Skyvern local agent opening a headful browser to perform as prompted" />
+</p>
 
 ---
 
