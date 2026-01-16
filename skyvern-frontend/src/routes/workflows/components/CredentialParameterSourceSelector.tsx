@@ -10,11 +10,8 @@ import { useCredentialsQuery } from "../hooks/useCredentialsQuery";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { WorkflowParameterValueType } from "../types/workflowTypes";
 import { PlusIcon } from "@radix-ui/react-icons";
-import {
-  CredentialModalTypes,
-  useCredentialModalState,
-} from "@/routes/credentials/useCredentialModalState";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
+import { useState } from "react";
 
 type Props = {
   value: string;
@@ -25,7 +22,8 @@ function CredentialParameterSourceSelector({ value, onChange }: Props) {
   const { data: credentials, isFetching } = useCredentialsQuery({
     page_size: 100, // Reasonable limit for dropdown selector
   });
-  const { setIsOpen, setType } = useCredentialModalState();
+  // Use local state for modal to avoid conflicts with other CredentialsModal instances
+  const [isModalOpen, setIsModalOpen] = useState(false);
   const { parameters: workflowParameters } = useWorkflowParametersStore();
   const workflowParametersOfTypeCredentialId = workflowParameters.filter(
     (parameter) =>
@@ -65,8 +63,7 @@ function CredentialParameterSourceSelector({ value, onChange }: Props) {
         value={value}
         onValueChange={(value) => {
           if (value === "new") {
-            setIsOpen(true);
-            setType(CredentialModalTypes.PASSWORD);
+            setIsModalOpen(true);
             return;
           }
           onChange(value);
@@ -90,9 +87,11 @@ function CredentialParameterSourceSelector({ value, onChange }: Props) {
         </SelectContent>
       </Select>
       <CredentialsModal
+        isOpen={isModalOpen}
+        onOpenChange={setIsModalOpen}
         onCredentialCreated={(id) => {
           onChange(id);
-          setIsOpen(false);
+          setIsModalOpen(false);
         }}
       />
     </>

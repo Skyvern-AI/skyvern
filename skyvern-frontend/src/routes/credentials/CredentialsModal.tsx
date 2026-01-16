@@ -67,12 +67,27 @@ function generateDefaultCredentialName(existingNames: string[]): string {
 
 type Props = {
   onCredentialCreated?: (id: string) => void;
+  /** Optional controlled mode: pass isOpen and onOpenChange to control modal state locally */
+  isOpen?: boolean;
+  onOpenChange?: (open: boolean) => void;
 };
 
-function CredentialsModal({ onCredentialCreated }: Props) {
+function CredentialsModal({
+  onCredentialCreated,
+  isOpen: controlledIsOpen,
+  onOpenChange: controlledOnOpenChange,
+}: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-  const { isOpen, type, setIsOpen } = useCredentialModalState();
+  const {
+    isOpen: urlIsOpen,
+    type,
+    setIsOpen: setUrlIsOpen,
+  } = useCredentialModalState();
+
+  // Use controlled props if provided, otherwise fall back to URL-based state
+  const isOpen = controlledIsOpen ?? urlIsOpen;
+  const setIsOpen = controlledOnOpenChange ?? setUrlIsOpen;
   const { data: credentials } = useCredentialsQuery({
     page_size: 100,
   });
@@ -120,6 +135,7 @@ function CredentialsModal({ onCredentialCreated }: Props) {
       return response.data;
     },
     onSuccess: (data) => {
+      reset();
       setIsOpen(false);
       queryClient.invalidateQueries({
         queryKey: ["credentials"],

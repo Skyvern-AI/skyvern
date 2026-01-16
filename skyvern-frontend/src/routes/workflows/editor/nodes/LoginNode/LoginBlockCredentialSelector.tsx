@@ -11,7 +11,7 @@ import CloudContext from "@/store/CloudContext";
 import { useContext, useMemo } from "react";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
-import { PlusIcon } from "@radix-ui/react-icons";
+import { ExclamationTriangleIcon, PlusIcon } from "@radix-ui/react-icons";
 import {
   CredentialModalTypes,
   useCredentialModalState,
@@ -19,7 +19,12 @@ import {
 import { useNodes } from "@xyflow/react";
 import { AppNode } from "..";
 import { isLoginNode } from "./types";
-import { parameterIsSkyvernCredential } from "../../types";
+import {
+  parameterIsSkyvernCredential,
+  parameterIsBitwardenCredential,
+  parameterIsOnePasswordCredential,
+  parameterIsAzureVaultCredential,
+} from "../../types";
 
 type Props = {
   nodeId: string;
@@ -57,27 +62,52 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
       parameter.parameterType === "credential" ||
       parameter.parameterType === "onepassword",
   );
-  const credentialInputParameters = workflowParameters.filter(
-    (parameter) =>
-      parameter.parameterType === "workflow" &&
-      parameter.dataType === "credential_id",
-  );
   const isCloud = useContext(CloudContext);
   const { data: credentials = [], isFetching } = useCredentialsQuery({
     enabled: isCloud,
     page_size: 100,
   });
 
+  // Get the set of credential IDs that are in the vault
+  const credentialIdsInVault = useMemo(
+    () => new Set(credentials.map((c) => c.credential_id)),
+    [credentials],
+  );
+
   // Determine which credential is currently selected (by credential_id)
-  // This must be before the early return to comply with React hooks rules
+  // This handles multiple cases:
+  // 1. Skyvern credential parameters (have credentialId)
+  // 2. Workflow input parameters with credential_id type and default value
   const selectedCredentialId = useMemo(() => {
     if (!value) return undefined;
-    const parameter = credentialParameters.find((p) => p.key === value);
-    if (parameter && parameterIsSkyvernCredential(parameter)) {
-      return parameter.credentialId;
+
+    // Check if it's a credential parameter
+    const credentialParam = credentialParameters.find((p) => p.key === value);
+    if (credentialParam && parameterIsSkyvernCredential(credentialParam)) {
+      return credentialParam.credentialId;
     }
+
+    // Check if it's a workflow input parameter with credential_id type and default value
+    const workflowParam = workflowParameters.find(
+      (p) =>
+        p.parameterType === "workflow" &&
+        p.key === value &&
+        p.dataType === "credential_id" &&
+        typeof p.defaultValue === "string" &&
+        p.defaultValue,
+    );
+    if (workflowParam && workflowParam.parameterType === "workflow") {
+      return workflowParam.defaultValue as string;
+    }
+
     return undefined;
-  }, [value, credentialParameters]);
+  }, [value, credentialParameters, workflowParameters]);
+
+  // Check if the selected credential is missing (deleted)
+  const isCredentialMissing = useMemo(() => {
+    if (!selectedCredentialId) return false;
+    return !credentialIdsInVault.has(selectedCredentialId);
+  }, [selectedCredentialId, credentialIdsInVault]);
 
   if (isCloud && isFetching) {
     return <Skeleton className="h-8 w-full" />;
@@ -86,48 +116,36 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
   const credentialOptions = credentials.map((credential) => ({
     label: credential.name,
     value: credential.credential_id,
-    type: "credential",
+    type: "credential" as const,
   }));
 
-  // Get the set of credential IDs that are in the vault
-  const credentialIdsInVault = new Set(credentials.map((c) => c.credential_id));
-
-  // Filter credential parameters to only show those that reference credentials
-  // NOT in the vault (e.g., Bitwarden, 1Password, Azure Vault credentials)
-  // Skyvern credential parameters are excluded because the actual credential is already shown
-  const filteredCredentialParameterOptions = credentialParameters
+  // Only show non-Skyvern credential parameters (Bitwarden, 1Password, Azure Vault)
+  // Skyvern credential parameters should never be shown - the actual credential is displayed directly
+  const externalVaultParameterOptions = credentialParameters
     .filter((parameter) => {
+      // Never show Skyvern credential parameters
       if (parameterIsSkyvernCredential(parameter)) {
-        // Don't show Skyvern credential parameters if the credential is in the vault
-        return !credentialIdsInVault.has(parameter.credentialId);
+        return false;
       }
-      // Show non-Skyvern credential parameters (Bitwarden, 1Password, etc.)
-      return true;
+      // Show Bitwarden, 1Password, Azure Vault credential parameters
+      return (
+        parameterIsBitwardenCredential(parameter) ||
+        parameterIsOnePasswordCredential(parameter) ||
+        parameterIsAzureVaultCredential(parameter)
+      );
     })
     .map((parameter) => ({
       label: parameter.key,
       value: parameter.key,
-      type: "parameter",
+      type: "parameter" as const,
     }));
 
-  const credentialInputParameterOptions = credentialInputParameters.map(
-    (parameter) => ({
-      label: parameter.key,
-      value: parameter.key,
-      type: "parameter",
-    }),
-  );
-
-  const options = [
-    ...credentialOptions,
-    ...filteredCredentialParameterOptions,
-    ...credentialInputParameterOptions,
-  ];
+  const options = [...credentialOptions, ...externalVaultParameterOptions];
 
   return (
     <>
       <Select
-        value={selectedCredentialId ?? value}
+        value={isCredentialMissing ? undefined : selectedCredentialId ?? value}
         onValueChange={(newValue) => {
           if (newValue === "new") {
             setIsOpen(true);
@@ -209,8 +227,21 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
           onChange?.(parameterKeyToUse);
         }}
       >
-        <SelectTrigger className="w-full">
-          <SelectValue placeholder="Select a credential" />
+        <SelectTrigger
+          className={
+            isCredentialMissing
+              ? "w-full border-red-500 text-red-500"
+              : "w-full"
+          }
+        >
+          {isCredentialMissing ? (
+            <div className="flex items-center gap-2 text-red-500">
+              <ExclamationTriangleIcon className="size-4" />
+              <span>Credential not found</span>
+            </div>
+          ) : (
+            <SelectValue placeholder="Select a credential" />
+          )}
         </SelectTrigger>
         <SelectContent>
           {options.map((option) => (
