@@ -91,6 +91,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "http_request": {
       return <GlobeIcon className={className} />;
     }
+    case "print_page": {
+      return <FileTextIcon className={className} />;
+    }
   }
 }
 

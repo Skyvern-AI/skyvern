@@ -196,20 +196,29 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                                 setHasChanges(true);
                                 setNodes((nodes) => {
                                   return nodes.map((node) => {
+                                    // All node types that have parameterKeys
                                     if (
                                       node.type === "task" ||
-                                      node.type === "textPrompt"
+                                      node.type === "textPrompt" ||
+                                      node.type === "login" ||
+                                      node.type === "navigation" ||
+                                      node.type === "extraction" ||
+                                      node.type === "fileDownload" ||
+                                      node.type === "action" ||
+                                      node.type === "http_request" ||
+                                      node.type === "validation" ||
+                                      node.type === "codeBlock"
                                     ) {
+                                      const parameterKeys = node.data
+                                        .parameterKeys as Array<string> | null;
                                       return {
                                         ...node,
                                         data: {
                                           ...node.data,
-                                          parameterKeys: (
-                                            node.data
-                                              .parameterKeys as Array<string>
-                                          ).filter(
-                                            (key) => key !== parameter.key,
-                                          ),
+                                          parameterKeys:
+                                            parameterKeys?.filter(
+                                              (key) => key !== parameter.key,
+                                            ) ?? null,
                                         },
                                       };
                                     }
@@ -293,24 +302,34 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                     );
                     setNodes((nodes) => {
                       return nodes.map((node) => {
+                        // All node types that have parameterKeys
                         if (
                           node.type === "task" ||
-                          node.type === "textPrompt"
+                          node.type === "textPrompt" ||
+                          node.type === "login" ||
+                          node.type === "navigation" ||
+                          node.type === "extraction" ||
+                          node.type === "fileDownload" ||
+                          node.type === "action" ||
+                          node.type === "http_request" ||
+                          node.type === "validation" ||
+                          node.type === "codeBlock"
                         ) {
+                          const parameterKeys = node.data
+                            .parameterKeys as Array<string> | null;
                           return {
                             ...node,
                             data: {
                               ...node.data,
-                              parameterKeys: (
-                                node.data.parameterKeys as Array<string>
-                              ).map((key) => {
-                                if (
-                                  key === operationPanelState.parameter?.key
-                                ) {
-                                  return editedParameter.key;
-                                }
-                                return key;
-                              }),
+                              parameterKeys:
+                                parameterKeys?.map((key) => {
+                                  if (
+                                    key === operationPanelState.parameter?.key
+                                  ) {
+                                    return editedParameter.key;
+                                  }
+                                  return key;
+                                }) ?? null,
                             },
                           };
                         }

@@ -39,6 +39,7 @@ from skyvern.exceptions import (
     FailToSelectByValue,
     IllegitComplete,
     ImaginaryFileUrl,
+    ImaginarySecretValue,
     InputToInvisibleElement,
     InputToReadonlyElement,
     InteractWithDisabledElement,
@@ -594,6 +595,9 @@ class ActionHandler:
             actions_result.append(ActionFailure(e))
         except LLMProviderError as e:
             LOG.exception("LLM error in action handler", action=action, exc_info=True)
+            actions_result.append(ActionFailure(e))
+        except ImaginarySecretValue as e:
+            LOG.exception("Imaginary secret value", action=action, exc_info=True)
             actions_result.append(ActionFailure(e))
         except Exception as e:
             LOG.exception("Unhandled exception in action handler", action=action)

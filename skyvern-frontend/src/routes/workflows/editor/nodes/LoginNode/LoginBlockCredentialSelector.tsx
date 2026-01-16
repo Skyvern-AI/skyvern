@@ -8,7 +8,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import CloudContext from "@/store/CloudContext";
-import { useContext } from "react";
+import { useContext, useMemo } from "react";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { PlusIcon } from "@radix-ui/react-icons";
@@ -68,6 +68,17 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
     page_size: 100,
   });
 
+  // Determine which credential is currently selected (by credential_id)
+  // This must be before the early return to comply with React hooks rules
+  const selectedCredentialId = useMemo(() => {
+    if (!value) return undefined;
+    const parameter = credentialParameters.find((p) => p.key === value);
+    if (parameter && parameterIsSkyvernCredential(parameter)) {
+      return parameter.credentialId;
+    }
+    return undefined;
+  }, [value, credentialParameters]);
+
   if (isCloud && isFetching) {
     return <Skeleton className="h-8 w-full" />;
   }
@@ -78,11 +89,26 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
     type: "credential",
   }));
 
-  const credentialParameterOptions = credentialParameters.map((parameter) => ({
-    label: parameter.key,
-    value: parameter.key,
-    type: "parameter",
-  }));
+  // Get the set of credential IDs that are in the vault
+  const credentialIdsInVault = new Set(credentials.map((c) => c.credential_id));
+
+  // Filter credential parameters to only show those that reference credentials
+  // NOT in the vault (e.g., Bitwarden, 1Password, Azure Vault credentials)
+  // Skyvern credential parameters are excluded because the actual credential is already shown
+  const filteredCredentialParameterOptions = credentialParameters
+    .filter((parameter) => {
+      if (parameterIsSkyvernCredential(parameter)) {
+        // Don't show Skyvern credential parameters if the credential is in the vault
+        return !credentialIdsInVault.has(parameter.credentialId);
+      }
+      // Show non-Skyvern credential parameters (Bitwarden, 1Password, etc.)
+      return true;
+    })
+    .map((parameter) => ({
+      label: parameter.key,
+      value: parameter.key,
+      type: "parameter",
+    }));
 
   const credentialInputParameterOptions = credentialInputParameters.map(
     (parameter) => ({
@@ -90,13 +116,6 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
       value: parameter.key,
       type: "parameter",
     }),
-  );
-
-  const filteredCredentialParameterOptions = credentialParameterOptions.filter(
-    (option) =>
-      !credentialOptions.some(
-        (credential) => credential.value === option.value,
-      ),
   );
 
   const options = [
@@ -108,7 +127,7 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
   return (
     <>
       <Select
-        value={value}
+        value={selectedCredentialId ?? value}
         onValueChange={(newValue) => {
           if (newValue === "new") {
             setIsOpen(true);
@@ -122,19 +141,20 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
             .filter((node) => node.id !== nodeId)
             .filter(isLoginNode);
 
-          const thereIsAParameterWithThisValue = workflowParameters.some(
-            (parameter) =>
-              parameter.parameterType === "credential" &&
-              parameterIsSkyvernCredential(parameter) &&
-              parameter.credentialId === value,
-          );
+          // Check if current value references a Skyvern credential
+          const currentParameter = workflowParameters.find((parameter) => {
+            if (parameter.parameterType !== "credential") return false;
+            if (!parameterIsSkyvernCredential(parameter)) return false;
+            return parameter.key === value;
+          });
 
           const isUsedInOtherLoginNodes =
             value &&
             loginNodes.some((node) => node.data.parameterKeys.includes(value));
 
+          // Only delete old parameter if it's not used elsewhere
           const deleteOldParameter =
-            thereIsAParameterWithThisValue && !isUsedInOtherLoginNodes;
+            currentParameter && !isUsedInOtherLoginNodes;
 
           if (deleteOldParameter) {
             newParameters = newParameters.filter(
@@ -142,21 +162,28 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
             );
           }
 
-          const option = options.find((option) => option.value === newValue);
+          // Check if user selected an actual credential (by credential_id)
+          const selectedCredential = credentialOptions.find(
+            (option) => option.value === newValue,
+          );
+
           let parameterKeyToUse = newValue;
-          if (option?.type === "credential") {
-            const existingCredential = workflowParameters.find((parameter) => {
+
+          if (selectedCredential) {
+            // User selected an actual credential
+            const existingParameter = newParameters.find((parameter) => {
               return (
                 parameter.parameterType === "credential" &&
-                "credentialId" in parameter &&
+                parameterIsSkyvernCredential(parameter) &&
                 parameter.credentialId === newValue
               );
             });
-            if (existingCredential) {
-              // Use the existing parameter's key
-              parameterKeyToUse = existingCredential.key;
+
+            if (existingParameter) {
+              // Reuse the existing parameter
+              parameterKeyToUse = existingParameter.key;
             } else {
-              // Generate a new parameter key based on existing keys
+              // Create a new parameter for this credential
               const existingKeys = newParameters.map((param) => param.key);
               const newKey =
                 generateDefaultCredentialParameterKey(existingKeys);
@@ -171,17 +198,19 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
                 },
               ];
             }
-          } else if (deleteOldParameter) {
-            newParameters = newParameters.filter(
-              (parameter) => parameter.key !== value,
-            );
           }
-          onChange?.(parameterKeyToUse);
+          // If user selected a parameter (non-Skyvern credential or input parameter)
+          // just use it directly (parameterKeyToUse is already set to newValue)
+
+          // Update Zustand store first, then call onChange
+          // This ensures workflowParameters is updated before the parent re-renders
+          // with the new value, so selectedCredentialId computes correctly
           setWorkflowParameters(newParameters);
+          onChange?.(parameterKeyToUse);
         }}
       >
         <SelectTrigger className="w-full">
-          <SelectValue placeholder="Select a credential parameter" />
+          <SelectValue placeholder="Select a credential" />
         </SelectTrigger>
         <SelectContent>
           {options.map((option) => (
@@ -202,7 +231,7 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
           const existingKeys = workflowParameters.map((param) => param.key);
           const newKey = generateDefaultCredentialParameterKey(existingKeys);
 
-          onChange?.(newKey);
+          // Update Zustand store first, then call onChange
           setWorkflowParameters([
             ...workflowParameters,
             {
@@ -211,6 +240,7 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
               key: newKey,
             },
           ]);
+          onChange?.(newKey);
         }}
       />
     </>

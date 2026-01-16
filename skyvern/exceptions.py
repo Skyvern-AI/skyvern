@@ -923,3 +923,10 @@ class PDFParsingError(SkyvernException):
         super().__init__(
             f"Failed to parse PDF '{file_identifier}'. pypdf error: {pypdf_error}; pdfplumber error: {pdfplumber_error}"
         )
+
+
+class ImaginarySecretValue(SkyvernException):
+    def __init__(self, value: str) -> None:
+        super().__init__(
+            f"The value {value} is imaginary. Try to double-check to see if this value is included in the provided information"
+        )

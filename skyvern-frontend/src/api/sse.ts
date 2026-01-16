@@ -2,19 +2,65 @@ import { fetchEventSource } from "@microsoft/fetch-event-source";
 import type { CredentialGetter } from "@/api/AxiosClient";
 import { getRuntimeApiKey, runsApiBaseUrl } from "@/util/env";
 
-export type SseJsonPayload = Record<string, unknown>;
+export type SseMessageHandler<T> = (payload: T, eventName: string) => boolean;
 
-type SseClient = {
-  post: <T extends SseJsonPayload>(path: string, body: unknown) => Promise<T>;
+type SseStreamingOptions = {
+  signal?: AbortSignal;
 };
 
-export async function fetchJsonSse<T extends SseJsonPayload>(
+type SseClient = {
+  postStreaming: <T>(
+    path: string,
+    body: unknown,
+    onMessage: SseMessageHandler<T>,
+    options?: SseStreamingOptions,
+  ) => Promise<void>;
+};
+
+export async function fetchStreamingSse<T>(
   input: RequestInfo | URL,
   init: RequestInit,
-): Promise<T> {
+  onMessage: SseMessageHandler<T>,
+  options?: SseStreamingOptions,
+): Promise<void> {
   const controller = new AbortController();
+  const externalSignal = options?.signal;
+  let settled = false;
+  const resolveOnce = () => {
+    if (!settled) {
+      settled = true;
+      return true;
+    }
+    return false;
+  };
+  const onExternalAbort = () => {
+    controller.abort();
+  };
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+      return;
+    }
+    externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+  }
   try {
-    const parsedPayload = await new Promise<T>((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
+      const safeResolve = () => {
+        if (resolveOnce()) {
+          resolve();
+        }
+      };
+      const safeReject = (error: unknown) => {
+        if (controller.signal.aborted) {
+          safeResolve();
+          return;
+        }
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      };
+
       fetchEventSource(input instanceof URL ? input.toString() : input, {
         method: init.method,
         headers: init.headers as Record<string, string>,
@@ -26,25 +72,28 @@ export async function fetchJsonSse<T extends SseJsonPayload>(
           }
           try {
             const payload = JSON.parse(event.data) as T;
-            resolve(payload);
+            if (onMessage(payload, event.event)) {
+              safeResolve();
+            }
           } catch (error) {
-            reject(error);
+            safeReject(error);
           }
         },
         onerror: (error) => {
-          reject(error);
+          safeReject(error);
         },
         onopen: async (response) => {
           if (!response.ok) {
             const errorText = await response.text();
-            reject(new Error(errorText || "Failed to send request."));
+            safeReject(new Error(errorText || "Failed to send request."));
           }
         },
-      }).catch(reject);
+      }).catch(safeReject);
     });
-
-    return parsedPayload;
   } finally {
+    if (externalSignal) {
+      externalSignal.removeEventListener("abort", onExternalAbort);
+    }
     controller.abort();
   }
 }
@@ -73,14 +122,21 @@ export async function getSseClient(
   }
 
   return {
-    post: <T extends SseJsonPayload>(path: string, body: unknown) => {
-      return fetchJsonSse<T>(
+    postStreaming: <T>(
+      path: string,
+      body: unknown,
+      onMessage: SseMessageHandler<T>,
+      options?: SseStreamingOptions,
+    ) => {
+      return fetchStreamingSse<T>(
         `${runsApiBaseUrl.replace(/\/$/, "")}/${path.replace(/^\//, "")}`,
         {
           method: "POST",
           headers: requestHeaders,
           body: JSON.stringify(body),
         },
+        onMessage,
+        options,
       );
     },
   };

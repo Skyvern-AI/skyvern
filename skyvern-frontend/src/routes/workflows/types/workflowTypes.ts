@@ -211,7 +211,8 @@ export type WorkflowBlock =
   | PDFParserBlock
   | Taskv2Block
   | URLBlock
-  | HttpRequestBlock;
+  | HttpRequestBlock
+  | PrintPageBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -236,6 +237,7 @@ export const WorkflowBlockTypes = {
   Taskv2: "task_v2",
   URL: "goto_url",
   HttpRequest: "http_request",
+  PrintPage: "print_page",
 } as const;
 
 // all of them
@@ -552,6 +554,15 @@ export type HttpRequestBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   download_filename: string | null;
   save_response_as_file: boolean;
+};
+
+export type PrintPageBlock = WorkflowBlockBase & {
+  block_type: "print_page";
+  include_timestamp: boolean;
+  custom_filename: string | null;
+  format: string;
+  landscape: boolean;
+  print_background: boolean;
 };
 
 export type WorkflowDefinition = {

@@ -2764,6 +2764,9 @@ class AgentDB(BaseAlchemyDB):
 
                 if search_key:
                     key_like = f"%{search_key}%"
+                    # Match workflow_run_id directly
+                    id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
+                    # Match parameter key, description, or value
                     param_exists = exists(
                         select(1)
                         .select_from(WorkflowRunParameterModel)
@@ -2782,7 +2785,7 @@ class AgentDB(BaseAlchemyDB):
                             )
                         )
                     )
-                    workflow_run_query = workflow_run_query.where(param_exists)
+                    workflow_run_query = workflow_run_query.where(or_(id_matches, param_exists))
 
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
@@ -5269,6 +5272,21 @@ class AgentDB(BaseAlchemyDB):
 
             model = (await session.scalars(query)).first()
 
+            return DebugSession.model_validate(model) if model else None
+
+    async def get_debug_session_by_browser_session_id(
+        self,
+        browser_session_id: str,
+        organization_id: str,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(browser_session_id=browser_session_id)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+            )
+            model = (await session.scalars(query)).first()
             return DebugSession.model_validate(model) if model else None
 
     async def get_workflow_runs_by_debug_session_id(
