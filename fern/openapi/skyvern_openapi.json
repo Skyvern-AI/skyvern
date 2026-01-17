@@ -4394,7 +4394,8 @@
           "html_action",
           "trace",
           "har",
-          "script_file"
+          "script_file",
+          "pdf"
         ],
         "title": "ArtifactType"
       },
@@ -5221,7 +5222,8 @@
           "goto_url",
           "pdf_parser",
           "http_request",
-          "human_interaction"
+          "human_interaction",
+          "print_page"
         ],
         "title": "BlockType"
       },
@@ -8794,6 +8796,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/PrintPageBlock"
                 }
               ],
               "discriminator": {
@@ -8814,6 +8819,7 @@
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
                   "task": "#/components/schemas/TaskBlock",
                   "task_v2": "#/components/schemas/TaskV2Block",
@@ -9028,6 +9034,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ConditionalBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PrintPageBlockYAML"
                 }
               ]
             },
@@ -9258,6 +9267,22 @@
             "title": "Follow Redirects",
             "default": true
           },
+          "download_filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Filename"
+          },
+          "save_response_as_file": {
+            "type": "boolean",
+            "title": "Save Response As File",
+            "default": false
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -9436,6 +9461,22 @@
             "type": "boolean",
             "title": "Follow Redirects",
             "default": true
+          },
+          "download_filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Filename"
+          },
+          "save_response_as_file": {
+            "type": "boolean",
+            "title": "Save Response As File",
+            "default": false
           },
           "parameter_keys": {
             "anyOf": [
@@ -11710,6 +11751,16 @@
         ],
         "title": "OutputParameterYAML"
       },
+      "PDFFormat": {
+        "type": "string",
+        "enum": [
+          "A4",
+          "Letter",
+          "Legal",
+          "Tabloid"
+        ],
+        "title": "PDFFormat"
+      },
       "PDFParserBlock": {
         "properties": {
           "label": {
@@ -11934,6 +11985,184 @@
           "url"
         ],
         "title": "PortalSessionResponse"
+      },
+      "PrintPageBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "print_page",
+            "title": "Block Type",
+            "default": "print_page"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "include_timestamp": {
+            "type": "boolean",
+            "title": "Include Timestamp",
+            "default": true
+          },
+          "custom_filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Filename"
+          },
+          "format": {
+            "type": "string",
+            "title": "Format",
+            "default": "A4"
+          },
+          "landscape": {
+            "type": "boolean",
+            "title": "Landscape",
+            "default": false
+          },
+          "print_background": {
+            "type": "boolean",
+            "title": "Print Background",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter"
+        ],
+        "title": "PrintPageBlock"
+      },
+      "PrintPageBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "print_page",
+            "title": "Block Type",
+            "default": "print_page"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "include_timestamp": {
+            "type": "boolean",
+            "title": "Include Timestamp",
+            "default": true
+          },
+          "custom_filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Filename"
+          },
+          "format": {
+            "$ref": "#/components/schemas/PDFFormat",
+            "default": "A4"
+          },
+          "landscape": {
+            "type": "boolean",
+            "title": "Landscape",
+            "default": false
+          },
+          "print_background": {
+            "type": "boolean",
+            "title": "Print Background",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "PrintPageBlockYAML"
       },
       "PromptAction": {
         "properties": {
@@ -16595,6 +16824,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/PrintPageBlock"
                 }
               ],
               "discriminator": {
@@ -16615,6 +16847,7 @@
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
                   "task": "#/components/schemas/TaskBlock",
                   "task_v2": "#/components/schemas/TaskV2Block",
@@ -16627,6 +16860,17 @@
             },
             "type": "array",
             "title": "Blocks"
+          },
+          "finally_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finally Block Label"
           }
         },
         "type": "object",
@@ -16764,6 +17008,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ConditionalBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PrintPageBlockYAML"
                 }
               ],
               "discriminator": {
@@ -16784,6 +17031,7 @@
                   "login": "#/components/schemas/LoginBlockYAML",
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "print_page": "#/components/schemas/PrintPageBlockYAML",
                   "send_email": "#/components/schemas/SendEmailBlockYAML",
                   "task": "#/components/schemas/TaskBlockYAML",
                   "task_v2": "#/components/schemas/TaskV2BlockYAML",
@@ -16796,6 +17044,17 @@
             },
             "type": "array",
             "title": "Blocks"
+          },
+          "finally_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finally Block Label"
           }
         },
         "type": "object",
