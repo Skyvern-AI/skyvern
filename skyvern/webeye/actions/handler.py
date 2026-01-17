@@ -27,7 +27,6 @@ from skyvern.constants import (
 from skyvern.errors.errors import TOTPExpiredError
 from skyvern.exceptions import (
     DownloadedFileNotFound,
-    DownloadFileMaxWaitingTime,
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
@@ -62,12 +61,13 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.files import (
+    check_downloading_files_and_wait_for_download_to_complete,
+)
 from skyvern.forge.sdk.api.files import download_file as download_file_api
 from skyvern.forge.sdk.api.files import (
     get_download_dir,
-    list_downloading_files_in_directory,
     list_files_in_directory,
-    wait_for_download_finished,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -484,32 +484,12 @@ class ActionHandler:
                 return results
             results[-1].download_triggered = True
 
-            # check if there's any file is still downloading
-            downloading_files = list_downloading_files_in_directory(download_dir)
-            if task.browser_session_id:
-                files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
-                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
-                )
-                downloading_files = downloading_files + files_in_browser_session
-
-            if len(downloading_files) == 0:
-                return results
-
-            LOG.info(
-                "File downloading hasn't completed, wait for a while",
-                downloading_files=downloading_files,
-                workflow_run_id=task.workflow_run_id,
+            await check_downloading_files_and_wait_for_download_to_complete(
+                download_dir=download_dir,
+                organization_id=task.organization_id,
+                browser_session_id=task.browser_session_id,
+                timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
             )
-            try:
-                await wait_for_download_finished(
-                    downloading_files=downloading_files, timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT
-                )
-            except DownloadFileMaxWaitingTime as e:
-                LOG.warning(
-                    "There're several long-time downloading files, these files might be broken",
-                    downloading_files=e.downloading_files,
-                    workflow_run_id=task.workflow_run_id,
-                )
             return results
         finally:
             if browser_state is not None and download_triggered:
