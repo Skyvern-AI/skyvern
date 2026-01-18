@@ -30,7 +30,10 @@ import {
   parameterIsAzureVaultCredential,
 } from "../types";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
-import { validateBitwardenLoginCredential } from "./util";
+import {
+  validateBitwardenLoginCredential,
+  validateParameterName,
+} from "./util";
 import { HelpTooltip } from "@/components/HelpTooltip";
 
 type Props = {
@@ -82,7 +85,7 @@ function WorkflowParameterEditPanel({
   const isCloud = useContext(CloudContext);
   const isEditMode = !!initialValues;
   const [key, setKey] = useState(initialValues?.key ?? "");
-  const hasWhitespace = /\s/.test(key);
+  const keyValidationError = key ? validateParameterName(key) : null;
   const isBitwardenCredential =
     initialValues?.parameterType === "credential" &&
     parameterIsBitwardenCredential(initialValues);
@@ -202,11 +205,12 @@ function WorkflowParameterEditPanel({
           <div className="space-y-1">
             <Label className="text-xs text-slate-300">Key</Label>
             <Input value={key} onChange={(e) => setKey(e.target.value)} />
-            {hasWhitespace && (
-              <p className="text-xs text-destructive">
-                Spaces are not allowed, consider using _
-              </p>
+            {keyValidationError && (
+              <p className="text-xs text-destructive">{keyValidationError}</p>
             )}
+            <p className="text-xs text-slate-400">
+              Use letters, numbers, and underscores only
+            </p>
           </div>
           <div className="space-y-1">
             <Label className="text-xs text-slate-300">Description</Label>
@@ -524,21 +528,15 @@ function WorkflowParameterEditPanel({
           }
           <div className="flex justify-end">
             <Button
+              disabled={!!keyValidationError}
               onClick={() => {
-                if (!key) {
+                // Validate parameter name
+                const validationError = validateParameterName(key);
+                if (validationError) {
                   toast({
                     variant: "destructive",
                     title: "Failed to save parameter",
-                    description: "Key is required",
-                  });
-                  return;
-                }
-                if (hasWhitespace) {
-                  toast({
-                    variant: "destructive",
-                    title: "Failed to save parameter",
-                    description:
-                      "Key cannot contain whitespace characters. Consider using underscores (_) instead.",
+                    description: validationError,
                   });
                   return;
                 }

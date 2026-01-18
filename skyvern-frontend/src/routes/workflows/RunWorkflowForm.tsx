@@ -122,6 +122,19 @@ type Props = {
   };
 };
 
+/**
+ * Normalize a parameter value before submission.
+ * - Empty strings or whitespace-only strings → null (triggers MissingValueError for required params)
+ * - Other values → unchanged
+ */
+function normalizeParameterValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed === "" ? null : trimmed;
+  }
+  return value;
+}
+
 function parseValuesForWorkflowRun(
   values: Record<string, unknown>,
   workflowParameters: Array<WorkflowParameter>,
@@ -156,10 +169,12 @@ function parseValuesForWorkflowRun(
         return [key, String(value)];
       }
       if (parameter?.workflow_parameter_type === "string") {
-        if (value === null || value === undefined) {
-          return [key, ""];
+        // Normalize string values: empty/whitespace-only → null for backend validation
+        const normalized = normalizeParameterValue(value);
+        if (normalized === null) {
+          return [key, null];
         }
-        return [key, String(value)];
+        return [key, String(normalized)];
       }
 
       if (
@@ -171,7 +186,7 @@ function parseValuesForWorkflowRun(
           value === undefined ||
           (typeof value === "number" && Number.isNaN(value))
         ) {
-          return [key, ""];
+          return [key, null];
         }
         return [key, String(value)];
       }
