@@ -3859,7 +3859,7 @@ class AgentDB(BaseAlchemyDB):
             session.add(new_action)
             await session.commit()
             await session.refresh(new_action)
-            return Action.model_validate(new_action)
+            return hydrate_action(new_action)
 
     async def update_action_screenshot_artifact_id(
         self, *, organization_id: str, action_id: str, screenshot_artifact_id: str

@@ -34,7 +34,14 @@ async def get_action_history(
         {
             "action": action.model_dump(
                 exclude_none=True,
-                include={"action_type", "element_id", "status", "reasoning", "option", "download"},
+                include={
+                    "action_type",
+                    "element_id",
+                    "status",
+                    "reasoning",
+                    "option",
+                    "download",
+                },
             ),
             # use the last result of the action, because some actions(like chain_click)
             # might have multiple results. Only the last one can represent the real result,

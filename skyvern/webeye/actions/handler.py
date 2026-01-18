@@ -481,8 +481,22 @@ class ActionHandler:
 
             if not download_triggered:
                 results[-1].download_triggered = False
+                action.download_triggered = False
                 return results
             results[-1].download_triggered = True
+            action.download_triggered = True
+
+            # Calculate newly downloaded file names
+            new_file_paths = set(list_files_after) - set(list_files_before)
+            downloaded_file_names = [os.path.basename(fp) for fp in new_file_paths]
+            if downloaded_file_names:
+                results[-1].downloaded_files = downloaded_file_names
+                action.downloaded_files = downloaded_file_names
+                LOG.info(
+                    "Downloaded files captured",
+                    downloaded_files=downloaded_file_names,
+                    workflow_run_id=task.workflow_run_id,
+                )
 
             await check_downloading_files_and_wait_for_download_to_complete(
                 download_dir=download_dir,
