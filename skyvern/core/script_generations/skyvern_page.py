@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, overload
+from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
 import structlog
 from playwright.async_api import Locator, Page
@@ -15,6 +15,10 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.library.ai_locator import AILocator
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
+
+if TYPE_CHECKING:
+    from skyvern.webeye.actions.actions import Action
+    from skyvern.webeye.actions.responses import ActionResult
 
 LOG = structlog.get_logger()
 
@@ -1007,3 +1011,5 @@ class RunContext:
                     self.parameters[key] = value
         self.page = page
         self.trace: list[ActionCall] = []
+        # Store actions and results for step output (similar to agent flow)
+        self.actions_and_results: list[tuple[Action, list[ActionResult]]] = []
