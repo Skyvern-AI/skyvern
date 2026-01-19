@@ -46,6 +46,7 @@ from skyvern.webeye.actions.handler import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -234,6 +235,10 @@ class ScriptSkyvernPage(SkyvernPage):
                 pass  # Don't block action execution if file listing fails
 
         try:
+            # Wait for page to be ready before executing action
+            # This helps prevent issues where cached actions execute before the page is fully loaded
+            await self._wait_for_page_ready_before_action()
+
             call.result = await fn(self, *args, **kwargs)
 
             # Note: Action status would be updated to completed here if update method existed
@@ -525,6 +530,33 @@ class ScriptSkyvernPage(SkyvernPage):
         except Exception:
             # If screenshot creation fails, don't block execution
             pass
+
+    async def _wait_for_page_ready_before_action(self) -> None:
+        """
+        Wait for the page to be ready before executing a cached action.
+
+        This addresses issues like SKY-6814, SKY-7476, SKY-7344 where cached actions
+        execute before the page is fully loaded (e.g., after login transitions).
+
+        The method checks for:
+        1. Network idle (with short timeout - some pages never go idle)
+        2. Loading indicators (spinners, skeletons, progress bars)
+        3. DOM stability (no significant mutations for 300ms)
+        """
+        try:
+            if not self._page:
+                return
+
+            skyvern_frame = await SkyvernFrame.create_instance(frame=self._page)
+            await skyvern_frame.wait_for_page_ready(
+                network_idle_timeout_ms=settings.PAGE_READY_NETWORK_IDLE_TIMEOUT_MS,
+                loading_indicator_timeout_ms=settings.PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS,
+                dom_stable_ms=settings.PAGE_READY_DOM_STABLE_MS,
+                dom_stability_timeout_ms=settings.PAGE_READY_DOM_STABILITY_TIMEOUT_MS,
+            )
+        except Exception:
+            # Don't block action execution if page readiness check fails
+            LOG.debug("Page readiness check failed, proceeding with action", exc_info=True)
 
     async def get_actual_value(
         self,

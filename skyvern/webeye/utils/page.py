@@ -540,3 +540,175 @@ class SkyvernFrame:
                 if is_finished:
                     return
                 await asyncio.sleep(0.1)
+
+    async def wait_for_page_ready(
+        self,
+        network_idle_timeout_ms: float = 3000,
+        loading_indicator_timeout_ms: float = 5000,
+        dom_stable_ms: float = 300,
+        dom_stability_timeout_ms: float = 3000,
+    ) -> None:
+        """
+        Wait for page to be ready for interaction by checking multiple signals:
+        1. Loading indicators gone (spinners, skeletons, progress bars) - highest timeout first
+        2. Network idle (no pending requests for 500ms)
+        3. DOM stability (no significant mutations for dom_stable_ms)
+
+        Checks are ordered by timeout (highest first) so the longest timeout
+        acts as the primary upper bound when checks complete early.
+
+        This is designed for cached action execution to ensure the page is ready
+        before attempting to interact with elements.
+        """
+        # 1. Wait for loading indicators to disappear (longest timeout first)
+        try:
+            await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
+        except (TimeoutError, asyncio.TimeoutError):
+            LOG.warning("Loading indicator timeout - some indicators may still be present, proceeding")
+        except Exception:
+            LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
+
+        # 2. Wait for network idle (with short timeout - some pages never go idle)
+        try:
+            await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
+            LOG.debug("Network idle achieved")
+        except (TimeoutError, asyncio.TimeoutError):
+            LOG.warning("Network idle timeout - page may have constant activity, proceeding")
+
+        # 3. Wait for DOM to stabilize
+        try:
+            await self._wait_for_dom_stable(stable_ms=dom_stable_ms, timeout_ms=dom_stability_timeout_ms)
+        except (TimeoutError, asyncio.TimeoutError):
+            LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
+        except Exception:
+            LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
+
+    async def _wait_for_loading_indicators_gone(self, timeout_ms: float = 5000) -> None:
+        """
+        Wait for common loading indicators to disappear from the page.
+        Checks for spinners, skeletons, progress bars, and loading overlays.
+        """
+        # JavaScript to detect loading indicators
+        loading_indicator_js = """
+        () => {
+            // Common loading indicator selectors
+            const selectors = [
+                // Class-based spinners and loaders
+                '[class*="spinner"]',
+                '[class*="loading"]',
+                '[class*="loader"]',
+                '[class*="skeleton"]',
+                '[class*="progress"]',
+                '[class*="shimmer"]',
+                // Role-based
+                '[role="progressbar"]',
+                '[role="status"][aria-busy="true"]',
+                // Aria attributes
+                '[aria-busy="true"]',
+                '[aria-live="polite"][aria-busy="true"]',
+                // Common loading overlay patterns
+                '.loading-overlay',
+                '.page-loading',
+                '.content-loading',
+                // SVG spinners
+                'svg[class*="spin"]',
+                'svg[class*="loading"]',
+            ];
+
+            for (const selector of selectors) {
+                try {
+                    const elements = document.querySelectorAll(selector);
+                    for (const el of elements) {
+                        // Check if element is visible
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        const isVisible = (
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            style.opacity !== '0' &&
+                            rect.width > 0 &&
+                            rect.height > 0
+                        );
+                        if (isVisible) {
+                            return true;  // Loading indicator found
+                        }
+                    }
+                } catch (e) {
+                    // Ignore selector errors
+                }
+            }
+            return false;  // No loading indicators found
+        }
+        """
+
+        async with asyncio.timeout(timeout_ms / 1000):
+            while True:
+                has_loading_indicator = await self.evaluate(
+                    frame=self.frame,
+                    expression=loading_indicator_js,
+                    timeout_ms=timeout_ms,
+                )
+                if not has_loading_indicator:
+                    LOG.debug("No loading indicators detected")
+                    return
+                await asyncio.sleep(0.1)
+
+    async def _wait_for_dom_stable(self, stable_ms: float = 300, timeout_ms: float = 3000) -> None:
+        """
+        Wait for DOM to stabilize (no significant mutations for stable_ms milliseconds).
+        Uses MutationObserver to detect DOM changes.
+        """
+        dom_stability_js = f"""
+        () => new Promise((resolve) => {{
+            let lastMutationTime = Date.now();
+            let resolved = false;
+
+            const observer = new MutationObserver((mutations) => {{
+                // Filter out insignificant mutations (attribute changes on non-visible elements)
+                const significantMutations = mutations.filter(m => {{
+                    if (m.type === 'childList') return true;
+                    if (m.type === 'characterData') return true;
+                    if (m.type === 'attributes') {{
+                        const el = m.target;
+                        if (el.nodeType !== 1) return false;
+                        const rect = el.getBoundingClientRect();
+                        // Only count attribute changes on visible elements
+                        return rect.width > 0 && rect.height > 0;
+                    }}
+                    return false;
+                }});
+
+                if (significantMutations.length > 0) {{
+                    lastMutationTime = Date.now();
+                }}
+            }});
+
+            observer.observe(document.body, {{
+                childList: true,
+                subtree: true,
+                attributes: true,
+                characterData: true,
+            }});
+
+            const checkStability = () => {{
+                if (resolved) return;
+                const timeSinceLastMutation = Date.now() - lastMutationTime;
+                if (timeSinceLastMutation >= {stable_ms}) {{
+                    resolved = true;
+                    observer.disconnect();
+                    resolve(true);
+                }} else {{
+                    setTimeout(checkStability, 50);
+                }}
+            }};
+
+            // Start checking after a brief delay to catch initial mutations
+            setTimeout(checkStability, 50);
+        }})
+        """
+
+        await self.evaluate(
+            frame=self.frame,
+            expression=dom_stability_js,
+            timeout_ms=timeout_ms,
+        )
