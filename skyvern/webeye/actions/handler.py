@@ -486,6 +486,13 @@ class ActionHandler:
             results[-1].download_triggered = True
             action.download_triggered = True
 
+            await check_downloading_files_and_wait_for_download_to_complete(
+                download_dir=download_dir,
+                organization_id=task.organization_id,
+                browser_session_id=task.browser_session_id,
+                timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
+            )
+
             # Calculate newly downloaded file names
             new_file_paths = set(list_files_after) - set(list_files_before)
             downloaded_file_names = [os.path.basename(fp) for fp in new_file_paths]
@@ -498,12 +505,6 @@ class ActionHandler:
                     workflow_run_id=task.workflow_run_id,
                 )
 
-            await check_downloading_files_and_wait_for_download_to_complete(
-                download_dir=download_dir,
-                organization_id=task.organization_id,
-                browser_session_id=task.browser_session_id,
-                timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
-            )
             return results
         finally:
             if browser_state is not None and download_triggered:
