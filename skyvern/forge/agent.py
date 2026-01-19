@@ -5,7 +5,6 @@ import json
 import os
 import random
 import re
-import string
 import uuid
 from asyncio.exceptions import CancelledError
 from dataclasses import dataclass
@@ -553,6 +552,20 @@ class ForgeAgent:
                             with open(os.path.join(workflow_download_directory, file), "wb") as f:
                                 f.write(file_data)
 
+                        file_path_obj = Path(file)
+                        if file_path_obj.is_absolute() or os.sep in file or (os.altsep and os.altsep in file):
+                            file = file_path_obj.name
+
+                        try:
+                            file_relative = os.path.relpath(file, str(workflow_download_directory))
+                            if file_relative != file and not file_relative.startswith(".."):
+                                file = os.path.basename(file_relative)
+                        except Exception:
+                            file = os.path.basename(file)
+
+                        if file.startswith(".") and ".metadata.json" in file:
+                            continue
+
                         file_extension = Path(file).suffix
                         if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                             LOG.warning(
@@ -564,24 +577,18 @@ class ForgeAgent:
                             continue
 
                         if task_block.download_suffix:
-                            # Use download_suffix as the complete filename (without extension)
                             final_file_name = task_block.download_suffix
-                        else:
-                            # Fallback to random filename if no download_suffix provided
-                            random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
-                            final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
-
-                        # Check if file with this name already exists
-                        final_file_name = final_file_name
-                        target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
-                        counter = 1
-                        while os.path.exists(target_path):
-                            # If file exists, append counter to filename
-                            final_file_name = f"{final_file_name}_{counter}"
                             target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
-                            counter += 1
-
-                        rename_file(os.path.join(workflow_download_directory, file), final_file_name + file_extension)
+                            counter = 1
+                            while os.path.exists(target_path):
+                                final_file_name = f"{final_file_name}_{counter}"
+                                target_path = os.path.join(
+                                    workflow_download_directory, final_file_name + file_extension
+                                )
+                                counter += 1
+                            rename_file(
+                                os.path.join(workflow_download_directory, file), final_file_name + file_extension
+                            )
 
                     LOG.info(
                         "Task marked as completed due to download",

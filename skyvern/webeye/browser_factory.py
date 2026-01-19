@@ -8,13 +8,14 @@ import random
 import re
 import shutil
 import socket
+import string
 import subprocess
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, cast
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 import psutil
 import structlog
@@ -27,7 +28,7 @@ from skyvern.constants import (
 )
 from skyvern.exceptions import UnknownBrowserType, UnknownErrorWhileCreatingBrowserContext
 from skyvern.forge import app
-from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
+from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory, sanitize_filename
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
@@ -64,6 +65,37 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
     browser_context.on("console", browser_console_log)
 
 
+def _get_original_filename_from_download(download: Download, url: str) -> str | None:
+    if download.suggested_filename:
+        suggested = download.suggested_filename.replace("\\", "/")
+        suggested = os.path.basename(suggested)
+        if suggested:
+            return suggested
+
+    try:
+        parsed_url = urlparse(url)
+        parsed_qs = parse_qsl(parsed_url.query)
+        for key, value in parsed_qs:
+            if key.lower() in ["filename", "file", "name"]:
+                decoded_value = unquote(value)
+                if decoded_value and "." in decoded_value:
+                    return os.path.basename(decoded_value)
+    except Exception:
+        pass
+
+    try:
+        parsed_url = urlparse(url)
+        path_filename = os.path.basename(parsed_url.path)
+        if path_filename and "." in path_filename:
+            decoded = unquote(path_filename)
+            if decoded:
+                return decoded
+    except Exception:
+        pass
+
+    return None
+
+
 def set_download_file_listener(
     browser_context: BrowserContext, download_timeout: float | None = None, **kwargs: Any
 ) -> None:
@@ -73,53 +105,55 @@ def set_download_file_listener(
         try:
             async with asyncio.timeout(download_timeout or BROWSER_DOWNLOAD_TIMEOUT):
                 file_path = await download.path()
-                if file_path.suffix:
-                    return
 
-                LOG.info(
-                    "No file extensions, going to add file extension automatically",
-                    workflow_run_id=workflow_run_id,
-                    task_id=task_id,
-                    suggested_filename=download.suggested_filename,
-                    url=download.url,
-                )
-                suffix = Path(download.suggested_filename).suffix
-                if suffix:
-                    LOG.info(
-                        "Add extension according to suggested filename",
-                        workflow_run_id=workflow_run_id,
-                        task_id=task_id,
-                        filepath=str(file_path) + suffix,
+                original_filename = _get_original_filename_from_download(download, download.url)
+
+                file_extension = file_path.suffix
+
+                if not file_extension:
+                    suffix = Path(download.suggested_filename).suffix if download.suggested_filename else ""
+                    if suffix:
+                        file_extension = suffix
+                    else:
+                        parsed_url = urlparse(download.url)
+                        parsed_qs = parse_qsl(parsed_url.query)
+                        for key, value in parsed_qs:
+                            if key.lower() == "filename":
+                                suffix = Path(value).suffix
+                                if suffix:
+                                    file_extension = suffix
+                                    break
+
+                        if not file_extension:
+                            suffix = Path(parsed_url.path).suffix
+                            if suffix:
+                                file_extension = suffix
+
+                if original_filename:
+                    sanitized_name = sanitize_filename(original_filename)
+                    name_without_ext = Path(sanitized_name).stem
+                    random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+                    final_filename = f"download-{name_without_ext}-{random_file_id}{file_extension}"
+                else:
+                    random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+                    final_filename = (
+                        f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}{file_extension}"
                     )
-                    file_path.rename(str(file_path) + suffix)
-                    return
 
-                parsed_url = urlparse(download.url)
-                parsed_qs = parse_qsl(parsed_url.query)
-                for key, value in parsed_qs:
-                    if key.lower() == "filename":
-                        suffix = Path(value).suffix
-                        if suffix:
-                            LOG.info(
-                                "Add extension according to the parsed query params of download url",
-                                workflow_run_id=workflow_run_id,
-                                task_id=task_id,
-                                filename=value,
-                            )
-                            file_path.rename(str(file_path) + suffix)
-                            return
+                final_file_path = file_path.parent / final_filename
 
-                suffix = Path(parsed_url.path).suffix
-                if suffix:
-                    LOG.info(
-                        "Add extension according to download url path",
-                        workflow_run_id=workflow_run_id,
-                        task_id=task_id,
-                        filepath=str(file_path) + suffix,
-                    )
-                    file_path.rename(str(file_path) + suffix)
-                    return
-                # TODO: maybe should try to parse it from URL response
+                counter = 1
+                while final_file_path.exists():
+                    name_without_ext = Path(final_filename).stem
+                    ext = Path(final_filename).suffix
+                    final_filename = f"{name_without_ext}_{counter}{ext}"
+                    final_file_path = file_path.parent / final_filename
+                    counter += 1
+
+                if file_path.name != final_filename:
+                    file_path.rename(final_file_path)
+
+                return
         except asyncio.TimeoutError:
             LOG.error(
                 "timeout to download file, going to cancel the download",
