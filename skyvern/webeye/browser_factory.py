@@ -421,12 +421,20 @@ async def _create_headless_chromium(
             apply_download_behaviour=True,
         )
 
-    # Check for browser_profile_id and load from storage if available
+    # Check for browser_session_dir (from persist_browser_session) or browser_profile_id
+    browser_session_dir = cast(str | None, kwargs.get("browser_session_dir"))
     browser_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
     organization_id_for_profile = cast(str | None, kwargs.get("organization_id"))
     user_data_dir: str | None = None
 
-    if browser_profile_id and organization_id_for_profile:
+    # Priority: browser_session_dir > browser_profile_id > temp directory
+    if browser_session_dir:
+        user_data_dir = browser_session_dir
+        LOG.info(
+            "Using browser session directory",
+            browser_session_dir=browser_session_dir,
+        )
+    elif browser_profile_id and organization_id_for_profile:
         profile_dir = await app.STORAGE.retrieve_browser_profile(
             organization_id=organization_id_for_profile,
             profile_id=browser_profile_id,
@@ -486,12 +494,20 @@ async def _create_headful_chromium(
             apply_download_behaviour=True,
         )
 
-    # Check for browser_profile_id and load from storage if available
+    # Check for browser_session_dir (from persist_browser_session) or browser_profile_id
+    browser_session_dir = cast(str | None, kwargs.get("browser_session_dir"))
     browser_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
     organization_id_for_profile = cast(str | None, kwargs.get("organization_id"))
     user_data_dir: str | None = None
 
-    if browser_profile_id and organization_id_for_profile:
+    # Priority: browser_session_dir > browser_profile_id > temp directory
+    if browser_session_dir:
+        user_data_dir = browser_session_dir
+        LOG.info(
+            "Using browser session directory",
+            browser_session_dir=browser_session_dir,
+        )
+    elif browser_profile_id and organization_id_for_profile:
         profile_dir = await app.STORAGE.retrieve_browser_profile(
             organization_id=organization_id_for_profile,
             profile_id=browser_profile_id,

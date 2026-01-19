@@ -554,10 +554,36 @@ async def run_task_v2_helper(
     yaml_parameters: list[PARAMETER_YAML_TYPES] = []
     current_url: str | None = None
 
+    # Check for persist_browser_session - first in current workflow, then in parent
+    persist_browser_session = workflow.persist_browser_session if workflow else False
+    session_workflow_permanent_id = workflow.workflow_permanent_id if workflow else None
+
+    # If not set and there's a parent workflow, check parent
+    if not persist_browser_session and workflow_run.parent_workflow_run_id:
+        try:
+            parent_workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run.parent_workflow_run_id, organization_id=organization_id
+            )
+            if parent_workflow_run:
+                parent_workflow = await app.WORKFLOW_SERVICE.get_workflow(
+                    parent_workflow_run.workflow_id, organization_id=organization_id
+                )
+                if parent_workflow and parent_workflow.persist_browser_session:
+                    persist_browser_session = True
+                    session_workflow_permanent_id = parent_workflow.workflow_permanent_id
+        except Exception as e:
+            LOG.warning(
+                "Could not get parent workflow for persist_browser_session",
+                parent_workflow_run_id=workflow_run.parent_workflow_run_id,
+                error=str(e),
+            )
+
     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
         workflow_run=workflow_run,
         browser_session_id=browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        persist_browser_session=persist_browser_session,
+        workflow_permanent_id=session_workflow_permanent_id,
     )
 
     page = await browser_state.get_working_page()
@@ -620,6 +646,8 @@ async def run_task_v2_helper(
             workflow_run=workflow_run,
             browser_session_id=browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,
+            persist_browser_session=persist_browser_session,
+            workflow_permanent_id=session_workflow_permanent_id,
         )
         page = await browser_state.get_working_page()
         should_fallback = False
@@ -903,6 +931,8 @@ async def run_task_v2_helper(
                     url=url,
                     browser_session_id=browser_session_id,
                     browser_profile_id=workflow_run.browser_profile_id,
+                    persist_browser_session=persist_browser_session,
+                    workflow_permanent_id=session_workflow_permanent_id,
                 )
                 scraped_page = await browser_state.scrape_website(
                     url=url,

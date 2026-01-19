@@ -34,6 +34,7 @@ class RealBrowserManager(BrowserManager):
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        browser_session_dir: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
         (
@@ -43,6 +44,7 @@ class RealBrowserManager(BrowserManager):
         ) = await BrowserContextFactory.create_browser_context(
             pw,
             proxy_location=proxy_location,
+            browser_session_dir=browser_session_dir,
             url=url,
             task_id=task_id,
             workflow_run_id=workflow_run_id,
@@ -147,6 +149,8 @@ class RealBrowserManager(BrowserManager):
         url: str | None = None,
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
+        persist_browser_session: bool = False,
+        workflow_permanent_id: str | None = None,
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -184,6 +188,23 @@ class RealBrowserManager(BrowserManager):
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
 
+        # Determine browser_session_dir if persist_browser_session is enabled
+        browser_session_dir: str | None = None
+        if persist_browser_session and workflow_permanent_id and not browser_profile_id:
+            from skyvern.config import settings
+            from pathlib import Path
+
+            session_path = (
+                Path(settings.BROWSER_SESSION_BASE_PATH) / workflow_run.organization_id / workflow_permanent_id
+            ).resolve()
+            session_path.mkdir(parents=True, exist_ok=True)
+            browser_session_dir = str(session_path)
+            LOG.info(
+                "Using persistent browser session directory",
+                browser_session_dir=browser_session_dir,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+
         if browser_state is None:
             LOG.info(
                 "Creating browser state for workflow run",
@@ -197,6 +218,7 @@ class RealBrowserManager(BrowserManager):
                 extra_http_headers=workflow_run.extra_http_headers,
                 browser_address=workflow_run.browser_address,
                 browser_profile_id=browser_profile_id,
+                browser_session_dir=browser_session_dir,
             )
 
             if browser_session_id:
