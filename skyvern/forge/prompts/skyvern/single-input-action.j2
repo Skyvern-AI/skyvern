@@ -46,7 +46,12 @@ HTML elements from `{{ current_url }}`:
 ```
 {{ elements }}
 ```
-
+{% if action_history %}
+Consider the action history from the previous steps and the screenshot together, if actions from the previous steps don't yield positive impact, try to take an action on a different element.
+Action history from previous steps:
+```
+{{ action_history }}
+```{% endif %}
 Current datetime, ISO format:
 ```
 {{ local_datetime }}
