@@ -1,6 +1,6 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
-import { Handle, NodeProps, Position } from "@xyflow/react";
+import { Handle, NodeProps, Position, useNodes, useEdges } from "@xyflow/react";
 import type { PrintPageNode } from "./types";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -24,6 +24,9 @@ import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
+import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
+import { AppNode } from "..";
+import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 
 function PrintPageNode({ id, data }: NodeProps<PrintPageNode>) {
   const { editable, label } = data;
@@ -36,6 +39,9 @@ function PrintPageNode({ id, data }: NodeProps<PrintPageNode>) {
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
 
+  const nodes = useNodes<AppNode>();
+  const edges = useEdges();
+  const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const update = useUpdate<PrintPageNode["data"]>({ id, editable });
 
   return (
@@ -126,6 +132,13 @@ function PrintPageNode({ id, data }: NodeProps<PrintPageNode>) {
             </AccordionTrigger>
             <AccordionContent className="pl-6 pr-1 pt-1">
               <div className="space-y-4">
+                <ParametersMultiSelect
+                  availableOutputParameters={outputParameterKeys}
+                  parameters={data.parameterKeys}
+                  onParametersChange={(parameterKeys) => {
+                    update({ parameterKeys });
+                  }}
+                />
                 <div className="space-y-2">
                   <Label className="text-xs text-slate-300">
                     Custom Filename

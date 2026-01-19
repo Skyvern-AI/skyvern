@@ -207,7 +207,8 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                                       node.type === "action" ||
                                       node.type === "http_request" ||
                                       node.type === "validation" ||
-                                      node.type === "codeBlock"
+                                      node.type === "codeBlock" ||
+                                      node.type === "printPage"
                                     ) {
                                       const parameterKeys = node.data
                                         .parameterKeys as Array<string> | null;
@@ -313,7 +314,8 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                           node.type === "action" ||
                           node.type === "http_request" ||
                           node.type === "validation" ||
-                          node.type === "codeBlock"
+                          node.type === "codeBlock" ||
+                          node.type === "printPage"
                         ) {
                           const parameterKeys = node.data
                             .parameterKeys as Array<string> | null;

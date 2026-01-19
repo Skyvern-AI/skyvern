@@ -413,4 +413,5 @@ export type PrintPageBlockYAML = BlockYAMLBase & {
   format: string;
   landscape: boolean;
   print_background: boolean;
+  parameter_keys?: Array<string> | null;
 };

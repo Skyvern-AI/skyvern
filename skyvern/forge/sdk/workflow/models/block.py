@@ -244,6 +244,57 @@ class Block(BaseModel, abc.ABC):
             workflow_run_block_id=workflow_run_block_id,
         )
 
+    async def get_or_create_browser_state(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> BrowserState | None:
+        """
+        Acquire or create browser state for block execution.
+
+        Checks persistent sessions first (debugger use case), then falls back to
+        workflow run browser manager. If no state exists, creates a new one.
+
+        Returns BrowserState if successful, None if creation failed.
+        """
+        browser_state: BrowserState | None = None
+
+        if browser_session_id and organization_id:
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+        else:
+            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+        if not browser_state:
+            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            try:
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url=None,
+                    browser_session_id=browser_session_id,
+                    browser_profile_id=workflow_run.browser_profile_id,
+                )
+                await browser_state.check_and_fix_state(
+                    url=None,
+                    proxy_location=workflow_run.proxy_location,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                    extra_http_headers=workflow_run.extra_http_headers,
+                    browser_address=workflow_run.browser_address,
+                    browser_profile_id=workflow_run.browser_profile_id,
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to create browser state",
+                    workflow_run_id=workflow_run_id,
+                )
+                return None
+
+        return browser_state
+
     def format_block_parameter_template_from_workflow_run_context(
         self,
         potential_template: str,
@@ -1905,63 +1956,11 @@ async def wrapper():
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
 
-        # TODO: only support to use code block to manupilate the browser page
-        # support browser context in the future
-        browser_state: BrowserState | None = None
-        if browser_session_id and organization_id:
-            LOG.info(
-                "Getting browser state for workflow run from persistent sessions manager",
-                browser_session_id=browser_session_id,
-            )
-            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
-            if browser_state:
-                LOG.info("Was occupying session here, but no longer.", browser_session_id=browser_session_id)
-        else:
-            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
-
-        # If no browser state exists, create one (e.g., when code block is the first block)
-        if not browser_state:
-            LOG.info(
-                "No browser state found, creating one for code block execution",
-                workflow_run_id=workflow_run_id,
-                browser_session_id=browser_session_id,
-            )
-            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-            )
-            try:
-                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                    workflow_run=workflow_run,
-                    url=None,  # Code block doesn't need to navigate to a URL initially
-                    browser_session_id=browser_session_id,
-                    browser_profile_id=workflow_run.browser_profile_id,
-                )
-                # Ensure the browser state has a working page
-                await browser_state.check_and_fix_state(
-                    url=None,  # Don't navigate to any URL, just ensure a page exists
-                    proxy_location=workflow_run.proxy_location,
-                    workflow_run_id=workflow_run_id,
-                    organization_id=workflow_run.organization_id,
-                    extra_http_headers=workflow_run.extra_http_headers,
-                    browser_address=workflow_run.browser_address,
-                    browser_profile_id=workflow_run.browser_profile_id,
-                )
-            except Exception as e:
-                LOG.exception(
-                    "Failed to create browser state for code block",
-                    workflow_run_id=workflow_run_id,
-                    error=str(e),
-                )
-                return await self.build_block_result(
-                    success=False,
-                    failure_reason=f"Failed to create browser for code block: {str(e)}",
-                    output_parameter_value=None,
-                    status=BlockStatus.failed,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-
+        browser_state = await self.get_or_create_browser_state(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
         if not browser_state:
             return await self.build_block_result(
                 success=False,
@@ -4484,11 +4483,12 @@ class PrintPageBlock(Block):
     format: str = "A4"
     landscape: bool = False
     print_background: bool = True
+    parameters: list[PARAMETER_TYPE] = []
 
     VALID_FORMATS: ClassVar[set[str]] = {"A4", "Letter", "Legal", "Tabloid"}
 
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
-        return []
+        return self.parameters
 
     @staticmethod
     def _sanitize_filename(filename: str) -> str:
@@ -4577,8 +4577,12 @@ class PrintPageBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
+        browser_state = await self.get_or_create_browser_state(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
         if not browser_state:
             return await self.build_block_result(
                 success=False,
