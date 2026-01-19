@@ -563,6 +563,7 @@ export type PrintPageBlock = WorkflowBlockBase & {
   format: string;
   landscape: boolean;
   print_background: boolean;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type WorkflowDefinition = {

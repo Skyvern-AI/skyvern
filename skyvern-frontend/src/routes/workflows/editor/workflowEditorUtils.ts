@@ -853,6 +853,7 @@ function convertToNode(
           format: block.format ?? "A4",
           landscape: block.landscape ?? false,
           printBackground: block.print_background ?? true,
+          parameterKeys: block.parameters.map((p) => p.key),
         },
       };
     }
@@ -2369,6 +2370,7 @@ function getWorkflowBlock(
         format: node.data.format,
         landscape: node.data.landscape,
         print_background: node.data.printBackground,
+        parameter_keys: node.data.parameterKeys,
       };
     }
     case "conditional": {
@@ -3386,6 +3388,7 @@ function convertBlocksToBlockYAML(
           format: block.format,
           landscape: block.landscape,
           print_background: block.print_background,
+          parameter_keys: block.parameters.map((p) => p.key),
         };
         return blockYaml;
       }
