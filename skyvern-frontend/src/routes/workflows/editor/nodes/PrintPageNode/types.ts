@@ -8,6 +8,7 @@ export type PrintPageNodeData = NodeBaseData & {
   format: string;
   landscape: boolean;
   printBackground: boolean;
+  parameterKeys: Array<string>;
 };
 
 export type PrintPageNode = Node<PrintPageNodeData, "printPage">;
@@ -23,6 +24,7 @@ export const printPageNodeDefaultData: PrintPageNodeData = {
   format: "A4",
   landscape: false,
   printBackground: true,
+  parameterKeys: [],
 };
 
 export function isPrintPageNode(node: Node): node is PrintPageNode {
