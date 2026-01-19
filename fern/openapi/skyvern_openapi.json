@@ -3592,6 +3592,31 @@
             ],
             "title": "Download"
           },
+          "download_triggered": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Triggered"
+          },
+          "downloaded_files": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Downloaded Files"
+          },
           "is_upload_file_tag": {
             "anyOf": [
               {
