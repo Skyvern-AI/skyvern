@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     CACHED_ACTION_DELAY_SECONDS: float = 1.0
+    # Page readiness settings for cached action execution
+    # These help prevent cached actions from executing before the page is fully loaded
+    PAGE_READY_NETWORK_IDLE_TIMEOUT_MS: float = 3000  # Wait for network idle (short timeout)
+    PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS: float = 5000  # Wait for loading indicators to disappear
+    PAGE_READY_DOM_STABLE_MS: float = 300  # Time with no DOM mutations to consider stable
+    PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
