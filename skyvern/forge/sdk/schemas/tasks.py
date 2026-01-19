@@ -364,6 +364,7 @@ class Task(TaskBase):
             workflow_run_id=self.workflow_run_id,
             max_screenshot_scrolls=self.max_screenshot_scrolls,
             step_count=step_count,
+            browser_session_id=self.browser_session_id,
         )
 
 
@@ -390,6 +391,7 @@ class TaskResponse(BaseModel):
     finished_at: datetime | None = None
     max_screenshot_scrolls: int | None = None
     step_count: int | None = None
+    browser_session_id: str | None = None
 
 
 class TaskOutput(BaseModel):
