@@ -5,7 +5,6 @@ from fastapi import Depends, HTTPException, status
 
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-from skyvern.exceptions import ScrapingFailed
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
@@ -226,19 +225,6 @@ async def run_sdk_action(
             organization_id=organization_id,
             status=TaskStatus.completed,
         )
-    except ScrapingFailed as e:
-        await app.DATABASE.update_task(
-            task_id=task.task_id,
-            organization_id=organization_id,
-            status=TaskStatus.failed,
-            failure_reason=str(e.reason) if e.reason else str(e),
-        )
-        LOG.warning(
-            "SDK action failed due to scraping error",
-            action_type=action.type,
-            error=str(e),
-        )
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=e.reason or str(e))
     except Exception as e:
         await app.DATABASE.update_task(
             task_id=task.task_id,

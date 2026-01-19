@@ -561,6 +561,7 @@ class PrintPageBlockYAML(BlockYAML):
     format: PDFFormat = PDFFormat.A4
     landscape: bool = False
     print_background: bool = True
+    parameter_keys: list[str] | None = None
 
 
 PARAMETER_YAML_SUBCLASSES = (

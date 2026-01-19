@@ -693,6 +693,7 @@ def block_yaml_to_block(
             complete_verification=False,
         )
     elif block_yaml.block_type == BlockType.PRINT_PAGE:
+        print_page_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return PrintPageBlock(
             **base_kwargs,
             include_timestamp=block_yaml.include_timestamp,
@@ -700,6 +701,7 @@ def block_yaml_to_block(
             format=block_yaml.format,
             landscape=block_yaml.landscape,
             print_background=block_yaml.print_background,
+            parameters=print_page_block_parameters,
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")
