@@ -104,6 +104,7 @@ dev = [
     "moto[s3, server]>=5.1.5,<6",
     "curlify>=3.0.0",
     "openpyxl>=3.1.0",
+    "gspread>=6",
 ]
 
 [tool.hatch.build]
