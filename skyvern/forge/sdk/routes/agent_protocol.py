@@ -262,6 +262,7 @@ async def run_task(
                 model=run_request.model,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolls,
                 extra_http_headers=run_request.extra_http_headers,
+                browser_session_id=run_request.browser_session_id,
                 browser_address=run_request.browser_address,
             )
         except MissingBrowserAddressError as e:
