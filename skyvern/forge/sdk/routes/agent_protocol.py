@@ -1476,6 +1476,12 @@ async def run_block(
     # LOG.critical("REMOVING BROWSER SESSION ID")
     # block_run_request.browser_session_id = None
 
+    await block_service.validate_block_labels(
+        workflow_permanent_id=block_run_request.workflow_id,
+        organization_id=organization.organization_id,
+        block_labels=block_run_request.block_labels,
+    )
+
     workflow_run = await block_service.ensure_workflow_run(
         organization=organization,
         template=template,
