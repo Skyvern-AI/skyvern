@@ -1,5 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { Status, StepApiResponse, TaskApiResponse } from "@/api/types";
+import { BrowserStream } from "@/components/BrowserStream";
+import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { ZoomableImage } from "@/components/ZoomableImage";
@@ -66,8 +68,14 @@ function TaskActions() {
   });
   const taskIsNotFinalized = task && statusIsNotFinalized(task);
   const taskIsRunningOrQueued = task && statusIsRunningOrQueued(task);
+  const browserSessionId = task?.browser_session_id;
 
   useEffect(() => {
+    // Skip screenshot WebSocket if VNC streaming is available via browser_session_id
+    if (browserSessionId) {
+      return;
+    }
+
     if (!taskIsRunningOrQueued) {
       return;
     }
@@ -138,7 +146,13 @@ function TaskActions() {
         socket = null;
       }
     };
-  }, [credentialGetter, taskId, taskIsRunningOrQueued, queryClient]);
+  }, [
+    browserSessionId,
+    credentialGetter,
+    taskId,
+    taskIsRunningOrQueued,
+    queryClient,
+  ]);
 
   const { data: steps, isLoading: stepsIsLoading } = useQuery<
     Array<StepApiResponse>
@@ -192,6 +206,29 @@ function TaskActions() {
     activeSelection !== "stream" ? actions[activeSelection] : null;
 
   function getStream() {
+    // Use VNC streaming via BrowserStream when browser_session_id is available
+    if (browserSessionId) {
+      return (
+        <AspectRatio ratio={16 / 9}>
+          <BrowserStream
+            key={browserSessionId}
+            browserSessionId={browserSessionId}
+            interactive={false}
+            showControlButtons={false}
+            onClose={() => {
+              queryClient.invalidateQueries({
+                queryKey: ["task", taskId],
+              });
+              queryClient.invalidateQueries({
+                queryKey: ["tasks"],
+              });
+            }}
+          />
+        </AspectRatio>
+      );
+    }
+
+    // Fall back to screenshot-based streaming
     if (task?.status === Status.Created) {
       return (
         <div className="flex h-full w-full flex-col items-center justify-center gap-4 bg-slate-elevation1 text-lg">
