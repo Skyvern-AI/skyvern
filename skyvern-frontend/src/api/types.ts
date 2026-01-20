@@ -150,6 +150,7 @@ export type TaskApiResponse = {
   max_steps_per_run: number | null;
   task_v2: TaskV2 | null;
   workflow_run_id: string | null;
+  browser_session_id: string | null;
 };
 
 export type CreateTaskRequest = {
