@@ -105,28 +105,6 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
             >
               Credential Parameter
             </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => {
-                setOperationPanelState({
-                  active: true,
-                  operation: "add",
-                  type: WorkflowEditorParameterTypes.Secret,
-                });
-              }}
-            >
-              Secret Parameter
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => {
-                setOperationPanelState({
-                  active: true,
-                  operation: "add",
-                  type: WorkflowEditorParameterTypes.CreditCardData,
-                });
-              }}
-            >
-              Credit Card Parameter
-            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
 
@@ -149,7 +127,9 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                         </span>
                       ) : (
                         <span className="text-sm text-slate-400">
-                          {parameter.parameterType === "onepassword"
+                          {parameter.parameterType === "onepassword" ||
+                          parameter.parameterType === "secret" ||
+                          parameter.parameterType === "creditCardData"
                             ? "credential"
                             : parameter.parameterType}
                         </span>
@@ -164,7 +144,9 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                             operation: "edit",
                             parameter: parameter,
                             type:
-                              parameter.parameterType === "onepassword"
+                              parameter.parameterType === "onepassword" ||
+                              parameter.parameterType === "secret" ||
+                              parameter.parameterType === "creditCardData"
                                 ? WorkflowEditorParameterTypes.Credential
                                 : parameter.parameterType,
                           });
