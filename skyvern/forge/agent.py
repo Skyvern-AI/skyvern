@@ -2661,8 +2661,23 @@ class ForgeAgent:
                 llm_config = LLMConfigRegistry.get_config(resolved_llm_key)
                 extracted_name = None
 
+                # For router configs (LLMRouterConfig), extract from model_list primary model FIRST
+                # This must be checked before model_name since router model_name is just an identifier
+                # (e.g., "gemini-3.0-flash-gpt-5-mini-fallback-router"), not an actual Vertex model
+                if hasattr(llm_config, "model_list") and hasattr(llm_config, "main_model_group"):
+                    # Find the primary model in model_list by matching main_model_group
+                    for model_entry in llm_config.model_list:
+                        if model_entry.model_name == llm_config.main_model_group:
+                            # Extract actual model name from litellm_params
+                            model_param = model_entry.litellm_params.get("model", "")
+                            if "vertex_ai/" in model_param:
+                                extracted_name = model_param.split("/")[-1]
+                            elif model_param.startswith("gemini-"):
+                                extracted_name = model_param
+                            break
+
                 # Try to extract from model_name if it contains "vertex_ai/" or starts with "gemini-"
-                if hasattr(llm_config, "model_name") and isinstance(llm_config.model_name, str):
+                if not extracted_name and hasattr(llm_config, "model_name") and isinstance(llm_config.model_name, str):
                     if "vertex_ai/" in llm_config.model_name:
                         # Direct Vertex config: "vertex_ai/gemini-2.5-flash" -> "gemini-2.5-flash"
                         extracted_name = llm_config.model_name.split("/")[-1]
