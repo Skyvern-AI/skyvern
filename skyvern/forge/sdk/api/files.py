@@ -251,10 +251,10 @@ async def download_file(
                 LOG.info(f"File downloaded successfully to {file_path}")
                 return file_path
     except aiohttp.ClientResponseError as e:
-        LOG.error(f"Failed to download file, status code: {e.status}")
+        LOG.exception(f"Failed to download file, status code: {e.status}")
         raise
     except DownloadFileMaxSizeExceeded as e:
-        LOG.error(f"Failed to download file, max size exceeded: {e.max_size}")
+        LOG.exception(f"Failed to download file, max size exceeded: {e.max_size}")
         raise
     except Exception:
         LOG.exception("Failed to download file")
