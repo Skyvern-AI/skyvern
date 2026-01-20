@@ -125,10 +125,9 @@ def _json_type_filter(value: Any) -> str:
     When _render_templates_in_json() detects these markers, it unwraps and
     parses the JSON to get the native typed value (bool, int, list, etc.).
 
-    Args:
-        value: Any JSON-serializable value (bool, int, float, str, list, dict, None).
+    Uses default=str to handle non-JSON-serializable types (datetime, Enum, etc.)
     """
-    return f"{_JSON_TYPE_MARKER}{json.dumps(value)}{_JSON_TYPE_MARKER}"
+    return f"{_JSON_TYPE_MARKER}{json.dumps(value, default=str)}{_JSON_TYPE_MARKER}"
 
 
 jinja_sandbox_env.filters["json"] = _json_type_filter
@@ -397,6 +396,7 @@ class Block(BaseModel, abc.ABC):
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
 
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
+        template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
 
         if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
             if missing_variables := get_missing_variables(potential_template, template_data):
