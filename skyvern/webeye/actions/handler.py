@@ -782,6 +782,7 @@ async def handle_click_action(
                     anchor_element=skyvern_element,
                     dom=dom,
                     page=page,
+                    skyvern_frame=skyvern_frame,
                     scraped_page=scraped_page,
                     incremental_scraped=incremental_scraped,
                     task=task,
@@ -812,12 +813,18 @@ async def handle_sequential_click_for_dropdown(
     anchor_element: SkyvernElement,
     dom: DomUtil,
     page: Page,
+    skyvern_frame: SkyvernFrame,
     scraped_page: ScrapedPage,
     incremental_scraped: IncrementalScrapePage,
     task: Task,
     step: Step,
 ) -> ActionResult | None:
     if await incremental_scraped.get_incremental_elements_num() == 0:
+        return None
+
+    await skyvern_frame.safe_wait_for_animation_end()
+    if page.url != scraped_page.url:
+        LOG.info("Page URL changed after clicking, exiting the sequential click logic")
         return None
 
     incremental_elements = await incremental_scraped.get_incremental_element_tree(
@@ -839,6 +846,10 @@ async def handle_sequential_click_for_dropdown(
         for element_id in new_element_ids
         if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
     ]
+
+    if len(new_interactable_element_ids) == 0:
+        LOG.info("No new interactable elements found, exiting the sequential click logic")
+        return None
 
     action_history_str = ""
     if action_history and len(action_history) > 0:
