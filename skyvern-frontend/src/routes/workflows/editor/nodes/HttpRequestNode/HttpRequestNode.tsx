@@ -6,7 +6,6 @@ import {
 } from "@/components/ui/accordion";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useCallback } from "react";
 import { NodeHeader } from "../components/NodeHeader";
@@ -71,11 +70,7 @@ const downloadFilenameTooltip =
   "The complete filename (without extension) for downloaded files. Extension is automatically determined from the response Content-Type.";
 
 function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
-  const { editable } = data;
-  const [label] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
+  const { editable, label } = data;
   const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
