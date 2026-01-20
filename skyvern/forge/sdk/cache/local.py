@@ -9,8 +9,9 @@ class LocalCache(BaseCache):
     def __init__(self) -> None:
         # Use a regular dict to store (value, expiration_timestamp) tuples
         self._cache: dict[str, tuple[Any, float]] = {}
-        self._lock = asyncio.Lock()  # Async lock for task-safe access within event loop
+        self._lock = asyncio.Lock()  # Async lock for write operations
         self._default_ttl_seconds = CACHE_EXPIRE_TIME.total_seconds()
+        self._insertion_count = 0  # Track insertions for cleanup scheduling
 
     def _normalize_expiration(self, ex: Union[int, timedelta, None]) -> float:
         """Convert expiration parameter to Unix timestamp."""
@@ -36,18 +37,25 @@ class LocalCache(BaseCache):
             self._cache.pop(key, None)
 
     async def get(self, key: str) -> Any:
-        async with self._lock:
-            if key not in self._cache:
-                return None
-
+        # Try lock-free read first (dict reads are atomic in CPython)
+        # This allows concurrent reads without blocking
+        try:
             value, expiration = self._cache[key]
+        except KeyError:
+            # Key was deleted between check and access, or never existed
+            return None
 
-            # Check if expired
-            if self._is_expired(expiration):
-                del self._cache[key]
+        # Check if expired - only acquire lock if we need to delete
+        if self._is_expired(expiration):
+            async with self._lock:
+                # Double-check after acquiring lock (key might have been deleted or updated)
+                if key in self._cache:
+                    cached_value, cached_expiration = self._cache[key]
+                    if self._is_expired(cached_expiration):
+                        del self._cache[key]
                 return None
 
-            return value
+        return value
 
     async def set(self, key: str, value: Any, ex: Union[int, timedelta, None] = CACHE_EXPIRE_TIME) -> None:
         expiration_timestamp = self._normalize_expiration(ex)
@@ -61,7 +69,8 @@ class LocalCache(BaseCache):
                     del self._cache[oldest_key]
 
             self._cache[key] = (value, expiration_timestamp)
+            self._insertion_count += 1
 
-            # Opportunistic cleanup every 100 insertions
-            if len(self._cache) % 100 == 0:
+            # Opportunistic cleanup every 100 insertions (works for any MAX_CACHE_ITEM value)
+            if self._insertion_count % 100 == 0:
                 self._cleanup_expired()
