@@ -65,13 +65,27 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
     browser_context.on("console", browser_console_log)
 
 
-def _get_original_filename_from_download(download: Download, url: str) -> str | None:
+def _extract_filename_info_from_download(download: Download, url: str) -> tuple[str | None, str | None]:
+    """Extract filename and extension from download object and URL.
+
+    Returns:
+        tuple[str | None, str | None]: (filename, extension) where:
+            - filename: Full filename with extension, or None if not found
+            - extension: Just the extension (e.g., '.pdf'), or None if not found
+    """
+    filename: str | None = None
+    extension: str | None = None
+
+    # Priority 1: Check suggested_filename
     if download.suggested_filename:
         suggested = download.suggested_filename.replace("\\", "/")
         suggested = os.path.basename(suggested)
         if suggested:
-            return suggested
+            filename = suggested
+            extension = Path(suggested).suffix or None
+            return filename, extension
 
+    # Priority 2: Check URL query parameters
     try:
         parsed_url = urlparse(url)
         parsed_qs = parse_qsl(parsed_url.query)
@@ -79,21 +93,36 @@ def _get_original_filename_from_download(download: Download, url: str) -> str | 
             if key.lower() in ["filename", "file", "name"]:
                 decoded_value = unquote(value)
                 if decoded_value and "." in decoded_value:
-                    return os.path.basename(decoded_value)
+                    filename = os.path.basename(decoded_value)
+                    extension = Path(decoded_value).suffix or None
+                    return filename, extension
     except Exception:
         pass
 
+    # Priority 3: Check URL path
     try:
         parsed_url = urlparse(url)
         path_filename = os.path.basename(parsed_url.path)
         if path_filename and "." in path_filename:
             decoded = unquote(path_filename)
             if decoded:
-                return decoded
+                filename = decoded
+                extension = Path(decoded).suffix or None
+                return filename, extension
     except Exception:
         pass
 
-    return None
+    return None, None
+
+
+def _get_original_filename_from_download(download: Download, url: str) -> str | None:
+    """Get the original filename from download object and URL.
+
+    This is a convenience wrapper around _extract_filename_info_from_download
+    that returns only the filename.
+    """
+    filename, _ = _extract_filename_info_from_download(download, url)
+    return filename
 
 
 def set_download_file_listener(
@@ -118,48 +147,62 @@ def set_download_file_listener(
                         suggested_filename=download.suggested_filename,
                         url=download.url,
                     )
-                    suffix = Path(download.suggested_filename).suffix if download.suggested_filename else ""
-                    if suffix:
-                        LOG.info(
-                            "Add extension according to suggested filename",
-                            workflow_run_id=workflow_run_id,
-                            task_id=task_id,
-                            filepath=str(file_path) + suffix,
-                        )
-                        file_extension = suffix
-                    else:
-                        parsed_url = urlparse(download.url)
-                        parsed_qs = parse_qsl(parsed_url.query)
-                        for key, value in parsed_qs:
-                            if key.lower() == "filename":
-                                suffix = Path(value).suffix
-                                if suffix:
+                    # Use the helper function to extract extension from download sources
+                    _, extracted_extension = _extract_filename_info_from_download(download, download.url)
+                    if extracted_extension:
+                        # Determine which source provided the extension for logging
+                        if (
+                            download.suggested_filename
+                            and Path(download.suggested_filename).suffix == extracted_extension
+                        ):
+                            LOG.info(
+                                "Add extension according to suggested filename",
+                                workflow_run_id=workflow_run_id,
+                                task_id=task_id,
+                                filepath=str(file_path) + extracted_extension,
+                            )
+                        else:
+                            # Check if it came from query params or path
+                            try:
+                                parsed_url = urlparse(download.url)
+                                parsed_qs = parse_qsl(parsed_url.query)
+                                found_in_query = False
+                                for key, value in parsed_qs:
+                                    if key.lower() == "filename" and Path(value).suffix == extracted_extension:
+                                        LOG.info(
+                                            "Add extension according to the parsed query params of download url",
+                                            workflow_run_id=workflow_run_id,
+                                            task_id=task_id,
+                                            filename=value,
+                                        )
+                                        found_in_query = True
+                                        break
+                                if not found_in_query:
                                     LOG.info(
-                                        "Add extension according to the parsed query params of download url",
+                                        "Add extension according to download url path",
                                         workflow_run_id=workflow_run_id,
                                         task_id=task_id,
-                                        filename=value,
+                                        filepath=str(file_path) + extracted_extension,
                                     )
-                                    file_extension = suffix
-                                    break
-
-                        if not file_extension:
-                            suffix = Path(parsed_url.path).suffix
-                            if suffix:
+                            except Exception:
                                 LOG.info(
                                     "Add extension according to download url path",
                                     workflow_run_id=workflow_run_id,
                                     task_id=task_id,
-                                    filepath=str(file_path) + suffix,
+                                    filepath=str(file_path) + extracted_extension,
                                 )
-                                file_extension = suffix
+                        file_extension = extracted_extension
 
                 if original_filename:
                     sanitized_name = sanitize_filename(original_filename)
-                    name_without_ext = Path(sanitized_name).stem
-                    random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
-                    final_filename = f"download-{name_without_ext}-{random_file_id}{file_extension}"
+                    # Use original filename directly (it already includes extension)
+                    # Only add extension if original_filename doesn't have one
+                    if Path(sanitized_name).suffix:
+                        final_filename = sanitized_name
+                    else:
+                        final_filename = sanitized_name + file_extension
                 else:
+                    # Fallback: use timestamp format only when original filename is not available
                     random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
                     final_filename = (
                         f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}{file_extension}"
@@ -197,6 +240,11 @@ def set_download_file_listener(
     def listen_to_new_page(page: Page) -> None:
         page.on("download", listen_to_download)
 
+    # Register listener on existing pages (e.g., when connecting via CDP)
+    for page in browser_context.pages:
+        page.on("download", listen_to_download)
+
+    # Register listener on future pages
     browser_context.on("page", listen_to_new_page)
 
 
