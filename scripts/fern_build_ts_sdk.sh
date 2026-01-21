@@ -13,6 +13,7 @@ cp -rf fern/.preview/fern-typescript-sdk/* skyvern-ts/client/
 # Post-processing: Update repository references the monorepo
 sed -i.bak 's|Skyvern-AI/skyvern-typescript|Skyvern-AI/skyvern|g' skyvern-ts/client/package.json
 sed -i.bak 's|https://github.com/Skyvern-AI/skyvern-typescript/blob/HEAD/./reference.md|https://www.skyvern.com/docs/api-reference/api-reference|g' skyvern-ts/client/README.md
+sed -i.bak '/\[!\[fern shield\]/d' skyvern-ts/client/README.md
 rm -f skyvern-ts/client/package.json.bak skyvern-ts/client/README.md.bak
 
 # Export library classes from main index
