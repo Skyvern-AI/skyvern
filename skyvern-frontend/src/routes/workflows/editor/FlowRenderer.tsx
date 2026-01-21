@@ -88,6 +88,7 @@ import {
   getWorkflowBlocks,
   getWorkflowSettings,
   layout,
+  removeJinjaReferenceFromNodes,
   upgradeWorkflowDefinitionToVersionTwo,
 } from "./workflowEditorUtils";
 import { getWorkflowErrors } from "./workflowEditorUtils";
@@ -490,61 +491,174 @@ function FlowRenderer({
       return;
     }
 
-    // if any node was using the output parameter of the deleted node, remove it from their parameter keys
-    const newNodesWithUpdatedParameters = newNodes.map((node) => {
-      if (node.type === "task") {
-        return {
-          ...node,
-          data: {
-            ...node.data,
-            parameterKeys: node.data.parameterKeys.filter(
-              (parameter) =>
-                parameter !== getOutputParameterKey(deletedNodeLabel),
-            ),
-          },
-        };
-      }
-      // TODO: Fix this. When we put these into the same if statement TS fails to recognize that the returned value fits both the task and text prompt node types
-      if (node.type === "textPrompt") {
-        return {
-          ...node,
-          data: {
-            ...node.data,
-            parameterKeys: node.data.parameterKeys.filter(
-              (parameter) =>
-                parameter !== getOutputParameterKey(deletedNodeLabel),
-            ),
-          },
-        };
-      }
-      if (node.type === "loop") {
-        return {
-          ...node,
-          data: {
-            ...node.data,
-            loopValue:
-              node.data.loopValue === getOutputParameterKey(deletedNodeLabel)
-                ? ""
-                : node.data.loopValue,
-          },
-        };
-      }
-      // Clear finallyBlockLabel if the deleted block was the finally block
-      if (
-        node.type === "start" &&
-        node.data.withWorkflowSettings &&
-        node.data.finallyBlockLabel === deletedNodeLabel
-      ) {
-        return {
-          ...node,
-          data: {
-            ...node.data,
-            finallyBlockLabel: null,
-          },
-        };
-      }
-      return node;
-    });
+    // Step 1: Remove inline {{ deleted_block_output }} references from all nodes
+    const deletedOutputKey = getOutputParameterKey(deletedNodeLabel);
+    const nodesWithRemovedInlineRefs = removeJinjaReferenceFromNodes(
+      newNodes,
+      deletedOutputKey,
+    );
+
+    // Step 2: Remove from parameterKeys arrays and handle special cases
+    const newNodesWithUpdatedParameters = nodesWithRemovedInlineRefs.map(
+      (node) => {
+        // Clear finallyBlockLabel if the deleted block was the finally block
+        if (
+          node.type === "start" &&
+          node.data.withWorkflowSettings &&
+          node.data.finallyBlockLabel === deletedNodeLabel
+        ) {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              finallyBlockLabel: null,
+            },
+          };
+        }
+
+        // Handle parameterKeys - filter out the deleted output key
+        // Each node type needs a separate branch due to TypeScript union type limitations
+        if (node.type === "task") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys: node.data.parameterKeys.filter(
+                (parameter) => parameter !== deletedOutputKey,
+              ),
+            },
+          };
+        }
+        if (node.type === "textPrompt") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys: node.data.parameterKeys.filter(
+                (parameter) => parameter !== deletedOutputKey,
+              ),
+            },
+          };
+        }
+        if (node.type === "login") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys: node.data.parameterKeys.filter(
+                (parameter) => parameter !== deletedOutputKey,
+              ),
+            },
+          };
+        }
+        if (node.type === "navigation") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys: node.data.parameterKeys.filter(
+                (parameter) => parameter !== deletedOutputKey,
+              ),
+            },
+          };
+        }
+        if (node.type === "extraction") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys: node.data.parameterKeys.filter(
+                (parameter) => parameter !== deletedOutputKey,
+              ),
+            },
+          };
+        }
+        if (node.type === "fileDownload") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys: node.data.parameterKeys.filter(
+                (parameter) => parameter !== deletedOutputKey,
+              ),
+            },
+          };
+        }
+        if (node.type === "action") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys: node.data.parameterKeys.filter(
+                (parameter) => parameter !== deletedOutputKey,
+              ),
+            },
+          };
+        }
+        if (node.type === "http_request") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys: node.data.parameterKeys.filter(
+                (parameter) => parameter !== deletedOutputKey,
+              ),
+            },
+          };
+        }
+        if (node.type === "validation") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys: node.data.parameterKeys.filter(
+                (parameter) => parameter !== deletedOutputKey,
+              ),
+            },
+          };
+        }
+        if (node.type === "codeBlock") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys:
+                node.data.parameterKeys?.filter(
+                  (parameter) => parameter !== deletedOutputKey,
+                ) ?? null,
+            },
+          };
+        }
+        if (node.type === "printPage") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              parameterKeys: node.data.parameterKeys.filter(
+                (parameter) => parameter !== deletedOutputKey,
+              ),
+            },
+          };
+        }
+        // Handle loop node's loopVariableReference (the active field displayed in UI).
+        // Note: loopValue is a legacy field populated during conversion for backward compatibility.
+        // It's not displayed in UI or sent to backend, so we only clean up loopVariableReference.
+        if (node.type === "loop") {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              loopVariableReference:
+                node.data.loopVariableReference === deletedOutputKey
+                  ? ""
+                  : node.data.loopVariableReference,
+            },
+          };
+        }
+
+        return node;
+      },
+    );
     workflowChangesStore.setHasChanges(true);
 
     doLayout(newNodesWithUpdatedParameters, newEdges);
