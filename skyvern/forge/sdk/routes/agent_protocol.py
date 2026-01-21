@@ -561,7 +561,27 @@ async def create_workflow_legacy(
     try:
         workflow_yaml = safe_load_no_dates(raw_yaml)
     except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+        raw_str = raw_yaml.decode("utf-8") if isinstance(raw_yaml, bytes) else raw_yaml
+        stripped = raw_str.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            json_parsed = False
+            try:
+                json.loads(raw_str)
+                json_parsed = True
+            except (json.JSONDecodeError, ValueError):
+                pass
+            if json_parsed:
+                raise HTTPException(
+                    status_code=422,
+                    detail="JSON file detected, but this endpoint expects YAML. Please convert your file to YAML before importing.",
+                ) from None
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid JSON format. Please check your JSON file syntax.",
+            ) from None
+        raise HTTPException(
+            status_code=422, detail="Invalid YAML format. Please check your YAML file syntax."
+        ) from None
 
     # Auto-sanitize block labels and update references for imports
     workflow_yaml = sanitize_workflow_yaml_with_references(workflow_yaml)
@@ -638,7 +658,9 @@ async def create_workflow(
             request=workflow_definition,
         )
     except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+        raise HTTPException(
+            status_code=422, detail="Invalid YAML format. Please check your YAML file syntax."
+        ) from None
     except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
