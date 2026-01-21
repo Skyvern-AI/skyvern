@@ -54,6 +54,14 @@ class FailedToUpdateWorkflow(BaseWorkflowHTTPException):
         )
 
 
+class WorkflowVersionConflict(BaseWorkflowHTTPException):
+    def __init__(self, workflow_permanent_id: str) -> None:
+        super().__init__(
+            f"Concurrent update detected for workflow {workflow_permanent_id}. Please retry.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class OutputParameterKeyCollisionError(BaseWorkflowHTTPException):
     def __init__(self, key: str, retry_count: int | None = None) -> None:
         message = f"Output parameter key {key} already exists in the context manager."
