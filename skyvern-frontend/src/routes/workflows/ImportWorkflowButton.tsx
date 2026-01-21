@@ -138,10 +138,35 @@ function ImportWorkflowButton({
                   } else {
                     // Non-pdf files like yaml, json
                     const fileTextContent = await file.text();
+                    const isJsonFile = fileName.endsWith(".json");
                     const isJson = isJsonString(fileTextContent);
-                    const content = isJson
-                      ? convertToYAML(JSON.parse(fileTextContent))
-                      : fileTextContent;
+
+                    // If file has .json extension but is not valid JSON, show error
+                    if (isJsonFile && !isJson) {
+                      toast({
+                        variant: "destructive",
+                        title: "Error importing workflow",
+                        description:
+                          "Invalid JSON file. Please check the file format.",
+                      });
+                      return;
+                    }
+
+                    let content: string;
+                    try {
+                      content = isJson
+                        ? convertToYAML(JSON.parse(fileTextContent))
+                        : fileTextContent;
+                    } catch (error) {
+                      toast({
+                        variant: "destructive",
+                        title: "Error importing workflow",
+                        description: isJsonFile
+                          ? "Failed to parse JSON file. Please check the file format."
+                          : "Failed to process file. Please check the file format.",
+                      });
+                      return;
+                    }
 
                     await createWorkflowFromYamlMutation(content);
                   }
