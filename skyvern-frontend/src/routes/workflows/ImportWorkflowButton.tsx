@@ -226,10 +226,16 @@ function ImportWorkflowButton({
       onImportStart?.();
     }
 
-    const prepared: PreparedYamlImport[] = await Promise.all(
-      yamlLikeFiles.map(async (file) => {
+    const invalidJsonFiles: string[] = [];
+    const preparedResults = await Promise.all(
+      yamlLikeFiles.map(async (file): Promise<PreparedYamlImport | null> => {
         const text = await file.text();
+        const isJsonFile = file.name.toLowerCase().endsWith(".json");
         const isJson = isJsonString(text);
+        if (isJsonFile && !isJson) {
+          invalidJsonFiles.push(file.name);
+          return null;
+        }
         const yaml = isJson ? convertToYAML(JSON.parse(text)) : text;
         const title = extractTitleFromYaml(yaml);
         let duplicateReason: DuplicateReason | null = null;
@@ -237,7 +243,10 @@ function ImportWorkflowButton({
           try {
             const existing = await findExistingWorkflowTitle(title);
             if (existing) {
-              duplicateReason = { kind: "existing", existingTitle: existing };
+              duplicateReason = {
+                kind: "existing",
+                existingTitle: existing,
+              };
             }
           } catch {
             duplicateReason = { kind: "check-failed" };
@@ -251,6 +260,20 @@ function ImportWorkflowButton({
         };
       }),
     );
+    const prepared: PreparedYamlImport[] = preparedResults.filter(
+      (p): p is PreparedYamlImport => p !== null,
+    );
+
+    if (invalidJsonFiles.length > 0) {
+      toast({
+        variant: "destructive",
+        title:
+          invalidJsonFiles.length === 1
+            ? "Invalid JSON file"
+            : `${invalidJsonFiles.length} invalid JSON files`,
+        description: `Please check the file format: ${invalidJsonFiles.join(", ")}`,
+      });
+    }
 
     const titleCounts = new Map<string, number>();
     for (const p of prepared) {
