@@ -944,11 +944,11 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                     organization_id=workflow_run.organization_id,
                     task_id=updated_task.task_id,
                 )
-                workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                workflow_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts(
                     workflow_run_id=workflow_run_id,
                     organization_id=workflow_run.organization_id,
                 )
@@ -956,8 +956,8 @@ class BaseTaskBlock(Block):
                 task_output = TaskOutput.from_task(
                     updated_task,
                     downloaded_files,
-                    task_screenshots=task_screenshots,
-                    workflow_screenshots=workflow_screenshots,
+                    task_screenshot_artifact_ids=[a.artifact_id for a in task_screenshot_artifacts],
+                    workflow_screenshot_artifact_ids=[a.artifact_id for a in workflow_screenshot_artifacts],
                 )
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
@@ -1020,11 +1020,11 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                     organization_id=workflow_run.organization_id,
                     task_id=updated_task.task_id,
                 )
-                workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                workflow_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts(
                     workflow_run_id=workflow_run_id,
                     organization_id=workflow_run.organization_id,
                 )
@@ -1032,8 +1032,8 @@ class BaseTaskBlock(Block):
                 task_output = TaskOutput.from_task(
                     updated_task,
                     downloaded_files,
-                    task_screenshots=task_screenshots,
-                    workflow_screenshots=workflow_screenshots,
+                    task_screenshot_artifact_ids=[a.artifact_id for a in task_screenshot_artifacts],
+                    workflow_screenshot_artifact_ids=[a.artifact_id for a in workflow_screenshot_artifacts],
                 )
                 LOG.warning(
                     f"Task failed with status {updated_task.status}{retry_message}",
@@ -3965,11 +3965,11 @@ class TaskV2Block(Block):
 
         # If continue_on_failure is True, we treat the block as successful even if the task failed
         # This allows the workflow to continue execution despite this block's failure
-        task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+        task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
             organization_id=organization_id,
             task_v2_id=task_v2.observer_cruise_id,
         )
-        workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+        workflow_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
@@ -3980,8 +3980,8 @@ class TaskV2Block(Block):
             "summary": task_v2.summary,
             "extracted_information": result_dict,
             "failure_reason": failure_reason,
-            "task_screenshots": task_screenshots,
-            "workflow_screenshots": workflow_screenshots,
+            "task_screenshot_artifact_ids": [a.artifact_id for a in task_screenshot_artifacts],
+            "workflow_screenshot_artifact_ids": [a.artifact_id for a in workflow_screenshot_artifacts],
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, task_v2_output)
         return await self.build_block_result(

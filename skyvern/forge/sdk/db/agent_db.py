@@ -1325,6 +1325,30 @@ class AgentDB(BaseAlchemyDB):
             LOG.exception("UnexpectedError")
             raise
 
+    async def get_artifacts_by_ids(
+        self,
+        artifact_ids: list[str],
+        organization_id: str,
+    ) -> list[Artifact]:
+        if not artifact_ids:
+            return []
+        try:
+            async with self.Session() as session:
+                artifacts = (
+                    await session.scalars(
+                        select(ArtifactModel)
+                        .filter(ArtifactModel.artifact_id.in_(artifact_ids))
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).all()
+                return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
+        except SQLAlchemyError:
+            LOG.exception("SQLAlchemyError")
+            raise
+        except Exception:
+            LOG.exception("UnexpectedError")
+            raise
+
     async def get_artifacts_by_entity_id(
         self,
         *,
