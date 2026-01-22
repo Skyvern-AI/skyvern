@@ -161,10 +161,13 @@ async def update_status(
         organization_id=organization_id,
         browser_status=status,
     )
+
+    completed_at = datetime.now(timezone.utc) if is_final_status(status) else None
     persistent_browser_session = await db.update_persistent_browser_session(
         session_id,
         status=status,
         organization_id=organization_id,
+        completed_at=completed_at,
     )
 
     return persistent_browser_session
@@ -264,15 +267,14 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         timeout_minutes: int | None = None,
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
+        is_high_priority: bool = False,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
-
         LOG.info(
             "Creating new browser session",
             organization_id=organization_id,
         )
-
-        browser_session_db = await self.database.create_persistent_browser_session(
+        return await self.database.create_persistent_browser_session(
             organization_id=organization_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
@@ -281,8 +283,6 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             extensions=extensions,
             browser_type=browser_type,
         )
-
-        return browser_session_db
 
     async def occupy_browser_session(
         self,
@@ -324,7 +324,6 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=organization_id,
                 session_id=browser_session_id,
             )
-
             # Export session profile before closing (so it can be used to create browser profiles)
             browser_artifacts = browser_session.browser_state.browser_artifacts
             if browser_artifacts and browser_artifacts.browser_session_dir:
@@ -345,6 +344,31 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                         browser_session_id=browser_session_id,
                         organization_id=organization_id,
                     )
+
+            if browser_artifacts and browser_artifacts.video_artifacts:
+                for video_artifact in browser_artifacts.video_artifacts:
+                    if video_artifact.video_path:
+                        try:
+                            from pathlib import Path
+
+                            video_path = Path(video_artifact.video_path)
+                            if video_path.exists():
+                                date = video_path.parent.name
+                                await app.STORAGE.sync_browser_session_file(
+                                    organization_id=organization_id,
+                                    browser_session_id=browser_session_id,
+                                    artifact_type="videos",
+                                    local_file_path=str(video_path),
+                                    remote_path=video_path.name,
+                                    date=date,
+                                )
+                        except Exception:
+                            LOG.exception(
+                                "Failed to sync video recording",
+                                browser_session_id=browser_session_id,
+                                organization_id=organization_id,
+                                video_path=video_artifact.video_path,
+                            )
 
             self._browser_sessions.pop(browser_session_id, None)
 
