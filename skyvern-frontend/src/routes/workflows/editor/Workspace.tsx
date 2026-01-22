@@ -2,6 +2,7 @@ import { AxiosError } from "axios";
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   MutableRefObject,
@@ -56,6 +57,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
+import { DeleteConfirmationDialog } from "@/components/DeleteConfirmationDialog";
 import { BrowserStream } from "@/components/BrowserStream";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -83,7 +85,12 @@ import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import { WorkflowCacheKeyValuesPanel } from "./panels/WorkflowCacheKeyValuesPanel";
 import { WorkflowComparisonPanel } from "./panels/WorkflowComparisonPanel";
-import { getWorkflowErrors, getElements } from "./workflowEditorUtils";
+import {
+  getWorkflowErrors,
+  getElements,
+  getAffectedBlocks,
+  getOutputParameterKey,
+} from "./workflowEditorUtils";
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
@@ -258,6 +265,39 @@ function Workspace({
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
   const cacheKey = workflow?.cache_key ?? "";
+
+  // Block delete confirmation dialog state
+  const [deleteBlockDialogState, setDeleteBlockDialogState] = useState<{
+    open: boolean;
+    nodeId: string | null;
+    nodeLabel: string | null;
+  }>({
+    open: false,
+    nodeId: null,
+    nodeLabel: null,
+  });
+  // Use a ref for the callback to avoid storing functions in state
+  const deleteConfirmCallbackRef = useRef<(() => void) | null>(null);
+
+  const affectedBlocksForDelete = useMemo(() => {
+    if (!deleteBlockDialogState.nodeLabel) {
+      return [];
+    }
+    const outputKey = getOutputParameterKey(deleteBlockDialogState.nodeLabel);
+    return getAffectedBlocks(nodes, outputKey);
+  }, [nodes, deleteBlockDialogState.nodeLabel]);
+
+  const handleRequestDeleteNode = useCallback(
+    (nodeId: string, nodeLabel: string, confirmCallback: () => void) => {
+      deleteConfirmCallbackRef.current = confirmCallback;
+      setDeleteBlockDialogState({
+        open: true,
+        nodeId,
+        nodeLabel,
+      });
+    },
+    [],
+  );
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
     cacheKey === ""
@@ -1281,6 +1321,7 @@ function Workspace({
                 onEdgesChange={onEdgesChange}
                 initialTitle={initialTitle}
                 workflow={workflow}
+                onRequestDeleteNode={handleRequestDeleteNode}
               />
 
               {/* sub panels */}
@@ -1446,6 +1487,7 @@ function Workspace({
                     initialTitle={initialTitle}
                     workflow={workflow}
                     onContainerResize={containerResizeTrigger}
+                    onRequestDeleteNode={handleRequestDeleteNode}
                   />
                 </div>
               </div>
@@ -1703,6 +1745,33 @@ function Workspace({
               variant: "destructive",
             });
           }
+        }}
+      />
+      <DeleteConfirmationDialog
+        open={deleteBlockDialogState.open}
+        onOpenChange={(open) => {
+          if (!open) {
+            deleteConfirmCallbackRef.current = null;
+            setDeleteBlockDialogState({
+              open: false,
+              nodeId: null,
+              nodeLabel: null,
+            });
+          }
+        }}
+        title="Delete Block"
+        description={`Are you sure you want to delete "${deleteBlockDialogState.nodeLabel}"?`}
+        affectedBlocks={affectedBlocksForDelete}
+        onConfirm={() => {
+          if (deleteConfirmCallbackRef.current) {
+            deleteConfirmCallbackRef.current();
+          }
+          deleteConfirmCallbackRef.current = null;
+          setDeleteBlockDialogState({
+            open: false,
+            nodeId: null,
+            nodeLabel: null,
+          });
         }}
       />
     </div>

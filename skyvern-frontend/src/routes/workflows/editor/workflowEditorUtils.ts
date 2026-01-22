@@ -2720,6 +2720,131 @@ function containsJinjaReference(text: string, key: string): boolean {
   return regex.test(text);
 }
 
+/**
+ * Recursively checks if any string field in an object contains a jinja reference to a key.
+ * @param obj - The object to check
+ * @param key - The key to look for
+ * @param skipKeys - Set of keys to skip
+ * @param depth - Current recursion depth
+ * @returns True if any string field contains a jinja reference to the key
+ */
+function objectContainsJinjaReference(
+  obj: unknown,
+  key: string,
+  skipKeys: Set<string>,
+  depth: number = 0,
+): boolean {
+  const MAX_DEPTH = 50;
+  if (depth > MAX_DEPTH || obj === null || obj === undefined) {
+    return false;
+  }
+
+  if (typeof obj === "string") {
+    return containsJinjaReference(obj, key);
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.some((item) =>
+      objectContainsJinjaReference(item, key, skipKeys, depth + 1),
+    );
+  }
+
+  if (typeof obj === "object") {
+    for (const [objKey, value] of Object.entries(obj)) {
+      if (skipKeys.has(objKey)) {
+        continue;
+      }
+      if (objectContainsJinjaReference(value, key, skipKeys, depth + 1)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+// Keys to skip when checking for jinja references (same as transform)
+const SKIP_KEYS_FOR_JINJA_CHECK = new Set([
+  "label",
+  "key",
+  "type",
+  "id",
+  "nodeId",
+  "parameterKeys",
+]);
+
+/**
+ * Information about a block that references a parameter or block output.
+ */
+type AffectedBlock = {
+  nodeId: string;
+  label: string;
+  hasParameterKeyReference: boolean;
+  hasJinjaReference: boolean;
+};
+
+/**
+ * Finds all blocks that reference a given key (parameter or block output).
+ * Checks both parameterKeys arrays and jinja references in text fields.
+ * @param nodes - Array of workflow nodes
+ * @param key - The key to search for (e.g., "my_param" or "block_1_output")
+ * @returns Array of affected block information
+ */
+function getAffectedBlocks<T extends Node>(
+  nodes: T[],
+  key: string,
+): AffectedBlock[] {
+  const affectedBlocks: AffectedBlock[] = [];
+
+  for (const node of nodes) {
+    // Skip non-block nodes (start, nodeAdder, etc.)
+    if (
+      !node.data ||
+      !("label" in node.data) ||
+      node.type === "start" ||
+      node.type === "nodeAdder"
+    ) {
+      continue;
+    }
+
+    const label = node.data.label as string;
+    let hasParameterKeyReference = false;
+    let hasJinjaReference = false;
+
+    // Check parameterKeys array
+    const parameterKeys = node.data.parameterKeys as Array<string> | undefined;
+    if (parameterKeys?.includes(key)) {
+      hasParameterKeyReference = true;
+    }
+
+    // Check for loop node's loopVariableReference
+    if (node.type === "loop") {
+      const loopVarRef = node.data.loopVariableReference as string | undefined;
+      if (loopVarRef === key || containsJinjaReference(loopVarRef ?? "", key)) {
+        hasJinjaReference = true;
+      }
+    }
+
+    // Check jinja references in text fields
+    if (
+      objectContainsJinjaReference(node.data, key, SKIP_KEYS_FOR_JINJA_CHECK)
+    ) {
+      hasJinjaReference = true;
+    }
+
+    if (hasParameterKeyReference || hasJinjaReference) {
+      affectedBlocks.push({
+        nodeId: node.id,
+        label,
+        hasParameterKeyReference,
+        hasJinjaReference,
+      });
+    }
+  }
+
+  return affectedBlocks;
+}
+
 // Maximum recursion depth to prevent stack overflow from malicious deeply nested objects
 const MAX_TRANSFORM_DEPTH = 50;
 
@@ -2838,6 +2963,74 @@ function removeJinjaReferenceFromNodes<T extends Node>(
         SKIP_KEYS_FOR_JINJA_TRANSFORM,
       ),
     };
+  });
+}
+
+/**
+ * Removes a key from all nodes' parameterKeys arrays and handles special cases.
+ * Used when deleting a block output or parameter.
+ *
+ * @param nodes - Array of nodes to process
+ * @param keyToRemove - The key to remove from parameterKeys arrays
+ * @param deletedBlockLabel - Optional label of deleted block (for finallyBlockLabel cleanup)
+ * @returns New array of nodes with the key removed
+ */
+function removeKeyFromNodesParameterKeys<T extends Node>(
+  nodes: T[],
+  keyToRemove: string,
+  deletedBlockLabel?: string,
+): T[] {
+  return nodes.map((node) => {
+    if (!node.data) {
+      return node;
+    }
+
+    // Handle start node's finallyBlockLabel
+    if (
+      node.type === "start" &&
+      deletedBlockLabel &&
+      (node.data as Record<string, unknown>).withWorkflowSettings &&
+      (node.data as Record<string, unknown>).finallyBlockLabel ===
+        deletedBlockLabel
+    ) {
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          finallyBlockLabel: null,
+        },
+      } as T;
+    }
+
+    // Handle loop node's loopVariableReference
+    if (node.type === "loop") {
+      const loopData = node.data as Record<string, unknown>;
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          loopVariableReference:
+            loopData.loopVariableReference === keyToRemove
+              ? ""
+              : loopData.loopVariableReference,
+        },
+      } as T;
+    }
+
+    // Handle parameterKeys for all other node types
+    const parameterKeys = (node.data as Record<string, unknown>)
+      .parameterKeys as Array<string> | null | undefined;
+    if (parameterKeys !== undefined) {
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          parameterKeys: parameterKeys?.filter((key) => key !== keyToRemove),
+        },
+      } as T;
+    }
+
+    return node;
   });
 }
 
@@ -3845,6 +4038,7 @@ export {
   createNode,
   generateNodeData,
   generateNodeLabel,
+  getAffectedBlocks,
   getNestingLevel,
   getAdditionalParametersForEmailBlock,
   getAvailableOutputParameterKeys,
@@ -3866,5 +4060,8 @@ export {
   isOutputParameterKey,
   layout,
   removeJinjaReferenceFromNodes,
+  removeKeyFromNodesParameterKeys,
   replaceJinjaReferenceInNodes,
 };
+
+export type { AffectedBlock };
