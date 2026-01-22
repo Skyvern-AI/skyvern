@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import floor
+from pathlib import Path
 
 import structlog
 from playwright._impl._errors import TargetClosedError
@@ -349,8 +350,6 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 for video_artifact in browser_artifacts.video_artifacts:
                     if video_artifact.video_path:
                         try:
-                            from pathlib import Path
-
                             video_path = Path(video_artifact.video_path)
                             if video_path.exists():
                                 date = video_path.parent.name
