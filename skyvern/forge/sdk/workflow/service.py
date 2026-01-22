@@ -772,7 +772,7 @@ class WorkflowService:
 
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
-            close_browser_on_completion = True
+            close_browser_on_completion = False
             await app.DATABASE.update_workflow_run(
                 workflow_run_id=workflow_run.workflow_run_id,
                 browser_session_id=browser_session_id,
