@@ -67,6 +67,7 @@ class PersistentSessionsManager(Protocol):
         timeout_minutes: int | None = None,
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
+        is_high_priority: bool = False,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...
