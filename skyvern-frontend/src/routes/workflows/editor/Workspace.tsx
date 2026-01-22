@@ -94,7 +94,7 @@ import {
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
-import { WorkflowApiResponse, WorkflowSettings } from "../types/workflowTypes";
+import { WorkflowSettings } from "../types/workflowTypes";
 import { ProxyLocation } from "@/api/types";
 import {
   nodeAdderNode,
@@ -1698,36 +1698,36 @@ function Workspace({
         buttonRef={copilotButtonRef}
         onWorkflowUpdate={(workflowData) => {
           try {
-            const saveData = workflowChangesStore.getSaveData?.();
-
             const settings: WorkflowSettings = {
               proxyLocation:
-                saveData?.settings.proxyLocation ?? ProxyLocation.Residential,
-              webhookCallbackUrl: saveData?.settings.webhookCallbackUrl || "",
+                workflowData.proxy_location ?? ProxyLocation.Residential,
+              webhookCallbackUrl: workflowData.webhook_callback_url || "",
               persistBrowserSession:
-                saveData?.settings.persistBrowserSession ?? false,
-              model: saveData?.settings.model ?? null,
-              maxScreenshotScrolls:
-                saveData?.settings.maxScreenshotScrolls || 3,
-              extraHttpHeaders: saveData?.settings.extraHttpHeaders ?? null,
-              runWith: saveData?.settings.runWith ?? null,
-              scriptCacheKey: saveData?.settings.scriptCacheKey ?? null,
-              aiFallback: saveData?.settings.aiFallback ?? true,
-              runSequentially: saveData?.settings.runSequentially ?? false,
-              sequentialKey: saveData?.settings.sequentialKey ?? null,
-              finallyBlockLabel: workflowData?.finally_block_label ?? null,
+                workflowData.persist_browser_session ?? false,
+              model: workflowData.model ?? null,
+              maxScreenshotScrolls: workflowData.max_screenshot_scrolls || 3,
+              extraHttpHeaders: workflowData.extra_http_headers
+                ? JSON.stringify(workflowData.extra_http_headers)
+                : null,
+              runWith: workflowData.run_with ?? null,
+              scriptCacheKey: workflowData.cache_key ?? null,
+              aiFallback: workflowData.ai_fallback ?? true,
+              runSequentially: workflowData.run_sequentially ?? false,
+              sequentialKey: workflowData.sequential_key ?? null,
+              finallyBlockLabel:
+                workflowData.workflow_definition?.finally_block_label ?? null,
             };
 
-            const elements = getElements(workflowData.blocks, settings, true);
+            const elements = getElements(
+              workflowData.workflow_definition.blocks,
+              settings,
+              true,
+            );
 
             setNodes(elements.nodes);
             setEdges(elements.edges);
 
-            const initialParameters = getInitialParameters({
-              workflow_definition: {
-                parameters: workflowData.parameters,
-              },
-            } as WorkflowApiResponse);
+            const initialParameters = getInitialParameters(workflowData);
             useWorkflowParametersStore
               .getState()
               .setParameters(initialParameters);
