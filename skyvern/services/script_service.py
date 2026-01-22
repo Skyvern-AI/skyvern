@@ -2095,11 +2095,17 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
 
 def render_list(template: str, data: dict[str, Any] | None = None) -> list[str]:
     rendered_value = render_template(template, data)
-    list_value = eval(rendered_value)
-    if isinstance(list_value, list):
-        return list_value
-    else:
-        return [list_value]
+    try:
+        # Use ast.literal_eval instead of eval for security - only evaluates literal expressions
+        import ast
+        list_value = ast.literal_eval(rendered_value)
+        if isinstance(list_value, list):
+            return list_value
+        else:
+            return [list_value]
+    except (ValueError, SyntaxError) as e:
+        # If ast.literal_eval fails, treat the rendered value as a single string item
+        return [rendered_value]
 
 
 # Non-task-based blocks
