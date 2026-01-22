@@ -1683,6 +1683,7 @@ async function buildElementObject(
 async function buildTreeFromBody(
   frame = "main.frame",
   frame_index = undefined,
+  must_included_tags = [],
 ) {
   if (
     window.GlobalSkyvernFrameIndex === undefined &&
@@ -1697,6 +1698,7 @@ async function buildTreeFromBody(
     false,
     undefined,
     maxElementNumber,
+    must_included_tags,
   );
   DomUtils.elementListCache = elementsAndResultArray[0];
   return elementsAndResultArray;
@@ -1708,12 +1710,19 @@ async function buildElementTree(
   full_tree = false,
   hoverStylesMap = undefined,
   maxElementNumber = 0,
+  must_included_tags = [],
 ) {
   // Generate hover styles map at the start
   if (hoverStylesMap === undefined) {
     hoverStylesMap = await getHoverStylesMap();
   }
 
+  if (must_included_tags.length > 0) {
+    _jsConsoleLog(
+      "full tree will be enabled as the must_included_tags is not empty",
+    );
+    full_tree = true;
+  }
   if (window.GlobalEnableAllTextualElements === undefined) {
     window.GlobalEnableAllTextualElements = false;
   }
@@ -1834,6 +1843,10 @@ async function buildElementTree(
         );
         if (elementObj.text.length > 0) {
           elementObj.purgeable = false;
+        }
+        if (must_included_tags.includes(tagName)) {
+          elementObj.purgeable = false;
+          elementObj.interactable = true;
         }
       }
 

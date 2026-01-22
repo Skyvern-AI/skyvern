@@ -11,6 +11,7 @@ Reply in the following JSON format:
     "is_location_input": bool, // True if the element is asking user to input where he lives, otherwise false. For example, it is asking for location, or address, or other similar information. Output False if it only requires ZIP code or postal code.
     "is_date_related": bool, // True if the field is related to date input or select, otherwise false.
     "date_format": str, // The format of the date or datetime to be input. For example YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, DD.MM.YYYY, MM/DD/YYYY, etc. If the field is not related to date input or select, this should be null.
+    "is_text_captcha": bool, // True if the field is asking for a text captcha, otherwise false. Do not confuse it with the verification code. Text CAPTCHAs are typically displayed alongside an image of distorted letters or numbers.
 }
 
 Existing reasoning context:

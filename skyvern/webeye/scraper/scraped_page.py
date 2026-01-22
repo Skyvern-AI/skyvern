@@ -306,6 +306,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         scroll: bool = True,
         take_screenshots: bool = True,
         max_retries: int = 0,
+        must_included_tags: list[str] | None = None,
     ) -> Self:
         return await self._browser_state.scrape_website(
             url=self.url,
@@ -315,6 +316,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
             take_screenshots=take_screenshots,
             draw_boxes=draw_boxes,
             scroll=scroll,
+            must_included_tags=must_included_tags,
         )
 
     async def generate_scraped_page_without_screenshots(self, max_retries: int = 0) -> Self:
