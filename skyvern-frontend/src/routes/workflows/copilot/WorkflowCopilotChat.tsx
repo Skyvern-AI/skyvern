@@ -7,7 +7,7 @@ import { ReloadIcon, Cross2Icon } from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
-import { WorkflowDefinition } from "@/routes/workflows/types/workflowTypes";
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
@@ -67,7 +67,7 @@ const MessageItem = memo(({ message }: { message: ChatMessage }) => {
 });
 
 interface WorkflowCopilotChatProps {
-  onWorkflowUpdate?: (workflow: WorkflowDefinition) => void;
+  onWorkflowUpdate?: (workflow: WorkflowApiResponse) => void;
   isOpen?: boolean;
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
@@ -425,7 +425,7 @@ export function WorkflowCopilotChat({
 
         if (response.updated_workflow && onWorkflowUpdate) {
           try {
-            onWorkflowUpdate(response.updated_workflow as WorkflowDefinition);
+            onWorkflowUpdate(response.updated_workflow);
           } catch (updateError) {
             console.error("Failed to update workflow:", updateError);
             toast({
