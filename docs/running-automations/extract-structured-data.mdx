@@ -1,0 +1,800 @@
+---
+title: Extract Structured Data
+subtitle: Get consistent, typed output from your tasks
+slug: running-automations/extract-structured-data
+---
+
+export const FIELD_TYPES = [
+  { value: "string", label: "String" },
+  { value: "number", label: "Number" },
+  { value: "integer", label: "Integer" },
+  { value: "boolean", label: "Boolean" },
+]
+
+export const SchemaBuilder = () => {
+  const [schemaType, setSchemaType] = useState("single")
+  const [arrayName, setArrayName] = useState("items")
+  const [fields, setFields] = useState([
+    { id: "1", name: "title", type: "string", description: "The title" },
+  ])
+  const [outputFormat, setOutputFormat] = useState("python")
+  const [copied, setCopied] = useState(false)
+
+  const addField = () => {
+    setFields([...fields, { id: String(Date.now()), name: "", type: "string", description: "" }])
+  }
+
+  const removeField = (id) => {
+    if (fields.length > 1) setFields(fields.filter((f) => f.id !== id))
+  }
+
+  const updateField = (id, key, value) => {
+    setFields(fields.map((f) => (f.id === id ? { ...f, [key]: value } : f)))
+  }
+
+  const schema = useMemo(() => {
+    const properties = {}
+    fields.forEach((field) => {
+      if (field.name) {
+        properties[field.name] = {
+          type: field.type,
+          description: field.description || `The ${field.name}`,
+        }
+      }
+    })
+    if (schemaType === "array") {
+      return {
+        type: "object",
+        properties: {
+          [arrayName]: {
+            type: "array",
+            description: "List of extracted items",
+            items: { type: "object", properties },
+          },
+        },
+      }
+    }
+    return { type: "object", properties }
+  }, [fields, schemaType, arrayName])
+
+  const formattedOutput = useMemo(() => {
+    const jsonStr = JSON.stringify(schema, null, 2)
+    if (outputFormat === "python") {
+      return `data_extraction_schema=${jsonStr.replace(/null/g, "None").replace(/true/g, "True").replace(/false/g, "False")}`
+    }
+    if (outputFormat === "typescript") {
+      return `data_extraction_schema: ${jsonStr}`
+    }
+    return `"data_extraction_schema": ${jsonStr}`
+  }, [schema, outputFormat])
+
+  const copyToClipboard = async () => {
+    await navigator.clipboard.writeText(formattedOutput)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  return (
+    <div className="p-5 border rounded-lg mt-4 mb-4 not-prose" style={{ backgroundColor: "#f8fafc" }}>
+      <div className="mb-5">
+        <label className="block font-semibold mb-2 text-sm">What are you extracting?</label>
+        <div className="flex gap-3">
+          {[
+            { value: "single", label: "Single object", desc: "Extract one item with multiple fields" },
+            { value: "array", label: "List of items", desc: "Extract multiple items with the same structure" },
+          ].map((type) => (
+            <button
+              key={type.value}
+              onClick={() => setSchemaType(type.value)}
+              className={`flex-1 p-3 rounded-md text-left border-2 ${schemaType === type.value ? "border-indigo-500 bg-indigo-50" : "border-gray-200 bg-white"}`}
+            >
+              <div className="font-medium text-sm">{type.label}</div>
+              <div className="text-xs text-gray-500 mt-1">{type.desc}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {schemaType === "array" && (
+        <div className="mb-5">
+          <label className="block text-xs font-medium mb-1 text-gray-700">Array field name</label>
+          <input
+            type="text"
+            value={arrayName}
+            onChange={(e) => setArrayName(e.target.value)}
+            className="w-full p-2 border rounded-md text-sm"
+            placeholder="items"
+          />
+        </div>
+      )}
+
+      <div className="mb-4">
+        <label className="block font-semibold mb-2 text-sm">Fields to extract</label>
+        <div className="flex flex-col gap-2">
+          {fields.map((field) => (
+            <div key={field.id} className="flex gap-2 items-center p-3 bg-white rounded-md border">
+              <input
+                type="text"
+                value={field.name}
+                onChange={(e) => updateField(field.id, "name", e.target.value)}
+                placeholder="Field name"
+                className="w-32 p-2 border rounded-md text-sm"
+              />
+              <select
+                value={field.type}
+                onChange={(e) => updateField(field.id, "type", e.target.value)}
+                className="w-24 p-2 border rounded-md text-sm bg-white"
+              >
+                {FIELD_TYPES.map((t) => (
+                  <option key={t.value} value={t.value}>{t.label}</option>
+                ))}
+              </select>
+              <input
+                type="text"
+                value={field.description}
+                onChange={(e) => updateField(field.id, "description", e.target.value)}
+                placeholder="Description (helps AI understand what to extract)"
+                className="flex-1 p-2 border rounded-md text-sm"
+              />
+              <button
+                onClick={() => removeField(field.id)}
+                disabled={fields.length === 1}
+                className={`px-2 py-1 rounded text-lg ${fields.length === 1 ? "text-gray-300 cursor-not-allowed" : "text-red-500 hover:bg-red-50"}`}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+        <button onClick={addField} className="w-full mt-2 p-2 border border-dashed rounded-md text-gray-500 text-sm hover:bg-gray-50">
+          + Add field
+        </button>
+      </div>
+
+      <div>
+        <div className="flex justify-between items-center mb-2">
+          <label className="font-semibold text-sm">Generated schema</label>
+          <div className="flex gap-1">
+            {["python", "typescript", "curl"].map((format) => (
+              <button
+                key={format}
+                onClick={() => setOutputFormat(format)}
+                className={`px-3 py-1 rounded text-xs ${outputFormat === format ? "bg-indigo-100 border-indigo-500 border font-medium" : "bg-white border border-gray-200"}`}
+              >
+                {format === "curl" ? "cURL" : format.charAt(0).toUpperCase() + format.slice(1)}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="relative">
+          <pre className="bg-slate-800 text-slate-200 p-4 rounded-md overflow-auto text-xs leading-relaxed">
+            <code>{formattedOutput}</code>
+          </pre>
+          <button
+            onClick={copyToClipboard}
+            className={`absolute top-2 right-2 px-3 py-1 rounded text-xs text-white ${copied ? "bg-green-500" : "bg-slate-600 hover:bg-slate-500"}`}
+          >
+            {copied ? "Copied!" : "Copy"}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+By default, Skyvern returns extracted data in whatever format makes sense for the task. 
+Pass a `data_extraction_schema` to enforce a specific structure using [JSON Schema.](https://json-schema.org/)
+
+---
+
+## Define a schema
+
+Add `data_extraction_schema` parameter to your task with a JSON Schema object:
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get the title of the top post",
+    url="https://news.ycombinator.com",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "The title of the top post"
+            }
+        }
+    }
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get the title of the top post",
+    url: "https://news.ycombinator.com",
+    data_extraction_schema: {
+      type: "object",
+      properties: {
+        title: {
+          type: "string",
+          description: "The title of the top post",
+        },
+      },
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get the title of the top post",
+    "url": "https://news.ycombinator.com",
+    "data_extraction_schema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "The title of the top post"
+        }
+      }
+    }
+  }'
+```
+</CodeGroup>
+
+The `description` field in each property helps Skyvern understand what data to extract. Be specific.
+
+<Warning>
+`description` fields drive extraction quality. Vague descriptions like "the data" produce vague results. Be specific: "The product price in USD, without currency symbol."
+</Warning>
+
+---
+
+## Schema format
+
+Skyvern uses standard JSON Schema. Common types:
+
+| Type | JSON Schema | Example value |
+|------|-------------|---------------|
+| String | `{"type": "string"}` | `"Hello world"` |
+| Number | `{"type": "number"}` | `19.99` |
+| Integer | `{"type": "integer"}` | `42` |
+| Boolean | `{"type": "boolean"}` | `true` |
+| Array | `{"type": "array", "items": {...}}` | `[1, 2, 3]` |
+| Object | `{"type": "object", "properties": {...}}` | `{"key": "value"}` |
+
+<Note>
+A schema doesn't guarantee all fields are populated. If the data isn't on the page, fields return `null`. Design your code to handle missing values.
+</Note>
+
+---
+
+## Build your schema
+
+Use the interactive builder below to generate a schema, then copy it into your code.
+
+<SchemaBuilder />
+
+---
+
+## Examples
+
+### Single value
+
+Extract one piece of information, such as the current price of Bitcoin:
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get the current Bitcoin price in USD",
+    url="https://coinmarketcap.com/currencies/bitcoin/",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "price": {
+                "type": "number",
+                "description": "Current Bitcoin price in USD"
+            }
+        }
+    }
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get the current Bitcoin price in USD",
+    url: "https://coinmarketcap.com/currencies/bitcoin/",
+    data_extraction_schema: {
+      type: "object",
+      properties: {
+        price: {
+          type: "number",
+          description: "Current Bitcoin price in USD",
+        },
+      },
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get the current Bitcoin price in USD",
+    "url": "https://coinmarketcap.com/currencies/bitcoin/",
+    "data_extraction_schema": {
+      "type": "object",
+      "properties": {
+        "price": {
+          "type": "number",
+          "description": "Current Bitcoin price in USD"
+        }
+      }
+    }
+  }'
+```
+</CodeGroup>
+
+**Output (when completed):**
+
+```json
+{
+  "price": 104521.37
+}
+```
+
+---
+
+### List of items
+
+Extract multiple items with the same structure, such as the top posts from a news site:
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get the top 5 posts",
+    url="https://news.ycombinator.com",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "posts": {
+                "type": "array",
+                "description": "Top 5 posts from the front page",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Post title"
+                        },
+                        "points": {
+                            "type": "integer",
+                            "description": "Number of points"
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "Link to the post"
+                        }
+                    }
+                }
+            }
+        }
+    }
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get the top 5 posts",
+    url: "https://news.ycombinator.com",
+    data_extraction_schema: {
+      type: "object",
+      properties: {
+        posts: {
+          type: "array",
+          description: "Top 5 posts from the front page",
+          items: {
+            type: "object",
+            properties: {
+              title: {
+                type: "string",
+                description: "Post title",
+              },
+              points: {
+                type: "integer",
+                description: "Number of points",
+              },
+              url: {
+                type: "string",
+                description: "Link to the post",
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get the top 5 posts",
+    "url": "https://news.ycombinator.com",
+    "data_extraction_schema": {
+      "type": "object",
+      "properties": {
+        "posts": {
+          "type": "array",
+          "description": "Top 5 posts from the front page",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "Post title"
+              },
+              "points": {
+                "type": "integer",
+                "description": "Number of points"
+              },
+              "url": {
+                "type": "string",
+                "description": "Link to the post"
+              }
+            }
+          }
+        }
+      }
+    }
+  }'
+```
+</CodeGroup>
+
+**Output (when completed):**
+
+```json
+{
+  "posts": [
+    {
+      "title": "Running Claude Code dangerously (safely)",
+      "points": 342,
+      "url": "https://blog.emilburzo.com/2026/01/running-claude-code-dangerously-safely/"
+    },
+    {
+      "title": "Linux kernel framework for PCIe device emulation",
+      "points": 287,
+      "url": "https://github.com/cakehonolulu/pciem"
+    },
+    {
+      "title": "I'm addicted to being useful",
+      "points": 256,
+      "url": "https://www.seangoedecke.com/addicted-to-being-useful/"
+    },
+    {
+      "title": "Level S4 solar radiation event",
+      "points": 198,
+      "url": "https://www.swpc.noaa.gov/news/g4-severe-geomagnetic-storm"
+    },
+    {
+      "title": "WebAssembly Text Format parser performance",
+      "points": 176,
+      "url": "https://blog.gplane.win/posts/improve-wat-parser-perf.html"
+    }
+  ]
+}
+```
+
+<Tip>
+Arrays without limits extract everything visible on the page. Specify limits in your prompt (e.g., "top 5 posts") or the array description to control output size.
+</Tip>
+
+---
+
+### Nested objects
+
+Extract hierarchical data, such as a product with its pricing and availability:
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get product details including pricing and availability",
+    url="https://www.amazon.com/dp/B0EXAMPLE",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "product": {
+                "type": "object",
+                "description": "Product information",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Product name"
+                    },
+                    "pricing": {
+                        "type": "object",
+                        "description": "Pricing details",
+                        "properties": {
+                            "current_price": {
+                                "type": "number",
+                                "description": "Current price in USD"
+                            },
+                            "original_price": {
+                                "type": "number",
+                                "description": "Original price before discount"
+                            },
+                            "discount_percent": {
+                                "type": "integer",
+                                "description": "Discount percentage"
+                            }
+                        }
+                    },
+                    "availability": {
+                        "type": "object",
+                        "description": "Stock information",
+                        "properties": {
+                            "in_stock": {
+                                "type": "boolean",
+                                "description": "Whether the item is in stock"
+                            },
+                            "delivery_estimate": {
+                                "type": "string",
+                                "description": "Estimated delivery date"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get product details including pricing and availability",
+    url: "https://www.amazon.com/dp/B0EXAMPLE",
+    data_extraction_schema: {
+      type: "object",
+      properties: {
+        product: {
+          type: "object",
+          description: "Product information",
+          properties: {
+            name: {
+              type: "string",
+              description: "Product name",
+            },
+            pricing: {
+              type: "object",
+              description: "Pricing details",
+              properties: {
+                current_price: {
+                  type: "number",
+                  description: "Current price in USD",
+                },
+                original_price: {
+                  type: "number",
+                  description: "Original price before discount",
+                },
+                discount_percent: {
+                  type: "integer",
+                  description: "Discount percentage",
+                },
+              },
+            },
+            availability: {
+              type: "object",
+              description: "Stock information",
+              properties: {
+                in_stock: {
+                  type: "boolean",
+                  description: "Whether the item is in stock",
+                },
+                delivery_estimate: {
+                  type: "string",
+                  description: "Estimated delivery date",
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get product details including pricing and availability",
+    "url": "https://www.amazon.com/dp/B0EXAMPLE",
+    "data_extraction_schema": {
+      "type": "object",
+      "properties": {
+        "product": {
+          "type": "object",
+          "description": "Product information",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Product name"
+            },
+            "pricing": {
+              "type": "object",
+              "description": "Pricing details",
+              "properties": {
+                "current_price": {
+                  "type": "number",
+                  "description": "Current price in USD"
+                },
+                "original_price": {
+                  "type": "number",
+                  "description": "Original price before discount"
+                },
+                "discount_percent": {
+                  "type": "integer",
+                  "description": "Discount percentage"
+                }
+              }
+            },
+            "availability": {
+              "type": "object",
+              "description": "Stock information",
+              "properties": {
+                "in_stock": {
+                  "type": "boolean",
+                  "description": "Whether the item is in stock"
+                },
+                "delivery_estimate": {
+                  "type": "string",
+                  "description": "Estimated delivery date"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }'
+```
+</CodeGroup>
+
+**Output (when completed):**
+
+```json
+{
+  "product": {
+    "name": "Wireless Bluetooth Headphones",
+    "pricing": {
+      "current_price": 79.99,
+      "original_price": 129.99,
+      "discount_percent": 38
+    },
+    "availability": {
+      "in_stock": true,
+      "delivery_estimate": "Tomorrow, Jan 21"
+    }
+  }
+}
+```
+
+---
+
+## Accessing extracted data
+
+The extracted data appears in the `output` field of the completed run. Poll until the task reaches a terminal state, then access the output.
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get the top post",
+    url="https://news.ycombinator.com",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Post title"},
+            "points": {"type": "integer", "description": "Points"}
+        }
+    }
+)
+
+run_id = result.run_id
+
+while True:
+    run = await client.get_run(run_id)
+
+    if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+        break
+
+    await asyncio.sleep(5)
+
+# Access the extracted data
+print(f"Output: {run.output}")
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get the top post",
+    url: "https://news.ycombinator.com",
+    data_extraction_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Post title" },
+        points: { type: "integer", description: "Points" },
+      },
+    },
+  },
+});
+
+const runId = result.run_id;
+
+while (true) {
+  const run = await client.getRun(runId);
+
+  if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
+    console.log(`Output: ${JSON.stringify(run.output)}`);
+    break;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+```
+
+```bash cURL
+RUN_ID="your_run_id_here"
+
+while true; do
+  RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY")
+
+  STATUS=$(echo "$RESPONSE" | jq -r '.status')
+
+  if [[ "$STATUS" == "completed" || "$STATUS" == "failed" || "$STATUS" == "terminated" || "$STATUS" == "timed_out" || "$STATUS" == "canceled" ]]; then
+    echo "$RESPONSE" | jq '.output'
+    break
+  fi
+
+  sleep 5
+done
+```
+</CodeGroup>
+
+If using webhooks, the same `output` field appears in the webhook payload.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Task Parameters"
+    icon="sliders"
+    href="/running-automations/task-parameters"
+  >
+    All available parameters for run_task
+  </Card>
+  <Card
+    title="Run a Task"
+    icon="play"
+    href="/running-automations/run-a-task"
+  >
+    Execute tasks and retrieve results
+  </Card>
+</CardGroup>

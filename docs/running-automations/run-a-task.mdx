@@ -1,0 +1,490 @@
+---
+title: Run a Task
+subtitle: Execute a single browser automation with natural language
+slug: running-automations/run-a-task
+---
+
+A **Task** is the simplest way to automate a browser action. 
+
+You describe what you want in natural language, and Skyvern's AI navigates the web to complete it.
+
+---
+
+## Call `run_task`
+
+A task requires two parameters:
+
+- **`prompt`** — Natural language instructions describing what the AI should do
+- **`url`** — The starting page for the automation
+
+For additional parameters like engines, proxies, and extraction schemas, see [Task Parameters](/running-automations/task-parameters).
+
+When you call `run_task`, Skyvern spins up a cloud browser, navigates to the URL, and executes your prompt. A typical task takes 30–90 seconds depending on complexity.
+
+<CodeGroup>
+```python Python
+import os
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+    result = await client.run_task(
+        prompt="Get the title of the top post",
+        url="https://news.ycombinator.com",
+    )
+
+    print(f"Run ID: {result.run_id}")
+    print(f"Status: {result.status}")
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+
+async function main() {
+  const client = new SkyvernClient({
+    apiKey: process.env.SKYVERN_API_KEY,
+  });
+
+  const result = await client.runTask({
+    body: {
+      prompt: "Get the title of the top post",
+      url: "https://news.ycombinator.com",
+    },
+  });
+
+  console.log(`Run ID: ${result.run_id}`);
+  console.log(`Status: ${result.status}`);
+}
+
+main();
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get the title of the top post",
+    "url": "https://news.ycombinator.com"
+  }'
+```
+</CodeGroup>
+
+**Example response:**
+
+```json
+{
+  "run_id": "tsk_v2_486305187432193504",
+  "status": "queued",
+  "output": null,
+  "downloaded_files": null,
+  "recording_url": null,
+  "screenshot_urls": null,
+  "failure_reason": null,
+  "created_at": "2026-01-20T11:52:29.276851",
+  "modified_at": "2026-01-20T11:52:29.484284",
+  "app_url": "https://app.skyvern.com/runs/wr_486305187432193510",
+  "run_type": "task_v2"
+}
+```
+
+The response includes a `run_id`. Use this ID to check status, fetch results, and retrieve artifacts.
+
+<Warning>
+`run_task` returns immediately—the task is queued, not finished. Always poll or use webhooks to get results.
+</Warning>
+
+---
+
+## Get results
+
+The `run_task` call queues the task and returns immediately. 
+
+Use the `run_id` to fetch results once the task reaches a terminal state.
+
+| Status | Description |
+|--------|-------------|
+| `created` | Task initialized, not yet queued |
+| `queued` | Waiting for an available browser |
+| `running` | AI is navigating and executing |
+| `completed` | Task finished successfully—check `output` for results |
+| `failed` | Task encountered an error—check `failure_reason` and retry or adjust your prompt |
+| `terminated` | Task was manually stopped |
+| `timed_out` | Task exceeded time limit—increase `max_steps` or simplify the task |
+| `canceled` | Task was cancelled before starting |
+
+You have three options for retrieving results:
+
+### Option 1: Polling
+
+Poll `get_run` until status is terminal (`completed`, `failed`, `terminated`, `timed_out`, or `canceled`).
+
+<CodeGroup>
+```python Python
+run_id = result.run_id
+
+while True:
+    run = await client.get_run(run_id)
+
+    if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+        break
+
+    await asyncio.sleep(5)
+
+print(f"Output: {run.output}")
+```
+
+```typescript TypeScript
+const runId = result.run_id;
+
+while (true) {
+  const run = await client.getRun(runId);
+
+  if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
+    console.log(`Output: ${JSON.stringify(run.output)}`);
+    break;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+```
+
+```bash cURL
+#!/bin/bash
+RUN_ID="YOUR_RUN_ID"
+
+while true; do
+  RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY")
+
+  STATUS=$(echo "$RESPONSE" | jq -r '.status')
+  echo "Status: $STATUS"
+
+  if [[ "$STATUS" == "completed" || "$STATUS" == "failed" || "$STATUS" == "terminated" || "$STATUS" == "timed_out" || "$STATUS" == "canceled" ]]; then
+    echo "$RESPONSE" | jq '.output'
+    break
+  fi
+
+  sleep 5
+done
+```
+</CodeGroup>
+
+<Warning>
+Your polling loop must check **all** terminal states: `completed`, `failed`, `terminated`, `timed_out`, `canceled`. Missing one causes infinite loops.
+</Warning>
+
+### Option 2: Webhooks
+
+Pass a `webhook_url` when creating the task. Skyvern sends a POST request to your URL when the task completes.
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get the title of the top post",
+    url="https://news.ycombinator.com",
+    webhook_url="https://your-server.com/webhook",
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get the title of the top post",
+    url: "https://news.ycombinator.com",
+    webhook_url: "https://your-server.com/webhook",
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get the title of the top post",
+    "url": "https://news.ycombinator.com",
+    "webhook_url": "https://your-server.com/webhook"
+  }'
+```
+</CodeGroup>
+
+Skyvern sends a POST request with the full run data when the task completes or fails.
+
+### Option 3: Wait for completion (Python only)
+
+Block until the task finishes instead of polling manually.
+
+```python Python
+result = await client.run_task(
+    prompt="Get the title of the top post",
+    url="https://news.ycombinator.com",
+    wait_for_completion=True,
+)
+print(result.output)
+```
+
+---
+
+## Understand the response
+
+The response from polling (`get_run`) and webhooks have slightly different structures. Both contain the core task data, but webhooks include additional metadata.
+
+<CodeGroup>
+```json Polling Response
+{
+  "run_id": "tsk_v2_486305187432193504",
+  "status": "completed",
+  "output": {
+    "top_post_title": "Linux kernel framework for PCIe device emulation, in userspace"
+  },
+  "downloaded_files": [],
+  "recording_url": "https://skyvern-artifacts.s3.amazonaws.com/v1/production/.../recording.webm?...",
+  "screenshot_urls": ["https://skyvern-artifacts.s3.amazonaws.com/.../screenshot_final.png?..."],
+  "failure_reason": null,
+  "errors": [],
+  "step_count": 2,
+  "run_type": "task_v2",
+  "app_url": "https://app.skyvern.com/runs/wr_486305187432193510",
+  "browser_session_id": null,
+  "browser_profile_id": null,
+  "created_at": "2026-01-20T11:52:29.276851",
+  "modified_at": "2026-01-20T11:54:08.822807",
+  "queued_at": "2026-01-20T11:52:29.483922",
+  "started_at": "2026-01-20T11:52:31.835337",
+  "finished_at": "2026-01-20T11:54:08.821985",
+  "run_request": {
+    "prompt": "Get the title of the top post",
+    "url": "https://news.ycombinator.com/",
+    "engine": "skyvern-2.0"
+  }
+}
+```
+
+```json Webhook Payload
+{
+  "task_id": "tsk_v2_486306851394503256",
+  "run_id": "tsk_v2_486306851394503256",
+  "status": "completed",
+  "output": {
+    "top_post_title": "Linux kernel framework for PCIe device emulation, in userspace"
+  },
+  "summary": "I have successfully navigated to Hacker News and extracted the title of the top post.",
+  "prompt": "Get the title of the top post",
+  "url": "https://news.ycombinator.com/",
+  "downloaded_files": [],
+  "recording_url": "https://skyvern-artifacts.s3.amazonaws.com/v1/production/.../recording.webm?...",
+  "screenshot_urls": ["https://skyvern-artifacts.s3.amazonaws.com/.../screenshot_final.png?..."],
+  "failure_reason": null,
+  "errors": [],
+  "step_count": 2,
+  "run_type": "task_v2",
+  "app_url": "https://app.skyvern.com/runs/wr_486306851394503262",
+  "organization_id": "o_485917350850524254",
+  "workflow_run_id": "wr_486306851394503262",
+  "proxy_location": "RESIDENTIAL",
+  "webhook_callback_url": "https://your-server.com/webhook",
+  "created_at": "2026-01-20T11:58:57.414123",
+  "modified_at": "2026-01-20T12:00:31.513449",
+  "queued_at": "2026-01-20T11:58:57.607233",
+  "started_at": "2026-01-20T11:58:59.395028",
+  "finished_at": "2026-01-20T12:00:31.512692"
+}
+```
+</CodeGroup>
+
+<Note>
+Webhook payloads differ from polling responses: webhooks include `summary` and `organization_id`; polling includes `run_request`. Plan your integration accordingly.
+</Note>
+
+**Common fields (both polling and webhook):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | string | Unique identifier for this run |
+| `status` | string | Current status: `queued`, `running`, `completed`, `failed`, `terminated`, `timed_out`, `canceled` |
+| `output` | object \| null | Extracted data from the task |
+| `downloaded_files` | array | Files downloaded during execution |
+| `recording_url` | string \| null | Video recording of the browser session |
+| `screenshot_urls` | array \| null | Screenshots captured (latest first) |
+| `failure_reason` | string \| null | Error message if the run failed |
+| `errors` | array | List of errors encountered |
+| `step_count` | integer \| null | Number of steps executed |
+| `run_type` | string | Type of run: `task_v2`, `openai_cua`, `anthropic_cua` |
+| `app_url` | string | Link to view this run in Skyvern Cloud |
+| `created_at` | datetime | When the run was created |
+| `modified_at` | datetime | When the run was last updated |
+| `queued_at` | datetime \| null | When the run entered the queue |
+| `started_at` | datetime \| null | When execution began |
+| `finished_at` | datetime \| null | When execution completed |
+
+**Polling-only fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_request` | object | Original request parameters (prompt, url, engine, etc.) |
+| `browser_session_id` | string \| null | ID of the browser session used |
+| `browser_profile_id` | string \| null | ID of the browser profile used |
+| `max_screenshot_scrolls` | integer \| null | Number of scrolls for screenshots |
+| `script_run` | object \| null | Script run result if AI fallback triggered |
+
+**Webhook-only fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `task_id` | string | Same as `run_id` |
+| `summary` | string | AI-generated description of what was done |
+| `prompt` | string | The prompt from the original request |
+| `url` | string | The URL from the original request |
+| `organization_id` | string | Your organization ID |
+| `workflow_run_id` | string | Associated workflow run ID |
+| `proxy_location` | string | Proxy location used (e.g., `RESIDENTIAL`) |
+| `webhook_callback_url` | string | The webhook URL that received this payload |
+
+---
+
+## Get artifacts
+
+The run response contains high-level data like `output`, `recording_url`, and `screenshot_urls`. 
+
+Every run also generates Artifacts, such as screenshots, reasoning logs, downloaded files, for observability. To get them, use `get_run_artifacts`.
+
+<CodeGroup>
+```python Python
+artifacts = await client.get_run_artifacts(run_id)
+
+for artifact in artifacts:
+    print(f"{artifact.artifact_type}: {artifact.signed_url}")
+```
+
+```typescript TypeScript
+const artifacts = await client.getRunArtifacts(runId);
+
+for (const artifact of artifacts) {
+  console.log(`${artifact.artifact_type}: ${artifact.signed_url}`);
+}
+```
+
+```bash cURL
+curl -X GET "https://api.skyvern.com/v1/runs/RUN_ID/artifacts" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+This returns a list of artifacts.
+
+**Example response:**
+
+```json
+[
+  {
+    "artifact_id": "a_486305284826607484",
+    "artifact_type": "recording",
+    "uri": "s3://skyvern-artifacts/v1/production/.../recording.webm",
+    "signed_url": "https://skyvern-artifacts.s3.amazonaws.com/v1/production/.../recording.webm?...",
+    "task_id": "tsk_486305246171901814",
+    "step_id": "stp_486305250466869112",
+    "workflow_run_id": "wr_486305187432193510",
+    "workflow_run_block_id": null,
+    "run_id": "tsk_v2_486305187432193504",
+    "organization_id": "o_485917350850524254",
+    "created_at": "2026-01-20T11:52:52.083001",
+    "modified_at": "2026-01-20T11:52:52.083003"
+  },
+  {
+    "artifact_id": "a_486305516754841578",
+    "artifact_type": "screenshot_final",
+    "uri": "s3://skyvern-artifacts/v1/production/.../screenshot_final.png",
+    "signed_url": "https://skyvern-artifacts.s3.amazonaws.com/v1/production/.../screenshot_final.png?...",
+    "task_id": "tsk_486305439445430190",
+    "step_id": "stp_486305439445430192",
+    "workflow_run_id": "wr_486305187432193510",
+    "workflow_run_block_id": null,
+    "run_id": "tsk_v2_486305187432193504",
+    "organization_id": "o_485917350850524254",
+    "created_at": "2026-01-20T11:53:46.468908",
+    "modified_at": "2026-01-20T11:53:46.468910"
+  }
+]
+```
+
+**Artifact fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `artifact_id` | string | Unique identifier for the artifact |
+| `artifact_type` | string | Type of artifact (see table below) |
+| `uri` | string | Internal storage path |
+| `signed_url` | string \| null | Pre-signed URL for downloading |
+| `task_id` | string \| null | Associated task ID |
+| `step_id` | string \| null | Associated step ID |
+| `run_id` | string \| null | Associated run ID (e.g., `tsk_v2_...`) |
+| `workflow_run_id` | string \| null | Associated workflow run ID |
+| `workflow_run_block_id` | string \| null | Associated workflow block ID |
+| `organization_id` | string | Organization that owns this artifact |
+| `created_at` | datetime | When the artifact was created |
+| `modified_at` | datetime | When the artifact was last modified |
+
+**Artifact types:**
+
+| Type | Description |
+|------|-------------|
+| `recording` | Full video of the browser session |
+| `screenshot` | Screenshot captured during execution |
+| `screenshot_action` | Screenshot taken after an action |
+| `screenshot_final` | Final screenshot when task completed |
+| `screenshot_llm` | Screenshot sent to the LLM for analysis |
+| `html` | Page HTML at various points |
+| `html_scrape` | Scraped HTML content |
+| `html_action` | HTML captured after an action |
+| `har` | HTTP Archive file for network debugging |
+| `trace` | Execution trace data |
+| `pdf` | PDF files generated or downloaded |
+| `script_file` | Generated script files |
+| `browser_console_log` | Browser console output |
+| `skyvern_log` | Skyvern execution logs |
+| `skyvern_log_raw` | Raw Skyvern execution logs |
+| `llm_prompt` | Prompt sent to the LLM |
+| `llm_request` | Full request sent to the LLM |
+| `llm_response` | Response from the LLM |
+| `llm_response_parsed` | Parsed LLM response |
+| `llm_response_rendered` | Rendered LLM response |
+| `visible_elements_tree` | DOM tree of visible elements |
+| `visible_elements_tree_trimmed` | Trimmed DOM tree |
+| `visible_elements_tree_in_prompt` | DOM tree included in prompt |
+| `visible_elements_id_css_map` | CSS selector map for elements |
+| `visible_elements_id_frame_map` | Frame map for elements |
+| `visible_elements_id_xpath_map` | XPath map for elements |
+| `hashed_href_map` | Hashed href mapping |
+
+You can filter by artifact type using query parameters:
+
+```bash
+curl -X GET "https://api.skyvern.com/v1/runs/RUN_ID/artifacts?artifact_type=screenshot&artifact_type=recording" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Task Parameters"
+    icon="sliders"
+    href="/running-automations/task-parameters"
+  >
+    Configure engines, proxies, extraction schemas, etc when running a task
+  </Card>
+  <Card
+    title="Extract Structured Data"
+    icon="database"
+    href="/running-automations/extract-structured-data"
+  >
+    Define a schema to get typed JSON output from your automations
+  </Card>
+</CardGroup>
