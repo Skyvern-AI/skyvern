@@ -44,7 +44,8 @@ function BrowserSession() {
       );
       return response.data;
     },
-    refetchInterval: (query) => query.state.data?.status === "running" ? 5000 : false,
+    refetchInterval: (query) =>
+      query.state.data?.status === "running" ? 5000 : false,
   });
 
   const browserSession = query.data;
@@ -88,15 +89,17 @@ function BrowserSession() {
             {browserSession && (
               <div className="ml-auto flex flex-col items-end justify-end overflow-hidden">
                 <div className="flex items-center justify-end gap-2">
-                  <span className={`rounded px-2 py-0.5 text-xs font-medium ${
-                    browserSession.status === "running"
-                      ? "bg-green-500/20 text-green-500"
-                      : browserSession.status === "completed"
-                      ? "bg-blue-500/20 text-blue-500"
-                      : browserSession.status === "failed"
-                      ? "bg-red-500/20 text-red-500"
-                      : "bg-gray-500/20 text-gray-500"
-                  }`}>
+                  <span
+                    className={`rounded px-2 py-0.5 text-xs font-medium ${
+                      browserSession.status === "running"
+                        ? "bg-green-500/20 text-green-500"
+                        : browserSession.status === "completed"
+                          ? "bg-blue-500/20 text-blue-500"
+                          : browserSession.status === "failed"
+                            ? "bg-red-500/20 text-red-500"
+                            : "bg-gray-500/20 text-gray-500"
+                    }`}
+                  >
                     {browserSession.status}
                   </span>
                   <div className="max-w-[20rem] truncate font-mono text-xs opacity-75">

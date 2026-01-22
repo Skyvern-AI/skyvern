@@ -31,11 +31,7 @@ import {
   type MessageInExfiltratedEvent,
 } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
-import {
-  wssBaseUrl,
-  newWssBaseUrl,
-  getRuntimeApiKey,
-} from "@/util/env";
+import { wssBaseUrl, newWssBaseUrl, getRuntimeApiKey } from "@/util/env";
 import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 

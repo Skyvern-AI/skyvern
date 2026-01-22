@@ -44,7 +44,7 @@ function BrowserSessionVideo() {
 
   const isSessionRunning = browserSession?.status === "running";
   // Don't show recordings while session is running - they're incomplete
-  const recordings = isSessionRunning ? [] : (browserSession?.recordings || []);
+  const recordings = isSessionRunning ? [] : browserSession?.recordings || [];
 
   if (isLoading) {
     return (
