@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useFirstParam } from "@/hooks/useFirstParam";
-import { getRuntimeApiKey } from "@/util/env";
+import { getRuntimeApiKey, legacyWssBaseUrl } from "@/util/env";
 import { toast } from "@/components/ui/use-toast";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -20,8 +20,6 @@ interface Props {
 }
 
 let socket: WebSocket | null = null;
-
-const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
 
 function WorkflowRunStream(props?: Props) {
   const alwaysShowStream = props?.alwaysShowStream ?? false;
@@ -54,7 +52,7 @@ function WorkflowRunStream(props?: Props) {
         socket.close();
       }
       socket = new WebSocket(
-        `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}${credential}`,
+        `${legacyWssBaseUrl}/stream/workflow_runs/${workflowRunId}${credential}`,
       );
       // Listen for messages
       socket.addEventListener("message", (event) => {

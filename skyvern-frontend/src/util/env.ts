@@ -43,6 +43,24 @@ try {
   newWssBaseUrl = wssBaseUrl.replace("/api", "");
 }
 
+let legacyWssBaseUrl = wssBaseUrl;
+try {
+  const url = new URL(wssBaseUrl);
+  if (!url.pathname.startsWith("/api")) {
+    const leadingSlash = url.pathname.startsWith("/") ? "" : "/";
+    url.pathname = `/api${leadingSlash}${url.pathname}`;
+  }
+  legacyWssBaseUrl = url.toString();
+} catch (e) {
+  if (!wssBaseUrl.includes("/api")) {
+    if (wssBaseUrl.includes("/v1")) {
+      legacyWssBaseUrl = wssBaseUrl.replace("/v1", "/api/v1");
+    } else {
+      legacyWssBaseUrl = `${wssBaseUrl.replace(/\/$/, "")}/api`;
+    }
+  }
+}
+
 // Base URL for the Runs API (strip a leading `/api` segment: /api/v1 -> /v1)
 const runsApiBaseUrl = (() => {
   try {
@@ -105,6 +123,7 @@ export {
   lsKeys,
   wssBaseUrl,
   newWssBaseUrl,
+  legacyWssBaseUrl,
   getRuntimeApiKey,
   persistRuntimeApiKey,
   clearRuntimeApiKey,
