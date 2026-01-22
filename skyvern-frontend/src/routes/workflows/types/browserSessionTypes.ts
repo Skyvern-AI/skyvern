@@ -6,6 +6,7 @@ interface BrowserSession {
   runnable_id: string | null;
   runnable_type: string | null;
   started_at: string | null;
+  status: string;
   timeout: number | null;
   vnc_streaming_supported: boolean;
 }

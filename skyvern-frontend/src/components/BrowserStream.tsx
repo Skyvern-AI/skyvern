@@ -32,7 +32,6 @@ import {
 } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import {
-  environment,
   wssBaseUrl,
   newWssBaseUrl,
   getRuntimeApiKey,
@@ -223,7 +222,7 @@ function BrowserStream({
 
     let credentialQueryParam = runtimeApiKey ? `apikey=${runtimeApiKey}` : "";
 
-    if (environment !== "local" && credentialGetter) {
+    if (credentialGetter) {
       const token = await credentialGetter();
       credentialQueryParam = token ? `token=Bearer ${token}` : "";
     }
