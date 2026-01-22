@@ -36,6 +36,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.services.browser_recording.service import BrowserSessionRecordingService
 from skyvern.webeye.browser_manager import BrowserManager
+from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
@@ -191,7 +192,7 @@ def create_forge_app() -> ForgeApp:
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
     app.WORKFLOW_SERVICE = WorkflowService()
     app.AGENT_FUNCTION = AgentFunction()
-    app.PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=app.DATABASE)
+    app.PERSISTENT_SESSIONS_MANAGER = DefaultPersistentSessionsManager(database=app.DATABASE)
     app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()

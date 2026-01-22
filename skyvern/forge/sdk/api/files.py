@@ -339,6 +339,39 @@ async def wait_for_download_finished(downloading_files: list[str], timeout: floa
         raise DownloadFileMaxWaitingTime(downloading_files=cur_downloading_files)
 
 
+async def check_downloading_files_and_wait_for_download_to_complete(
+    download_dir: Path,
+    organization_id: str,
+    browser_session_id: str | None = None,
+    timeout: float = BROWSER_DOWNLOAD_TIMEOUT,
+) -> None:
+    # check if there's any file is still downloading
+    downloading_files = list_downloading_files_in_directory(download_dir)
+    if browser_session_id:
+        files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
+        downloading_files = downloading_files + files_in_browser_session
+
+    if len(downloading_files) == 0:
+        return
+
+    LOG.info(
+        "File downloading hasn't completed, wait for a while",
+        downloading_files=downloading_files,
+    )
+    try:
+        await wait_for_download_finished(
+            downloading_files=downloading_files,
+            timeout=timeout,
+        )
+    except DownloadFileMaxWaitingTime as e:
+        LOG.warning(
+            "There're several long-time downloading files, these files might be broken",
+            downloading_files=e.downloading_files,
+        )
+
+
 def get_number_of_files_in_directory(directory: Path, recursive: bool = False) -> int:
     return len(list_files_in_directory(directory, recursive))
 

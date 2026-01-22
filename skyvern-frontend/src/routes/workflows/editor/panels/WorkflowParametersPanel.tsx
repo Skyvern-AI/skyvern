@@ -30,7 +30,11 @@ import {
   WorkflowEditorParameterType,
   WorkflowEditorParameterTypes,
 } from "../../types/workflowTypes";
-import { getLabelForWorkflowParameterType } from "../workflowEditorUtils";
+import {
+  getLabelForWorkflowParameterType,
+  removeJinjaReferenceFromNodes,
+  replaceJinjaReferenceInNodes,
+} from "../workflowEditorUtils";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
@@ -105,28 +109,6 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
             >
               Credential Parameter
             </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => {
-                setOperationPanelState({
-                  active: true,
-                  operation: "add",
-                  type: WorkflowEditorParameterTypes.Secret,
-                });
-              }}
-            >
-              Secret Parameter
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => {
-                setOperationPanelState({
-                  active: true,
-                  operation: "add",
-                  type: WorkflowEditorParameterTypes.CreditCardData,
-                });
-              }}
-            >
-              Credit Card Parameter
-            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
 
@@ -149,7 +131,9 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                         </span>
                       ) : (
                         <span className="text-sm text-slate-400">
-                          {parameter.parameterType === "onepassword"
+                          {parameter.parameterType === "onepassword" ||
+                          parameter.parameterType === "secret" ||
+                          parameter.parameterType === "creditCardData"
                             ? "credential"
                             : parameter.parameterType}
                         </span>
@@ -164,7 +148,9 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                             operation: "edit",
                             parameter: parameter,
                             type:
-                              parameter.parameterType === "onepassword"
+                              parameter.parameterType === "onepassword" ||
+                              parameter.parameterType === "secret" ||
+                              parameter.parameterType === "creditCardData"
                                 ? WorkflowEditorParameterTypes.Credential
                                 : parameter.parameterType,
                           });
@@ -195,21 +181,39 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                                 );
                                 setHasChanges(true);
                                 setNodes((nodes) => {
-                                  return nodes.map((node) => {
+                                  // Step 1: Remove inline {{ parameter.key }} references
+                                  const nodesWithRemovedRefs =
+                                    removeJinjaReferenceFromNodes(
+                                      nodes,
+                                      parameter.key,
+                                    );
+
+                                  // Step 2: Remove from parameterKeys arrays
+                                  return nodesWithRemovedRefs.map((node) => {
+                                    // All node types that have parameterKeys
                                     if (
                                       node.type === "task" ||
-                                      node.type === "textPrompt"
+                                      node.type === "textPrompt" ||
+                                      node.type === "login" ||
+                                      node.type === "navigation" ||
+                                      node.type === "extraction" ||
+                                      node.type === "fileDownload" ||
+                                      node.type === "action" ||
+                                      node.type === "http_request" ||
+                                      node.type === "validation" ||
+                                      node.type === "codeBlock" ||
+                                      node.type === "printPage"
                                     ) {
+                                      const parameterKeys = node.data
+                                        .parameterKeys as Array<string> | null;
                                       return {
                                         ...node,
                                         data: {
                                           ...node.data,
-                                          parameterKeys: (
-                                            node.data
-                                              .parameterKeys as Array<string>
-                                          ).filter(
-                                            (key) => key !== parameter.key,
-                                          ),
+                                          parameterKeys:
+                                            parameterKeys?.filter(
+                                              (key) => key !== parameter.key,
+                                            ) ?? null,
                                         },
                                       };
                                     }
@@ -292,25 +296,44 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                       }),
                     );
                     setNodes((nodes) => {
-                      return nodes.map((node) => {
+                      const oldKey = operationPanelState.parameter?.key;
+                      const newKey = editedParameter.key;
+                      const keyChanged = oldKey && newKey && oldKey !== newKey;
+
+                      // Step 1: Update inline {{ old_key }} references to {{ new_key }}
+                      const nodesWithUpdatedRefs = keyChanged
+                        ? replaceJinjaReferenceInNodes(nodes, oldKey, newKey)
+                        : nodes;
+
+                      // Step 2: Update parameterKeys arrays
+                      return nodesWithUpdatedRefs.map((node) => {
+                        // All node types that have parameterKeys
                         if (
                           node.type === "task" ||
-                          node.type === "textPrompt"
+                          node.type === "textPrompt" ||
+                          node.type === "login" ||
+                          node.type === "navigation" ||
+                          node.type === "extraction" ||
+                          node.type === "fileDownload" ||
+                          node.type === "action" ||
+                          node.type === "http_request" ||
+                          node.type === "validation" ||
+                          node.type === "codeBlock" ||
+                          node.type === "printPage"
                         ) {
+                          const parameterKeys = node.data
+                            .parameterKeys as Array<string> | null;
                           return {
                             ...node,
                             data: {
                               ...node.data,
-                              parameterKeys: (
-                                node.data.parameterKeys as Array<string>
-                              ).map((key) => {
-                                if (
-                                  key === operationPanelState.parameter?.key
-                                ) {
-                                  return editedParameter.key;
-                                }
-                                return key;
-                              }),
+                              parameterKeys:
+                                parameterKeys?.map((key) => {
+                                  if (key === oldKey) {
+                                    return newKey;
+                                  }
+                                  return key;
+                                }) ?? null,
                             },
                           };
                         }

@@ -60,9 +60,10 @@ from skyvern.schemas.scripts import (
     ScriptFileCreate,
     ScriptStatus,
 )
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
@@ -455,6 +456,8 @@ async def _create_workflow_block_run_and_task(
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
                 model=model,
+                # always use the action history for validation in caching/script run
+                include_action_history_in_verification=True,
             )
 
             task_id = task.task_id
@@ -593,12 +596,30 @@ async def _update_workflow_block(
         final_output = output
         if task_id:
             if step_id:
+                # Build step output from script actions similar to agent flow
+                step_output = None
+                run_context = script_run_context_manager.get_run_context()
+                if run_context and run_context.actions_and_results:
+                    # Extract errors from DecisiveActions (similar to agent flow)
+                    errors: list[UserDefinedError] = []
+                    for action, _ in run_context.actions_and_results:
+                        if isinstance(action, DecisiveAction):
+                            errors.extend(action.errors)
+
+                    # Create AgentStepOutput similar to how agent does it
+                    step_output = AgentStepOutput(
+                        actions_and_results=run_context.actions_and_results,
+                        action_results=[result for _, results in run_context.actions_and_results for result in results],
+                        errors=errors,
+                    )
+
                 await app.DATABASE.update_step(
                     step_id=step_id,
                     task_id=task_id,
                     organization_id=context.organization_id,
                     status=step_status,
                     is_last=is_last,
+                    output=step_output,
                 )
             updated_task = await app.DATABASE.update_task(
                 task_id=task_id,
@@ -617,11 +638,11 @@ async def _update_workflow_block(
             except asyncio.TimeoutError:
                 LOG.warning("Timeout getting downloaded files", task_id=task_id)
 
-            task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+            task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                 organization_id=context.organization_id,
                 task_id=task_id,
             )
-            workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+            workflow_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts(
                 workflow_run_id=context.workflow_run_id,
                 organization_id=context.organization_id,
             )
@@ -629,8 +650,8 @@ async def _update_workflow_block(
             task_output = TaskOutput.from_task(
                 updated_task,
                 downloaded_files,
-                task_screenshots=task_screenshots,
-                workflow_screenshots=workflow_screenshots,
+                task_screenshot_artifact_ids=[a.artifact_id for a in task_screenshot_artifacts],
+                workflow_screenshot_artifact_ids=[a.artifact_id for a in workflow_screenshot_artifacts],
             )
             final_output = task_output.model_dump()
             step_for_billing: Step | None = None

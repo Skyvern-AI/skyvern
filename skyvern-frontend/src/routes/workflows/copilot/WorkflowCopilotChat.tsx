@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, memo } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, memo } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useIsSkyvernUser } from "@/hooks/useIsSkyvernUser";
@@ -7,15 +7,29 @@ import { ReloadIcon, Cross2Icon } from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
+import { WorkflowDefinition } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
+import {
+  WorkflowCopilotChatHistoryResponse,
+  WorkflowCopilotProcessingUpdate,
+  WorkflowCopilotStreamErrorUpdate,
+  WorkflowCopilotStreamResponseUpdate,
+  WorkflowCopilotChatSender,
+  WorkflowCopilotChatRequest,
+} from "./workflowCopilotTypes";
 
 interface ChatMessage {
   id: string;
-  sender: "ai" | "user";
+  sender: WorkflowCopilotChatSender;
   content: string;
   timestamp?: string;
 }
+
+type WorkflowCopilotSsePayload =
+  | WorkflowCopilotProcessingUpdate
+  | WorkflowCopilotStreamResponseUpdate
+  | WorkflowCopilotStreamErrorUpdate;
 
 const formatChatTimestamp = (value: string) => {
   let normalizedValue = value.replace(/\.(\d{3})\d*/, ".$1");
@@ -39,7 +53,9 @@ const MessageItem = memo(({ message }: { message: ChatMessage }) => {
         {message.sender === "ai" ? "AI" : "U"}
       </div>
       <div className="relative flex-1 rounded-lg bg-slate-800 p-3 pr-12">
-        <p className="text-sm text-slate-200">{message.content}</p>
+        <p className="whitespace-pre-wrap pr-3 text-sm text-slate-200">
+          {message.content}
+        </p>
         {message.timestamp ? (
           <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-900/70 px-1.5 py-0.5 text-[10px] text-slate-400">
             {formatChatTimestamp(message.timestamp)}
@@ -51,7 +67,7 @@ const MessageItem = memo(({ message }: { message: ChatMessage }) => {
 });
 
 interface WorkflowCopilotChatProps {
-  onWorkflowUpdate?: (workflowYaml: string) => void;
+  onWorkflowUpdate?: (workflow: WorkflowDefinition) => void;
   isOpen?: boolean;
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
@@ -111,7 +127,10 @@ export function WorkflowCopilotChat({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [processingStatus, setProcessingStatus] = useState<string>("");
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const streamingAbortController = useRef<AbortController | null>(null);
+  const pendingMessageId = useRef<string | null>(null);
   const [workflowCopilotChatId, setWorkflowCopilotChatId] = useState<
     string | null
   >(null);
@@ -143,6 +162,7 @@ export function WorkflowCopilotChat({
   const credentialGetter = useCredentialGetter();
   const { workflowRunId, workflowPermanentId } = useParams();
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
   const hasScrolledOnLoad = useRef(false);
@@ -150,6 +170,18 @@ export function WorkflowCopilotChat({
   const scrollToBottom = (behavior: ScrollBehavior) => {
     messagesEndRef.current?.scrollIntoView({ behavior });
   };
+
+  const adjustTextareaHeight = () => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 150)}px`;
+  };
+
+  useEffect(() => {
+    adjustTextareaHeight();
+  }, [inputValue]);
 
   const handleNewChat = () => {
     setMessages([]);
@@ -165,6 +197,10 @@ export function WorkflowCopilotChat({
   }, [messages.length, onMessageCountChange]);
 
   useEffect(() => {
+    if (!isOpen) {
+      hasScrolledOnLoad.current = false;
+      return;
+    }
     if (isLoadingHistory) {
       return;
     }
@@ -174,7 +210,7 @@ export function WorkflowCopilotChat({
       return;
     }
     scrollToBottom("smooth");
-  }, [messages, isLoading, isLoadingHistory]);
+  }, [messages, isLoading, isLoadingHistory, isOpen]);
 
   useEffect(() => {
     if (!workflowPermanentId) {
@@ -190,16 +226,12 @@ export function WorkflowCopilotChat({
       hasScrolledOnLoad.current = false;
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
-        const response = await client.get<{
-          workflow_copilot_chat_id: string | null;
-          chat_history: Array<{
-            sender: "ai" | "user";
-            content: string;
-            created_at: string;
-          }>;
-        }>("/workflow/copilot/chat-history", {
-          params: { workflow_permanent_id: workflowPermanentId },
-        });
+        const response = await client.get<WorkflowCopilotChatHistoryResponse>(
+          "/workflow/copilot/chat-history",
+          {
+            params: { workflow_permanent_id: workflowPermanentId },
+          },
+        );
 
         if (!isMounted) return;
 
@@ -229,6 +261,33 @@ export function WorkflowCopilotChat({
     };
   }, [credentialGetter, workflowPermanentId]);
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || !isOpen || !isLoading) {
+        return;
+      }
+      cancelSend();
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isLoading, isOpen]);
+
+  const cancelSend = async () => {
+    if (!streamingAbortController.current) return;
+
+    if (pendingMessageId.current) {
+      const messageId = pendingMessageId.current;
+      pendingMessageId.current = null;
+      setMessages((prev) => prev.filter((message) => message.id !== messageId));
+    }
+    setIsLoading(false);
+    setProcessingStatus("");
+    streamingAbortController.current?.abort();
+  };
+
   const handleSend = async () => {
     if (!inputValue.trim() || isLoading) return;
     if (!workflowPermanentId) {
@@ -247,14 +306,30 @@ export function WorkflowCopilotChat({
       content: inputValue,
     };
 
+    pendingMessageId.current = userMessageId;
     setMessages((prev) => [...prev, userMessage]);
     const messageContent = inputValue;
     setInputValue("");
     setIsLoading(true);
+    setProcessingStatus("Starting...");
+
+    const abortController = new AbortController();
+    streamingAbortController.current?.abort();
+    streamingAbortController.current = abortController;
 
     try {
       const saveData = getSaveData();
+      const workflowId = saveData?.workflow.workflow_id;
       let workflowYaml = "";
+
+      if (!workflowId) {
+        toast({
+          title: "Missing workflow",
+          description: "Workflow ID is required to chat.",
+          variant: "destructive",
+        });
+        return;
+      }
 
       if (saveData) {
         const extraHttpHeaders: Record<string, string> = {};
@@ -310,69 +385,100 @@ export function WorkflowCopilotChat({
         workflowYaml = convertToYAML(requestBody);
       }
 
-      const client = await getSseClient(credentialGetter);
-      const response = await client.post<{
-        workflow_copilot_chat_id?: string;
-        message?: string;
-        updated_workflow_yaml?: string | null;
-        request_time?: string;
-        response_time?: string;
-        error?: string;
-      }>("/workflow/copilot/chat-post", {
-        workflow_permanent_id: workflowPermanentId,
-        workflow_copilot_chat_id: workflowCopilotChatId,
-        workflow_run_id: workflowRunId,
-        message: messageContent,
-        workflow_yaml: workflowYaml,
-      });
+      const handleProcessingUpdate = (
+        payload: WorkflowCopilotProcessingUpdate,
+      ) => {
+        if (payload.status) {
+          setProcessingStatus(payload.status);
+        }
 
-      if (response.error) {
-        throw new Error(response.error);
-      }
+        const pendingId = pendingMessageId.current;
+        if (!pendingId || !payload.timestamp) {
+          return;
+        }
 
-      if (
-        !response.workflow_copilot_chat_id ||
-        !response.message ||
-        !response.request_time ||
-        !response.response_time
-      ) {
-        throw new Error("No response received.");
-      }
-
-      setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
-
-      const aiMessage: ChatMessage = {
-        id: Date.now().toString(),
-        sender: "ai",
-        content: response.message || "I received your message.",
-        timestamp: response.response_time,
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === pendingId
+              ? {
+                  ...message,
+                  timestamp: payload.timestamp,
+                }
+              : message,
+          ),
+        );
       };
 
-      setMessages((prev) => [
-        ...prev.map((message) =>
-          message.id === userMessageId
-            ? {
-                ...message,
-                timestamp: response.request_time,
-              }
-            : message,
-        ),
-        aiMessage,
-      ]);
+      const handleResponse = (
+        response: WorkflowCopilotStreamResponseUpdate,
+      ) => {
+        setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
 
-      if (response.updated_workflow_yaml && onWorkflowUpdate) {
-        try {
-          onWorkflowUpdate(response.updated_workflow_yaml);
-        } catch (updateError) {
-          console.error("Failed to update workflow:", updateError);
-          toast({
-            title: "Update failed",
-            description: "Failed to apply workflow changes. Please try again.",
-            variant: "destructive",
-          });
+        const aiMessage: ChatMessage = {
+          id: Date.now().toString(),
+          sender: "ai",
+          content: response.message,
+          timestamp: response.response_time,
+        };
+
+        setMessages((prev) => [...prev, aiMessage]);
+
+        if (response.updated_workflow && onWorkflowUpdate) {
+          try {
+            onWorkflowUpdate(response.updated_workflow as WorkflowDefinition);
+          } catch (updateError) {
+            console.error("Failed to update workflow:", updateError);
+            toast({
+              title: "Update failed",
+              description:
+                "Failed to apply workflow changes. Please try again.",
+              variant: "destructive",
+            });
+          }
         }
-      }
+      };
+
+      const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
+        const errorMessage: ChatMessage = {
+          id: Date.now().toString(),
+          sender: "ai",
+          content: payload.error,
+        };
+        setMessages((prev) => [...prev, errorMessage]);
+      };
+
+      const client = await getSseClient(credentialGetter);
+      await client.postStreaming<WorkflowCopilotSsePayload>(
+        "/workflow/copilot/chat-post",
+        {
+          workflow_id: workflowId,
+          workflow_permanent_id: workflowPermanentId,
+          workflow_copilot_chat_id: workflowCopilotChatId,
+          workflow_run_id: workflowRunId,
+          message: messageContent,
+          workflow_yaml: workflowYaml,
+        } as WorkflowCopilotChatRequest,
+        (payload) => {
+          switch (payload.type) {
+            case "processing_update":
+              handleProcessingUpdate(payload);
+              return false;
+            case "response":
+              handleResponse(payload);
+              return true;
+            case "error":
+              handleError(payload);
+              return true;
+            default:
+              return false;
+          }
+        },
+        { signal: abortController.signal },
+      );
     } catch (error) {
+      if (abortController.signal.aborted) {
+        return;
+      }
       console.error("Failed to send message:", error);
       const errorMessage: ChatMessage = {
         id: Date.now().toString(),
@@ -381,12 +487,18 @@ export function WorkflowCopilotChat({
       };
       setMessages((prev) => [...prev, errorMessage]);
     } finally {
+      if (streamingAbortController.current === abortController) {
+        streamingAbortController.current = null;
+      }
+      pendingMessageId.current = null;
       setIsLoading(false);
+      setProcessingStatus("");
     }
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
+  const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
       handleSend();
     }
   };
@@ -525,7 +637,7 @@ export function WorkflowCopilotChat({
   }, [size]);
 
   // Recalculate position when chat opens to align with button (only first time)
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (isOpen && buttonRef?.current && !hasInitializedPosition.current) {
       const newPosition = calculateDefaultPosition(
         size.width,
@@ -610,7 +722,7 @@ export function WorkflowCopilotChat({
               <div className="flex-1 rounded-lg bg-slate-800 p-3">
                 <div className="flex items-center gap-2 text-sm text-slate-400">
                   <ReloadIcon className="h-4 w-4 animate-spin" />
-                  <span>Processing...</span>
+                  <span>{processingStatus || "Processing..."}</span>
                 </div>
               </div>
             </div>
@@ -621,15 +733,21 @@ export function WorkflowCopilotChat({
 
       {/* Input */}
       <div className="border-t border-slate-700 p-3">
-        <div className="flex gap-2">
-          <input
-            type="text"
-            placeholder="Type your message..."
+        <div className="flex items-end gap-2">
+          <textarea
+            ref={textareaRef}
+            placeholder="Type your message... (Shift+Enter for new line)"
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
-            onKeyPress={handleKeyPress}
+            onKeyDown={handleKeyPress}
             disabled={isLoading}
-            className="flex-1 rounded-md border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            rows={1}
+            className="flex-1 resize-none rounded-md border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            style={{
+              minHeight: "38px",
+              maxHeight: "150px",
+              overflow: "auto",
+            }}
           />
           <button
             onClick={handleSend}

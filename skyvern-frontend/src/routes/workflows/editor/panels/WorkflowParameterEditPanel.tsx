@@ -50,6 +50,36 @@ const workflowParameterTypeOptions = [
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
 
+type CredentialDataType = "password" | "secret" | "creditCard";
+type CredentialSource = "bitwarden" | "skyvern" | "onepassword" | "azurevault";
+
+// Determine available sources based on credential data type
+function getAvailableSourcesForDataType(
+  dataType: CredentialDataType,
+  isCloud: boolean,
+): Array<{ value: CredentialSource; label: string }> {
+  switch (dataType) {
+    case "password":
+      return [
+        ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
+        { value: "bitwarden" as const, label: "Bitwarden" },
+        { value: "onepassword" as const, label: "1Password" },
+        { value: "azurevault" as const, label: "Azure Key Vault" },
+      ];
+    case "secret":
+      return [
+        ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
+        { value: "bitwarden" as const, label: "Bitwarden" },
+      ];
+    case "creditCard":
+      return [
+        ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
+        { value: "bitwarden" as const, label: "Bitwarden" },
+        { value: "onepassword" as const, label: "1Password" },
+      ];
+  }
+}
+
 function header(type: WorkflowEditorParameterType, isEdit: boolean) {
   const prefix = isEdit ? "Edit" : "Add";
   if (type === "workflow") {
@@ -58,13 +88,36 @@ function header(type: WorkflowEditorParameterType, isEdit: boolean) {
   if (type === "credential") {
     return `${prefix} Credential Parameter`;
   }
-  if (type === "secret") {
-    return `${prefix} Secret Parameter`;
-  }
-  if (type === "creditCardData") {
-    return `${prefix} Credit Card Parameter`;
-  }
   return `${prefix} Context Parameter`;
+}
+
+// Helper to detect initial credential data type from existing parameter
+function detectInitialCredentialDataType(
+  initialValues: ParametersState[number] | undefined,
+): CredentialDataType {
+  if (!initialValues) return "password";
+  if (initialValues.parameterType === "secret") return "secret";
+  if (initialValues.parameterType === "creditCardData") return "creditCard";
+  return "password";
+}
+
+// Helper to detect initial credential source from existing parameter
+function detectInitialCredentialSource(
+  initialValues: ParametersState[number] | undefined,
+): CredentialSource {
+  if (!initialValues) return "bitwarden";
+
+  if (initialValues.parameterType === "secret") return "bitwarden";
+  if (initialValues.parameterType === "creditCardData") return "bitwarden";
+  if (initialValues.parameterType === "onepassword") return "onepassword";
+
+  if (initialValues.parameterType === "credential") {
+    if (parameterIsSkyvernCredential(initialValues)) return "skyvern";
+    if (parameterIsBitwardenCredential(initialValues)) return "bitwarden";
+    if (parameterIsAzureVaultCredential(initialValues)) return "azurevault";
+  }
+
+  return "bitwarden";
 }
 
 function WorkflowParameterEditPanel({
@@ -83,6 +136,8 @@ function WorkflowParameterEditPanel({
   const isEditMode = !!initialValues;
   const [key, setKey] = useState(initialValues?.key ?? "");
   const hasWhitespace = /\s/.test(key);
+
+  // Detect initial values for backward compatibility
   const isBitwardenCredential =
     initialValues?.parameterType === "credential" &&
     parameterIsBitwardenCredential(initialValues);
@@ -95,17 +150,16 @@ function WorkflowParameterEditPanel({
   const isAzureVaultCredential =
     initialValues?.parameterType === "credential" &&
     parameterIsAzureVaultCredential(initialValues);
-  const [credentialType, setCredentialType] = useState<
-    "bitwarden" | "skyvern" | "onepassword" | "azurevault"
-  >(
-    isBitwardenCredential
-      ? "bitwarden"
-      : isOnePasswordCredential
-        ? "onepassword"
-        : isAzureVaultCredential
-          ? "azurevault"
-          : "skyvern",
+
+  // New unified credential state
+  const [credentialDataType, setCredentialDataType] =
+    useState<CredentialDataType>(
+      detectInitialCredentialDataType(initialValues),
+    );
+  const [credentialSource, setCredentialSource] = useState<CredentialSource>(
+    detectInitialCredentialSource(initialValues),
   );
+
   const [urlParameterKey, setUrlParameterKey] = useState(
     isBitwardenCredential ? initialValues?.urlParameterKey ?? "" : "",
   );
@@ -190,6 +244,43 @@ function WorkflowParameterEditPanel({
   const [azureTotpSecretKey, setAzureTotpKey] = useState(
     isAzureVaultCredential ? initialValues.totpSecretKey ?? "" : "",
   );
+
+  // Handle credential data type change - reset source to first available
+  const handleCredentialDataTypeChange = (newDataType: CredentialDataType) => {
+    setCredentialDataType(newDataType);
+    const availableSources = getAvailableSourcesForDataType(
+      newDataType,
+      isCloud,
+    );
+    if (!availableSources.find((s) => s.value === credentialSource)) {
+      setCredentialSource(availableSources[0]?.value ?? "bitwarden");
+    }
+  };
+
+  const availableSources = getAvailableSourcesForDataType(
+    credentialDataType,
+    isCloud,
+  );
+
+  // Determine what fields to show based on credential data type and source
+  const showBitwardenPasswordFields =
+    type === "credential" &&
+    credentialDataType === "password" &&
+    credentialSource === "bitwarden";
+  const showBitwardenSecretFields =
+    type === "credential" &&
+    credentialDataType === "secret" &&
+    credentialSource === "bitwarden";
+  const showBitwardenCreditCardFields =
+    type === "credential" &&
+    credentialDataType === "creditCard" &&
+    credentialSource === "bitwarden";
+  const showOnePasswordFields =
+    type === "credential" && credentialSource === "onepassword";
+  const showAzureVaultFields =
+    type === "credential" && credentialSource === "azurevault";
+  const showSkyvernCredentialSelector =
+    type === "credential" && credentialSource === "skyvern" && isCloud;
 
   return (
     <ScrollArea>
@@ -301,59 +392,100 @@ function WorkflowParameterEditPanel({
               </div>
             </>
           )}
+
+          {/* Credential Parameter - Unified Flow */}
           {type === "credential" && (
             <>
+              {/* Step 1: Credential Type */}
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">
-                  Credential Type
-                </Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Credential Type
+                  </Label>
+                  <HelpTooltip content="Select the type of credential you want to use. Password for login credentials, Secret for sensitive data fields, Credit Card for payment information." />
+                </div>
                 <Select
-                  value={credentialType}
-                  onValueChange={(value) => {
-                    setCredentialType(
-                      value as
-                        | "bitwarden"
-                        | "skyvern"
-                        | "onepassword"
-                        | "azurevault",
-                    );
-                  }}
+                  value={credentialDataType}
+                  onValueChange={(value) =>
+                    handleCredentialDataTypeChange(value as CredentialDataType)
+                  }
                 >
                   <SelectTrigger className="w-full">
-                    <SelectValue placeholder="Select a type" />
+                    <SelectValue placeholder="Select credential type" />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectGroup>
-                      <SelectItem value="skyvern">Skyvern</SelectItem>
-                      <SelectItem value="bitwarden">Bitwarden</SelectItem>
-                      <SelectItem value="onepassword">1Password</SelectItem>
-                      <SelectItem value="azurevault">Azure Vault</SelectItem>
+                      <SelectItem value="password">Password</SelectItem>
+                      <SelectItem value="secret">Secret</SelectItem>
+                      <SelectItem value="creditCard">Credit Card</SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Step 2: Source */}
+              <div className="space-y-1">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Source</Label>
+                  <HelpTooltip content="Select where your credentials are stored. Skyvern uses managed credentials, while Bitwarden, 1Password, and Azure Key Vault connect directly to your vault." />
+                </div>
+                <Select
+                  value={credentialSource}
+                  onValueChange={(value) =>
+                    setCredentialSource(value as CredentialSource)
+                  }
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Select source" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {availableSources.map((source) => (
+                        <SelectItem key={source.value} value={source.value}>
+                          {source.label}
+                        </SelectItem>
+                      ))}
                     </SelectGroup>
                   </SelectContent>
                 </Select>
               </div>
             </>
           )}
-          {type === "credential" && credentialType === "bitwarden" && (
+
+          {/* Bitwarden Password Fields */}
+          {showBitwardenPasswordFields && (
             <>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">
-                  URL Parameter Key
-                </Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    URL Parameter Key
+                  </Label>
+                  <HelpTooltip content="Optional. The workflow parameter key that holds the URL. If provided, Skyvern will match the credential based on this URL." />
+                </div>
                 <Input
                   value={urlParameterKey}
                   onChange={(e) => setUrlParameterKey(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Collection ID</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Bitwarden Collection ID
+                  </Label>
+                  <HelpTooltip content="The Bitwarden collection ID. You can find this in the URL when viewing a collection in Bitwarden (e.g., https://vault.bitwarden.com/#/organizations/.../collections/[COLLECTION_ID])." />
+                </div>
                 <Input
                   value={bitwardenCollectionId}
                   onChange={(e) => setBitwardenCollectionId(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Item ID</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Bitwarden Item ID
+                  </Label>
+                  <HelpTooltip content="The Bitwarden item ID. You can find this in the URL when viewing the item in Bitwarden (e.g., https://vault.bitwarden.com/#/vault?itemId=[ITEM_ID])." />
+                </div>
                 <Input
                   value={bitwardenLoginCredentialItemId}
                   onChange={(e) =>
@@ -363,119 +495,70 @@ function WorkflowParameterEditPanel({
               </div>
             </>
           )}
-          {type === "credential" && credentialType === "onepassword" && (
+
+          {/* Bitwarden Secret Fields */}
+          {showBitwardenSecretFields && (
             <>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Vault ID</Label>
-                  <HelpTooltip content="You can find the Vault ID and Item ID in the URL when viewing the item in 1Password on the web." />
+                  <Label className="text-xs text-slate-300">
+                    Bitwarden Collection ID
+                  </Label>
+                  <HelpTooltip content="Required. The Bitwarden collection ID containing the identity item. You can find this in the URL when viewing a collection in Bitwarden." />
                 </div>
                 <Input
-                  value={opVaultId}
-                  onChange={(e) => setOpVaultId(e.target.value)}
+                  value={bitwardenCollectionId}
+                  onChange={(e) => setBitwardenCollectionId(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Item ID</Label>
-                  <HelpTooltip content="Supports all 1Password item types: Logins, Passwords, Credit Cards, Secure Notes, and more." />
+                  <Label className="text-xs text-slate-300">Identity Key</Label>
+                  <HelpTooltip content="The key used to identify which identity to use from Bitwarden (e.g., the identity name or a custom identifier)." />
                 </div>
-                <Input
-                  value={opItemId}
-                  onChange={(e) => setOpItemId(e.target.value)}
-                />
-              </div>
-              <div className="rounded-md bg-slate-800 p-2">
-                <div className="space-y-1 text-xs text-slate-400">
-                  Credit Cards: Due to a 1Password limitation, add the
-                  expiration date as a separate text field named “Expire Date”
-                  in the format MM/YYYY (e.g. 09/2027).
-                </div>
-              </div>
-            </>
-          )}
-          {type === "credential" && credentialType === "azurevault" && (
-            <>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Vault Name</Label>
-                <Input
-                  value={azureVaultName}
-                  onChange={(e) => setAzureVaultName(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Username Key</Label>
-                <Input
-                  autoComplete="off"
-                  value={azureUsernameKey}
-                  onChange={(e) => setAzureUsernameKey(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Password Key</Label>
-                <Input
-                  value={azurePasswordKey}
-                  onChange={(e) => setAzurePasswordKey(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">
-                  TOTP Secret Key
-                </Label>
-                <Input
-                  value={azureTotpSecretKey}
-                  onChange={(e) => setAzureTotpKey(e.target.value)}
-                />
-              </div>
-            </>
-          )}
-          {type === "context" && (
-            <div className="space-y-1">
-              <Label className="text-xs text-slate-300">Source Parameter</Label>
-              <SourceParameterKeySelector
-                value={sourceParameterKey}
-                onChange={setSourceParameterKey}
-              />
-            </div>
-          )}
-          {type === "secret" && (
-            <>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Identity Key</Label>
                 <Input
                   value={identityKey}
                   onChange={(e) => setIdentityKey(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">
-                  Identity Fields
-                </Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Identity Fields
+                  </Label>
+                  <HelpTooltip content="Comma-separated list of field names to extract from the Bitwarden identity (e.g., 'ssn, address, phone')." />
+                </div>
                 <Input
                   value={identityFields}
                   onChange={(e) => setIdentityFields(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Collection ID</Label>
-                <Input
-                  value={bitwardenCollectionId}
-                  onChange={(e) => setBitwardenCollectionId(e.target.value)}
+                  placeholder="field1, field2, field3"
                 />
               </div>
             </>
           )}
-          {type === "creditCardData" && (
+
+          {/* Bitwarden Credit Card Fields */}
+          {showBitwardenCreditCardFields && (
             <>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Collection ID</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Bitwarden Collection ID
+                  </Label>
+                  <HelpTooltip content="Required. The Bitwarden collection ID containing the credit card. You can find this in the URL when viewing a collection in Bitwarden." />
+                </div>
                 <Input
                   value={bitwardenCollectionId}
                   onChange={(e) => setBitwardenCollectionId(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Item ID</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Bitwarden Item ID
+                  </Label>
+                  <HelpTooltip content="Required. The Bitwarden item ID of the credit card. You can find this in the URL when viewing the item in Bitwarden." />
+                </div>
                 <Input
                   value={sensitiveInformationItemId}
                   onChange={(e) =>
@@ -485,20 +568,127 @@ function WorkflowParameterEditPanel({
               </div>
             </>
           )}
-          {
-            // temporarily cloud only
-            type === "credential" &&
-              credentialType === "skyvern" &&
-              isCloud && (
-                <div className="space-y-1">
-                  <Label className="text-xs text-slate-300">Credential</Label>
-                  <CredentialParameterSourceSelector
-                    value={credentialId}
-                    onChange={(value) => setCredentialId(value)}
-                  />
+
+          {/* 1Password Fields */}
+          {showOnePasswordFields && (
+            <>
+              <div className="space-y-1">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    1Password Vault ID
+                  </Label>
+                  <HelpTooltip content="You can find the Vault ID in the URL when viewing the vault in 1Password on the web (e.g., https://my.1password.com/vaults/[VAULT_ID])." />
                 </div>
-              )
-          }
+                <Input
+                  value={opVaultId}
+                  onChange={(e) => setOpVaultId(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    1Password Item ID
+                  </Label>
+                  <HelpTooltip content="You can find the Item ID in the URL when viewing the item in 1Password on the web. Supports all item types: Logins, Passwords, Credit Cards, Secure Notes, and more." />
+                </div>
+                <Input
+                  value={opItemId}
+                  onChange={(e) => setOpItemId(e.target.value)}
+                />
+              </div>
+              {credentialDataType === "creditCard" && (
+                <div className="rounded-md bg-slate-800 p-2">
+                  <div className="space-y-1 text-xs text-slate-400">
+                    Credit Cards: Due to a 1Password limitation, add the
+                    expiration date as a separate text field named "Expire Date"
+                    in the format MM/YYYY (e.g. 09/2027).
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Azure Key Vault Fields */}
+          {showAzureVaultFields && (
+            <>
+              <div className="space-y-1">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Azure Key Vault Name
+                  </Label>
+                  <HelpTooltip content="The name of your Azure Key Vault instance (e.g., 'my-company-vault'). This is the name you see in the Azure portal." />
+                </div>
+                <Input
+                  value={azureVaultName}
+                  onChange={(e) => setAzureVaultName(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Azure Username Secret Key
+                  </Label>
+                  <HelpTooltip content="The secret name in Azure Key Vault that stores the username (e.g., 'my-app-username')." />
+                </div>
+                <Input
+                  autoComplete="off"
+                  value={azureUsernameKey}
+                  onChange={(e) => setAzureUsernameKey(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Azure Password Secret Key
+                  </Label>
+                  <HelpTooltip content="The secret name in Azure Key Vault that stores the password (e.g., 'my-app-password')." />
+                </div>
+                <Input
+                  value={azurePasswordKey}
+                  onChange={(e) => setAzurePasswordKey(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Azure TOTP Secret Key
+                  </Label>
+                  <HelpTooltip content="Optional. The secret name in Azure Key Vault that stores the TOTP secret for two-factor authentication." />
+                </div>
+                <Input
+                  value={azureTotpSecretKey}
+                  onChange={(e) => setAzureTotpKey(e.target.value)}
+                />
+              </div>
+            </>
+          )}
+
+          {/* Skyvern Managed Credential Selector */}
+          {showSkyvernCredentialSelector && (
+            <div className="space-y-1">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">
+                  Skyvern Credential
+                </Label>
+                <HelpTooltip content="Select a credential from your Skyvern credential store. These are managed credentials you've previously added to Skyvern." />
+              </div>
+              <CredentialParameterSourceSelector
+                value={credentialId}
+                onChange={(value) => setCredentialId(value)}
+              />
+            </div>
+          )}
+
+          {type === "context" && (
+            <div className="space-y-1">
+              <Label className="text-xs text-slate-300">Source Parameter</Label>
+              <SourceParameterKeySelector
+                value={sourceParameterKey}
+                onChange={setSourceParameterKey}
+              />
+            </div>
+          )}
+
           <div className="flex justify-end">
             <Button
               onClick={() => {
@@ -527,6 +717,8 @@ function WorkflowParameterEditPanel({
                   });
                   return;
                 }
+
+                // Handle workflow parameters
                 if (type === "workflow") {
                   if (
                     parameterType === "json" &&
@@ -578,111 +770,10 @@ function WorkflowParameterEditPanel({
                       ? defaultValue
                       : null,
                   });
+                  return;
                 }
-                if (type === "credential" && credentialType === "bitwarden") {
-                  const errorMessage = validateBitwardenLoginCredential(
-                    bitwardenCollectionId,
-                    bitwardenLoginCredentialItemId,
-                    urlParameterKey,
-                  );
-                  if (errorMessage) {
-                    toast({
-                      variant: "destructive",
-                      title: "Failed to save parameter",
-                      description: errorMessage,
-                    });
-                    return;
-                  }
-                  onSave({
-                    key,
-                    parameterType: "credential",
-                    itemId:
-                      bitwardenLoginCredentialItemId === ""
-                        ? null
-                        : bitwardenLoginCredentialItemId,
-                    urlParameterKey:
-                      urlParameterKey === "" ? null : urlParameterKey,
-                    collectionId:
-                      bitwardenCollectionId === ""
-                        ? null
-                        : bitwardenCollectionId,
-                    description,
-                  });
-                }
-                if (type === "credential" && credentialType === "onepassword") {
-                  if (opVaultId.trim() === "" || opItemId.trim() === "") {
-                    toast({
-                      variant: "destructive",
-                      title: "Failed to save parameter",
-                      description: "Vault ID and Item ID are required",
-                    });
-                    return;
-                  }
-                  onSave({
-                    key,
-                    parameterType: "onepassword",
-                    vaultId: opVaultId,
-                    itemId: opItemId,
-                    description,
-                  });
-                }
-                if (type === "credential" && credentialType === "azurevault") {
-                  if (
-                    azureVaultName.trim() === "" ||
-                    azureUsernameKey.trim() === "" ||
-                    azurePasswordKey.trim() === ""
-                  ) {
-                    toast({
-                      variant: "destructive",
-                      title: "Failed to add parameter",
-                      description:
-                        "Azure Vault Name, Username Key and Password Key are required",
-                    });
-                    return;
-                  }
-                  onSave({
-                    key,
-                    parameterType: "credential",
-                    vaultName: azureVaultName,
-                    usernameKey: azureUsernameKey,
-                    passwordKey: azurePasswordKey,
-                    totpSecretKey:
-                      azureTotpSecretKey === "" ? null : azureTotpSecretKey,
-                    description: description,
-                  });
-                }
-                if (type === "secret" || type === "creditCardData") {
-                  if (!bitwardenCollectionId) {
-                    toast({
-                      variant: "destructive",
-                      title: "Failed to save parameter",
-                      description: "Collection ID is required",
-                    });
-                    return;
-                  }
-                }
-                if (type === "secret") {
-                  onSave({
-                    key,
-                    parameterType: "secret",
-                    collectionId: bitwardenCollectionId,
-                    identityFields: identityFields
-                      .split(",")
-                      .filter((s) => s.length > 0)
-                      .map((field) => field.trim()),
-                    identityKey,
-                    description,
-                  });
-                }
-                if (type === "creditCardData") {
-                  onSave({
-                    key,
-                    parameterType: "creditCardData",
-                    collectionId: bitwardenCollectionId,
-                    itemId: sensitiveInformationItemId,
-                    description,
-                  });
-                }
+
+                // Handle context parameters
                 if (type === "context") {
                   if (!sourceParameterKey) {
                     toast({
@@ -698,22 +789,166 @@ function WorkflowParameterEditPanel({
                     sourceParameterKey,
                     description,
                   });
+                  return;
                 }
-                if (type === "credential" && credentialType === "skyvern") {
-                  if (!credentialId) {
-                    toast({
-                      variant: "destructive",
-                      title: "Failed to save parameter",
-                      description: "Credential is required",
+
+                // Handle credential parameters based on type + source combination
+                if (type === "credential") {
+                  // Skyvern managed credentials
+                  if (credentialSource === "skyvern") {
+                    if (!credentialId) {
+                      toast({
+                        variant: "destructive",
+                        title: "Failed to save parameter",
+                        description: "Credential is required",
+                      });
+                      return;
+                    }
+                    onSave({
+                      key,
+                      parameterType: "credential",
+                      credentialId,
+                      description,
                     });
                     return;
                   }
-                  onSave({
-                    key,
-                    parameterType: "credential",
-                    credentialId,
-                    description,
-                  });
+
+                  // Bitwarden credentials
+                  if (credentialSource === "bitwarden") {
+                    // Password type
+                    if (credentialDataType === "password") {
+                      const errorMessage = validateBitwardenLoginCredential(
+                        bitwardenCollectionId,
+                        bitwardenLoginCredentialItemId,
+                        urlParameterKey,
+                      );
+                      if (errorMessage) {
+                        toast({
+                          variant: "destructive",
+                          title: "Failed to save parameter",
+                          description: errorMessage,
+                        });
+                        return;
+                      }
+                      onSave({
+                        key,
+                        parameterType: "credential",
+                        itemId:
+                          bitwardenLoginCredentialItemId === ""
+                            ? null
+                            : bitwardenLoginCredentialItemId,
+                        urlParameterKey:
+                          urlParameterKey === "" ? null : urlParameterKey,
+                        collectionId:
+                          bitwardenCollectionId === ""
+                            ? null
+                            : bitwardenCollectionId,
+                        description,
+                      });
+                      return;
+                    }
+
+                    // Secret type
+                    if (credentialDataType === "secret") {
+                      if (!bitwardenCollectionId) {
+                        toast({
+                          variant: "destructive",
+                          title: "Failed to save parameter",
+                          description: "Bitwarden Collection ID is required",
+                        });
+                        return;
+                      }
+                      onSave({
+                        key,
+                        parameterType: "secret",
+                        collectionId: bitwardenCollectionId,
+                        identityFields: identityFields
+                          .split(",")
+                          .filter((s) => s.length > 0)
+                          .map((field) => field.trim()),
+                        identityKey,
+                        description,
+                      });
+                      return;
+                    }
+
+                    // Credit Card type
+                    if (credentialDataType === "creditCard") {
+                      if (!bitwardenCollectionId) {
+                        toast({
+                          variant: "destructive",
+                          title: "Failed to save parameter",
+                          description: "Bitwarden Collection ID is required",
+                        });
+                        return;
+                      }
+                      if (!sensitiveInformationItemId) {
+                        toast({
+                          variant: "destructive",
+                          title: "Failed to save parameter",
+                          description: "Bitwarden Item ID is required",
+                        });
+                        return;
+                      }
+                      onSave({
+                        key,
+                        parameterType: "creditCardData",
+                        collectionId: bitwardenCollectionId,
+                        itemId: sensitiveInformationItemId,
+                        description,
+                      });
+                      return;
+                    }
+                  }
+
+                  // 1Password credentials
+                  if (credentialSource === "onepassword") {
+                    if (opVaultId.trim() === "" || opItemId.trim() === "") {
+                      toast({
+                        variant: "destructive",
+                        title: "Failed to save parameter",
+                        description:
+                          "1Password Vault ID and Item ID are required",
+                      });
+                      return;
+                    }
+                    onSave({
+                      key,
+                      parameterType: "onepassword",
+                      vaultId: opVaultId,
+                      itemId: opItemId,
+                      description,
+                    });
+                    return;
+                  }
+
+                  // Azure Key Vault credentials
+                  if (credentialSource === "azurevault") {
+                    if (
+                      azureVaultName.trim() === "" ||
+                      azureUsernameKey.trim() === "" ||
+                      azurePasswordKey.trim() === ""
+                    ) {
+                      toast({
+                        variant: "destructive",
+                        title: "Failed to add parameter",
+                        description:
+                          "Azure Vault Name, Username Key and Password Key are required",
+                      });
+                      return;
+                    }
+                    onSave({
+                      key,
+                      parameterType: "credential",
+                      vaultName: azureVaultName,
+                      usernameKey: azureUsernameKey,
+                      passwordKey: azurePasswordKey,
+                      totpSecretKey:
+                        azureTotpSecretKey === "" ? null : azureTotpSecretKey,
+                      description: description,
+                    });
+                    return;
+                  }
                 }
               }}
             >

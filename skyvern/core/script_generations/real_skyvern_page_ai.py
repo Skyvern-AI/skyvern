@@ -182,20 +182,26 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 organization_id=context.organization_id,
             )
             actions_json = json_response.get("actions", [])
-            if actions_json:
-                task_id = context.task_id if context else None
-                task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
-                if organization_id and task and step:
-                    actions = parse_actions(
-                        task, step.step_id, step.order, self.scraped_page, json_response.get("actions", [])
-                    )
-                    action = cast(ClickAction, actions[0])
-                    result = await handle_click_action(action, self.page, self.scraped_page, task, step)
-                    if result and result[-1].success is False:
-                        raise Exception(result[-1].exception_message)
-                    xpath = action.get_xpath()
-                    selector = f"xpath={xpath}" if xpath else selector
-                    return selector
+            if not actions_json:
+                # LLM returned no actions - the element likely doesn't exist on the page.
+                # Raise an exception so the caller knows the action failed.
+                raise Exception(
+                    f"AI could not find an element to click for intention: {intention}. "
+                    "The element may not exist on the current page."
+                )
+            task_id = context.task_id if context else None
+            task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
+            if organization_id and task and step:
+                actions = parse_actions(
+                    task, step.step_id, step.order, self.scraped_page, json_response.get("actions", [])
+                )
+                action = cast(ClickAction, actions[0])
+                result = await handle_click_action(action, self.page, self.scraped_page, task, step)
+                if result and result[-1].success is False:
+                    raise Exception(result[-1].exception_message)
+                xpath = action.get_xpath()
+                selector = f"xpath={xpath}" if xpath else selector
+                return selector
         except Exception:
             LOG.exception(
                 f"Failed to do ai click. Falling back to original selector={selector}, intention={intention}, data={data}"
@@ -204,7 +210,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
         if selector:
             locator = self.page.locator(selector)
             await locator.click(timeout=timeout)
-        return selector
+            return selector
+
+        # If we reach here with no selector, the AI failed and there's no fallback - raise an error
+        raise Exception(f"AI click failed and no fallback selector available for intention: {intention}")
 
     async def ai_input_text(
         self,

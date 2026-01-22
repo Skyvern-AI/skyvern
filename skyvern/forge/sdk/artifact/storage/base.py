@@ -34,6 +34,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.HASHED_HREF_MAP: "json",
     # DEPRECATED: we're using CSS selector map now
     ArtifactType.VISIBLE_ELEMENTS_ID_XPATH_MAP: "json",
+    ArtifactType.PDF: "pdf",
 }
 
 

@@ -1,14 +1,19 @@
 import { AxiosError } from "axios";
-import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
-import { useEffect, useState } from "react";
+import {
+  ExclamationTriangleIcon,
+  PlayIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
+import { useEffect, useMemo, useState } from "react";
 import { type FieldErrors, useForm } from "react-hook-form";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
 
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Accordion,
@@ -46,10 +51,54 @@ import { runsApiBaseUrl } from "@/util/env";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
-import { WorkflowParameter } from "./types/workflowTypes";
+import {
+  WorkflowApiResponse,
+  WorkflowBlock,
+  WorkflowParameter,
+} from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import * as env from "@/util/env";
+
+/**
+ * Recursively finds all login blocks that don't have any credential parameters selected.
+ * Checks nested blocks inside for_loop blocks as well.
+ */
+function getLoginBlocksWithoutCredentials(
+  blocks: Array<WorkflowBlock>,
+): Array<{ label: string }> {
+  const result: Array<{ label: string }> = [];
+
+  for (const block of blocks) {
+    if (block.block_type === "login") {
+      // Login block requires at least one parameter (credential) to be selected
+      if (!block.parameters || block.parameters.length === 0) {
+        result.push({ label: block.label });
+      }
+    }
+
+    // Check nested blocks in for_loop
+    if (block.block_type === "for_loop" && block.loop_blocks) {
+      result.push(...getLoginBlocksWithoutCredentials(block.loop_blocks));
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Validates the workflow for issues that would prevent it from running.
+ * Returns an array of login block labels that are missing credentials.
+ */
+function validateWorkflowForRun(
+  workflow: WorkflowApiResponse | undefined,
+): Array<{ label: string }> {
+  if (!workflow) {
+    return [];
+  }
+
+  return getLoginBlocksWithoutCredentials(workflow.workflow_definition.blocks);
+}
 
 // Utility function to omit specified keys from an object
 function omit<T extends Record<string, unknown>, K extends keyof T>(
@@ -237,6 +286,13 @@ function RunWorkflowForm({
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
+
+  // Validate login blocks have credentials selected
+  const loginBlocksWithoutCredentials = useMemo(
+    () => validateWorkflowForRun(workflow),
+    [workflow],
+  );
+  const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
 
   const form = useForm<RunWorkflowFormType>({
     mode: "onTouched",
@@ -448,6 +504,33 @@ function RunWorkflowForm({
         onSubmit={form.handleSubmit(onSubmit, handleInvalid)}
         className="space-y-8"
       >
+        {hasLoginBlockValidationError && (
+          <Alert variant="destructive">
+            <ExclamationTriangleIcon className="h-4 w-4" />
+            <AlertTitle>Cannot run workflow</AlertTitle>
+            <AlertDescription>
+              <p>
+                The following login block(s) need a credential selected before
+                running:
+              </p>
+              <ul className="mt-2 list-inside list-disc">
+                {loginBlocksWithoutCredentials.map((block) => (
+                  <li key={block.label}>{block.label}</li>
+                ))}
+              </ul>
+              <p className="mt-2">
+                <Link
+                  to={`/workflows/${workflowPermanentId}/debug`}
+                  className="underline hover:no-underline"
+                >
+                  Go to the editor
+                </Link>{" "}
+                to configure credentials for these blocks.
+              </p>
+            </AlertDescription>
+          </Alert>
+        )}
+
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
             <h1 className="text-lg">Input Parameters</h1>
@@ -996,7 +1079,12 @@ function RunWorkflowForm({
               } satisfies ApiCommandOptions;
             }}
           />
-          <Button type="submit" disabled={runWorkflowMutation.isPending}>
+          <Button
+            type="submit"
+            disabled={
+              runWorkflowMutation.isPending || hasLoginBlockValidationError
+            }
+          >
             {runWorkflowMutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
             )}

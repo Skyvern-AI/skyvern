@@ -364,6 +364,7 @@ class Task(TaskBase):
             workflow_run_id=self.workflow_run_id,
             max_screenshot_scrolls=self.max_screenshot_scrolls,
             step_count=step_count,
+            browser_session_id=self.browser_session_id,
         )
 
 
@@ -390,6 +391,7 @@ class TaskResponse(BaseModel):
     finished_at: datetime | None = None
     max_screenshot_scrolls: int | None = None
     step_count: int | None = None
+    browser_session_id: str | None = None
 
 
 class TaskOutput(BaseModel):
@@ -402,13 +404,15 @@ class TaskOutput(BaseModel):
     downloaded_file_urls: list[str] | None = None  # For backward compatibility
     task_screenshots: list[str] | None = None
     workflow_screenshots: list[str] | None = None
+    task_screenshot_artifact_ids: list[str] | None = None
+    workflow_screenshot_artifact_ids: list[str] | None = None
 
     @staticmethod
     def from_task(
         task: Task,
         downloaded_files: list[FileInfo] | None = None,
-        task_screenshots: list[str] | None = None,
-        workflow_screenshots: list[str] | None = None,
+        task_screenshot_artifact_ids: list[str] | None = None,
+        workflow_screenshot_artifact_ids: list[str] | None = None,
     ) -> TaskOutput:
         # For backward compatibility, extract just the URLs from FileInfo objects
         downloaded_file_urls = [file_info.url for file_info in downloaded_files] if downloaded_files else None
@@ -421,8 +425,8 @@ class TaskOutput(BaseModel):
             errors=task.errors,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
-            task_screenshots=task_screenshots,
-            workflow_screenshots=workflow_screenshots,
+            task_screenshot_artifact_ids=task_screenshot_artifact_ids,
+            workflow_screenshot_artifact_ids=workflow_screenshot_artifact_ids,
         )
 
 

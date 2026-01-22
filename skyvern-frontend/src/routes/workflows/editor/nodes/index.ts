@@ -47,6 +47,8 @@ import { HttpRequestNode } from "./HttpRequestNode/types";
 import { HttpRequestNode as HttpRequestNodeComponent } from "./HttpRequestNode/HttpRequestNode";
 import { HumanInteractionNode } from "./HumanInteractionNode/types";
 import { HumanInteractionNode as HumanInteractionNodeComponent } from "./HumanInteractionNode/HumanInteractionNode";
+import { PrintPageNode } from "./PrintPageNode/types";
+import { PrintPageNode as PrintPageNodeComponent } from "./PrintPageNode/PrintPageNode";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -72,7 +74,8 @@ export type WorkflowBlockNode =
   | PDFParserNode
   | Taskv2Node
   | URLNode
-  | HttpRequestNode;
+  | HttpRequestNode
+  | PrintPageNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -109,4 +112,5 @@ export const nodeTypes = {
   taskv2: memo(Taskv2NodeComponent),
   url: memo(URLNodeComponent),
   http_request: memo(HttpRequestNodeComponent),
+  printPage: memo(PrintPageNodeComponent),
 } as const;

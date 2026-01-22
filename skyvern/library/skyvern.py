@@ -529,9 +529,12 @@ class Skyvern(AsyncSkyvern):
         """
         self._ensure_cloud_environment()
         browser_sessions = await self.get_browser_sessions()
-        browser_session = max(
-            (s for s in browser_sessions if s.runnable_id is None), key=lambda s: s.started_at, default=None
-        )
+        available_sessions = [
+            s
+            for s in browser_sessions
+            if s.runnable_id is None and s.started_at is not None and s.browser_address is not None
+        ]
+        browser_session = max(available_sessions, key=lambda s: s.started_at, default=None)
         if browser_session is None:
             LOG.info("No existing cloud browser session found, launching a new session")
             browser_session = await self.create_browser_session(

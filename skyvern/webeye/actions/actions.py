@@ -125,6 +125,8 @@ class Action(BaseModel):
     file_name: str | None = None
     file_url: str | None = None
     download: bool | None = None
+    download_triggered: bool | None = None  # Whether a download was triggered by this action
+    downloaded_files: list[str] | None = None  # List of file names downloaded by this action
     is_upload_file_tag: bool | None = None
     text: str | None = None
     input_or_select_context: InputOrSelectContext | None = None

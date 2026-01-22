@@ -8,11 +8,21 @@ from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any, Literal, cast
 
 import httpx
 import structlog
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+# Import LockError for specific exception handling; fallback for OSS without redis
+try:
+    from redis.exceptions import LockError
+except ImportError:
+    # redis not installed (OSS deployment) - create placeholder that's never raised
+    class LockError(Exception):  # type: ignore[no-redef]
+        pass
+
 
 import skyvern
 from skyvern import analytics
@@ -37,6 +47,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -49,6 +60,7 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRu
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
+    WorkflowVersionConflict,
 )
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
@@ -343,6 +355,78 @@ class WorkflowService:
                 results.extend(WorkflowService._collect_extracted_information(item))
         return results
 
+    async def _generate_urls_from_artifact_ids(
+        self,
+        artifact_ids: list[str],
+        organization_id: str | None,
+    ) -> list[str]:
+        """Generate presigned URLs from artifact IDs."""
+        if not artifact_ids or not organization_id:
+            return []
+
+        artifacts = await app.DATABASE.get_artifacts_by_ids(artifact_ids, organization_id)
+        if not artifacts:
+            return []
+
+        return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
+
+    async def _refresh_output_screenshot_urls(
+        self,
+        value: Any,
+        organization_id: str | None,
+        workflow_run_id: str,
+    ) -> Any:
+        """
+        Recursively walk through output values and generate presigned URLs for screenshots.
+
+        TaskOutput dicts stored in workflow_run_output_parameters contain artifact IDs.
+        This method finds any TaskOutput-like dicts and generates fresh presigned URLs
+        from the stored artifact IDs.
+
+        For backwards compatibility with old data that stored URLs directly (now expired),
+        we also check for task_id and regenerate URLs using the task_id lookup.
+        """
+        if isinstance(value, dict):
+            # Check if this looks like a TaskOutput with screenshot artifact IDs (new format)
+            has_artifact_ids = "task_screenshot_artifact_ids" in value or "workflow_screenshot_artifact_ids" in value
+            # Also check for old format (URLs stored directly) for backwards compat
+            has_old_format = "task_id" in value and ("task_screenshots" in value or "workflow_screenshots" in value)
+
+            if has_artifact_ids:
+                # New format: generate URLs from artifact IDs
+                if value.get("task_screenshot_artifact_ids"):
+                    value["task_screenshots"] = await self._generate_urls_from_artifact_ids(
+                        value["task_screenshot_artifact_ids"],
+                        organization_id,
+                    )
+                if value.get("workflow_screenshot_artifact_ids"):
+                    value["workflow_screenshots"] = await self._generate_urls_from_artifact_ids(
+                        value["workflow_screenshot_artifact_ids"],
+                        organization_id,
+                    )
+            elif has_old_format:
+                # Old format (backwards compat): regenerate URLs using task_id lookup
+                task_id = value.get("task_id")
+                if value.get("task_screenshots"):
+                    value["task_screenshots"] = await self.get_recent_task_screenshot_urls(
+                        organization_id=organization_id,
+                        task_id=task_id,
+                    )
+                if value.get("workflow_screenshots"):
+                    value["workflow_screenshots"] = await self.get_recent_workflow_screenshot_urls(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                    )
+            else:
+                # Recurse into nested dicts
+                for k, v in value.items():
+                    value[k] = await self._refresh_output_screenshot_urls(v, organization_id, workflow_run_id)
+        elif isinstance(value, list):
+            # Recurse into list items
+            for i, item in enumerate(value):
+                value[i] = await self._refresh_output_screenshot_urls(item, organization_id, workflow_run_id)
+        return value
+
     async def _validate_credential_id(self, credential_id: str, organization: Organization) -> None:
         credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
         if credential is None:
@@ -437,6 +521,10 @@ class WorkflowService:
             for workflow_parameter in all_workflow_parameters:
                 if workflow_request.data and workflow_parameter.key in workflow_request.data:
                     request_body_value = workflow_request.data[workflow_parameter.key]
+                    # Fall back to default value if the request explicitly sends null
+                    # This supports API clients (e.g., n8n) that include the key with null value
+                    if request_body_value is None and workflow_parameter.default_value is not None:
+                        request_body_value = workflow_parameter.default_value
                     if self._is_missing_required_value(workflow_parameter, request_body_value):
                         missing_parameters.append(workflow_parameter.key)
                         continue
@@ -1499,30 +1587,35 @@ class WorkflowService:
         sequential_key: str | None = None,
         folder_id: str | None = None,
     ) -> Workflow:
-        return await app.DATABASE.create_workflow(
-            title=title,
-            workflow_definition=workflow_definition.model_dump(),
-            organization_id=organization_id,
-            description=description,
-            proxy_location=proxy_location,
-            webhook_callback_url=webhook_callback_url,
-            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
-            totp_verification_url=totp_verification_url,
-            totp_identifier=totp_identifier,
-            persist_browser_session=persist_browser_session,
-            model=model,
-            workflow_permanent_id=workflow_permanent_id,
-            version=version,
-            is_saved_task=is_saved_task,
-            status=status,
-            extra_http_headers=extra_http_headers,
-            run_with=run_with,
-            cache_key=cache_key,
-            ai_fallback=False if ai_fallback is None else ai_fallback,
-            run_sequentially=run_sequentially,
-            sequential_key=sequential_key,
-            folder_id=folder_id,
-        )
+        try:
+            return await app.DATABASE.create_workflow(
+                title=title,
+                workflow_definition=workflow_definition.model_dump(),
+                organization_id=organization_id,
+                description=description,
+                proxy_location=proxy_location,
+                webhook_callback_url=webhook_callback_url,
+                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
+                persist_browser_session=persist_browser_session,
+                model=model,
+                workflow_permanent_id=workflow_permanent_id,
+                version=version,
+                is_saved_task=is_saved_task,
+                status=status,
+                extra_http_headers=extra_http_headers,
+                run_with=run_with,
+                cache_key=cache_key,
+                ai_fallback=False if ai_fallback is None else ai_fallback,
+                run_sequentially=run_sequentially,
+                sequential_key=sequential_key,
+                folder_id=folder_id,
+            )
+        except IntegrityError as e:
+            if "uc_org_permanent_id_version" in str(e) and workflow_permanent_id:
+                raise WorkflowVersionConflict(workflow_permanent_id) from e
+            raise
 
     async def create_workflow_from_prompt(
         self,
@@ -2430,15 +2523,15 @@ class WorkflowService:
     async def get_tasks_by_workflow_run_id(self, workflow_run_id: str) -> list[Task]:
         return await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
 
-    async def get_recent_task_screenshot_urls(
+    async def get_recent_task_screenshot_artifacts(
         self,
         *,
         organization_id: str | None,
         task_id: str | None = None,
         task_v2_id: str | None = None,
         limit: int = 3,
-    ) -> list[str]:
-        """Return the latest action/final screenshot URLs for a task (v1 or v2)."""
+    ) -> list[Artifact]:
+        """Return the latest action/final screenshot artifacts for a task (v1 or v2)."""
 
         artifact_types = [ArtifactType.SCREENSHOT_ACTION, ArtifactType.SCREENSHOT_FINAL]
 
@@ -2472,19 +2565,35 @@ class WorkflowService:
                 reverse=True,
             )[:limit]
 
+        return artifacts
+
+    async def get_recent_task_screenshot_urls(
+        self,
+        *,
+        organization_id: str | None,
+        task_id: str | None = None,
+        task_v2_id: str | None = None,
+        limit: int = 3,
+    ) -> list[str]:
+        """Return the latest action/final screenshot URLs for a task (v1 or v2)."""
+        artifacts = await self.get_recent_task_screenshot_artifacts(
+            organization_id=organization_id,
+            task_id=task_id,
+            task_v2_id=task_v2_id,
+            limit=limit,
+        )
         if not artifacts:
             return []
-
         return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
 
-    async def get_recent_workflow_screenshot_urls(
+    async def get_recent_workflow_screenshot_artifacts(
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
         limit: int = 3,
         workflow_run_tasks: list[Task] | None = None,
-    ) -> list[str]:
-        """Return latest screenshots across recent tasks in a workflow run."""
+    ) -> list[Artifact]:
+        """Return latest screenshot artifacts across recent tasks in a workflow run."""
 
         screenshot_artifacts: list[Artifact] = []
         seen_artifact_ids: set[str] = set()
@@ -2530,10 +2639,25 @@ class WorkflowService:
                 if len(screenshot_artifacts) >= limit:
                     break
 
-        if not screenshot_artifacts:
-            return []
+        return screenshot_artifacts
 
-        return await app.ARTIFACT_MANAGER.get_share_links(screenshot_artifacts) or []
+    async def get_recent_workflow_screenshot_urls(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        limit: int = 3,
+        workflow_run_tasks: list[Task] | None = None,
+    ) -> list[str]:
+        """Return latest screenshot URLs across recent tasks in a workflow run."""
+        artifacts = await self.get_recent_workflow_screenshot_artifacts(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            limit=limit,
+            workflow_run_tasks=workflow_run_tasks,
+        )
+        if not artifacts:
+            return []
+        return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
 
     async def build_workflow_run_status_response_by_workflow_id(
         self,
@@ -2653,6 +2777,10 @@ class WorkflowService:
                 if output.value is not None:
                     extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
+            # Refresh any expired presigned screenshot URLs in the outputs
+            outputs = await self._refresh_output_screenshot_urls(
+                outputs, organization_id=organization_id, workflow_run_id=workflow_run_id
+            )
 
         errors: list[dict[str, Any]] = []
         for task in workflow_run_tasks:
@@ -2977,14 +3105,10 @@ class WorkflowService:
         self,
         workflow_id: str,
         workflow_definition_yaml: WorkflowDefinitionYAML,
-        title: str,
-        organization_id: str,
     ) -> WorkflowDefinition:
         workflow_definition = convert_workflow_definition(
-            workflow_id=workflow_id,
             workflow_definition_yaml=workflow_definition_yaml,
-            title=title,
-            organization_id=organization_id,
+            workflow_id=workflow_id,
         )
 
         await app.DATABASE.save_workflow_definition_parameters(workflow_definition.parameters)
@@ -3076,8 +3200,6 @@ class WorkflowService:
             workflow_definition = await self.make_workflow_definition(
                 potential_workflow.workflow_id,
                 request.workflow_definition,
-                request.title,
-                organization_id,
             )
 
             updated_workflow = await self.update_workflow_definition(
@@ -3269,50 +3391,103 @@ class WorkflowService:
                 )
                 return
 
-            LOG.info(
-                "deleting old workflow script and generating new script",
-                workflow_id=workflow.workflow_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-                cache_key_value=rendered_cache_key_value,
-                script_id=existing_script.script_id,
-                script_revision_id=existing_script.script_revision_id,
-                run_with=workflow_run.run_with,
-                blocks_to_update=list(blocks_to_update),
-                code_gen=code_gen,
-            )
+            async def _regenerate_script() -> None:
+                """Delete old script and generate new one.
 
-            # delete the existing workflow scripts if any
-            await app.DATABASE.delete_workflow_scripts_by_permanent_id(
-                organization_id=workflow.organization_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                script_ids=[existing_script.script_id],
-            )
-
-            # create a new script
-            regenerated_script = await app.DATABASE.create_script(
-                organization_id=workflow.organization_id,
-                run_id=workflow_run.workflow_run_id,
-            )
-
-            await workflow_script_service.generate_workflow_script(
-                workflow_run=workflow_run,
-                workflow=workflow,
-                script=regenerated_script,
-                rendered_cache_key_value=rendered_cache_key_value,
-                cached_script=existing_script,
-                updated_block_labels=blocks_to_update,
-            )
-            aio_task_primary_key = f"{regenerated_script.script_id}_{regenerated_script.version}"
-            if aio_task_primary_key in app.ARTIFACT_MANAGER.upload_aiotasks_map:
-                aio_tasks = app.ARTIFACT_MANAGER.upload_aiotasks_map[aio_task_primary_key]
-                if aio_tasks:
-                    await asyncio.gather(*aio_tasks)
-                else:
-                    LOG.warning(
-                        "No upload aio tasks found for regenerated script",
-                        script_id=regenerated_script.script_id,
-                        version=regenerated_script.version,
+                Uses double-check pattern: re-verify regeneration is needed after acquiring lock
+                to handle race conditions where another process regenerated while we waited.
+                """
+                # Double-check: another process may have regenerated while we waited for lock
+                fresh_script = await workflow_script_service.get_workflow_script_by_cache_key_value(
+                    organization_id=workflow.organization_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    cache_key_value=rendered_cache_key_value,
+                    statuses=[ScriptStatus.published],
+                    use_cache=False,
+                )
+                if fresh_script and fresh_script.script_id != existing_script.script_id:
+                    LOG.info(
+                        "Script already regenerated by another process, skipping",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        cache_key_value=rendered_cache_key_value,
+                        existing_script_id=existing_script.script_id,
+                        fresh_script_id=fresh_script.script_id,
                     )
+                    return
+
+                LOG.info(
+                    "deleting old workflow script and generating new script",
+                    workflow_id=workflow.workflow_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    cache_key_value=rendered_cache_key_value,
+                    script_id=existing_script.script_id,
+                    script_revision_id=existing_script.script_revision_id,
+                    run_with=workflow_run.run_with,
+                    blocks_to_update=list(blocks_to_update),
+                    code_gen=code_gen,
+                )
+
+                await app.DATABASE.delete_workflow_scripts_by_permanent_id(
+                    organization_id=workflow.organization_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    script_ids=[existing_script.script_id],
+                )
+
+                regenerated_script = await app.DATABASE.create_script(
+                    organization_id=workflow.organization_id,
+                    run_id=workflow_run.workflow_run_id,
+                )
+
+                await workflow_script_service.generate_workflow_script(
+                    workflow_run=workflow_run,
+                    workflow=workflow,
+                    script=regenerated_script,
+                    rendered_cache_key_value=rendered_cache_key_value,
+                    cached_script=existing_script,
+                    updated_block_labels=blocks_to_update,
+                )
+                aio_task_primary_key = f"{regenerated_script.script_id}_{regenerated_script.version}"
+                if aio_task_primary_key in app.ARTIFACT_MANAGER.upload_aiotasks_map:
+                    aio_tasks = app.ARTIFACT_MANAGER.upload_aiotasks_map[aio_task_primary_key]
+                    if aio_tasks:
+                        await asyncio.gather(*aio_tasks)
+                    else:
+                        LOG.warning(
+                            "No upload aio tasks found for regenerated script",
+                            script_id=regenerated_script.script_id,
+                            version=regenerated_script.version,
+                        )
+
+            # Use distributed redis lock to prevent concurrent regenerations
+            cache = CacheFactory.get_cache()
+            lock = None
+            if cache is not None:
+                try:
+                    digest = sha256(rendered_cache_key_value.encode("utf-8")).hexdigest()
+                    lock_name = f"workflow_script_regen:{workflow.workflow_permanent_id}:{digest}"
+                    # blocking_timeout=60s to wait for lock, timeout=60s for lock TTL (per wintonzheng: p99=44s)
+                    lock = cache.get_lock(lock_name, blocking_timeout=60, timeout=60)
+                except AttributeError:
+                    LOG.debug("Cache doesn't support locking, proceeding without lock")
+
+            if lock is not None:
+                try:
+                    async with lock:
+                        await _regenerate_script()
+                except LockError as exc:
+                    # Lock acquisition failed (e.g., another process holds the lock, timeout)
+                    # Skip regeneration and trust the lock holder to complete the work.
+                    # The double-check pattern in _regenerate_script() will handle it on the next call.
+                    LOG.info(
+                        "Skipping regeneration - lock acquisition failed, another process may be regenerating",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        error=str(exc),
+                    )
+            else:
+                # No Redis/cache available - proceed without lock (graceful degradation for OSS)
+                await _regenerate_script()
             return
 
         created_script = await app.DATABASE.create_script(

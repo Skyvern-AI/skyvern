@@ -33,6 +33,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     SecretCredential,
 )
 from skyvern.forge.sdk.services.credentials import parse_totp_secret
+from skyvern.utils.strings import is_uuid
 
 LOG = structlog.get_logger()
 BITWARDEN_SERVER_BASE_URL = f"{settings.BITWARDEN_SERVER}:{settings.BITWARDEN_SERVER_PORT or 8002}"
@@ -222,6 +223,9 @@ class BitwardenService:
         fail_reasons: list[str] = []
         if not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
             raise BitwardenAccessDeniedError()
+
+        if item_id and not is_uuid(item_id):
+            raise BitwardenGetItemError(f"Invalid item ID: {item_id}. Check if the item ID is correct")
 
         for i in range(max_retries):
             # FIXME: just simply double the timeout for the second try. maybe a better backoff policy when needed
@@ -698,6 +702,9 @@ class BitwardenService:
         """
         Get the credit card data from the Bitwarden CLI.
         """
+        if not is_uuid(item_id):
+            raise BitwardenGetItemError(f"Invalid item ID: {item_id}. Check if the item ID is correct")
+
         try:
             async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
                 return await BitwardenService._get_credit_card_data(

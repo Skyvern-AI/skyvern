@@ -16,6 +16,28 @@ from skyvern.services import workflow_service
 LOG = structlog.get_logger()
 
 
+async def validate_block_labels(
+    workflow_permanent_id: str,
+    organization_id: str,
+    block_labels: list[str],
+) -> None:
+    """
+    Validate that all block labels exist in the workflow.
+    This should be called BEFORE creating a workflow run to prevent orphaned runs.
+    """
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+    )
+
+    if not workflow:
+        raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
+
+    for block_label in block_labels:
+        if not workflow.get_output_parameter(block_label):
+            raise OutputParameterNotFound(block_label=block_label, workflow_permanent_id=workflow_permanent_id)
+
+
 async def ensure_workflow_run(
     organization: Organization,
     template: bool,

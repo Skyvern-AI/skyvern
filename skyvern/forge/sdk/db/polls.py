@@ -33,7 +33,7 @@ async def await_browser_session(
                 if persistent_browser_session is None:
                     raise Exception(f"Persistent browser session not found for {session_id}")
 
-                LOG.info(
+                LOG.debug(
                     "Checking browser address",
                     session_id=session_id,
                     address=persistent_browser_session.browser_address,

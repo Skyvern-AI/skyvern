@@ -11,13 +11,14 @@ import smtplib
 import textwrap
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
 from urllib.parse import quote, urlparse
 
+import aiofiles
 import aiohttp
 import filetype
 import pandas as pd
@@ -66,6 +67,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -123,10 +125,9 @@ def _json_type_filter(value: Any) -> str:
     When _render_templates_in_json() detects these markers, it unwraps and
     parses the JSON to get the native typed value (bool, int, list, etc.).
 
-    Args:
-        value: Any JSON-serializable value (bool, int, float, str, list, dict, None).
+    Uses default=str to handle non-JSON-serializable types (datetime, Enum, etc.)
     """
-    return f"{_JSON_TYPE_MARKER}{json.dumps(value)}{_JSON_TYPE_MARKER}"
+    return f"{_JSON_TYPE_MARKER}{json.dumps(value, default=str)}{_JSON_TYPE_MARKER}"
 
 
 jinja_sandbox_env.filters["json"] = _json_type_filter
@@ -242,6 +243,57 @@ class Block(BaseModel, abc.ABC):
             workflow_run_block_id=workflow_run_block_id,
         )
 
+    async def get_or_create_browser_state(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> BrowserState | None:
+        """
+        Acquire or create browser state for block execution.
+
+        Checks persistent sessions first (debugger use case), then falls back to
+        workflow run browser manager. If no state exists, creates a new one.
+
+        Returns BrowserState if successful, None if creation failed.
+        """
+        browser_state: BrowserState | None = None
+
+        if browser_session_id and organization_id:
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+        else:
+            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+        if not browser_state:
+            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            try:
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url=None,
+                    browser_session_id=browser_session_id,
+                    browser_profile_id=workflow_run.browser_profile_id,
+                )
+                await browser_state.check_and_fix_state(
+                    url=None,
+                    proxy_location=workflow_run.proxy_location,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                    extra_http_headers=workflow_run.extra_http_headers,
+                    browser_address=workflow_run.browser_address,
+                    browser_profile_id=workflow_run.browser_profile_id,
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to create browser state",
+                    workflow_run_id=workflow_run_id,
+                )
+                return None
+
+        return browser_state
+
     def format_block_parameter_template_from_workflow_run_context(
         self,
         potential_template: str,
@@ -344,6 +396,7 @@ class Block(BaseModel, abc.ABC):
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
 
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
+        template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
 
         if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
             if missing_variables := get_missing_variables(potential_template, template_data):
@@ -891,11 +944,11 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                     organization_id=workflow_run.organization_id,
                     task_id=updated_task.task_id,
                 )
-                workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                workflow_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts(
                     workflow_run_id=workflow_run_id,
                     organization_id=workflow_run.organization_id,
                 )
@@ -903,8 +956,8 @@ class BaseTaskBlock(Block):
                 task_output = TaskOutput.from_task(
                     updated_task,
                     downloaded_files,
-                    task_screenshots=task_screenshots,
-                    workflow_screenshots=workflow_screenshots,
+                    task_screenshot_artifact_ids=[a.artifact_id for a in task_screenshot_artifacts],
+                    workflow_screenshot_artifact_ids=[a.artifact_id for a in workflow_screenshot_artifacts],
                 )
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
@@ -967,11 +1020,11 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                     organization_id=workflow_run.organization_id,
                     task_id=updated_task.task_id,
                 )
-                workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                workflow_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts(
                     workflow_run_id=workflow_run_id,
                     organization_id=workflow_run.organization_id,
                 )
@@ -979,8 +1032,8 @@ class BaseTaskBlock(Block):
                 task_output = TaskOutput.from_task(
                     updated_task,
                     downloaded_files,
-                    task_screenshots=task_screenshots,
-                    workflow_screenshots=workflow_screenshots,
+                    task_screenshot_artifact_ids=[a.artifact_id for a in task_screenshot_artifacts],
+                    workflow_screenshot_artifact_ids=[a.artifact_id for a in workflow_screenshot_artifacts],
                 )
                 LOG.warning(
                     f"Task failed with status {updated_task.status}{retry_message}",
@@ -1903,63 +1956,11 @@ async def wrapper():
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
 
-        # TODO: only support to use code block to manupilate the browser page
-        # support browser context in the future
-        browser_state: BrowserState | None = None
-        if browser_session_id and organization_id:
-            LOG.info(
-                "Getting browser state for workflow run from persistent sessions manager",
-                browser_session_id=browser_session_id,
-            )
-            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
-            if browser_state:
-                LOG.info("Was occupying session here, but no longer.", browser_session_id=browser_session_id)
-        else:
-            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
-
-        # If no browser state exists, create one (e.g., when code block is the first block)
-        if not browser_state:
-            LOG.info(
-                "No browser state found, creating one for code block execution",
-                workflow_run_id=workflow_run_id,
-                browser_session_id=browser_session_id,
-            )
-            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-            )
-            try:
-                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                    workflow_run=workflow_run,
-                    url=None,  # Code block doesn't need to navigate to a URL initially
-                    browser_session_id=browser_session_id,
-                    browser_profile_id=workflow_run.browser_profile_id,
-                )
-                # Ensure the browser state has a working page
-                await browser_state.check_and_fix_state(
-                    url=None,  # Don't navigate to any URL, just ensure a page exists
-                    proxy_location=workflow_run.proxy_location,
-                    workflow_run_id=workflow_run_id,
-                    organization_id=workflow_run.organization_id,
-                    extra_http_headers=workflow_run.extra_http_headers,
-                    browser_address=workflow_run.browser_address,
-                    browser_profile_id=workflow_run.browser_profile_id,
-                )
-            except Exception as e:
-                LOG.exception(
-                    "Failed to create browser state for code block",
-                    workflow_run_id=workflow_run_id,
-                    error=str(e),
-                )
-                return await self.build_block_result(
-                    success=False,
-                    failure_reason=f"Failed to create browser for code block: {str(e)}",
-                    output_parameter_value=None,
-                    status=BlockStatus.failed,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-
+        browser_state = await self.get_or_create_browser_state(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
         if not browser_state:
             return await self.build_block_result(
                 success=False,
@@ -3964,11 +3965,11 @@ class TaskV2Block(Block):
 
         # If continue_on_failure is True, we treat the block as successful even if the task failed
         # This allows the workflow to continue execution despite this block's failure
-        task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+        task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
             organization_id=organization_id,
             task_v2_id=task_v2.observer_cruise_id,
         )
-        workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+        workflow_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
@@ -3979,8 +3980,8 @@ class TaskV2Block(Block):
             "summary": task_v2.summary,
             "extracted_information": result_dict,
             "failure_reason": failure_reason,
-            "task_screenshots": task_screenshots,
-            "workflow_screenshots": workflow_screenshots,
+            "task_screenshot_artifact_ids": [a.artifact_id for a in task_screenshot_artifacts],
+            "workflow_screenshot_artifact_ids": [a.artifact_id for a in workflow_screenshot_artifacts],
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, task_v2_output)
         return await self.build_block_result(
@@ -4472,6 +4473,194 @@ class HttpRequestBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+
+
+class PrintPageBlock(Block):
+    block_type: Literal[BlockType.PRINT_PAGE] = BlockType.PRINT_PAGE  # type: ignore
+
+    include_timestamp: bool = True
+    custom_filename: str | None = None
+    format: str = "A4"
+    landscape: bool = False
+    print_background: bool = True
+    parameters: list[PARAMETER_TYPE] = []
+
+    VALID_FORMATS: ClassVar[set[str]] = {"A4", "Letter", "Legal", "Tabloid"}
+
+    def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
+        return self.parameters
+
+    @staticmethod
+    def _sanitize_filename(filename: str) -> str:
+        sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename)
+        sanitized = sanitized.strip(". ")
+        return sanitized[:200] if sanitized else "document"
+
+    def _build_pdf_options(self) -> dict[str, Any]:
+        pdf_format = self.format if self.format in self.VALID_FORMATS else "A4"
+        pdf_options: dict[str, Any] = {
+            "format": pdf_format,
+            "landscape": self.landscape,
+            "print_background": self.print_background,
+        }
+
+        if self.include_timestamp:
+            pdf_options["display_header_footer"] = True
+            pdf_options["header_template"] = (
+                '<div style="font-size:10px;width:100%;display:flex;justify-content:space-between;padding:0 10px;">'
+                '<span class="date"></span><span class="title"></span><span></span></div>'
+            )
+            pdf_options["footer_template"] = (
+                '<div style="font-size:10px;width:100%;display:flex;justify-content:space-between;padding:0 10px;">'
+                '<span class="url"></span><span></span><span><span class="pageNumber"></span>/<span class="totalPages"></span></span></div>'
+            )
+            pdf_options["margin"] = {"top": "40px", "bottom": "40px"}
+
+        return pdf_options
+
+    async def _upload_pdf_artifact(
+        self,
+        *,
+        pdf_bytes: bytes,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: WorkflowRunContext,
+        organization_id: str | None,
+    ) -> str | None:
+        artifact_org_id = organization_id or workflow_run_context.organization_id
+        if not artifact_org_id:
+            LOG.warning(
+                "PrintPageBlock: Missing organization_id, skipping artifact upload",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return None
+
+        try:
+            workflow_run_block = await app.DATABASE.get_workflow_run_block(
+                workflow_run_block_id,
+                organization_id=artifact_org_id,
+            )
+        except NotFoundError:
+            LOG.warning(
+                "PrintPageBlock: Workflow run block not found, skipping artifact upload",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=artifact_org_id,
+            )
+            return None
+
+        _, artifact_uri = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact_with_uri(
+            workflow_run_block=workflow_run_block,
+            artifact_type=ArtifactType.PDF,
+            data=pdf_bytes,
+        )
+        try:
+            await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([workflow_run_block.workflow_run_block_id])
+        except Exception:
+            LOG.warning(
+                "PrintPageBlock: Failed to upload PDF artifact",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block.workflow_run_block_id,
+                exc_info=True,
+            )
+            return None
+
+        return artifact_uri
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        browser_state = await self.get_or_create_browser_state(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
+        if not browser_state:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No browser state available",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        page = await browser_state.get_working_page()
+        if not page:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No page available",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        pdf_options = self._build_pdf_options()
+
+        try:
+            pdf_bytes = await page.pdf(**pdf_options)
+        except Exception as e:
+            error_msg = str(e)
+            if "pdf" in error_msg.lower() and ("not supported" in error_msg.lower() or "chromium" in error_msg.lower()):
+                error_msg = "PDF generation requires Chromium browser. Current browser does not support page.pdf()."
+            LOG.warning("PrintPageBlock: Failed to generate PDF", error=error_msg, workflow_run_id=workflow_run_id)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to generate PDF: {error_msg}",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        if self.custom_filename:
+            filename = self.format_block_parameter_template_from_workflow_run_context(
+                self.custom_filename, workflow_run_context
+            )
+            filename = self._sanitize_filename(filename)
+            if not filename.endswith(".pdf"):
+                filename += ".pdf"
+        else:
+            filename = f"page_{timestamp_str}.pdf"
+
+        # Save PDF to download directory so it appears in runs UI
+        download_dir = get_download_dir(workflow_run_id)
+        file_path = os.path.join(download_dir, filename)
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(pdf_bytes)
+
+        # Upload to artifact storage for downstream block access (e.g., File Extraction Block)
+        artifact_uri = await self._upload_pdf_artifact(
+            pdf_bytes=pdf_bytes,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_context=workflow_run_context,
+            organization_id=organization_id,
+        )
+
+        output = {
+            "filename": filename,
+            "file_path": file_path,
+            "size_bytes": len(pdf_bytes),
+            "artifact_uri": artifact_uri,
+        }
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
+
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=output,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
 
 class BranchEvaluationContext:
@@ -5246,6 +5435,7 @@ BlockSubclasses = Union[
     TaskV2Block,
     FileUploadBlock,
     HttpRequestBlock,
+    PrintPageBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

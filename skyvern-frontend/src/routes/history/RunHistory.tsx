@@ -48,6 +48,7 @@ import { TableSearchInput } from "@/components/TableSearchInput";
 import { useKeywordSearch } from "@/routes/workflows/hooks/useKeywordSearch";
 import { useParameterExpansion } from "@/routes/workflows/hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "@/routes/workflows/components/ParameterDisplayInline";
+import { HighlightText } from "@/routes/workflows/components/HighlightText";
 
 function isTask(run: Task | WorkflowRunApiResponse): run is Task {
   return "task_id" in run;
@@ -158,7 +159,7 @@ function RunHistory() {
             params.set("page", "1");
             setSearchParams(params, { replace: true });
           }}
-          placeholder="Search runs by parameter..."
+          placeholder="Search by run ID or parameter..."
           className="w-48 lg:w-72"
         />
         <StatusFilterDropdown
@@ -255,7 +256,10 @@ function RunHistory() {
                         className="max-w-0 truncate"
                         title={run.workflow_run_id}
                       >
-                        {run.workflow_run_id}
+                        <HighlightText
+                          text={run.workflow_run_id}
+                          query={debouncedSearch}
+                        />
                       </TableCell>
                       <TableCell
                         className="max-w-0 truncate"

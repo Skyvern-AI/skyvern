@@ -124,7 +124,7 @@ export function GeoTargetSelector({
                   <CommandGroup heading="Countries">
                     {results.countries.map((item) => (
                       <CommandItem
-                        key={`country-${item.value.country}`}
+                        key={`country-${item.value.country}${item.value.isISP ? "-isp" : ""}`}
                         value={JSON.stringify(item.value)}
                         onSelect={() => handleSelect(item)}
                       >

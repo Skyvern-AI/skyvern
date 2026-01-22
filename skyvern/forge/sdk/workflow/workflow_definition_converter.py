@@ -23,6 +23,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
     WorkflowDefinitionHasDuplicateParameterKeys,
     WorkflowDefinitionHasReservedParameterKeys,
+    WorkflowDefinitionHasUndefinedParameters,
     WorkflowParameterMissingRequiredValue,
 )
 from skyvern.forge.sdk.workflow.models.block import (
@@ -43,6 +44,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
+    PrintPageBlock,
     PromptBranchCriteria,
     SendEmailBlock,
     TaskBlock,
@@ -84,10 +86,8 @@ LOG = structlog.get_logger()
 
 
 def convert_workflow_definition(
-    workflow_id: str,
     workflow_definition_yaml: WorkflowDefinitionYAML,
-    title: str,
-    organization_id: str,
+    workflow_id: str,
 ) -> WorkflowDefinition:
     # Create parameters from the request
     parameters: dict[str, PARAMETER_TYPE] = {}
@@ -289,6 +289,11 @@ def convert_workflow_definition(
     if duplicate_parameter_keys:
         raise WorkflowDefinitionHasDuplicateParameterKeys(duplicate_keys=duplicate_parameter_keys)
 
+    # Validate that all blocks reference defined parameters
+    undefined_parameters = _collect_undefined_parameters(workflow_definition_yaml.blocks, parameters)
+    if undefined_parameters:
+        raise WorkflowDefinitionHasUndefinedParameters(undefined_parameters=undefined_parameters)
+
     # Create blocks from the request
     block_label_mapping = {}
     blocks: list[BlockTypeVar] = []
@@ -310,11 +315,9 @@ def convert_workflow_definition(
     )
 
     LOG.info(
-        f"Created workflow from request, title: {title}",
+        "Created workflow from request",
         parameter_keys=[parameter.key for parameter in parameters.values()],
         block_labels=[block.label for block in blocks],
-        organization_id=organization_id,
-        title=title,
         workflow_id=workflow_id,
     )
 
@@ -365,11 +368,7 @@ def block_yaml_to_block(
     output_parameter = cast(OutputParameter, parameters[f"{block_yaml.label}_output"])
     base_kwargs = _build_block_kwargs(block_yaml, output_parameter)
     if block_yaml.block_type == BlockType.TASK:
-        task_block_parameters = (
-            [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-            if block_yaml.parameter_keys
-            else []
-        )
+        task_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return TaskBlock(
             **base_kwargs,
             url=block_yaml.url,
@@ -455,22 +454,14 @@ def block_yaml_to_block(
         return CodeBlock(
             **base_kwargs,
             code=block_yaml.code,
-            parameters=(
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            ),
+            parameters=_resolve_block_parameters(block_yaml, parameters),
         )
     elif block_yaml.block_type == BlockType.TEXT_PROMPT:
         return TextPromptBlock(
             **base_kwargs,
             llm_key=block_yaml.llm_key,
             prompt=block_yaml.prompt,
-            parameters=(
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            ),
+            parameters=_resolve_block_parameters(block_yaml, parameters),
             json_schema=block_yaml.json_schema,
         )
     elif block_yaml.block_type == BlockType.DOWNLOAD_TO_S3:
@@ -523,11 +514,7 @@ def block_yaml_to_block(
             json_schema=block_yaml.json_schema,
         )
     elif block_yaml.block_type == BlockType.VALIDATION:
-        validation_block_parameters = (
-            [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-            if block_yaml.parameter_keys
-            else []
-        )
+        validation_block_parameters = _resolve_block_parameters(block_yaml, parameters)
 
         if not block_yaml.complete_criterion and not block_yaml.terminate_criterion:
             raise InvalidWorkflowDefinition(
@@ -546,11 +533,7 @@ def block_yaml_to_block(
         )
 
     elif block_yaml.block_type == BlockType.ACTION:
-        action_block_parameters = (
-            [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-            if block_yaml.parameter_keys
-            else []
-        )
+        action_block_parameters = _resolve_block_parameters(block_yaml, parameters)
 
         if not block_yaml.navigation_goal:
             raise InvalidWorkflowDefinition(f"Action block '{block_yaml.label}' requires navigation_goal")
@@ -576,11 +559,7 @@ def block_yaml_to_block(
         )
 
     elif block_yaml.block_type == BlockType.NAVIGATION:
-        navigation_block_parameters = (
-            [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-            if block_yaml.parameter_keys
-            else []
-        )
+        navigation_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return NavigationBlock(
             **base_kwargs,
             url=block_yaml.url,
@@ -617,11 +596,7 @@ def block_yaml_to_block(
         )
 
     elif block_yaml.block_type == BlockType.EXTRACTION:
-        extraction_block_parameters = (
-            [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-            if block_yaml.parameter_keys
-            else []
-        )
+        extraction_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return ExtractionBlock(
             **base_kwargs,
             url=block_yaml.url,
@@ -637,11 +612,7 @@ def block_yaml_to_block(
         )
 
     elif block_yaml.block_type == BlockType.LOGIN:
-        login_block_parameters = (
-            [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-            if block_yaml.parameter_keys
-            else []
-        )
+        login_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return LoginBlock(
             **base_kwargs,
             url=block_yaml.url,
@@ -670,11 +641,7 @@ def block_yaml_to_block(
         )
 
     elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
-        file_download_block_parameters = (
-            [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-            if block_yaml.parameter_keys
-            else []
-        )
+        file_download_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return FileDownloadBlock(
             **base_kwargs,
             url=block_yaml.url,
@@ -705,11 +672,7 @@ def block_yaml_to_block(
             max_steps=block_yaml.max_steps,
         )
     elif block_yaml.block_type == BlockType.HTTP_REQUEST:
-        http_request_block_parameters = (
-            [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-            if block_yaml.parameter_keys
-            else []
-        )
+        http_request_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return HttpRequestBlock(
             **base_kwargs,
             method=block_yaml.method,
@@ -729,8 +692,51 @@ def block_yaml_to_block(
             url=block_yaml.url,
             complete_verification=False,
         )
+    elif block_yaml.block_type == BlockType.PRINT_PAGE:
+        print_page_block_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return PrintPageBlock(
+            **base_kwargs,
+            include_timestamp=block_yaml.include_timestamp,
+            custom_filename=block_yaml.custom_filename,
+            format=block_yaml.format,
+            landscape=block_yaml.landscape,
+            print_background=block_yaml.print_background,
+            parameters=print_page_block_parameters,
+        )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")
+
+
+def _collect_undefined_parameters(
+    block_yamls: list[BLOCK_YAML_TYPES],
+    parameters: dict[str, PARAMETER_TYPE],
+) -> dict[str, list[str]]:
+    """
+    Collect all undefined parameters referenced by blocks (including nested blocks in for_loop).
+    Returns a dict mapping block labels to lists of undefined parameter keys.
+    """
+    undefined_params: dict[str, list[str]] = {}
+
+    for block_yaml in block_yamls:
+        if hasattr(block_yaml, "parameter_keys") and block_yaml.parameter_keys:
+            undefined_for_block = [param_key for param_key in block_yaml.parameter_keys if param_key not in parameters]
+            if undefined_for_block:
+                undefined_params[block_yaml.label] = undefined_for_block
+
+        # Recursively check nested blocks in for_loop
+        if isinstance(block_yaml, ForLoopBlockYAML) and block_yaml.loop_blocks:
+            nested_undefined = _collect_undefined_parameters(block_yaml.loop_blocks, parameters)
+            undefined_params.update(nested_undefined)
+
+    return undefined_params
+
+
+def _resolve_block_parameters(
+    block_yaml: BLOCK_YAML_TYPES,
+    parameters: dict[str, PARAMETER_TYPE],
+) -> list[PARAMETER_TYPE]:
+    parameter_keys = getattr(block_yaml, "parameter_keys", None)
+    return [parameters[parameter_key] for parameter_key in parameter_keys] if parameter_keys else []
 
 
 def _has_dag_metadata(block_yamls: list[BLOCK_YAML_TYPES]) -> bool:

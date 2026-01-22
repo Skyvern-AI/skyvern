@@ -266,6 +266,17 @@ const nodeLibraryItems: Array<{
     title: "HTTP Request Block",
     description: "Make HTTP API calls",
   },
+  {
+    nodeType: "printPage",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.PrintPage}
+        className="size-6"
+      />
+    ),
+    title: "Print Page Block",
+    description: "Print current page to PDF",
+  },
 ];
 
 type Props = {

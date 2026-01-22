@@ -54,6 +54,14 @@ class FailedToUpdateWorkflow(BaseWorkflowHTTPException):
         )
 
 
+class WorkflowVersionConflict(BaseWorkflowHTTPException):
+    def __init__(self, workflow_permanent_id: str) -> None:
+        super().__init__(
+            f"Concurrent update detected for workflow {workflow_permanent_id}. Please retry.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class OutputParameterKeyCollisionError(BaseWorkflowHTTPException):
     def __init__(self, key: str, retry_count: int | None = None) -> None:
         message = f"Output parameter key {key} already exists in the context manager."
@@ -119,11 +127,34 @@ class InvalidFileType(BaseWorkflowHTTPException):
         )
 
 
-class WorkflowParameterMissingRequiredValue(BaseWorkflowHTTPException):
+class WorkflowDefinitionValidationException(BaseWorkflowHTTPException):
+    """Base exception for workflow definition validation errors."""
+
+
+class WorkflowParameterMissingRequiredValue(WorkflowDefinitionValidationException):
     def __init__(self, workflow_parameter_type: str, workflow_parameter_key: str, required_value: str) -> None:
         super().__init__(
             f"Missing required value for workflow parameter. Workflow parameter type: {workflow_parameter_type}. workflow_parameter_key: {workflow_parameter_key}. Required value: {required_value}",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class WorkflowDefinitionHasUndefinedParameters(WorkflowDefinitionValidationException):
+    def __init__(self, undefined_parameters: dict[str, list[str]]) -> None:
+        # Format: {"block_label": ["param1", "param2"]}
+        error_details = []
+        for block_label, params in undefined_parameters.items():
+            params_str = ", ".join(f"'{p}'" for p in params)
+            error_details.append(f"  - Block '{block_label}' references undefined parameter(s): {params_str}")
+
+        error_message = (
+            f"Workflow definition has blocks that reference undefined parameters:\n"
+            f"{chr(10).join(error_details)}\n\n"
+            f"Make sure to define all parameters in the workflow parameters list before using them in blocks."
+        )
+        super().__init__(
+            error_message,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
 
