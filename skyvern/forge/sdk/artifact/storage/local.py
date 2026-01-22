@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 
+import aiofiles
 import structlog
 
 from skyvern.config import settings
@@ -55,8 +56,9 @@ class LocalStorage(BaseStorage):
         if not file_path.exists():
             return []
         try:
-            with open(file_path) as f:
-                return [line.strip() for line in f.readlines() if line.strip()]
+            async with aiofiles.open(file_path, "r") as f:
+                lines = await f.readlines()
+                return [line.strip() for line in lines if line.strip()]
         except Exception:
             return []
 
@@ -122,8 +124,8 @@ class LocalStorage(BaseStorage):
             if WINDOWS:
                 file_path = file_path.with_name(_windows_safe_filename(file_path.name))
             self._create_directories_if_not_exists(file_path)
-            with open(file_path, "wb") as f:
-                f.write(data)
+            async with aiofiles.open(file_path, "wb") as f:
+                await f.write(data)
         except Exception:
             LOG.exception(
                 "Failed to store artifact locally.",
@@ -150,8 +152,8 @@ class LocalStorage(BaseStorage):
         file_path = None
         try:
             file_path = parse_uri_to_path(artifact.uri)
-            with open(file_path, "rb") as f:
-                return f.read()
+            async with aiofiles.open(file_path, "rb") as f:
+                return await f.read()
         except Exception:
             LOG.exception(
                 "Failed to retrieve local artifact.",
@@ -174,8 +176,8 @@ class LocalStorage(BaseStorage):
         Path(f"{get_skyvern_temp_dir()}/{organization_id}").mkdir(parents=True, exist_ok=True)
         file_path = Path(f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}")
         try:
-            with open(file_path, "rb") as f:
-                return f.read()
+            async with aiofiles.open(file_path, "rb") as f:
+                return await f.read()
         except Exception:
             return None
 
@@ -481,8 +483,8 @@ class LocalStorage(BaseStorage):
         """Download a user-uploaded file from local filesystem."""
         try:
             file_path = parse_uri_to_path(uri)
-            with open(file_path, "rb") as f:
-                return f.read()
+            async with aiofiles.open(file_path, "rb") as f:
+                return await f.read()
         except Exception:
             LOG.exception("Failed to read local file", uri=uri)
             return None
