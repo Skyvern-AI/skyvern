@@ -127,7 +127,12 @@ async def _get_otp_value_from_url(
     )
     try:
         json_resp = await aiohttp_post(
-            url=url, str_data=signed_data.signed_payload, headers=signed_data.headers, raise_exception=False
+            url=url,
+            str_data=signed_data.signed_payload,
+            headers=signed_data.headers,
+            raise_exception=False,
+            retry=2,
+            retry_timeout=5,
         )
     except Exception as e:
         LOG.error("Failed to get otp value from url", exc_info=True)

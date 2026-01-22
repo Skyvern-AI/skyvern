@@ -150,6 +150,7 @@ async def scrape_website(
     scroll: bool = True,
     support_empty_page: bool = False,
     wait_seconds: float = 0,
+    must_included_tags: list[str] | None = None,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -186,6 +187,7 @@ async def scrape_website(
             scroll=scroll,
             support_empty_page=support_empty_page,
             wait_seconds=wait_seconds,
+            must_included_tags=must_included_tags,
         )
     except ScrapingFailedBlankPage:
         raise
@@ -216,6 +218,7 @@ async def scrape_website(
             draw_boxes=draw_boxes,
             max_screenshot_number=max_screenshot_number,
             scroll=scroll,
+            must_included_tags=must_included_tags,
         )
 
 
@@ -269,6 +272,7 @@ async def scrape_web_unsafe(
     scroll: bool = True,
     support_empty_page: bool = False,
     wait_seconds: float = 0,
+    must_included_tags: list[str] | None = None,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -301,11 +305,11 @@ async def scrape_web_unsafe(
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
         await asyncio.sleep(wait_seconds)
 
-    elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
+    elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
     if not elements and not support_empty_page:
         LOG.warning("No elements found on the page, wait and retry")
         await empty_page_retry_wait()
-        elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
+        elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
 
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
     element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
@@ -415,6 +419,7 @@ async def add_frame_interactable_elements(
     frame_index: int,
     elements: list[dict],
     element_tree: list[dict],
+    must_included_tags: list[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Add the interactable element of the frame to the elements and element_tree.
@@ -444,7 +449,7 @@ async def add_frame_interactable_elements(
     await skyvern_frame.safe_wait_for_animation_end()
 
     frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
-        frame_name=skyvern_id, frame_index=frame_index
+        frame_name=skyvern_id, frame_index=frame_index, must_included_tags=must_included_tags
     )
 
     for element in elements:
@@ -460,6 +465,7 @@ async def add_frame_interactable_elements(
 async def get_interactable_element_tree(
     page: Page,
     scrape_exclude: ScrapeExcludeFunc | None = None,
+    must_included_tags: list[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Get the element tree of the page, including all the elements that are interactable.
@@ -468,7 +474,9 @@ async def get_interactable_element_tree(
     """
     # main page index is 0
     skyvern_page = await SkyvernFrame.create_instance(page)
-    elements, element_tree = await skyvern_page.build_tree_from_body(frame_name="main.frame", frame_index=0)
+    elements, element_tree = await skyvern_page.build_tree_from_body(
+        frame_name="main.frame", frame_index=0, must_included_tags=must_included_tags
+    )
 
     context = skyvern_context.ensure_context()
     frames = await get_all_children_frames(page)
@@ -487,6 +495,7 @@ async def get_interactable_element_tree(
             frame_index,
             elements,
             element_tree,
+            must_included_tags,
         )
 
     return elements, element_tree
