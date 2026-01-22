@@ -83,4 +83,5 @@ class BrowserState(Protocol):
         scroll: bool = True,
         support_empty_page: bool = False,
         wait_seconds: float = 0,
+        must_included_tags: list[str] | None = None,
     ) -> ScrapedPage: ...

@@ -12,10 +12,8 @@ NOTE(jdo:streaming-local-dev)
 import structlog
 from fastapi import WebSocket
 
-from skyvern.config import settings
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming.auth import _auth as local_auth
-from skyvern.forge.sdk.routes.streaming.auth import auth as real_auth
+from skyvern.forge.sdk.routes.streaming.auth import auth
 from skyvern.forge.sdk.routes.streaming.channels.vnc import (
     Loops,
     VncChannel,
@@ -88,7 +86,6 @@ async def stream(
         workflow_run_id=workflow_run_id,
     )
 
-    auth = local_auth if settings.ENV == "local" else real_auth
     organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
 
     if not organization_id:

@@ -1,5 +1,4 @@
 from datetime import datetime
-from decimal import Decimal
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
@@ -49,11 +48,6 @@ class PersistentBrowserSession(BaseModel):
     status: str | None = None
     timeout_minutes: int | None = None
     proxy_location: ProxyLocation | None = None
-    instance_type: str | None = None
-    vcpu_millicores: int | None = None
-    memory_mb: int | None = None
-    duration_ms: int | None = None
-    compute_cost: Decimal | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime

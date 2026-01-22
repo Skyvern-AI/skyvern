@@ -289,72 +289,14 @@ class LocalStorage(BaseStorage):
         return []
 
     async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
-        """List all recording files for a browser session from local storage.
-
-        Videos are synced to the browser_sessions storage path when the session closes.
-        """
-        videos_base = (
-            Path(self.artifact_path)
-            / settings.ENV
-            / organization_id
-            / "browser_sessions"
-            / browser_session_id
-            / "videos"
-        )
-
-        recording_files: list[str] = []
-        if videos_base.exists():
-            for root, _, files in os.walk(videos_base):
-                for file in files:
-                    file_path = Path(root) / file
-                    recording_files.append(f"file://{file_path}")
-
-        return recording_files
+        """List all recording files for a browser session (not implemented for local storage)."""
+        return []
 
     async def get_shared_recordings_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        """Get recording files with URLs for a browser session from local storage."""
-        file_uris = await self.list_recordings_in_browser_session(organization_id, browser_session_id)
-        if not file_uris:
-            return []
-
-        file_infos: list[FileInfo] = []
-        for uri in file_uris:
-            uri_lower = uri.lower()
-            if not (uri_lower.endswith(".webm") or uri_lower.endswith(".mp4")):
-                LOG.warning(
-                    "Skipping recording file with unsupported extension",
-                    uri=uri,
-                    organization_id=organization_id,
-                    browser_session_id=browser_session_id,
-                )
-                continue
-
-            file_path = parse_uri_to_path(uri)
-            path_obj = Path(file_path)
-
-            if not path_obj.exists():
-                continue
-
-            file_size = path_obj.stat().st_size
-            if file_size == 0:
-                continue
-
-            modified_at = datetime.fromtimestamp(path_obj.stat().st_mtime)
-            checksum = calculate_sha256_for_file(file_path)
-            filename = path_obj.name
-
-            file_info = FileInfo(
-                url=uri,
-                checksum=checksum,
-                filename=filename,
-                modified_at=modified_at,
-            )
-            file_infos.append(file_info)
-
-        file_infos.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
-        return file_infos
+        """Get recording files with URLs for a browser session (not implemented for local storage)."""
+        return []
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
         download_dir = get_download_dir(run_id=run_id)
