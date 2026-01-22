@@ -15,7 +15,7 @@ import { useOnChange } from "@/hooks/useOnChange";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useRequestDeleteNodeCallback } from "@/routes/workflows/hooks/useRequestDeleteNodeCallback";
 import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
@@ -180,7 +180,7 @@ function NodeHeader({
     initialValue: blockLabel,
   });
   const blockTitle = workflowBlockTitle[type];
-  const deleteNodeCallback = useDeleteNodeCallback();
+  const requestDeleteNodeCallback = useRequestDeleteNodeCallback();
   const transmuteNodeCallback = useTransmuteNodeCallback();
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const credentialGetter = useCredentialGetter();
@@ -625,7 +625,7 @@ function NodeHeader({
                 <NodeActionMenu
                   isScriptable={isScriptable}
                   onDelete={() => {
-                    deleteNodeCallback(nodeId);
+                    requestDeleteNodeCallback(nodeId, blockLabel);
                   }}
                   onShowScript={() =>
                     toggleScriptForNodeCallback({ id: nodeId, show: true })

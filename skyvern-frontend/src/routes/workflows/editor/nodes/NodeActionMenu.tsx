@@ -33,7 +33,7 @@ function NodeActionMenu({
   }
 
   return (
-    <DropdownMenu>
+    <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <DotsHorizontalIcon className="h-6 w-6 cursor-pointer" />
       </DropdownMenuTrigger>
