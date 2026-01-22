@@ -1,3 +1,5 @@
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+
 export type WorkflowCopilotChatSender = "user" | "ai";
 
 export interface WorkflowCopilotChat {
@@ -53,7 +55,7 @@ export interface WorkflowCopilotStreamResponseUpdate {
   type: "response";
   workflow_copilot_chat_id: string;
   message: string;
-  updated_workflow?: Record<string, unknown> | null;
+  updated_workflow?: WorkflowApiResponse | null;
   response_time: string;
 }
 
