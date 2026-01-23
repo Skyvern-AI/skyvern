@@ -204,7 +204,7 @@ async def copilot_call_llm(
     if action_type == "REPLACE_WORKFLOW":
         llm_workflow_yaml = action_data.get("workflow_yaml", "")
         try:
-            updated_workflow = await _process_workflow_yaml(
+            updated_workflow = _process_workflow_yaml(
                 workflow_id=chat_request.workflow_id,
                 workflow_permanent_id=chat_request.workflow_permanent_id,
                 organization_id=organization_id,
@@ -228,7 +228,7 @@ async def copilot_call_llm(
                 debug_run_info_text=debug_run_info_text,
                 error=e,
             )
-            updated_workflow = await _process_workflow_yaml(
+            updated_workflow = _process_workflow_yaml(
                 workflow_id=chat_request.workflow_id,
                 workflow_permanent_id=chat_request.workflow_permanent_id,
                 organization_id=organization_id,
@@ -298,7 +298,7 @@ async def _auto_correct_workflow_yaml(
     return action_data.get("workflow_yaml", workflow_yaml)
 
 
-async def _process_workflow_yaml(
+def _process_workflow_yaml(
     workflow_id: str,
     workflow_permanent_id: str,
     organization_id: str,

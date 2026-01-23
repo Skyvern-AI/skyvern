@@ -634,18 +634,19 @@ label: <unique_label>
 method: <GET|POST|PUT|PATCH|DELETE>            # Optional: HTTP method (default: GET)
 url: <https_url>                               # Optional: Target URL
 headers: {}                                    # Optional: HTTP headers
-body: {}                                       # Optional: JSON body (dict)
+body: {}                                       # Optional: JSON body (MUST be a dict, not a string)
 files: {}                                      # Optional: Multipart files mapping
 timeout: 30                                    # Optional: Timeout in seconds
 follow_redirects: true                         # Optional: Follow redirects
-parameter_keys: []                             # Optional: Parameters used in this block
+parameter_keys: []                             # Optional: Workflow parameters used (block outputs don't need to be listed)
 
 Use Cases:
 - Call third-party APIs for enrichment
 - Post data to internal services
 - Upload files via multipart requests
+- Send results from previous blocks to webhooks
 
-Example:
+Example 1 - Using workflow parameters:
 workflow_definition:
   version: 2
   blocks:
@@ -667,26 +668,75 @@ workflow_definition:
       key: customer_email
       workflow_parameter_type: string
 
+Example 2 - Sending block output to webhook (no parameter_keys needed):
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+    - block_type: task_v2
+      label: get_data
+      next_block_label: send_webhook
+      prompt: "Get top 3 hacker news items"
+      url: "https://news.ycombinator.com"
+    - block_type: http_request
+      label: send_webhook
+      next_block_label: null
+      method: POST
+      url: "http://example.com/webhook"
+      body:
+        data: "{{ get_data.output }}"
+      parameter_keys: []
+
 ** PARAMETER TEMPLATING **
 
-All string fields in blocks support Jinja2 templating to reference parameters.
+All string fields in blocks support Jinja2 templating to reference parameters and block outputs.
 
-Syntax (preferred):
-{{ param_key }}
+There are TWO types of references:
 
-Examples:
+1. WORKFLOW PARAMETERS - Reference input parameters defined in the parameters section
+   Syntax: {{ param_key }}
+   Requires: parameter_keys list must include the param_key
+
+2. BLOCK OUTPUTS - Reference output from a previous block by its label
+   Syntax: {{ block_label.output }}
+   Requires: NOTHING - block outputs are automatically available, no parameter_keys needed
+
+IMPORTANT: Block outputs use the block's label directly (e.g., {{ block_1.output }}).
+
+Examples - Workflow Parameters:
 
 * In URL:
 url: "https://example.com/search?q={{ search_term }}"
+parameter_keys: [search_term]
 
 * In goals:
 navigation_goal: "Search for {{ product_name }} and filter by {{ category }}"
+parameter_keys: [product_name, category]
 
-* In data extraction:
-data_extraction_goal: "Extract {{ field_name }} from the results"
+Examples - Block Outputs (no parameter_keys needed):
 
-* Complex expressions:
-navigation_goal: "Enter {{ first_name }} {{ last_name }} in the name field"
+* Send previous block output to webhook:
+blocks:
+  - block_type: task_v2
+    label: get_data
+    prompt: "Get top 3 hacker news items"
+    ...
+  - block_type: http_request
+    label: send_webhook
+    method: POST
+    url: "http://example.com/webhook"
+    body:
+      data: "{{ get_data.output }}"
+    parameter_keys: []  # Empty - block outputs don't need to be declared
+
+* Use extraction output in next block:
+blocks:
+  - block_type: extraction
+    label: extract_items
+    ...
+  - block_type: task_v2
+    label: process_items
+    prompt: "Process these items: {{ extract_items.output }}"
 
 * In schemas (as descriptions):
 data_schema:
