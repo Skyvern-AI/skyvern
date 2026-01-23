@@ -89,6 +89,7 @@ import {
   getWorkflowSettings,
   layout,
   removeJinjaReferenceFromNodes,
+  removeKeyFromNodesParameterKeys,
   upgradeWorkflowDefinitionToVersionTwo,
 } from "./workflowEditorUtils";
 import { getWorkflowErrors } from "./workflowEditorUtils";
@@ -282,6 +283,11 @@ type Props = {
   onMouseDownCapture?: () => void;
   zIndex?: number;
   onContainerResize?: number;
+  onRequestDeleteNode?: (
+    nodeId: string,
+    nodeLabel: string,
+    confirmCallback: () => void,
+  ) => void;
 };
 
 function FlowRenderer({
@@ -300,6 +306,7 @@ function FlowRenderer({
   onMouseDownCapture,
   zIndex,
   onContainerResize,
+  onRequestDeleteNode,
 }: Props) {
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
@@ -347,11 +354,14 @@ function FlowRenderer({
     );
   });
 
-  function doLayout(nodes: Array<AppNode>, edges: Array<Edge>) {
-    const layoutedElements = layout(nodes, edges);
-    setNodes(layoutedElements.nodes);
-    setEdges(layoutedElements.edges);
-  }
+  const doLayout = useCallback(
+    (nodes: Array<AppNode>, edges: Array<Edge>) => {
+      const layoutedElements = layout(nodes, edges);
+      setNodes(layoutedElements.nodes);
+      setEdges(layoutedElements.edges);
+    },
+    [setNodes, setEdges],
+  );
 
   useEffect(() => {
     if (nodesInitialized) {
@@ -446,223 +456,92 @@ function FlowRenderer({
     return true;
   }
 
-  function deleteNode(id: string) {
-    const node = nodes.find((node) => node.id === id);
-    if (!node || !isWorkflowBlockNode(node)) {
-      return;
-    }
-    const nodesToDelete = descendants(nodes, id);
-    const deletedNodeLabel = node.data.label;
-    const newNodes = nodes.filter(
-      (node) => !nodesToDelete.includes(node) && node.id !== id,
-    );
-    const newEdges = edges.flatMap((edge) => {
-      if (edge.source === id) {
-        return [];
+  const deleteNode = useCallback(
+    (id: string) => {
+      const node = nodes.find((node) => node.id === id);
+      if (!node || !isWorkflowBlockNode(node)) {
+        return;
       }
-      if (
-        nodesToDelete.some(
-          (node) => node.id === edge.source || node.id === edge.target,
-        )
-      ) {
-        return [];
-      }
-      if (edge.target === id) {
-        const nextEdge = edges.find((edge) => edge.source === id);
-        if (nextEdge) {
-          // connect the old incoming edge to the next node if both of them exist
-          // also take the type of the old edge for plus button edge vs default
-          return [
-            {
-              ...edge,
-              type: nextEdge.type,
-              target: nextEdge.target,
-            },
-          ];
+      const nodesToDelete = descendants(nodes, id);
+      const deletedNodeLabel = node.data.label;
+      const newNodes = nodes.filter(
+        (node) => !nodesToDelete.includes(node) && node.id !== id,
+      );
+      const newEdges = edges.flatMap((edge) => {
+        if (edge.source === id) {
+          return [];
+        }
+        if (
+          nodesToDelete.some(
+            (node) => node.id === edge.source || node.id === edge.target,
+          )
+        ) {
+          return [];
+        }
+        if (edge.target === id) {
+          const nextEdge = edges.find((edge) => edge.source === id);
+          if (nextEdge) {
+            // connect the old incoming edge to the next node if both of them exist
+            // also take the type of the old edge for plus button edge vs default
+            return [
+              {
+                ...edge,
+                type: nextEdge.type,
+                target: nextEdge.target,
+              },
+            ];
+          }
+          return [edge];
         }
         return [edge];
+      });
+
+      if (newNodes.every((node) => node.type === "nodeAdder")) {
+        // No user created nodes left, so return to the empty state.
+        doLayout([], []);
+        return;
       }
-      return [edge];
-    });
 
-    if (newNodes.every((node) => node.type === "nodeAdder")) {
-      // No user created nodes left, so return to the empty state.
-      doLayout([], []);
-      return;
-    }
+      // Step 1: Remove inline {{ deleted_block_output }} references from all nodes
+      const deletedOutputKey = getOutputParameterKey(deletedNodeLabel);
+      const nodesWithRemovedInlineRefs = removeJinjaReferenceFromNodes(
+        newNodes,
+        deletedOutputKey,
+      );
 
-    // Step 1: Remove inline {{ deleted_block_output }} references from all nodes
-    const deletedOutputKey = getOutputParameterKey(deletedNodeLabel);
-    const nodesWithRemovedInlineRefs = removeJinjaReferenceFromNodes(
-      newNodes,
-      deletedOutputKey,
-    );
+      // Step 2: Remove from parameterKeys arrays and handle special cases
+      const newNodesWithUpdatedParameters = removeKeyFromNodesParameterKeys(
+        nodesWithRemovedInlineRefs,
+        deletedOutputKey,
+        deletedNodeLabel,
+      );
 
-    // Step 2: Remove from parameterKeys arrays and handle special cases
-    const newNodesWithUpdatedParameters = nodesWithRemovedInlineRefs.map(
-      (node) => {
-        // Clear finallyBlockLabel if the deleted block was the finally block
-        if (
-          node.type === "start" &&
-          node.data.withWorkflowSettings &&
-          node.data.finallyBlockLabel === deletedNodeLabel
-        ) {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              finallyBlockLabel: null,
-            },
-          };
-        }
+      workflowChangesStore.setHasChanges(true);
 
-        // Handle parameterKeys - filter out the deleted output key
-        // Each node type needs a separate branch due to TypeScript union type limitations
-        if (node.type === "task") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys: node.data.parameterKeys.filter(
-                (parameter) => parameter !== deletedOutputKey,
-              ),
-            },
-          };
-        }
-        if (node.type === "textPrompt") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys: node.data.parameterKeys.filter(
-                (parameter) => parameter !== deletedOutputKey,
-              ),
-            },
-          };
-        }
-        if (node.type === "login") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys: node.data.parameterKeys.filter(
-                (parameter) => parameter !== deletedOutputKey,
-              ),
-            },
-          };
-        }
-        if (node.type === "navigation") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys: node.data.parameterKeys.filter(
-                (parameter) => parameter !== deletedOutputKey,
-              ),
-            },
-          };
-        }
-        if (node.type === "extraction") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys: node.data.parameterKeys.filter(
-                (parameter) => parameter !== deletedOutputKey,
-              ),
-            },
-          };
-        }
-        if (node.type === "fileDownload") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys: node.data.parameterKeys.filter(
-                (parameter) => parameter !== deletedOutputKey,
-              ),
-            },
-          };
-        }
-        if (node.type === "action") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys: node.data.parameterKeys.filter(
-                (parameter) => parameter !== deletedOutputKey,
-              ),
-            },
-          };
-        }
-        if (node.type === "http_request") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys: node.data.parameterKeys.filter(
-                (parameter) => parameter !== deletedOutputKey,
-              ),
-            },
-          };
-        }
-        if (node.type === "validation") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys: node.data.parameterKeys.filter(
-                (parameter) => parameter !== deletedOutputKey,
-              ),
-            },
-          };
-        }
-        if (node.type === "codeBlock") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys:
-                node.data.parameterKeys?.filter(
-                  (parameter) => parameter !== deletedOutputKey,
-                ) ?? null,
-            },
-          };
-        }
-        if (node.type === "printPage") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              parameterKeys: node.data.parameterKeys.filter(
-                (parameter) => parameter !== deletedOutputKey,
-              ),
-            },
-          };
-        }
-        // Handle loop node's loopVariableReference (the active field displayed in UI).
-        // Note: loopValue is a legacy field populated during conversion for backward compatibility.
-        // It's not displayed in UI or sent to backend, so we only clean up loopVariableReference.
-        if (node.type === "loop") {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              loopVariableReference:
-                node.data.loopVariableReference === deletedOutputKey
-                  ? ""
-                  : node.data.loopVariableReference,
-            },
-          };
-        }
+      doLayout(newNodesWithUpdatedParameters, newEdges);
+    },
+    [nodes, edges, doLayout, workflowChangesStore],
+  );
 
-        return node;
-      },
-    );
-    workflowChangesStore.setHasChanges(true);
+  // Use a ref to always have access to the latest deleteNode without causing re-renders
+  const deleteNodeRef = useRef(deleteNode);
+  useEffect(() => {
+    deleteNodeRef.current = deleteNode;
+  }, [deleteNode]);
 
-    doLayout(newNodesWithUpdatedParameters, newEdges);
-  }
+  // Callback for requesting node deletion (opens confirmation dialog in parent)
+  // Uses ref to avoid recreating on every nodes/edges change while still using latest deleteNode
+  const requestDeleteNode = useCallback(
+    (id: string, label: string) => {
+      if (onRequestDeleteNode) {
+        onRequestDeleteNode(id, label, () => deleteNodeRef.current(id));
+      } else {
+        // Fallback: delete directly if no confirmation handler provided
+        deleteNodeRef.current(id);
+      }
+    },
+    [onRequestDeleteNode],
+  );
 
   function transmuteNode(id: string, nodeType: string) {
     const nodeToTransmute = nodes.find((node) => node.id === id);
@@ -947,13 +826,7 @@ function FlowRenderer({
       </Dialog>
       <BlockActionContext.Provider
         value={{
-          /**
-           * NOTE: defer deletion to next tick to allow React Flow's internal
-           * event handlers to complete; removes a console warning from the
-           * React Flow library
-           */
-          deleteNodeCallback: (id: string) =>
-            setTimeout(() => deleteNode(id), 0),
+          requestDeleteNodeCallback: requestDeleteNode,
           transmuteNodeCallback: (id: string, nodeName: string) =>
             setTimeout(() => transmuteNode(id, nodeName), 0),
           toggleScriptForNodeCallback: toggleScript,

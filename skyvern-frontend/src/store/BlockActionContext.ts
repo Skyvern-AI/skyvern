@@ -1,6 +1,6 @@
 import { createContext } from "react";
 
-type DeleteNodeCallback = (id: string) => void;
+type RequestDeleteNodeCallback = (id: string, label: string) => void;
 type TransmuteNodeCallback = (id: string, nodeName: string) => void;
 type ToggleScriptForNodeCallback = (opts: {
   id?: string;
@@ -10,7 +10,7 @@ type ToggleScriptForNodeCallback = (opts: {
 
 const BlockActionContext = createContext<
   | {
-      deleteNodeCallback: DeleteNodeCallback;
+      requestDeleteNodeCallback: RequestDeleteNodeCallback;
       transmuteNodeCallback: TransmuteNodeCallback;
       toggleScriptForNodeCallback?: ToggleScriptForNodeCallback;
     }
