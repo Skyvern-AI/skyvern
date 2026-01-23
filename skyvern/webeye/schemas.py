@@ -122,9 +122,11 @@ class BrowserSessionResponse(BaseModel):
                 )
 
             # Sort downloaded files by modified_at in descending order (newest first)
-            downloaded_files.sort(key=lambda x: x.modified_at or datetime.min, reverse=True)
+            # Treat None as "oldest".
+            downloaded_files.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
             # Sort recordings by modified_at in descending order (newest first)
-            recordings.sort(key=lambda x: x.modified_at or datetime.min, reverse=True)
+            # Treat None as "oldest".
+            recordings.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
 
         return cls(
             browser_session_id=browser_session.persistent_browser_session_id,
