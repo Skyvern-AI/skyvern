@@ -1412,10 +1412,12 @@ function Workspace({
               <WorkflowParametersPanel />
             )}
             {workflowPanelState.content === "history" && (
-              <WorkflowHistoryPanel
-                workflowPermanentId={workflowPermanentId!}
-                onCompare={handleCompareVersions}
-              />
+              <div className="h-[calc(100vh-14rem)]">
+                <WorkflowHistoryPanel
+                  workflowPermanentId={workflowPermanentId!}
+                  onCompare={handleCompareVersions}
+                />
+              </div>
             )}
           </div>
         )}
