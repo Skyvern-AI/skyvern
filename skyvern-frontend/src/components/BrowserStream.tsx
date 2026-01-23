@@ -31,12 +31,7 @@ import {
   type MessageInExfiltratedEvent,
 } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
-import {
-  environment,
-  wssBaseUrl,
-  newWssBaseUrl,
-  getRuntimeApiKey,
-} from "@/util/env";
+import { wssBaseUrl, newWssBaseUrl, getRuntimeApiKey } from "@/util/env";
 import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 
@@ -223,7 +218,7 @@ function BrowserStream({
 
     let credentialQueryParam = runtimeApiKey ? `apikey=${runtimeApiKey}` : "";
 
-    if (environment !== "local" && credentialGetter) {
+    if (credentialGetter) {
       const token = await credentialGetter();
       credentialQueryParam = token ? `token=Bearer ${token}` : "";
     }
