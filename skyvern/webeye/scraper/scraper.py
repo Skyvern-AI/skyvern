@@ -232,6 +232,8 @@ async def get_frame_text(iframe: Frame) -> str:
 
     try:
         text = await SkyvernFrame.evaluate(frame=iframe, expression=js_script)
+        if text is None:
+            text = ""
     except Exception:
         LOG.warning(
             "failed to get text from iframe",
@@ -445,18 +447,21 @@ async def add_frame_interactable_elements(
         )
         return elements, element_tree
 
-    skyvern_frame = await SkyvernFrame.create_instance(frame)
-    await skyvern_frame.safe_wait_for_animation_end()
+    try:
+        skyvern_frame = await SkyvernFrame.create_instance(frame)
+        await skyvern_frame.safe_wait_for_animation_end()
 
-    frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
-        frame_name=skyvern_id, frame_index=frame_index, must_included_tags=must_included_tags
-    )
+        frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
+            frame_name=skyvern_id, frame_index=frame_index, must_included_tags=must_included_tags
+        )
 
-    for element in elements:
-        if element["id"] == skyvern_id:
-            element["children"] = frame_element_tree
+        for element in elements:
+            if element["id"] == skyvern_id:
+                element["children"] = frame_element_tree
 
-    elements = elements + frame_elements
+        elements = elements + frame_elements
+    except Exception:
+        LOG.warning("Failed to build the tree of the frame, skipping frame", frame_id=skyvern_id, exc_info=True)
 
     return elements, element_tree
 
