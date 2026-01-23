@@ -1,6 +1,5 @@
 import { forwardRef } from "react";
 import { ChatBubbleIcon } from "@radix-ui/react-icons";
-import { useIsSkyvernUser } from "@/hooks/useIsSkyvernUser";
 
 interface WorkflowCopilotButtonProps {
   messageCount: number;
@@ -11,12 +10,6 @@ export const WorkflowCopilotButton = forwardRef<
   HTMLButtonElement,
   WorkflowCopilotButtonProps
 >(({ messageCount, onClick }, ref) => {
-  const isSkyvernUser = useIsSkyvernUser();
-
-  if (!isSkyvernUser) {
-    return null;
-  }
-
   return (
     <button
       ref={ref}
