@@ -1,8 +1,13 @@
-You receive either an email or a text message containing an OTP(like TOTP, Magic Link) to verify the login. Your job is to parse the content, identify the OTP type and value. There should be only one OTP type and one OTP value in the content. The value must be from the content
+You receive either an email or a text message containing an OTP(like TOTP, Magic Link) to verify the login. Your job is to parse the content, identify the OTP type and value. The value must be from the content.
+{% if enforced_otp_type %}
+IMPORTANT: The user has specified they expect a "{{ enforced_otp_type }}" type OTP. You MUST extract the {{ enforced_otp_type }} value from the content, even if other OTP types are present. Ignore any other OTP types in the content. If no {{ enforced_otp_type }} is found, set otp_value_found to false.
+{% else %}
+There should be only one OTP type and one OTP value in the content.
+{% endif %}
 
 You should follow the rules below to identify the OTP type and value:
 - If it's a Magic Link login, the value is usually a link which must be a valid HTTP or HTTPS URL.
-- If it's a TOTP login, The most common value is a code which is a series of digits, although sometimes it may contain letters. 
+- If it's a TOTP login, The most common value is a code which is a series of digits, although sometimes it may contain letters.
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 
