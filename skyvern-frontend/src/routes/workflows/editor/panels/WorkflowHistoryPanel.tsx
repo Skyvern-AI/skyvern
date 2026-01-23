@@ -67,7 +67,11 @@ function WorkflowHistoryPanel({ workflowPermanentId, onCompare }: Props) {
 
   const handleCompare = (mode: "visual" | "json" = "visual") => {
     if (selectedVersions.size === 2 && versions) {
-      const selectedVersionsArray = Array.from(selectedVersions);
+      // Sort ascending so older version (lower number) is first, newer is second
+      // This matches standard diff convention: old on left, new on right
+      const selectedVersionsArray = Array.from(selectedVersions).sort(
+        (a, b) => a - b,
+      );
       const version1 = versions.find(
         (v) => v.version === selectedVersionsArray[0],
       );
