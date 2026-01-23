@@ -177,6 +177,7 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
         "disable_cache",
         "next_block_label",
         "version",
+        "model",
     ]
 
     # Use BFS to recursively remove fields from all nested objects
@@ -1971,6 +1972,28 @@ class WorkflowService:
             current_definition = _get_workflow_definition_core_data(previous_valid_workflow.workflow_definition)
             new_definition = _get_workflow_definition_core_data(workflow_definition)
             has_changes = current_definition != new_definition
+
+            # Log definition changes for debugging cache invalidation issues (SKY-7016)
+            if has_changes:
+                LOG.debug(
+                    "Workflow definition has changes, checking for cache invalidation",
+                    workflow_id=workflow.workflow_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=organization_id,
+                    previous_version=previous_valid_workflow.version,
+                    new_version=workflow.version,
+                    current_block_count=len(current_definition.get("blocks", [])),
+                    new_block_count=len(new_definition.get("blocks", [])),
+                    current_param_count=len(current_definition.get("parameters", [])),
+                    new_param_count=len(new_definition.get("parameters", [])),
+                )
+            else:
+                LOG.debug(
+                    "Workflow definition unchanged, skipping cache invalidation check",
+                    workflow_id=workflow.workflow_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=organization_id,
+                )
         else:
             has_changes = False
 
