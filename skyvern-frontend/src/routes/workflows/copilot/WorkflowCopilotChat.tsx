@@ -1,7 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, memo } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useIsSkyvernUser } from "@/hooks/useIsSkyvernUser";
 import { useParams } from "react-router-dom";
 import { ReloadIcon, Cross2Icon } from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
@@ -123,7 +122,6 @@ export function WorkflowCopilotChat({
   onMessageCountChange,
   buttonRef,
 }: WorkflowCopilotChatProps = {}) {
-  const isSkyvernUser = useIsSkyvernUser();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -649,8 +647,7 @@ export function WorkflowCopilotChat({
     }
   }, [isOpen, buttonRef, size.width, size.height]);
 
-  // Only show to Skyvern users
-  if (!isSkyvernUser || !isOpen) {
+  if (!isOpen) {
     return null;
   }
 
@@ -670,7 +667,7 @@ export function WorkflowCopilotChat({
         onMouseDown={handleMouseDown}
       >
         <h3 className="text-sm font-semibold text-slate-200">
-          Workflow Copilot
+          Workflow Copilot (Beta)
         </h3>
         <div className="flex items-center gap-2">
           <button
