@@ -1,15 +1,20 @@
 from abc import ABC, abstractmethod
 
 import structlog
+from cachetools import TTLCache
 
 LOG = structlog.get_logger()
 
+EXPERIMENTATION_CACHE_TTL = 300  # seconds (5 minutes)
+EXPERIMENTATION_CACHE_MAX_SIZE = 100000  # Max entries per cache
+
 
 class BaseExperimentationProvider(ABC):
-    # feature_name -> distinct_id -> result
-    result_map: dict[str, dict[str, bool]] = {}
-    variant_map: dict[str, dict[str, str | None]] = {}
-    payload_map: dict[str, dict[str, str | None]] = {}
+    def __init__(self) -> None:
+        # feature_name -> distinct_id -> result with TTL-based expiration
+        self.result_map: TTLCache = TTLCache(maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL)
+        self.variant_map: TTLCache = TTLCache(maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL)
+        self.payload_map: TTLCache = TTLCache(maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL)
 
     @abstractmethod
     async def is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
@@ -62,6 +67,9 @@ class BaseExperimentationProvider(ABC):
 
 
 class NoOpExperimentationProvider(BaseExperimentationProvider):
+    def __init__(self) -> None:
+        super().__init__()
+
     async def is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
         return False
 
