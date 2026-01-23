@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { basicLocalTimeFormat } from "@/util/timeFormat";
 import {
@@ -90,7 +90,7 @@ function WorkflowHistoryPanel({ workflowPermanentId, onCompare }: Props) {
   const canCompare = selectedVersions.size === 2;
 
   return (
-    <div className="flex h-full w-[25rem] flex-col rounded-lg bg-slate-elevation2">
+    <div className="flex h-full w-[25rem] flex-col overflow-hidden rounded-lg bg-slate-elevation2">
       {/* Header */}
       <div className="flex-shrink-0 p-4 pb-3">
         <div className="flex items-center justify-between">
@@ -129,67 +129,69 @@ function WorkflowHistoryPanel({ workflowPermanentId, onCompare }: Props) {
       <Separator />
 
       {/* Version List */}
-      <ScrollArea className="flex-1">
-        <div className="p-4">
-          {isLoading ? (
-            <div className="space-y-3">
-              {Array.from({ length: 5 }).map((_, i) => (
-                <div
-                  key={i}
-                  className="flex items-center space-x-3 rounded-lg border p-3"
-                >
-                  <Skeleton className="h-4 w-4" />
-                  <div className="flex-1 space-y-2">
-                    <Skeleton className="h-4 w-20" />
-                    <Skeleton className="h-3 w-32" />
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : sortedVersions.length === 0 ? (
-            <div className="py-8 text-center text-muted-foreground">
-              No version history found
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {sortedVersions.map((workflow, index) => {
-                const isSelected = selectedVersions.has(workflow.version);
-                const isCurrent = index === 0;
-
-                return (
+      <ScrollArea className="min-h-0 flex-1">
+        <ScrollAreaViewport className="h-full">
+          <div className="p-4">
+            {isLoading ? (
+              <div className="space-y-3">
+                {Array.from({ length: 5 }).map((_, i) => (
                   <div
-                    key={workflow.version}
-                    className={`flex cursor-pointer items-center space-x-3 rounded-lg border p-3 transition-colors ${
-                      isSelected
-                        ? "border-primary/20 bg-primary/5"
-                        : "hover:bg-muted/50"
-                    }`}
-                    onClick={() => handleVersionToggle(workflow.version)}
+                    key={i}
+                    className="flex items-center space-x-3 rounded-lg border p-3"
                   >
-                    <Checkbox
-                      checked={isSelected}
-                      onChange={() => {}} // Handled by parent click
-                    />
-
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium">
-                          Version {workflow.version}
-                        </span>
-                        {isCurrent && (
-                          <Badge variant="secondary">Current</Badge>
-                        )}
-                      </div>
-                      <div className="text-sm text-muted-foreground">
-                        Modified: {basicLocalTimeFormat(workflow.modified_at)}
-                      </div>
+                    <Skeleton className="h-4 w-4" />
+                    <div className="flex-1 space-y-2">
+                      <Skeleton className="h-4 w-20" />
+                      <Skeleton className="h-3 w-32" />
                     </div>
                   </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+                ))}
+              </div>
+            ) : sortedVersions.length === 0 ? (
+              <div className="py-8 text-center text-muted-foreground">
+                No version history found
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {sortedVersions.map((workflow, index) => {
+                  const isSelected = selectedVersions.has(workflow.version);
+                  const isCurrent = index === 0;
+
+                  return (
+                    <div
+                      key={workflow.version}
+                      className={`flex cursor-pointer items-center space-x-3 rounded-lg border p-3 transition-colors ${
+                        isSelected
+                          ? "border-primary/20 bg-primary/5"
+                          : "hover:bg-muted/50"
+                      }`}
+                      onClick={() => handleVersionToggle(workflow.version)}
+                    >
+                      <Checkbox
+                        checked={isSelected}
+                        onChange={() => {}} // Handled by parent click
+                      />
+
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">
+                            Version {workflow.version}
+                          </span>
+                          {isCurrent && (
+                            <Badge variant="secondary">Current</Badge>
+                          )}
+                        </div>
+                        <div className="text-sm text-muted-foreground">
+                          Modified: {basicLocalTimeFormat(workflow.modified_at)}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </ScrollAreaViewport>
       </ScrollArea>
     </div>
   );
