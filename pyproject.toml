@@ -203,3 +203,10 @@ skyvern = "skyvern.cli.commands:cli_app"
 
 [tool.pytest.ini_options]
 norecursedirs = ["eval"]
+
+[tool.codeflash]
+module-root = "skyvern"
+tests-root = "codeflash-tests"
+test-framework = "pytest"
+ignore-paths = ["skyvern/client"]
+formatter-cmds = ["ruff check --exit-zero --fix $file", "ruff format $file"]
