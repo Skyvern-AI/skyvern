@@ -3117,7 +3117,7 @@
     "/api/v1/billing/change-tier": {
       "post": {
         "summary": "Change Tier",
-        "description": "Change the subscription tier (upgrade or downgrade).\n\nThis swaps the tier price while keeping metered items unchanged.\nStripe will fire a customer.subscription.updated webhook which\nupdates the billing state automatically.",
+        "description": "Redirect to Stripe Portal for tier changes.\nPortal handles proration based on configured settings:\n- Upgrades: Immediate proration charge\n- Downgrades: Apply at end of billing period",
         "operationId": "change_tier_api_v1_billing_change_tier_post",
         "parameters": [
           {
@@ -4696,6 +4696,18 @@
             "type": "integer",
             "title": "Browser Uptime Seconds Consumed"
           },
+          "topup_credits_total": {
+            "type": "integer",
+            "title": "Topup Credits Total"
+          },
+          "topup_credits_used": {
+            "type": "integer",
+            "title": "Topup Credits Used"
+          },
+          "topup_credits_remaining": {
+            "type": "integer",
+            "title": "Topup Credits Remaining"
+          },
           "credits_remaining": {
             "type": "integer",
             "title": "Credits Remaining"
@@ -4723,6 +4735,9 @@
           "cached_credits_consumed_this_period",
           "overage_enabled",
           "browser_uptime_seconds_consumed",
+          "topup_credits_total",
+          "topup_credits_used",
+          "topup_credits_remaining",
           "credits_remaining",
           "created_at",
           "modified_at"
@@ -5733,6 +5748,17 @@
           "tier": {
             "type": "string",
             "title": "Tier"
+          },
+          "redirect_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Redirect Url"
           }
         },
         "type": "object",
@@ -10060,6 +10086,17 @@
               }
             ],
             "title": "Date Format"
+          },
+          "is_text_captcha": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Text Captcha"
           }
         },
         "type": "object",
@@ -12115,6 +12152,64 @@
             "type": "boolean",
             "title": "Print Background",
             "default": true
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
           }
         },
         "type": "object",
@@ -12200,6 +12295,20 @@
             "type": "boolean",
             "title": "Print Background",
             "default": true
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
           }
         },
         "type": "object",
@@ -13083,6 +13192,21 @@
               "2025-01-01T00:00:00Z"
             ]
           },
+          "type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OTPType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+            "examples": [
+              "totp",
+              "magic_link"
+            ]
+          },
           "totp_code_id": {
             "type": "string",
             "title": "Totp Code Id",
@@ -13230,6 +13354,21 @@
             "description": "The timestamp when the TOTP code expires",
             "examples": [
               "2025-01-01T00:00:00Z"
+            ]
+          },
+          "type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OTPType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+            "examples": [
+              "totp",
+              "magic_link"
             ]
           }
         },
