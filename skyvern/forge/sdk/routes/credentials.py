@@ -113,10 +113,10 @@ async def send_totp_code(
         if not workflow_run:
             raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
     content = data.content.strip()
-    otp_value: OTPValue | None = OTPValue(value=content, type=OTPType.TOTP)
+    otp_value: OTPValue | None = OTPValue(value=content, type=data.type or OTPType.TOTP)
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
     if len(content) > 10:
-        otp_value = await parse_otp_login(content, curr_org.organization_id)
+        otp_value = await parse_otp_login(content, curr_org.organization_id, enforced_otp_type=data.type)
 
     if not otp_value:
         LOG.error(

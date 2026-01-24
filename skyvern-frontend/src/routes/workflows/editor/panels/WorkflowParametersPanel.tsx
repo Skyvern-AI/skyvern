@@ -1,19 +1,9 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { ParametersState } from "../types";
 import { WorkflowParameterEditPanel } from "./WorkflowParameterEditPanel";
 import { MixerVerticalIcon, PlusIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { GarbageIcon } from "@/components/icons/GarbageIcon";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { DialogClose } from "@radix-ui/react-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -22,7 +12,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { useReactFlow } from "@xyflow/react";
+import { useNodes, useReactFlow } from "@xyflow/react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
@@ -31,10 +21,14 @@ import {
   WorkflowEditorParameterTypes,
 } from "../../types/workflowTypes";
 import {
+  getAffectedBlocks,
   getLabelForWorkflowParameterType,
   removeJinjaReferenceFromNodes,
+  removeKeyFromNodesParameterKeys,
   replaceJinjaReferenceInNodes,
 } from "../workflowEditorUtils";
+import { DeleteConfirmationDialog } from "@/components/DeleteConfirmationDialog";
+import { AppNode } from "../nodes";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
@@ -62,7 +56,42 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
     parameter: null,
     type: "workflow",
   });
+  const [deleteDialogState, setDeleteDialogState] = useState<{
+    open: boolean;
+    parameterKey: string | null;
+  }>({
+    open: false,
+    parameterKey: null,
+  });
+  const nodes = useNodes<AppNode>();
   const { setNodes } = useReactFlow();
+
+  const affectedBlocksForDelete = useMemo(() => {
+    if (!deleteDialogState.parameterKey) {
+      return [];
+    }
+    return getAffectedBlocks(nodes, deleteDialogState.parameterKey);
+  }, [nodes, deleteDialogState.parameterKey]);
+
+  const handleDeleteParameter = (parameterKey: string) => {
+    setWorkflowParameters(
+      workflowParameters.filter((p) => p.key !== parameterKey),
+    );
+    setHasChanges(true);
+    setNodes((nodes) => {
+      // Step 1: Remove inline {{ parameter.key }} references
+      const nodesWithRemovedRefs = removeJinjaReferenceFromNodes(
+        nodes,
+        parameterKey,
+      );
+      // Step 2: Remove from parameterKeys arrays
+      return removeKeyFromNodesParameterKeys(
+        nodesWithRemovedRefs,
+        parameterKey,
+      );
+    });
+    setDeleteDialogState({ open: false, parameterKey: null });
+  };
 
   return (
     <div
@@ -156,77 +185,17 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                           });
                         }}
                       />
-                      <Dialog>
-                        <DialogTrigger>
-                          <GarbageIcon className="size-4 cursor-pointer text-destructive-foreground text-red-600" />
-                        </DialogTrigger>
-                        <DialogContent>
-                          <DialogHeader>
-                            <DialogTitle>Are you sure?</DialogTitle>
-                            <DialogDescription>
-                              This parameter will be deleted.
-                            </DialogDescription>
-                          </DialogHeader>
-                          <DialogFooter>
-                            <DialogClose asChild>
-                              <Button variant="secondary">Cancel</Button>
-                            </DialogClose>
-                            <Button
-                              variant="destructive"
-                              onClick={() => {
-                                setWorkflowParameters(
-                                  workflowParameters.filter(
-                                    (p) => p.key !== parameter.key,
-                                  ),
-                                );
-                                setHasChanges(true);
-                                setNodes((nodes) => {
-                                  // Step 1: Remove inline {{ parameter.key }} references
-                                  const nodesWithRemovedRefs =
-                                    removeJinjaReferenceFromNodes(
-                                      nodes,
-                                      parameter.key,
-                                    );
-
-                                  // Step 2: Remove from parameterKeys arrays
-                                  return nodesWithRemovedRefs.map((node) => {
-                                    // All node types that have parameterKeys
-                                    if (
-                                      node.type === "task" ||
-                                      node.type === "textPrompt" ||
-                                      node.type === "login" ||
-                                      node.type === "navigation" ||
-                                      node.type === "extraction" ||
-                                      node.type === "fileDownload" ||
-                                      node.type === "action" ||
-                                      node.type === "http_request" ||
-                                      node.type === "validation" ||
-                                      node.type === "codeBlock" ||
-                                      node.type === "printPage"
-                                    ) {
-                                      const parameterKeys = node.data
-                                        .parameterKeys as Array<string> | null;
-                                      return {
-                                        ...node,
-                                        data: {
-                                          ...node.data,
-                                          parameterKeys:
-                                            parameterKeys?.filter(
-                                              (key) => key !== parameter.key,
-                                            ) ?? null,
-                                        },
-                                      };
-                                    }
-                                    return node;
-                                  });
-                                });
-                              }}
-                            >
-                              Delete
-                            </Button>
-                          </DialogFooter>
-                        </DialogContent>
-                      </Dialog>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDeleteDialogState({
+                            open: true,
+                            parameterKey: parameter.key,
+                          });
+                        }}
+                      >
+                        <GarbageIcon className="size-4 cursor-pointer text-destructive-foreground text-red-600" />
+                      </button>
                     </div>
                   </div>
                 );
@@ -235,6 +204,22 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           </ScrollAreaViewport>
         </ScrollArea>
       </div>
+      <DeleteConfirmationDialog
+        open={deleteDialogState.open}
+        onOpenChange={(open) => {
+          if (!open) {
+            setDeleteDialogState({ open: false, parameterKey: null });
+          }
+        }}
+        title="Delete Parameter"
+        description={`Are you sure you want to delete "${deleteDialogState.parameterKey}"?`}
+        affectedBlocks={affectedBlocksForDelete}
+        onConfirm={() => {
+          if (deleteDialogState.parameterKey) {
+            handleDeleteParameter(deleteDialogState.parameterKey);
+          }
+        }}
+      />
       {operationPanelState.active && (
         <div
           className="absolute"

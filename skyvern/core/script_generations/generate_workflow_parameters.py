@@ -27,18 +27,24 @@ class GeneratedFieldMapping(BaseModel):
 
 async def generate_workflow_parameters_schema(
     actions_by_task: Dict[str, List[Dict[str, Any]]],
+    existing_field_assignments: Dict[int, str] | None = None,
 ) -> Tuple[str, Dict[str, str]]:
     """
     Generate a GeneratedWorkflowParameters Pydantic schema based on input_text actions.
 
     Args:
         actions_by_task: Dictionary mapping task IDs to lists of action dictionaries
+        existing_field_assignments: Optional dictionary mapping action index (1-based) to
+            existing field names that must be preserved. Used when regenerating schemas
+            to maintain compatibility with cached block code.
 
     Returns:
         Tuple of (schema_code, field_mappings) where:
         - schema_code: Python code for the GeneratedWorkflowParameters class
         - field_mappings: Dictionary mapping action indices to field names for hydration
     """
+    existing_field_assignments = existing_field_assignments or {}
+
     # Extract all input_text actions
     custom_field_actions = []
     action_index_map = {}
@@ -57,6 +63,10 @@ async def generate_workflow_parameters_schema(
                 value = action.get("file_url", "")
             elif action_type == ActionType.SELECT_OPTION:
                 value = action.get("option", "")
+
+            # Check if this action has an existing field name that must be preserved
+            existing_field_name = existing_field_assignments.get(action_counter)
+
             custom_field_actions.append(
                 {
                     "action_type": action_type,
@@ -64,6 +74,7 @@ async def generate_workflow_parameters_schema(
                     "intention": action.get("intention", ""),
                     "task_id": task_id,
                     "action_id": action.get("action_id", ""),
+                    "existing_field_name": existing_field_name,
                 }
             )
             action_index_map[f"action_index_{action_counter}"] = {
@@ -98,18 +109,27 @@ async def generate_workflow_parameters_schema(
         return _generate_empty_schema(), {}
 
 
-async def _generate_field_names_with_llm(custom_field_actions: List[Dict[str, Any]]) -> GeneratedFieldMapping:
+async def _generate_field_names_with_llm(
+    custom_field_actions: List[Dict[str, Any]],
+) -> GeneratedFieldMapping:
     """
     Use LLM to generate field names from input actions.
 
     Args:
-        input_actions: List of input_text action dictionaries
+        custom_field_actions: List of action dictionaries with action details.
+            Each action may include an "existing_field_name" key if the field
+            name must be preserved from a cached block.
 
     Returns:
         GeneratedFieldMapping with field mappings and schema definitions
     """
+    # Check if any actions have existing field names that must be preserved
+    has_existing_fields = any(action.get("existing_field_name") for action in custom_field_actions)
+
     prompt = prompt_engine.load_prompt(
-        template="generate-workflow-parameters", custom_field_actions=custom_field_actions
+        template="generate-workflow-parameters",
+        custom_field_actions=custom_field_actions,
+        has_existing_fields=has_existing_fields,
     )
 
     response = await app.SCRIPT_GENERATION_LLM_API_HANDLER(prompt=prompt, prompt_name="generate-workflow-parameters")

@@ -1,13 +1,12 @@
 import { useState, useEffect, useLayoutEffect, useRef, memo } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useIsSkyvernUser } from "@/hooks/useIsSkyvernUser";
 import { useParams } from "react-router-dom";
 import { ReloadIcon, Cross2Icon } from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
-import { WorkflowDefinition } from "@/routes/workflows/types/workflowTypes";
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
@@ -67,7 +66,7 @@ const MessageItem = memo(({ message }: { message: ChatMessage }) => {
 });
 
 interface WorkflowCopilotChatProps {
-  onWorkflowUpdate?: (workflow: WorkflowDefinition) => void;
+  onWorkflowUpdate?: (workflow: WorkflowApiResponse) => void;
   isOpen?: boolean;
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
@@ -123,7 +122,6 @@ export function WorkflowCopilotChat({
   onMessageCountChange,
   buttonRef,
 }: WorkflowCopilotChatProps = {}) {
-  const isSkyvernUser = useIsSkyvernUser();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -425,7 +423,7 @@ export function WorkflowCopilotChat({
 
         if (response.updated_workflow && onWorkflowUpdate) {
           try {
-            onWorkflowUpdate(response.updated_workflow as WorkflowDefinition);
+            onWorkflowUpdate(response.updated_workflow);
           } catch (updateError) {
             console.error("Failed to update workflow:", updateError);
             toast({
@@ -649,8 +647,7 @@ export function WorkflowCopilotChat({
     }
   }, [isOpen, buttonRef, size.width, size.height]);
 
-  // Only show to Skyvern users
-  if (!isSkyvernUser || !isOpen) {
+  if (!isOpen) {
     return null;
   }
 
@@ -670,7 +667,7 @@ export function WorkflowCopilotChat({
         onMouseDown={handleMouseDown}
       >
         <h3 className="text-sm font-semibold text-slate-200">
-          Workflow Copilot
+          Workflow Copilot (Beta)
         </h3>
         <div className="flex items-center gap-2">
           <button

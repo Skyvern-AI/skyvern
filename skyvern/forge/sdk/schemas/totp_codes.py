@@ -47,6 +47,11 @@ class TOTPCodeBase(BaseModel):
     )
 
 
+class OTPType(StrEnum):
+    TOTP = "totp"
+    MAGIC_LINK = "magic_link"
+
+
 class TOTPCodeCreate(TOTPCodeBase):
     totp_identifier: str = Field(
         ...,
@@ -58,17 +63,17 @@ class TOTPCodeCreate(TOTPCodeBase):
         description="The content of the TOTP code. It can be the email content that contains the TOTP code, or the sms message that contains the TOTP code. Skyvern will automatically extract the TOTP code from the content.",
         examples=["Hello, your verification code is 123456"],
     )
+    type: OTPType | None = Field(
+        default=None,
+        description="Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+        examples=["totp", "magic_link"],
+    )
 
     @field_validator("content")
     @classmethod
     def sanitize_content(cls, value: str) -> str:
         """Remove NUL (0x00) bytes from content to avoid PostgreSQL DataError."""
         return sanitize_postgres_text(value)
-
-
-class OTPType(StrEnum):
-    TOTP = "totp"
-    MAGIC_LINK = "magic_link"
 
 
 class TOTPCode(TOTPCodeCreate):

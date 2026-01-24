@@ -394,6 +394,7 @@ class RealBrowserState(BrowserState):
         scroll: bool = True,
         support_empty_page: bool = False,
         wait_seconds: float = 0,
+        must_included_tags: list[str] | None = None,
     ) -> ScrapedPage:
         return await scraper.scrape_website(
             browser_state=self,
@@ -408,6 +409,7 @@ class RealBrowserState(BrowserState):
             scroll=scroll,
             support_empty_page=support_empty_page,
             wait_seconds=wait_seconds,
+            must_included_tags=must_included_tags,
         )
 
     async def close(self, close_browser_on_completion: bool = True) -> None:

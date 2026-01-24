@@ -489,11 +489,16 @@ class SkyvernFrame:
         self,
         frame_name: str | None,
         frame_index: int,
+        must_included_tags: list[str] | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
-        js_script = "async ([frame_name, frame_index]) => await buildTreeFromBody(frame_name, frame_index)"
+        must_included_tags = must_included_tags or []
+        js_script = "async ([frame_name, frame_index, must_included_tags]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags)"
         return await self.evaluate(
-            frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[frame_name, frame_index]
+            frame=self.frame,
+            expression=js_script,
+            timeout_ms=timeout_ms,
+            arg=[frame_name, frame_index, must_included_tags],
         )
 
     @TraceManager.traced_async()
