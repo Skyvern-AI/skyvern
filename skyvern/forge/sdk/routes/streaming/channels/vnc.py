@@ -26,7 +26,7 @@ import structlog
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
-from websockets import ConnectionClosedError, Data
+from websockets import ConnectionClosedError, ConnectionClosedOK, Data
 
 from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
@@ -253,7 +253,7 @@ async def copy_text(vnc_channel: VncChannel) -> None:
             if message_channel:
                 await message_channel.send_copied_text(copied_text)
             else:
-                LOG.warning(
+                LOG.info(
                     f"{class_name} No message channel found for client, or it is not open",
                     message_channel=message_channel,
                     **vnc_channel.identity,
@@ -272,7 +272,7 @@ async def ask_for_clipboard(vnc_channel: VncChannel) -> None:
         if message_channel:
             await message_channel.ask_for_clipboard()
         else:
-            LOG.warning(
+            LOG.info(
                 f"{class_name} No message channel found for client, or it is not open",
                 message_channel=message_channel,
                 **vnc_channel.identity,
@@ -408,6 +408,9 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                 except ConnectionClosedError:
                     LOG.info(f"{class_name} Frontend closed the vnc channel.", **vnc_channel.identity)
                     raise
+                except ConnectionClosedOK:
+                    LOG.info(f"{class_name} Frontend closed the vnc channel cleanly.", **vnc_channel.identity)
+                    raise
                 except asyncio.CancelledError:
                     pass
                 except Exception:
@@ -424,6 +427,9 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     raise
                 except ConnectionClosedError:
                     LOG.info(f"{class_name} Browser closed vnc.", **vnc_channel.identity)
+                    raise
+                except ConnectionClosedOK:
+                    LOG.info(f"{class_name} Browser closed vnc cleanly.", **vnc_channel.identity)
                     raise
                 except asyncio.CancelledError:
                     pass
@@ -450,6 +456,9 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                 except ConnectionClosedError:
                     LOG.info(f"{class_name} Browser closed the vnc channel session.", **vnc_channel.identity)
                     await vnc_channel.close(reason="browser-closed")
+                except ConnectionClosedOK:
+                    LOG.info(f"{class_name} Browser closed the vnc channel session cleanly.", **vnc_channel.identity)
+                    await vnc_channel.close(reason="browser-closed-ok")
                 except asyncio.CancelledError:
                     pass
                 except Exception:
@@ -474,6 +483,9 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                 except ConnectionClosedError:
                     LOG.info(f"{class_name} Frontend closed the vnc channel session.", **vnc_channel.identity)
                     await vnc_channel.close(reason="frontend-closed")
+                except ConnectionClosedOK:
+                    LOG.info(f"{class_name} Frontend closed the vnc channel session cleanly.", **vnc_channel.identity)
+                    await vnc_channel.close(reason="frontend-closed-ok")
                 except asyncio.CancelledError:
                     pass
                 except Exception:
@@ -489,6 +501,8 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
             await collect(loops)
         except WebSocketDisconnect:
             pass
+        except ConnectionClosedOK:
+            LOG.info(f"{class_name} Connection closed cleanly in loop stream.", **vnc_channel.identity)
         except Exception:
             LOG.exception(f"{class_name} An exception occurred in loop stream.", **vnc_channel.identity)
         finally:
