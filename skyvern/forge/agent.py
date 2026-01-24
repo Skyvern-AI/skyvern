@@ -2723,10 +2723,7 @@ class ForgeAgent:
                 model_name = match.group(1).lower()
 
             # Create cache for this task
-            # Use asyncio.to_thread to offload blocking HTTP request (requests.post)
-            # This prevents freezing the event loop during cache creation
-            cache_data = await asyncio.to_thread(
-                cache_manager.create_cache,
+            cache_data = await cache_manager.create_cache(
                 model_name=model_name,
                 static_content=static_prompt,
                 cache_key=cache_key,
