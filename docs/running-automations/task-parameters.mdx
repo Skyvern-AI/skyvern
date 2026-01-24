@@ -257,7 +257,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 ```
 </CodeGroup>
 
-On the cloud hosted version, you're billed per step. Set this to a reasonable value during development to cap costs.
+On the cloud-hosted version, you're billed per step. Set this to a reasonable value during development to cap costs.
 
 <Warning>
 Set `max_steps` during development to avoid runaway costs. A task that loops or gets stuck will keep consuming steps until it hits this limit.

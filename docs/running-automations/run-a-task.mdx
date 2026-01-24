@@ -12,10 +12,10 @@ You describe what you want in natural language, and Skyvern's AI navigates the w
 
 ## Call `run_task`
 
-A task requires two parameters:
+A task has one required parameter and one commonly used optional parameter:
 
-- **`prompt`** — Natural language instructions describing what the AI should do
-- **`url`** — The starting page for the automation
+- **`prompt`** (required) — Natural language instructions describing what the AI should do
+- **`url`** (optional) — The starting page for the automation
 
 For additional parameters like engines, proxies, and extraction schemas, see [Task Parameters](/running-automations/task-parameters).
 
@@ -115,7 +115,7 @@ Use the `run_id` to fetch results once the task reaches a terminal state.
 | `failed` | Task encountered an error—check `failure_reason` and retry or adjust your prompt |
 | `terminated` | Task was manually stopped |
 | `timed_out` | Task exceeded time limit—increase `max_steps` or simplify the task |
-| `canceled` | Task was cancelled before starting |
+| `canceled` | Task was canceled before starting |
 
 You have three options for retrieving results:
 
