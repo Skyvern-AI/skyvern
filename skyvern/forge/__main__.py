@@ -1,4 +1,5 @@
 import os
+import sys
 
 import structlog
 import uvicorn
@@ -16,7 +17,9 @@ if __name__ == "__main__":
     LOG.info("Agent server starting.", host="0.0.0.0", port=port)
     load_dotenv()
 
-    reload = settings.ENV == "local"
+    # Disable reload on Windows - uvicorn forces WindowsSelectorEventLoopPolicy when reload=True,
+    # but Windows needs WindowsProactorEventLoopPolicy for async subprocess operations
+    reload = settings.ENV == "local" and sys.platform != "win32"
 
     # Configure reload settings
     # Convert TEMP_PATH to relative path if it's absolute to avoid pathlib.glob() issues

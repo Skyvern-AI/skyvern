@@ -11,9 +11,12 @@ NOTE(jdo:streaming-local-dev)
 
 import structlog
 from fastapi import WebSocket
+from websockets.exceptions import ConnectionClosedOK
 
+from skyvern.config import settings
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming.auth import auth
+from skyvern.forge.sdk.routes.streaming.auth import _auth as local_auth
+from skyvern.forge.sdk.routes.streaming.auth import auth as real_auth
 from skyvern.forge.sdk.routes.streaming.channels.vnc import (
     Loops,
     VncChannel,
@@ -86,10 +89,11 @@ async def stream(
         workflow_run_id=workflow_run_id,
     )
 
+    auth = local_auth if settings.ENV == "local" else real_auth
     organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
 
     if not organization_id:
-        LOG.warning("Authentication failed.", task_id=task_id, workflow_run_id=workflow_run_id)
+        LOG.info("Authentication failed.", task_id=task_id, workflow_run_id=workflow_run_id)
         return
 
     vnc_channel: VncChannel
@@ -163,6 +167,13 @@ async def stream(
             organization_id=organization_id,
         )
         await collect(loops)
+    except ConnectionClosedOK:
+        LOG.info(
+            "VNC connection closed cleanly.",
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
     except Exception:
         LOG.exception(
             "An exception occurred in the vnc loop.",

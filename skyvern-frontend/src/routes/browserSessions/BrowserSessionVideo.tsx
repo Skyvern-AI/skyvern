@@ -3,12 +3,23 @@ import { useParams } from "react-router-dom";
 
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { artifactApiBaseUrl } from "@/util/env";
 
 interface Recording {
   url: string;
   checksum: string;
   filename: string;
   modified_at: string;
+}
+
+function getRecordingUrl(url: string | null | undefined): string | null {
+  if (!url) {
+    return null;
+  }
+  if (url.startsWith("file://")) {
+    return `${artifactApiBaseUrl}/artifact/recording?path=${url.slice(7)}`;
+  }
+  return url;
 }
 
 function BrowserSessionVideo() {
@@ -31,7 +42,9 @@ function BrowserSessionVideo() {
     enabled: !!browserSessionId,
   });
 
-  const recordings = browserSession?.recordings || [];
+  const isSessionRunning = browserSession?.status === "running";
+  // Don't show recordings while session is running - they're incomplete
+  const recordings = isSessionRunning ? [] : browserSession?.recordings || [];
 
   if (isLoading) {
     return (
@@ -59,8 +72,9 @@ function BrowserSessionVideo() {
             No recordings available
           </div>
           <div className="text-sm text-gray-400">
-            Video recordings will appear here when the browser session is active
-            and recording
+            {isSessionRunning
+              ? "Recordings will be available after the session completes"
+              : "No recordings were created for this session"}
           </div>
         </div>
       </div>
@@ -93,19 +107,19 @@ function BrowserSessionVideo() {
               </h3>
             </div>
 
-            {recording.url ? (
+            {getRecordingUrl(recording.url) ? (
               <div className="w-full">
                 <video
                   controls
                   className="w-full max-w-4xl rounded-lg"
-                  src={recording.url}
+                  src={getRecordingUrl(recording.url)!}
                   preload="metadata"
                 >
                   Your browser does not support the video tag.
                 </video>
                 <div className="mt-2 text-xs text-gray-500">
                   <a
-                    href={recording.url}
+                    href={getRecordingUrl(recording.url)!}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-blue-600 hover:text-blue-800"

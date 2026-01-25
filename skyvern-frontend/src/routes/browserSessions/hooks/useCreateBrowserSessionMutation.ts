@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useMutation } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
+import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { BrowserSession } from "@/routes/workflows/types/browserSessionTypes";
 import { ProxyLocation } from "@/api/types";
@@ -34,6 +35,26 @@ function useCreateBrowserSessionMutation() {
         queryKey: ["browser_sessions"],
       });
       navigate(`/browser-session/${response.data.browser_session_id}`);
+    },
+    onError: (error: unknown) => {
+      let errorMessage =
+        "Browser session could not be started. Please try again.";
+      if (error && typeof error === "object") {
+        const axiosError = error as {
+          response?: { data?: { detail?: string } };
+          message?: string;
+        };
+        if (axiosError.response?.data?.detail) {
+          errorMessage = axiosError.response.data.detail;
+        } else if (axiosError.message) {
+          errorMessage = axiosError.message;
+        }
+      }
+      toast({
+        variant: "destructive",
+        title: "Failed to create browser session",
+        description: errorMessage,
+      });
     },
   });
 }

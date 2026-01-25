@@ -19,6 +19,7 @@ from skyvern.utils.image_resizer import Resolution, scale_coordinates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
+    CaptchaType,
     CheckboxAction,
     ClickAction,
     ClickContext,
@@ -181,7 +182,10 @@ def parse_action(
         return NullAction(**base_action_dict)
 
     if action_type == ActionType.SOLVE_CAPTCHA:
-        return SolveCaptchaAction(**base_action_dict)
+        captcha_type: str | None = action.get("captcha_type")
+        return SolveCaptchaAction(
+            **base_action_dict, captcha_type=CaptchaType[captcha_type.upper()] if captcha_type else None
+        )
 
     if action_type == ActionType.CLOSE_PAGE:
         return ClosePageAction(**base_action_dict)

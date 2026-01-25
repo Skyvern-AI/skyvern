@@ -1325,6 +1325,30 @@ class AgentDB(BaseAlchemyDB):
             LOG.exception("UnexpectedError")
             raise
 
+    async def get_artifacts_by_ids(
+        self,
+        artifact_ids: list[str],
+        organization_id: str,
+    ) -> list[Artifact]:
+        if not artifact_ids:
+            return []
+        try:
+            async with self.Session() as session:
+                artifacts = (
+                    await session.scalars(
+                        select(ArtifactModel)
+                        .filter(ArtifactModel.artifact_id.in_(artifact_ids))
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).all()
+                return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
+        except SQLAlchemyError:
+            LOG.exception("SQLAlchemyError")
+            raise
+        except Exception:
+            LOG.exception("UnexpectedError")
+            raise
+
     async def get_artifacts_by_entity_id(
         self,
         *,
@@ -4681,6 +4705,7 @@ class AgentDB(BaseAlchemyDB):
         status: str | None = None,
         timeout_minutes: int | None = None,
         organization_id: str | None = None,
+        completed_at: datetime | None = None,
     ) -> PersistentBrowserSession:
         try:
             async with self.Session() as session:
@@ -4699,6 +4724,8 @@ class AgentDB(BaseAlchemyDB):
                     persistent_browser_session.status = status
                 if timeout_minutes:
                     persistent_browser_session.timeout_minutes = timeout_minutes
+                if completed_at:
+                    persistent_browser_session.completed_at = completed_at
 
                 await session.commit()
                 await session.refresh(persistent_browser_session)
@@ -4717,7 +4744,7 @@ class AgentDB(BaseAlchemyDB):
         self,
         browser_session_id: str,
         browser_address: str | None,
-        ip_address: str,
+        ip_address: str | None,
         ecs_task_arn: str | None,
         organization_id: str | None = None,
     ) -> None:
@@ -4745,6 +4772,47 @@ class AgentDB(BaseAlchemyDB):
                     await session.refresh(persistent_browser_session)
                 else:
                     raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def update_persistent_browser_session_compute_cost(
+        self,
+        session_id: str,
+        organization_id: str,
+        instance_type: str,
+        vcpu_millicores: int,
+        memory_mb: int,
+        duration_ms: int,
+        compute_cost: float,
+    ) -> None:
+        """Update the compute cost fields for a persistent browser session"""
+        try:
+            async with self.Session() as session:
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if persistent_browser_session:
+                    persistent_browser_session.instance_type = instance_type
+                    persistent_browser_session.vcpu_millicores = vcpu_millicores
+                    persistent_browser_session.memory_mb = memory_mb
+                    persistent_browser_session.duration_ms = duration_ms
+                    persistent_browser_session.compute_cost = compute_cost
+                    await session.commit()
+                    await session.refresh(persistent_browser_session)
+                else:
+                    raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
         except NotFoundError:
             LOG.error("NotFoundError", exc_info=True)
             raise

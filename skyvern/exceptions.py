@@ -829,6 +829,14 @@ class BrowserSessionNotFound(SkyvernHTTPException):
         )
 
 
+class BrowserSessionStartupTimeout(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} failed to start within the timeout period.",
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        )
+
+
 class BrowserProfileNotFound(SkyvernHTTPException):
     def __init__(self, profile_id: str, organization_id: str | None = None) -> None:
         message = f"Browser profile {profile_id} not found"
