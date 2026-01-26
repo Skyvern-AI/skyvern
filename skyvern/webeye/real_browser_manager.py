@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+import aiofiles
 import structlog
 from playwright.async_api import async_playwright
 
@@ -262,8 +263,8 @@ class RealBrowserManager(BrowserManager):
         for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
-                with open(path, "rb") as f:
-                    browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+                async with aiofiles.open(path, "rb") as f:
+                    browser_state.browser_artifacts.video_artifacts[i].video_data = await f.read()
 
         return browser_state.browser_artifacts.video_artifacts
 
@@ -277,8 +278,8 @@ class RealBrowserManager(BrowserManager):
         if browser_state:
             path = browser_state.browser_artifacts.har_path
             if path and os.path.exists(path=path):
-                with open(path, "rb") as f:
-                    return f.read()
+                async with aiofiles.open(path, "rb") as f:
+                    return await f.read()
         LOG.warning(
             "HAR data not found for task",
             task_id=task_id,
