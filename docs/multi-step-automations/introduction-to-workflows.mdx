@@ -1,0 +1,222 @@
+---
+title: Introduction to Workflows
+subtitle: Reusable, multi-step automations built from blocks
+slug: multi-step-automations/introduction-to-workflows
+---
+
+Workflows let you chain multiple automation steps into a single, reusable template. While a Task handles one thing at a time, a Workflow orchestrates an entire process—filling forms, validating data, downloading files, and sending results—all in sequence.
+
+---
+
+## What is a Workflow?
+
+A **Workflow** is a sequence of blocks that execute in order. Each block performs a specific operation, and blocks can pass data to subsequent blocks.
+
+For example, lets look at an IRS EIN registration workflow that fills out the SS-4 form, validates the information, downloads the confirmation letter, and emails it:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Worflow: IRS SS-4 Filing Workflow                                           │
+│  Input: ein_info, company_name, responsible_party                            │
+│  Output: EIN confirmation letter emailed to recipient                        │
+│                                                                              │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐    │
+│  │Navigation│   │Validation│   │Extraction│   │ File     │   │  Send    │    │
+│  │          │ → │          │ → │          │ → │ Download │ → │  Email   │    │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘    │
+│       │              │              │              │              │          │
+│ "Fill out      "Verify the    "Extract the   "Download      "Email the       │
+│  SS-4 form      summary is     assigned EIN   confirmation   letter to       │
+│  with company   correct"       and legal      letter PDF"    founders@       │
+│  info"                         name"                         company.com"    │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Tasks vs Workflows
+
+| Characteristic | Tasks | Workflows |
+|----------------|-------|-----------|
+| **Structure** | Single prompt, one execution | Multiple blocks in sequence |
+| **Scope** | Single goal, usually one page | Multi-step process across pages |
+| **Reusability** | Run ad-hoc or scheduled | Define once, run with different parameters |
+| **Parameterization** | Basic (prompt, URL, extraction schema) | Rich (input parameters, block outputs, Jinja templates) |
+| **Control Flow** | Linear | Loops, conditionals, validation gates |
+| **Data Passing** | Output returned at the end | Each block can pass data to subsequent blocks |
+| **Composition** | Single AI agent execution | Combine navigation, extraction, files, notifications |
+| **File Operations** | Download files during task | Download, parse, upload, email files across blocks |
+| **Best For** | Prototyping, simple extractions, one-offs | Production automations, bulk processing, complex logic |
+| **Run ID Format** | `tsk_*` | `wr_*` |
+
+**Use Tasks to:**
+- **Extract data from a single page** — Get the top 5 products and their prices from an e-commerce search results page
+- **Prototype before building a workflow** — Test if Skyvern can successfully navigate Airbnb's filters before building a price comparison workflow
+- **Run one-off jobs** — Check the current status of a specific support ticket on your vendor's portal
+- **Fill out simple forms** — Submit a contact form with your name, email, and message
+
+
+**Use Workflows to:**
+- **Automate multi-step processes** — Search a medical licensing database, click into a provider's profile, extract their credentials, check expiration dates, and email a compliance report
+- **Process items in bulk** — Download invoices for 50 orders from a supplier portal by looping through order IDs
+- **Chain dependent operations** — Parse a resume PDF to extract applicant information, then use that data to fill out 10 different job application forms
+- **Include validation and notifications** — Fill out an IRS SS-4 form, validate the summary page is correct, download the EIN confirmation letter, and email it to your team
+- **Create reusable automations** — Build a professional background check workflow that you run weekly for new hires, passing in different names and license numbers each time
+
+
+---
+
+## Workflow Structure:
+
+A workflow is defined as an ordered list of **blocks**. Blocks execute one after another, and each block can access the outputs of previous blocks.
+
+Let's look at an IRS EIN registration workflow that fills out a government form, validates the summary, extracts the result, downloads the confirmation letter, and emails it to your team:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Worflow: IRS SS-4 Filing Workflow                                           │
+│  Input: ein_info, company_name, responsible_party                            │
+│  Output: EIN confirmation letter emailed to recipient                        │
+│                                                                              │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐    │
+│  │Navigation│   │Validation│   │Extraction│   │ File     │   │  Send    │    │
+│  │          │ → │          │ → │          │ → │ Download │ → │  Email   │    │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘    │
+│       │              │              │              │              │          │
+│ "Fill out      "Verify the    "Extract the   "Download      "Email the       │
+│  SS-4 form      summary is     assigned EIN   confirmation   letter to       │
+│  with company   correct"       and legal      letter PDF"    founders@       │
+│  info"                         name"                         company.com"    │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+Here's what each block does in this workflow:
+
+- **Navigation** takes the company information from `ein_info` and fills out the multi-page SS-4 form until it reaches the review page
+- **Validation** checks that the form summary matches the provided information and either continues (if correct) or terminates the workflow (if incorrect)
+- **Extraction** pulls the assigned EIN number and legal name from the confirmation page into structured JSON output
+- **File Download** navigates to and downloads the EIN confirmation letter as a PDF file
+- **Send Email** attaches the downloaded PDF and sends it to the specified recipients with company details in the email body
+
+<Info>
+For detailed documentation on all available block types and their parameters, see [Workflow Blocks Reference](/multi-step-automations/workflow-blocks-reference).
+</Info>
+
+---
+
+## Example Workflow Patterns
+
+Here are patterns from real workflows showing how different block types combine.
+
+### Pattern 1: Search, Click, Extract
+
+Let's look at a credential verification workflow that searches a registry, clicks into the result, and extracts certification details.
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│  Workflow: ASHA Credential Lookup                                     │
+│  Input: first_name, last_name, employee_state                         │
+│  Output: asha_account_number, certification_status, valid_through     │
+│                                                                       │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐           │
+│  │  Navigation  │     │  Navigation  │     │  Extraction  │           │
+│  │              │ ──▶ │              │ ──▶ │              │           │
+│  └──────────────┘     └──────────────┘     └──────────────┘           │
+│         │                    │                    │                   │
+│    "Search ASHA         "Click into the      "Extract account         │
+│     for John Smith       profile link         number, status,         │
+│     in California        for John Smith"      and valid_through"      │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+Two Navigation blocks handle the multi-page search flow. The Extraction block captures structured data that subsequent blocks can reference.
+
+### Pattern 2: Parse File, Then Loop
+
+Let's look at a job application workflow that parses a resume once, then applies to multiple positions.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Bulk Job Applications                                                       │
+│                                                                              │
+│  ┌──────────────┐     ┌──────────────────────────────────────────────────┐   │
+│  │  PDF Parser  │     │                    For Loop                      │   │
+│  │              │     │   ┌──────────────────────────────────────────┐   │   │
+│  │              │ ──▶ │   │              Navigation                  │   │   │
+│  └──────────────┘     │   │                                          │   │   │
+│         │             │   │   Fill out the application form using    │   │   │
+│    Parse resume       │   │   parsed resume data and submit          │   │   │
+│    PDF to extract     │   └──────────────────────────────────────────┘   │   │
+│    name, experience,  │                    ↻ repeats for each URL        │   │
+│    and skills         └──────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Input: resume (file URL), job_urls (array), additional_information          │
+│  Output: application submitted for each job URL                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+The PDF Parser block runs once and outputs structured resume data. The For Loop iterates over an array of job URLs, running the nested Navigation block for each one. The Navigation block references `{{parsed_resume_output}}` to fill application forms.
+
+### Pattern 3: Extract, Validate, Conditionally Notify
+
+Let's look at a credential monitoring workflow that extracts data, checks conditions, and only sends email if there's an issue.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Workflow: Credential Expiration Monitor                                     │
+│  Input: first_name, last_name, current_credential_expiry                     │
+│  Output: Email sent only if credential needs attention                       │
+│                                                                              │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                  │
+│  │  Extraction  │     │  Validation  │     │  Send Email  │                  │
+│  │              │ ──▶ │              │ ──▶ │              │                  │
+│  └──────────────┘     └──────────────┘     └──────────────┘                  │
+│         │                    │                    │                          │
+│    "Extract status,     "If expired, inactive,  "Send alert:                │
+│     expiration date,     or date changed:       Credential                  │
+│     and mentor info      continue to email.     needs attention"            │
+│     from profile"        If active and valid:                               │
+│                          terminate (no email)"                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+The Validation block acts as a gatekeeper with two paths: **complete** (issue found → continue to Send Email) or **terminate** (everything OK → stop workflow). This pattern prevents unnecessary notifications.
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Build a Workflow"
+    icon="hammer"
+    href="/multi-step-automations/build-a-workflow"
+  >
+    Create your first workflow using the API
+  </Card>
+  <Card
+    title="Workflow Blocks Reference"
+    icon="cube"
+    href="/workflows/workflow-blocks-details"
+  >
+    Explore all available block types
+  </Card>
+  <Card
+    title="Core Concepts"
+    icon="book"
+    href="/getting-started/core-concepts"
+  >
+    Review the building blocks of Skyvern
+  </Card>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="/api-reference"
+  >
+    Full workflow API documentation
+  </Card>
+</CardGroup>
