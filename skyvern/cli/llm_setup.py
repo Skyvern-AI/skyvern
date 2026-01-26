@@ -4,10 +4,9 @@ from dotenv import load_dotenv, set_key
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
+from skyvern.cli.console import console
+from skyvern.cli.utils import strip_quotes
 from skyvern.utils.env_paths import resolve_backend_env_path
-
-from .console import console
-from .utils import strip_quotes
 
 
 def update_or_add_env_var(key: str, value: str) -> None:

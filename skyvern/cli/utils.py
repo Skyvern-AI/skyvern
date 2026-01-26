@@ -9,7 +9,14 @@ from skyvern.utils.env_paths import resolve_backend_env_path
 
 
 def strip_quotes(val: str | None) -> str:
-    """Strip surrounding single or double quotes from a value."""
+    """Strip surrounding single or double quotes from a value.
+
+    Args:
+        val: The input value or None.
+
+    Returns:
+        The unquoted value, or an empty string if val is None.
+    """
     if val is None:
         return ""
     return val.strip('"').strip("'")

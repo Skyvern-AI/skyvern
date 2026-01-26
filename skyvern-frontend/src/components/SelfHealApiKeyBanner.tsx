@@ -1,10 +1,9 @@
 import { useState } from "react";
-import axios from "axios";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/ui/use-toast";
-import { setApiKeyHeader } from "@/api/AxiosClient";
+import { getClient, setApiKeyHeader } from "@/api/AxiosClient";
 import {
   AuthStatusValue,
   useAuthDiagnostics,
@@ -82,10 +81,7 @@ function SelfHealApiKeyBanner() {
     setErrorMessage(null);
 
     try {
-      const client = axios.create({
-        baseURL: import.meta.env.VITE_API_BASE_URL,
-        timeout: 10_000,
-      });
+      const client = await getClient(null);
 
       const response = await client.post<{
         fingerprint?: string;
