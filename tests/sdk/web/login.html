@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            text-align: center;
+            background-color: #121212;
+            color: #f5f5f5;
+        }
+        h1 {
+            color: #f5f5f5;
+        }
+        .view {
+            display: none;
+        }
+        .view.active {
+            display: block;
+        }
+        .form-container {
+            margin: 30px 0;
+            padding: 30px;
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+        }
+        .input-group {
+            margin: 20px 0;
+            text-align: left;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            color: #d1d5db;
+        }
+        input[type="text"],
+        input[type="password"] {
+            padding: 12px 14px;
+            font-size: 16px;
+            width: 100%;
+            box-sizing: border-box;
+            border: 1px solid #2d2d2d;
+            border-radius: 8px;
+            background-color: #1b1b1b;
+            color: #f5f5f5;
+        }
+        input[type="text"]::placeholder,
+        input[type="password"]::placeholder {
+            color: #9ca3af;
+        }
+        input[type="text"]:focus,
+        input[type="password"]:focus {
+            outline: none;
+            border-color: #2563eb;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.35);
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            background-color: #2563eb;
+            color: #f5f5f5;
+            border: 1px solid #1d4ed8;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.3s, transform 0.1s;
+            box-shadow: 0 10px 25px rgba(37, 99, 235, 0.25);
+            margin: 10px 5px;
+        }
+        button:hover {
+            background-color: #1d4ed8;
+        }
+        button:active {
+            transform: scale(0.98);
+        }
+        button.secondary {
+            background-color: #374151;
+            border: 1px solid #4b5563;
+            box-shadow: 0 10px 25px rgba(55, 65, 81, 0.25);
+        }
+        button.secondary:hover {
+            background-color: #4b5563;
+        }
+        .error {
+            margin-top: 15px;
+            padding: 12px;
+            background-color: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            border-radius: 8px;
+            color: #fca5a5;
+            font-size: 14px;
+        }
+        .welcome {
+            margin: 30px 0;
+            padding: 20px;
+            font-size: 20px;
+            color: #86efac;
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
+        }
+        .account-info {
+            margin: 30px 0;
+            padding: 25px;
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+            text-align: left;
+        }
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid #2d2d2d;
+        }
+        .info-row:last-child {
+            border-bottom: none;
+        }
+        .info-label {
+            font-weight: 500;
+            color: #9ca3af;
+        }
+        .info-value {
+            color: #f5f5f5;
+        }
+        .click-section {
+            margin: 30px 0;
+            padding: 20px;
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
+        }
+        .click-counter {
+            margin-top: 15px;
+            font-size: 20px;
+            font-weight: bold;
+            color: #86efac;
+        }
+    </style>
+</head>
+<body>
+    <!-- Login View -->
+    <div id="loginView" class="view active">
+        <h1>Login</h1>
+        <div class="form-container">
+            <div class="input-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" placeholder="Enter username">
+            </div>
+            <div class="input-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" placeholder="Enter password">
+            </div>
+            <button id="loginBtn">Login</button>
+            <div id="errorMessage" class="error" style="display: none;"></div>
+        </div>
+    </div>
+
+    <!-- Main View -->
+    <div id="mainView" class="view">
+        <h1>Dashboard</h1>
+        <div class="welcome" id="welcomeMessage"></div>
+        <button id="accountBtn">Account</button>
+        <button id="logoutBtn" class="secondary">Logout</button>
+    </div>
+
+    <!-- Account View -->
+    <div id="accountView" class="view">
+        <h1>Account Information</h1>
+        <div class="account-info">
+            <div class="info-row">
+                <span class="info-label">Username:</span>
+                <span class="info-value" id="accountUsername"></span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Email:</span>
+                <span class="info-value" id="accountEmail"></span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Member Since:</span>
+                <span class="info-value" id="accountMemberSince"></span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Account Type:</span>
+                <span class="info-value" id="accountType"></span>
+            </div>
+        </div>
+        <div class="click-section">
+            <button id="clickMeBtn">Click Me</button>
+            <div id="clickCounter" class="click-counter">Button clicked 0 times</div>
+        </div>
+        <button id="backBtn" class="secondary">Back to Dashboard</button>
+        <button id="logoutFromAccountBtn" class="secondary">Logout</button>
+    </div>
+
+    <script>
+        // In-memory state
+        let currentUser = null;
+        let clickCount = 0;
+
+        // Views
+        const loginView = document.getElementById('loginView');
+        const mainView = document.getElementById('mainView');
+        const accountView = document.getElementById('accountView');
+
+        // Login elements
+        const usernameInput = document.getElementById('username');
+        const passwordInput = document.getElementById('password');
+        const loginBtn = document.getElementById('loginBtn');
+        const errorMessage = document.getElementById('errorMessage');
+
+        // Main view elements
+        const welcomeMessage = document.getElementById('welcomeMessage');
+        const accountBtn = document.getElementById('accountBtn');
+        const logoutBtn = document.getElementById('logoutBtn');
+
+        // Account view elements
+        const accountUsername = document.getElementById('accountUsername');
+        const accountEmail = document.getElementById('accountEmail');
+        const accountMemberSince = document.getElementById('accountMemberSince');
+        const accountType = document.getElementById('accountType');
+        const clickMeBtn = document.getElementById('clickMeBtn');
+        const clickCounter = document.getElementById('clickCounter');
+        const backBtn = document.getElementById('backBtn');
+        const logoutFromAccountBtn = document.getElementById('logoutFromAccountBtn');
+
+        // Fake user data
+        const validCredentials = {
+            username: 'testlogin',
+            password: 'testpassword',
+            email: 'testlogin@example.com',
+            memberSince: 'January 2024',
+            accountType: 'Premium'
+        };
+
+        function showView(view) {
+            loginView.classList.remove('active');
+            mainView.classList.remove('active');
+            accountView.classList.remove('active');
+            view.classList.add('active');
+        }
+
+        function login() {
+            const username = usernameInput.value.trim();
+            const password = passwordInput.value;
+
+            if (username === validCredentials.username && password === validCredentials.password) {
+                currentUser = validCredentials;
+                welcomeMessage.textContent = `Welcome back, ${currentUser.username}!`;
+                errorMessage.style.display = 'none';
+                usernameInput.value = '';
+                passwordInput.value = '';
+                showView(mainView);
+            } else {
+                errorMessage.textContent = 'Invalid username or password';
+                errorMessage.style.display = 'block';
+            }
+        }
+
+        function logout() {
+            currentUser = null;
+            showView(loginView);
+        }
+
+        function showAccount() {
+            if (currentUser) {
+                accountUsername.textContent = currentUser.username;
+                accountEmail.textContent = currentUser.email;
+                accountMemberSince.textContent = currentUser.memberSince;
+                accountType.textContent = currentUser.accountType;
+                showView(accountView);
+            }
+        }
+
+        // Event listeners
+        loginBtn.addEventListener('click', login);
+
+        usernameInput.addEventListener('keypress', function(event) {
+            if (event.key === 'Enter') {
+                login();
+            }
+        });
+
+        passwordInput.addEventListener('keypress', function(event) {
+            if (event.key === 'Enter') {
+                login();
+            }
+        });
+
+        accountBtn.addEventListener('click', showAccount);
+        backBtn.addEventListener('click', () => showView(mainView));
+        logoutBtn.addEventListener('click', logout);
+        logoutFromAccountBtn.addEventListener('click', logout);
+
+        clickMeBtn.addEventListener('click', function() {
+            clickCount++;
+            clickCounter.textContent = `Button clicked ${clickCount} times`;
+        });
+    </script>
+</body>
+</html>
