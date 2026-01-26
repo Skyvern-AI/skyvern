@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Upload</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            text-align: center;
+            background-color: #121212;
+            color: #f5f5f5;
+        }
+        h1 {
+            color: #f5f5f5;
+        }
+        .upload-container {
+            margin: 30px 0;
+            padding: 40px;
+            border: 2px dashed #3f3f3f;
+            border-radius: 12px;
+            background-color: #1e1e1e;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+        }
+        input[type="file"] {
+            padding: 10px;
+            font-size: 16px;
+            cursor: pointer;
+            color: #f5f5f5;
+        }
+        input[type="file"]::-webkit-file-upload-button {
+            padding: 10px 18px;
+            font-size: 14px;
+            background-color: #2563eb;
+            color: #f5f5f5;
+            border: 1px solid #1d4ed8;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.3s, transform 0.1s;
+        }
+        input[type="file"]::-webkit-file-upload-button:hover {
+            background-color: #1d4ed8;
+        }
+        input[type="file"]::-webkit-file-upload-button:active {
+            transform: scale(0.98);
+        }
+        #preview {
+            margin-top: 30px;
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            padding: 30px;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+        }
+        #preview img {
+            max-width: 100%;
+            max-height: 500px;
+            border-radius: 8px;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+        }
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <h1>Upload an Image</h1>
+
+    <div class="upload-container">
+        <input type="file" id="imageUpload" accept="image/*">
+    </div>
+
+    <div id="preview" class="hidden">
+        <h2>Your Image:</h2>
+        <img id="uploadedImage" src="" alt="Uploaded image">
+    </div>
+
+    <script>
+        const fileInput = document.getElementById('imageUpload');
+        const preview = document.getElementById('preview');
+        const uploadedImage = document.getElementById('uploadedImage');
+
+        fileInput.addEventListener('change', function(event) {
+            const file = event.target.files[0];
+
+            if (file && file.type.startsWith('image/')) {
+                const reader = new FileReader();
+
+                reader.onload = function(e) {
+                    uploadedImage.src = e.target.result;
+                    preview.classList.remove('hidden');
+                };
+
+                reader.readAsDataURL(file);
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Text Input Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            text-align: center;
+            background-color: #121212;
+            color: #f5f5f5;
+        }
+        h1 {
+            color: #f5f5f5;
+        }
+        .input-container {
+            margin: 30px 0;
+            padding: 25px;
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+            display: inline-flex;
+            gap: 12px;
+        }
+        input[type="text"] {
+            padding: 12px 14px;
+            font-size: 16px;
+            width: 300px;
+            border: 1px solid #2d2d2d;
+            border-radius: 8px;
+            background-color: #1b1b1b;
+            color: #f5f5f5;
+        }
+        input[type="text"]::placeholder {
+            color: #9ca3af;
+        }
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #2563eb;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.35);
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            background-color: #2563eb;
+            color: #f5f5f5;
+            border: 1px solid #1d4ed8;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.3s, transform 0.1s;
+            box-shadow: 0 10px 25px rgba(37, 99, 235, 0.25);
+        }
+        button:hover {
+            background-color: #1d4ed8;
+        }
+        button:active {
+            transform: scale(0.98);
+        }
+        #output {
+            margin-top: 30px;
+            padding: 20px;
+            font-size: 24px;
+            font-weight: bold;
+            color: #86efac;
+            min-height: 50px;
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
+        }
+    </style>
+</head>
+<body>
+    <h1>Enter Your Name</h1>
+
+    <div class="input-container">
+        <input type="text" id="nameInput" placeholder="Type your name here...">
+        <button id="submitBtn">Submit</button>
+    </div>
+
+    <div id="output"></div>
+
+    <script>
+        const nameInput = document.getElementById('nameInput');
+        const submitBtn = document.getElementById('submitBtn');
+        const output = document.getElementById('output');
+
+        function showGreeting() {
+            const name = nameInput.value.trim();
+            if (name) {
+                output.textContent = `Hello, ${name}!`;
+            } else {
+                output.textContent = 'Please enter a name!';
+            }
+        }
+
+        submitBtn.addEventListener('click', showGreeting);
+
+        // Allow pressing Enter to submit
+        nameInput.addEventListener('keypress', function(event) {
+            if (event.key === 'Enter') {
+                showGreeting();
+            }
+        });
+    </script>
+</body>
+</html>
