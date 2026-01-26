@@ -57,7 +57,7 @@ async def verify_browser_session(
 
         return dummy_browser_session
 
-    browser_session = await app.DATABASE.get_persistent_browser_session(browser_session_id, organization_id)
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, organization_id)
 
     if not browser_session:
         LOG.info(
