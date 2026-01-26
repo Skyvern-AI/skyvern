@@ -27,6 +27,7 @@ from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_e
 
 
 def strip_quotes(val: str | None) -> str:
+    """Strip surrounding single or double quotes from a value."""
     if val is None:
         return ""
     return val.strip('"').strip("'")

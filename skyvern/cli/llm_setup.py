@@ -52,7 +52,8 @@ def update_or_add_env_var(key: str, value: str) -> None:
             set_key(env_path, k, v)
 
     # Sanitize API key and other sensitive values to avoid unwanted quotes
-    def strip_quotes(val: str) -> str:
+    def strip_quotes(val: str | None) -> str:
+        """Strip surrounding single or double quotes from a value."""
         if val is None:
             return ""
         return val.strip('"').strip("'")
