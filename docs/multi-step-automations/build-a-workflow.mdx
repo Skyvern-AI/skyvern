@@ -1,0 +1,574 @@
+---
+title: Build a Workflow
+subtitle: Create, run, and test multi-step automations
+slug: multi-step-automations/build-a-workflow
+---
+
+A **Workflow** chains multiple automation steps into a reusable template.
+
+You define the workflow once with blocks, then run it with different parameters each time.
+
+---
+
+## Create a workflow
+
+A workflow requires:
+
+- **`title`** — Name for the workflow
+- **`workflow_definition`** — The blocks, parameters, and logic
+
+For all available parameters, see [Workflow Parameters](/multi-step-automations/workflow-parameters).
+
+<CodeGroup>
+```python Python
+import os
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+    workflow = await client.create_workflow(
+        title="Job Application Workflow",
+        workflow_definition={
+            "parameters": [
+                {
+                    "key": "resume",
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "file_url"
+                },
+                {
+                    "key": "job_url",
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "string"
+                }
+            ],
+            "blocks": [
+                {
+                    "label": "parse_resume",
+                    "block_type": "pdf_parser",
+                    "file_url": "{{ resume }}"
+                },
+                {
+                    "label": "apply_to_job",
+                    "block_type": "navigation",
+                    "url": "{{ job_url }}",
+                    "navigation_goal": """
+                        Apply for the job using the parsed resume information.
+
+                        Resume data: {{ parse_resume_output }}
+                    """
+                }
+            ]
+        }
+    )
+
+    print(f"Workflow ID: {workflow.workflow_permanent_id}")
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+
+async function main() {
+  const client = new SkyvernClient({
+    apiKey: process.env.SKYVERN_API_KEY,
+  });
+
+  const workflow = await client.createWorkflow({
+    body: {
+      title: "Job Application Workflow",
+      workflow_definition: {
+        parameters: [
+          {
+            key: "resume",
+            parameter_type: "workflow",
+            workflow_parameter_type: "file_url",
+          },
+          {
+            key: "job_url",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+          },
+        ],
+        blocks: [
+          {
+            label: "parse_resume",
+            block_type: "pdf_parser",
+            file_url: "{{ resume }}",
+          },
+          {
+            label: "apply_to_job",
+            block_type: "navigation",
+            url: "{{ job_url }}",
+            navigation_goal: `
+              Apply for the job using the parsed resume information.
+
+              Resume data: {{ parse_resume_output }}
+            `,
+          },
+        ],
+      },
+    },
+  });
+
+  console.log(`Workflow ID: ${workflow.workflow_permanent_id}`);
+}
+
+main();
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Job Application Workflow",
+    "workflow_definition": {
+      "parameters": [
+        {
+          "key": "resume",
+          "parameter_type": "workflow",
+          "workflow_parameter_type": "file_url"
+        },
+        {
+          "key": "job_url",
+          "parameter_type": "workflow",
+          "workflow_parameter_type": "string"
+        }
+      ],
+      "blocks": [
+        {
+          "label": "parse_resume",
+          "block_type": "pdf_parser",
+          "file_url": "{{ resume }}"
+        },
+        {
+          "label": "apply_to_job",
+          "block_type": "navigation",
+          "url": "{{ job_url }}",
+          "navigation_goal": "Apply for the job using the parsed resume information.\n\nResume data: {{ parse_resume_output }}"
+        }
+      ]
+    }
+  }'
+```
+</CodeGroup>
+
+**Example response:**
+
+```json
+{
+  "workflow_permanent_id": "wpid_123456789",
+  "workflow_id": "wf_987654321",
+  "version": 1,
+  "title": "Job Application Workflow",
+  "workflow_definition": {
+    "parameters": [...],
+    "blocks": [...]
+  },
+  "created_at": "2026-01-20T12:00:00.000000",
+  "modified_at": "2026-01-20T12:00:00.000000"
+}
+```
+
+The response includes a `workflow_permanent_id`. Use this ID to run the workflow.
+
+---
+
+## Connect blocks with parameters
+
+Blocks pass data to each other through **output parameters**. When a block completes, its output becomes available to subsequent blocks.
+
+### Reference block outputs
+
+Use Jinja templating to reference a block's output:
+
+```
+{{ block_label_output }}
+```
+
+For example, if a block has the label `parse_resume`, its output is available as `{{ parse_resume_output }}`.
+
+### Example: Parse and apply
+
+```yaml
+blocks:
+  - label: parse_resume
+    block_type: pdf_parser
+    file_url: "{{ resume }}"
+
+  - label: apply_to_job
+    block_type: navigation
+    url: "{{ job_url }}"
+    navigation_goal: |
+      Fill out the job application form.
+
+      Use this information:
+      - Name: {{ parse_resume_output.name }}
+      - Email: {{ parse_resume_output.email }}
+      - Experience: {{ parse_resume_output.work_experience }}
+```
+
+The Navigation block waits for the PDF Parser block to complete, then uses the parsed data to fill out the form.
+
+### Example: Loop over items
+
+```yaml
+blocks:
+  - label: extract_orders
+    block_type: extraction
+    url: "https://example.com/orders"
+    data_extraction_goal: "Extract all order IDs from the page"
+    data_schema:
+      type: object
+      properties:
+        order_ids:
+          type: array
+          items:
+            type: string
+
+  - label: download_invoices
+    block_type: for_loop
+    loop_over_parameter_key: extract_orders_output.order_ids
+    loop_blocks:
+      - label: download_invoice
+        block_type: file_download
+        url: "https://example.com/invoice/{{ download_invoice.current_value }}"
+        navigation_goal: "Download the invoice PDF"
+```
+
+The For Loop iterates over `order_ids` from the Extraction block. Inside the loop, `{{ download_invoice.current_value }}` contains the current order ID.
+
+---
+
+## Run a workflow
+
+Once created, run the workflow by passing values for its input parameters.
+
+<CodeGroup>
+```python Python
+run = await client.run_workflow(
+    workflow_permanent_id="wpid_123456789",
+    data={
+        "resume": "https://example.com/resume.pdf",
+        "job_url": "https://jobs.lever.co/company/position"
+    }
+)
+
+print(f"Run ID: {run.workflow_run_id}")
+```
+
+```typescript TypeScript
+const run = await client.runWorkflow("wpid_123456789", {
+  body: {
+    data: {
+      resume: "https://example.com/resume.pdf",
+      job_url: "https://jobs.lever.co/company/position",
+    },
+  },
+});
+
+console.log(`Run ID: ${run.workflow_run_id}`);
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_permanent_id": "wpid_123456789",
+    "data": {
+      "resume": "https://example.com/resume.pdf",
+      "job_url": "https://jobs.lever.co/company/position"
+    }
+  }'
+```
+</CodeGroup>
+
+**Example response:**
+
+```json
+{
+  "workflow_permanent_id": "wpid_123456789",
+  "workflow_run_id": "wr_486305187432193510"
+}
+```
+
+The response includes a `workflow_run_id`. Use this ID to check status and fetch results.
+
+---
+
+## Get results
+
+The `run_workflow` call queues the workflow and returns immediately.
+
+Use the `workflow_run_id` to fetch results once the workflow reaches a terminal state.
+
+| Status | Description |
+|--------|-------------|
+| `created` | Workflow initialized, not yet queued |
+| `queued` | Waiting for resources |
+| `running` | Blocks are executing |
+| `completed` | Workflow finished successfully |
+| `failed` | Workflow encountered an error |
+| `terminated` | Workflow was manually stopped |
+| `timed_out` | Workflow exceeded time limit |
+| `canceled` | Workflow was cancelled before starting |
+
+You have two options for retrieving results:
+
+### Option 1: Polling
+
+Poll `get_run` until status is terminal.
+
+<CodeGroup>
+```python Python
+workflow_run_id = run.workflow_run_id
+
+while True:
+    result = await client.get_run(workflow_run_id)
+
+    if result.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+        break
+
+    await asyncio.sleep(5)
+
+print(f"Status: {result.status}")
+print(f"Outputs: {result.outputs}")
+```
+
+```typescript TypeScript
+const workflowRunId = run.workflow_run_id;
+
+while (true) {
+  const result = await client.getRun(workflowRunId);
+
+  if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(result.status)) {
+    console.log(`Status: ${result.status}`);
+    console.log(`Outputs: ${JSON.stringify(result.outputs)}`);
+    break;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+```
+
+```bash cURL
+#!/bin/bash
+WORKFLOW_RUN_ID="wr_486305187432193510"
+
+while true; do
+  RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$WORKFLOW_RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY")
+
+  STATUS=$(echo "$RESPONSE" | jq -r '.status')
+  echo "Status: $STATUS"
+
+  if [[ "$STATUS" == "completed" || "$STATUS" == "failed" || "$STATUS" == "terminated" || "$STATUS" == "timed_out" || "$STATUS" == "canceled" ]]; then
+    echo "$RESPONSE" | jq '.outputs'
+    break
+  fi
+
+  sleep 5
+done
+```
+</CodeGroup>
+
+### Option 2: Webhooks
+
+Pass a `webhook_callback_url` when running the workflow. Skyvern sends a POST request to your URL when the workflow completes.
+
+<CodeGroup>
+```python Python
+run = await client.run_workflow(
+    workflow_permanent_id="wpid_123456789",
+    data={
+        "resume": "https://example.com/resume.pdf",
+        "job_url": "https://jobs.lever.co/company/position"
+    },
+    webhook_callback_url="https://your-server.com/webhook"
+)
+```
+
+```typescript TypeScript
+const run = await client.runWorkflow("wpid_123456789", {
+  body: {
+    data: {
+      resume: "https://example.com/resume.pdf",
+      job_url: "https://jobs.lever.co/company/position",
+    },
+    webhook_callback_url: "https://your-server.com/webhook",
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_permanent_id": "wpid_123456789",
+    "data": {
+      "resume": "https://example.com/resume.pdf",
+      "job_url": "https://jobs.lever.co/company/position"
+    },
+    "webhook_callback_url": "https://your-server.com/webhook"
+  }'
+```
+</CodeGroup>
+
+For webhook authentication and retry options, see [Webhooks FAQ](/running-automations/webhooks-faq).
+
+---
+
+## Understand the response
+
+The response from polling contains the workflow run status and outputs from each block.
+
+```json
+{
+  "workflow_run_id": "wr_486305187432193510",
+  "workflow_permanent_id": "wpid_123456789",
+  "status": "completed",
+  "proxy_location": "RESIDENTIAL",
+  "webhook_callback_url": null,
+  "created_at": "2026-01-20T12:00:00.000000",
+  "modified_at": "2026-01-20T12:05:00.000000",
+  "parameters": {
+    "resume": "https://example.com/resume.pdf",
+    "job_url": "https://jobs.lever.co/company/position"
+  },
+  "screenshot_urls": [
+    "https://skyvern-artifacts.s3.amazonaws.com/.../screenshot_final.png"
+  ],
+  "recording_url": "https://skyvern-artifacts.s3.amazonaws.com/.../recording.webm",
+  "outputs": {
+    "parse_resume_output": {
+      "name": "John Smith",
+      "email": "john@example.com",
+      "work_experience": [...]
+    },
+    "apply_to_job_output": {
+      "task_id": "tsk_123456",
+      "status": "completed",
+      "extracted_information": null
+    }
+  }
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `workflow_run_id` | string | Unique identifier for this run |
+| `workflow_permanent_id` | string | The workflow template ID |
+| `status` | string | Current status: `created`, `queued`, `running`, `completed`, `failed`, `terminated`, `timed_out`, `canceled` |
+| `parameters` | object | Input parameters passed when running |
+| `outputs` | object | Output from each block, keyed by `{label}_output` |
+| `screenshot_urls` | array | Final screenshots from the last blocks |
+| `recording_url` | string | Video recording of the browser session |
+| `proxy_location` | string | Proxy location used |
+| `webhook_callback_url` | string \| null | Webhook URL if configured |
+| `created_at` | datetime | When the run started |
+| `modified_at` | datetime | When the run was last updated |
+
+### Block outputs
+
+Each block's output appears in the `outputs` object with the key `{label}_output`. The structure depends on the block type:
+
+**Navigation/Action blocks:**
+```json
+{
+  "apply_to_job_output": {
+    "task_id": "tsk_123456",
+    "status": "completed",
+    "extracted_information": null,
+    "failure_reason": null
+  }
+}
+```
+
+**Extraction blocks:**
+```json
+{
+  "extract_data_output": {
+    "product_name": "Widget Pro",
+    "price": 99.99,
+    "in_stock": true
+  }
+}
+```
+
+**For Loop blocks:**
+```json
+{
+  "download_invoices_output": [
+    { "task_id": "tsk_111", "status": "completed" },
+    { "task_id": "tsk_222", "status": "completed" },
+    { "task_id": "tsk_333", "status": "completed" }
+  ]
+}
+```
+
+---
+
+## List your workflows
+
+Retrieve all workflows in your organization.
+
+<CodeGroup>
+```python Python
+workflows = await client.list_workflows()
+
+for workflow in workflows:
+    print(f"{workflow.workflow_permanent_id}: {workflow.title}")
+```
+
+```typescript TypeScript
+const workflows = await client.listWorkflows();
+
+for (const workflow of workflows) {
+  console.log(`${workflow.workflow_permanent_id}: ${workflow.title}`);
+}
+```
+
+```bash cURL
+curl -X GET "https://api.skyvern.com/v1/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+---
+
+## Next steps
+  <Card
+    title="Workflow Blocks Reference"
+    icon="cube"
+    href="/multi-step-automations/workflow-blocks-reference"
+  >
+    Detailed documentation for all 16 block types
+  </Card>
+  <Card
+    title="Workflow Parameters"
+    icon="sliders"
+    href="/multi-step-automations/workflow-parameters"
+  >
+    Configure proxies, webhooks, and other run options
+  </Card>
+  <Card
+    title="File Operations"
+    icon="file"
+    href="/multi-step-automations/file-operations"
+  >
+    Download, parse, and upload files in workflows
+  </Card>
+  <Card
+    title="Introduction to Workflows"
+    icon="book"
+    href="/multi-step-automations/introduction-to-workflows"
+  >
+    Learn about workflow concepts and patterns
+  </Card>

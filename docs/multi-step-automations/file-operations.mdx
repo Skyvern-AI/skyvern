@@ -1,0 +1,440 @@
+---
+title: File Operations
+subtitle: Download, parse, and upload files in workflows
+slug: multi-step-automations/file-operations
+---
+
+Workflows often need to handle files—downloading invoices, parsing spreadsheets, uploading documents to storage. This page covers the four core file operations: downloading, parsing, saving, and passing files between blocks.
+
+---
+
+## Downloading files
+
+When your workflow needs to retrieve documents from a website—invoices from a vendor portal, confirmation letters after form submission, compliance certificates—use `file_download`. Downloaded files land in `SKYVERN_DOWNLOAD_DIRECTORY`, a special directory you can reference in later blocks to upload or email them.
+
+Let's download an EIN confirmation letter from the IRS:
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "file_download",
+  "label": "download_ein_letter",
+  "url": "https://sa.www4.irs.gov/modiein/individual/index.jsp",
+  "navigation_goal": "Find and download the EIN confirmation letter PDF. Look for a Download or Print button. COMPLETE when the download starts.",
+  "download_suffix": "ein_confirmation.pdf"
+}
+```
+
+```yaml YAML
+- block_type: file_download
+  label: download_ein_letter
+  url: "https://sa.www4.irs.gov/modiein/individual/index.jsp"
+  navigation_goal: |
+    Find and download the EIN confirmation letter PDF.
+    Look for a Download or Print button.
+    COMPLETE when the download starts.
+  download_suffix: ein_confirmation.pdf
+```
+</CodeGroup>
+
+The `navigation_goal` tells Skyvern how to find and trigger the download. The file lands in `SKYVERN_DOWNLOAD_DIRECTORY` automatically.
+
+| Parameter | Type | Use this to |
+|-----------|------|-------------|
+| `navigation_goal` | string | Describe how to find and click the download button |
+| `url` | string | Set the starting page (omit to continue from previous block) |
+| `download_suffix` | string | Set the filename for the downloaded file |
+| `download_timeout` | number | Allow more time for large files (in seconds) |
+| `max_retries` | integer | Retry the block on failure |
+| `max_steps_per_run` | integer | Limit how many actions the block can take |
+| `engine` | string | Set the AI engine (`skyvern-1.0` or `skyvern-2.0`) |
+
+### Downloading multiple files
+
+Extract a list of URLs first, then loop through them:
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "for_loop",
+  "label": "download_all_invoices",
+  "loop_over_parameter_key": "get_invoices_output.urls",
+  "continue_on_failure": true,
+  "loop_blocks": [
+    {
+      "block_type": "file_download",
+      "label": "download_invoice",
+      "url": "{{ download_invoice.current_value }}",
+      "navigation_goal": "Download the invoice PDF from this page"
+    }
+  ]
+}
+```
+
+```yaml YAML
+- block_type: for_loop
+  label: download_all_invoices
+  loop_over_parameter_key: get_invoices_output.urls
+  continue_on_failure: true
+  loop_blocks:
+    - block_type: file_download
+      label: download_invoice
+      url: "{{ download_invoice.current_value }}"
+      navigation_goal: Download the invoice PDF from this page
+```
+</CodeGroup>
+
+All files accumulate in `SKYVERN_DOWNLOAD_DIRECTORY`. After the loop, upload or email them all in one block.
+
+---
+
+## Parsing files
+
+When your workflow needs to act on information from a file—filling forms with resume data, processing orders from a spreadsheet, extracting fields from a PDF—use `file_url_parser`. It downloads the file, parses it, and returns structured data you can use in subsequent blocks.
+
+Let's parse a resume PDF to extract candidate information:
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "file_url_parser",
+  "label": "parse_resume",
+  "file_url": "{{ resume }}",
+  "file_type": "pdf",
+  "json_schema": {
+    "type": "object",
+    "properties": {
+      "name": { "type": "string" },
+      "email": { "type": "string" },
+      "work_experience": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "company": { "type": "string" },
+            "role": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+```yaml YAML
+- block_type: file_url_parser
+  label: parse_resume
+  file_url: "{{ resume }}"
+  file_type: pdf
+  json_schema:
+    type: object
+    properties:
+      name:
+        type: string
+      email:
+        type: string
+      work_experience:
+        type: array
+        items:
+          type: object
+          properties:
+            company:
+              type: string
+            role:
+              type: string
+```
+</CodeGroup>
+
+With a `json_schema`, Skyvern uses an LLM to extract exactly the fields you specify. Without a schema, you get the raw parsed content.
+
+| Parameter | Type | Use this to |
+|-----------|------|-------------|
+| `file_url` | string | Point to the file (HTTP URL, S3 URI, or parameter like `{{ resume }}`) |
+| `file_type` | string | Specify format: `csv`, `excel`, or `pdf` |
+| `json_schema` | object | Define the structure you want extracted |
+
+**Supported sources for `file_url`:**
+- HTTP/HTTPS URLs
+- S3 URIs (`s3://bucket/path/file.csv`)
+- Azure Blob URIs (`azure://container/path/file.xlsx`)
+- Google Drive links (auto-converted)
+- Workflow parameters (`{{ parameter_name }}`)
+
+### Parsing a CSV and processing each row
+
+<CodeGroup>
+```json JSON
+[
+  {
+    "block_type": "file_url_parser",
+    "label": "parse_orders",
+    "file_url": "{{ orders_csv }}",
+    "file_type": "csv"
+  },
+  {
+    "block_type": "for_loop",
+    "label": "process_orders",
+    "loop_over_parameter_key": "parse_orders_output",
+    "loop_blocks": [
+      {
+        "block_type": "navigation",
+        "label": "enter_order",
+        "url": "https://erp.example.com/orders/new",
+        "navigation_goal": "Create a new order with: {{ enter_order.current_value }}"
+      }
+    ]
+  }
+]
+```
+
+```yaml YAML
+- block_type: file_url_parser
+  label: parse_orders
+  file_url: "{{ orders_csv }}"
+  file_type: csv
+
+- block_type: for_loop
+  label: process_orders
+  loop_over_parameter_key: parse_orders_output
+  loop_blocks:
+    - block_type: navigation
+      label: enter_order
+      url: "https://erp.example.com/orders/new"
+      navigation_goal: "Create a new order with: {{ enter_order.current_value }}"
+```
+</CodeGroup>
+
+CSV parsing returns an array of objects—one per row, with column headers as keys. Loop over `parse_orders_output` to process each row.
+
+---
+
+## Saving files
+
+When your workflow needs to store downloaded files permanently—archiving invoices, sending reports to a shared bucket, integrating with other systems—use one of the upload blocks.
+
+### Upload to Skyvern's S3
+
+Use `upload_to_s3` for the simplest option. It uploads everything from `SKYVERN_DOWNLOAD_DIRECTORY` and returns S3 URIs:
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "upload_to_s3",
+  "label": "save_invoices",
+  "path": "SKYVERN_DOWNLOAD_DIRECTORY"
+}
+```
+
+```yaml YAML
+- block_type: upload_to_s3
+  label: save_invoices
+  path: SKYVERN_DOWNLOAD_DIRECTORY
+```
+</CodeGroup>
+
+The output is a list of S3 URIs you can return from your workflow or use in subsequent blocks.
+
+| Parameter | Type | Use this to |
+|-----------|------|-------------|
+| `path` | string | Specify what to upload (`SKYVERN_DOWNLOAD_DIRECTORY` or a specific file path) |
+
+**Limit:** 25 files maximum per upload.
+
+### Upload to your own storage
+
+Use `file_upload` when files need to land in your own S3 bucket or Azure Blob Storage:
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "file_upload",
+  "label": "upload_to_company_bucket",
+  "storage_type": "s3",
+  "s3_bucket": "company-documents",
+  "aws_access_key_id": "{{ aws_key }}",
+  "aws_secret_access_key": "{{ aws_secret }}",
+  "region_name": "us-west-2",
+  "path": "SKYVERN_DOWNLOAD_DIRECTORY"
+}
+```
+
+```yaml YAML
+- block_type: file_upload
+  label: upload_to_company_bucket
+  storage_type: s3
+  s3_bucket: company-documents
+  aws_access_key_id: "{{ aws_key }}"
+  aws_secret_access_key: "{{ aws_secret }}"
+  region_name: us-west-2
+  path: SKYVERN_DOWNLOAD_DIRECTORY
+```
+</CodeGroup>
+
+| Parameter | Type | Use this to |
+|-----------|------|-------------|
+| `storage_type` | string | Choose `s3` or `azure` |
+| `path` | string | Specify what to upload (`SKYVERN_DOWNLOAD_DIRECTORY` or a file path) |
+
+**S3 parameters:** `s3_bucket`, `aws_access_key_id`, `aws_secret_access_key`, `region_name`
+
+**Azure parameters:** `azure_storage_account_name`, `azure_storage_account_key`, `azure_blob_container_name`, `azure_folder_path`
+
+**Limit:** 50 files maximum per upload.
+
+### Quick URL-to-S3
+
+When you already have a direct file URL and just need to save it—no browser navigation required—use `download_to_s3`:
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "download_to_s3",
+  "label": "save_report",
+  "url": "https://analytics.example.com/report.pdf"
+}
+```
+
+```yaml YAML
+- block_type: download_to_s3
+  label: save_report
+  url: "https://analytics.example.com/report.pdf"
+```
+</CodeGroup>
+
+| Parameter | Type | Use this to |
+|-----------|------|-------------|
+| `url` | string | Specify the file URL to download and save |
+
+This skips the browser entirely—faster when you have the URL. **Limit:** 10 MB maximum file size.
+
+---
+
+## Passing files between blocks
+
+Files flow through workflows in two ways: through `SKYVERN_DOWNLOAD_DIRECTORY` for downloaded files, and through output parameters for parsed data.
+
+### Using downloaded files
+
+Any file downloaded during a workflow run lands in `SKYVERN_DOWNLOAD_DIRECTORY`. Reference this directory in blocks that accept file paths:
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "send_email",
+  "label": "email_documents",
+  "sender": "automation@company.com",
+  "recipients": ["accounting@company.com"],
+  "subject": "Monthly invoices attached",
+  "body": "See attached invoices for this month.",
+  "smtp_host_secret_parameter_key": "smtp_host",
+  "smtp_port_secret_parameter_key": "smtp_port",
+  "smtp_username_secret_parameter_key": "smtp_username",
+  "smtp_password_secret_parameter_key": "smtp_password",
+  "file_attachments": ["SKYVERN_DOWNLOAD_DIRECTORY"]
+}
+```
+
+```yaml YAML
+- block_type: send_email
+  label: email_documents
+  sender: automation@company.com
+  recipients:
+    - accounting@company.com
+  subject: Monthly invoices attached
+  body: See attached invoices for this month.
+  smtp_host_secret_parameter_key: smtp_host
+  smtp_port_secret_parameter_key: smtp_port
+  smtp_username_secret_parameter_key: smtp_username
+  smtp_password_secret_parameter_key: smtp_password
+  file_attachments:
+    - SKYVERN_DOWNLOAD_DIRECTORY
+```
+</CodeGroup>
+
+### Using parsed data
+
+When you parse a file, its output becomes available as `{{ label_output }}`:
+
+<CodeGroup>
+```json JSON
+[
+  {
+    "block_type": "file_url_parser",
+    "label": "parse_resume",
+    "file_url": "{{ resume }}",
+    "file_type": "pdf"
+  },
+  {
+    "block_type": "navigation",
+    "label": "fill_application",
+    "url": "{{ job_url }}",
+    "navigation_goal": "Fill out the application form using this candidate's information:\n\n{{ parse_resume_output }}"
+  }
+]
+```
+
+```yaml YAML
+- block_type: file_url_parser
+  label: parse_resume
+  file_url: "{{ resume }}"
+  file_type: pdf
+
+- block_type: navigation
+  label: fill_application
+  url: "{{ job_url }}"
+  navigation_goal: |
+    Fill out the application form using this candidate's information:
+
+    {{ parse_resume_output }}
+```
+</CodeGroup>
+
+### Accepting files as workflow inputs
+
+Define a `file_url` parameter to accept files when the workflow runs:
+
+<CodeGroup>
+```json JSON
+{
+  "parameters": [
+    {
+      "key": "resume",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "file_url",
+      "description": "URL to the applicant's resume"
+    }
+  ]
+}
+```
+
+```yaml YAML
+parameters:
+  - key: resume
+    parameter_type: workflow
+    workflow_parameter_type: file_url
+    description: URL to the applicant's resume
+```
+</CodeGroup>
+
+When running the workflow, pass any accessible URL—public links, S3 presigned URLs, or files in your own storage.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Workflow Blocks Reference"
+    icon="cube"
+    href="/multi-step-automations/workflow-blocks-reference"
+  >
+    Complete parameter reference for all file blocks
+  </Card>
+  <Card
+    title="Build a Workflow"
+    icon="hammer"
+    href="/multi-step-automations/build-a-workflow"
+  >
+    Learn how blocks pass data to each other
+  </Card>
+</CardGroup>
