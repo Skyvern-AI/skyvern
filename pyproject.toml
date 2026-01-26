@@ -87,8 +87,7 @@ dev = [
     "isort>=5.13.2",
     "mypy>=1.18.2,<2",
     "types-requests>=2.31.0.2,<3",
-    "pytest>=7.4.0,<8",
-    "pytest-asyncio>=0.21.1,<0.22",
+    "pytest",
     "autoflake>=2.2.0,<3",
     "pydevd-pycharm>=233.6745.319,<234",
     "ipython>=8.17.2,<9",
@@ -105,6 +104,8 @@ dev = [
     "curlify>=3.0.0",
     "openpyxl>=3.1.0",
     "gspread>=6",
+    "pytest-asyncio>=0.21.2",
+    "codeflash",
 ]
 
 [tool.hatch.build]
@@ -203,3 +204,13 @@ skyvern = "skyvern.cli.commands:cli_app"
 
 [tool.pytest.ini_options]
 norecursedirs = ["eval"]
+
+[tool.codeflash]
+module-root = "skyvern"
+tests-root = "codeflash-tests"
+test-framework = "pytest"
+ignore-paths = ["skyvern/client"]
+formatter-cmds = ["ruff check --exit-zero --fix $file", "ruff format $file"]
+
+[tool.uv.sources]
+codeflash = { path = "../codeflash", editable = true }

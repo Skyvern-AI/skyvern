@@ -114,6 +114,15 @@ class MessageInAskForClipboardResponse(Message):
     text: str = ""
 
 
+_MESSAGE_CONSTRUCTORS = {
+    MessageKind.BEGIN_EXFILTRATION: lambda data: MessageInBeginExfiltration(),
+    MessageKind.CEDE_CONTROL: lambda data: MessageInCedeControl(),
+    MessageKind.END_EXFILTRATION: lambda data: MessageInEndExfiltration(),
+    MessageKind.TAKE_CONTROL: lambda data: MessageInTakeControl(),
+    MessageKind.ASK_FOR_CLIPBOARD_RESPONSE: lambda data: MessageInAskForClipboardResponse(text=data.get("text") or ""),
+}
+
+
 @dataclasses.dataclass
 class MessageOutExfiltratedEvent(Message):
     kind: t.Literal[MessageKind.EXFILTRATED_EVENT] = MessageKind.EXFILTRATED_EVENT
@@ -149,20 +158,11 @@ ChannelMessage = MessageIn | MessageOut
 def reify_channel_message(data: dict) -> ChannelMessage:
     kind = data.get("kind", None)
 
-    match kind:
-        case MessageKind.ASK_FOR_CLIPBOARD_RESPONSE:
-            text = data.get("text") or ""
-            return MessageInAskForClipboardResponse(text=text)
-        case MessageKind.BEGIN_EXFILTRATION:
-            return MessageInBeginExfiltration()
-        case MessageKind.CEDE_CONTROL:
-            return MessageInCedeControl()
-        case MessageKind.END_EXFILTRATION:
-            return MessageInEndExfiltration()
-        case MessageKind.TAKE_CONTROL:
-            return MessageInTakeControl()
-        case _:
-            raise ValueError(f"Unknown message kind: '{kind}'")
+    constructor = _MESSAGE_CONSTRUCTORS.get(kind)
+    if constructor is not None:
+        return constructor(data)
+
+    raise ValueError(f"Unknown message kind: '{kind}'")
 
 
 def message_to_dict(message: MessageOut) -> dict:
