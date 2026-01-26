@@ -10,6 +10,7 @@ import { useState } from "react";
 import { toast } from "@/components/ui/use-toast";
 import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
+import { validateUrl, validateJson } from "./httpValidation";
 
 // HTTP Method Badge Component
 export function MethodBadge({
@@ -56,23 +57,34 @@ export function MethodBadge({
 
 // URL Validation Component
 export function UrlValidator({ url }: { url: string }) {
-  const isValidUrl = (urlString: string) => {
-    if (!urlString.trim()) return { valid: false, message: "URL is required" };
-
-    try {
-      const url = new URL(urlString);
-      if (!["http:", "https:"].includes(url.protocol)) {
-        return { valid: false, message: "URL must use HTTP or HTTPS protocol" };
-      }
-      return { valid: true, message: "Valid URL" };
-    } catch {
-      return { valid: false, message: "Invalid URL format" };
-    }
-  };
-
-  const validation = isValidUrl(url);
+  const validation = validateUrl(url);
 
   if (!url.trim()) return null;
+
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-1 text-xs",
+        validation.valid
+          ? "text-green-600 dark:text-green-400"
+          : "text-red-600 dark:text-red-400",
+      )}
+    >
+      {validation.valid ? (
+        <CheckCircledIcon className="h-3 w-3" />
+      ) : (
+        <ExclamationTriangleIcon className="h-3 w-3" />
+      )}
+      <span>{validation.message}</span>
+    </div>
+  );
+}
+
+// JSON Validation Component
+export function JsonValidator({ value }: { value: string }) {
+  const validation = validateJson(value);
+
+  if (validation.message === null) return null;
 
   return (
     <div

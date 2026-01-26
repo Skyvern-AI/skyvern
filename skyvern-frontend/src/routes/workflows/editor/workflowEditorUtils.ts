@@ -122,7 +122,14 @@ import {
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
-import { httpRequestNodeDefaultData } from "./nodes/HttpRequestNode/types";
+import {
+  httpRequestNodeDefaultData,
+  isHttpRequestNode,
+} from "./nodes/HttpRequestNode/types";
+import {
+  validateUrl,
+  validateJson,
+} from "./nodes/HttpRequestNode/httpValidation";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
@@ -3983,6 +3990,28 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     if (!isNumber) {
       errors.push(`${node.data.label}: Invalid input for wait time.`);
     }
+  });
+
+  const httpRequestNodes = nodes.filter(isHttpRequestNode);
+  httpRequestNodes.forEach((node) => {
+    // Validate URL - required and must be valid format
+    const urlValidation = validateUrl(node.data.url);
+    if (!urlValidation.valid) {
+      errors.push(`${node.data.label}: ${urlValidation.message}`);
+    }
+
+    // Validate JSON fields - optional but must be valid if provided
+    const jsonFields = [
+      { value: node.data.headers, name: "Headers" },
+      { value: node.data.body, name: "Body" },
+      { value: node.data.files, name: "Files" },
+    ];
+    jsonFields.forEach(({ value, name }) => {
+      const result = validateJson(value);
+      if (!result.valid && result.message) {
+        errors.push(`${node.data.label}: ${name} is not valid JSON.`);
+      }
+    });
   });
 
   return errors;

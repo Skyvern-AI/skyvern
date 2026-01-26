@@ -5130,7 +5130,7 @@ wheels = [
 
 [[package]]
 name = "skyvern"
-version = "1.0.6"
+version = "1.0.10"
 source = { editable = "." }
 dependencies = [
     { name = "aioboto3" },

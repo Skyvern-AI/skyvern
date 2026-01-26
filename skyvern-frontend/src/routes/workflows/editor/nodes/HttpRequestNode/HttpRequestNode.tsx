@@ -39,7 +39,12 @@ import { CodeIcon, PlusIcon, MagicWandIcon } from "@radix-ui/react-icons";
 import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 import { CurlImportDialog } from "./CurlImportDialog";
 import { QuickHeadersDialog } from "./QuickHeadersDialog";
-import { MethodBadge, UrlValidator, RequestPreview } from "./HttpUtils";
+import {
+  MethodBadge,
+  UrlValidator,
+  RequestPreview,
+  JsonValidator,
+} from "./HttpUtils";
 import { useRerender } from "@/hooks/useRerender";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
@@ -271,6 +276,7 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
               minHeight="80px"
               maxHeight="160px"
             />
+            <JsonValidator value={data.headers} />
           </div>
 
           {/* Body Section */}
@@ -312,6 +318,7 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
                 minHeight="100px"
                 maxHeight="200px"
               />
+              <JsonValidator value={data.body} />
             </div>
           )}
 
@@ -333,6 +340,7 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
                 minHeight="80px"
                 maxHeight="160px"
               />
+              <JsonValidator value={data.files} />
             </div>
           )}
 
