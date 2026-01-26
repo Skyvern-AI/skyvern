@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# This script loads all variables from .env into the current shell environment (Windows compatible)
+# This script loads all variables from .env into the current shell environment
+# On Windows, use WSL, Git Bash, or a similar Bash-compatible shell
 # Usage: source ./load_env.sh
 
 set -a

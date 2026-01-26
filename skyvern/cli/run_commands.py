@@ -15,7 +15,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 
 from skyvern.cli.console import console
-from skyvern.cli.utils import start_services
+from skyvern.cli.utils import start_services, strip_quotes
 from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
@@ -24,14 +24,6 @@ from skyvern.library.skyvern import Skyvern
 from skyvern.services.script_service import run_script
 from skyvern.utils import detect_os
 from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
-
-
-def strip_quotes(val: str | None) -> str:
-    """Strip surrounding single or double quotes from a value."""
-    if val is None:
-        return ""
-    return val.strip('"').strip("'")
-
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
 

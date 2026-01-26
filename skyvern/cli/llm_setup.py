@@ -7,6 +7,7 @@ from rich.prompt import Confirm, Prompt
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .console import console
+from .utils import strip_quotes
 
 
 def update_or_add_env_var(key: str, value: str) -> None:
@@ -50,13 +51,6 @@ def update_or_add_env_var(key: str, value: str) -> None:
         }
         for k, v in defaults.items():
             set_key(env_path, k, v)
-
-    # Sanitize API key and other sensitive values to avoid unwanted quotes
-    def strip_quotes(val: str | None) -> str:
-        """Strip surrounding single or double quotes from a value."""
-        if val is None:
-            return ""
-        return val.strip('"').strip("'")
 
     # Only sanitize for keys that are API keys or sensitive
     sensitive_keys = [

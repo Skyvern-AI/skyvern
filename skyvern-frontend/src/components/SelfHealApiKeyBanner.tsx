@@ -12,6 +12,7 @@ import {
 
 type BannerStatus = Exclude<AuthStatusValue, "ok"> | "error";
 
+/** Return the user-facing title and description for the given banner status. */
 function getCopy(status: BannerStatus): { title: string; description: string } {
   switch (status) {
     case "missing_env":
@@ -54,6 +55,7 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
   }
 }
 
+/** Banner that diagnoses API-key issues and offers one-click regeneration. */
 function SelfHealApiKeyBanner() {
   const diagnosticsQuery = useAuthDiagnostics();
   const { toast } = useToast();
@@ -61,7 +63,7 @@ function SelfHealApiKeyBanner() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const isProductionBuild = !import.meta.env.DEV;
 
-  const { data, error, isLoading, refetch } = diagnosticsQuery;
+  const { data, error, refetch } = diagnosticsQuery;
 
   const rawStatus = data?.status;
   const bannerStatus: BannerStatus | null = error
@@ -70,10 +72,7 @@ function SelfHealApiKeyBanner() {
       ? rawStatus
       : null;
 
-  if (!bannerStatus && !errorMessage && !isRepairing) {
-    if (isLoading) return null;
-    return null;
-  }
+  if (!bannerStatus && !errorMessage && !isRepairing) return null;
 
   const copy = getCopy(bannerStatus ?? "missing_env");
   const queryErrorMessage = error?.message ?? null;
@@ -85,6 +84,7 @@ function SelfHealApiKeyBanner() {
     try {
       const client = axios.create({
         baseURL: import.meta.env.VITE_API_BASE_URL,
+        timeout: 10_000,
       });
 
       const response = await client.post<{

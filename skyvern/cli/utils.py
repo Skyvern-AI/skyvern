@@ -8,6 +8,13 @@ from skyvern.cli.console import console
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 
+def strip_quotes(val: str | None) -> str:
+    """Strip surrounding single or double quotes from a value."""
+    if val is None:
+        return ""
+    return val.strip('"').strip("'")
+
+
 async def start_services(server_only: bool = False) -> None:
     """Start Skyvern services in the background.
 
