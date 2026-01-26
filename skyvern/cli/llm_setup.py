@@ -51,9 +51,29 @@ def update_or_add_env_var(key: str, value: str) -> None:
         for k, v in defaults.items():
             set_key(env_path, k, v)
 
+    # Sanitize API key and other sensitive values to avoid unwanted quotes
+    def strip_quotes(val: str) -> str:
+        if val is None:
+            return ""
+        return val.strip('"').strip("'")
+
+    # Only sanitize for keys that are API keys or sensitive
+    sensitive_keys = [
+        "SKYVERN_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AZURE_API_KEY",
+        "AZURE_GPT4O_MINI_API_KEY",
+        "GEMINI_API_KEY",
+        "NOVITA_API_KEY",
+        "VOLCENGINE_API_KEY",
+        "OPENAI_COMPATIBLE_API_KEY",
+    ]
+    sanitized_value = strip_quotes(value) if key in sensitive_keys else value
+
     load_dotenv(env_path)
-    set_key(env_path, key, value)
-    os.environ[key] = value
+    set_key(env_path, key, sanitized_value)
+    os.environ[key] = sanitized_value
 
 
 def setup_llm_providers() -> None:
