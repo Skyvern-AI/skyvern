@@ -1,31 +1,50 @@
 ---
-title: Error Handling & Observability
-subtitle: Build production systems that handle failures gracefully
+title: Error Handling
+subtitle: Build systems that detect, classify, and recover from failures
 slug: going-to-production/error-handling
 ---
 
-Automations fail. Sites change, logins expire, CAPTCHAs appear. This page covers how to detect failures, map them to actionable error codes, and debug issues when they occur.
+Skyvern lets you make your workflows and tasks handle errors gracefully instead of failing silently.
+
+Every run returns a `status`. When it's not `completed`, you need to know what went wrong and respond programmatically. The flow is:
+
+1. **Check `status`** to detect failure states
+2. **Read `failure_reason`** to get the raw error description
+3. **Set up `error_code_mapping`** to map failures to your own error codes
+4. **Respond in code** to branch your logic based on the error code
+
+This page covers each step with exact field locations and full code examples.
 
 ---
 
-## Run statuses
+## Step 1: Check `status`
 
-Every task and workflow run transitions through these states:
+Every run transitions through these states:
 
-| Status | Description |
-|--------|-------------|
+| Status | What it means |
+|--------|---------------|
 | `created` | Run initialized, not yet queued |
 | `queued` | Waiting for an available browser |
 | `running` | AI is navigating and executing |
-| `completed` | Run finished successfully |
-| `failed` | Run encountered an error |
-| `terminated` | AI determined the goal cannot be achieved |
-| `timed_out` | Run exceeded `max_steps` or time limit |
-| `canceled` | Run was manually stopped |
+| `completed` | Success—check `output` for results |
+| `failed` | System error (browser crash, network failure, exception) |
+| `terminated` | AI determined the goal is unachievable (login blocked, page unavailable) |
+| `timed_out` | Exceeded `max_steps` or time limit |
+| `canceled` | Manually stopped |
 
 **Terminal states:** `completed`, `failed`, `terminated`, `timed_out`, `canceled`
 
-Check the `status` field in your polling loop or webhook payload:
+The `status` field is at the top level of every run response:
+
+```json
+{
+  "run_id": "tsk_v2_486305187432193504",
+  "status": "failed",  // <-- Check this field
+  "output": null,
+  "failure_reason": "Login failed: Invalid credentials",
+  ...
+}
+```
 
 <CodeGroup>
 ```python Python
@@ -33,12 +52,8 @@ run = await client.get_run(run_id)
 
 if run.status == "completed":
     process_output(run.output)
-elif run.status == "failed":
-    handle_failure(run.failure_reason)
-elif run.status == "terminated":
-    handle_termination(run.failure_reason)
-elif run.status == "timed_out":
-    retry_with_more_steps(run_id)
+elif run.status in ["failed", "terminated", "timed_out", "canceled"]:
+    handle_failure(run)
 ```
 
 ```typescript TypeScript
@@ -46,57 +61,82 @@ const run = await client.getRun(runId);
 
 if (run.status === "completed") {
   processOutput(run.output);
-} else if (run.status === "failed") {
-  handleFailure(run.failure_reason);
-} else if (run.status === "terminated") {
-  handleTermination(run.failure_reason);
-} else if (run.status === "timed_out") {
-  retryWithMoreSteps(runId);
+} else if (["failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
+  handleFailure(run);
 }
 ```
 </CodeGroup>
 
+**`failed` vs `terminated`:** A `failed` run hit infrastructure problems—retry might work. A `terminated` run means the AI recognized the goal is unachievable with current conditions. Retrying without changes (new credentials, different URL) will produce the same result.
+
 ---
 
-## Interpreting `failure_reason`
+## Step 2: Read `failure_reason`
 
-When a run fails or terminates, the `failure_reason` field contains details about what went wrong.
+When a run fails or terminates, the `failure_reason` field contains a description of what went wrong. This is a free-text string—useful for logging but hard to branch on programmatically.
+
+The field is at the top level of the run response:
 
 ```json
 {
   "run_id": "tsk_v2_486305187432193504",
-  "status": "failed",
-  "failure_reason": "Login failed: Invalid credentials or account locked",
-  "output": null
+  "status": "terminated",
+  "output": null,
+  "failure_reason": "Login failed: The page displayed 'Invalid username or password' after submitting credentials",  // <-- Raw error text
+  ...
 }
 ```
 
-Common failure patterns:
+<CodeGroup>
+```python Python
+run = await client.get_run(run_id)
 
-| Pattern in `failure_reason` | Likely cause |
-|----------------------------|--------------|
-| `Login failed` | Credentials expired, account locked, or MFA required |
-| `Element not found` | Page structure changed or element didn't load |
-| `Navigation timeout` | Page took too long to load |
-| `Max steps exceeded` | Task was too complex for the `max_steps` limit |
-| `CAPTCHA detected` | Site requires human verification |
+if run.status in ["failed", "terminated"]:
+    print(f"Run failed: {run.failure_reason}")
+
+    # Fragile: parsing free text
+    if "login" in run.failure_reason.lower():
+        refresh_credentials()
+```
+
+```typescript TypeScript
+const run = await client.getRun(runId);
+
+if (["failed", "terminated"].includes(run.status)) {
+  console.log(`Run failed: ${run.failure_reason}`);
+
+  // Fragile: parsing free text
+  if (run.failure_reason?.toLowerCase().includes("login")) {
+    refreshCredentials();
+  }
+}
+```
+</CodeGroup>
+
+Parsing `failure_reason` is fragile—the text varies based on what the AI encountered. Use `error_code_mapping` instead.
 
 ---
 
-## Custom error codes with `error_code_mapping`
+## Step 3: Use `error_code_mapping`
 
-Map specific failure conditions to your own error codes for programmatic handling. Instead of parsing free-text `failure_reason`, get structured codes you can switch on.
+Define error codes upfront. When the run fails, Skyvern checks if the failure matches any of your descriptions and returns your code instead of raw text.
+
+**How it works:** The `error_code_mapping` values are natural language descriptions interpreted by the LLM. You don't need exact string matches—describe the condition and the AI will recognize it. For example, `"The login credentials are incorrect"` will match pages showing "Invalid password", "Wrong username", "Authentication failed", etc.
+
+### In tasks
+
+Pass `error_code_mapping` as a parameter to `run_task`:
 
 <CodeGroup>
 ```python Python
 result = await client.run_task(
-    prompt="Log in and download the invoice",
+    prompt="Log in and download the invoice for January 2024",
     url="https://vendor-portal.example.com",
     error_code_mapping={
-        "login_failed": "The login credentials are incorrect or the account is locked",
-        "invoice_not_found": "No invoice found for the specified date range",
-        "maintenance_mode": "The website is down for maintenance",
-        "access_denied": "User does not have permission to access invoices"
+        "login_failed": "The login credentials are incorrect, account is locked, or MFA is required",
+        "invoice_not_found": "No invoice exists for the requested date range",
+        "maintenance": "The website is down for maintenance or unavailable",
+        "access_denied": "User does not have permission to view invoices"
     }
 )
 ```
@@ -104,13 +144,13 @@ result = await client.run_task(
 ```typescript TypeScript
 const result = await client.runTask({
   body: {
-    prompt: "Log in and download the invoice",
+    prompt: "Log in and download the invoice for January 2024",
     url: "https://vendor-portal.example.com",
-    errorCodeMapping: {
-      login_failed: "The login credentials are incorrect or the account is locked",
-      invoice_not_found: "No invoice found for the specified date range",
-      maintenance_mode: "The website is down for maintenance",
-      access_denied: "User does not have permission to access invoices",
+    error_code_mapping: {
+      login_failed: "The login credentials are incorrect, account is locked, or MFA is required",
+      invoice_not_found: "No invoice exists for the requested date range",
+      maintenance: "The website is down for maintenance or unavailable",
+      access_denied: "User does not have permission to view invoices",
     },
   },
 });
@@ -121,155 +161,216 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Log in and download the invoice",
+    "prompt": "Log in and download the invoice for January 2024",
     "url": "https://vendor-portal.example.com",
     "error_code_mapping": {
-      "login_failed": "The login credentials are incorrect or the account is locked",
-      "invoice_not_found": "No invoice found for the specified date range",
-      "maintenance_mode": "The website is down for maintenance",
-      "access_denied": "User does not have permission to access invoices"
+      "login_failed": "The login credentials are incorrect, account is locked, or MFA is required",
+      "invoice_not_found": "No invoice exists for the requested date range",
+      "maintenance": "The website is down for maintenance or unavailable",
+      "access_denied": "User does not have permission to view invoices"
     }
   }'
 ```
 </CodeGroup>
 
-When Skyvern encounters a condition matching one of your descriptions, the output contains your error code:
+### In workflows
+
+Add `error_code_mapping` to individual blocks (navigation, task, validation):
+
+```yaml
+- block_type: navigation
+  label: login_step
+  url: "https://vendor-portal.example.com/login"
+  navigation_goal: "Log in using the stored credentials"
+  error_code_mapping:
+    login_failed: "Login credentials are incorrect or account is locked"
+    mfa_required: "Two-factor authentication is being requested"
+    captcha_blocked: "CAPTCHA is displayed and cannot be bypassed"
+
+- block_type: navigation
+  label: download_invoice
+  navigation_goal: "Download the invoice for {{invoice_date}}"
+  error_code_mapping:
+    invoice_not_found: "No invoice found for the specified date"
+    download_failed: "Invoice exists but download button is broken or missing"
+```
+
+### Validation blocks as assertions
+
+Validation blocks are assertions that check conditions at critical points—like unit test assertions. If validation fails, the workflow terminates immediately with your error code instead of continuing and failing later with a confusing error.
+
+Use validation blocks after steps where you need to confirm success before proceeding:
+
+```yaml
+blocks:
+  - block_type: navigation
+    label: login
+    url: "https://vendor-portal.example.com/login"
+    navigation_goal: "Log in using stored credentials"
+
+  - block_type: validation
+    label: verify_login
+    complete_criterion: "Dashboard or account overview page is visible"
+    terminate_criterion: "Login error message, CAPTCHA, or still on login page"
+    error_code_mapping:
+      login_failed: "Login error message is displayed"
+      captcha_required: "CAPTCHA verification is shown"
+      session_expired: "Session timeout message appeared"
+
+  - block_type: navigation
+    label: download_invoice
+    navigation_goal: "Navigate to invoices and download {{invoice_date}}"
+    error_code_mapping:
+      invoice_not_found: "No invoice for the specified date"
+```
+
+| Parameter | Purpose |
+|-----------|---------|
+| `complete_criterion` | Condition that must be true to continue to the next block |
+| `terminate_criterion` | Condition that stops the workflow immediately |
+| `error_code_mapping` | Maps termination conditions to your error codes |
+
+If `verify_login` sees a login error, the workflow terminates with `output.error = "login_failed"`. Your Step 4 code handles it the same way as any other error code.
+
+### Where the error code appears
+
+When a mapped error occurs, your code appears in `output.error`:
 
 ```json
 {
   "run_id": "tsk_v2_486305187432193504",
   "status": "terminated",
   "output": {
-    "error": "login_failed"
-  }
+    "error": "login_failed"  // <-- Your custom code
+  },
+  "failure_reason": "Login failed: The page displayed 'Invalid username or password'"
 }
 ```
 
-Now you can handle errors programmatically:
-
-```python
-if run.output and run.output.get("error") == "login_failed":
-    refresh_credentials()
-    retry_task()
-elif run.output and run.output.get("error") == "maintenance_mode":
-    schedule_retry_later()
-```
+Both `output.error` (your code) and `failure_reason` (raw text) are present. Use `output.error` for branching, `failure_reason` for logging.
 
 ---
 
-## Validation blocks in workflows
+## Step 4: Respond in code
 
-Add validation blocks to workflows to assert conditions at critical points. If validation fails, the workflow terminates early with a clear reason.
-
-<CodeGroup>
-```json JSON
-{
-  "block_type": "validation",
-  "label": "verify_login",
-  "complete_criterion": "The page shows a logged-in state with user dashboard visible",
-  "terminate_criterion": "Login failed, incorrect credentials message, or CAPTCHA displayed",
-  "error_code_mapping": {
-    "login_failed": "Login credentials invalid",
-    "captcha_required": "CAPTCHA verification required"
-  }
-}
-```
-
-```yaml YAML
-- block_type: validation
-  label: verify_login
-  complete_criterion: |
-    The page shows a logged-in state with user dashboard visible
-  terminate_criterion: |
-    Login failed, incorrect credentials message, or CAPTCHA displayed
-  error_code_mapping:
-    login_failed: Login credentials invalid
-    captcha_required: CAPTCHA verification required
-```
-</CodeGroup>
-
-| Parameter | Description |
-|-----------|-------------|
-| `complete_criterion` | Condition that must be true to continue |
-| `terminate_criterion` | Condition that stops the workflow |
-| `error_code_mapping` | Map termination conditions to custom error codes |
-
----
-
-## Debugging with artifacts
-
-Every run generates artifacts for debugging: recordings, screenshots, logs, and AI reasoning. Access them via API or the Skyvern UI.
+Now you can write clean switch/match logic:
 
 <CodeGroup>
 ```python Python
-artifacts = await client.get_run_artifacts(run_id)
+import asyncio
 
-for artifact in artifacts:
-    print(f"{artifact.artifact_type}: {artifact.signed_url}")
+async def run_with_error_handling():
+    result = await client.run_task(
+        prompt="Log in and download the invoice",
+        url="https://vendor-portal.example.com",
+        error_code_mapping={
+            "login_failed": "Login credentials are incorrect or account is locked",
+            "invoice_not_found": "No invoice for the requested date",
+            "maintenance": "Site is down for maintenance"
+        }
+    )
+
+    run_id = result.run_id
+
+    # Poll until terminal state
+    while True:
+        run = await client.get_run(run_id)
+        if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+            break
+        await asyncio.sleep(5)
+
+    # Handle based on status and error code
+    if run.status == "completed":
+        return {"success": True, "data": run.output}
+
+    error_code = run.output.get("error") if run.output else None
+
+    if error_code == "login_failed":
+        # Refresh credentials and retry
+        await refresh_credentials("vendor-portal")
+        return await run_with_error_handling()  # Retry once
+
+    elif error_code == "invoice_not_found":
+        # Expected condition—no invoice for this period
+        return {"success": False, "reason": "no_invoice", "date": invoice_date}
+
+    elif error_code == "maintenance":
+        # Schedule retry for later
+        await schedule_retry(run_id, delay_minutes=60)
+        return {"success": False, "reason": "scheduled_retry"}
+
+    else:
+        # Unknown error—log and alert
+        log_error(run_id, run.failure_reason)
+        return {"success": False, "reason": "unknown", "details": run.failure_reason}
 ```
 
 ```typescript TypeScript
-const artifacts = await client.getRunArtifacts(runId);
+async function runWithErrorHandling() {
+  const result = await client.runTask({
+    body: {
+      prompt: "Log in and download the invoice",
+      url: "https://vendor-portal.example.com",
+      error_code_mapping: {
+        login_failed: "Login credentials are incorrect or account is locked",
+        invoice_not_found: "No invoice for the requested date",
+        maintenance: "Site is down for maintenance",
+      },
+    },
+  });
 
-for (const artifact of artifacts) {
-  console.log(`${artifact.artifact_type}: ${artifact.signed_url}`);
+  const runId = result.run_id;
+
+  // Poll until terminal state
+  let run;
+  while (true) {
+    run = await client.getRun(runId);
+    if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+
+  // Handle based on status and error code
+  if (run.status === "completed") {
+    return { success: true, data: run.output };
+  }
+
+  const errorCode = run.output?.error;
+
+  switch (errorCode) {
+    case "login_failed":
+      await refreshCredentials("vendor-portal");
+      return runWithErrorHandling(); // Retry once
+
+    case "invoice_not_found":
+      return { success: false, reason: "no_invoice", date: invoiceDate };
+
+    case "maintenance":
+      await scheduleRetry(runId, { delayMinutes: 60 });
+      return { success: false, reason: "scheduled_retry" };
+
+    default:
+      logError(runId, run.failure_reason);
+      return { success: false, reason: "unknown", details: run.failure_reason };
+  }
 }
-```
-
-```bash cURL
-curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID/artifacts" \
-  -H "x-api-key: $SKYVERN_API_KEY"
 ```
 </CodeGroup>
 
-**Key artifact types for debugging:**
-
-| Type | Use this to |
-|------|-------------|
-| `recording` | Watch the full browser session video |
-| `screenshot_final` | See the final state when the run ended |
-| `llm_response` | Understand why the AI made each decision |
-| `browser_console_log` | Check for JavaScript errors |
-| `har` | Analyze network requests and responses |
-
 ---
 
-## Observability with Laminar
+## Common error patterns
 
-For production systems, integrate [Laminar](https://lmnr.ai) to trace workflow executions, monitor LLM calls, and debug failures at scale.
-
-```python
-import litellm
-from lmnr import Laminar, LaminarLiteLLMCallback, Instruments
-
-# Initialize at startup
-Laminar.initialize(disabled_instruments=set([Instruments.OPENAI]))
-litellm.callbacks = [LaminarLiteLLMCallback()]
-
-# Run tasks as normal - Laminar traces automatically
-result = await client.run_task(
-    prompt="Extract pricing data",
-    url="https://example.com"
-)
-```
-
-Laminar provides:
-- **Browser session recordings** synchronized with execution steps
-- **LLM decision traces** showing prompts and responses
-- **Performance metrics** including latency, token usage, and cost
-- **Error aggregation** to identify patterns across runs
-
----
-
-## Handling common failures
-
-| Failure | Detection | Recovery |
-|---------|-----------|----------|
-| **Credentials expired** | `error_code_mapping` with `login_failed` | Refresh credentials, retry |
-| **Site structure changed** | `failed` status with element errors | Update prompts, add visual hints |
-| **Rate limiting** | Repeated failures in short window | Add delays, use different proxy |
-| **CAPTCHA** | `terminated` with CAPTCHA in reason | Use `human_interaction` block or browser profile |
-| **Timeout** | `timed_out` status | Increase `max_steps`, simplify task |
+| Error Code | Description | Typical Response |
+|------------|-------------|------------------|
+| `login_failed` | Credentials wrong, account locked, or MFA | Refresh credentials, retry |
+| `captcha_required` | CAPTCHA blocking automation | Use `human_interaction` block or browser profile |
+| `not_found` | Target data doesn't exist | Return empty result, don't retry |
+| `maintenance` | Site temporarily down | Schedule retry with backoff |
+| `rate_limited` | Too many requests | Add delays, use different proxy |
+| `access_denied` | Permission issue | Check account permissions |
+| `timeout` | Task took too long | Increase `max_steps`, simplify task |
 
 ---
 
@@ -281,7 +382,7 @@ Laminar provides:
     icon="shield-check"
     href="/going-to-production/reliability-tips"
   >
-    Write robust prompts and handle edge cases
+    Write prompts that fail less often
   </Card>
   <Card
     title="Webhooks"

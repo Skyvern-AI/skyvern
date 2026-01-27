@@ -6,7 +6,7 @@ slug: going-to-production/webhooks
 
 Workflows and task runs are asyncronous. Use Webhooks to get notified when they finish.
 
-This page explains how to set up webhooks, understand the payload, verify signatures, and retry failed deliveries.
+This page covers setting them up, payload structure, signature verification, and handling delivery failures.
 
 ---
 
@@ -173,7 +173,7 @@ Skyvern sends a JSON payload with run results:
 
 ## Verify webhook signatures
 
-Skyvern signs every webhook with your API key using HMAC-SHA256. Verify the signature to ensure the request is authentic.
+Skyvern signs every webhook with your API key using HMAC-SHA256, so you can verify the request actually came from Skyvern before acting on it.
 
 **Headers sent with every webhook:**
 - `x-skyvern-signature` — HMAC-SHA256 signature of the payload
@@ -260,7 +260,7 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 ## Retry failed webhooks
 
-Skyvern does not automatically retry failed webhook deliveries. If your server was down or returned an error, replay the webhook manually:
+Skyvern doesn't automatically retry failed webhook deliveries—automatic retries can cause duplicate processing if your server received the payload but returned an error. Instead, you control when to replay.
 
 <CodeGroup>
 ```python Python
@@ -302,11 +302,17 @@ curl -X POST "https://api.skyvern.com/v1/internal/runs/tsk_v2_486305187432193504
 
 ## Troubleshooting
 
-| Issue | Reason | How to Fix |
-|-------|--------|------------|
-| Webhook not received | Server unreachable, firewall blocking, URL incorrect, or delivery timed out | 1. Check your server logs for incoming requests. 2. Verify the URL is publicly accessible (not localhost). 3. Poll `get_run` to retrieve the data and check `webhook_failure_reason` for the specific error. |
-| Signature validation fails | Raw payload bytes don't match what was signed, or API key mismatch | Use the raw request body for HMAC validation, not parsed/re-serialized JSON. Verify you're using the same API key that created the run. |
-| Webhook times out | Server took longer than 30 seconds to respond | Return `200 OK` immediately upon receiving the request, then process the payload asynchronously in a background job. |
+**Webhook not received**
+
+Your server might be unreachable, behind a firewall, or the URL might be incorrect. Check your server logs for incoming requests and verify the URL is publicly accessible (not `localhost`). If you still don't see the request, poll `get_run` to retrieve the data directly—the `webhook_failure_reason` field contains the specific error.
+
+**Signature validation fails**
+
+This happens when the payload bytes you're validating don't match what Skyvern signed. The most common cause: parsing the JSON and re-serializing it changes the byte representation. Always validate against the raw request body, not parsed JSON. Also verify you're using the same API key that created the run.
+
+**Webhook times out**
+
+Skyvern waits 30 seconds for a response. If your server takes longer, the delivery is marked as failed even if processing eventually succeeds. Return `200 OK` immediately when you receive the request, then process the payload in a background job.
 
 ---
 

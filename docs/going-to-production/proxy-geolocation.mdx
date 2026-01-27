@@ -4,7 +4,7 @@ subtitle: Route browser traffic through residential proxies worldwide
 slug: going-to-production/proxy-geolocation
 ---
 
-Access geo-restricted websites and avoid bot detection with Skyvern's global network of residential proxies. 
+Many websites serve different content based on your location—prices in local currency, region-locked inventory, or outright access blocks. Others detect and block datacenter IPs, treating them as bots. Skyvern's residential proxy network routes your browser through real consumer IP addresses in 19 countries, so sites see a legitimate local visitor. 
 
 <Note>
 Proxy routing is only available in Skyvern Cloud. Self-hosted deployments require your own proxy infrastructure.
@@ -110,7 +110,7 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 ```
 </CodeGroup>
 
-For browser sessions, set `proxy_location` at creation—all tasks in that session use the same proxy:
+For browser sessions, set `proxy_location` at creation. All tasks in that session use the same proxy IP, which matters for sites that track IP consistency across a login session—switching IPs mid-session often triggers security warnings or logouts.
 
 <CodeGroup>
 ```python Python
@@ -260,8 +260,8 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 
 ## Troubleshooting
 
-| Error | Reason | Options |
-|-------|--------|---------|
+| Error | Reason | How to Fix |
+|-------|--------|------------|
 | `NoProxyAvailable` | Requested city/state is temporarily unavailable in the proxy pool | Broaden target (city → state → country), use `RESIDENTIAL_ISP`, or retry later |
 | Site still blocks requests | Bot detection beyond IP geolocation (fingerprinting, behavioral analysis) | Use `RESIDENTIAL_ISP` for static IPs, match proxy to site's region, add `wait` blocks between actions |
 | Need to debug proxy issues | Isolate whether proxy is causing failures | Set `proxy_location: "NONE"` to bypass proxy entirely |

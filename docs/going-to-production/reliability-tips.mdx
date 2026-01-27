@@ -30,37 +30,43 @@ COMPLETE when the form is submitted and you see a confirmation message.
 TERMINATE if you see an error message or the form cannot be submitted.
 ```
 
-### Dos
+### What works
 
-| Practice | Example |
-|----------|---------|
-| **Be explicit about completion** | "COMPLETE when you see 'Order confirmed'" |
-| **Use visual descriptions** | "Click the blue Submit button at the bottom of the form" |
-| **Start general, then refine** | Test with basic prompts first, add specifics based on failures |
-| **Include termination criteria** | "TERMINATE if login fails or account is locked" |
-| **Reference visual indicators** | "The invoice download link has a PDF icon next to it" |
+**Be explicit about completion.** The AI needs to know when to stop. "COMPLETE when you see 'Order confirmed'" is unambiguous. Without this, the AI might keep navigating or stop too early.
 
-### Don'ts
+**Use visual descriptions.** "Click the blue Submit button at the bottom of the form" works better than "click Submit"—there might be multiple buttons, and visual context helps the AI pick the right one. Describe position, color, icons, and surrounding text.
 
-| Anti-pattern | Why it fails |
-|--------------|--------------|
-| **Vague goals** | "Do the thing on the website" — AI needs specifics |
-| **Missing completion criteria** | AI doesn't know when to stop |
-| **Action lists without context** | "Click button A, then B, then C" — breaks if layout changes |
-| **HTML element names** | "Click the `<button id='submit'>` element" — IDs change, not all are accessible |
-| **Assuming page state** | Always describe what you expect to see |
+**Start general, then refine.** Begin with simple prompts and add specifics based on failures. Over-specified prompts are brittle; the AI handles variation better when you describe goals rather than exact steps.
+
+**Include termination criteria.** Tell the AI when to give up: "TERMINATE if login fails or account is locked." Without this, the AI might keep trying forever or fail silently.
+
+**Reference visual indicators.** "The invoice download link has a PDF icon next to it" helps the AI identify the right element when there are multiple links with similar text.
+
+### What doesn't work
+
+**Vague goals.** "Do the thing on the website" gives the AI nothing to work with. Be specific about what outcome you want.
+
+**Missing completion criteria.** Without knowing when to stop, the AI keeps navigating indefinitely or terminates at arbitrary points.
+
+**Action lists without context.** "Click button A, then B, then C" breaks when the layout changes or buttons move. Describe the goal instead, and let the AI figure out the steps.
+
+**HTML element names.** "Click the `<button id='submit'>` element" assumes IDs are stable and visible to the AI. They often change between deployments, and the AI works from visual screenshots, not DOM structure.
+
+**Assuming page state.** The AI doesn't know what page you expect to be on. Always describe what you expect to see, not just what to do.
 
 ---
 
 ## Choosing the right block type
 
-| Block | Determinism | Use for |
-|-------|-------------|---------|
-| **Action** | Highest | Single, specific actions: "Click the Submit button" |
-| **Navigation** | Medium | Single goals: "Fill out the registration form" |
-| **Task (Navigation V2)** | Lowest | Multi-step goals: "Log in, navigate to settings, update profile" |
+Skyvern offers three block types with different tradeoffs between reliability and flexibility. The more interpretation you ask the AI to do, the more room for unexpected behavior.
 
-More deterministic blocks are more reliable but less flexible. Start with the most deterministic block that can accomplish your goal.
+**Action blocks** are the most deterministic. You tell Skyvern exactly what to do: "Click the Submit button." There's no interpretation—it either finds the element and clicks it, or fails. Use these when you know exactly what action is needed and the page structure is predictable.
+
+**Navigation blocks** give Skyvern a goal: "Fill out the registration form." The AI figures out which fields to fill and in what order. This handles variation in form layouts—fields might be in different positions, have different labels, or be split across tabs—but the AI can misinterpret ambiguous forms or fill fields you didn't intend.
+
+**Task blocks (Navigation V2)** handle multi-step goals: "Log in, navigate to settings, update profile." Maximum flexibility for complex workflows, but more room for the AI to take unexpected paths. A task block might navigate through menus you didn't anticipate or skip steps it deems unnecessary.
+
+**Rule of thumb:** Start with the most deterministic block that can accomplish your goal. If a single click solves the problem, don't use a Task block—you're adding unnecessary interpretation where errors can creep in. Reserve Task blocks for genuinely multi-step workflows where you can't predict the exact sequence of actions.
 
 ---
 
@@ -111,9 +117,11 @@ TERMINATE if any validation error cannot be resolved.
 
 ## Validation strategies
 
+Workflows can silently produce wrong results—the AI might fill a form with incorrect data, navigate to the wrong page, or extract stale information. Validation blocks let you assert conditions at critical points and fail fast when something goes wrong, rather than discovering the problem downstream.
+
 ### Add validation blocks at critical points
 
-After login:
+**After login:** Verify you're actually authenticated before proceeding. A failed login might redirect to an error page or show a CAPTCHA, and subsequent blocks will fail in confusing ways if you don't catch this early.
 ```yaml
 - block_type: validation
   label: verify_login_success
@@ -121,7 +129,8 @@ After login:
   terminate_criterion: Login error, CAPTCHA, or still on login page
 ```
 
-Before form submission:
+**Before form submission:** Catch data entry errors before they become permanent. The AI might have misinterpreted a field or filled in default values instead of your parameters.
+
 ```yaml
 - block_type: validation
   label: verify_form_data
@@ -134,7 +143,7 @@ Before form submission:
 
 ### Use extraction to verify
 
-Extract key values and compare programmatically:
+For validation that requires exact matching (email addresses, confirmation numbers, prices), extract the values and compare programmatically in your code rather than relying on the AI's judgment:
 
 ```python
 result = await client.run_task(
@@ -157,7 +166,7 @@ if result.output["submitted_email"] != expected_email:
 
 ## ForLoop reliability
 
-Loops are especially prone to cascading failures. Each iteration can affect the next.
+Loops are especially prone to cascading failures—when one iteration fails, it can leave the browser in an unexpected state that breaks subsequent iterations. For example, if iteration 3 navigates to an error page and fails, iteration 4 starts from that error page instead of the expected list view, causing it to fail too. One bad item can take down your entire loop.
 
 ### Always set `continue_on_failure`
 
@@ -174,7 +183,7 @@ Loops are especially prone to cascading failures. Each iteration can affect the 
 
 ### Add a reset block
 
-If each iteration should start from a known state:
+Each iteration should start from a known state. If iteration 3 fails on a detail page, iteration 4 needs to navigate back to the list before it can find its item. Add a reset block at the start of each loop iteration:
 
 ```yaml
 loop_blocks:
