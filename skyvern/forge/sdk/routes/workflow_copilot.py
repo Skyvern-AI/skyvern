@@ -26,6 +26,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
+    WorkflowCopilotClearProposedWorkflowRequest,
     WorkflowCopilotProcessingUpdate,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamMessageType,
@@ -448,6 +449,13 @@ async def workflow_copilot_chat_post(
                 )
                 return
 
+            if updated_workflow and chat.auto_accept is not True:
+                await app.DATABASE.update_workflow_copilot_chat(
+                    organization_id=chat.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    proposed_workflow=updated_workflow.model_dump(mode="json"),
+                )
+
             await app.DATABASE.create_workflow_copilot_chat_message(
                 organization_id=chat.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -518,15 +526,33 @@ async def workflow_copilot_chat_history(
         organization_id=organization.organization_id,
         workflow_permanent_id=workflow_permanent_id,
     )
-    if not latest_chat:
-        return WorkflowCopilotChatHistoryResponse(workflow_copilot_chat_id=None, chat_history=[])
-    chat_messages = await app.DATABASE.get_workflow_copilot_chat_messages(
-        workflow_copilot_chat_id=latest_chat.workflow_copilot_chat_id,
-    )
+    if latest_chat:
+        chat_messages = await app.DATABASE.get_workflow_copilot_chat_messages(latest_chat.workflow_copilot_chat_id)
+    else:
+        chat_messages = []
     return WorkflowCopilotChatHistoryResponse(
-        workflow_copilot_chat_id=latest_chat.workflow_copilot_chat_id,
+        workflow_copilot_chat_id=latest_chat.workflow_copilot_chat_id if latest_chat else None,
         chat_history=convert_to_history_messages(chat_messages),
+        proposed_workflow=latest_chat.proposed_workflow if latest_chat else None,
+        auto_accept=latest_chat.auto_accept if latest_chat else None,
     )
+
+
+@base_router.post(
+    "/workflow/copilot/clear-proposed-workflow", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT
+)
+async def workflow_copilot_clear_proposed_workflow(
+    clear_request: WorkflowCopilotClearProposedWorkflowRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    updated_chat = await app.DATABASE.update_workflow_copilot_chat(
+        organization_id=organization.organization_id,
+        workflow_copilot_chat_id=clear_request.workflow_copilot_chat_id,
+        proposed_workflow=None,
+        auto_accept=clear_request.auto_accept,
+    )
+    if not updated_chat:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
 
 
 def convert_to_history_messages(

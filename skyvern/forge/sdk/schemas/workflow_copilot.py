@@ -10,6 +10,8 @@ class WorkflowCopilotChat(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="ID for the workflow copilot chat")
     organization_id: str = Field(..., description="Organization ID for the chat")
     workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
+    proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
+    auto_accept: bool | None = Field(False, description="Whether copilot auto-accepts workflow updates")
     created_at: datetime = Field(..., description="When the chat was created")
     modified_at: datetime = Field(..., description="When the chat was last modified")
 
@@ -40,6 +42,11 @@ class WorkflowCopilotChatRequest(BaseModel):
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
 
 
+class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., description="The chat ID to update")
+    auto_accept: bool = Field(..., description="Whether to auto-accept future workflow updates")
+
+
 class WorkflowCopilotChatHistoryMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
@@ -49,6 +56,8 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
 class WorkflowCopilotChatHistoryResponse(BaseModel):
     workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
+    proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
+    auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
 
 
 class WorkflowCopilotStreamMessageType(StrEnum):

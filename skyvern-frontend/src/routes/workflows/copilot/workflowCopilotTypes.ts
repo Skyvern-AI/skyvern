@@ -38,6 +38,13 @@ export interface WorkflowCopilotChatHistoryMessage {
 export interface WorkflowCopilotChatHistoryResponse {
   workflow_copilot_chat_id: string | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
+  proposed_workflow?: WorkflowApiResponse | null;
+  auto_accept?: boolean | null;
+}
+
+export interface WorkflowCopilotClearProposedWorkflowRequest {
+  workflow_copilot_chat_id: string;
+  auto_accept: boolean;
 }
 
 export type WorkflowCopilotStreamMessageType =
