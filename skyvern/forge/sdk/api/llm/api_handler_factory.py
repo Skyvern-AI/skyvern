@@ -2,6 +2,7 @@ import copy
 import dataclasses
 import json
 import time
+import warnings
 from asyncio import CancelledError
 from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
@@ -52,6 +53,19 @@ CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termina
 
 # Default thinking budget for extract-actions prompt (can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
 EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = 512
+
+
+def _safe_model_dump_json(response: ModelResponse, indent: int = 2) -> str:
+    """
+    Call model_dump_json() while suppressing Pydantic serialization warnings.
+
+    litellm's ModelResponse has Union types (Choices | StreamingChoices) that cause
+    Pydantic to emit warnings during serialization. These are cosmetic and don't
+    affect the serialized output.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, message=".*Pydantic.*Serializ.*")
+        return response.model_dump_json(indent=indent)
 
 
 @runtime_checkable
@@ -671,7 +685,7 @@ class LLMAPIHandlerFactory:
                     )
                     raise LLMProviderError(llm_key) from e
 
-                llm_response_json = response.model_dump_json(indent=2)
+                llm_response_json = _safe_model_dump_json(response)
                 if should_persist_llm_artifacts:
                     artifacts.append(
                         await app.ARTIFACT_MANAGER.prepare_llm_artifact(
@@ -1063,7 +1077,7 @@ class LLMAPIHandlerFactory:
                     )
                     raise LLMProviderError(llm_key) from e
 
-                llm_response_json = response.model_dump_json(indent=2)
+                llm_response_json = _safe_model_dump_json(response)
                 if should_persist_llm_artifacts:
                     artifacts.append(
                         await app.ARTIFACT_MANAGER.prepare_llm_artifact(
@@ -1442,7 +1456,7 @@ class LLMCaller:
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
                 raise LLMProviderError(self.llm_key) from e
 
-            llm_response_json = response.model_dump_json(indent=2)
+            llm_response_json = _safe_model_dump_json(response)
             if should_persist_llm_artifacts:
                 artifacts.append(
                     await app.ARTIFACT_MANAGER.prepare_llm_artifact(
