@@ -4,15 +4,15 @@ subtitle: Download, parse, and upload files in workflows
 slug: multi-step-automations/file-operations
 ---
 
-Workflows often need to handle files—downloading invoices, parsing spreadsheets, uploading documents to storage. This page covers the four core file operations: downloading, parsing, saving, and passing files between blocks.
+Workflows can download files from websites, parse CSVs/PDFs/Excel files, and upload to cloud storage. This page covers the four file operation blocks.
 
 ---
 
 ## Downloading files
 
-When your workflow needs to retrieve documents from a website—invoices from a vendor portal, confirmation letters after form submission, compliance certificates—use `file_download`. Downloaded files land in `SKYVERN_DOWNLOAD_DIRECTORY`, a special directory you can reference in later blocks to upload or email them.
+Add a `file_download` block to save files from a website. This block works like a Navigation block, but completes the moment a file download starts.
 
-Let's download an EIN confirmation letter from the IRS:
+**Required:** `navigation_goal`
 
 <CodeGroup>
 ```json JSON
@@ -37,21 +37,20 @@ Let's download an EIN confirmation letter from the IRS:
 ```
 </CodeGroup>
 
-The `navigation_goal` tells Skyvern how to find and trigger the download. The file lands in `SKYVERN_DOWNLOAD_DIRECTORY` automatically.
+Downloaded files land in `SKYVERN_DOWNLOAD_DIRECTORY`. Reference this in later blocks to upload or email them.
 
-| Parameter | Type | Use this to |
+| Parameter | Type | Description |
 |-----------|------|-------------|
-| `navigation_goal` | string | Describe how to find and click the download button |
-| `url` | string | Set the starting page (omit to continue from previous block) |
-| `download_suffix` | string | Set the filename for the downloaded file |
-| `download_timeout` | number | Allow more time for large files (in seconds) |
-| `max_retries` | integer | Retry the block on failure |
-| `max_steps_per_run` | integer | Limit how many actions the block can take |
-| `engine` | string | Set the AI engine (`skyvern-1.0` or `skyvern-2.0`) |
+| `navigation_goal` | string | **Required.** How to find and click the download button |
+| `url` | string | Starting page (omit to continue from previous block) |
+| `download_suffix` | string | Filename for the downloaded file |
+| `download_timeout` | number | Seconds to wait for large files |
+| `max_retries` | integer | Retry count on failure |
+| `max_steps_per_run` | integer | Max actions the block can take |
 
 ### Downloading multiple files
 
-Extract a list of URLs first, then loop through them:
+Extract URLs first, then loop:
 
 <CodeGroup>
 ```json JSON
@@ -84,15 +83,15 @@ Extract a list of URLs first, then loop through them:
 ```
 </CodeGroup>
 
-All files accumulate in `SKYVERN_DOWNLOAD_DIRECTORY`. After the loop, upload or email them all in one block.
+All files accumulate in `SKYVERN_DOWNLOAD_DIRECTORY`.
 
 ---
 
 ## Parsing files
 
-When your workflow needs to act on information from a file—filling forms with resume data, processing orders from a spreadsheet, extracting fields from a PDF—use `file_url_parser`. It downloads the file, parses it, and returns structured data you can use in subsequent blocks.
+Add a `file_url_parser` block to extract structured data from CSV, Excel, or PDF files. Parsed output is available to subsequent blocks as `{{ label_output }}`.
 
-Let's parse a resume PDF to extract candidate information:
+**Required:** `file_url`, `file_type`
 
 <CodeGroup>
 ```json JSON
@@ -145,22 +144,22 @@ Let's parse a resume PDF to extract candidate information:
 ```
 </CodeGroup>
 
-With a `json_schema`, Skyvern uses an LLM to extract exactly the fields you specify. Without a schema, you get the raw parsed content.
+With `json_schema`, an LLM extracts exactly the fields you specify. Without it, you get raw parsed content.
 
-| Parameter | Type | Use this to |
+| Parameter | Type | Description |
 |-----------|------|-------------|
-| `file_url` | string | Point to the file (HTTP URL, S3 URI, or parameter like `{{ resume }}`) |
-| `file_type` | string | Specify format: `csv`, `excel`, or `pdf` |
-| `json_schema` | object | Define the structure you want extracted |
+| `file_url` | string | **Required.** HTTP URL, S3 URI, or parameter (`{{ resume }}`) |
+| `file_type` | string | **Required.** `csv`, `excel`, or `pdf` |
+| `json_schema` | object | JSON Schema for structured extraction |
 
-**Supported sources for `file_url`:**
+**Supported `file_url` sources:**
 - HTTP/HTTPS URLs
 - S3 URIs (`s3://bucket/path/file.csv`)
 - Azure Blob URIs (`azure://container/path/file.xlsx`)
 - Google Drive links (auto-converted)
 - Workflow parameters (`{{ parameter_name }}`)
 
-### Parsing a CSV and processing each row
+### Parse CSV and process each row
 
 <CodeGroup>
 ```json JSON
@@ -204,17 +203,19 @@ With a `json_schema`, Skyvern uses an LLM to extract exactly the fields you spec
 ```
 </CodeGroup>
 
-CSV parsing returns an array of objects—one per row, with column headers as keys. Loop over `parse_orders_output` to process each row.
+CSV parsing returns an array of objects (one per row, column headers as keys). Loop over `parse_orders_output` to process each row.
 
 ---
 
 ## Saving files
 
-When your workflow needs to store downloaded files permanently—archiving invoices, sending reports to a shared bucket, integrating with other systems—use one of the upload blocks.
+Three blocks for uploading files to cloud storage.
 
 ### Upload to Skyvern's S3
 
-Use `upload_to_s3` for the simplest option. It uploads everything from `SKYVERN_DOWNLOAD_DIRECTORY` and returns S3 URIs:
+Simplest option. Uploads everything from `SKYVERN_DOWNLOAD_DIRECTORY` and returns S3 URIs.
+
+**Required:** `path`
 
 <CodeGroup>
 ```json JSON
@@ -232,17 +233,13 @@ Use `upload_to_s3` for the simplest option. It uploads everything from `SKYVERN_
 ```
 </CodeGroup>
 
-The output is a list of S3 URIs you can return from your workflow or use in subsequent blocks.
+Output is a list of S3 URIs. **Limit:** 25 files max.
 
-| Parameter | Type | Use this to |
-|-----------|------|-------------|
-| `path` | string | Specify what to upload (`SKYVERN_DOWNLOAD_DIRECTORY` or a specific file path) |
+### Upload to your own S3/Azure
 
-**Limit:** 25 files maximum per upload.
+Use `file_upload` to send files to your own bucket.
 
-### Upload to your own storage
-
-Use `file_upload` when files need to land in your own S3 bucket or Azure Blob Storage:
+**Required:** `storage_type`, `path`, and storage credentials
 
 <CodeGroup>
 ```json JSON
@@ -270,20 +267,22 @@ Use `file_upload` when files need to land in your own S3 bucket or Azure Blob St
 ```
 </CodeGroup>
 
-| Parameter | Type | Use this to |
+| Parameter | Type | Description |
 |-----------|------|-------------|
-| `storage_type` | string | Choose `s3` or `azure` |
-| `path` | string | Specify what to upload (`SKYVERN_DOWNLOAD_DIRECTORY` or a file path) |
+| `storage_type` | string | **Required.** `s3` or `azure` |
+| `path` | string | **Required.** `SKYVERN_DOWNLOAD_DIRECTORY` or specific file |
 
-**S3 parameters:** `s3_bucket`, `aws_access_key_id`, `aws_secret_access_key`, `region_name`
+**S3 params:** `s3_bucket`, `aws_access_key_id`, `aws_secret_access_key`, `region_name`
 
-**Azure parameters:** `azure_storage_account_name`, `azure_storage_account_key`, `azure_blob_container_name`, `azure_folder_path`
+**Azure params:** `azure_storage_account_name`, `azure_storage_account_key`, `azure_blob_container_name`, `azure_folder_path`
 
-**Limit:** 50 files maximum per upload.
+**Limit:** 50 files max.
 
-### Quick URL-to-S3
+### Direct URL to S3
 
-When you already have a direct file URL and just need to save it—no browser navigation required—use `download_to_s3`:
+Skip the browser entirely. Downloads a file from a URL and saves to Skyvern's S3.
+
+**Required:** `url`
 
 <CodeGroup>
 ```json JSON
@@ -301,21 +300,15 @@ When you already have a direct file URL and just need to save it—no browser na
 ```
 </CodeGroup>
 
-| Parameter | Type | Use this to |
-|-----------|------|-------------|
-| `url` | string | Specify the file URL to download and save |
-
-This skips the browser entirely—faster when you have the URL. **Limit:** 10 MB maximum file size.
+Faster when you already have the URL. **Limit:** 10 MB max file size.
 
 ---
 
 ## Passing files between blocks
 
-Files flow through workflows in two ways: through `SKYVERN_DOWNLOAD_DIRECTORY` for downloaded files, and through output parameters for parsed data.
+### Downloaded files
 
-### Using downloaded files
-
-Any file downloaded during a workflow run lands in `SKYVERN_DOWNLOAD_DIRECTORY`. Reference this directory in blocks that accept file paths:
+All downloaded files land in `SKYVERN_DOWNLOAD_DIRECTORY`. Reference it in blocks that accept file paths:
 
 <CodeGroup>
 ```json JSON
@@ -351,9 +344,9 @@ Any file downloaded during a workflow run lands in `SKYVERN_DOWNLOAD_DIRECTORY`.
 ```
 </CodeGroup>
 
-### Using parsed data
+### Parsed data
 
-When you parse a file, its output becomes available as `{{ label_output }}`:
+Parsed file output is available as `{{ label_output }}`:
 
 <CodeGroup>
 ```json JSON
@@ -389,9 +382,9 @@ When you parse a file, its output becomes available as `{{ label_output }}`:
 ```
 </CodeGroup>
 
-### Accepting files as workflow inputs
+### File URL as workflow input
 
-Define a `file_url` parameter to accept files when the workflow runs:
+Define a `file_url` parameter to accept files when running the workflow:
 
 <CodeGroup>
 ```json JSON
@@ -416,7 +409,7 @@ parameters:
 ```
 </CodeGroup>
 
-When running the workflow, pass any accessible URL—public links, S3 presigned URLs, or files in your own storage.
+Pass any accessible URL: public links, S3 presigned URLs, or files from your own storage.
 
 ---
 
@@ -428,7 +421,7 @@ When running the workflow, pass any accessible URL—public links, S3 presigned 
     icon="cube"
     href="/multi-step-automations/workflow-blocks-reference"
   >
-    Complete parameter reference for all file blocks
+    Complete parameter reference for all blocks
   </Card>
   <Card
     title="Build a Workflow"
