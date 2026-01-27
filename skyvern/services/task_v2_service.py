@@ -1,4 +1,3 @@
-import json
 import string
 from datetime import UTC, datetime
 from typing import Any
@@ -1822,10 +1821,9 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
     try:
         # build the task v2 response with backward compatible data
         task_run_response = await build_task_v2_run_response(task_v2)
-        task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
-        payload_json = task_v2.model_dump_json(by_alias=True)
-        payload_dict = json.loads(payload_json)
-        payload_dict.update(json.loads(task_run_response_json))
+        task_run_response_dict = task_run_response.model_dump(exclude={"run_request"}, mode="json")
+        payload_dict = task_v2.model_dump(by_alias=True, mode="json")
+        payload_dict.update(task_run_response_dict)
         signed_data = generate_skyvern_webhook_signature(payload=payload_dict, api_key=api_key.token)
         payload = signed_data.signed_payload
         headers = signed_data.headers
