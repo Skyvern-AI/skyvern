@@ -552,11 +552,16 @@ class Block(BaseModel, abc.ABC):
             # Record output parameter value if it hasn't been recorded yet
             workflow_run_context = self.get_workflow_run_context(workflow_run_id)
             if not workflow_run_context.has_value(self.output_parameter.key):
-                await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
-
-            failure_reason = f"Unexpected error: {str(e)}"
-            if isinstance(e, SkyvernException):
-                failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+                failure_reason = f"Unexpected error: {str(e)}"
+                if isinstance(e, SkyvernException):
+                    failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+                await self.record_output_parameter_value(
+                    workflow_run_context, workflow_run_id, {"failure_reason": failure_reason}
+                )
+            else:
+                failure_reason = f"Unexpected error: {str(e)}"
+                if isinstance(e, SkyvernException):
+                    failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
 
             return await self.build_block_result(
                 success=False,
@@ -1060,11 +1065,13 @@ class BaseTaskBlock(Block):
                         organization_id=organization_id,
                     )
 
-        await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
+        task_failure_reason = current_running_task.failure_reason if current_running_task else None
+        output_value = {"failure_reason": task_failure_reason} if task_failure_reason else None
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_value)
         return await self.build_block_result(
             success=False,
             status=BlockStatus.failed,
-            failure_reason=current_running_task.failure_reason if current_running_task else None,
+            failure_reason=task_failure_reason,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
