@@ -32,6 +32,22 @@
               "running-automations/task-parameters",
               "running-automations/extract-structured-data"
             ]
+          },
+          {
+            "group": "Going to Production",
+            "pages": [
+              "going-to-production/webhooks",
+              "going-to-production/proxy-geolocation",
+              "going-to-production/error-handling",
+              "going-to-production/reliability-tips"
+            ]
+          },
+          {
+            "group": "Debugging",
+            "pages": [
+              "debugging/using-artifacts",
+              "debugging/troubleshooting-guide"
+            ]
           }
         ]
       },

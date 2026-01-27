@@ -1,0 +1,317 @@
+---
+title: Troubleshooting Guide
+subtitle: Common issues, step timeline, and when to adjust what
+slug: debugging/troubleshooting-guide
+---
+
+When a run fails or produces unexpected results, this guide helps you identify the cause and fix it. The debugging flow is:
+
+1. **Check the run status and failure reason** — What happened?
+2. **Read the step timeline** — Where did it go wrong?
+3. **Inspect artifacts** — What did the AI see and decide?
+4. **Determine the fix** — Adjust prompt, parameters, or file a bug?
+
+---
+
+## Step 1: Check the run
+
+Start with the run response to understand what happened:
+
+```python
+run = await client.get_run(run_id)
+
+print(f"Status: {run.status}")
+print(f"Failure reason: {run.failure_reason}")
+print(f"Step count: {run.step_count}")
+print(f"Output: {run.output}")
+```
+
+| Status | What it means | Likely cause |
+|--------|---------------|--------------|
+| `completed` | Run finished, but output may be wrong | Prompt interpretation issue |
+| `failed` | System error | Browser crash, network failure |
+| `terminated` | AI gave up | Login blocked, CAPTCHA, page unavailable |
+| `timed_out` | Exceeded `max_steps` | Task too complex, or AI got stuck |
+| `canceled` | Manually stopped | — |
+
+---
+
+## Step 2: Read the step timeline
+
+The timeline shows each block and action in execution order. Use it to find exactly where things went wrong.
+
+<CodeGroup>
+```python Python
+timeline = await client.get_run_timeline(run_id)
+
+for item in timeline:
+    if item.type == "block":
+        block = item.block
+        print(f"Block: {block.label}")
+        print(f"  Status: {block.status}")
+        print(f"  Duration: {block.duration}s")
+        if block.failure_reason:
+            print(f"  Failure: {block.failure_reason}")
+        for action in block.actions:
+            print(f"  Action: {action.action_type} -> {action.status}")
+```
+
+```typescript TypeScript
+const timeline = await client.getRunTimeline(runId);
+
+for (const item of timeline) {
+  if (item.type === "block") {
+    const block = item.block;
+    console.log(`Block: ${block.label}`);
+    console.log(`  Status: ${block.status}`);
+    console.log(`  Duration: ${block.duration}s`);
+    if (block.failure_reason) {
+      console.log(`  Failure: ${block.failure_reason}`);
+    }
+    for (const action of block.actions || []) {
+      console.log(`  Action: ${action.action_type} -> ${action.status}`);
+    }
+  }
+}
+```
+
+```bash cURL
+curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID/timeline" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+**Example timeline response:**
+
+```json
+[
+  {
+    "type": "block",
+    "block": {
+      "workflow_run_block_id": "wrb_123",
+      "label": "login",
+      "block_type": "navigation",
+      "status": "completed",
+      "duration": 12.5,
+      "actions": [
+        {"action_type": "input_text", "status": "completed"},
+        {"action_type": "click", "status": "completed"}
+      ]
+    }
+  },
+  {
+    "type": "block",
+    "block": {
+      "workflow_run_block_id": "wrb_124",
+      "label": "download_invoice",
+      "block_type": "navigation",
+      "status": "terminated",
+      "failure_reason": "Could not find invoice for January 2024",
+      "duration": 8.2,
+      "actions": [
+        {"action_type": "click", "status": "completed"},
+        {"action_type": "click", "status": "failed"}
+      ]
+    }
+  }
+]
+```
+
+The timeline tells you:
+- **Which block failed** — `download_invoice` terminated
+- **What it tried** — Clicked twice, second click failed
+- **Why it stopped** — "Could not find invoice for January 2024"
+
+---
+
+## Step 3: Inspect artifacts
+
+Once you know which step failed, pull artifacts for that step:
+
+```python
+artifacts = await client.get_run_artifacts(
+    run_id,
+    artifact_type=["screenshot_final", "llm_response_parsed", "skyvern_log"]
+)
+
+for a in artifacts:
+    print(f"{a.artifact_type}: {a.signed_url}")
+```
+
+Check these in order:
+
+1. **`screenshot_final`** — What did the page look like when it stopped?
+2. **`recording`** — Watch what happened leading up to the failure
+3. **`llm_response_parsed`** — What action did the AI decide to take?
+4. **`skyvern_log`** — Step-by-step execution details
+
+---
+
+## Common issues and fixes
+
+### Run completed but output is wrong
+
+**Symptom:** Status is `completed`, but the extracted data is incorrect or incomplete.
+
+**Check:**
+- `screenshot_final` — Did it end on the right page?
+- `llm_response_parsed` — Did the AI extract from the right elements?
+
+**Likely causes:**
+- Prompt was ambiguous about what to extract
+- `data_extraction_schema` descriptions weren't specific enough
+- Page had multiple similar elements and AI picked the wrong one
+
+**Fix:**
+- Add more specific descriptions in your schema: `"description": "The price in USD, without currency symbol, as a decimal number"`
+- Add visual hints to your prompt: "The price is displayed in bold below the product title"
+
+---
+
+### AI clicked the wrong element
+
+**Symptom:** Recording shows the AI clicking something other than what you intended.
+
+**Check:**
+- `visible_elements_tree` — Was the right element detected?
+- `llm_prompt` — Was the target described clearly?
+
+**Likely causes:**
+- Multiple similar elements on the page
+- Element wasn't visible (scrolled out of view, in an iframe)
+- Prompt description matched multiple elements
+
+**Fix:**
+- Add distinguishing details: "Click the **blue** Submit button at the **bottom** of the form"
+- Reference surrounding text: "Click the Download link in the row that says 'January 2024'"
+
+---
+
+### Run timed out
+
+**Symptom:** Status is `timed_out`.
+
+**Check:**
+- `recording` — Did the AI get stuck in a loop?
+- `step_count` — How many steps did it take?
+
+**Likely causes:**
+- Task was too complex for `max_steps`
+- AI kept navigating without reaching the goal
+- Missing completion criteria caused infinite loop
+
+**Fix:**
+- Increase `max_steps` if the task genuinely needs more steps
+- Add explicit completion criteria: "COMPLETE when you see 'Order confirmed'"
+- Simplify the task or break it into multiple workflow blocks
+
+---
+
+### Element not found
+
+**Symptom:** `failure_reason` mentions an element couldn't be found.
+
+**Check:**
+- `screenshot_final` — Is the element visible on the page?
+- `visible_elements_tree` — Did Skyvern detect it?
+
+**Likely causes:**
+- Element loads dynamically after the page appears
+- Element is inside an iframe
+- Element is below the fold (needs scrolling)
+- Element has unusual rendering (canvas, shadow DOM)
+
+**Fix:**
+- Add `max_screenshot_scrolls` to capture lazy-loaded content
+- Describe the element visually rather than by its technical properties
+- Add a wait or explicit scroll instruction in your prompt
+
+---
+
+### Login failed
+
+**Symptom:** Status is `terminated` with login-related failure reason.
+
+**Check:**
+- `screenshot_final` — What error message appeared?
+- `recording` — Did it fill the fields correctly?
+
+**Likely causes:**
+- Credentials are expired or wrong
+- CAPTCHA appeared
+- MFA is required but not configured
+- Site detected automation
+
+**Fix:**
+- Verify credentials in your credential store
+- Use `RESIDENTIAL_ISP` proxy for more stable IPs
+- Configure TOTP if MFA is required
+- Use a browser profile with an existing session
+
+---
+
+### CAPTCHA blocked the run
+
+**Symptom:** `failure_reason` mentions CAPTCHA.
+
+**Fix options:**
+1. **Browser profile** — Create a profile with an authenticated session that skips login
+2. **Human interaction block** — Pause for manual CAPTCHA solving
+3. **Different proxy** — Use `RESIDENTIAL_ISP` for static IPs that sites trust more
+
+---
+
+## When to adjust prompts vs parameters
+
+**Adjust your prompt if:**
+- The AI misunderstood what to do
+- It clicked the wrong element among similar options
+- Completion criteria were ambiguous
+- It extracted the wrong data
+
+**Adjust parameters if:**
+- Run timed out → increase `max_steps`
+- Site blocked you → change `proxy_location`
+- Content didn't load → increase `max_screenshot_scrolls`
+- Geo-restricted content → set appropriate `proxy_location`
+
+**File a bug if:**
+- Element is clearly visible but Skyvern doesn't detect it
+- Standard UI patterns (dropdowns, checkboxes, date pickers) don't work
+- Actions execute on consistently wrong elements despite clear prompts
+- Recording shows unexpected browser behavior
+
+---
+
+## Quick debugging checklist
+
+```
+□ Check run.status and run.failure_reason
+□ Get timeline to find which step failed
+□ View screenshot_final to see final page state
+□ Watch recording to see what happened
+□ Check llm_response_parsed to see AI's decision
+□ Review visible_elements_tree if element wasn't found
+□ Check har file if network request failed
+```
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Using Artifacts"
+    icon="file-lines"
+    href="/debugging/using-artifacts"
+  >
+    Detailed reference for all artifact types
+  </Card>
+  <Card
+    title="Reliability Tips"
+    icon="shield-check"
+    href="/going-to-production/reliability-tips"
+  >
+    Write prompts that fail less often
+  </Card>
+</CardGroup>
