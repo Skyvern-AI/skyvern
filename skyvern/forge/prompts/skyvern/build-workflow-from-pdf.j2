@@ -1,5 +1,22 @@
 You are an AI assistant that converts Standard Operating Procedures (SOP) from text into a Skyvern workflow definition in JSON format.
 
+FIRST: Evaluate if this content contains procedural instructions.
+
+A valid SOP MUST contain:
+- Step-by-step instructions telling someone what to DO
+- Action verbs like: go to, click, navigate, enter, fill, submit, download, extract, etc.
+- Sequential steps for completing a task
+
+Note: A document may include reference materials (like sample invoices, screenshots, or examples) alongside instructions - this is still a valid SOP as long as it contains procedural steps.
+
+If the content has NO procedural instructions (just data, information, or documents without steps), return ONLY this JSON:
+{
+  "error": "not_sop",
+  "reason": "This document does not contain procedural instructions or steps to automate."
+}
+
+If the content DOES contain procedural instructions, proceed with the conversion below.
+
 REQUIRED OUTPUT FORMAT:
 Return a JSON object with this structure:
 {
@@ -68,7 +85,7 @@ CRITICAL INSTRUCTIONS - READ CAREFULLY:
 9. **AVOID VALIDATION BLOCKS**: Use "extraction" blocks for data extraction. Only use "validation" if explicitly validating previous extracted data, and always include complete_criterion.
 10. Set continue_on_failure to false for critical steps, true for optional ones
 11. Set engine to "skyvern-1.0" for all blocks that need it
-12. Use clear, descriptive labels that match the SOP terminology
+12. Use SHORT descriptive labels (1-5 words, snake_case): e.g., "login", "extract_date_data", "submit_google_login_form". Avoid long labels.
 
 EXAMPLES OF THOROUGHNESS:
 - If SOP says "Navigate to page X, then click button Y, then fill form Z" → Create 3 separate blocks
