@@ -1,0 +1,293 @@
+---
+title: Error Handling & Observability
+subtitle: Build production systems that handle failures gracefully
+slug: going-to-production/error-handling
+---
+
+Automations fail. Sites change, logins expire, CAPTCHAs appear. This page covers how to detect failures, map them to actionable error codes, and debug issues when they occur.
+
+---
+
+## Run statuses
+
+Every task and workflow run transitions through these states:
+
+| Status | Description |
+|--------|-------------|
+| `created` | Run initialized, not yet queued |
+| `queued` | Waiting for an available browser |
+| `running` | AI is navigating and executing |
+| `completed` | Run finished successfully |
+| `failed` | Run encountered an error |
+| `terminated` | AI determined the goal cannot be achieved |
+| `timed_out` | Run exceeded `max_steps` or time limit |
+| `canceled` | Run was manually stopped |
+
+**Terminal states:** `completed`, `failed`, `terminated`, `timed_out`, `canceled`
+
+Check the `status` field in your polling loop or webhook payload:
+
+<CodeGroup>
+```python Python
+run = await client.get_run(run_id)
+
+if run.status == "completed":
+    process_output(run.output)
+elif run.status == "failed":
+    handle_failure(run.failure_reason)
+elif run.status == "terminated":
+    handle_termination(run.failure_reason)
+elif run.status == "timed_out":
+    retry_with_more_steps(run_id)
+```
+
+```typescript TypeScript
+const run = await client.getRun(runId);
+
+if (run.status === "completed") {
+  processOutput(run.output);
+} else if (run.status === "failed") {
+  handleFailure(run.failure_reason);
+} else if (run.status === "terminated") {
+  handleTermination(run.failure_reason);
+} else if (run.status === "timed_out") {
+  retryWithMoreSteps(runId);
+}
+```
+</CodeGroup>
+
+---
+
+## Interpreting `failure_reason`
+
+When a run fails or terminates, the `failure_reason` field contains details about what went wrong.
+
+```json
+{
+  "run_id": "tsk_v2_486305187432193504",
+  "status": "failed",
+  "failure_reason": "Login failed: Invalid credentials or account locked",
+  "output": null
+}
+```
+
+Common failure patterns:
+
+| Pattern in `failure_reason` | Likely cause |
+|----------------------------|--------------|
+| `Login failed` | Credentials expired, account locked, or MFA required |
+| `Element not found` | Page structure changed or element didn't load |
+| `Navigation timeout` | Page took too long to load |
+| `Max steps exceeded` | Task was too complex for the `max_steps` limit |
+| `CAPTCHA detected` | Site requires human verification |
+
+---
+
+## Custom error codes with `error_code_mapping`
+
+Map specific failure conditions to your own error codes for programmatic handling. Instead of parsing free-text `failure_reason`, get structured codes you can switch on.
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Log in and download the invoice",
+    url="https://vendor-portal.example.com",
+    error_code_mapping={
+        "login_failed": "The login credentials are incorrect or the account is locked",
+        "invoice_not_found": "No invoice found for the specified date range",
+        "maintenance_mode": "The website is down for maintenance",
+        "access_denied": "User does not have permission to access invoices"
+    }
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Log in and download the invoice",
+    url: "https://vendor-portal.example.com",
+    errorCodeMapping: {
+      login_failed: "The login credentials are incorrect or the account is locked",
+      invoice_not_found: "No invoice found for the specified date range",
+      maintenance_mode: "The website is down for maintenance",
+      access_denied: "User does not have permission to access invoices",
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Log in and download the invoice",
+    "url": "https://vendor-portal.example.com",
+    "error_code_mapping": {
+      "login_failed": "The login credentials are incorrect or the account is locked",
+      "invoice_not_found": "No invoice found for the specified date range",
+      "maintenance_mode": "The website is down for maintenance",
+      "access_denied": "User does not have permission to access invoices"
+    }
+  }'
+```
+</CodeGroup>
+
+When Skyvern encounters a condition matching one of your descriptions, the output contains your error code:
+
+```json
+{
+  "run_id": "tsk_v2_486305187432193504",
+  "status": "terminated",
+  "output": {
+    "error": "login_failed"
+  }
+}
+```
+
+Now you can handle errors programmatically:
+
+```python
+if run.output and run.output.get("error") == "login_failed":
+    refresh_credentials()
+    retry_task()
+elif run.output and run.output.get("error") == "maintenance_mode":
+    schedule_retry_later()
+```
+
+---
+
+## Validation blocks in workflows
+
+Add validation blocks to workflows to assert conditions at critical points. If validation fails, the workflow terminates early with a clear reason.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "validation",
+  "label": "verify_login",
+  "complete_criterion": "The page shows a logged-in state with user dashboard visible",
+  "terminate_criterion": "Login failed, incorrect credentials message, or CAPTCHA displayed",
+  "error_code_mapping": {
+    "login_failed": "Login credentials invalid",
+    "captcha_required": "CAPTCHA verification required"
+  }
+}
+```
+
+```yaml YAML
+- block_type: validation
+  label: verify_login
+  complete_criterion: |
+    The page shows a logged-in state with user dashboard visible
+  terminate_criterion: |
+    Login failed, incorrect credentials message, or CAPTCHA displayed
+  error_code_mapping:
+    login_failed: Login credentials invalid
+    captcha_required: CAPTCHA verification required
+```
+</CodeGroup>
+
+| Parameter | Description |
+|-----------|-------------|
+| `complete_criterion` | Condition that must be true to continue |
+| `terminate_criterion` | Condition that stops the workflow |
+| `error_code_mapping` | Map termination conditions to custom error codes |
+
+---
+
+## Debugging with artifacts
+
+Every run generates artifacts for debugging: recordings, screenshots, logs, and AI reasoning. Access them via API or the Skyvern UI.
+
+<CodeGroup>
+```python Python
+artifacts = await client.get_run_artifacts(run_id)
+
+for artifact in artifacts:
+    print(f"{artifact.artifact_type}: {artifact.signed_url}")
+```
+
+```typescript TypeScript
+const artifacts = await client.getRunArtifacts(runId);
+
+for (const artifact of artifacts) {
+  console.log(`${artifact.artifact_type}: ${artifact.signed_url}`);
+}
+```
+
+```bash cURL
+curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID/artifacts" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+**Key artifact types for debugging:**
+
+| Type | Use this to |
+|------|-------------|
+| `recording` | Watch the full browser session video |
+| `screenshot_final` | See the final state when the run ended |
+| `llm_response` | Understand why the AI made each decision |
+| `browser_console_log` | Check for JavaScript errors |
+| `har` | Analyze network requests and responses |
+
+---
+
+## Observability with Laminar
+
+For production systems, integrate [Laminar](https://lmnr.ai) to trace workflow executions, monitor LLM calls, and debug failures at scale.
+
+```python
+import litellm
+from lmnr import Laminar, LaminarLiteLLMCallback, Instruments
+
+# Initialize at startup
+Laminar.initialize(disabled_instruments=set([Instruments.OPENAI]))
+litellm.callbacks = [LaminarLiteLLMCallback()]
+
+# Run tasks as normal - Laminar traces automatically
+result = await client.run_task(
+    prompt="Extract pricing data",
+    url="https://example.com"
+)
+```
+
+Laminar provides:
+- **Browser session recordings** synchronized with execution steps
+- **LLM decision traces** showing prompts and responses
+- **Performance metrics** including latency, token usage, and cost
+- **Error aggregation** to identify patterns across runs
+
+---
+
+## Handling common failures
+
+| Failure | Detection | Recovery |
+|---------|-----------|----------|
+| **Credentials expired** | `error_code_mapping` with `login_failed` | Refresh credentials, retry |
+| **Site structure changed** | `failed` status with element errors | Update prompts, add visual hints |
+| **Rate limiting** | Repeated failures in short window | Add delays, use different proxy |
+| **CAPTCHA** | `terminated` with CAPTCHA in reason | Use `human_interaction` block or browser profile |
+| **Timeout** | `timed_out` status | Increase `max_steps`, simplify task |
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Reliability Tips"
+    icon="shield-check"
+    href="/going-to-production/reliability-tips"
+  >
+    Write robust prompts and handle edge cases
+  </Card>
+  <Card
+    title="Webhooks"
+    icon="webhook"
+    href="/going-to-production/webhooks"
+  >
+    Get notified when runs complete or fail
+  </Card>
+</CardGroup>

@@ -1,0 +1,290 @@
+---
+title: Proxy & Geolocation
+subtitle: Route browser traffic through residential proxies worldwide
+slug: going-to-production/proxy-geolocation
+---
+
+Access geo-restricted websites and avoid bot detection with Skyvern's global network of residential proxies. 
+
+<Note>
+Proxy routing is only available in Skyvern Cloud. Self-hosted deployments require your own proxy infrastructure.
+</Note>
+
+---
+
+## Set `proxy_location`
+
+Pass `proxy_location` when creating or running tasks, workflows or browser sessions to route browser traffic through a specific region.
+
+For tasks:
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Get the price of this product",
+    url="https://shop.example.co.uk/product/123",
+    proxy_location="RESIDENTIAL_GB",
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Get the price of this product",
+    url: "https://shop.example.co.uk/product/123",
+    proxy_location: "RESIDENTIAL_GB",
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get the price of this product",
+    "url": "https://shop.example.co.uk/product/123",
+    "proxy_location": "RESIDENTIAL_GB"
+  }'
+```
+</CodeGroup>
+
+For workflows, set a default `proxy_location` when creating the workflow, then you can also override it when starting the run:
+
+<CodeGroup>
+```python Python
+# Set default proxy on workflow
+workflow = await client.create_workflow(
+    title="UK Price Monitor",
+    proxy_location="RESIDENTIAL_GB",
+    workflow_definition={...}
+)
+
+# Override for a specific run (takes priority over workflow default)
+run = await client.run_workflow(
+    workflow_permanent_id="wpid_123456789",
+    data={...},
+    proxy_location="RESIDENTIAL_DE"  # This run uses Germany instead
+)
+```
+
+```typescript TypeScript
+// Set default proxy on workflow
+const workflow = await client.createWorkflow({
+  body: {
+    title: "UK Price Monitor",
+    proxy_location: "RESIDENTIAL_GB",
+    workflow_definition: {...},
+  },
+});
+
+// Override for a specific run (takes priority over workflow default)
+const run = await client.runWorkflow("wpid_123456789", {
+  body: {
+    data: {...},
+    proxy_location: "RESIDENTIAL_DE",  // This run uses Germany instead
+  },
+});
+```
+
+```bash cURL
+# Set default proxy on workflow
+curl -X POST "https://api.skyvern.com/v1/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "UK Price Monitor",
+    "proxy_location": "RESIDENTIAL_GB",
+    "workflow_definition": {...}
+  }'
+
+# Override for a specific run (takes priority over workflow default)
+curl -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_permanent_id": "wpid_123456789",
+    "data": {...},
+    "proxy_location": "RESIDENTIAL_DE"
+  }'
+```
+</CodeGroup>
+
+For browser sessions, set `proxy_location` at creation—all tasks in that session use the same proxy:
+
+<CodeGroup>
+```python Python
+session = await client.create_browser_session(
+    timeout=60,
+    proxy_location="RESIDENTIAL_DE"
+)
+```
+
+```typescript TypeScript
+const session = await client.createBrowserSession({
+  body: {
+    timeout: 60,
+    proxy_location: "RESIDENTIAL_DE",
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "timeout": 60,
+    "proxy_location": "RESIDENTIAL_DE"
+  }'
+```
+</CodeGroup>
+
+---
+
+## Proxy location options
+
+Use these enum values for country-level targeting. Each routes through a residential proxy pool in that country.
+
+| Value | Country | Timezone |
+|-------|---------|----------|
+| `RESIDENTIAL` | United States | America/New_York |
+| `RESIDENTIAL_ISP` | United States | America/New_York |
+| `RESIDENTIAL_AR` | Argentina | America/Buenos_Aires |
+| `RESIDENTIAL_AU` | Australia | Australia/Sydney |
+| `RESIDENTIAL_BR` | Brazil | America/Sao_Paulo |
+| `RESIDENTIAL_CA` | Canada | America/Toronto |
+| `RESIDENTIAL_DE` | Germany | Europe/Berlin |
+| `RESIDENTIAL_ES` | Spain | Europe/Madrid |
+| `RESIDENTIAL_FR` | France | Europe/Paris |
+| `RESIDENTIAL_GB` | United Kingdom | Europe/London |
+| `RESIDENTIAL_IE` | Ireland | Europe/Dublin |
+| `RESIDENTIAL_IN` | India | Asia/Kolkata |
+| `RESIDENTIAL_IT` | Italy | Europe/Rome |
+| `RESIDENTIAL_JP` | Japan | Asia/Tokyo |
+| `RESIDENTIAL_MX` | Mexico | America/Mexico_City |
+| `RESIDENTIAL_NL` | Netherlands | Europe/Amsterdam |
+| `RESIDENTIAL_NZ` | New Zealand | Pacific/Auckland |
+| `RESIDENTIAL_TR` | Türkiye | Europe/Istanbul |
+| `RESIDENTIAL_ZA` | South Africa | Africa/Johannesburg |
+| `NONE` | No proxy | — |
+
+- `RESIDENTIAL` is the default. It routes traffic through a random US residential IP.
+- `RESIDENTIAL_ISP` uses static ISP IPs instead of rotating residential IPs. Useful for sites that distrust rotating pools or require consistent IP addresses across requests.
+- `NONE` disables proxy routing entirely—traffic originates from Skyvern's US datacenters. Useful for testing or internal tools.
+
+**Note on timezone:** When using `proxy_location`, the browser's timezone is set accordingly. Sites that compare your IP's geolocation against browser timezone for bot detection will see consistent data.
+
+### State and city targeting
+
+For granular targeting—a specific US state, a city, or a country not in the presets—pass a `GeoTarget` object instead of an enum.
+
+<CodeGroup>
+```python Python
+# US state (California)
+result = await client.run_task(
+    prompt="Get local pricing",
+    url="https://example.com",
+    proxy_location={"country": "US", "subdivision": "CA"},
+)
+
+# US city (New York City)
+result = await client.run_task(
+    prompt="Get local pricing",
+    url="https://example.com",
+    proxy_location={"country": "US", "subdivision": "NY", "city": "New York"},
+)
+
+# City without subdivision (London)
+result = await client.run_task(
+    prompt="Get local pricing",
+    url="https://example.com",
+    proxy_location={"country": "GB", "city": "London"},
+)
+```
+
+```typescript TypeScript
+// US state (California)
+const result = await client.runTask({
+  body: {
+    prompt: "Get local pricing",
+    url: "https://example.com",
+    proxy_location: { country: "US", subdivision: "CA" },
+  },
+});
+
+// US city (New York City)
+const result = await client.runTask({
+  body: {
+    prompt: "Get local pricing",
+    url: "https://example.com",
+    proxy_location: { country: "US", subdivision: "NY", city: "New York" },
+  },
+});
+
+// City without subdivision (London)
+const result = await client.runTask({
+  body: {
+    prompt: "Get local pricing",
+    url: "https://example.com",
+    proxy_location: { country: "GB", city: "London" },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get local pricing",
+    "url": "https://example.com",
+    "proxy_location": {
+      "country": "US",
+      "subdivision": "CA",
+      "city": "San Francisco"
+    }
+  }'
+```
+</CodeGroup>
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `country` | string | **Required.** ISO 3166-1 alpha-2 code (e.g., `US`, `GB`, `DE`). |
+| `subdivision` | string | ISO 3166-2 subdivision code without country prefix (e.g., `CA` for California, `NY` for New York). |
+| `city` | string | City name in English (e.g., `San Francisco`, `London`). |
+
+**Supported countries:** `US`, `AR`, `AU`, `BR`, `CA`, `DE`, `ES`, `FR`, `GB`, `IE`, `IN`, `IT`, `JP`, `MX`, `NL`, `NZ`, `TR`, `ZA`
+
+---
+
+## Troubleshooting
+
+| Error | Reason | Options |
+|-------|--------|---------|
+| `NoProxyAvailable` | Requested city/state is temporarily unavailable in the proxy pool | Broaden target (city → state → country), use `RESIDENTIAL_ISP`, or retry later |
+| Site still blocks requests | Bot detection beyond IP geolocation (fingerprinting, behavioral analysis) | Use `RESIDENTIAL_ISP` for static IPs, match proxy to site's region, add `wait` blocks between actions |
+| Need to debug proxy issues | Isolate whether proxy is causing failures | Set `proxy_location: "NONE"` to bypass proxy entirely |
+
+Need a location that's not available? [Contact support](https://discord.gg/skyvern) to request new proxy pools.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Webhooks"
+    icon="webhook"
+    href="/going-to-production/webhooks"
+  >
+    Get notified when tasks complete instead of polling
+  </Card>
+  <Card
+    title="Error Handling"
+    icon="triangle-exclamation"
+    href="/going-to-production/error-handling"
+  >
+    Handle failures and map custom error codes
+  </Card>
+</CardGroup>

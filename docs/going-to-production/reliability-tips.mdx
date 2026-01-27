@@ -1,0 +1,275 @@
+---
+title: Reliability Tips
+subtitle: Write robust prompts and handle edge cases
+slug: going-to-production/reliability-tips
+---
+
+The difference between a demo and production-ready automation is reliability. This page covers techniques for writing prompts that work consistently, handling dynamic pages, and validating results.
+
+---
+
+## Writing robust prompts
+
+### Anatomy of a good prompt
+
+Every prompt needs four components:
+
+1. **Main goal** (required) — What should happen
+2. **Guardrails** — Constraints and boundaries
+3. **Payload** — Data to use in form fields
+4. **Completion criteria** (required) — How to know when done
+
+```
+Your goal is to fill out the contact form with the provided information.
+Only fill out required fields. Skip optional fields unless you have data for them.
+
+Here is the information:
+{{contact_data}}
+
+COMPLETE when the form is submitted and you see a confirmation message.
+TERMINATE if you see an error message or the form cannot be submitted.
+```
+
+### Dos
+
+| Practice | Example |
+|----------|---------|
+| **Be explicit about completion** | "COMPLETE when you see 'Order confirmed'" |
+| **Use visual descriptions** | "Click the blue Submit button at the bottom of the form" |
+| **Start general, then refine** | Test with basic prompts first, add specifics based on failures |
+| **Include termination criteria** | "TERMINATE if login fails or account is locked" |
+| **Reference visual indicators** | "The invoice download link has a PDF icon next to it" |
+
+### Don'ts
+
+| Anti-pattern | Why it fails |
+|--------------|--------------|
+| **Vague goals** | "Do the thing on the website" — AI needs specifics |
+| **Missing completion criteria** | AI doesn't know when to stop |
+| **Action lists without context** | "Click button A, then B, then C" — breaks if layout changes |
+| **HTML element names** | "Click the `<button id='submit'>` element" — IDs change, not all are accessible |
+| **Assuming page state** | Always describe what you expect to see |
+
+---
+
+## Choosing the right block type
+
+| Block | Determinism | Use for |
+|-------|-------------|---------|
+| **Action** | Highest | Single, specific actions: "Click the Submit button" |
+| **Navigation** | Medium | Single goals: "Fill out the registration form" |
+| **Task (Navigation V2)** | Lowest | Multi-step goals: "Log in, navigate to settings, update profile" |
+
+More deterministic blocks are more reliable but less flexible. Start with the most deterministic block that can accomplish your goal.
+
+---
+
+## Handling dynamic pages
+
+### Lazy-loaded content
+
+For pages that load content as you scroll:
+
+```python
+result = await client.run_task(
+    prompt="Extract all product listings from the page",
+    url="https://example.com/products",
+    max_screenshot_scrolls=5  # Scroll to load more content
+)
+```
+
+### Popups and modals
+
+Include handling instructions in your prompt:
+
+```
+Your goal is to add the item to cart.
+
+If a popup appears asking about newsletter signup, close it by clicking the X.
+If a cookie consent banner appears, click Accept.
+
+COMPLETE when the item is in the cart and the cart count increases.
+```
+
+### Multi-step forms
+
+For forms spread across multiple pages:
+
+```
+Your goal is to complete the checkout process.
+
+Page 1: Fill in shipping address using {{shipping_data}}
+Page 2: Select standard shipping
+Page 3: Enter payment details using {{payment_data}}
+Page 4: Review and submit
+
+COMPLETE when you see the order confirmation number.
+TERMINATE if any validation error cannot be resolved.
+```
+
+---
+
+## Validation strategies
+
+### Add validation blocks at critical points
+
+After login:
+```yaml
+- block_type: validation
+  label: verify_login_success
+  complete_criterion: Dashboard or account page is visible
+  terminate_criterion: Login error, CAPTCHA, or still on login page
+```
+
+Before form submission:
+```yaml
+- block_type: validation
+  label: verify_form_data
+  complete_criterion: |
+    Review page shows correct values:
+    - Name matches {{name}}
+    - Email matches {{email}}
+  terminate_criterion: Data mismatch or missing required fields
+```
+
+### Use extraction to verify
+
+Extract key values and compare programmatically:
+
+```python
+result = await client.run_task(
+    prompt="Fill out the form and extract the confirmation number",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "confirmation_number": {"type": "string"},
+            "submitted_email": {"type": "string"}
+        }
+    }
+)
+
+# Verify in your code
+if result.output["submitted_email"] != expected_email:
+    raise ValueError("Email mismatch")
+```
+
+---
+
+## ForLoop reliability
+
+Loops are especially prone to cascading failures. Each iteration can affect the next.
+
+### Always set `continue_on_failure`
+
+```yaml
+- block_type: for_loop
+  label: process_items
+  loop_over_parameter_key: items_list
+  continue_on_failure: true  # Don't stop the whole loop if one item fails
+  loop_blocks:
+    - block_type: navigation
+      label: process_item
+      navigation_goal: "Process: {{ process_item.current_value }}"
+```
+
+### Add a reset block
+
+If each iteration should start from a known state:
+
+```yaml
+loop_blocks:
+  - block_type: navigation
+    label: reset_to_list
+    url: "https://example.com/items"
+    navigation_goal: "Navigate back to the items list"
+  - block_type: navigation
+    label: process_item
+    navigation_goal: "Find and process: {{ process_item.current_value }}"
+```
+
+### Include termination criteria per iteration
+
+```yaml
+- block_type: navigation
+  label: process_item
+  navigation_goal: |
+    Process the item: {{ process_item.current_value }}
+
+    COMPLETE when the item is processed.
+    TERMINATE if you're not on the expected page or the item doesn't exist.
+```
+
+---
+
+## Keyboard actions and workarounds
+
+<Note>
+Direct keyboard shortcuts (Ctrl+C, Alt+Tab, etc.) are not currently supported. Here are workarounds for common scenarios.
+</Note>
+
+| Scenario | Workaround |
+|----------|------------|
+| **Copy text** | Use extraction block to get the text value |
+| **Paste into field** | Pass the value as a parameter: `{{value_to_paste}}` |
+| **Keyboard navigation** | Describe the click target visually instead |
+| **Hotkey-only features** | Look for menu alternatives or right-click options |
+| **Tab between fields** | AI handles field navigation automatically |
+
+For applications that require keyboard shortcuts, consider:
+1. Using the Code block with custom Playwright scripts
+2. Checking if the application has an API alternative
+3. Using browser profiles with pre-configured settings
+
+---
+
+## Troubleshooting workflow
+
+When a run fails:
+
+1. **Check the recording** — Watch what actually happened
+2. **Review screenshots** — See the state at each step
+3. **Check LLM reasoning** — Understand why the AI made each decision
+4. **Compare parameters** — Verify inputs match expectations
+
+### Common fixes
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| **Completed too early** | Ambiguous completion criteria | Add specific visual indicators |
+| **Didn't complete** | Missing completion criteria | Add explicit COMPLETE condition |
+| **Wrong element clicked** | Multiple similar elements | Add distinguishing details to prompt |
+| **Form field skipped** | Field not visible or labeled differently | Describe the field's visual position |
+| **Loop stuck** | No reset between iterations | Add reset block at loop start |
+
+### When to adjust prompts vs file a bug
+
+**Adjust your prompt if:**
+- The AI misunderstood what to do
+- Completion criteria were ambiguous
+- Visual descriptions were unclear
+
+**File a bug if:**
+- Elements are visibly present but not detected
+- Actions execute on wrong elements consistently
+- Standard UI patterns (dropdowns, checkboxes) don't work
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Error Handling"
+    icon="triangle-exclamation"
+    href="/going-to-production/error-handling"
+  >
+    Map errors to custom codes for programmatic handling
+  </Card>
+  <Card
+    title="Workflow Blocks Reference"
+    icon="cube"
+    href="/multi-step-automations/workflow-blocks-reference"
+  >
+    Detailed documentation for validation and other blocks
+  </Card>
+</CardGroup>
