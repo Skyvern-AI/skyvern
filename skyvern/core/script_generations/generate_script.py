@@ -201,6 +201,10 @@ def _requires_mini_agent(act: dict[str, Any]) -> bool:
     """
     Determine whether an input/select action should be forced into proactive mode.
     Mirrors runtime logic that treats some inputs as mini-agent flows or TOTP-sensitive.
+
+    NOTE: Multi-field TOTP sequences do NOT require proactive mode because we use
+    get_totp_digit() to provide the exact digit value. Using proactive mode would
+    cause the AI to override our value with its own generated one.
     """
     if act.get("has_mini_agent", False):
         return True
@@ -211,10 +215,115 @@ def _requires_mini_agent(act: dict[str, Any]) -> bool:
     # ):
     #     return True
 
-    if act.get("totp_timing_info") and act.get("totp_timing_info", {}).get("is_totp_sequence"):
-        return True
+    # Multi-field TOTP sequences should NOT use proactive mode - we provide the
+    # exact digit via get_totp_digit() and want that value used directly
+    # if act.get("totp_timing_info") and act.get("totp_timing_info", {}).get("is_totp_sequence"):
+    #     return True
 
     return False
+
+
+def _annotate_multi_field_totp_sequence(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Detect and annotate multi-field TOTP sequences in the action list.
+
+    Multi-field TOTP is when a 6-digit code needs to be split across 6 individual input fields.
+    This function identifies such sequences and adds totp_timing_info with the action_index
+    so that each field gets the correct digit (e.g., totp_code[0], totp_code[1], etc.).
+
+    Args:
+        actions: List of actions to analyze and annotate
+
+    Returns:
+        The same actions list with totp_timing_info added to multi-field TOTP actions
+    """
+    if len(actions) < 4:
+        return actions
+
+    # Identify consecutive runs of single-digit TOTP inputs
+    # A multi-field TOTP sequence is 4+ consecutive INPUT_TEXT actions with single-digit text
+    # and the same field_name (typically 'totp_code')
+    consecutive_start = None
+    consecutive_count = 0
+    totp_field_name = None
+
+    for idx, act in enumerate(actions):
+        is_single_digit_totp = (
+            act.get("action_type") == ActionType.INPUT_TEXT
+            and act.get("field_name")
+            and act.get("text")
+            and len(str(act.get("text", ""))) == 1
+            and str(act.get("text", "")).isdigit()
+        )
+
+        if is_single_digit_totp:
+            current_field = act.get("field_name")
+            if consecutive_start is None:
+                # Start a new sequence
+                consecutive_start = idx
+                totp_field_name = current_field
+                consecutive_count = 1
+            elif current_field == totp_field_name:
+                # Same field, continue the sequence
+                consecutive_count += 1
+            else:
+                # Different field - finalize current sequence if valid, then start new one
+                if consecutive_count >= 4:
+                    for seq_idx in range(consecutive_count):
+                        actions[consecutive_start + seq_idx]["totp_timing_info"] = {
+                            "is_totp_sequence": True,
+                            "action_index": seq_idx,
+                            "total_digits": consecutive_count,
+                            "field_name": totp_field_name,
+                        }
+                    LOG.debug(
+                        "Annotated multi-field TOTP sequence (field change)",
+                        start_idx=consecutive_start,
+                        count=consecutive_count,
+                        field_name=totp_field_name,
+                    )
+                # Start new sequence with different field
+                consecutive_start = idx
+                totp_field_name = current_field
+                consecutive_count = 1
+        else:
+            # End of consecutive sequence - check if it was a multi-field TOTP
+            if consecutive_count >= 4 and consecutive_start is not None:
+                # Annotate all actions in this sequence
+                for seq_idx in range(consecutive_count):
+                    actions[consecutive_start + seq_idx]["totp_timing_info"] = {
+                        "is_totp_sequence": True,
+                        "action_index": seq_idx,
+                        "total_digits": consecutive_count,
+                        "field_name": totp_field_name,
+                    }
+                LOG.debug(
+                    "Annotated multi-field TOTP sequence for script generation",
+                    start_idx=consecutive_start,
+                    count=consecutive_count,
+                    field_name=totp_field_name,
+                )
+            consecutive_start = None
+            consecutive_count = 0
+            totp_field_name = None
+
+    # Handle sequence at end of actions list
+    if consecutive_count >= 4 and consecutive_start is not None:
+        for seq_idx in range(consecutive_count):
+            actions[consecutive_start + seq_idx]["totp_timing_info"] = {
+                "is_totp_sequence": True,
+                "action_index": seq_idx,
+                "total_digits": consecutive_count,
+                "field_name": totp_field_name,
+            }
+        LOG.debug(
+            "Annotated multi-field TOTP sequence for script generation (at end)",
+            start_idx=consecutive_start,
+            count=consecutive_count,
+            field_name=totp_field_name,
+        )
+
+    return actions
 
 
 def _safe_name(label: str) -> str:
@@ -389,13 +498,32 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
     elif method in ["type", "fill"]:
         # Use context.parameters if field_name is available, otherwise fallback to direct value
         if act.get("field_name"):
-            text_value = cst.Subscript(
-                value=cst.Attribute(
-                    value=cst.Name("context"),
-                    attr=cst.Name("parameters"),
-                ),
-                slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
-            )
+            # Check if this is a multi-field TOTP sequence that needs digit indexing
+            totp_info = act.get("totp_timing_info") or {}
+            if totp_info.get("is_totp_sequence") and "action_index" in totp_info:
+                # Generate: await page.get_totp_digit(context, 'field_name', digit_index)
+                # This method properly resolves the TOTP code from credentials and returns the specific digit
+                text_value = cst.Await(
+                    expression=cst.Call(
+                        func=cst.Attribute(
+                            value=cst.Name("page"),
+                            attr=cst.Name("get_totp_digit"),
+                        ),
+                        args=[
+                            cst.Arg(value=cst.Name("context")),
+                            cst.Arg(value=_value(act["field_name"])),
+                            cst.Arg(value=_value(totp_info["action_index"])),
+                        ],
+                    )
+                )
+            else:
+                text_value = cst.Subscript(
+                    value=cst.Attribute(
+                        value=cst.Name("context"),
+                        attr=cst.Name("parameters"),
+                    ),
+                    slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
+                )
         else:
             text_value = _value(act["text"])
 
@@ -643,6 +771,9 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
     name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
     body_stmts: list[cst.BaseStatement] = []
+
+    # Detect and annotate multi-field TOTP sequences so each fill gets the correct digit index
+    actions = _annotate_multi_field_totp_sequence(actions)
 
     if block.get("url"):
         body_stmts.append(cst.parse_statement(f"await page.goto({repr(block['url'])})"))

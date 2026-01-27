@@ -123,6 +123,40 @@ class SkyvernPage(Page):
     ) -> str:
         return value
 
+    async def get_totp_digit(
+        self,
+        context: Any,
+        field_name: str,
+        digit_index: int,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str:
+        """
+        Get a specific digit from a TOTP code for multi-field TOTP inputs.
+
+        This method is used by generated scripts for multi-field TOTP where each
+        input field needs a single digit. It resolves the full TOTP code from
+        the credential and returns the specific digit.
+
+        Args:
+            context: The run context containing parameters
+            field_name: The parameter name containing the TOTP code or credential reference
+            digit_index: The index of the digit to return (0-5 for a 6-digit TOTP)
+            totp_identifier: Optional TOTP identifier for polling
+            totp_url: Optional TOTP verification URL
+
+        Returns:
+            The single digit at the specified index
+        """
+        # Get the raw parameter value (may be credential reference like BW_TOTP)
+        raw_value = context.parameters.get(field_name, "")
+        # Resolve the actual TOTP code (this handles credential generation)
+        totp_code = await self.get_actual_value(raw_value, totp_identifier, totp_url)
+        # Return the specific digit
+        if digit_index < len(totp_code):
+            return totp_code[digit_index]
+        return ""
+
     ######### Public Interfaces #########
 
     @overload
@@ -408,6 +442,11 @@ class SkyvernPage(Page):
         context = skyvern_context.current()
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
+
+        # For single-digit TOTP values (from multi-field TOTP inputs), force fallback mode
+        # so that we use the exact digit value instead of having AI generate a new one
+        if value and len(value) == 1 and value.isdigit() and ai == "proactive":
+            ai = "fallback"
 
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
