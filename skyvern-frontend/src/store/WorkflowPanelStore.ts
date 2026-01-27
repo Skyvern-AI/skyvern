@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { WorkflowVersion } from "@/routes/workflows/hooks/useWorkflowVersionsQuery";
+import { CopilotReviewStatus } from "@/routes/workflows/editor/panels/WorkflowComparisonPanel";
 
 export type BranchContext = {
   conditionalNodeId: string;
@@ -27,6 +28,8 @@ type WorkflowPanelState = {
     version1?: WorkflowVersion;
     version2?: WorkflowVersion;
     showComparison?: boolean;
+    mode?: "history" | "copilot";
+    onCopilotReviewClose?: (status: CopilotReviewStatus) => void;
   };
 };
 
