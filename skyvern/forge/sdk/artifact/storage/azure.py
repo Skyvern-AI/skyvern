@@ -357,12 +357,14 @@ class AzureStorage(BaseStorage):
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
         base_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
+
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
+
             LOG.info(
                 "Calculated checksum for file",
                 file=file,
