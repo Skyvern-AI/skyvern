@@ -488,14 +488,10 @@ class TestS3StorageHARCompression:
         # Create sample HAR JSON data (easily compressible)
         har_data = b'{"log": {"version": "1.2", "entries": [{"request": {}, "response": {}}]}}'
         artifact = self._create_har_artifact(s3_storage, TEST_STEP_ID)
-        original_uri = artifact.uri
+        assert artifact.uri.endswith(".har.zst")
 
         # Store the artifact
         await s3_storage.store_artifact(artifact, har_data)
-
-        # Verify URI was updated to .har.zst
-        assert artifact.uri.endswith(".har.zst")
-        assert artifact.uri == original_uri.replace(".har", ".har.zst")
 
         # Verify the stored data is compressed
         s3uri = S3Uri(artifact.uri)
