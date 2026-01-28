@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1380 500" width="1380" height="500">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap');
+    </style>
+    <!-- Hachure fill pattern -->
+    <pattern id="hachure" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(135)">
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#5b7fff" stroke-width="0.6" opacity="0.07"/>
+    </pattern>
+  </defs>
+
+  <!-- ============ CANVAS ============ -->
+  <rect width="1380" height="500" fill="#121220"/>
+
+  <!-- ============ TITLE SECTION ============ -->
+  <text x="690" y="46" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="26" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="-0.5">IRS SS-4 Filing Workflow</text>
+  <text x="690" y="72" font-family="Inter, -apple-system, sans-serif" font-size="13" fill="#7a85b2" text-anchor="middle" font-weight="400">Automated EIN application, verification, and delivery</text>
+
+  <!-- Divider -->
+  <line x1="128" y1="92" x2="1252" y2="92" stroke="#5b7fff" stroke-opacity="0.2" stroke-width="1" stroke-dasharray="8,5"/>
+
+  <!-- ============ CARD 1: NAVIGATION ============ -->
+  <rect x="128" y="115" width="180" height="200" rx="12" fill="#1a1a38" stroke="#5b7fff" stroke-width="2"/>
+  <rect x="128" y="115" width="180" height="200" rx="12" fill="url(#hachure)"/>
+  <circle cx="218" cy="155" r="18" fill="#004bdd" stroke="#5b7fff" stroke-width="1.5"/>
+  <text x="218" y="161" font-family="Inter, sans-serif" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+  <text x="218" y="202" font-family="Inter, sans-serif" font-size="16" font-weight="600" fill="#f0f2ff" text-anchor="middle">Navigation</text>
+  <line x1="152" y1="218" x2="284" y2="218" stroke="#5b7fff" stroke-opacity="0.25" stroke-width="1" stroke-dasharray="4,4"/>
+  <text font-family="Inter, sans-serif" font-size="12.5" fill="#a0a8cc" text-anchor="middle">
+    <tspan x="218" y="244">Fill out SS-4 form</tspan>
+    <tspan x="218" dy="18">with company info</tspan>
+  </text>
+
+  <!-- ====== ARROW 1→2 ====== -->
+  <path d="M 313,215 C 330,207 350,223 358,215" fill="none" stroke="#5b7fff" stroke-width="2" stroke-linecap="round"/>
+  <path d="M 351,208 L 361,215 L 351,222" fill="none" stroke="#5b7fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- ============ CARD 2: VALIDATION ============ -->
+  <rect x="364" y="115" width="180" height="200" rx="12" fill="#1a1a38" stroke="#5b7fff" stroke-width="2"/>
+  <rect x="364" y="115" width="180" height="200" rx="12" fill="url(#hachure)"/>
+  <circle cx="454" cy="155" r="18" fill="#004bdd" stroke="#5b7fff" stroke-width="1.5"/>
+  <text x="454" y="161" font-family="Inter, sans-serif" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
+  <text x="454" y="202" font-family="Inter, sans-serif" font-size="16" font-weight="600" fill="#f0f2ff" text-anchor="middle">Validation</text>
+  <line x1="388" y1="218" x2="520" y2="218" stroke="#5b7fff" stroke-opacity="0.25" stroke-width="1" stroke-dasharray="4,4"/>
+  <text font-family="Inter, sans-serif" font-size="12.5" fill="#a0a8cc" text-anchor="middle">
+    <tspan x="454" y="244">Verify the summary</tspan>
+    <tspan x="454" dy="18">is correct</tspan>
+  </text>
+
+  <!-- ====== ARROW 2→3 ====== -->
+  <path d="M 549,215 C 566,223 586,207 594,215" fill="none" stroke="#5b7fff" stroke-width="2" stroke-linecap="round"/>
+  <path d="M 587,208 L 597,215 L 587,222" fill="none" stroke="#5b7fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- ============ CARD 3: EXTRACTION ============ -->
+  <rect x="600" y="115" width="180" height="200" rx="12" fill="#1a1a38" stroke="#5b7fff" stroke-width="2"/>
+  <rect x="600" y="115" width="180" height="200" rx="12" fill="url(#hachure)"/>
+  <circle cx="690" cy="155" r="18" fill="#004bdd" stroke="#5b7fff" stroke-width="1.5"/>
+  <text x="690" y="161" font-family="Inter, sans-serif" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">3</text>
+  <text x="690" y="202" font-family="Inter, sans-serif" font-size="16" font-weight="600" fill="#f0f2ff" text-anchor="middle">Extraction</text>
+  <line x1="624" y1="218" x2="756" y2="218" stroke="#5b7fff" stroke-opacity="0.25" stroke-width="1" stroke-dasharray="4,4"/>
+  <text font-family="Inter, sans-serif" font-size="12.5" fill="#a0a8cc" text-anchor="middle">
+    <tspan x="690" y="244">Extract the assigned</tspan>
+    <tspan x="690" dy="18">EIN and legal name</tspan>
+  </text>
+
+  <!-- ====== ARROW 3→4 ====== -->
+  <path d="M 785,215 C 802,208 822,222 830,215" fill="none" stroke="#5b7fff" stroke-width="2" stroke-linecap="round"/>
+  <path d="M 823,208 L 833,215 L 823,222" fill="none" stroke="#5b7fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- ============ CARD 4: FILE DOWNLOAD ============ -->
+  <rect x="836" y="115" width="180" height="200" rx="12" fill="#1a1a38" stroke="#5b7fff" stroke-width="2"/>
+  <rect x="836" y="115" width="180" height="200" rx="12" fill="url(#hachure)"/>
+  <circle cx="926" cy="155" r="18" fill="#004bdd" stroke="#5b7fff" stroke-width="1.5"/>
+  <text x="926" y="161" font-family="Inter, sans-serif" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
+  <text x="926" y="202" font-family="Inter, sans-serif" font-size="16" font-weight="600" fill="#f0f2ff" text-anchor="middle">File Download</text>
+  <line x1="860" y1="218" x2="992" y2="218" stroke="#5b7fff" stroke-opacity="0.25" stroke-width="1" stroke-dasharray="4,4"/>
+  <text font-family="Inter, sans-serif" font-size="12.5" fill="#a0a8cc" text-anchor="middle">
+    <tspan x="926" y="244">Download confirmation</tspan>
+    <tspan x="926" dy="18">letter PDF</tspan>
+  </text>
+
+  <!-- ====== ARROW 4→5 ====== -->
+  <path d="M 1021,215 C 1038,222 1058,208 1066,215" fill="none" stroke="#5b7fff" stroke-width="2" stroke-linecap="round"/>
+  <path d="M 1059,208 L 1069,215 L 1059,222" fill="none" stroke="#5b7fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- ============ CARD 5: SEND EMAIL ============ -->
+  <rect x="1072" y="115" width="180" height="200" rx="12" fill="#1a1a38" stroke="#5b7fff" stroke-width="2"/>
+  <rect x="1072" y="115" width="180" height="200" rx="12" fill="url(#hachure)"/>
+  <circle cx="1162" cy="155" r="18" fill="#004bdd" stroke="#5b7fff" stroke-width="1.5"/>
+  <text x="1162" y="161" font-family="Inter, sans-serif" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">5</text>
+  <text x="1162" y="202" font-family="Inter, sans-serif" font-size="16" font-weight="600" fill="#f0f2ff" text-anchor="middle">Send Email</text>
+  <line x1="1096" y1="218" x2="1228" y2="218" stroke="#5b7fff" stroke-opacity="0.25" stroke-width="1" stroke-dasharray="4,4"/>
+  <text font-family="Inter, sans-serif" font-size="12.5" fill="#a0a8cc" text-anchor="middle">
+    <tspan x="1162" y="244">Email the letter to</tspan>
+    <tspan x="1162" dy="18">founders@company.com</tspan>
+  </text>
+
+  <!-- ============ INPUT / OUTPUT SECTION ============ -->
+  <!-- Input box -->
+  <rect x="128" y="345" width="540" height="70" rx="10" fill="#14142a" stroke="#5b7fff" stroke-width="1.5" stroke-opacity="0.35" stroke-dasharray="6,4"/>
+  <text x="152" y="374" font-family="Inter, sans-serif" font-size="11" font-weight="600" fill="#5b7fff" letter-spacing="1.2">INPUT</text>
+  <rect x="152" y="385" width="72" height="22" rx="6" fill="#5b7fff" fill-opacity="0.1" stroke="#5b7fff" stroke-width="1" stroke-opacity="0.2"/>
+  <text x="188" y="400" font-family="SF Mono, Fira Code, Consolas, monospace" font-size="11" fill="#dee1ff" text-anchor="middle">ein_info</text>
+  <rect x="234" y="385" width="112" height="22" rx="6" fill="#5b7fff" fill-opacity="0.1" stroke="#5b7fff" stroke-width="1" stroke-opacity="0.2"/>
+  <text x="290" y="400" font-family="SF Mono, Fira Code, Consolas, monospace" font-size="11" fill="#dee1ff" text-anchor="middle">company_name</text>
+  <rect x="356" y="385" width="138" height="22" rx="6" fill="#5b7fff" fill-opacity="0.1" stroke="#5b7fff" stroke-width="1" stroke-opacity="0.2"/>
+  <text x="425" y="400" font-family="SF Mono, Fira Code, Consolas, monospace" font-size="11" fill="#dee1ff" text-anchor="middle">responsible_party</text>
+
+  <!-- Output box -->
+  <rect x="688" y="345" width="564" height="70" rx="10" fill="#14142a" stroke="#5b7fff" stroke-width="1.5" stroke-opacity="0.35" stroke-dasharray="6,4"/>
+  <text x="712" y="374" font-family="Inter, sans-serif" font-size="11" font-weight="600" fill="#5b7fff" letter-spacing="1.2">OUTPUT</text>
+  <text x="712" y="400" font-family="Inter, sans-serif" font-size="13" fill="#a0a8cc">EIN confirmation letter emailed to recipient</text>
+
+  <!-- ============ FOOTER ============ -->
+  <text x="690" y="465" font-family="Inter, sans-serif" font-size="12" font-weight="500" fill="#5b7fff" opacity="0.3" text-anchor="middle" letter-spacing="0.5">Powered by Skyvern</text>
+</svg>
