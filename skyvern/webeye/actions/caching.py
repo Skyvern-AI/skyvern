@@ -233,6 +233,7 @@ async def personalize_action(
         ActionType.WAIT,
         ActionType.SOLVE_CAPTCHA,
         ActionType.NULL_ACTION,
+        ActionType.DOWNLOAD_FILE,
     ]:
         return [action]
     elif action.action_type == ActionType.TERMINATE:
@@ -246,7 +247,13 @@ async def personalize_action(
 
 
 def check_for_unsupported_actions(actions: list[Action]) -> None:
-    supported_actions = [ActionType.INPUT_TEXT, ActionType.WAIT, ActionType.CLICK, ActionType.COMPLETE]
+    supported_actions = [
+        ActionType.INPUT_TEXT,
+        ActionType.WAIT,
+        ActionType.CLICK,
+        ActionType.COMPLETE,
+        ActionType.DOWNLOAD_FILE,
+    ]
     supported_actions_with_query = [ActionType.INPUT_TEXT]
     for action in actions:
         query = action.intention
