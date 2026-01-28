@@ -31,6 +31,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotStreamResponseUpdate,
+    WorkflowYAMLConversionRequest,
+    WorkflowYAMLConversionResponse,
 )
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
@@ -40,6 +42,7 @@ from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_wor
 from skyvern.schemas.workflows import (
     LoginBlockYAML,
     WorkflowCreateYAMLRequest,
+    WorkflowDefinitionYAML,
 )
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
@@ -566,3 +569,30 @@ def convert_to_history_messages(
         )
         for message in messages
     ]
+
+
+@base_router.post("/workflow/copilot/convert-yaml-to-blocks", include_in_schema=False)
+async def workflow_copilot_convert_yaml_to_blocks(
+    request: WorkflowYAMLConversionRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowYAMLConversionResponse:
+    """
+    Convert workflow definition YAML to blocks format for comparison view.
+    This endpoint is used by the frontend to convert YAML to the proper blocks structure
+    that the comparison panel expects.
+    """
+    try:
+        parsed_yaml = yaml.safe_load(request.workflow_definition_yaml)
+        workflow_definition_yaml = WorkflowDefinitionYAML.model_validate(parsed_yaml)
+
+        workflow_definition = convert_workflow_definition(
+            workflow_definition_yaml=workflow_definition_yaml,
+            workflow_id=request.workflow_id,
+        )
+
+        return WorkflowYAMLConversionResponse(workflow_definition=workflow_definition.model_dump(mode="json"))
+    except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to convert workflow YAML: {str(e)}",
+        )
