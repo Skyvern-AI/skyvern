@@ -8,6 +8,7 @@ import structlog
 from pydantic import BaseModel
 
 from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.webeye.actions.actions import ActionType
 
@@ -63,6 +64,21 @@ async def generate_workflow_parameters_schema(
                 value = action.get("file_url", "")
             elif action_type == ActionType.SELECT_OPTION:
                 value = action.get("option", "")
+
+            # Skip actions without data - addresses race condition where script generation
+            # runs before action data is fully saved to database (SKY-7653)
+            if not value:
+                LOG.debug(
+                    "Skipping action without data during field mapping generation",
+                    action_type=action_type,
+                    action_id=action.get("action_id", ""),
+                    task_id=task_id,
+                )
+                # Mark that we had incomplete actions - triggers finalize regeneration
+                ctx = skyvern_context.current()
+                if ctx:
+                    ctx.script_gen_had_incomplete_actions = True
+                continue
 
             # Check if this action has an existing field name that must be preserved
             existing_field_name = existing_field_assignments.get(action_counter)
