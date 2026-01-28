@@ -74,6 +74,15 @@ async def _current_viewpoint_screenshot_helper(
 ) -> bytes:
     if page.is_closed():
         raise FailedToTakeScreenshot(error_message="Page is closed")
+
+    # Capture page context for debugging screenshot issues
+    url = page.url
+    try:
+        viewport = page.viewport_size
+        viewport_info = f"{viewport['width']}x{viewport['height']}" if viewport else "unknown"
+    except Exception:
+        viewport_info = "unknown"
+
     try:
         if mode == ScreenshotMode.DETAILED:
             await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
@@ -94,10 +103,25 @@ async def _current_viewpoint_screenshot_helper(
         )
         return screenshot
     except TimeoutError as e:
-        LOG.exception(f"Timeout error while taking screenshot: {str(e)}")
+        LOG.error(
+            "Screenshot timeout",
+            timeout_ms=timeout,
+            url=url,
+            viewport=viewport_info,
+            full_page=full_page,
+            mode=mode.value if hasattr(mode, "value") else str(mode),
+            error=str(e),
+        )
         raise FailedToTakeScreenshot(error_message=str(e)) from e
     except Exception as e:
-        LOG.exception(f"Unknown error while taking screenshot: {str(e)}")
+        LOG.error(
+            "Screenshot failed",
+            url=url,
+            viewport=viewport_info,
+            full_page=full_page,
+            error=str(e),
+            exc_info=True,
+        )
         raise FailedToTakeScreenshot(error_message=str(e)) from e
 
 

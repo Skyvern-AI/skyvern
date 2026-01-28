@@ -2456,8 +2456,23 @@ class ForgeAgent:
                     break
                 except (FailedToTakeScreenshot, ScrapingFailed) as e:
                     if idx < len(SCRAPE_TYPE_ORDER) - 1:
+                        LOG.warning(
+                            "Scrape attempt failed, will retry with next strategy",
+                            attempt=idx + 1,
+                            scrape_type=scrape_type.value if hasattr(scrape_type, "value") else str(scrape_type),
+                            error_type=e.__class__.__name__,
+                            url=task.url,
+                        )
                         continue
-                    LOG.exception(f"{e.__class__.__name__} happened in two normal attempts and reload-page retry")
+                    LOG.error(
+                        "All scrape attempts failed",
+                        total_attempts=len(SCRAPE_TYPE_ORDER),
+                        error_type=e.__class__.__name__,
+                        url=task.url,
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        exc_info=True,
+                    )
                     raise e
 
         if scraped_page is None:
