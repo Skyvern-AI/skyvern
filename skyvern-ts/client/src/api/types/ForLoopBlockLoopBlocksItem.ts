@@ -18,6 +18,7 @@ export type ForLoopBlockLoopBlocksItem =
     | Skyvern.ForLoopBlockLoopBlocksItem.Login
     | Skyvern.ForLoopBlockLoopBlocksItem.Navigation
     | Skyvern.ForLoopBlockLoopBlocksItem.PdfParser
+    | Skyvern.ForLoopBlockLoopBlocksItem.PrintPage
     | Skyvern.ForLoopBlockLoopBlocksItem.SendEmail
     | Skyvern.ForLoopBlockLoopBlocksItem.Task
     | Skyvern.ForLoopBlockLoopBlocksItem.TaskV2
@@ -85,6 +86,10 @@ export namespace ForLoopBlockLoopBlocksItem {
 
     export interface PdfParser extends Skyvern.PdfParserBlock {
         block_type: "pdf_parser";
+    }
+
+    export interface PrintPage extends Skyvern.PrintPageBlock {
+        block_type: "print_page";
     }
 
     export interface SendEmail extends Skyvern.SendEmailBlock {

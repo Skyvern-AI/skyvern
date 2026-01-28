@@ -24,7 +24,8 @@ export type ForLoopBlockYamlLoopBlocksItem =
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.PdfParser
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.TaskV2
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.HttpRequest
-    | Skyvern.ForLoopBlockYamlLoopBlocksItem.Conditional;
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.Conditional
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.PrintPage;
 
 export namespace ForLoopBlockYamlLoopBlocksItem {
     export interface Task extends Skyvern.TaskBlockYaml {
@@ -113,5 +114,9 @@ export namespace ForLoopBlockYamlLoopBlocksItem {
 
     export interface Conditional extends Skyvern.ConditionalBlockYaml {
         block_type: "conditional";
+    }
+
+    export interface PrintPage extends Skyvern.PrintPageBlockYaml {
+        block_type: "print_page";
     }
 }

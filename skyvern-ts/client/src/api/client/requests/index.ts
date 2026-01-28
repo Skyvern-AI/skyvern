@@ -1,4 +1,6 @@
 export type { BodyUploadFileV1UploadFilePost } from "./BodyUploadFileV1UploadFilePost.js";
+export type { ChangeTierRequest } from "./ChangeTierRequest.js";
+export type { CheckoutSubscriptionRequest } from "./CheckoutSubscriptionRequest.js";
 export type { CreateBrowserProfileRequest } from "./CreateBrowserProfileRequest.js";
 export type { CreateBrowserSessionRequest } from "./CreateBrowserSessionRequest.js";
 export type { CreateCredentialRequest } from "./CreateCredentialRequest.js";

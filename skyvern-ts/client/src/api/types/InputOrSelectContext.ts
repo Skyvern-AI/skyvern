@@ -8,4 +8,5 @@ export interface InputOrSelectContext {
     is_location_input?: boolean;
     is_date_related?: boolean;
     date_format?: string;
+    is_text_captcha?: boolean;
 }

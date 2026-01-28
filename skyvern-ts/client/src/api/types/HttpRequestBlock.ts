@@ -19,5 +19,7 @@ export interface HttpRequestBlock {
     files?: Record<string, string | undefined>;
     timeout?: number;
     follow_redirects?: boolean;
+    download_filename?: string;
+    save_response_as_file?: boolean;
     parameters?: Skyvern.HttpRequestBlockParametersItem[];
 }

@@ -26,8 +26,8 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "1.0.10",
-                    "User-Agent": "@skyvern/client/1.0.10",
+                    "X-Fern-SDK-Version": "1.0.11",
+                    "User-Agent": "@skyvern/client/1.0.11",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
@@ -2810,6 +2810,331 @@ export class SkyvernClient {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/sdk/run_action.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Create a Stripe Checkout Session for subscribing to a tier.
+     *
+     * Frontend should redirect the user to the returned URL.
+     * After successful checkout, Stripe will send a webhook that we handle
+     * to store the subscription and initialize billing state.
+     *
+     * Returns 400 if org already has an active subscription (use portal instead).
+     *
+     * @param {Skyvern.CheckoutSubscriptionRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.createCheckoutSessionApiV1BillingCheckoutPost({
+     *         tier: "free"
+     *     })
+     */
+    public createCheckoutSessionApiV1BillingCheckoutPost(
+        request: Skyvern.CheckoutSubscriptionRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.CheckoutSessionResponse> {
+        return core.HttpResponsePromise.fromPromise(
+            this.__createCheckoutSessionApiV1BillingCheckoutPost(request, requestOptions),
+        );
+    }
+
+    private async __createCheckoutSessionApiV1BillingCheckoutPost(
+        request: Skyvern.CheckoutSubscriptionRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.CheckoutSessionResponse>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "api/v1/billing/checkout",
+            ),
+            method: "POST",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.CheckoutSessionResponse, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /api/v1/billing/checkout.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Create a Stripe Customer Portal session for managing subscription.
+     *
+     * Frontend should redirect the user to the returned URL.
+     * The portal allows users to:
+     * - Update payment methods
+     * - Upgrade/downgrade plans
+     * - Cancel subscription
+     * - View invoices
+     *
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.createPortalSessionApiV1BillingPortalPost()
+     */
+    public createPortalSessionApiV1BillingPortalPost(
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.PortalSessionResponse> {
+        return core.HttpResponsePromise.fromPromise(this.__createPortalSessionApiV1BillingPortalPost(requestOptions));
+    }
+
+    private async __createPortalSessionApiV1BillingPortalPost(
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.PortalSessionResponse>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "api/v1/billing/portal",
+            ),
+            method: "POST",
+            headers: _headers,
+            queryParameters: requestOptions?.queryParams,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.PortalSessionResponse, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /api/v1/billing/portal.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.getOrganizationBillingApiV1BillingStateGet()
+     */
+    public getOrganizationBillingApiV1BillingStateGet(
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.BillingStateResponse | undefined> {
+        return core.HttpResponsePromise.fromPromise(this.__getOrganizationBillingApiV1BillingStateGet(requestOptions));
+    }
+
+    private async __getOrganizationBillingApiV1BillingStateGet(
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.BillingStateResponse | undefined>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "api/v1/billing/state",
+            ),
+            method: "GET",
+            headers: _headers,
+            queryParameters: requestOptions?.queryParams,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return {
+                data: _response.body as Skyvern.BillingStateResponse | undefined,
+                rawResponse: _response.rawResponse,
+            };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /api/v1/billing/state.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Redirect to Stripe Portal for tier changes.
+     * Portal handles proration based on configured settings:
+     * - Upgrades: Immediate proration charge
+     * - Downgrades: Apply at end of billing period
+     *
+     * @param {Skyvern.ChangeTierRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.changeTierApiV1BillingChangeTierPost({
+     *         tier: "free"
+     *     })
+     */
+    public changeTierApiV1BillingChangeTierPost(
+        request: Skyvern.ChangeTierRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.ChangeTierResponse> {
+        return core.HttpResponsePromise.fromPromise(
+            this.__changeTierApiV1BillingChangeTierPost(request, requestOptions),
+        );
+    }
+
+    private async __changeTierApiV1BillingChangeTierPost(
+        request: Skyvern.ChangeTierRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.ChangeTierResponse>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "api/v1/billing/change-tier",
+            ),
+            method: "POST",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.ChangeTierResponse, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /api/v1/billing/change-tier.");
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,
