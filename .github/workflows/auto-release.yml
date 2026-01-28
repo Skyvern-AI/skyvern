@@ -8,6 +8,8 @@ on:
       - 'pyproject.toml'
 jobs:
   check-version-change:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     outputs:
       version_changed: ${{ steps.check.outputs.version_changed }}
