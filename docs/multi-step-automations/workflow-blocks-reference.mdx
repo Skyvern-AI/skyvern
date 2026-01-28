@@ -6,7 +6,7 @@ slug: multi-step-automations/workflow-blocks-reference
 
 This page covers all block types available for building workflows.
 
-Blocks are defined in YAML format within the `workflow_definition.blocks` array.
+Blocks are defined in the `workflow_definition.blocks` array. Use JSON when passing a `json_definition` or YAML when passing a `yaml_definition` — both formats are shown for every block below.
 
 ---
 
@@ -26,7 +26,7 @@ Blocks are defined in YAML format within the `workflow_definition.blocks` array.
 | [`goto_url`](#goto-url) | Navigate directly to a URL |
 | [`file_download`](#file-download) | Download files from websites |
 | [`file_url_parser`](#file-parser) | Parse CSV, Excel, or PDF files |
-| [`pdf_parser`](#pdf-parser) | Parse PDF files specifically |
+| [`pdf_parser`](#pdf-parser) | Parse PDF files specifically (deprecated, use `file_url_parser`) |
 | [`download_to_s3`](#download-to-s3) | Download a file from URL to S3 |
 | [`upload_to_s3`](#upload-to-s3) | Upload workflow files to S3 |
 | [`file_upload`](#file-upload) | Upload files to S3 or Azure storage |
@@ -51,6 +51,59 @@ These parameters are available on all block types:
 | `next_loop_on_failure` | boolean | `false` | If `true` and inside a loop, skips to next iteration on failure. |
 | `next_block_label` | string | — | Label of the next block to execute. If omitted, uses sequential order. |
 | `model` | object | — | Override model configuration for this block. |
+
+### Finally block
+
+You can designate any block as a "finally" block that always executes when the workflow ends — whether it completed, failed, terminated, or timed out. The only exception is explicit cancellation.
+
+Set `finally_block_label` at the workflow definition level (alongside `parameters` and `blocks`):
+
+```yaml
+workflow_definition:
+  parameters: [...]
+  blocks:
+    - block_type: navigation
+      label: main_task
+      # ...
+    - block_type: send_email
+      label: notify_team
+      # ...
+  finally_block_label: notify_team
+```
+
+The referenced block must be a terminal block — it cannot have a `next_block_label`.
+
+---
+
+### Error code mapping
+
+Several blocks accept an `error_code_mapping` parameter. This is an object mapping custom error codes to natural language descriptions. Skyvern evaluates each description against the current page state and surfaces matching errors in the block output.
+
+```json
+{
+  "error_code_mapping": {
+    "INVALID_CREDENTIALS": "The page shows an error message indicating the username or password is incorrect.",
+    "ACCOUNT_LOCKED": "The page indicates the account has been locked or suspended.",
+    "CAPTCHA_REQUIRED": "A CAPTCHA challenge is displayed that cannot be solved."
+  }
+}
+```
+
+### Block outputs
+
+Every block produces an output accessible by other blocks as `{{label_output}}`, where `label` is the block's `label` value. The output shape depends on the block type:
+
+- **Navigation / Action / Login / File Download**: the output is `null` on success (the primary effect is the browser state change).
+- **Extraction**: the output matches the `data_schema` you provide (or a free-form object if no schema is given).
+- **Task**: `null` when only `navigation_goal` is set. When `data_extraction_goal` is set, the output matches the `data_schema`.
+- **Code**: the value of the `result` variable at the end of execution.
+- **Text Prompt**: the LLM response, structured according to `json_schema` if provided.
+- **File Parser / PDF Parser**: the parsed file content (structured if `json_schema` is provided).
+- **For Loop**: an array of outputs, one per iteration.
+- **HTTP Request**: the response body (as JSON if applicable, otherwise as a string).
+- **Upload to S3 / File Upload / Download to S3**: the storage URL of the uploaded/downloaded file.
+- **Print Page**: the file path of the saved PDF.
+- **Validation / Conditional / Goto URL / Wait / Send Email / Human Interaction**: `null` (control-flow blocks).
 
 ---
 
@@ -97,7 +150,7 @@ Navigate through websites to take actions with a natural language goal.
 | `navigation_goal` | string | — | **Required.** Natural language description of what to do. Include when to COMPLETE or TERMINATE. |
 | `url` | string | — | Starting URL. If omitted, continues from previous block's page. |
 | `title` | string | `""` | Display title for this block. |
-| `engine` | string | — | `"skyvern-1.0"` or `"skyvern-2.0"`. |
+| `engine` | string | `"skyvern-1.0"` | `"skyvern-1.0"` or `"skyvern-2.0"`. |
 | `max_steps_per_run` | integer | — | Maximum steps this block can take. |
 | `max_retries` | integer | `0` | Number of retry attempts on failure. |
 | `parameter_keys` | array | — | Parameters this block can access. |
@@ -145,12 +198,12 @@ Take a single action on the current page without navigation.
 | `navigation_goal` | string | — | Description of the action to take. |
 | `url` | string | — | URL to navigate to first. |
 | `title` | string | `""` | Display title for this block. |
-| `engine` | string | — | AI engine to use. |
+| `engine` | string | `"skyvern-1.0"` | AI engine to use (`"skyvern-1.0"` or `"skyvern-2.0"`). |
 | `max_retries` | integer | `0` | Number of retry attempts. |
 | `parameter_keys` | array | — | Parameters this block can access. |
 | `error_code_mapping` | object | — | Map conditions to custom error codes. |
 | `complete_on_download` | boolean | `false` | Complete when download triggered. |
-| `download_suffix` | string | — | Suffix for downloaded files. |
+| `download_suffix` | string | — | Filename for the downloaded file. |
 | `totp_identifier` | string | — | TOTP credential identifier. |
 | `totp_verification_url` | string | — | URL to fetch TOTP codes. |
 | `disable_cache` | boolean | `false` | Disable caching for this block. |
@@ -206,7 +259,7 @@ Extract structured data from a page without taking any actions.
 | `url` | string | — | URL to extract from. If omitted, uses current page. |
 | `title` | string | `""` | Display title for this block. |
 | `data_schema` | object/array/string | — | JSON Schema for the output structure. |
-| `engine` | string | — | AI engine to use. |
+| `engine` | string | `"skyvern-1.0"` | AI engine to use (`"skyvern-1.0"` or `"skyvern-2.0"`). |
 | `max_retries` | integer | `0` | Retry attempts. |
 | `max_steps_per_run` | integer | — | Maximum steps allowed. |
 | `parameter_keys` | array | — | Parameters this block can access. |
@@ -248,7 +301,7 @@ Authenticate to a website using stored credentials.
 | `url` | string | — | Login page URL. |
 | `navigation_goal` | string | — | Additional instructions for complex login flows. |
 | `title` | string | `""` | Display title for this block. |
-| `engine` | string | — | AI engine to use. |
+| `engine` | string | `"skyvern-1.0"` | AI engine to use (`"skyvern-1.0"` or `"skyvern-2.0"`). |
 | `parameter_keys` | array | — | Parameters including credential reference. |
 | `error_code_mapping` | object | — | Map conditions to custom error codes. |
 | `max_retries` | integer | `0` | Retry attempts. |
@@ -314,13 +367,13 @@ Legacy block combining navigation and extraction. For new workflows, prefer sepa
 | `data_extraction_goal` | string | — | What data to extract. |
 | `data_schema` | object/array/string | — | Schema for extracted data. |
 | `title` | string | `""` | Display title for this block. |
-| `engine` | string | — | AI engine to use. |
+| `engine` | string | `"skyvern-1.0"` | AI engine to use (`"skyvern-1.0"` or `"skyvern-2.0"`). |
 | `parameter_keys` | array | — | Available parameters. |
 | `error_code_mapping` | object | — | Custom error codes. |
 | `max_steps_per_run` | integer | — | Maximum steps. |
 | `max_retries` | integer | `0` | Retry attempts. |
 | `complete_on_download` | boolean | `false` | Complete when download triggered. |
-| `download_suffix` | string | — | Suffix for downloaded files. |
+| `download_suffix` | string | — | Filename for the downloaded file. |
 | `complete_criterion` | string | — | Condition for completion. |
 | `terminate_criterion` | string | — | Condition for termination. |
 | `complete_verification` | boolean | `true` | Verify completion criteria. |
@@ -368,6 +421,10 @@ Simplified task block using natural language prompts. Uses computer-use agents f
 | `totp_identifier` | string | — | TOTP credential identifier. |
 | `totp_verification_url` | string | — | URL to fetch TOTP codes. |
 | `disable_cache` | boolean | `false` | Disable caching. |
+
+<Info>
+`task_v2` does not use `parameter_keys`. All workflow parameters and previous block outputs are automatically available as Jinja2 template variables in `prompt` and `url`. For example: `"Fill the form with name {{first_name}} and email {{email}}"`.
+</Info>
 
 ---
 
@@ -529,7 +586,15 @@ Iterate over an array and execute nested blocks for each item.
 | `loop_variable_reference` | string | — | Custom name for the loop variable. |
 | `complete_if_empty` | boolean | `false` | If `true`, completes successfully when array is empty. |
 
-Inside the loop, access the current item with `{{label.current_value}}` where `label` is the nested block's label. Output is an array of results from each iteration.
+<Info>
+**Accessing the current item inside a loop**
+
+Use `{{nested_block_label.current_value}}` to reference the current iteration value, where `nested_block_label` is the `label` of the block **inside** `loop_blocks` — not the label of the `for_loop` itself.
+
+In the example above, the loop label is `apply_to_jobs` and the nested block label is `submit_application`, so the current URL is accessed as `{{submit_application.current_value}}`.
+</Info>
+
+The output of a `for_loop` block is an array containing the result from each iteration.
 
 ---
 
@@ -591,7 +656,7 @@ Navigate to download a file from a website.
 | `navigation_goal` | string | — | **Required.** How to find and download the file. |
 | `url` | string | — | Starting URL. |
 | `title` | string | `""` | Display title for this block. |
-| `engine` | string | — | AI engine to use. |
+| `engine` | string | `"skyvern-1.0"` | AI engine to use (`"skyvern-1.0"` or `"skyvern-2.0"`). |
 | `download_suffix` | string | — | Filename for the downloaded file. |
 | `download_timeout` | number | — | Timeout in seconds for download. |
 | `parameter_keys` | array | — | Parameters this block can access. |
@@ -637,6 +702,10 @@ Download and parse a file from a URL. Supports CSV, Excel, and PDF files.
 ---
 
 ## PDF Parser
+
+<Warning>
+Deprecated. Use [File Parser](#file-parser) with `file_type: "pdf"` instead. This block will be removed in a future version.
+</Warning>
 
 Parse a PDF file specifically for text extraction.
 
@@ -728,7 +797,8 @@ Upload downloaded files to AWS S3 or Azure Blob storage.
   "aws_access_key_id": "{{aws_access_key}}",
   "aws_secret_access_key": "{{aws_secret_key}}",
   "s3_bucket": "company-invoices",
-  "region_name": "us-west-2"
+  "region_name": "us-west-2",
+  "path": "SKYVERN_DOWNLOAD_DIRECTORY"
 }
 ```
 
@@ -740,6 +810,7 @@ Upload downloaded files to AWS S3 or Azure Blob storage.
   aws_secret_access_key: "{{aws_secret_key}}"
   s3_bucket: "company-invoices"
   region_name: us-west-2
+  path: SKYVERN_DOWNLOAD_DIRECTORY
 ```
 </CodeGroup>
 
@@ -1006,6 +1077,10 @@ Save the current browser page as a PDF file.
 | `include_timestamp` | boolean | `true` | Include timestamp in filename. |
 | `parameter_keys` | array | — | Parameters this block can access. |
 
+<Note>
+The `print_page` block works via the REST API and TypeScript SDK, but the Python SDK's generated types do not yet include it. If you use the Python SDK, pass the block definition through `json_definition` or `yaml_definition` — the API will accept it.
+</Note>
+
 ---
 
 ## Wait
@@ -1089,11 +1164,11 @@ Pause the workflow and send an email requesting human approval before continuing
 
 <CardGroup cols={2}>
   <Card
-    title="Introduction to Workflows"
-    icon="route"
-    href="/multi-step-automations/introduction-to-workflows"
+    title="Build a Workflow"
+    icon="hammer"
+    href="/multi-step-automations/build-a-workflow"
   >
-    Understand workflow concepts and patterns
+    Create and run your first workflow
   </Card>
   <Card
     title="Workflow Parameters"
@@ -1103,17 +1178,17 @@ Pause the workflow and send an email requesting human approval before continuing
     Pass data between blocks with parameters
   </Card>
   <Card
-    title="API Reference"
-    icon="code"
-    href="/api-reference"
+    title="File Operations"
+    icon="file"
+    href="/multi-step-automations/file-operations"
   >
-    Full API documentation
+    Parse, download, and upload files
   </Card>
   <Card
-    title="Credentials"
-    icon="key"
-    href="/credentials/introduction"
+    title="Webhooks"
+    icon="bell"
+    href="/going-to-production/webhooks"
   >
-    Store and use credentials securely
+    Get notified when workflows complete
   </Card>
 </CardGroup>

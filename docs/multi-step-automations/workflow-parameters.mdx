@@ -15,7 +15,9 @@ This page covers all parameters you can pass when creating and running workflows
 | [`title`](#title) **(Required)** | string | Name the workflow for identification |
 | [`workflow_definition`](#workflow_definition) **(Required)** | object | Define blocks, parameters, and logic |
 | [`description`](#description) | string | Document what the workflow does |
-| [`proxy_location`](#proxy_location-create) | string | Set default proxy for all blocks |
+| [`proxy_location`](#proxy_location-create) | string or object | Set default proxy for all blocks |
+| [`webhook_callback_url`](#webhook_callback_url) | string | Get notified when any run of this workflow completes |
+| [`persist_browser_session`](#persist_browser_session) | boolean | Keep the browser session alive across blocks |
 
 ---
 
@@ -23,43 +25,90 @@ This page covers all parameters you can pass when creating and running workflows
 
 | Parameter | Type | Use this to |
 |-----------|------|-------------|
-| [`workflow_permanent_id`](#workflow_permanent_id) **(Required)** | string | Specify which workflow to run |
-| [`data`](#data) | object | Pass values for workflow input parameters |
-| [`proxy_location`](#proxy_location-run) | string | Override the default proxy location |
-| [`webhook_callback_url`](#webhook_callback_url) | string | Get notified when the workflow completes |
+| [`workflow_id`](#workflow_id) **(Required)** | string | Specify which workflow to run |
+| [`parameters`](#parameters) | object | Pass values for workflow input parameters |
+| [`title`](#title-run) | string | Name this specific workflow run |
+| [`proxy_location`](#proxy_location-run) | string or object | Override the default proxy location |
+| [`webhook_url`](#webhook_url) | string | Get notified when the workflow completes |
+| [`browser_session_id`](#browser_session_id) | string | Reuse a persistent browser session |
+| [`browser_profile_id`](#browser_profile_id) | string | Reuse a browser profile (cookies, storage) |
 
 ---
 
 ## Creating a workflow
 
-### `title`
-
-**Required.** Display name for the workflow.
+<Info>
+All create parameters (`title`, `workflow_definition`, `description`, `proxy_location`, etc.) are nested inside a **`json_definition`** object — not passed at the top level. You can alternatively use `yaml_definition` (a YAML string) instead.
+</Info>
 
 <CodeGroup>
-```text Python
+```python Python
 workflow = await client.create_workflow(
-    title="Invoice Downloader",
-    workflow_definition={...}
+    json_definition={
+        "title": "...",
+        "workflow_definition": {...}
+    }
 )
 ```
 
-```text TypeScript
+```typescript TypeScript
 const workflow = await client.createWorkflow({
   body: {
-    title: "Invoice Downloader",
-    workflow_definition: {...},
+    json_definition: {
+      title: "...",
+      workflow_definition: {...},
+    },
   },
 });
 ```
 
-```text cURL
+```bash cURL
 curl -X POST "https://api.skyvern.com/v1/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "title": "Invoice Downloader",
-    "workflow_definition": {...}
+    "json_definition": {
+      "title": "...",
+      "workflow_definition": {...}
+    }
+  }'
+```
+</CodeGroup>
+
+### `title`
+
+**Required.** Display name for the workflow. This field goes inside the `json_definition` object.
+
+<CodeGroup>
+```python Python
+workflow = await client.create_workflow(
+    json_definition={
+        "title": "Invoice Downloader",
+        "workflow_definition": {...}
+    }
+)
+```
+
+```typescript TypeScript
+const workflow = await client.createWorkflow({
+  body: {
+    json_definition: {
+      title: "Invoice Downloader",
+      workflow_definition: {...},
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "json_definition": {
+      "title": "Invoice Downloader",
+      "workflow_definition": {...}
+    }
   }'
 ```
 </CodeGroup>
@@ -70,7 +119,7 @@ curl -X POST "https://api.skyvern.com/v1/workflows" \
 
 **Required.** The workflow structure containing parameters and blocks.
 
-```text
+```json
 {
   "workflow_definition": {
     "parameters": [...],
@@ -87,99 +136,105 @@ Input parameters the workflow accepts. Each parameter has:
 |-------|------|-------------|
 | `key` | string | Parameter name, used to reference via `{{ key }}` |
 | `parameter_type` | string | Always `"workflow"` for input parameters |
-| `workflow_parameter_type` | string | Data type: `string`, `integer`, `float`, `boolean`, `json`, `file_url` |
+| `workflow_parameter_type` | string | Data type: `string`, `integer`, `float`, `boolean`, `json`, `file_url`, `credential_id` |
 | `default_value` | any | Optional default value |
 | `description` | string | Optional description |
 
 <CodeGroup>
-```text Python
+```python Python
 workflow = await client.create_workflow(
-    title="Job Application Workflow",
-    workflow_definition={
-        "parameters": [
-            {
-                "key": "resume",
-                "parameter_type": "workflow",
-                "workflow_parameter_type": "file_url",
-                "description": "URL to the resume PDF"
-            },
-            {
-                "key": "job_urls",
-                "parameter_type": "workflow",
-                "workflow_parameter_type": "json",
-                "default_value": []
-            },
-            {
-                "key": "cover_letter",
-                "parameter_type": "workflow",
-                "workflow_parameter_type": "string",
-                "default_value": ""
-            }
-        ],
-        "blocks": [...]
+    json_definition={
+        "title": "Job Application Workflow",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "key": "resume",
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "file_url",
+                    "description": "URL to the resume PDF"
+                },
+                {
+                    "key": "job_urls",
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "json",
+                    "default_value": []
+                },
+                {
+                    "key": "cover_letter",
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "string",
+                    "default_value": ""
+                }
+            ],
+            "blocks": [...]
+        }
     }
 )
 ```
 
-```text TypeScript
+```typescript TypeScript
 const workflow = await client.createWorkflow({
   body: {
-    title: "Job Application Workflow",
-    workflow_definition: {
-      parameters: [
-        {
-          key: "resume",
-          parameter_type: "workflow",
-          workflow_parameter_type: "file_url",
-          description: "URL to the resume PDF",
-        },
-        {
-          key: "job_urls",
-          parameter_type: "workflow",
-          workflow_parameter_type: "json",
-          default_value: [],
-        },
-        {
-          key: "cover_letter",
-          parameter_type: "workflow",
-          workflow_parameter_type: "string",
-          default_value: "",
-        },
-      ],
-      blocks: [...],
+    json_definition: {
+      title: "Job Application Workflow",
+      workflow_definition: {
+        parameters: [
+          {
+            key: "resume",
+            parameter_type: "workflow",
+            workflow_parameter_type: "file_url",
+            description: "URL to the resume PDF",
+          },
+          {
+            key: "job_urls",
+            parameter_type: "workflow",
+            workflow_parameter_type: "json",
+            default_value: [],
+          },
+          {
+            key: "cover_letter",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+            default_value: "",
+          },
+        ],
+        blocks: [...],
+      },
     },
   },
 });
 ```
 
-```text cURL
+```bash cURL
 curl -X POST "https://api.skyvern.com/v1/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "title": "Job Application Workflow",
-    "workflow_definition": {
-      "parameters": [
-        {
-          "key": "resume",
-          "parameter_type": "workflow",
-          "workflow_parameter_type": "file_url",
-          "description": "URL to the resume PDF"
-        },
-        {
-          "key": "job_urls",
-          "parameter_type": "workflow",
-          "workflow_parameter_type": "json",
-          "default_value": []
-        },
-        {
-          "key": "cover_letter",
-          "parameter_type": "workflow",
-          "workflow_parameter_type": "string",
-          "default_value": ""
-        }
-      ],
-      "blocks": [...]
+    "json_definition": {
+      "title": "Job Application Workflow",
+      "workflow_definition": {
+        "parameters": [
+          {
+            "key": "resume",
+            "parameter_type": "workflow",
+            "workflow_parameter_type": "file_url",
+            "description": "URL to the resume PDF"
+          },
+          {
+            "key": "job_urls",
+            "parameter_type": "workflow",
+            "workflow_parameter_type": "json",
+            "default_value": []
+          },
+          {
+            "key": "cover_letter",
+            "parameter_type": "workflow",
+            "workflow_parameter_type": "string",
+            "default_value": ""
+          }
+        ],
+        "blocks": [...]
+      }
     }
   }'
 ```
@@ -195,6 +250,7 @@ curl -X POST "https://api.skyvern.com/v1/workflows" \
 | `boolean` | True/false | `true` |
 | `json` | JSON object or array | `{"key": "value"}` or `["a", "b"]` |
 | `file_url` | URL to a file | `"https://example.com/resume.pdf"` |
+| `credential_id` | Reference to a stored credential | `"cred_abc123"` |
 
 #### `blocks`
 
@@ -207,32 +263,38 @@ Array of blocks that execute in sequence. See [Workflow Blocks Reference](/multi
 Optional description of what the workflow does.
 
 <CodeGroup>
-```text Python
+```python Python
 workflow = await client.create_workflow(
-    title="Invoice Downloader",
-    description="Downloads all invoices from the vendor portal since a given date",
-    workflow_definition={...}
+    json_definition={
+        "title": "Invoice Downloader",
+        "description": "Downloads all invoices from the vendor portal since a given date",
+        "workflow_definition": {...}
+    }
 )
 ```
 
-```text TypeScript
+```typescript TypeScript
 const workflow = await client.createWorkflow({
   body: {
-    title: "Invoice Downloader",
-    description: "Downloads all invoices from the vendor portal since a given date",
-    workflow_definition: {...},
+    json_definition: {
+      title: "Invoice Downloader",
+      description: "Downloads all invoices from the vendor portal since a given date",
+      workflow_definition: {...},
+    },
   },
 });
 ```
 
-```text cURL
+```bash cURL
 curl -X POST "https://api.skyvern.com/v1/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "title": "Invoice Downloader",
-    "description": "Downloads all invoices from the vendor portal since a given date",
-    "workflow_definition": {...}
+    "json_definition": {
+      "title": "Invoice Downloader",
+      "description": "Downloads all invoices from the vendor portal since a given date",
+      "workflow_definition": {...}
+    }
   }'
 ```
 </CodeGroup>
@@ -246,82 +308,181 @@ Default proxy location for all blocks in the workflow. Individual blocks can ove
 See [Proxy & Geo Targeting](/running-tasks/proxy-location) for all available locations.
 
 <CodeGroup>
-```text Python
+```python Python
 workflow = await client.create_workflow(
-    title="UK Price Checker",
-    proxy_location="RESIDENTIAL_GB",
-    workflow_definition={...}
+    json_definition={
+        "title": "UK Price Checker",
+        "proxy_location": "RESIDENTIAL_GB",
+        "workflow_definition": {...}
+    }
 )
 ```
 
-```text TypeScript
+```typescript TypeScript
 const workflow = await client.createWorkflow({
   body: {
-    title: "UK Price Checker",
-    proxy_location: "RESIDENTIAL_GB",
-    workflow_definition: {...},
+    json_definition: {
+      title: "UK Price Checker",
+      proxy_location: "RESIDENTIAL_GB",
+      workflow_definition: {...},
+    },
   },
 });
 ```
 
-```text cURL
+```bash cURL
 curl -X POST "https://api.skyvern.com/v1/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "title": "UK Price Checker",
-    "proxy_location": "RESIDENTIAL_GB",
-    "workflow_definition": {...}
+    "json_definition": {
+      "title": "UK Price Checker",
+      "proxy_location": "RESIDENTIAL_GB",
+      "workflow_definition": {...}
+    }
   }'
 ```
 </CodeGroup>
+
+---
+
+### `webhook_callback_url`
+
+URL to receive a POST request whenever any run of this workflow completes. This is set at the workflow level and applies to all runs. To set a webhook for a single run instead, use [`webhook_url`](#webhook_url) when running the workflow.
+
+<CodeGroup>
+```python Python
+workflow = await client.create_workflow(
+    json_definition={
+        "title": "Invoice Downloader",
+        "webhook_callback_url": "https://your-server.com/webhook",
+        "workflow_definition": {...}
+    }
+)
+```
+
+```typescript TypeScript
+const workflow = await client.createWorkflow({
+  body: {
+    json_definition: {
+      title: "Invoice Downloader",
+      webhook_callback_url: "https://your-server.com/webhook",
+      workflow_definition: {...},
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "json_definition": {
+      "title": "Invoice Downloader",
+      "webhook_callback_url": "https://your-server.com/webhook",
+      "workflow_definition": {...}
+    }
+  }'
+```
+</CodeGroup>
+
+---
+
+### `persist_browser_session`
+
+If `true`, the browser session is kept alive across all blocks in the workflow. This means blocks share the same browser context including cookies, local storage, and login state.
+
+Defaults to `false`.
+
+<CodeGroup>
+```python Python
+workflow = await client.create_workflow(
+    json_definition={
+        "title": "Multi-Step Portal Scraper",
+        "persist_browser_session": True,
+        "workflow_definition": {...}
+    }
+)
+```
+
+```typescript TypeScript
+const workflow = await client.createWorkflow({
+  body: {
+    json_definition: {
+      title: "Multi-Step Portal Scraper",
+      persist_browser_session: true,
+      workflow_definition: {...},
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "json_definition": {
+      "title": "Multi-Step Portal Scraper",
+      "persist_browser_session": true,
+      "workflow_definition": {...}
+    }
+  }'
+```
+</CodeGroup>
+
+<Info>
+Additional advanced parameters are available when creating a workflow, including `totp_verification_url`, `totp_identifier`, `model`, and `extra_http_headers`. See the [API Reference](/api-reference) for the full list.
+</Info>
 
 ---
 
 ## Running a workflow
 
-### `workflow_permanent_id`
+### `workflow_id`
 
 **Required.** The ID of the workflow to run. This is the `workflow_permanent_id` returned when creating the workflow.
 
 <CodeGroup>
-```text Python
+```python Python
 run = await client.run_workflow(
-    workflow_permanent_id="wpid_123456789",
-    data={...}
+    workflow_id="wpid_123456789",
+    parameters={...}
 )
 ```
 
-```text TypeScript
-const run = await client.runWorkflow("wpid_123456789", {
+```typescript TypeScript
+const run = await client.runWorkflow({
   body: {
-    data: {...},
+    workflow_id: "wpid_123456789",
+    parameters: {...},
   },
 });
 ```
 
-```text cURL
+```bash cURL
 curl -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "workflow_permanent_id": "wpid_123456789",
-    "data": {...}
+    "workflow_id": "wpid_123456789",
+    "parameters": {...}
   }'
 ```
 </CodeGroup>
 
 ---
 
-### `data`
+### `parameters`
 
 Values for the workflow's input parameters. Keys must match the `key` field in the workflow's parameter definitions.
 
 <CodeGroup>
-```text Python
+```python Python
 run = await client.run_workflow(
-    workflow_permanent_id="wpid_123456789",
-    data={
+    workflow_id="wpid_123456789",
+    parameters={
         "resume": "https://example.com/resume.pdf",
         "job_urls": [
             "https://jobs.lever.co/company/position-1",
@@ -332,10 +493,11 @@ run = await client.run_workflow(
 )
 ```
 
-```text TypeScript
-const run = await client.runWorkflow("wpid_123456789", {
+```typescript TypeScript
+const run = await client.runWorkflow({
   body: {
-    data: {
+    workflow_id: "wpid_123456789",
+    parameters: {
       resume: "https://example.com/resume.pdf",
       job_urls: [
         "https://jobs.lever.co/company/position-1",
@@ -347,13 +509,13 @@ const run = await client.runWorkflow("wpid_123456789", {
 });
 ```
 
-```text cURL
+```bash cURL
 curl -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "workflow_permanent_id": "wpid_123456789",
-    "data": {
+    "workflow_id": "wpid_123456789",
+    "parameters": {
       "resume": "https://example.com/resume.pdf",
       "job_urls": [
         "https://jobs.lever.co/company/position-1",
@@ -374,85 +536,257 @@ Parameters with `default_value` in the workflow definition are optional. Paramet
 Override the workflow's default proxy location for this run.
 
 <CodeGroup>
-```text Python
+```python Python
 run = await client.run_workflow(
-    workflow_permanent_id="wpid_123456789",
-    data={...},
+    workflow_id="wpid_123456789",
+    parameters={...},
     proxy_location="RESIDENTIAL_CA"
 )
 ```
 
-```text TypeScript
-const run = await client.runWorkflow("wpid_123456789", {
+```typescript TypeScript
+const run = await client.runWorkflow({
   body: {
-    data: {...},
+    workflow_id: "wpid_123456789",
+    parameters: {...},
     proxy_location: "RESIDENTIAL_CA",
   },
 });
 ```
 
-```text cURL
+```bash cURL
 curl -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "workflow_permanent_id": "wpid_123456789",
-    "data": {...},
+    "workflow_id": "wpid_123456789",
+    "parameters": {...},
     "proxy_location": "RESIDENTIAL_CA"
   }'
 ```
 </CodeGroup>
 
-**Common proxy locations:**
+**Proxy locations:**
 
 | Value | Location |
 |-------|----------|
-| `RESIDENTIAL` | Random US residential (default) |
+| `RESIDENTIAL` | Random US residential **(default)** |
+| `US-CA` | California, US |
+| `US-NY` | New York, US |
+| `US-TX` | Texas, US |
+| `US-FL` | Florida, US |
+| `US-WA` | Washington, US |
 | `RESIDENTIAL_GB` | United Kingdom |
 | `RESIDENTIAL_DE` | Germany |
+| `RESIDENTIAL_FR` | France |
+| `RESIDENTIAL_ES` | Spain |
+| `RESIDENTIAL_IE` | Ireland |
+| `RESIDENTIAL_IT` | Italy |
+| `RESIDENTIAL_NL` | Netherlands |
 | `RESIDENTIAL_CA` | Canada |
+| `RESIDENTIAL_MX` | Mexico |
 | `RESIDENTIAL_AU` | Australia |
+| `RESIDENTIAL_NZ` | New Zealand |
+| `RESIDENTIAL_BR` | Brazil |
+| `RESIDENTIAL_AR` | Argentina |
+| `RESIDENTIAL_IN` | India |
+| `RESIDENTIAL_JP` | Japan |
+| `RESIDENTIAL_PH` | Philippines |
+| `RESIDENTIAL_ZA` | South Africa |
+| `RESIDENTIAL_TR` | Turkey |
+| `RESIDENTIAL_ISP` | ISP proxy |
 | `NONE` | No proxy |
 
-See [Proxy & Geo Targeting](/running-tasks/proxy-location) for the full list.
+You can also pass a `GeoTarget` object for granular city or state-level targeting:
+
+```json
+{
+  "proxy_location": {
+    "country": "US",
+    "subdivision": "CA",
+    "city": "San Francisco"
+  }
+}
+```
+
+`country` is required (ISO 3166-1 alpha-2 code). `subdivision` and `city` are optional.
+
+See [Proxy & Geo Targeting](/running-tasks/proxy-location) for more details.
 
 ---
 
-### `webhook_callback_url`
+### `webhook_url`
 
 URL to receive a POST request when the workflow completes.
 
 <CodeGroup>
-```text Python
+```python Python
 run = await client.run_workflow(
-    workflow_permanent_id="wpid_123456789",
-    data={...},
-    webhook_callback_url="https://your-server.com/webhook"
+    workflow_id="wpid_123456789",
+    parameters={...},
+    webhook_url="https://your-server.com/webhook"
 )
 ```
 
-```text TypeScript
-const run = await client.runWorkflow("wpid_123456789", {
+```typescript TypeScript
+const run = await client.runWorkflow({
   body: {
-    data: {...},
-    webhook_callback_url: "https://your-server.com/webhook",
+    workflow_id: "wpid_123456789",
+    parameters: {...},
+    webhook_url: "https://your-server.com/webhook",
   },
 });
 ```
 
-```text cURL
+```bash cURL
 curl -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "workflow_permanent_id": "wpid_123456789",
-    "data": {...},
-    "webhook_callback_url": "https://your-server.com/webhook"
+    "workflow_id": "wpid_123456789",
+    "parameters": {...},
+    "webhook_url": "https://your-server.com/webhook"
   }'
 ```
 </CodeGroup>
 
-The webhook payload contains the same data as the polling response. See [Webhooks FAQ](/running-automations/webhooks-faq) for authentication and retry options.
+The webhook payload contains the same data as the polling response. See [Webhooks](/going-to-production/webhooks) for authentication and retry options.
+
+---
+
+### `title` (run)
+
+Optional display name for this specific workflow run. Useful for distinguishing runs in the UI and API responses.
+
+<CodeGroup>
+```python Python
+run = await client.run_workflow(
+    workflow_id="wpid_123456789",
+    title="January 2025 Invoice Batch",
+    parameters={...}
+)
+```
+
+```typescript TypeScript
+const run = await client.runWorkflow({
+  body: {
+    workflow_id: "wpid_123456789",
+    title: "January 2025 Invoice Batch",
+    parameters: {...},
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "wpid_123456789",
+    "title": "January 2025 Invoice Batch",
+    "parameters": {...}
+  }'
+```
+</CodeGroup>
+
+---
+
+### `browser_session_id`
+
+ID of an existing Skyvern browser session to reuse. The workflow run continues from the current screen state of that session. Browser session IDs start with `pbs_`.
+
+<CodeGroup>
+```python Python
+run = await client.run_workflow(
+    workflow_id="wpid_123456789",
+    browser_session_id="pbs_abc123",
+    parameters={...}
+)
+```
+
+```typescript TypeScript
+const run = await client.runWorkflow({
+  body: {
+    workflow_id: "wpid_123456789",
+    browser_session_id: "pbs_abc123",
+    parameters: {...},
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "wpid_123456789",
+    "browser_session_id": "pbs_abc123",
+    "parameters": {...}
+  }'
+```
+</CodeGroup>
+
+---
+
+### `browser_profile_id`
+
+ID of a browser profile to reuse. Browser profiles persist cookies, local storage, and other browser state across runs. Profile IDs start with `bp_`.
+
+<CodeGroup>
+```python Python
+run = await client.run_workflow(
+    workflow_id="wpid_123456789",
+    browser_profile_id="bp_xyz789",
+    parameters={...}
+)
+```
+
+```typescript TypeScript
+const run = await client.runWorkflow({
+  body: {
+    workflow_id: "wpid_123456789",
+    browser_profile_id: "bp_xyz789",
+    parameters: {...},
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "wpid_123456789",
+    "browser_profile_id": "bp_xyz789",
+    "parameters": {...}
+  }'
+```
+</CodeGroup>
+
+<Info>
+Additional advanced parameters are available when running a workflow, including `totp_url`, `totp_identifier`, `browser_address`, `extra_http_headers`, and `max_screenshot_scrolls`. See the [API Reference](/api-reference) for the full list.
+</Info>
+
+---
+
+## Run response
+
+When you run a workflow, the response contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | string | Unique ID for this run (starts with `wr_`). |
+| `status` | string | One of: `created`, `queued`, `running`, `completed`, `failed`, `terminated`, `timed_out`, `canceled`. |
+| `output` | object/array/string/null | Extracted data from the workflow, if any. |
+| `failure_reason` | string/null | Why the run failed, if applicable. |
+| `errors` | array/null | List of errors encountered during the run. |
+| `downloaded_files` | array/null | Files downloaded during the run. |
+| `recording_url` | string/null | URL to the browser recording. |
+| `screenshot_urls` | array/null | Latest screenshots in reverse chronological order. |
+| `app_url` | string/null | Link to view this run in the Skyvern UI. |
+| `created_at` | datetime | When the run was created. |
+| `started_at` | datetime/null | When execution started. |
+| `finished_at` | datetime/null | When execution finished. |
 
 ---
 
@@ -481,9 +815,9 @@ The webhook payload contains the same data as the polling response. See [Webhook
     Full list of proxy locations
   </Card>
   <Card
-    title="Webhooks FAQ"
+    title="Webhooks"
     icon="webhook"
-    href="/running-automations/webhooks-faq"
+    href="/going-to-production/webhooks"
   >
     Handle webhook authentication and retries
   </Card>

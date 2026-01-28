@@ -36,7 +36,6 @@
           {
             "group": "Multi-Step Automations",
             "pages": [
-              "multi-step-automations/introduction-to-workflows",
               "multi-step-automations/build-a-workflow",
               "multi-step-automations/workflow-blocks-reference",
               "multi-step-automations/file-operations",
