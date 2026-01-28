@@ -8,6 +8,7 @@ import {
   MutableRefObject,
 } from "react";
 import { nanoid } from "nanoid";
+import { stringify as convertToYAML } from "yaml";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -94,11 +95,7 @@ import {
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
-import {
-  Parameter,
-  WorkflowBlock,
-  WorkflowSettings,
-} from "../types/workflowTypes";
+import { WorkflowSettings } from "../types/workflowTypes";
 import { ProxyLocation } from "@/api/types";
 import {
   nodeAdderNode,
@@ -112,6 +109,7 @@ import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
 import type { CopilotReviewStatus } from "./panels/WorkflowComparisonPanel";
+import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
 import "./workspace-styles.css";
 
 const Constants = {
@@ -1743,105 +1741,133 @@ function Workspace({
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
-        onReviewWorkflow={(pendingWorkflow, clearPending) => {
+        onReviewWorkflow={async (pendingWorkflow, clearPending) => {
           const saveData = workflowChangesStore.getSaveData?.();
           if (!saveData) return;
 
-          // Construct fake WorkflowVersion for current state
-          const currentVersion: WorkflowVersion = {
-            workflow_id: saveData.workflow.workflow_id,
-            organization_id: "",
-            is_saved_task: saveData.workflow.is_saved_task ?? false,
-            is_template: false,
-            title: "Current",
-            workflow_permanent_id: saveData.workflow.workflow_permanent_id,
-            version: saveData.workflow.version ?? 0,
-            description: saveData.workflow.description ?? "",
-            workflow_definition: {
-              parameters: saveData.parameters as unknown as Parameter[],
-              blocks: saveData.blocks as unknown as WorkflowBlock[],
-              finally_block_label: saveData.settings.finallyBlockLabel,
-            },
-            proxy_location: saveData.settings.proxyLocation,
-            webhook_callback_url: saveData.settings.webhookCallbackUrl,
-            extra_http_headers: saveData.settings.extraHttpHeaders
-              ? JSON.parse(saveData.settings.extraHttpHeaders)
-              : null,
-            persist_browser_session: saveData.settings.persistBrowserSession,
-            model: saveData.settings.model,
-            totp_verification_url: saveData.workflow.totp_verification_url,
-            totp_identifier: null,
-            max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
-            status: saveData.workflow.status,
-            created_at: new Date().toISOString(),
-            modified_at: new Date().toISOString(),
-            deleted_at: null,
-            run_with: saveData.settings.runWith,
-            cache_key: saveData.settings.scriptCacheKey,
-            ai_fallback: saveData.settings.aiFallback,
-            run_sequentially: saveData.settings.runSequentially,
-            sequential_key: saveData.settings.sequentialKey,
-            folder_id: null,
-            import_error: null,
-          };
+          try {
+            // Create YAML from current workflow definition only
+            const workflowDefinitionYaml = convertToYAML({
+              version: saveData.workflowDefinitionVersion,
+              parameters: saveData.parameters,
+              blocks: saveData.blocks,
+              finally_block_label:
+                saveData.settings.finallyBlockLabel ?? undefined,
+            });
 
-          // Construct fake WorkflowVersion for pending copilot suggestion
-          const pendingVersion: WorkflowVersion = {
-            ...pendingWorkflow,
-            title: "Copilot Suggestion",
-          };
+            // Convert current workflow definition YAML to blocks
+            const client = await getClient(credentialGetter, "sans-api-v1");
 
-          // Handle copilot review close with status
-          const handleCopilotReviewClose = (status: CopilotReviewStatus) => {
-            if (status === "approve") {
-              try {
-                applyWorkflowUpdate(pendingWorkflow);
-              } catch (error) {
-                console.error(
-                  "Failed to apply copilot workflow",
-                  error,
-                  pendingWorkflow,
-                );
-                toast({
-                  title: "Update failed",
-                  description:
-                    "Failed to apply workflow update. Please try again.",
-                  variant: "destructive",
-                });
+            const currentConversionResponse =
+              await client.post<WorkflowYAMLConversionResponse>(
+                "/workflow/copilot/convert-yaml-to-blocks",
+                {
+                  workflow_definition_yaml: workflowDefinitionYaml,
+                  workflow_id: saveData.workflow.workflow_id,
+                },
+              );
+
+            // Construct WorkflowVersion for current state with converted blocks
+            const currentVersion: WorkflowVersion = {
+              workflow_id: saveData.workflow.workflow_id,
+              organization_id: "",
+              is_saved_task: saveData.workflow.is_saved_task ?? false,
+              is_template: false,
+              title: "Current",
+              workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+              version: saveData.workflow.version ?? 0,
+              description: saveData.workflow.description ?? "",
+              workflow_definition:
+                currentConversionResponse.data.workflow_definition,
+              proxy_location: saveData.settings.proxyLocation,
+              webhook_callback_url: saveData.settings.webhookCallbackUrl,
+              extra_http_headers: saveData.settings.extraHttpHeaders
+                ? JSON.parse(saveData.settings.extraHttpHeaders)
+                : null,
+              persist_browser_session: saveData.settings.persistBrowserSession,
+              model: saveData.settings.model,
+              totp_verification_url: saveData.workflow.totp_verification_url,
+              totp_identifier: null,
+              max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
+              status: saveData.workflow.status,
+              created_at: new Date().toISOString(),
+              modified_at: new Date().toISOString(),
+              deleted_at: null,
+              run_with: saveData.settings.runWith,
+              cache_key: saveData.settings.scriptCacheKey,
+              ai_fallback: saveData.settings.aiFallback,
+              run_sequentially: saveData.settings.runSequentially,
+              sequential_key: saveData.settings.sequentialKey,
+              folder_id: null,
+              import_error: null,
+            };
+
+            // Construct fake WorkflowVersion for pending copilot suggestion
+            const pendingVersion: WorkflowVersion = {
+              ...pendingWorkflow,
+              title: "Copilot Suggestion",
+            };
+
+            // Handle copilot review close with status
+            const handleCopilotReviewClose = (status: CopilotReviewStatus) => {
+              if (status === "approve") {
+                try {
+                  applyWorkflowUpdate(pendingWorkflow);
+                } catch (error) {
+                  console.error(
+                    "Failed to apply copilot workflow",
+                    error,
+                    pendingWorkflow,
+                  );
+                  toast({
+                    title: "Update failed",
+                    description:
+                      "Failed to apply workflow update. Please try again.",
+                    variant: "destructive",
+                  });
+                }
               }
-            }
 
-            // Close the panel and reopen copilot chat
+              // Close the panel and reopen copilot chat
+              setWorkflowPanelState({
+                active: false,
+                content: "history",
+                data: {
+                  showComparison: false,
+                  version1: undefined,
+                  version2: undefined,
+                },
+              });
+              setIsCopilotOpen(true);
+
+              // Clear pending for approve and reject, but not for close
+              if (status !== "close") {
+                clearPending();
+              }
+            };
+
+            // Hide chat and show comparison
+            setIsCopilotOpen(false);
             setWorkflowPanelState({
               active: false,
               content: "history",
               data: {
-                showComparison: false,
-                version1: undefined,
-                version2: undefined,
+                version1: currentVersion,
+                version2: pendingVersion,
+                showComparison: true,
+                mode: "copilot",
+                onCopilotReviewClose: handleCopilotReviewClose,
               },
             });
-            setIsCopilotOpen(true);
-
-            // Clear pending for approve and reject, but not for close
-            if (status !== "close") {
-              clearPending();
-            }
-          };
-
-          // Hide chat and show comparison
-          setIsCopilotOpen(false);
-          setWorkflowPanelState({
-            active: false,
-            content: "history",
-            data: {
-              version1: currentVersion,
-              version2: pendingVersion,
-              showComparison: true,
-              mode: "copilot",
-              onCopilotReviewClose: handleCopilotReviewClose,
-            },
-          });
+          } catch (error) {
+            console.error("Failed to prepare workflow comparison", error);
+            toast({
+              title: "Comparison failed",
+              description:
+                "Failed to prepare workflow for comparison. Please try again.",
+              variant: "destructive",
+            });
+          }
         }}
         onWorkflowUpdate={(workflowData) => {
           try {

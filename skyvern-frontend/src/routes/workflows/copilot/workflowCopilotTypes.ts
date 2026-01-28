@@ -1,4 +1,7 @@
-import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import {
+  WorkflowApiResponse,
+  WorkflowDefinition,
+} from "@/routes/workflows/types/workflowTypes";
 
 export type WorkflowCopilotChatSender = "user" | "ai";
 
@@ -69,4 +72,13 @@ export interface WorkflowCopilotStreamResponseUpdate {
 export interface WorkflowCopilotStreamErrorUpdate {
   type: "error";
   error: string;
+}
+
+export interface WorkflowYAMLConversionRequest {
+  workflow_definition_yaml: string;
+  workflow_id: string;
+}
+
+export interface WorkflowYAMLConversionResponse {
+  workflow_definition: WorkflowDefinition;
 }
