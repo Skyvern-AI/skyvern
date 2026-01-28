@@ -126,7 +126,7 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = "password"
 
     # browser settings
-    BROWSER_LOCALE: str = "en-US"
+    BROWSER_LOCALE: str | None = None  # "en-US"
     BROWSER_TIMEZONE: str = "America/New_York"
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
