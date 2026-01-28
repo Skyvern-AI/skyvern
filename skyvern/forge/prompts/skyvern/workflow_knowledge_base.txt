@@ -464,7 +464,7 @@ label: <unique_label>
 navigation_goal: <download_instruction>        # Required: How to trigger the download
 url: <starting_url>                            # Optional: URL to navigate to first
 title: str                                     # Optional: Title for the block
-engine: skyvern_v1                             # Optional: Run engine
+engine: skyvern-1.0                            # Optional: Run engine
 error_code_mapping: {}                         # Optional: Map errors to custom codes
 max_retries: 0                                 # Optional: Number of retry attempts
 max_steps_per_run: null                        # Optional: Limit steps per execution
