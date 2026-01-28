@@ -97,6 +97,7 @@ function WorkflowAddMenu({
       startAt={startAt}
       gap={gap}
       rotateText={rotateText}
+      layout="vertical"
     >
       {children}
     </RadialMenu>
