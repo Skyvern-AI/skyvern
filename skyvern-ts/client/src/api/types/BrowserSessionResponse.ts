@@ -10,6 +10,8 @@ export interface BrowserSessionResponse {
     browser_session_id: string;
     /** ID of the organization that owns this session */
     organization_id: string;
+    /** Current status of the browser session */
+    status?: string;
     /** Type of the current runnable associated with this session (workflow, task etc) */
     runnable_type?: string;
     /** ID of the current runnable */
@@ -20,6 +22,10 @@ export interface BrowserSessionResponse {
     browser_address?: string;
     /** Url for the browser session page */
     app_url?: string;
+    /** A list of extensions installed in the browser session. */
+    extensions?: Skyvern.Extensions[];
+    /** The type of browser used for the session. */
+    browser_type?: Skyvern.PersistentBrowserType;
     /** Whether the browser session supports VNC streaming */
     vnc_streaming_supported?: boolean;
     /** The path where the browser session downloads files */

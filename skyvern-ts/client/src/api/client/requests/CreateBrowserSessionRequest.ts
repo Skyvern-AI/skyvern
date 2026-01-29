@@ -22,16 +22,21 @@ export interface CreateBrowserSessionRequest {
      * - RESIDENTIAL_FR: France
      * - RESIDENTIAL_DE: Germany
      * - RESIDENTIAL_NZ: New Zealand
+     * - RESIDENTIAL_PH: Philippines
      * - RESIDENTIAL_ZA: South Africa
      * - RESIDENTIAL_AR: Argentina
      * - RESIDENTIAL_AU: Australia
      * - RESIDENTIAL_ISP: ISP proxy
-     * - US-CA: California
-     * - US-NY: New York
-     * - US-TX: Texas
-     * - US-FL: Florida
-     * - US-WA: Washington
+     * - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
      * - NONE: No proxy
      */
     proxy_location?: Skyvern.ProxyLocation;
+    /** A list of extensions to install in the browser session. */
+    extensions?: Skyvern.Extensions[];
+    /** The type of browser to use for the session. */
+    browser_type?: Skyvern.PersistentBrowserType;
 }

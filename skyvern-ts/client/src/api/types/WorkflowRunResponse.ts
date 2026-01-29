@@ -39,6 +39,8 @@ export interface WorkflowRunResponse {
     script_run?: Skyvern.ScriptRunResponse;
     /** The errors for the run */
     errors?: Record<string, unknown>[];
+    /** Total number of steps executed in this run */
+    step_count?: number;
     /** Whether the workflow run was executed with agent or code */
     run_with?: string;
     /** Whether to fallback to AI if code run fails. */

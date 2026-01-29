@@ -12,6 +12,7 @@ from .branch_condition_yaml import BranchConditionYaml
 from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from .file_storage_type import FileStorageType
 from .file_type import FileType
+from .pdf_format import PdfFormat
 from .run_engine import RunEngine
 from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
 
@@ -270,6 +271,8 @@ class WorkflowDefinitionYamlBlocksItem_HttpRequest(UniversalBaseModel):
     files: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     timeout: typing.Optional[int] = None
     follow_redirects: typing.Optional[bool] = None
+    download_filename: typing.Optional[str] = None
+    save_response_as_file: typing.Optional[bool] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
@@ -384,6 +387,30 @@ class WorkflowDefinitionYamlBlocksItem_PdfParser(UniversalBaseModel):
     next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class WorkflowDefinitionYamlBlocksItem_PrintPage(UniversalBaseModel):
+    block_type: typing.Literal["print_page"] = "print_page"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    include_timestamp: typing.Optional[bool] = None
+    custom_filename: typing.Optional[str] = None
+    format: typing.Optional[PdfFormat] = None
+    landscape: typing.Optional[bool] = None
+    print_background: typing.Optional[bool] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -583,6 +610,7 @@ WorkflowDefinitionYamlBlocksItem = typing.Union[
     WorkflowDefinitionYamlBlocksItem_Login,
     WorkflowDefinitionYamlBlocksItem_Navigation,
     WorkflowDefinitionYamlBlocksItem_PdfParser,
+    WorkflowDefinitionYamlBlocksItem_PrintPage,
     WorkflowDefinitionYamlBlocksItem_SendEmail,
     WorkflowDefinitionYamlBlocksItem_Task,
     WorkflowDefinitionYamlBlocksItem_TaskV2,

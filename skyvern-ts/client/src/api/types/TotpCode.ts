@@ -17,6 +17,8 @@ export interface TotpCode {
     content: string;
     /** The timestamp when the TOTP code expires */
     expired_at?: string;
+    /** Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract. */
+    type?: Skyvern.OtpType;
     /** The skyvern ID of the TOTP code. */
     totp_code_id: string;
     /** The TOTP code extracted from the content. */

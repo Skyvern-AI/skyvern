@@ -18,6 +18,7 @@ export type WorkflowDefinitionYamlBlocksItem =
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Login
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Navigation
     | Skyvern.WorkflowDefinitionYamlBlocksItem.PdfParser
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.PrintPage
     | Skyvern.WorkflowDefinitionYamlBlocksItem.SendEmail
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Task
     | Skyvern.WorkflowDefinitionYamlBlocksItem.TaskV2
@@ -85,6 +86,10 @@ export namespace WorkflowDefinitionYamlBlocksItem {
 
     export interface PdfParser extends Skyvern.PdfParserBlockYaml {
         block_type: "pdf_parser";
+    }
+
+    export interface PrintPage extends Skyvern.PrintPageBlockYaml {
+        block_type: "print_page";
     }
 
     export interface SendEmail extends Skyvern.SendEmailBlockYaml {
