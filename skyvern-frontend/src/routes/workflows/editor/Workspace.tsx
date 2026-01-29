@@ -8,6 +8,7 @@ import {
   MutableRefObject,
 } from "react";
 import { nanoid } from "nanoid";
+import { stringify as convertToYAML } from "yaml";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -107,6 +108,8 @@ import {
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
+import type { CopilotReviewStatus } from "./panels/WorkflowComparisonPanel";
+import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
 import "./workspace-styles.css";
 
 const Constants = {
@@ -981,6 +984,40 @@ function Workspace({
     }
   };
 
+  const applyWorkflowUpdate = (workflowData: WorkflowVersion) => {
+    const settings: WorkflowSettings = {
+      proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
+      webhookCallbackUrl: workflowData.webhook_callback_url || "",
+      persistBrowserSession: workflowData.persist_browser_session ?? false,
+      model: workflowData.model ?? null,
+      maxScreenshotScrolls: workflowData.max_screenshot_scrolls || 3,
+      extraHttpHeaders: workflowData.extra_http_headers
+        ? JSON.stringify(workflowData.extra_http_headers)
+        : null,
+      runWith: workflowData.run_with ?? null,
+      scriptCacheKey: workflowData.cache_key ?? null,
+      aiFallback: workflowData.ai_fallback ?? true,
+      runSequentially: workflowData.run_sequentially ?? false,
+      sequentialKey: workflowData.sequential_key ?? null,
+      finallyBlockLabel:
+        workflowData.workflow_definition?.finally_block_label ?? null,
+    };
+
+    const elements = getElements(
+      workflowData.workflow_definition.blocks,
+      settings,
+      true,
+    );
+
+    setNodes(elements.nodes);
+    setEdges(elements.edges);
+
+    const initialParameters = getInitialParameters(workflowData);
+    useWorkflowParametersStore.getState().setParameters(initialParameters);
+
+    workflowChangesStore.setHasChanges(true);
+  };
+
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
     // Close panels
     setWorkflowPanelState({
@@ -1239,7 +1276,9 @@ function Workspace({
           <div
             className="absolute left-6 top-[6rem]"
             style={{
-              width: "calc(100% - 32rem)",
+              width: workflowPanelState.active
+                ? "calc(100% - 32rem)"
+                : "calc(100% - 3rem)",
               height: "calc(100vh - 11rem)",
             }}
           >
@@ -1248,6 +1287,10 @@ function Workspace({
               version1={workflowPanelState.data.version1}
               version2={workflowPanelState.data.version2}
               onSelectState={handleSelectState}
+              mode={workflowPanelState.data.mode}
+              onCopilotReviewClose={
+                workflowPanelState.data.onCopilotReviewClose
+              }
             />
           </div>
 
@@ -1698,43 +1741,137 @@ function Workspace({
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
-        onWorkflowUpdate={(workflowData) => {
+        onReviewWorkflow={async (pendingWorkflow, clearPending) => {
+          const saveData = workflowChangesStore.getSaveData?.();
+          if (!saveData) return;
+
           try {
-            const settings: WorkflowSettings = {
-              proxyLocation:
-                workflowData.proxy_location ?? ProxyLocation.Residential,
-              webhookCallbackUrl: workflowData.webhook_callback_url || "",
-              persistBrowserSession:
-                workflowData.persist_browser_session ?? false,
-              model: workflowData.model ?? null,
-              maxScreenshotScrolls: workflowData.max_screenshot_scrolls || 3,
-              extraHttpHeaders: workflowData.extra_http_headers
-                ? JSON.stringify(workflowData.extra_http_headers)
+            // Create YAML from current workflow definition only
+            const workflowDefinitionYaml = convertToYAML({
+              version: saveData.workflowDefinitionVersion,
+              parameters: saveData.parameters,
+              blocks: saveData.blocks,
+              finally_block_label:
+                saveData.settings.finallyBlockLabel ?? undefined,
+            });
+
+            // Convert current workflow definition YAML to blocks
+            const client = await getClient(credentialGetter, "sans-api-v1");
+
+            const currentConversionResponse =
+              await client.post<WorkflowYAMLConversionResponse>(
+                "/workflow/copilot/convert-yaml-to-blocks",
+                {
+                  workflow_definition_yaml: workflowDefinitionYaml,
+                  workflow_id: saveData.workflow.workflow_id,
+                },
+              );
+
+            // Construct WorkflowVersion for current state with converted blocks
+            const currentVersion: WorkflowVersion = {
+              workflow_id: saveData.workflow.workflow_id,
+              organization_id: "",
+              is_saved_task: saveData.workflow.is_saved_task ?? false,
+              is_template: false,
+              title: "Current",
+              workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+              version: saveData.workflow.version ?? 0,
+              description: saveData.workflow.description ?? "",
+              workflow_definition:
+                currentConversionResponse.data.workflow_definition,
+              proxy_location: saveData.settings.proxyLocation,
+              webhook_callback_url: saveData.settings.webhookCallbackUrl,
+              extra_http_headers: saveData.settings.extraHttpHeaders
+                ? JSON.parse(saveData.settings.extraHttpHeaders)
                 : null,
-              runWith: workflowData.run_with ?? null,
-              scriptCacheKey: workflowData.cache_key ?? null,
-              aiFallback: workflowData.ai_fallback ?? true,
-              runSequentially: workflowData.run_sequentially ?? false,
-              sequentialKey: workflowData.sequential_key ?? null,
-              finallyBlockLabel:
-                workflowData.workflow_definition?.finally_block_label ?? null,
+              persist_browser_session: saveData.settings.persistBrowserSession,
+              model: saveData.settings.model,
+              totp_verification_url: saveData.workflow.totp_verification_url,
+              totp_identifier: null,
+              max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
+              status: saveData.workflow.status,
+              created_at: new Date().toISOString(),
+              modified_at: new Date().toISOString(),
+              deleted_at: null,
+              run_with: saveData.settings.runWith,
+              cache_key: saveData.settings.scriptCacheKey,
+              ai_fallback: saveData.settings.aiFallback,
+              run_sequentially: saveData.settings.runSequentially,
+              sequential_key: saveData.settings.sequentialKey,
+              folder_id: null,
+              import_error: null,
             };
 
-            const elements = getElements(
-              workflowData.workflow_definition.blocks,
-              settings,
-              true,
-            );
+            // Construct fake WorkflowVersion for pending copilot suggestion
+            const pendingVersion: WorkflowVersion = {
+              ...pendingWorkflow,
+              title: "Copilot Suggestion",
+            };
 
-            setNodes(elements.nodes);
-            setEdges(elements.edges);
+            // Handle copilot review close with status
+            const handleCopilotReviewClose = (status: CopilotReviewStatus) => {
+              if (status === "approve") {
+                try {
+                  applyWorkflowUpdate(pendingWorkflow);
+                } catch (error) {
+                  console.error(
+                    "Failed to apply copilot workflow",
+                    error,
+                    pendingWorkflow,
+                  );
+                  toast({
+                    title: "Update failed",
+                    description:
+                      "Failed to apply workflow update. Please try again.",
+                    variant: "destructive",
+                  });
+                }
+              }
 
-            const initialParameters = getInitialParameters(workflowData);
-            useWorkflowParametersStore
-              .getState()
-              .setParameters(initialParameters);
+              // Close the panel and reopen copilot chat
+              setWorkflowPanelState({
+                active: false,
+                content: "history",
+                data: {
+                  showComparison: false,
+                  version1: undefined,
+                  version2: undefined,
+                },
+              });
+              setIsCopilotOpen(true);
 
-            workflowChangesStore.setHasChanges(true);
+              // Clear pending for approve and reject, but not for close
+              if (status !== "close") {
+                clearPending();
+              }
+            };
+
+            // Hide chat and show comparison
+            setIsCopilotOpen(false);
+            setWorkflowPanelState({
+              active: false,
+              content: "history",
+              data: {
+                version1: currentVersion,
+                version2: pendingVersion,
+                showComparison: true,
+                mode: "copilot",
+                onCopilotReviewClose: handleCopilotReviewClose,
+              },
+            });
+          } catch (error) {
+            console.error("Failed to prepare workflow comparison", error);
+            toast({
+              title: "Comparison failed",
+              description:
+                "Failed to prepare workflow for comparison. Please try again.",
+              variant: "destructive",
+            });
+          }
+        }}
+        onWorkflowUpdate={(workflowData) => {
+          try {
+            applyWorkflowUpdate(workflowData);
           } catch (error) {
             console.error(
               "Failed to parse and apply workflow",

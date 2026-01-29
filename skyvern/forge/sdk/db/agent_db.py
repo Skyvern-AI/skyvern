@@ -140,6 +140,7 @@ from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+_UNSET = object()
 
 
 def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
@@ -3666,6 +3667,33 @@ class AgentDB(BaseAlchemyDB):
             await session.commit()
             await session.refresh(new_chat)
             return WorkflowCopilotChat.model_validate(new_chat)
+
+    async def update_workflow_copilot_chat(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        proposed_workflow: dict | None | object = _UNSET,
+        auto_accept: bool | None = None,
+    ) -> WorkflowCopilotChat | None:
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                )
+            ).first()
+            if not chat:
+                return None
+
+            if proposed_workflow is not _UNSET:
+                chat.proposed_workflow = proposed_workflow
+            if auto_accept is not None:
+                chat.auto_accept = auto_accept
+
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
 
     async def create_workflow_copilot_chat_message(
         self,

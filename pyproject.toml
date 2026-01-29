@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.6"
+version = "1.0.11"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -202,4 +202,4 @@ plugins = "sqlalchemy.ext.mypy.plugin"
 skyvern = "skyvern.cli.commands:cli_app"
 
 [tool.pytest.ini_options]
-norecursedirs = ["eval"]
+norecursedirs = ["eval", "tests/sdk"]

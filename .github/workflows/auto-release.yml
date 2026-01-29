@@ -1,0 +1,98 @@
+name: Auto Create GitHub Release on Version Change
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'pyproject.toml'
+jobs:
+  check-version-change:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      version_changed: ${{ steps.check.outputs.version_changed }}
+      new_version: ${{ steps.check.outputs.new_version }}
+      previous_version: ${{ steps.check.outputs.previous_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Check if version changed
+        id: check
+        run: |
+          # Get version from current pyproject.toml
+          CURRENT_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+
+          # Get version from previous commit
+          git checkout HEAD^1
+          PREVIOUS_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+
+          # Return to current commit
+          git checkout -
+
+          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
+            echo "Version changed from $PREVIOUS_VERSION to $CURRENT_VERSION"
+            echo "version_changed=true" >> $GITHUB_OUTPUT
+            echo "new_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+            echo "previous_version=$PREVIOUS_VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "Version remained at $CURRENT_VERSION"
+            echo "version_changed=false" >> $GITHUB_OUTPUT
+            echo "new_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+            echo "previous_version=$PREVIOUS_VERSION" >> $GITHUB_OUTPUT
+          fi
+  create-release:
+    runs-on: ubuntu-latest
+    needs: check-version-change
+    if: needs.check-version-change.outputs.version_changed == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          VERSION="v${{ needs.check-version-change.outputs.new_version }}"
+          PREVIOUS_VERSION="v${{ needs.check-version-change.outputs.previous_version }}"
+
+          # Try to find the previous version tag
+          if git rev-parse "$PREVIOUS_VERSION" >/dev/null 2>&1; then
+            # Generate changelog from commits since last version
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" "$PREVIOUS_VERSION"..HEAD)
+          else
+            # If no previous tag exists, get recent commits
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" -10)
+          fi
+
+          # Create release notes
+          cat << EOF > release_notes.md
+          ## What's Changed
+
+          Version bumped from ${{ needs.check-version-change.outputs.previous_version }} to ${{ needs.check-version-change.outputs.new_version }}
+
+          ### Recent Changes
+          $CHANGELOG
+
+          **Full Changelog**: https://github.com/Skyvern-AI/skyvern/compare/$PREVIOUS_VERSION...$VERSION
+          EOF
+
+          echo "Release notes generated"
+          cat release_notes.md
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version-change.outputs.new_version }}
+          name: Release v${{ needs.check-version-change.outputs.new_version }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          # Using PAT instead of GITHUB_TOKEN to trigger downstream workflows (e.g., build-docker-image)
+          # GITHUB_TOKEN events don't trigger other workflows to prevent infinite loops
+          GITHUB_TOKEN: ${{ secrets.SKYVERN_OSS_GITHUB_TOKEN }}

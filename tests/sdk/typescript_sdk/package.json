@@ -1,0 +1,23 @@
+{
+  "name": "skyvern-ts-sdk-tests",
+  "version": "1.0.0",
+  "description": "Playground for testing Skyvern TypeScript SDK",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "serve": "http-server ../web -p 9010 --silent",
+    "test": "node run-test.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@skyvern/client": "file:../../../skyvern-ts/client",
+    "dotenv": "^17.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "http-server": "^14.1.1",
+    "tsx": "^4.7.0",
+    "typescript": "^5.0.0"
+  }
+}

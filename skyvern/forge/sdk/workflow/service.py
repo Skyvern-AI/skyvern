@@ -849,6 +849,7 @@ class WorkflowService:
                 workflow_run=workflow_run,
                 block_labels=block_labels,
                 blocks_to_update=blocks_to_update,
+                finalize=True,  # Force regeneration to ensure field mappings have complete action data
             )
 
         # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
@@ -3352,9 +3353,47 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         block_labels: list[str] | None = None,
         blocks_to_update: set[str] | None = None,
+        finalize: bool = False,
     ) -> None:
+        """
+        Generate or regenerate workflow script if needed.
+
+        Args:
+            workflow: The workflow definition
+            workflow_run: The workflow run instance
+            block_labels: Optional list of specific block labels to generate
+            blocks_to_update: Set of block labels that need regeneration
+            finalize: If True, check if any actions were skipped during script generation
+                     due to missing data (race condition). Only regenerate if needed.
+                     This fixes SKY-7653 while avoiding unnecessary regeneration costs.
+        """
         code_gen = workflow_run.code_gen
         blocks_to_update = set(blocks_to_update or [])
+
+        # When finalizing, only regenerate if script generation had incomplete actions.
+        # This addresses the race condition (SKY-7653) while avoiding unnecessary
+        # regeneration costs when the script is already complete.
+        if finalize:
+            current_context = skyvern_context.current()
+            if current_context and current_context.script_gen_had_incomplete_actions:
+                LOG.info(
+                    "Finalize: regenerating script due to incomplete actions during generation",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                task_block_labels = {
+                    block.label
+                    for block in workflow.workflow_definition.blocks
+                    if block.label and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                }
+                blocks_to_update.update(task_block_labels)
+                blocks_to_update.add(settings.WORKFLOW_START_BLOCK_LABEL)
+                # Reset flag after triggering regeneration to prevent stale state
+                current_context.script_gen_had_incomplete_actions = False
+            else:
+                LOG.debug(
+                    "Finalize: skipping regeneration - no incomplete actions detected",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
 
         LOG.info(
             "Generate script?",

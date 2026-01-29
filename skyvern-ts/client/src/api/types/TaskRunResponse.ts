@@ -39,6 +39,8 @@ export interface TaskRunResponse {
     script_run?: Skyvern.ScriptRunResponse;
     /** The errors for the run */
     errors?: Record<string, unknown>[];
+    /** Total number of steps executed in this run */
+    step_count?: number;
     /** The original request parameters used to start this task run */
     run_request?: Skyvern.TaskRunRequest;
 }

@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
+import pyotp
 import structlog
+from cachetools import TTLCache
 from playwright.async_api import Page
 
 from skyvern.config import settings
@@ -544,10 +546,11 @@ class ScriptSkyvernPage(SkyvernPage):
         3. DOM stability (no significant mutations for 300ms)
         """
         try:
-            if not self._page:
+            # Note: SkyvernPage uses self.page, not self._page
+            if not self.page:
                 return
 
-            skyvern_frame = await SkyvernFrame.create_instance(frame=self._page)
+            skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
             await skyvern_frame.wait_for_page_ready(
                 network_idle_timeout_ms=settings.PAGE_READY_NETWORK_IDLE_TIMEOUT_MS,
                 loading_indicator_timeout_ms=settings.PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS,
@@ -590,6 +593,124 @@ class ScriptSkyvernPage(SkyvernPage):
                     value = totp_value.value
 
         return value
+
+    # Class-level cache for TOTP codes to ensure all digits in a sequence use the same code
+    # Key: (workflow_run_id, credential_key), Value: totp_code
+    # Uses TTLCache with 30-second expiry (aligned with TOTP rotation period)
+    # and max 100 entries to prevent unbounded memory growth
+    _totp_sequence_cache: TTLCache[tuple[str, str], str] = TTLCache(maxsize=100, ttl=30)
+
+    async def get_totp_digit(
+        self,
+        context: Any,
+        field_name: str,
+        digit_index: int,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str:
+        """
+        Get a specific digit from a TOTP code for multi-field TOTP inputs.
+
+        This method is used by generated scripts for multi-field TOTP where each
+        input field needs a single digit. It resolves the full TOTP code from
+        the credential and returns the specific digit.
+
+        IMPORTANT: When digit_index == 0, a fresh TOTP code is generated and cached.
+        For digit_index > 0, the cached code is used. This ensures all 6 digits
+        of a multi-field TOTP use the same code even if filling spans TOTP rotation
+        boundaries.
+
+        Args:
+            context: The run context containing parameters
+            field_name: The parameter name containing the TOTP code or credential reference
+            digit_index: The index of the digit to return (0-5 for a 6-digit TOTP)
+            totp_identifier: Optional TOTP identifier for polling
+            totp_url: Optional TOTP verification URL
+
+        Returns:
+            The single digit at the specified index
+        """
+        totp_code = ""
+        skyvern_ctx = skyvern_context.ensure_context()
+        workflow_run_id = skyvern_ctx.workflow_run_id if skyvern_ctx else None
+
+        LOG.info(
+            "get_totp_digit called",
+            field_name=field_name,
+            digit_index=digit_index,
+            workflow_run_id=workflow_run_id,
+        )
+
+        # Get the raw parameter value (may be credential reference like BW_TOTP)
+        raw_value = context.parameters.get(field_name, "")
+
+        # If the direct field_name parameter is empty, try to find a credential TOTP
+        # by looking at the workflow run context for credential parameters
+        if not raw_value and skyvern_ctx and workflow_run_id:
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+            if workflow_run_context:
+                # Look for credential parameters in the workflow run context values
+                for key, value in workflow_run_context.values.items():
+                    if key.startswith("cred_") and isinstance(value, dict) and "totp" in value:
+                        cache_key = (workflow_run_id, key)
+
+                        # For digit_index == 0, clear any stale cache and generate fresh TOTP
+                        # For digit_index > 0, use cached code if available
+                        if digit_index == 0:
+                            # Clear stale cache for new sequence, fall through to generate
+                            if cache_key in self._totp_sequence_cache:
+                                del self._totp_sequence_cache[cache_key]
+                        elif cache_key in self._totp_sequence_cache:
+                            # Use cached value for digit_index > 0
+                            totp_code = self._totp_sequence_cache[cache_key]
+                            LOG.info(
+                                "Using cached TOTP code for sequence",
+                                field_name=field_name,
+                                credential_key=key,
+                                digit_index=digit_index,
+                                totp_code_length=len(totp_code),
+                            )
+                            break
+
+                        # Generate new TOTP code (digit_index==0 or cache miss)
+                        totp_secret_id = value.get("totp")
+                        if totp_secret_id:
+                            totp_secret_key = workflow_run_context.totp_secret_value_key(totp_secret_id)
+                            totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+                            if totp_secret:
+                                try:
+                                    totp_code = pyotp.TOTP(totp_secret).now()
+                                    # Cache the code for subsequent digit requests in this sequence
+                                    self._totp_sequence_cache[cache_key] = totp_code
+                                    LOG.info(
+                                        "Generated fresh TOTP and cached for sequence",
+                                        field_name=field_name,
+                                        credential_key=key,
+                                        digit_index=digit_index,
+                                        totp_code_length=len(totp_code),
+                                    )
+                                    break
+                                except Exception as e:
+                                    LOG.warning(
+                                        "Failed to generate TOTP code",
+                                        credential_key=key,
+                                        error=str(e),
+                                    )
+
+        # If we still don't have a TOTP code, try resolving via get_actual_value
+        if not totp_code:
+            totp_code = await self.get_actual_value(raw_value, totp_identifier, totp_url)
+
+        # Return the specific digit
+        if digit_index < len(totp_code):
+            return totp_code[digit_index]
+        LOG.warning(
+            "TOTP digit index out of range",
+            field_name=field_name,
+            digit_index=digit_index,
+            totp_code_length=len(totp_code),
+        )
+        return ""
 
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)

@@ -237,7 +237,6 @@ class BrowserContextFactory:
             LOG.info("Extensions added to browser args", extensions=joined_paths)
 
         args = {
-            "locale": settings.BROWSER_LOCALE,
             "color_scheme": "no-preference",
             "args": browser_args,
             "ignore_default_args": [
@@ -251,6 +250,8 @@ class BrowserContextFactory:
             },
             "extra_http_headers": extra_http_headers,
         }
+        if settings.BROWSER_LOCALE:
+            args["locale"] = settings.BROWSER_LOCALE
 
         if settings.ENABLE_PROXY:
             proxy_config = setup_proxy()

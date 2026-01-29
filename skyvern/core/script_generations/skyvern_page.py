@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
@@ -10,7 +11,7 @@ from playwright.async_api import Locator, Page
 
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
-from skyvern.forge.sdk.api.files import download_file
+from skyvern.forge.sdk.api.files import download_file as download_file_from_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.library.ai_locator import AILocator
 from skyvern.webeye.actions import handler_utils
@@ -122,6 +123,40 @@ class SkyvernPage(Page):
         totp_url: str | None = None,
     ) -> str:
         return value
+
+    async def get_totp_digit(
+        self,
+        context: Any,
+        field_name: str,
+        digit_index: int,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str:
+        """
+        Get a specific digit from a TOTP code for multi-field TOTP inputs.
+
+        This method is used by generated scripts for multi-field TOTP where each
+        input field needs a single digit. It resolves the full TOTP code from
+        the credential and returns the specific digit.
+
+        Args:
+            context: The run context containing parameters
+            field_name: The parameter name containing the TOTP code or credential reference
+            digit_index: The index of the digit to return (0-5 for a 6-digit TOTP)
+            totp_identifier: Optional TOTP identifier for polling
+            totp_url: Optional TOTP verification URL
+
+        Returns:
+            The single digit at the specified index
+        """
+        # Get the raw parameter value (may be credential reference like BW_TOTP)
+        raw_value = context.parameters.get(field_name, "")
+        # Resolve the actual TOTP code (this handles credential generation)
+        totp_code = await self.get_actual_value(raw_value, totp_identifier, totp_url)
+        # Return the specific digit
+        if digit_index < len(totp_code):
+            return totp_code[digit_index]
+        return ""
 
     ######### Public Interfaces #########
 
@@ -409,6 +444,11 @@ class SkyvernPage(Page):
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
 
+        # For single-digit TOTP values (from multi-field TOTP inputs), force fallback mode
+        # so that we use the exact digit value instead of having AI generate a new one
+        if value and len(value) == 1 and value.isdigit() and ai == "proactive":
+            ai = "fallback"
+
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
             error_to_raise = None
@@ -512,7 +552,7 @@ class SkyvernPage(Page):
             error_to_raise = None
             if selector and files:
                 try:
-                    file_path = await download_file(files)
+                    file_path = await download_file_from_url(files)
                     locator = self.page.locator(selector)
                     await locator.set_input_files(file_path, **kwargs)
                 except Exception as e:
@@ -547,7 +587,7 @@ class SkyvernPage(Page):
         if not files:
             raise ValueError("Parameter 'files' is required but was not provided")
 
-        file_path = await download_file(files)
+        file_path = await download_file_from_url(files)
         locator = self.page.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout, **kwargs)
         return files
@@ -692,6 +732,31 @@ class SkyvernPage(Page):
     @action_wrap(ActionType.COMPLETE)
     async def complete(self, prompt: str | None = None) -> None:
         """Stub for complete. Override in subclasses for specific behavior."""
+
+    @action_wrap(ActionType.DOWNLOAD_FILE)
+    async def download_file(
+        self,
+        file_name: str | None = None,
+        download_url: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Download a file from a URL and save it locally during cached script replay.
+
+        Args:
+            file_name: The original file name (for logging/reference). Defaults to UUID if empty.
+            download_url: The URL to download the file from.
+
+        Returns:
+            The local file path where the file was saved.
+        """
+        if not download_url:
+            raise ValueError("download_url is required for download_file action in cached scripts")
+
+        # Use uuid as fallback for empty file_name, matching handler.py behavior
+        file_name = file_name or str(uuid.uuid4())
+
+        file_path = await download_file_from_url(download_url, filename=file_name)
+        return file_path
 
     @action_wrap(ActionType.RELOAD_PAGE)
     async def reload_page(self, **kwargs: Any) -> None:

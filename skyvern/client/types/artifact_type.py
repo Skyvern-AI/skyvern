@@ -30,6 +30,7 @@ ArtifactType = typing.Union[
         "trace",
         "har",
         "script_file",
+        "pdf",
     ],
     typing.Any,
 ]
