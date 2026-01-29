@@ -93,4 +93,6 @@ jobs:
           prerelease: false
           generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Using PAT instead of GITHUB_TOKEN to trigger downstream workflows (e.g., build-docker-image)
+          # GITHUB_TOKEN events don't trigger other workflows to prevent infinite loops
+          GITHUB_TOKEN: ${{ secrets.SKYVERN_OSS_GITHUB_TOKEN }}
