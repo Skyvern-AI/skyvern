@@ -746,6 +746,10 @@ async def _get_credential_vault_service() -> CredentialVaultService:
         if not app.CUSTOM_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Custom credential vault is not supported")
         return app.CUSTOM_CREDENTIAL_VAULT_SERVICE
+    elif settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.LOCAL:
+        if not app.LOCAL_CREDENTIAL_VAULT_SERVICE:
+            raise HTTPException(status_code=400, detail="Local credential vault is not supported")
+        return app.LOCAL_CREDENTIAL_VAULT_SERVICE
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
 

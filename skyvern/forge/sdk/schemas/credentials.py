@@ -8,6 +8,7 @@ class CredentialVaultType(StrEnum):
     BITWARDEN = "bitwarden"
     AZURE_VAULT = "azure_vault"
     CUSTOM = "custom"
+    LOCAL = "local"
 
 
 class CredentialType(StrEnum):
