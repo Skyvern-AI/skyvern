@@ -967,10 +967,12 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=completion_screenshots,
                 )
-                await app.WORKFLOW_SERVICE.generate_script_if_needed(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                )
+                if task_v2.run_with == "code":
+                    await app.WORKFLOW_SERVICE.generate_script_if_needed(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                        finalize=True,  # Force regeneration to ensure field mappings have complete action data
+                    )
                 break
 
         # total step number validation

@@ -87,3 +87,12 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
 class WorkflowCopilotStreamErrorUpdate(BaseModel):
     type: WorkflowCopilotStreamMessageType = Field(WorkflowCopilotStreamMessageType.ERROR, description="Message type")
     error: str = Field(..., description="Error message")
+
+
+class WorkflowYAMLConversionRequest(BaseModel):
+    workflow_definition_yaml: str = Field(..., description="Workflow definition YAML to convert to blocks")
+    workflow_id: str = Field(..., description="Workflow ID")
+
+
+class WorkflowYAMLConversionResponse(BaseModel):
+    workflow_definition: dict = Field(..., description="Converted workflow definition with blocks")
