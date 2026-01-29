@@ -437,6 +437,11 @@ class TaskRunRequest(BaseModel):
         description="The CDP address for the task.",
         examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
     )
+    run_with: str | None = Field(
+        default=None,
+        description="Whether to run the task with agent or code.",
+        examples=["agent", "code"],
+    )
 
     @field_validator("url", "webhook_url", "totp_url")
     @classmethod
