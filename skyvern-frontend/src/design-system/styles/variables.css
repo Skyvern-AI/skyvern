@@ -1,0 +1,283 @@
+/**
+ * Skyvern Design System - Extended CSS Variables
+ *
+ * This file extends the base CSS variables in index.css
+ * with additional tokens for the enhanced design system.
+ *
+ * Import this file after the base index.css to add
+ * new design tokens without modifying the original file.
+ */
+
+@layer base {
+  :root {
+    /* ============================================
+       INFO COLOR (missing from base)
+       ============================================ */
+    --info: 217.2 91.2% 59.8%; /* blue-500 */
+    --info-foreground: 213.1 93.9% 97.8%; /* blue-50 */
+
+    /* ============================================
+       EXTENDED SEMANTIC COLORS
+       ============================================ */
+    /* Light variants for backgrounds */
+    --success-light: 142.1 76.2% 36.3% / 0.1;
+    --warning-light: 40.6 96.1% 40.4% / 0.1;
+    --destructive-light: 0 84.2% 60.2% / 0.1;
+    --info-light: 217.2 91.2% 59.8% / 0.1;
+
+    /* ============================================
+       STATUS COLORS FOR WORKFLOWS/TASKS
+       ============================================ */
+    --status-created: var(--muted-foreground);
+    --status-running: var(--info);
+    --status-queued: var(--warning);
+    --status-completed: var(--success);
+    --status-failed: var(--destructive);
+    --status-terminated: var(--destructive);
+    --status-canceled: var(--muted-foreground);
+    --status-timed-out: var(--warning);
+    --status-skipped: var(--muted-foreground);
+    --status-paused: var(--warning);
+
+    /* ============================================
+       COMPARISON COLORS (for diff views)
+       ============================================ */
+    --comparison-added: 142 76% 36%;
+    --comparison-modified: 45 93% 47%;
+    --comparison-removed: 21 90% 48%;
+
+    /* ============================================
+       INTERACTIVE STATE COLORS
+       ============================================ */
+    --hover-opacity: 0.9;
+    --active-opacity: 0.8;
+    --disabled-opacity: 0.5;
+
+    /* ============================================
+       FOCUS RING
+       ============================================ */
+    --focus-ring-width: 2px;
+    --focus-ring-offset: 2px;
+    --focus-ring-color: var(--ring);
+
+    /* ============================================
+       TRANSITION DEFAULTS
+       ============================================ */
+    --transition-fast: 100ms;
+    --transition-normal: 150ms;
+    --transition-slow: 300ms;
+    --transition-easing: cubic-bezier(0.4, 0, 0.2, 1);
+
+    /* ============================================
+       SPACING SHORTCUTS
+       ============================================ */
+    --space-xs: 0.25rem; /* 4px */
+    --space-sm: 0.5rem; /* 8px */
+    --space-md: 1rem; /* 16px */
+    --space-lg: 1.5rem; /* 24px */
+    --space-xl: 2rem; /* 32px */
+    --space-2xl: 3rem; /* 48px */
+
+    /* ============================================
+       COMPONENT-SPECIFIC TOKENS
+       ============================================ */
+    /* Buttons */
+    --button-height-sm: 2rem; /* 32px */
+    --button-height-md: 2.5rem; /* 40px */
+    --button-height-lg: 3rem; /* 48px */
+
+    /* Inputs */
+    --input-height-sm: 2rem; /* 32px */
+    --input-height-md: 2.5rem; /* 40px */
+    --input-height-lg: 3rem; /* 48px */
+
+    /* Cards */
+    --card-padding: 1.5rem; /* 24px */
+    --card-padding-sm: 1rem; /* 16px */
+
+    /* Sidebar */
+    --sidebar-width: 240px;
+    --sidebar-width-collapsed: 64px;
+
+    /* Header */
+    --header-height: 64px;
+  }
+
+  .dark {
+    /* ============================================
+       DARK MODE INFO COLOR
+       ============================================ */
+    --info: 217.2 91.2% 59.8%; /* blue-500 */
+    --info-foreground: 213.1 93.9% 97.8%; /* blue-50 */
+
+    /* ============================================
+       DARK MODE LIGHT VARIANTS
+       ============================================ */
+    --success-light: 142.1 76.2% 36.3% / 0.15;
+    --warning-light: 40.6 96.1% 40.4% / 0.15;
+    --destructive-light: 0 72.2% 50.6% / 0.15;
+    --info-light: 217.2 91.2% 59.8% / 0.15;
+
+    /* ============================================
+       ADDITIONAL DARK MODE ELEVATION COLORS
+       For creating layered surfaces
+       ============================================ */
+    /* Already defined in index.css: slate-elevation-1 through 5 */
+
+    /* Interactive overlays */
+    --overlay-hover: 0 0% 100% / 0.05;
+    --overlay-active: 0 0% 100% / 0.1;
+  }
+}
+
+/* ============================================
+   UTILITY CLASSES FOR STATUS COLORS
+   ============================================ */
+@layer utilities {
+  /* Status text colors */
+  .text-status-created { color: hsl(var(--status-created)); }
+  .text-status-running { color: hsl(var(--status-running)); }
+  .text-status-queued { color: hsl(var(--status-queued)); }
+  .text-status-completed { color: hsl(var(--status-completed)); }
+  .text-status-failed { color: hsl(var(--status-failed)); }
+  .text-status-terminated { color: hsl(var(--status-terminated)); }
+  .text-status-canceled { color: hsl(var(--status-canceled)); }
+  .text-status-timed-out { color: hsl(var(--status-timed-out)); }
+  .text-status-skipped { color: hsl(var(--status-skipped)); }
+  .text-status-paused { color: hsl(var(--status-paused)); }
+
+  /* Status background colors (with opacity) */
+  .bg-status-created { background-color: hsl(var(--status-created) / 0.1); }
+  .bg-status-running { background-color: hsl(var(--status-running) / 0.1); }
+  .bg-status-queued { background-color: hsl(var(--status-queued) / 0.1); }
+  .bg-status-completed { background-color: hsl(var(--status-completed) / 0.1); }
+  .bg-status-failed { background-color: hsl(var(--status-failed) / 0.1); }
+  .bg-status-terminated { background-color: hsl(var(--status-terminated) / 0.1); }
+  .bg-status-canceled { background-color: hsl(var(--status-canceled) / 0.1); }
+  .bg-status-timed-out { background-color: hsl(var(--status-timed-out) / 0.1); }
+  .bg-status-skipped { background-color: hsl(var(--status-skipped) / 0.1); }
+  .bg-status-paused { background-color: hsl(var(--status-paused) / 0.1); }
+
+  /* Comparison colors */
+  .text-comparison-added { color: hsl(var(--comparison-added)); }
+  .text-comparison-modified { color: hsl(var(--comparison-modified)); }
+  .text-comparison-removed { color: hsl(var(--comparison-removed)); }
+
+  .bg-comparison-added { background-color: hsl(var(--comparison-added) / 0.15); }
+  .bg-comparison-modified { background-color: hsl(var(--comparison-modified) / 0.15); }
+  .bg-comparison-removed { background-color: hsl(var(--comparison-removed) / 0.15); }
+}
+
+/* ============================================
+   ANIMATION KEYFRAMES
+   ============================================ */
+@layer base {
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  @keyframes fade-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
+  }
+
+  @keyframes scale-in {
+    from {
+      opacity: 0;
+      transform: scale(0.95);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes scale-out {
+    from {
+      opacity: 1;
+      transform: scale(1);
+    }
+    to {
+      opacity: 0;
+      transform: scale(0.95);
+    }
+  }
+
+  @keyframes slide-in-from-top {
+    from {
+      opacity: 0;
+      transform: translateY(-10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes slide-in-from-bottom {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes slide-in-from-left {
+    from {
+      opacity: 0;
+      transform: translateX(-10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes slide-in-from-right {
+    from {
+      opacity: 0;
+      transform: translateX(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes pulse-dot {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.7;
+      transform: scale(1.1);
+    }
+  }
+}
+
+@layer utilities {
+  .animate-fade-in {
+    animation: fade-in var(--transition-normal) var(--transition-easing);
+  }
+
+  .animate-scale-in {
+    animation: scale-in var(--transition-normal) var(--transition-easing);
+  }
+
+  .animate-slide-in-top {
+    animation: slide-in-from-top var(--transition-slow) var(--transition-easing);
+  }
+
+  .animate-slide-in-bottom {
+    animation: slide-in-from-bottom var(--transition-slow) var(--transition-easing);
+  }
+
+  .animate-pulse-dot {
+    animation: pulse-dot 2s ease-in-out infinite;
+  }
+}
