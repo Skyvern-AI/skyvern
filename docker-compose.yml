@@ -103,6 +103,14 @@ services:
     # - LLM_KEY=OPENROUTER
     # - OPENROUTER_API_KEY=<your_openrouter_api_key>
     # - OPENROUTER_MODEL=mistralai/mistral-small-3.1-24b-instruct
+    # CometAPI Support:
+    # CometAPI provides access to 500+ LLMs and multimodal models via an OpenAI-compatible endpoint.
+    # - ENABLE_OPENAI_COMPATIBLE=true
+    # - LLM_KEY=OPENAI_COMPATIBLE
+    # - OPENAI_COMPATIBLE_API_KEY=<your_cometapi_key>
+    # - OPENAI_COMPATIBLE_API_BASE=https://api.cometapi.com
+    # - OPENAI_COMPATIBLE_MODEL_NAME=cometapi/gpt-4o # Replace with the specific model you want to use on CometAPI (e.g., cometapi/claude-3-opus)
+    # - OPENAI_COMPATIBLE_SUPPORTS_VISION=true # Set to true if your chosen model supports vision (e.g., for multimodal models)
     # Groq Support:
     # - ENABLE_GROQ=true
     # - LLM_KEY=GROQ
