@@ -33,25 +33,31 @@ def check_docker() -> bool:
 def quickstart(
     ctx: typer.Context,
     no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
+    database_string: str = typer.Option(
+        "",
+        "--database-string",
+        help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
+    ),
     skip_browser_install: bool = typer.Option(
         False, "--skip-browser-install", help="Skip Chromium browser installation"
     ),
     server_only: bool = typer.Option(False, "--server-only", help="Only start the server, not the UI"),
 ) -> None:
     """Quickstart command to set up and run Skyvern with one command."""
-    # Check Docker
-    with console.status("Checking Docker installation...") as status:
-        if not check_docker():
-            console.print(
-                Panel(
-                    "[bold red]Docker is not installed or not running.[/bold red]\n"
-                    "Please install Docker and start it before running quickstart.\n"
-                    "Get Docker from: [link]https://www.docker.com/get-started[/link]",
-                    border_style="red",
+    # Check Docker only if not using custom database
+    if not database_string:
+        with console.status("Checking Docker installation...") as status:
+            if not check_docker():
+                console.print(
+                    Panel(
+                        "[bold red]Docker is not installed or not running.[/bold red]\n"
+                        "Please install Docker and start it before running quickstart.\n"
+                        "Get Docker from: [link]https://www.docker.com/get-started[/link]",
+                        border_style="red",
+                    )
                 )
-            )
-            raise typer.Exit(1)
-        status.update("✅ Docker is installed and running")
+                raise typer.Exit(1)
+            status.update("✅ Docker is installed and running")
 
     # Run initialization
     console.print(Panel("[bold green]🚀 Starting Skyvern Quickstart[/bold green]", border_style="green"))
@@ -59,7 +65,7 @@ def quickstart(
     try:
         # Initialize Skyvern
         console.print("\n[bold blue]Initializing Skyvern...[/bold blue]")
-        run_local = init_env(no_postgres=no_postgres)
+        run_local = init_env(no_postgres=no_postgres, database_string=database_string)
 
         # Skip browser installation if requested
         if not skip_browser_install:
