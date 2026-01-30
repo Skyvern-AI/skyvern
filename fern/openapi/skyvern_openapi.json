@@ -14173,6 +14173,22 @@
               "http://127.0.0.1:9222",
               "ws://127.0.0.1:9222/devtools/browser/1234567890"
             ]
+          },
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With",
+            "description": "Whether to run the task with agent or code.",
+            "examples": [
+              "agent",
+              "code"
+            ]
           }
         },
         "type": "object",
