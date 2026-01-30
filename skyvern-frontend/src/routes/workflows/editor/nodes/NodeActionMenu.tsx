@@ -1,4 +1,4 @@
-import { DotsHorizontalIcon } from "@radix-ui/react-icons";
+import { DotsHorizontalIcon, Pencil2Icon } from "@radix-ui/react-icons";
 
 import {
   DropdownMenu,
@@ -12,23 +12,27 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 
 type Props = {
   isDeletable?: boolean;
+  isRenameable?: boolean;
   isScriptable?: boolean;
   showScriptText?: string;
   onDelete?: () => void;
+  onRename?: () => void;
   onShowScript?: () => void;
 };
 
 function NodeActionMenu({
   isDeletable = true,
+  isRenameable = true,
   isScriptable = false,
   showScriptText,
   onDelete,
+  onRename,
   onShowScript,
 }: Props) {
   const recordingStore = useRecordingStore();
   const isRecording = recordingStore.isRecording;
 
-  if (!isDeletable && !isScriptable) {
+  if (!isDeletable && !isScriptable && !isRenameable) {
     return null;
   }
 
@@ -40,14 +44,15 @@ function NodeActionMenu({
       <DropdownMenuContent>
         <DropdownMenuLabel>Block Actions</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        {isDeletable && (
+        {isRenameable && onRename && (
           <DropdownMenuItem
             disabled={isRecording}
             onSelect={() => {
-              onDelete?.();
+              onRename();
             }}
           >
-            Delete Block
+            <Pencil2Icon className="mr-2 h-4 w-4" />
+            Rename Block
           </DropdownMenuItem>
         )}
         {isScriptable && onShowScript && (
@@ -57,6 +62,17 @@ function NodeActionMenu({
             }}
           >
             {showScriptText ?? "Show Code"}
+          </DropdownMenuItem>
+        )}
+        {isDeletable && (
+          <DropdownMenuItem
+            disabled={isRecording}
+            onSelect={() => {
+              onDelete?.();
+            }}
+            className="text-destructive focus:text-destructive"
+          >
+            Delete Block
           </DropdownMenuItem>
         )}
       </DropdownMenuContent>

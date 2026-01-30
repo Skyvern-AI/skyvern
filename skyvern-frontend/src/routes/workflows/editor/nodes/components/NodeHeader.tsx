@@ -3,6 +3,7 @@ import { ReloadIcon, PlayIcon, StopIcon } from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNodes } from "@xyflow/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
@@ -49,6 +50,8 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { workflowBlockTitle } from "../types";
 import { MicroDropdown } from "./MicroDropdown";
+import { RenameBlockDialog } from "./RenameBlockDialog";
+import { AppNode, isWorkflowBlockNode } from "../index";
 
 interface Transmutations {
   blockTitle: string;
@@ -175,10 +178,11 @@ function NodeHeader({
   const recordingStore = useRecordingStore();
   const { closeWorkflowPanel } = useWorkflowPanelStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id: nodeId,
-    initialValue: blockLabel,
-  });
+  const [label, setLabel, validationError, validateLabel] =
+    useNodeLabelChangeHandler({
+      id: nodeId,
+      initialValue: blockLabel,
+    });
   const blockTitle = workflowBlockTitle[type];
   const requestDeleteNodeCallback = useRequestDeleteNodeCallback();
   const transmuteNodeCallback = useTransmuteNodeCallback();
@@ -199,6 +203,14 @@ function NodeHeader({
     workflowPermanentId,
   });
   const saveWorkflow = useWorkflowSave();
+  const [renameDialogOpen, setRenameDialogOpen] = useState(false);
+  const nodes = useNodes<AppNode>();
+
+  // Get existing labels for duplicate validation (excluding current block)
+  const existingLabels = nodes
+    .filter(isWorkflowBlockNode)
+    .filter((n) => n.id !== nodeId)
+    .map((n) => n.data.label);
 
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued &&
@@ -526,9 +538,11 @@ function NodeHeader({
           </div>
           <div className="flex flex-col gap-1">
             <EditableNodeTitle
-              value={blockLabel}
+              value={label}
               editable={editable}
               onChange={setLabel}
+              onValidate={validateLabel}
+              validationError={validationError}
               titleClassName="text-base"
               inputClassName="text-base"
             />
@@ -624,8 +638,12 @@ function NodeHeader({
               >
                 <NodeActionMenu
                   isScriptable={isScriptable}
+                  isRenameable={editable}
                   onDelete={() => {
                     requestDeleteNodeCallback(nodeId, blockLabel);
+                  }}
+                  onRename={() => {
+                    setRenameDialogOpen(true);
                   }}
                   onShowScript={() =>
                     toggleScriptForNodeCallback({ id: nodeId, show: true })
@@ -636,6 +654,21 @@ function NodeHeader({
           )}
         </div>
       </header>
+
+      <RenameBlockDialog
+        open={renameDialogOpen}
+        onOpenChange={setRenameDialogOpen}
+        currentLabel={label}
+        existingLabels={existingLabels}
+        onRename={(newLabel) => {
+          setLabel(newLabel);
+          toast({
+            variant: "success",
+            title: "Block Renamed",
+            description: `Block renamed to "${newLabel}"`,
+          });
+        }}
+      />
     </>
   );
 }
