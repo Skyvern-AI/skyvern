@@ -181,6 +181,7 @@ ACTION_MAP = {
     "wait": "wait",
     "extract": "extract",
     "complete": "complete",
+    "download_file": "download_file",
 }
 ACTIONS_WITH_XPATH = [
     "click",
@@ -656,6 +657,28 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                 ),
             )
         )
+    elif method == "download_file":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("file_name"),
+                value=_value(act.get("file_name", "")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        if act.get("download_url"):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("download_url"),
+                    value=_value(act["download_url"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
     elif method == "extract":
         args.append(
             cst.Arg(
@@ -779,7 +802,11 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
         body_stmts.append(cst.parse_statement(f"await page.goto({repr(block['url'])})"))
 
     for act in actions:
-        if act["action_type"] in [ActionType.COMPLETE, ActionType.TERMINATE, ActionType.NULL_ACTION]:
+        if act["action_type"] in [
+            ActionType.COMPLETE,
+            ActionType.TERMINATE,
+            ActionType.NULL_ACTION,
+        ]:
             continue
 
         # For extraction blocks, assign extract action results to output variable

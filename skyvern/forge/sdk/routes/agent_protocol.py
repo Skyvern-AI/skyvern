@@ -264,6 +264,7 @@ async def run_task(
                 extra_http_headers=run_request.extra_http_headers,
                 browser_session_id=run_request.browser_session_id,
                 browser_address=run_request.browser_address,
+                run_with=run_request.run_with,
             )
         except MissingBrowserAddressError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -662,6 +663,76 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
             detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE / 1024 / 1024} MB)",
         )
     return file
+
+
+@legacy_base_router.post(
+    "/workflows/sop-to-blocks",
+    response_model=dict[str, Any],
+    include_in_schema=False,
+)
+@legacy_base_router.post(
+    "/workflows/sop-to-blocks/",
+    response_model=dict[str, Any],
+    include_in_schema=False,
+)
+async def convert_sop_to_blocks(
+    file: UploadFile = Depends(_validate_file_size),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict[str, Any]:
+    """Convert a PDF SOP to workflow blocks without creating a workflow."""
+    analytics.capture(
+        "skyvern-oss-workflow-sop-to-blocks",
+        data={"organization_id": current_org.organization_id},
+    )
+
+    # Validate PDF
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    try:
+        file_contents = await file.read()
+        file_name = file.filename
+    finally:
+        await file.close()
+
+    # Extract text from PDF
+    sop_text = await asyncio.to_thread(
+        pdf_import_service.extract_text_from_pdf,
+        file_contents,
+        file_name,
+    )
+
+    # Convert to workflow definition via LLM
+    try:
+        result = await pdf_import_service.create_workflow_from_sop_text(sop_text, current_org)
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOG.exception(
+            "Failed to convert SOP to blocks",
+            organization_id=current_org.organization_id,
+            filename=file_name,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="Failed to convert SOP to workflow blocks. Please verify the PDF content and try again.",
+        ) from e
+
+    workflow_def = result.get("workflow_definition", {})
+
+    # Transform blocks: convert parameter_keys (backend format) to parameters (frontend format)
+    # This is done here rather than in _sanitize_workflow_json because the import-pdf endpoint
+    # needs the backend format for WorkflowCreateYAMLRequest validation
+    # Create shallow copies to avoid mutating shared data structures
+    blocks = [dict(block) for block in workflow_def.get("blocks", [])]
+    for block in blocks:
+        parameter_keys = block.pop("parameter_keys", None) or []
+        block["parameters"] = [{"key": key} for key in parameter_keys]
+
+    return {
+        "blocks": blocks,
+        "parameters": workflow_def.get("parameters", []),
+    }
 
 
 @legacy_base_router.post(

@@ -104,6 +104,13 @@ This is most helpful for first time run (db setup, db migrations etc).
 skyvern quickstart
 ```
 
+If you already have a database you want to use, pass a custom connection string to skip the
+local Docker PostgreSQL setup:
+
+```bash
+skyvern quickstart --database-string "postgresql+psycopg://user:password@localhost:5432/skyvern"
+```
+
 ### 3. Run task
 
 #### UI (Recommended)

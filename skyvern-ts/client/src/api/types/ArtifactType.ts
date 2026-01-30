@@ -27,5 +27,6 @@ export const ArtifactType = {
     Trace: "trace",
     Har: "har",
     ScriptFile: "script_file",
+    Pdf: "pdf",
 } as const;
 export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];

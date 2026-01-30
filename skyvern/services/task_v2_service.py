@@ -209,6 +209,7 @@ async def initialize_task_v2(
                 browser_session_id=browser_session_id,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                run_with=run_with,
             ),
             workflow_permanent_id=new_workflow.workflow_permanent_id,
             organization=organization,
@@ -755,10 +756,11 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=scraped_page.screenshots,
                 )
-                await app.WORKFLOW_SERVICE.generate_script_if_needed(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                )
+                if task_v2.run_with == "code":
+                    await app.WORKFLOW_SERVICE.generate_script_if_needed(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                    )
                 break
 
             if not plan:
@@ -967,10 +969,12 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=completion_screenshots,
                 )
-                await app.WORKFLOW_SERVICE.generate_script_if_needed(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                )
+                if task_v2.run_with == "code":
+                    await app.WORKFLOW_SERVICE.generate_script_if_needed(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                        finalize=True,  # Force regeneration to ensure field mappings have complete action data
+                    )
                 break
 
         # total step number validation

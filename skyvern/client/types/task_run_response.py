@@ -103,6 +103,11 @@ class TaskRunResponse(UniversalBaseModel):
     The errors for the run
     """
 
+    step_count: typing.Optional[int] = pydantic.Field(default=None)
+    """
+    Total number of steps executed in this run
+    """
+
     run_request: typing.Optional[TaskRunRequest] = pydantic.Field(default=None)
     """
     The original request parameters used to start this task run

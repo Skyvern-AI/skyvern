@@ -21,6 +21,7 @@ export interface Action {
     element_id?: string;
     skyvern_element_hash?: string;
     skyvern_element_data?: Record<string, unknown>;
+    screenshot_artifact_id?: string;
     tool_call_id?: string;
     xpath?: string;
     errors?: Skyvern.UserDefinedError[];
@@ -28,6 +29,8 @@ export interface Action {
     file_name?: string;
     file_url?: string;
     download?: boolean;
+    download_triggered?: boolean;
+    downloaded_files?: string[];
     is_upload_file_tag?: boolean;
     text?: string;
     input_or_select_context?: Skyvern.InputOrSelectContext;

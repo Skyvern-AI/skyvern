@@ -1,6 +1,7 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { Cross2Icon } from "@radix-ui/react-icons";
 import {
   ReactFlowProvider,
   useNodesState,
@@ -22,10 +23,16 @@ type BlockComparison = {
   identifier: string;
 };
 
+type ComparisonMode = "history" | "copilot";
+
+export type CopilotReviewStatus = "approve" | "reject" | "close";
+
 type Props = {
   version1: WorkflowVersion;
   version2: WorkflowVersion;
   onSelectState?: (version: WorkflowVersion) => void;
+  mode?: ComparisonMode;
+  onCopilotReviewClose?: (status: CopilotReviewStatus) => void;
 };
 
 // Mapping from WorkflowBlock.block_type to ReactFlow node.type
@@ -255,7 +262,13 @@ function WorkflowComparisonRenderer({
   );
 }
 
-function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
+function WorkflowComparisonPanel({
+  version1,
+  version2,
+  onSelectState,
+  mode = "history",
+  onCopilotReviewClose,
+}: Props) {
   const comparisons = useMemo(() => {
     const blocks1 = version1?.workflow_definition?.blocks || [];
     const blocks2 = version2?.workflow_definition?.blocks || [];
@@ -264,6 +277,20 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
     version1?.workflow_definition?.blocks,
     version2?.workflow_definition?.blocks,
   ]);
+
+  // ESC key handler for copilot mode - close without rejecting
+  useEffect(() => {
+    if (mode !== "copilot" || !onCopilotReviewClose) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onCopilotReviewClose("close");
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [mode, onCopilotReviewClose]);
 
   // Statistics
   const stats = useMemo(
@@ -321,7 +348,18 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
   return (
     <div className="flex h-full w-full flex-col rounded-lg bg-slate-elevation2">
       {/* Header */}
-      <div className="flex-shrink-0 p-4 pb-3">
+      <div className="relative flex-shrink-0 p-4 pb-3">
+        {/* Close button for copilot mode */}
+        {mode === "copilot" && onCopilotReviewClose && (
+          <button
+            type="button"
+            onClick={() => onCopilotReviewClose("close")}
+            className="absolute right-4 top-4 rounded p-1 text-slate-400 hover:bg-slate-700 hover:text-slate-200"
+            title="Close (Esc)"
+          >
+            <Cross2Icon className="h-5 w-5" />
+          </button>
+        )}
         {/* 3x3 Grid Layout */}
         <div className="grid grid-cols-3 gap-4">
           {/* Row 1: Workflow Names and Title */}
@@ -329,17 +367,21 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
             {version1.title}
           </h2>
           <h3 className="text-center text-lg font-medium text-muted-foreground">
-            Version Comparison
+            {mode === "copilot" ? "Copilot Review" : "Version Comparison"}
           </h3>
           <h2 className="text-center text-xl font-semibold">
             {version2.title}
           </h2>
 
           {/* Row 2: Version Details and Statistics */}
-          <div className="text-center text-sm text-muted-foreground">
-            [Version {version1.version}] •{" "}
-            {new Date(version1.modified_at).toLocaleDateString()}
-          </div>
+          {mode === "history" ? (
+            <div className="text-center text-sm text-muted-foreground">
+              [Version {version1.version}] •{" "}
+              {new Date(version1.modified_at).toLocaleDateString()}
+            </div>
+          ) : (
+            <div></div>
+          )}
           <div className="flex justify-center gap-3 text-sm">
             <div className="flex items-center gap-1">
               <div className="h-3 w-3 rounded-full bg-green-300"></div>
@@ -358,14 +400,18 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
               <span>Removed ({stats.removed})</span>
             </div>
           </div>
-          <div className="text-center text-sm text-muted-foreground">
-            [Version {version2.version}] •{" "}
-            {new Date(version2.modified_at).toLocaleDateString()}
-          </div>
+          {mode === "history" ? (
+            <div className="text-center text-sm text-muted-foreground">
+              [Version {version2.version}] •{" "}
+              {new Date(version2.modified_at).toLocaleDateString()}
+            </div>
+          ) : (
+            <div></div>
+          )}
 
-          {/* Row 3: Select Buttons */}
+          {/* Row 3: Action Buttons */}
           <div className="flex justify-center">
-            {onSelectState && (
+            {mode === "history" && onSelectState && (
               <Button
                 size="sm"
                 onClick={() => onSelectState(version1)}
@@ -375,9 +421,29 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
               </Button>
             )}
           </div>
-          <div></div>
+          <div className="flex justify-center gap-2">
+            {mode === "copilot" && (
+              <>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => onCopilotReviewClose?.("reject")}
+                  className="text-xs"
+                >
+                  Reject
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={() => onCopilotReviewClose?.("approve")}
+                  className="bg-green-600 text-xs hover:bg-green-700"
+                >
+                  Accept
+                </Button>
+              </>
+            )}
+          </div>
           <div className="flex justify-center">
-            {onSelectState && (
+            {mode === "history" && onSelectState && (
               <Button
                 size="sm"
                 onClick={() => onSelectState(version2)}
