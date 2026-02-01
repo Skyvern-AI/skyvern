@@ -173,7 +173,9 @@ Use these enum values for country-level targeting. Each routes through a residen
 - `RESIDENTIAL_ISP` uses static ISP IPs instead of rotating residential IPs. Useful for sites that distrust rotating pools or require consistent IP addresses across requests.
 - `NONE` disables proxy routing entirely—traffic originates from Skyvern's US datacenters. Useful for testing or internal tools.
 
-**Note on timezone:** When using `proxy_location`, the browser's timezone is set accordingly. Sites that compare your IP's geolocation against browser timezone for bot detection will see consistent data.
+<Info>
+**Timezone is automatically set:** When using `proxy_location`, the browser's timezone is set to match the proxy's region. Sites that compare your IP's geolocation against browser timezone for bot detection will see consistent data.
+</Info>
 
 ### State and city targeting
 
@@ -266,7 +268,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 | Site still blocks requests | Bot detection beyond IP geolocation (fingerprinting, behavioral analysis) | Use `RESIDENTIAL_ISP` for static IPs, match proxy to site's region, add `wait` blocks between actions |
 | Need to debug proxy issues | Isolate whether proxy is causing failures | Set `proxy_location: "NONE"` to bypass proxy entirely |
 
-Need a location that's not available? [Contact support](https://discord.gg/skyvern) to request new proxy pools.
+Need a location that's not available? Get help in the [Skyvern Discord community](https://discord.gg/skyvern) to request new proxy pools.
 
 ---
 
