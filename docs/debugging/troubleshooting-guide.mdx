@@ -17,7 +17,8 @@ When a run fails or produces unexpected results, this guide helps you identify t
 
 Start with the run response to understand what happened:
 
-```python
+<CodeGroup>
+```python Python
 run = await client.get_run(run_id)
 
 print(f"Status: {run.status}")
@@ -25,6 +26,22 @@ print(f"Failure reason: {run.failure_reason}")
 print(f"Step count: {run.step_count}")
 print(f"Output: {run.output}")
 ```
+
+```typescript TypeScript
+const run = await client.getRun(runId);
+
+console.log(`Status: ${run.status}`);
+console.log(`Failure reason: ${run.failure_reason}`);
+console.log(`Step count: ${run.step_count}`);
+console.log(`Output: ${JSON.stringify(run.output)}`);
+```
+
+```bash cURL
+curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  | jq '{status, failure_reason, step_count, output}'
+```
+</CodeGroup>
 
 | Status | What it means | Likely cause |
 |--------|---------------|--------------|
@@ -128,7 +145,8 @@ The timeline tells you:
 
 Once you know which step failed, pull artifacts for that step:
 
-```python
+<CodeGroup>
+```python Python
 artifacts = await client.get_run_artifacts(
     run_id,
     artifact_type=["screenshot_final", "llm_response_parsed", "skyvern_log"]
@@ -137,6 +155,23 @@ artifacts = await client.get_run_artifacts(
 for a in artifacts:
     print(f"{a.artifact_type}: {a.signed_url}")
 ```
+
+```typescript TypeScript
+const artifacts = await client.getRunArtifacts(runId, {
+  artifact_type: ["screenshot_final", "llm_response_parsed", "skyvern_log"]
+});
+
+for (const a of artifacts) {
+  console.log(`${a.artifact_type}: ${a.signed_url}`);
+}
+```
+
+```bash cURL
+curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID/artifacts?artifact_type=screenshot_final&artifact_type=llm_response_parsed&artifact_type=skyvern_log" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  | jq '.[] | "\(.artifact_type): \(.signed_url)"'
+```
+</CodeGroup>
 
 Check these in order:
 

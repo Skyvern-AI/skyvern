@@ -182,7 +182,8 @@ These contain structured execution data.
 
 Here's a complete example of using artifacts to debug a login failure:
 
-```python
+<CodeGroup>
+```python Python
 import asyncio
 
 async def debug_failed_run(run_id: str):
@@ -225,6 +226,97 @@ async def debug_failed_run(run_id: str):
 
 asyncio.run(debug_failed_run("tsk_v2_486305187432193504"))
 ```
+
+```typescript TypeScript
+async function debugFailedRun(runId: string) {
+  // 1. Get the run to see what failed
+  const run = await client.getRun(runId);
+  console.log(`Status: ${run.status}`);
+  console.log(`Failure reason: ${run.failure_reason}`);
+
+  // 2. Get key artifacts
+  const artifacts = await client.getRunArtifacts(runId, {
+    artifact_type: [
+      "recording",
+      "screenshot_final",
+      "llm_response_parsed",
+      "skyvern_log"
+    ]
+  });
+
+  // 3. Organize by type
+  const byType: Record<string, string> = {};
+  for (const a of artifacts) {
+    if (a.signed_url) {
+      byType[a.artifact_type] = a.signed_url;
+    }
+  }
+
+  // 4. Print URLs for manual inspection
+  console.log("\n=== Debug artifacts ===");
+  if (byType["screenshot_final"]) {
+    console.log(`Final screenshot: ${byType["screenshot_final"]}`);
+  }
+  if (byType["recording"]) {
+    console.log(`Recording: ${byType["recording"]}`);
+  }
+  if (byType["skyvern_log"]) {
+    console.log(`Execution log: ${byType["skyvern_log"]}`);
+  }
+
+  // 5. Download and parse the LLM response to see what action was attempted
+  if (byType["llm_response_parsed"]) {
+    const response = await fetch(byType["llm_response_parsed"]);
+    const text = await response.text();
+    console.log(`\nLast AI decision:\n${text.slice(0, 500)}...`);
+  }
+}
+
+debugFailedRun("tsk_v2_486305187432193504");
+```
+
+```bash cURL
+#!/bin/bash
+
+RUN_ID="tsk_v2_486305187432193504"
+
+# 1. Get the run to see what failed
+echo "Fetching run status..."
+curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  | jq '{status: .status, failure_reason: .failure_reason}'
+
+# 2. Get key artifacts
+echo -e "\nFetching debug artifacts..."
+ARTIFACTS=$(curl -s -X GET \
+  "https://api.skyvern.com/v1/runs/$RUN_ID/artifacts?artifact_type=recording&artifact_type=screenshot_final&artifact_type=llm_response_parsed&artifact_type=skyvern_log" \
+  -H "x-api-key: $SKYVERN_API_KEY")
+
+# 3. Extract URLs for each artifact type
+echo -e "\n=== Debug artifacts ==="
+echo "$ARTIFACTS" | jq -r '
+  map(select(.artifact_type == "screenshot_final") | .signed_url) | first
+  | "Final screenshot: \(.)"'
+
+echo "$ARTIFACTS" | jq -r '
+  map(select(.artifact_type == "recording") | .signed_url) | first
+  | "Recording: \(.)"'
+
+echo "$ARTIFACTS" | jq -r '
+  map(select(.artifact_type == "skyvern_log") | .signed_url) | first
+  | "Execution log: \(.)"'
+
+# 4. Download and preview the LLM response
+LLM_RESPONSE_URL=$(echo "$ARTIFACTS" | jq -r '
+  map(select(.artifact_type == "llm_response_parsed") | .signed_url) | first')
+
+if [ "$LLM_RESPONSE_URL" != "null" ]; then
+  echo -e "\nLast AI decision:"
+  curl -s "$LLM_RESPONSE_URL" | head -c 500
+  echo "..."
+fi
+```
+</CodeGroup>
 
 ---
 
