@@ -48,7 +48,8 @@
               "going-to-production/webhooks",
               "going-to-production/proxy-geolocation",
               "going-to-production/error-handling",
-              "going-to-production/reliability-tips"
+              "going-to-production/reliability-tips",
+              "going-to-production/captcha-bot-detection"
             ]
           }
         ]
