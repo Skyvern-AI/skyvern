@@ -1,641 +1,209 @@
 ---
 title: CAPTCHA & Bot Detection
-subtitle: How Skyvern handles CAPTCHAs and avoids bot detection
+subtitle: How Skyvern detects, solves, and avoids CAPTCHAs and anti-bot systems
 slug: going-to-production/captcha-bot-detection
 ---
 
-Skyvern includes built-in mechanisms for handling CAPTCHAs and avoiding bot detection systems. This page covers how Skyvern deals with these security challenges.
+Websites use CAPTCHAs and bot detection to block automated traffic. Skyvern handles both — it detects CAPTCHAs using vision, solves them automatically on Skyvern Cloud, and configures browsers to avoid triggering anti-bot systems in the first place.
 
 ---
 
-## CAPTCHA Handling
+## CAPTCHA detection
 
-### Supported CAPTCHA Types
+Skyvern detects CAPTCHAs using its LLM vision model. During each step, the AI analyzes the page screenshot and identifies whether a CAPTCHA is present and what type it is.
 
-Skyvern can detect the following CAPTCHA types:
+**Supported CAPTCHA types:**
 
-| CAPTCHA Type | Description |
-|--------------|-------------|
-| **TEXT_CAPTCHA** | Simple text-based challenge |
-| **RECAPTCHA** | Google reCAPTCHA v2/v3 |
-| **HCAPTCHA** | hCaptcha challenges |
-| **MTCAPTCHA** | MTCaptcha protection |
-| **FUNCAPTCHA** | FunCaptcha (ArkoseLabs) |
-| **CLOUDFLARE** | Cloudflare Turnstile/Challenge |
-| **OTHER** | Unrecognized CAPTCHA types |
+| Type | Examples |
+|------|----------|
+| `RECAPTCHA` | Google reCAPTCHA v2, v3 |
+| `HCAPTCHA` | hCaptcha checkbox, image challenges |
+| `CLOUDFLARE` | Cloudflare Turnstile, Challenge pages |
+| `FUNCAPTCHA` | FunCaptcha / ArkoseLabs |
+| `MTCAPTCHA` | MTCaptcha |
+| `TEXT_CAPTCHA` | Distorted text/number images with an input field |
+| `OTHER` | Unrecognized CAPTCHA types |
 
-### How CAPTCHA Solving Works
+When the AI detects a CAPTCHA, it emits a `SOLVE_CAPTCHA` action with the identified `captcha_type`. What happens next depends on your deployment.
 
-When Skyvern encounters a CAPTCHA, it uses the `SOLVE_CAPTCHA` action type. The current implementation:
+---
 
-1. **Detects** the CAPTCHA type automatically using computer vision
-2. **Pauses** execution for 30 seconds
-3. **Waits** for manual intervention or external solver
+## CAPTCHA solving
 
-```python
-# Skyvern detects CAPTCHAs automatically during task execution
-# The agent will identify the CAPTCHA type and take appropriate action
-result = await client.run_task(
-    prompt="Submit this form",
-    url="https://example.com/form",
-)
+### Skyvern Cloud (automatic)
 
-# If a CAPTCHA is encountered, the task may pause for manual solving
-```
+On [Skyvern Cloud](https://app.skyvern.com), CAPTCHAs are solved automatically. When the AI detects a CAPTCHA, Skyvern's solver service handles it in the background. No configuration needed — it works out of the box for all supported CAPTCHA types.
 
-<Warning>
-**Current Limitation**: Skyvern does not automatically solve CAPTCHAs. The agent will pause when a CAPTCHA is detected, allowing 30 seconds for intervention.
-</Warning>
-
-### Using Human Interaction Block for CAPTCHAs
-
-For workflows, use the **Human Interaction** block to explicitly handle CAPTCHAs:
+If the solver cannot resolve the CAPTCHA (rare edge cases or novel CAPTCHA types), the task continues with a `SOLVE_CAPTCHA` action failure. Handle this with [error code mapping](/going-to-production/error-handling):
 
 <CodeGroup>
-```yaml YAML
+```python Python
+result = await client.run_task(
+    prompt="Submit the application form. COMPLETE when you see confirmation.",
+    url="https://example.com/apply",
+    error_code_mapping={
+        "captcha_failed": "Return this if a CAPTCHA blocks progress after multiple attempts",
+    },
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Submit the application form. COMPLETE when you see confirmation.",
+    url: "https://example.com/apply",
+    error_code_mapping: {
+      captcha_failed: "Return this if a CAPTCHA blocks progress after multiple attempts",
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Submit the application form. COMPLETE when you see confirmation.",
+    "url": "https://example.com/apply",
+    "error_code_mapping": {
+      "captcha_failed": "Return this if a CAPTCHA blocks progress after multiple attempts"
+    }
+  }'
+```
+</CodeGroup>
+
+### Human Interaction block (workflows)
+
+For workflows where you want a human to solve the CAPTCHA manually, use the **Human Interaction** block. The workflow pauses and notifies you, then resumes after you solve it.
+
+```yaml
 blocks:
   - block_type: navigation
-    label: navigate_to_form
+    label: fill_form
     url: https://example.com/form
     navigation_goal: Fill out the registration form
 
-  # Pause for manual CAPTCHA solving
   - block_type: human_interaction
     label: solve_captcha
     message: "Please solve the CAPTCHA and click Continue"
 
-  - block_type: action
+  - block_type: navigation
     label: submit_form
     navigation_goal: Click the submit button
 ```
 
-```json JSON
-{
-  "blocks": [
-    {
-      "block_type": "navigation",
-      "label": "navigate_to_form",
-      "url": "https://example.com/form",
-      "navigation_goal": "Fill out the registration form"
-    },
-    {
-      "block_type": "human_interaction",
-      "label": "solve_captcha",
-      "message": "Please solve the CAPTCHA and click Continue"
-    },
-    {
-      "block_type": "action",
-      "label": "submit_form",
-      "navigation_goal": "Click the submit button"
-    }
-  ]
-}
-```
-</CodeGroup>
+---
 
-### Error Handling for CAPTCHAs
+## Bot detection avoidance
 
-In workflows, use custom error codes to handle CAPTCHA-related failures:
+Skyvern automatically configures the browser to reduce bot detection triggers. These protections apply to every run — no configuration needed.
 
-<CodeGroup>
-```yaml YAML
-error_code_mapping:
-  - error_code: cant_solve_captcha
-    description: Return this error if CAPTCHA isn't solved after multiple retries
-```
+### Browser fingerprinting
 
-```json JSON
-{
-  "error_code_mapping": [
-    {
-      "error_code": "cant_solve_captcha",
-      "description": "Return this error if CAPTCHA isn't solved after multiple retries"
-    }
-  ]
-}
-```
-</CodeGroup>
+Skyvern launches Chromium with settings that remove common automation signals:
+
+- **`AutomationControlled` disabled** — Removes the Blink feature flag that marks the browser as automated
+- **`navigator.webdriver` hidden** — The `enable-automation` flag is suppressed so JavaScript detection scripts don't see a webdriver
+- **Viewport and user agent** — Set to match real consumer browsers
+- **Locale and timezone** — Automatically matched to the proxy location (see [Proxy & Geolocation](/going-to-production/proxy-geolocation))
+
+### Reducing detection risk
+
+Beyond fingerprinting, how you structure your automation affects detection. Three patterns that help:
+
+**1. Use residential proxies for sensitive sites.** Datacenter IPs are the most common bot signal. Residential proxies route through real ISP addresses. See [Proxy & Geolocation](/going-to-production/proxy-geolocation).
+
+**2. Reuse browser sessions for multi-step flows.** Creating a fresh browser for every step looks suspicious. A persistent session maintains cookies, cache, and history — appearing as a returning user. See [Browser Sessions](/optimization/browser-sessions).
+
+**3. Use browser profiles for repeat visits.** Profiles save browser state from a previous session. Starting with an existing profile means the site sees a known browser with familiar cookies, not a blank slate. See [Browser Profiles](/optimization/browser-profiles).
 
 ---
 
-## 2FA & Verification Code Support
+## Self-hosted deployment
 
-Skyvern supports logging into websites that require 2FA/MFA/Verification codes. There are **5 methods** to provide verification codes to Skyvern:
+<Note>
+The sections above apply to Skyvern Cloud. If you're running Skyvern locally, the following differences apply.
+</Note>
 
-### Option 1: Google Authenticator (TOTP)
+### CAPTCHA solving
 
-Store TOTP secrets in Skyvern credentials and they'll be used automatically during login.
+The open-source version does **not** include automatic CAPTCHA solving. When a CAPTCHA is detected, the agent pauses for 30 seconds to allow manual intervention (e.g., solving it in the browser window yourself), then continues.
 
-**Setup:**
-1. Save username and password in [Skyvern Credentials](https://app.skyvern.com/credentials)
-2. Add TOTP secret key from your authenticator app
-3. Skyvern automatically generates codes during workflow execution
+To handle CAPTCHAs in self-hosted workflows, use the Human Interaction block as described above.
 
-**No code changes needed** - Skyvern will fetch credentials and generate TOTP codes automatically.
+### Browser extensions
 
-### Option 2: Email Verification Code
-
-Forward verification emails to Skyvern's TOTP endpoint using email filters.
-
-**Pass `totp_identifier` in your task or workflow:**
-
-<CodeGroup>
-```python Python
-result = await client.run_task(
-    prompt="Login to the account",
-    url="https://example.com/login",
-    totp_identifier="user@example.com",  # Email where code is sent
-)
-```
-
-```typescript TypeScript
-const result = await client.runTask({
-  body: {
-    prompt: "Login to the account",
-    url: "https://example.com/login",
-    totp_identifier: "user@example.com",  // Email where code is sent
-  },
-});
-```
-
-```bash cURL
-curl -X POST "https://api.skyvern.com/v1/run/tasks" \
-  -H "x-api-key: $SKYVERN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Login to the account",
-    "url": "https://example.com/login",
-    "totp_identifier": "user@example.com"
-  }'
-```
-</CodeGroup>
-
-**Send the code to Skyvern when it arrives:**
+Self-hosted deployments can load Chrome extensions for additional stealth or functionality:
 
 ```bash
-curl -X POST "https://api.skyvern.com/v1/credentials/totp" \
-  -H "x-api-key: $SKYVERN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "totp_identifier": "user@example.com",
-    "content": "Your verification code is: 123456",
-    "source": "email"
-  }'
-```
-
-**Automated Email Forwarding:**
-
-You can set up automated forwarding using Gmail + Zapier:
-1. Create a Zapier Zap with Email trigger
-2. Add a Webhook action to POST to `https://api.skyvern.com/v1/credentials/totp`
-3. Set up Gmail filter to forward verification emails
-
-See [TOTP Documentation](/credentials/totp) for detailed setup instructions.
-
-### Option 3: Phone Verification Code
-
-Similar to email verification, but for SMS codes.
-
-**Setup with Twilio:**
-
-<CodeGroup>
-```python Python
-result = await client.run_task(
-    prompt="Login to the account",
-    url="https://example.com/login",
-    totp_identifier="+15555551234",  # Phone number where code is sent
-)
-```
-
-```typescript TypeScript
-const result = await client.runTask({
-  body: {
-    prompt: "Login to the account",
-    url: "https://example.com/login",
-    totp_identifier: "+15555551234",  // Phone number where code is sent
-  },
-});
-```
-</CodeGroup>
-
-**Twilio webhook to forward SMS to Skyvern:**
-
-```javascript
-// Twilio Function
-exports.handler = async function(context, event, callback) {
-  const axios = require('axios');
-
-  const requestBody = {
-    totp_identifier: event.To,  // Phone number
-    content: event.Body,        // SMS message content
-    source: "phone"
-  };
-
-  try {
-    await axios.post('https://api.skyvern.com/v1/credentials/totp', requestBody, {
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': context.SKYVERN_API_KEY
-      }
-    });
-
-    callback(null, 'Success');
-  } catch (error) {
-    callback(error);
-  }
-};
-```
-
-### Option 4: Webhook (Let Skyvern fetch from your server)
-
-Instead of pushing codes to Skyvern, let Skyvern pull codes from your endpoint.
-
-**Pass `totp_url` when running a task or workflow:**
-
-<CodeGroup>
-```python Python
-result = await client.run_task(
-    prompt="Login to the account",
-    url="https://example.com/login",
-    totp_url="https://your-server.com/api/get-totp-code",
-)
-```
-
-```typescript TypeScript
-const result = await client.runTask({
-  body: {
-    prompt: "Login to the account",
-    url: "https://example.com/login",
-    totp_url: "https://your-server.com/api/get-totp-code",
-  },
-});
-```
-
-```bash cURL
-curl -X POST "https://api.skyvern.com/v1/run/tasks" \
-  -H "x-api-key: $SKYVERN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Login to the account",
-    "url": "https://example.com/login",
-    "totp_url": "https://your-server.com/api/get-totp-code"
-  }'
-```
-</CodeGroup>
-
-**Your endpoint should accept this request:**
-
-```
-POST https://your-server.com/api/get-totp-code
-
-Request Body:
-{
-  "task_id": "tsk_abc123"
-}
-
-Response:
-{
-  "task_id": "tsk_abc123",
-  "verification_code": "123456"
-}
-```
-
-**Verify the request is from Skyvern:**
-
-<CodeGroup>
-```python Python
-import hmac
-import hashlib
-from fastapi import Request
-
-def validate_skyvern_request(request: Request, api_key: str) -> bool:
-    header_signature = request.headers.get("x-skyvern-signature")
-    payload = request.body()
-
-    hash_obj = hmac.new(
-        api_key.encode("utf-8"),
-        msg=payload,
-        digestmod=hashlib.sha256
-    )
-    expected_signature = hash_obj.hexdigest()
-
-    return header_signature == expected_signature
-```
-
-```typescript TypeScript
-import crypto from 'crypto';
-
-function validateSkyvernRequest(
-  body: string,
-  signature: string,
-  apiKey: string
-): boolean {
-  const expectedSignature = crypto
-    .createHmac('sha256', apiKey)
-    .update(body)
-    .digest('hex');
-
-  return signature === expectedSignature;
-}
-```
-</CodeGroup>
-
-### Option 5: One-Time Login Link (Magic Link)
-
-For websites that send magic links instead of codes, forward the email to Skyvern and it will extract and follow the link.
-
-Same setup as **Option 2 (Email)**, but Skyvern will automatically:
-1. Extract the login link from the email
-2. Navigate to the link
-3. Complete the authentication
-
----
-
-## Bot Detection Avoidance
-
-Skyvern includes multiple mechanisms to avoid detection by anti-bot systems.
-
-### Browser Fingerprinting Protection
-
-Skyvern automatically configures Chromium to appear as a real user browser:
-
-**Disabled automation indicators:**
-- `--disable-blink-features=AutomationControlled` - Removes automation flag
-- `--enable-automation` flag is **ignored** - Prevents `navigator.webdriver` detection
-- Custom viewport and user agent configuration
-- Browser locale settings
-
-These settings are applied automatically - no configuration needed.
-
-### Residential Proxy Support
-
-Use residential proxies to appear as real users from specific locations.
-
-**Example: Route through UK residential proxy**
-
-<CodeGroup>
-```python Python
-result = await client.run_task(
-    prompt="Get the price of this product",
-    url="https://shop.example.co.uk/product/123",
-    proxy_location="RESIDENTIAL_GB",  # UK residential IP
-)
-```
-
-```typescript TypeScript
-const result = await client.runTask({
-  body: {
-    prompt: "Get the price of this product",
-    url: "https://shop.example.co.uk/product/123",
-    proxy_location: "RESIDENTIAL_GB",  // UK residential IP
-  },
-});
-```
-
-```bash cURL
-curl -X POST "https://api.skyvern.com/v1/run/tasks" \
-  -H "x-api-key: $SKYVERN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Get the price of this product",
-    "url": "https://shop.example.co.uk/product/123",
-    "proxy_location": "RESIDENTIAL_GB"
-  }'
-```
-</CodeGroup>
-
-**Available proxy locations:**
-- `RESIDENTIAL` - United States (default)
-- `RESIDENTIAL_GB` - United Kingdom
-- `RESIDENTIAL_DE` - Germany
-- `RESIDENTIAL_ES` - Spain
-- `RESIDENTIAL_FR` - France
-- `RESIDENTIAL_IT` - Italy
-- `RESIDENTIAL_NL` - Netherlands
-
-See [Proxy & Geolocation](/going-to-production/proxy-geolocation) for full details.
-
-**Benefits:**
-- Real residential ISP IP addresses (not datacenter IPs)
-- Automatic timezone matching to proxy location
-- Reduces risk of IP-based blocking
-
-### Browser Session Persistence
-
-Maintain cookies, cache, and browser state across multiple runs to appear as a returning user.
-
-**Create a persistent browser session:**
-
-<CodeGroup>
-```python Python
-# Create a session
-session = await client.create_browser_session(
-    organization_id="org_abc123",
-    proxy_location="RESIDENTIAL_GB",
-)
-
-# Use the session across multiple tasks
-result1 = await client.run_task(
-    prompt="Login to the website",
-    url="https://example.com/login",
-    browser_session_id=session.browser_session_id,
-)
-
-result2 = await client.run_task(
-    prompt="Navigate to account settings",
-    url="https://example.com",
-    browser_session_id=session.browser_session_id,  # Reuses cookies, state
-)
-```
-
-```typescript TypeScript
-// Create a session
-const session = await client.createBrowserSession({
-  body: {
-    organization_id: "org_abc123",
-    proxy_location: "RESIDENTIAL_GB",
-  },
-});
-
-// Use the session across multiple tasks
-const result1 = await client.runTask({
-  body: {
-    prompt: "Login to the website",
-    url: "https://example.com/login",
-    browser_session_id: session.browser_session_id,
-  },
-});
-
-const result2 = await client.runTask({
-  body: {
-    prompt: "Navigate to account settings",
-    url: "https://example.com",
-    browser_session_id: session.browser_session_id,  // Reuses cookies, state
-  },
-});
-```
-</CodeGroup>
-
-**Why this helps:**
-- Preserves login state between runs
-- Maintains cookie history
-- Appears as a returning user instead of first-time visitor
-- Reduces likelihood of triggering security challenges
-
-### Browser Extensions
-
-Skyvern supports loading Chrome extensions for additional stealth or functionality.
-
-**Configure extensions via environment variables:**
-
-```bash
-# .env file
+# .env
 EXTENSIONS=extension1,extension2
 EXTENSIONS_BASE_PATH=/path/to/extensions
 ```
 
-Extensions are automatically loaded when the browser launches.
+Extensions are loaded automatically when the browser launches.
 
----
+### Proxies
 
-## Skyvern Cloud: Enhanced Bot Detection Protection
-
-[Skyvern Cloud](https://app.skyvern.com) includes additional anti-bot detection mechanisms:
-
-- **Advanced CAPTCHA Solvers**: Automatic solving for many CAPTCHA types
-- **Global Proxy Network**: Access to residential proxies worldwide
-- **Browser Fingerprinting Protection**: Additional stealth layers
-- **Rate Limiting Management**: Automatic request throttling
-- **Session Management**: Optimized browser session persistence
-
-<Info>
-Skyvern Cloud includes built-in CAPTCHA solving capabilities that go beyond the open-source version. Get help in the [Skyvern Discord community](https://discord.gg/fG2XXEuQX3).
-</Info>
-
----
-
-## Best Practices
-
-### 1. Use Residential Proxies for High-Security Sites
-
-```python
-# Good: Use residential proxy for banking, e-commerce
-result = await client.run_task(
-    prompt="Get quote",
-    url="https://insurance-site.com",
-    proxy_location="RESIDENTIAL",
-)
-
-# Avoid: Default network for high-security sites
-# May trigger bot detection systems
-```
-
-### 2. Maintain Browser Sessions for Multi-Step Workflows
-
-```python
-# Good: Reuse browser session for logged-in flows
-session = await client.create_browser_session()
-
-await client.run_task(
-    prompt="Login",
-    url="https://example.com/login",
-    browser_session_id=session.browser_session_id,
-)
-
-await client.run_task(
-    prompt="Download report",
-    url="https://example.com/reports",
-    browser_session_id=session.browser_session_id,  # Preserves login state
-)
-
-# Avoid: Creating new sessions for each step
-# Requires re-login, triggers more security checks
-```
-
-### 3. Plan for CAPTCHA Interruptions
-
-```yaml
-# Use Human Interaction block when CAPTCHAs are likely
-blocks:
-  - block_type: navigation
-    label: start_checkout
-    navigation_goal: Proceed to checkout
-
-  # Expect CAPTCHA during checkout
-  - block_type: human_interaction
-    label: solve_checkout_captcha
-    message: "Solve CAPTCHA if present, then click Continue"
-
-  - block_type: action
-    label: complete_payment
-    navigation_goal: Complete the payment
-```
-
-### 4. Set Up Automated 2FA Code Delivery
-
-```python
-# Good: Configure totp_identifier for automated code retrieval
-result = await client.run_task(
-    prompt="Login to account",
-    url="https://example.com/login",
-    totp_identifier="user@example.com",  # Skyvern receives codes automatically
-)
-
-# Better: Use stored TOTP secrets for instant code generation
-# No waiting for SMS/email delivery
-```
+Self-hosted deployments need their own proxy infrastructure. The `proxy_location` parameter is not available — configure proxies at the network level or via environment variables.
 
 ---
 
 ## Troubleshooting
 
-### Issue: Task fails with "CAPTCHA detected"
+### CAPTCHA blocks the run
 
-**Solution:**
-- Add a Human Interaction block before the CAPTCHA step
-- Use Skyvern Cloud for automatic CAPTCHA solving
-- Implement retry logic with longer wait times
+**On Skyvern Cloud:** This is rare. If it happens, the CAPTCHA type may be unsupported or the site changed its challenge. Add an `error_code_mapping` entry to detect the failure, and contact [support@skyvern.com](mailto:support@skyvern.com).
 
-### Issue: "Bot detection triggered" or access denied
+**Self-hosted:** Use a Human Interaction block, or solve it manually within the 30-second window.
 
-**Solutions:**
-1. Enable residential proxies:
-   ```python
-   proxy_location="RESIDENTIAL"
-   ```
+### Bot detection triggered (access denied)
 
-2. Use browser sessions to maintain state:
-   ```python
-   browser_session_id=session.browser_session_id
-   ```
+1. Switch to a residential proxy — `proxy_location="RESIDENTIAL"` or `RESIDENTIAL_ISP` for static IPs
+2. Reuse a browser session instead of creating fresh browsers
+3. Use a browser profile with existing cookies
+4. Add `wait` blocks between rapid actions to reduce behavioral signals
 
-3. Add delays between actions:
-   ```yaml
-   - block_type: wait
-     label: wait_before_submit
-     wait_sec: 3
-   ```
+### Cloudflare challenge page loops
 
-### Issue: 2FA codes not received
+Cloudflare sometimes loops through multiple challenges. If a task gets stuck:
 
-**Check:**
-- `totp_identifier` matches the email/phone where codes are sent
-- Email forwarding or SMS webhook is configured correctly
-- Skyvern API key is valid in webhook configuration
-- Test the integration by manually sending a code to `/v1/credentials/totp`
-
-### Issue: Login fails despite correct credentials
-
-**Verify:**
-- TOTP secret is correctly stored in Skyvern credentials
-- Browser session is being reused for multi-step login flows
-- Proxy location matches expected region (some sites block foreign IPs)
+- Increase `max_steps` to give the solver more attempts
+- Use `RESIDENTIAL_ISP` for a static IP that Cloudflare is more likely to trust
+- Use a browser profile that has previously passed the Cloudflare challenge on that domain
 
 ---
 
-## Related Documentation
+## Next steps
 
-- [Proxy & Geolocation](/going-to-production/proxy-geolocation) - Configure proxy locations and timezone settings
-- [Error Handling](/going-to-production/error-handling) - Handle CAPTCHA and 2FA failures gracefully
-- [2FA Support](/credentials/totp) - Detailed 2FA/TOTP setup instructions
-- [Browser Sessions](/api-reference/api-reference/browser-sessions/create-browser-session) - API reference for persistent sessions
+<CardGroup cols={2}>
+  <Card
+    title="Proxy & Geolocation"
+    icon="globe"
+    href="/going-to-production/proxy-geolocation"
+  >
+    Route traffic through residential proxies in 19 countries
+  </Card>
+  <Card
+    title="Handle 2FA"
+    icon="lock"
+    href="/credentials/handle-2fa"
+  >
+    Configure TOTP, email, and SMS verification codes
+  </Card>
+  <Card
+    title="Browser Sessions"
+    icon="window-restore"
+    href="/optimization/browser-sessions"
+  >
+    Persist browser state across multiple runs
+  </Card>
+  <Card
+    title="Error Handling"
+    icon="triangle-exclamation"
+    href="/going-to-production/error-handling"
+  >
+    Map CAPTCHA and bot failures to custom error codes
+  </Card>
+</CardGroup>
