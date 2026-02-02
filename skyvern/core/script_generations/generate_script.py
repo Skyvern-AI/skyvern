@@ -2028,9 +2028,30 @@ def _build_block_statement(
         stmt = _build_http_request_statement(block)
     elif block_type == "pdf_parser":
         stmt = _build_pdf_parser_statement(block)
+    elif block_type == "conditional":
+        # Conditional blocks are evaluated at runtime by the workflow engine.
+        # Generate a descriptive comment showing this is a runtime branch point.
+        # The blocks inside conditional branches are processed separately when executed.
+        branches = block.get("branches") or block.get("ordered_branches") or []
+        branch_info_lines = []
+        for i, branch in enumerate(branches):
+            next_label = branch.get("next_block_label", "?")
+            condition = branch.get("condition", "")
+            # Truncate long conditions for readability
+            if len(condition) > 50:
+                condition = condition[:47] + "..."
+            branch_info_lines.append(f"#   Branch {i + 1}: {condition!r} → {next_label}")
+
+        if branch_info_lines:
+            branch_info = "\n".join(branch_info_lines)
+            comment_text = f"# === CONDITIONAL: {block_title} ===\n# Evaluated at runtime by workflow engine. One branch executes:\n{branch_info}"
+        else:
+            comment_text = f"# === CONDITIONAL: {block_title} ===\n# Evaluated at runtime by workflow engine."
+
+        stmt = cst.SimpleStatementLine([cst.Expr(cst.parse_expression(f"({repr(comment_text)})"))])
     else:
-        # Default case for unknown block types
-        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"# Unknown block type: {block_type}"))])
+        # Default case for unknown block types - use quoted string literal to avoid libcst validation error
+        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"'# Unknown block type: {block_type}'"))])
 
     return stmt
 
@@ -2111,15 +2132,23 @@ async def generate_workflow_script_python_code(
     pending: bool = False,
     cached_blocks: dict[str, ScriptBlockSource] | None = None,
     updated_block_labels: set[str] | None = None,
+    workflow_definition_labels: set[str] | None = None,
+    downstream_of_updated: set[str] | None = None,
 ) -> str:
     """
     Build a LibCST Module and emit .code (PEP-8-formatted source).
 
     Cached script blocks can be reused by providing them via `cached_blocks`. Any labels present in
     `updated_block_labels` will be regenerated from the latest workflow run execution data.
+
+    Args:
+        downstream_of_updated: Set of block labels that are downstream of any updated block
+            in the DAG. These blocks should not be preserved from cache because they may
+            depend on data from the updated upstream blocks.
     """
     cached_blocks = cached_blocks or {}
     updated_block_labels = set(updated_block_labels or [])
+    downstream_of_updated = downstream_of_updated or set()
 
     # Drop cached entries that do not have usable source
     cached_blocks = {label: source for label, source in cached_blocks.items() if source.code}
@@ -2304,6 +2333,86 @@ async def generate_workflow_script_python_code(
                 LOG.error("Failed to create task_v2 script block", error=str(e), exc_info=True)
 
         append_block_code(block_code)
+
+    # --- preserve cached blocks not executed in current run (progressive caching) ---
+    # Track which blocks were processed from the current run
+    processed_labels = {
+        task.get("label") or task.get("title") or task.get("task_id") or f"task_{idx}"
+        for idx, task in enumerate(task_v1_blocks)
+        if not task.get("parent_task_v2_label")
+    }
+    processed_labels.update(
+        task_v2.get("label") or f"task_v2_{task_v2.get('workflow_run_block_id')}" for task_v2 in task_v2_blocks
+    )
+
+    # Add any cached blocks that weren't in the current run (from other conditional branches)
+    preserved_block_count = 0
+    failed_block_count = 0
+    for cached_label, cached_source in cached_blocks.items():
+        if cached_label in processed_labels:
+            continue  # Already processed from current run
+        if cached_label == settings.WORKFLOW_START_BLOCK_LABEL:
+            continue  # Skip the start block, it's always regenerated
+        # Only preserve blocks that still exist in the current workflow definition.
+        # This prevents preserving stale blocks after a user deletes or renames blocks.
+        if workflow_definition_labels is not None and cached_label not in workflow_definition_labels:
+            LOG.debug(
+                "Skipping cached block that no longer exists in workflow definition",
+                block_label=cached_label,
+            )
+            continue
+        # Don't preserve blocks that are downstream of any updated block.
+        # These may depend on data from the updated upstream block, so their cached
+        # code could be stale. For example, if Block A extracts data used by Block B,
+        # and A is modified, then B's cached code may produce incorrect results.
+        if cached_label in downstream_of_updated:
+            LOG.debug(
+                "Skipping cached block that is downstream of an updated block",
+                block_label=cached_label,
+            )
+            continue
+        # Note: cached_blocks is already filtered to remove entries without code (line ~2129),
+        # but we keep this check as defensive programming in case the upstream filter changes
+        if not cached_source.code:
+            continue
+
+        LOG.info(
+            "Preserving cached block from previous run (progressive caching)",
+            block_label=cached_label,
+            workflow_run_id=cached_source.workflow_run_id,
+        )
+
+        # Persist the cached block to the new script revision
+        if script_id and script_revision_id and organization_id:
+            try:
+                await create_or_update_script_block(
+                    block_code=cached_source.code,
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    block_label=cached_label,
+                    update=pending,
+                    run_signature=cached_source.run_signature,
+                    workflow_run_id=cached_source.workflow_run_id,
+                    workflow_run_block_id=cached_source.workflow_run_block_id,
+                    input_fields=cached_source.input_fields,
+                )
+                preserved_block_count += 1
+            except Exception as e:
+                failed_block_count += 1
+                LOG.error("Failed to preserve cached block", block_label=cached_label, error=str(e), exc_info=True)
+                # Continue on individual block failures - these are cached blocks from previous runs
+                # that aren't critical to the current run's success. The script will still work,
+                # just without the previously cached code for this particular block.
+
+        append_block_code(cached_source.code)
+
+    if preserved_block_count > 0 or failed_block_count > 0:
+        LOG.info(
+            "Progressive caching summary",
+            preserved_blocks=preserved_block_count,
+            failed_blocks=failed_block_count,
+        )
 
     # --- runner ---------------------------------------------------------
     run_fn = _build_run_fn(blocks, workflow_run_request)

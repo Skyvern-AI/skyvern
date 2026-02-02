@@ -128,6 +128,7 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
     BlockType.EXTRACTION,
     BlockType.LOGIN,
     BlockType.FILE_DOWNLOAD,
+    BlockType.FOR_LOOP,
 }
 
 
