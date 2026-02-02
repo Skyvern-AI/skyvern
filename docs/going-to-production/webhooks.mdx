@@ -318,7 +318,7 @@ Never use simple equality operators (`==` or `===`) for signature comparison as 
 
 Webhook delivery can fail even when the run itself completes successfully. 
 
-When this happens, Skyvern records the error in the `webhook_failure_reason` field on the run object. To check it, call `get_run` after the the run has terminated:
+When this happens, Skyvern records the error in the `webhook_failure_reason` field on the run object. To check it, call `get_run` after the run has terminated:
 
 <CodeGroup>
 ```python Python

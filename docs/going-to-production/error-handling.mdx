@@ -461,7 +461,7 @@ Now you can write clean switch/match logic:
 ```python Python
 import asyncio
 
-async def run_with_error_handling():
+async def run_with_error_handling(retries=1):
     result = await client.run_task(
         prompt="Log in and download the invoice",
         url="https://vendor-portal.example.com",
@@ -488,9 +488,10 @@ async def run_with_error_handling():
     error_code = run.output.get("error") if run.output else None
 
     if error_code == "login_failed":
-        # Refresh credentials and retry
-        await refresh_credentials("vendor-portal")
-        return await run_with_error_handling()  # Retry once
+        if retries > 0:
+            await refresh_credentials("vendor-portal")
+            return await run_with_error_handling(retries=retries - 1)
+        return {"success": False, "reason": "login_failed", "details": "Retry limit reached"}
 
     elif error_code == "invoice_not_found":
         # Expected condition—no invoice for this period
@@ -508,7 +509,7 @@ async def run_with_error_handling():
 ```
 
 ```typescript TypeScript
-async function runWithErrorHandling() {
+async function runWithErrorHandling(retries = 1) {
   const result = await client.runTask({
     body: {
       prompt: "Log in and download the invoice",
@@ -542,8 +543,11 @@ async function runWithErrorHandling() {
 
   switch (errorCode) {
     case "login_failed":
-      await refreshCredentials("vendor-portal");
-      return runWithErrorHandling(); // Retry once
+      if (retries > 0) {
+        await refreshCredentials("vendor-portal");
+        return runWithErrorHandling(retries - 1);
+      }
+      return { success: false, reason: "login_failed", details: "Retry limit reached" };
 
     case "invoice_not_found":
       return { success: false, reason: "no_invoice", date: invoiceDate };

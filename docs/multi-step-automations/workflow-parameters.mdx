@@ -305,7 +305,7 @@ curl -X POST "https://api.skyvern.com/v1/workflows" \
 
 Default proxy location for all blocks in the workflow. Individual blocks can override this.
 
-See [Proxy & Geo Targeting](/running-tasks/proxy-location) for all available locations.
+See [Proxy & Geo Targeting](/going-to-production/proxy-geolocation) for all available locations.
 
 <CodeGroup>
 ```python Python
@@ -570,34 +570,28 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 
 | Value | Location |
 |-------|----------|
-| `RESIDENTIAL` | Random US residential **(default)** |
-| `US-CA` | California, US |
-| `US-NY` | New York, US |
-| `US-TX` | Texas, US |
-| `US-FL` | Florida, US |
-| `US-WA` | Washington, US |
-| `RESIDENTIAL_GB` | United Kingdom |
-| `RESIDENTIAL_DE` | Germany |
-| `RESIDENTIAL_FR` | France |
-| `RESIDENTIAL_ES` | Spain |
-| `RESIDENTIAL_IE` | Ireland |
-| `RESIDENTIAL_IT` | Italy |
-| `RESIDENTIAL_NL` | Netherlands |
-| `RESIDENTIAL_CA` | Canada |
-| `RESIDENTIAL_MX` | Mexico |
-| `RESIDENTIAL_AU` | Australia |
-| `RESIDENTIAL_NZ` | New Zealand |
-| `RESIDENTIAL_BR` | Brazil |
+| `RESIDENTIAL` | United States **(default)** |
+| `RESIDENTIAL_ISP` | United States (static ISP IPs) |
 | `RESIDENTIAL_AR` | Argentina |
+| `RESIDENTIAL_AU` | Australia |
+| `RESIDENTIAL_BR` | Brazil |
+| `RESIDENTIAL_CA` | Canada |
+| `RESIDENTIAL_DE` | Germany |
+| `RESIDENTIAL_ES` | Spain |
+| `RESIDENTIAL_FR` | France |
+| `RESIDENTIAL_GB` | United Kingdom |
+| `RESIDENTIAL_IE` | Ireland |
 | `RESIDENTIAL_IN` | India |
+| `RESIDENTIAL_IT` | Italy |
 | `RESIDENTIAL_JP` | Japan |
-| `RESIDENTIAL_PH` | Philippines |
+| `RESIDENTIAL_MX` | Mexico |
+| `RESIDENTIAL_NL` | Netherlands |
+| `RESIDENTIAL_NZ` | New Zealand |
+| `RESIDENTIAL_TR` | Türkiye |
 | `RESIDENTIAL_ZA` | South Africa |
-| `RESIDENTIAL_TR` | Turkey |
-| `RESIDENTIAL_ISP` | ISP proxy |
 | `NONE` | No proxy |
 
-You can also pass a `GeoTarget` object for granular city or state-level targeting:
+For US state or city-level targeting, pass a `GeoTarget` object instead:
 
 ```json
 {
@@ -611,7 +605,7 @@ You can also pass a `GeoTarget` object for granular city or state-level targetin
 
 `country` is required (ISO 3166-1 alpha-2 code). `subdivision` and `city` are optional.
 
-See [Proxy & Geo Targeting](/running-tasks/proxy-location) for more details.
+See [Proxy & Geo Targeting](/going-to-production/proxy-geolocation) for more details.
 
 ---
 
@@ -810,7 +804,7 @@ When you run a workflow, the response contains:
   <Card
     title="Proxy & Geo Targeting"
     icon="globe"
-    href="/running-tasks/proxy-location"
+    href="/going-to-production/proxy-geolocation"
   >
     Full list of proxy locations
   </Card>

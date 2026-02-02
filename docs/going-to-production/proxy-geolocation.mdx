@@ -55,15 +55,17 @@ For workflows, set a default `proxy_location` when creating the workflow, then y
 ```python Python
 # Set default proxy on workflow
 workflow = await client.create_workflow(
-    title="UK Price Monitor",
-    proxy_location="RESIDENTIAL_GB",
-    workflow_definition={...}
+    json_definition={
+        "title": "UK Price Monitor",
+        "proxy_location": "RESIDENTIAL_GB",
+        "workflow_definition": {...}
+    }
 )
 
 # Override for a specific run (takes priority over workflow default)
 run = await client.run_workflow(
-    workflow_permanent_id="wpid_123456789",
-    data={...},
+    workflow_id="wpid_123456789",
+    parameters={...},
     proxy_location="RESIDENTIAL_DE"  # This run uses Germany instead
 )
 ```
@@ -72,16 +74,19 @@ run = await client.run_workflow(
 // Set default proxy on workflow
 const workflow = await client.createWorkflow({
   body: {
-    title: "UK Price Monitor",
-    proxy_location: "RESIDENTIAL_GB",
-    workflow_definition: {...},
+    json_definition: {
+      title: "UK Price Monitor",
+      proxy_location: "RESIDENTIAL_GB",
+      workflow_definition: {...},
+    },
   },
 });
 
 // Override for a specific run (takes priority over workflow default)
-const run = await client.runWorkflow("wpid_123456789", {
+const run = await client.runWorkflow({
   body: {
-    data: {...},
+    workflow_id: "wpid_123456789",
+    parameters: {...},
     proxy_location: "RESIDENTIAL_DE",  // This run uses Germany instead
   },
 });
@@ -93,9 +98,11 @@ curl -X POST "https://api.skyvern.com/v1/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "title": "UK Price Monitor",
-    "proxy_location": "RESIDENTIAL_GB",
-    "workflow_definition": {...}
+    "json_definition": {
+      "title": "UK Price Monitor",
+      "proxy_location": "RESIDENTIAL_GB",
+      "workflow_definition": {...}
+    }
   }'
 
 # Override for a specific run (takes priority over workflow default)
@@ -103,8 +110,8 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "workflow_permanent_id": "wpid_123456789",
-    "data": {...},
+    "workflow_id": "wpid_123456789",
+    "parameters": {...},
     "proxy_location": "RESIDENTIAL_DE"
   }'
 ```
@@ -150,7 +157,7 @@ Use these enum values for country-level targeting. Each routes through a residen
 |-------|---------|----------|
 | `RESIDENTIAL` | United States | America/New_York |
 | `RESIDENTIAL_ISP` | United States | America/New_York |
-| `RESIDENTIAL_AR` | Argentina | America/Buenos_Aires |
+| `RESIDENTIAL_AR` | Argentina | America/Argentina/Buenos_Aires |
 | `RESIDENTIAL_AU` | Australia | Australia/Sydney |
 | `RESIDENTIAL_BR` | Brazil | America/Sao_Paulo |
 | `RESIDENTIAL_CA` | Canada | America/Toronto |

@@ -1140,7 +1140,7 @@ from skyvern import Skyvern
 async def main():
     client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
 
-    # Create the workflow
+    # Create the workflow with AWS Secrets Manager-backed credentials
     workflow = await client.create_workflow(
         json_definition={
             "title": "Upload to Company S3",
@@ -1148,13 +1148,13 @@ async def main():
                 "parameters": [
                     {
                         "key": "aws_key",
-                        "parameter_type": "workflow",
-                        "workflow_parameter_type": "string"
+                        "parameter_type": "aws_secret",
+                        "aws_key": "skyvern/aws/access_key_id"
                     },
                     {
                         "key": "aws_secret",
-                        "parameter_type": "workflow",
-                        "workflow_parameter_type": "string"
+                        "parameter_type": "aws_secret",
+                        "aws_key": "skyvern/aws/secret_access_key"
                     }
                 ],
                 "blocks": [
@@ -1174,14 +1174,8 @@ async def main():
     )
     print(f"Workflow ID: {workflow.workflow_permanent_id}")
 
-    # Run the workflow with AWS credentials
-    run = await client.run_workflow(
-        workflow_id=workflow.workflow_permanent_id,
-        parameters={
-            "aws_key": os.getenv("AWS_ACCESS_KEY_ID"),
-            "aws_secret": os.getenv("AWS_SECRET_ACCESS_KEY")
-        }
-    )
+    # Run the workflow (credentials auto-resolve from AWS Secrets Manager)
+    run = await client.run_workflow(workflow_id=workflow.workflow_permanent_id)
     print(f"Run ID: {run.run_id}")
 
     # Poll until complete
@@ -1206,7 +1200,7 @@ async function main() {
     apiKey: process.env.SKYVERN_API_KEY,
   });
 
-  // Create the workflow
+  // Create the workflow with AWS Secrets Manager-backed credentials
   const workflow = await client.createWorkflow({
     body: {
       json_definition: {
@@ -1215,13 +1209,13 @@ async function main() {
           parameters: [
             {
               key: "aws_key",
-              parameter_type: "workflow",
-              workflow_parameter_type: "string",
+              parameter_type: "aws_secret",
+              aws_key: "skyvern/aws/access_key_id",
             },
             {
               key: "aws_secret",
-              parameter_type: "workflow",
-              workflow_parameter_type: "string",
+              parameter_type: "aws_secret",
+              aws_key: "skyvern/aws/secret_access_key",
             },
           ],
           blocks: [
@@ -1242,14 +1236,10 @@ async function main() {
   });
   console.log(`Workflow ID: ${workflow.workflow_permanent_id}`);
 
-  // Run the workflow with AWS credentials
+  // Run the workflow (credentials auto-resolve from AWS Secrets Manager)
   const run = await client.runWorkflow({
     body: {
       workflow_id: workflow.workflow_permanent_id,
-      parameters: {
-        aws_key: process.env.AWS_ACCESS_KEY_ID,
-        aws_secret: process.env.AWS_SECRET_ACCESS_KEY,
-      },
     },
   });
   console.log(`Run ID: ${run.run_id}`);
@@ -1275,7 +1265,7 @@ main();
 ```
 
 ```bash cURL
-# Create the workflow
+# Create the workflow with AWS Secrets Manager-backed credentials
 WORKFLOW=$(curl -s -X POST "https://api.skyvern.com/v1/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
@@ -1286,13 +1276,13 @@ WORKFLOW=$(curl -s -X POST "https://api.skyvern.com/v1/workflows" \
         "parameters": [
           {
             "key": "aws_key",
-            "parameter_type": "workflow",
-            "workflow_parameter_type": "string"
+            "parameter_type": "aws_secret",
+            "aws_key": "skyvern/aws/access_key_id"
           },
           {
             "key": "aws_secret",
-            "parameter_type": "workflow",
-            "workflow_parameter_type": "string"
+            "parameter_type": "aws_secret",
+            "aws_key": "skyvern/aws/secret_access_key"
           }
         ],
         "blocks": [
@@ -1314,16 +1304,12 @@ WORKFLOW=$(curl -s -X POST "https://api.skyvern.com/v1/workflows" \
 WORKFLOW_ID=$(echo "$WORKFLOW" | jq -r '.workflow_permanent_id')
 echo "Workflow ID: $WORKFLOW_ID"
 
-# Run the workflow with AWS credentials
+# Run the workflow (credentials auto-resolve from AWS Secrets Manager)
 RUN=$(curl -s -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d "{
-    \"workflow_id\": \"$WORKFLOW_ID\",
-    \"parameters\": {
-      \"aws_key\": \"$AWS_ACCESS_KEY_ID\",
-      \"aws_secret\": \"$AWS_SECRET_ACCESS_KEY\"
-    }
+    \"workflow_id\": \"$WORKFLOW_ID\"
   }")
 
 RUN_ID=$(echo "$RUN" | jq -r '.run_id')
@@ -1345,7 +1331,7 @@ done
 </CodeGroup>
 
 - **`storage_type`** selects the destination: `s3` for AWS, `azure` for Azure Blob Storage.
-- **Credentials** (`aws_access_key_id`, `aws_secret_access_key`) should be passed as workflow parameters, not hardcoded.
+- **Credentials** should use `aws_secret` parameters backed by AWS Secrets Manager — credentials auto-resolve at runtime without being passed in the run payload.
 - **`path`** works the same as `upload_to_s3` — pass `SKYVERN_DOWNLOAD_DIRECTORY` to upload everything, or a specific file path.
 
 | Parameter | Type | Use this to |
