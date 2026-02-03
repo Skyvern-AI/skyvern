@@ -67,7 +67,6 @@ class FileType(StrEnum):
     CSV = "csv"
     EXCEL = "excel"
     PDF = "pdf"
-    IMAGE = "image"
 
 
 class PDFFormat(StrEnum):
