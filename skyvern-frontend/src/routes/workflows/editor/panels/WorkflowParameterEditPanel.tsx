@@ -360,6 +360,15 @@ function WorkflowParameterEditPanel({
                       setAzureTotpKey("");
                     }
 
+                    // Clear default value state when switching to credential type
+                    // since credentials don't use default values
+                    if (!wasCredential && isNowCredential) {
+                      setDefaultValueState({
+                        hasDefaultValue: false,
+                        defaultValue: null,
+                      });
+                    }
+
                     if (!isNowCredential) {
                       setDefaultValueState((state) => {
                         return {
