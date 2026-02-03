@@ -350,7 +350,7 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
 export type FileUrlParserBlockYAML = BlockYAMLBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv" | "excel" | "pdf" | "image";
+  file_type: "csv" | "excel" | "pdf";
   json_schema?: Record<string, unknown> | null;
 };
 
