@@ -1,4 +1,5 @@
-import { FileIcon, Pencil1Icon } from "@radix-ui/react-icons";
+import { Pencil1Icon } from "@radix-ui/react-icons";
+import { FolderIcon } from "@/components/icons/FolderIcon";
 import { cn } from "@/util/utils";
 import type { Folder } from "../types/folderTypes";
 import { DeleteFolderButton } from "./DeleteFolderButton";
@@ -36,7 +37,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
       >
         <div className="flex items-start gap-3">
           <div className="mt-0.5">
-            <FileIcon className="h-5 w-5 text-blue-400" />
+            <FolderIcon className="h-5 w-5 text-blue-400" />
           </div>
           <div className="flex min-w-0 flex-1 flex-col gap-1">
             <div className="flex items-start justify-between gap-2">
