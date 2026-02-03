@@ -188,7 +188,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "File Parser Block",
-    description: "Parse PDFs, CSVs, and Excel files",
+    description: "Parse PDFs, CSVs, Excel files, and Images",
   },
   // {
   //   nodeType: "pdfParser",
