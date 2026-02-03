@@ -135,6 +135,11 @@ class TaskRunRequest(UniversalBaseModel):
     The CDP address for the task.
     """
 
+    run_with: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Whether to run the task with agent or code.
+    """
+
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
     else:
