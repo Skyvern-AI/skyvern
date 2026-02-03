@@ -370,12 +370,13 @@ async def parse_cua_actions(
                             intention=reasoning,
                         )
                     else:
-                        start_x, start_y = whole_path[0][0], whole_path[0][1]
+                        # ActionDragPath objects have x and y attributes
+                        start_x, start_y = whole_path[0].x, whole_path[0].y
                         reasoning = reasoning or f"Drag action path: {whole_path}"
                         action = DragAction(
                             start_x=start_x,
                             start_y=start_y,
-                            path=whole_path[1:],
+                            path=[(p.x, p.y) for p in whole_path[1:]],
                             reasoning=reasoning,
                             intention=reasoning,
                         )
