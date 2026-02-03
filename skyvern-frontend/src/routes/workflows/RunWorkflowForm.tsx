@@ -504,60 +504,6 @@ function RunWorkflowForm({
         onSubmit={form.handleSubmit(onSubmit, handleInvalid)}
         className="space-y-8"
       >
-        <header className="flex items-end justify-between gap-4">
-          <div className="space-y-5">
-            <h1 className="text-3xl">
-              Parameters{workflow?.title ? ` - ${workflow.title}` : ""}
-            </h1>
-            <h2 className="text-lg text-slate-400">
-              Fill the placeholder values that you have linked throughout your
-              workflow.
-            </h2>
-          </div>
-          <div className="flex shrink-0 gap-2">
-            <CopyApiCommandDropdown
-              getOptions={() => {
-                const values = form.getValues();
-                const body = getRunWorkflowRequestBody(
-                  values,
-                  workflowParameters,
-                );
-                const transformedBody = transformToWorkflowRunRequest(
-                  body,
-                  workflowPermanentId,
-                );
-
-                // Build headers - x-max-steps-override is optional and can be added manually if needed
-                const headers: Record<string, string> = {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                };
-
-                return {
-                  method: "POST",
-                  url: `${runsApiBaseUrl}/run/workflows`,
-                  body: transformedBody,
-                  headers,
-                } satisfies ApiCommandOptions;
-              }}
-            />
-            <Button
-              type="submit"
-              disabled={
-                runWorkflowMutation.isPending || hasLoginBlockValidationError
-              }
-            >
-              {runWorkflowMutation.isPending && (
-                <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-              )}
-              {!runWorkflowMutation.isPending && (
-                <PlayIcon className="mr-2 h-4 w-4" />
-              )}
-              Run workflow
-            </Button>
-          </div>
-        </header>
-
         {hasLoginBlockValidationError && (
           <Alert variant="destructive">
             <ExclamationTriangleIcon className="h-4 w-4" />
@@ -1104,6 +1050,49 @@ function RunWorkflowForm({
               </AccordionContent>
             </AccordionItem>
           </Accordion>
+        </div>
+
+        <div className="flex justify-end gap-2">
+          <CopyApiCommandDropdown
+            getOptions={() => {
+              const values = form.getValues();
+              const body = getRunWorkflowRequestBody(
+                values,
+                workflowParameters,
+              );
+              const transformedBody = transformToWorkflowRunRequest(
+                body,
+                workflowPermanentId,
+              );
+
+              // Build headers - x-max-steps-override is optional and can be added manually if needed
+              const headers: Record<string, string> = {
+                "Content-Type": "application/json",
+                "x-api-key": apiCredential ?? "<your-api-key>",
+              };
+
+              return {
+                method: "POST",
+                url: `${runsApiBaseUrl}/run/workflows`,
+                body: transformedBody,
+                headers,
+              } satisfies ApiCommandOptions;
+            }}
+          />
+          <Button
+            type="submit"
+            disabled={
+              runWorkflowMutation.isPending || hasLoginBlockValidationError
+            }
+          >
+            {runWorkflowMutation.isPending && (
+              <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+            )}
+            {!runWorkflowMutation.isPending && (
+              <PlayIcon className="mr-2 h-4 w-4" />
+            )}
+            Run workflow
+          </Button>
         </div>
       </form>
     </Form>
