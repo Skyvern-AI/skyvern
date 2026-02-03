@@ -29,7 +29,6 @@ import {
   BookmarkFilledIcon,
   ChevronDownIcon,
   DotsHorizontalIcon,
-  FileIcon,
   LightningBoltIcon,
   MixerHorizontalIcon,
   Pencil2Icon,
@@ -37,6 +36,7 @@ import {
   PlusIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
+import { FolderIcon } from "@/components/icons/FolderIcon";
 import { useQuery } from "@tanstack/react-query";
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -351,7 +351,7 @@ function Workflows() {
           ) : (
             <div className="rounded-lg border border-slate-200 bg-slate-elevation1 py-6 text-center dark:border-slate-700">
               <div className="mx-auto max-w-md">
-                <FileIcon className="mx-auto mb-3 h-10 w-10 text-blue-400 opacity-50" />
+                <FolderIcon className="mx-auto mb-3 h-10 w-10 text-blue-400 opacity-50" />
                 <h3 className="mb-2 text-slate-900 dark:text-slate-100">
                   Organize Your Workflows with Folders
                 </h3>
@@ -524,7 +524,7 @@ function Workflows() {
                           <TableCell>
                             <div className="flex justify-end gap-2">
                               <Button size="icon" variant="ghost" disabled>
-                                <FileIcon className="h-4 w-4" />
+                                <FolderIcon className="h-4 w-4" />
                               </Button>
                               <Button size="icon" variant="ghost" disabled>
                                 <MixerHorizontalIcon className="h-4 w-4" />
@@ -588,7 +588,7 @@ function Workflows() {
                           >
                             {workflow.folder_id ? (
                               <div className="flex items-center gap-1.5">
-                                <FileIcon className="h-3.5 w-3.5 text-blue-400" />
+                                <FolderIcon className="h-3.5 w-3.5 text-blue-400" />
                                 <span className="text-sm">
                                   <HighlightText
                                     text={
