@@ -314,6 +314,23 @@ def setup_logger() -> None:
         + additional_processors
         + [skyvern_logs_processor, renderer],
     )
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            processors=[
+                structlog.stdlib.add_log_level,
+                structlog.stdlib.add_logger_name,
+                structlog.processors.TimeStamper(fmt="iso"),
+                structlog.processors.format_exc_info,
+                renderer,
+            ]
+        )
+    )
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(LOG_LEVEL_VAL)
+
     uvicorn_error = logging.getLogger("uvicorn.error")
     uvicorn_error.disabled = True
     uvicorn_access = logging.getLogger("uvicorn.access")
