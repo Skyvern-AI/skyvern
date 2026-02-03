@@ -50,6 +50,7 @@ describe("SkyvernClient", () => {
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
+                run_with: "run_with",
             },
         };
         server
@@ -130,6 +131,7 @@ describe("SkyvernClient", () => {
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
+                run_with: "run_with",
             },
         });
     });
@@ -396,6 +398,7 @@ describe("SkyvernClient", () => {
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
+                run_with: "run_with",
             },
         };
         server.mockEndpoint().get("/v1/runs/tsk_123").respondWith().statusCode(200).jsonBody(rawResponseBody).build();
@@ -464,6 +467,7 @@ describe("SkyvernClient", () => {
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
+                run_with: "run_with",
             },
         });
     });
