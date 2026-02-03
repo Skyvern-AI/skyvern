@@ -371,6 +371,10 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 
 Add `error_code_mapping` to individual blocks (navigation, task, validation):
 
+<Note>
+The JSON examples below include comments (`//`) for clarity. Remove comments before using in actual workflow definitions—JSON does not support comments.
+</Note>
+
 <CodeGroup>
 ```json JSON
 {
@@ -451,6 +455,14 @@ When a mapped error occurs, your code appears in `output.error`. This field is a
 
 Both `output.error` (your code) and `failure_reason` (raw text) are present. Use `output.error` for branching, `failure_reason` for logging.
 
+**Quick reference:** Where error codes appear
+
+| Context | Field | Example |
+|---------|-------|---------|
+| Polling response | `run.output.error` | `run.output.get("error")` in Python |
+| Webhook payload | `output.error` | Same structure as polling |
+| Successful run | `output` contains your extracted data | No `error` key present |
+
 ---
 
 ## Step 4: Respond in code
@@ -460,6 +472,9 @@ Now you can write clean switch/match logic:
 <CodeGroup>
 ```python Python
 import asyncio
+from skyvern import Skyvern
+
+client = Skyvern(api_key="your-api-key")
 
 async def run_with_error_handling(retries=1):
     result = await client.run_task(

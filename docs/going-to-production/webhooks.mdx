@@ -157,6 +157,10 @@ When creating a workflow, use `webhook_callback_url` inside `json_definition` �
 | Workflow creation | `webhook_callback_url` | Inside `json_definition` |
 | Workflow run (override) | `webhook_url` | Top-level parameter |
 
+<Warning>
+**Watch the parameter names.** Using `webhook_url` when creating a workflow (instead of `webhook_callback_url` inside `json_definition`) silently results in no webhook being sent. The API won't return an error—your runs will just complete without notifications.
+</Warning>
+
 ---
 
 ## Step 2: Understand the payload
@@ -216,7 +220,7 @@ User-Agent: python-httpx/0.28.1
 | `run_id` | string | Unique identifier for this run |
 | `task_id` | string | Same as `run_id` |
 | `status` | string | `completed`, `failed`, `terminated`, `timed_out`, or `canceled` |
-| `output` | object \| null | Extracted data from the task |
+| `output` | object \| null | Extracted data from the task. If you configured [`error_code_mapping`](/going-to-production/error-handling#step-3-use-error_code_mapping), failed runs include `output.error` with your custom error code. |
 | `summary` | string | AI-generated description of what was done |
 | `prompt` | string | The prompt from the original request |
 | `url` | string | The URL from the original request |
@@ -363,6 +367,32 @@ Never use simple equality operators (`==` or `===`) for signature comparison as 
 
 ## Handling webhook failures
 
+Task execution and webhook delivery are independent—a task can succeed while webhook delivery fails. When this happens, the run shows `status: "failed"` even though your data was extracted successfully.
+
+```mermaid
+graph TD
+    A["Run Finishes"] --> B{"Check status"}
+    B -->|"completed"| C["Task succeeded<br>Webhook delivered"]
+    B -->|"failed"| D{"Does failure_reason<br>mention 'webhook'?"}
+    B -->|"terminated"| E["Goal unachievable"]
+    D -->|"Yes"| F["Webhook delivery failed"]
+    D -->|"No"| G["Task execution failed"]
+    F --> H["Check output field<br>Data may still exist!"]
+    G --> I["Check failure_reason"]
+    C --> J["Process output"]
+
+    style A fill:#f8fafc,stroke:#6366F1,stroke-width:2px,color:#1e293b
+    style B fill:#f8fafc,stroke:#6366F1,stroke-width:2px,color:#1e293b
+    style C fill:#6366F1,stroke:#4F46E5,stroke-width:2px,color:#fff
+    style D fill:#fef3c7,stroke:#f59e0b,stroke-width:2px,color:#1e293b
+    style E fill:#f1f5f9,stroke:#64748b,stroke-width:2px,color:#475569
+    style F fill:#fef3c7,stroke:#f59e0b,stroke-width:2px,color:#92400e
+    style G fill:#fee2e2,stroke:#ef4444,stroke-width:2px,color:#991b1b
+    style H fill:#6366F1,stroke:#4F46E5,stroke-width:2px,color:#fff
+    style I fill:#f1f5f9,stroke:#64748b,stroke-width:2px,color:#475569
+    style J fill:#6366F1,stroke:#4F46E5,stroke-width:2px,color:#fff
+```
+
 Webhook delivery can fail due to network issues, server errors, or misconfigured URLs.
 
 When this happens, the run is marked as `failed` and the error is recorded in the `failure_reason` field. Check it by calling `get_run` after the run terminates:
@@ -418,7 +448,7 @@ Even when webhook delivery fails, the task's `output` field may still contain ex
 **Common reasons webhooks fail:**
 
 - **Server unreachable** — Your server is down, behind a firewall, or the URL is incorrect. Verify the URL is publicly accessible (not `localhost`) and check your server logs for incoming requests.
-- **Timeout** — Skyvern waits 30 seconds for a response. If your server takes longer, the delivery is marked as failed even if processing eventually succeeds. Return `200 OK` immediately and process the payload in a background job.
+- **Timeout** — Skyvern waits 10 seconds for a response. If your server takes longer, the delivery is marked as failed even if processing eventually succeeds. Return `200 OK` immediately and process the payload in a background job.
 - **Server returns an error** — Your endpoint received the payload but responded with a non-2xx status code (e.g., 500). Check your server logs to identify the issue.
 - **Signature validation fails** — If your verification logic rejects the request, make sure you're validating against the raw request body, not parsed-and-re-serialized JSON (re-serializing changes the byte representation). Also verify you're using the same API key that created the run.
 
@@ -426,7 +456,11 @@ Even when webhook delivery fails, the task's `output` field may still contain ex
 
 ### Retrying webhooks
 
-Once you've identified and fixed the issue, you can replay the webhook using `retry_run_webhook`. Skyvern doesn't retry automatically—automatic retries can cause duplicate processing if your server received the payload but returned an error.
+Once you've identified and fixed the issue, you can replay the webhook using `retry_run_webhook`.
+
+<Note>
+Skyvern does not automatically retry failed webhooks. This is intentional—automatic retries can cause duplicate processing if your server received the payload but returned an error. You must explicitly call `retry_run_webhook` after fixing the issue.
+</Note>
 
 <CodeGroup>
 ```python Python
@@ -464,7 +498,13 @@ curl -X POST "https://api.skyvern.com/v1/runs/tsk_v2_486305187432193504/retry_we
 ```
 </CodeGroup>
 
-The SDK method is fire-and-forget—it returns immediately without waiting for confirmation. To verify the retry succeeded, check the `failure_reason` field on the run afterward, or monitor your webhook endpoint directly.
+<Warning>
+`retry_run_webhook` is fire-and-forget—it returns immediately without waiting for delivery confirmation. To verify success, monitor your webhook endpoint directly or check the run's `failure_reason` field after a short delay.
+</Warning>
+
+<Tip>
+**Implement idempotency.** If you call `retry_run_webhook`, you may receive the same payload twice (once from the original attempt that your server processed but returned an error, and once from the retry). Use the `run_id` as an idempotency key—check if you've already processed this run before taking action.
+</Tip>
 
 You can pass a different `webhook_url` to send the payload to a new endpoint—useful if the original URL was misconfigured.
 
@@ -481,10 +521,10 @@ You can pass a different `webhook_url` to send the payload to a new endpoint—u
     Handle failures and map custom error codes
   </Card>
   <Card
-    title="Run a Task"
-    icon="play"
-    href="/running-automations/run-a-task"
+    title="Reliability Tips"
+    icon="shield-check"
+    href="/going-to-production/reliability-tips"
   >
-    See the full task response structure
+    Write robust prompts and add validation blocks
   </Card>
 </CardGroup>
