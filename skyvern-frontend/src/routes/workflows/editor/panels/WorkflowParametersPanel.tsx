@@ -4,14 +4,6 @@ import { WorkflowParameterEditPanel } from "./WorkflowParameterEditPanel";
 import { MixerVerticalIcon, PlusIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { GarbageIcon } from "@/components/icons/GarbageIcon";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { useNodes, useReactFlow } from "@xyflow/react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
@@ -106,40 +98,19 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
             prompted to fill them in before running your workflow.
           </span>
         </header>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button className="w-full">
-              <PlusIcon className="mr-2 h-6 w-6" />
-              Add Parameter
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent className="w-60">
-            <DropdownMenuLabel>Add Parameter</DropdownMenuLabel>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              onClick={() => {
-                setOperationPanelState({
-                  active: true,
-                  operation: "add",
-                  type: WorkflowEditorParameterTypes.Workflow,
-                });
-              }}
-            >
-              Input Parameter
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => {
-                setOperationPanelState({
-                  active: true,
-                  operation: "add",
-                  type: WorkflowEditorParameterTypes.Credential,
-                });
-              }}
-            >
-              Credential Parameter
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
+        <Button
+          className="w-full"
+          onClick={() => {
+            setOperationPanelState({
+              active: true,
+              operation: "add",
+              type: WorkflowEditorParameterTypes.Workflow,
+            });
+          }}
+        >
+          <PlusIcon className="mr-2 h-6 w-6" />
+          Add Parameter
+        </Button>
 
         <ScrollArea>
           <ScrollAreaViewport className="max-h-96">
