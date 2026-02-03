@@ -2949,6 +2949,229 @@
         },
         "x-fern-sdk-method-name": "run_sdk_action"
       }
+    },
+    "/api/v1/billing/checkout": {
+      "post": {
+        "summary": "Create Checkout Session",
+        "description": "Create a Stripe Checkout Session for subscribing to a tier.\n\nFrontend should redirect the user to the returned URL.\nAfter successful checkout, Stripe will send a webhook that we handle\nto store the subscription and initialize billing state.\n\nReturns 400 if org already has an active subscription (use portal instead).",
+        "operationId": "create_checkout_session_api_v1_billing_checkout_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckoutSubscriptionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckoutSessionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/billing/portal": {
+      "post": {
+        "summary": "Create Portal Session",
+        "description": "Create a Stripe Customer Portal session for managing subscription.\n\nFrontend should redirect the user to the returned URL.\nThe portal allows users to:\n- Update payment methods\n- Upgrade/downgrade plans\n- Cancel subscription\n- View invoices",
+        "operationId": "create_portal_session_api_v1_billing_portal_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalSessionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/billing/state": {
+      "get": {
+        "summary": "Get Organization Billing",
+        "operationId": "get_organization_billing_api_v1_billing_state_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/BillingStateResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Get Organization Billing Api V1 Billing State Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/billing/change-tier": {
+      "post": {
+        "summary": "Change Tier",
+        "description": "Redirect to Stripe Portal for tier changes.\nPortal handles proration based on configured settings:\n- Upgrades: Immediate proration charge\n- Downgrades: Apply at end of billing period",
+        "operationId": "change_tier_api_v1_billing_change_tier_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeTierRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeTierResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3278,6 +3501,17 @@
             ],
             "title": "Skyvern Element Data"
           },
+          "screenshot_artifact_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Screenshot Artifact Id"
+          },
           "tool_call_id": {
             "anyOf": [
               {
@@ -3357,6 +3591,31 @@
               }
             ],
             "title": "Download"
+          },
+          "download_triggered": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Triggered"
+          },
+          "downloaded_files": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Downloaded Files"
           },
           "is_upload_file_tag": {
             "anyOf": [
@@ -4160,7 +4419,8 @@
           "html_action",
           "trace",
           "har",
-          "script_file"
+          "script_file",
+          "pdf"
         ],
         "title": "ArtifactType"
       },
@@ -4378,6 +4638,111 @@
           "password_key"
         ],
         "title": "AzureVaultCredentialParameterYAML"
+      },
+      "BillingStateResponse": {
+        "properties": {
+          "billing_id": {
+            "type": "string",
+            "title": "Billing Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "plan_tier": {
+            "$ref": "#/components/schemas/PlanTier"
+          },
+          "current_period_start": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Period Start"
+          },
+          "current_period_end": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Period End"
+          },
+          "included_credits_this_period": {
+            "type": "integer",
+            "title": "Included Credits This Period"
+          },
+          "credits_consumed_this_period": {
+            "type": "integer",
+            "title": "Credits Consumed This Period"
+          },
+          "cached_credits_consumed_this_period": {
+            "type": "integer",
+            "title": "Cached Credits Consumed This Period"
+          },
+          "overage_enabled": {
+            "type": "boolean",
+            "title": "Overage Enabled"
+          },
+          "browser_uptime_seconds_consumed": {
+            "type": "integer",
+            "title": "Browser Uptime Seconds Consumed"
+          },
+          "topup_credits_total": {
+            "type": "integer",
+            "title": "Topup Credits Total"
+          },
+          "topup_credits_used": {
+            "type": "integer",
+            "title": "Topup Credits Used"
+          },
+          "topup_credits_remaining": {
+            "type": "integer",
+            "title": "Topup Credits Remaining"
+          },
+          "credits_remaining": {
+            "type": "integer",
+            "title": "Credits Remaining"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "billing_id",
+          "organization_id",
+          "plan_tier",
+          "current_period_start",
+          "current_period_end",
+          "included_credits_this_period",
+          "credits_consumed_this_period",
+          "cached_credits_consumed_this_period",
+          "overage_enabled",
+          "browser_uptime_seconds_consumed",
+          "topup_credits_total",
+          "topup_credits_used",
+          "topup_credits_remaining",
+          "credits_remaining",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "BillingStateResponse"
       },
       "BitwardenCreditCardDataParameter": {
         "properties": {
@@ -4897,7 +5262,8 @@
           "goto_url",
           "pdf_parser",
           "http_request",
-          "human_interaction"
+          "human_interaction",
+          "print_page"
         ],
         "title": "BlockType"
       },
@@ -5127,6 +5493,25 @@
             "title": "Organization Id",
             "description": "ID of the organization that owns this session"
           },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status",
+            "description": "Current status of the browser session",
+            "examples": [
+              "created",
+              "running",
+              "completed",
+              "failed",
+              "timeout"
+            ]
+          },
           "runnable_type": {
             "anyOf": [
               {
@@ -5220,6 +5605,17 @@
             ],
             "title": "Extensions",
             "description": "A list of extensions installed in the browser session."
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PersistentBrowserType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The type of browser used for the session."
           },
           "vnc_streaming_supported": {
             "type": "boolean",
@@ -5330,6 +5726,77 @@
         ],
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
+      },
+      "ChangeTierRequest": {
+        "properties": {
+          "tier": {
+            "$ref": "#/components/schemas/PlanTier"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tier"
+        ],
+        "title": "ChangeTierRequest"
+      },
+      "ChangeTierResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "tier": {
+            "type": "string",
+            "title": "Tier"
+          },
+          "redirect_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Redirect Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "tier"
+        ],
+        "title": "ChangeTierResponse"
+      },
+      "CheckoutSessionResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "url"
+        ],
+        "title": "CheckoutSessionResponse"
+      },
+      "CheckoutSubscriptionRequest": {
+        "properties": {
+          "tier": {
+            "$ref": "#/components/schemas/PlanTier"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tier"
+        ],
+        "title": "CheckoutSubscriptionRequest"
       },
       "ClickAction": {
         "properties": {
@@ -5952,7 +6419,7 @@
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n"
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n"
           },
           "extensions": {
             "anyOf": [
@@ -5968,6 +6435,17 @@
             ],
             "title": "Extensions",
             "description": "A list of extensions to install in the browser session."
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PersistentBrowserType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The type of browser to use for the session."
           }
         },
         "type": "object",
@@ -8388,6 +8866,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/PrintPageBlock"
                 }
               ],
               "discriminator": {
@@ -8408,6 +8889,7 @@
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
                   "task": "#/components/schemas/TaskBlock",
                   "task_v2": "#/components/schemas/TaskV2Block",
@@ -8622,6 +9104,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ConditionalBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PrintPageBlockYAML"
                 }
               ]
             },
@@ -8852,6 +9337,22 @@
             "title": "Follow Redirects",
             "default": true
           },
+          "download_filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Filename"
+          },
+          "save_response_as_file": {
+            "type": "boolean",
+            "title": "Save Response As File",
+            "default": false
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -9030,6 +9531,22 @@
             "type": "boolean",
             "title": "Follow Redirects",
             "default": true
+          },
+          "download_filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Filename"
+          },
+          "save_response_as_file": {
+            "type": "boolean",
+            "title": "Save Response As File",
+            "default": false
           },
           "parameter_keys": {
             "anyOf": [
@@ -9569,6 +10086,17 @@
               }
             ],
             "title": "Date Format"
+          },
+          "is_text_captcha": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Text Captcha"
           }
         },
         "type": "object",
@@ -11304,6 +11832,16 @@
         ],
         "title": "OutputParameterYAML"
       },
+      "PDFFormat": {
+        "type": "string",
+        "enum": [
+          "A4",
+          "Letter",
+          "Legal",
+          "Tabloid"
+        ],
+        "title": "PDFFormat"
+      },
       "PDFParserBlock": {
         "properties": {
           "label": {
@@ -11498,6 +12036,287 @@
         "title": "PasswordCredentialResponse",
         "description": "Response model for password credentials, containing only the username."
       },
+      "PersistentBrowserType": {
+        "type": "string",
+        "enum": [
+          "msedge",
+          "chrome"
+        ],
+        "title": "PersistentBrowserType"
+      },
+      "PlanTier": {
+        "type": "string",
+        "enum": [
+          "free",
+          "hobby",
+          "pro"
+        ],
+        "title": "PlanTier",
+        "description": "Self-serve subscription tiers. Enterprise customers use manual billing (bypass)."
+      },
+      "PortalSessionResponse": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "PortalSessionResponse"
+      },
+      "PrintPageBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "print_page",
+            "title": "Block Type",
+            "default": "print_page"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "include_timestamp": {
+            "type": "boolean",
+            "title": "Include Timestamp",
+            "default": true
+          },
+          "custom_filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Filename"
+          },
+          "format": {
+            "type": "string",
+            "title": "Format",
+            "default": "A4"
+          },
+          "landscape": {
+            "type": "boolean",
+            "title": "Landscape",
+            "default": false
+          },
+          "print_background": {
+            "type": "boolean",
+            "title": "Print Background",
+            "default": true
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter"
+        ],
+        "title": "PrintPageBlock"
+      },
+      "PrintPageBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "print_page",
+            "title": "Block Type",
+            "default": "print_page"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "include_timestamp": {
+            "type": "boolean",
+            "title": "Include Timestamp",
+            "default": true
+          },
+          "custom_filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Filename"
+          },
+          "format": {
+            "$ref": "#/components/schemas/PDFFormat",
+            "default": "A4"
+          },
+          "landscape": {
+            "type": "boolean",
+            "title": "Landscape",
+            "default": false
+          },
+          "print_background": {
+            "type": "boolean",
+            "title": "Print Background",
+            "default": true
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "PrintPageBlockYAML"
+      },
       "PromptAction": {
         "properties": {
           "type": {
@@ -11602,6 +12421,7 @@
           "RESIDENTIAL_MX",
           "RESIDENTIAL_IT",
           "RESIDENTIAL_NL",
+          "RESIDENTIAL_PH",
           "RESIDENTIAL_ISP",
           "NONE"
         ],
@@ -12372,6 +13192,21 @@
               "2025-01-01T00:00:00Z"
             ]
           },
+          "type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OTPType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+            "examples": [
+              "totp",
+              "magic_link"
+            ]
+          },
           "totp_code_id": {
             "type": "string",
             "title": "Totp Code Id",
@@ -12519,6 +13354,21 @@
             "description": "The timestamp when the TOTP code expires",
             "examples": [
               "2025-01-01T00:00:00Z"
+            ]
+          },
+          "type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OTPType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+            "examples": [
+              "totp",
+              "magic_link"
             ]
           }
         },
@@ -13125,7 +13975,7 @@
               }
             ],
             "title": "Proxy Location",
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "data_extraction_schema": {
@@ -13572,6 +14422,18 @@
             ],
             "title": "Errors",
             "description": "The errors for the run"
+          },
+          "step_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Count",
+            "description": "Total number of steps executed in this run"
           },
           "run_type": {
             "type": "string",
@@ -16145,6 +17007,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/PrintPageBlock"
                 }
               ],
               "discriminator": {
@@ -16165,6 +17030,7 @@
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
                   "task": "#/components/schemas/TaskBlock",
                   "task_v2": "#/components/schemas/TaskV2Block",
@@ -16177,6 +17043,17 @@
             },
             "type": "array",
             "title": "Blocks"
+          },
+          "finally_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finally Block Label"
           }
         },
         "type": "object",
@@ -16314,6 +17191,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ConditionalBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PrintPageBlockYAML"
                 }
               ],
               "discriminator": {
@@ -16334,6 +17214,7 @@
                   "login": "#/components/schemas/LoginBlockYAML",
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "print_page": "#/components/schemas/PrintPageBlockYAML",
                   "send_email": "#/components/schemas/SendEmailBlockYAML",
                   "task": "#/components/schemas/TaskBlockYAML",
                   "task_v2": "#/components/schemas/TaskV2BlockYAML",
@@ -16346,6 +17227,17 @@
             },
             "type": "array",
             "title": "Blocks"
+          },
+          "finally_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finally Block Label"
           }
         },
         "type": "object",
@@ -17042,7 +17934,7 @@
               }
             ],
             "title": "Proxy Location",
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "webhook_url": {
@@ -17428,6 +18320,18 @@
             ],
             "title": "Errors",
             "description": "The errors for the run"
+          },
+          "step_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Count",
+            "description": "Total number of steps executed in this run"
           },
           "run_type": {
             "type": "string",

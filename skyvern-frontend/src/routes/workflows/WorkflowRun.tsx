@@ -38,6 +38,7 @@ import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkf
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
 import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
+import { isBlockItem } from "./types/workflowRunTypes";
 import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
 import { cn } from "@/util/utils";
@@ -146,10 +147,13 @@ function WorkflowRun() {
     workflowRun && statusIsCancellable(workflowRun);
 
   const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
+  const finallyBlockLabel =
+    workflow?.workflow_definition?.finally_block_label ?? null;
   const selection = findActiveItem(
     workflowRunTimeline ?? [],
     active,
     !!workflowRunIsFinalized,
+    finallyBlockLabel,
   );
   const parameters = workflowRun?.parameters ?? {};
   const proxyLocation =
@@ -194,6 +198,23 @@ function WorkflowRun() {
       ? "Termination Reason"
       : "Failure Reason";
 
+  const finallyBlockInTimeline = finallyBlockLabel
+    ? workflowRunTimeline?.find(
+        (item) => isBlockItem(item) && item.block.label === finallyBlockLabel,
+      )
+    : null;
+
+  const finallyBlockStatus =
+    finallyBlockInTimeline && isBlockItem(finallyBlockInTimeline)
+      ? finallyBlockInTimeline.block.status
+      : null;
+
+  const shouldShowFinallyNote =
+    (workflowRun?.status === Status.Terminated ||
+      workflowRun?.status === Status.Failed) &&
+    finallyBlockLabel &&
+    finallyBlockInTimeline;
+
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div
       className="space-y-2 rounded-md border border-red-600 p-4"
@@ -204,6 +225,20 @@ function WorkflowRun() {
       <div className="font-bold">{failureReasonTitle}</div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
       {matchedTips}
+      {shouldShowFinallyNote && (
+        <div className="mt-2 flex items-center gap-2 rounded bg-amber-500/20 px-3 py-2 text-sm text-amber-200">
+          <span className="font-medium">Note:</span>
+          <span>
+            "Execute on any outcome" block ({finallyBlockLabel}){" "}
+            {finallyBlockStatus === Status.Completed
+              ? "completed successfully"
+              : finallyBlockStatus === Status.Failed
+                ? "failed"
+                : "ran"}
+            .
+          </span>
+        </div>
+      )}
     </div>
   ) : null;
 
@@ -442,7 +477,10 @@ function WorkflowRun() {
               <ScrollArea>
                 <ScrollAreaViewport className="max-h-[250px] space-y-2">
                   {fileUrls.length > 0 ? (
-                    fileUrls.map((url, index) => {
+                    fileUrls.map((url) => {
+                      // Extract filename from URL path, stripping query params from signed URLs
+                      const urlPath = url.split("?")[0] ?? url;
+                      const filename = urlPath.split("/").pop() || "download";
                       return (
                         <div key={url} title={url} className="flex gap-2">
                           <FileIcon className="size-6" />
@@ -450,7 +488,7 @@ function WorkflowRun() {
                             href={url}
                             className="underline underline-offset-4"
                           >
-                            <span>{`File ${index + 1}`}</span>
+                            <span>{filename}</span>
                           </a>
                         </div>
                       );

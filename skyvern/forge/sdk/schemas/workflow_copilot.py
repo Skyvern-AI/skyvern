@@ -33,18 +33,11 @@ class WorkflowCopilotChatMessage(BaseModel):
 
 class WorkflowCopilotChatRequest(BaseModel):
     workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
+    workflow_id: str = Field(..., description="Workflow permanent ID for the chat")
     workflow_copilot_chat_id: str | None = Field(None, description="The chat ID to send the message to")
     workflow_run_id: str | None = Field(None, description="The workflow run ID to use for the context")
     message: str = Field(..., description="The message that user sends")
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
-
-
-class WorkflowCopilotChatResponse(BaseModel):
-    workflow_copilot_chat_id: str = Field(..., description="The chat ID")
-    message: str = Field(..., description="The message sent to the user")
-    updated_workflow_yaml: str | None = Field(None, description="The updated workflow yaml")
-    request_time: datetime = Field(..., description="When the request was received")
-    response_time: datetime = Field(..., description="When the assistant message was created")
 
 
 class WorkflowCopilotChatHistoryMessage(BaseModel):
@@ -56,3 +49,32 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
 class WorkflowCopilotChatHistoryResponse(BaseModel):
     workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
+
+
+class WorkflowCopilotStreamMessageType(StrEnum):
+    PROCESSING_UPDATE = "processing_update"
+    RESPONSE = "response"
+    ERROR = "error"
+
+
+class WorkflowCopilotProcessingUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.PROCESSING_UPDATE, description="Message type"
+    )
+    status: str = Field(..., description="Processing status text")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowCopilotStreamResponseUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.RESPONSE, description="Message type"
+    )
+    workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+    message: str = Field(..., description="The message sent to the user")
+    updated_workflow: dict | None = Field(None, description="The updated workflow")
+    response_time: datetime = Field(..., description="When the assistant message was created")
+
+
+class WorkflowCopilotStreamErrorUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(WorkflowCopilotStreamMessageType.ERROR, description="Message type")
+    error: str = Field(..., description="Error message")

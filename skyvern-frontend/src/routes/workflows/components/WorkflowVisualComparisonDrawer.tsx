@@ -116,7 +116,7 @@ function compareWorkflowBlocks(
 
 function getWorkflowElements(version: WorkflowVersion) {
   const settings: WorkflowSettings = {
-    proxyLocation: version.proxy_location || ProxyLocation.Residential,
+    proxyLocation: version.proxy_location ?? ProxyLocation.Residential,
     webhookCallbackUrl: version.webhook_callback_url || "",
     persistBrowserSession: version.persist_browser_session,
     model: version.model,
@@ -129,6 +129,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     aiFallback: version.ai_fallback ?? true,
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
+    finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
   };
 
   return getElements(

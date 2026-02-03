@@ -621,49 +621,46 @@ async def run_task_v2_helper(
             browser_session_id=browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,
         )
-
-        fallback_occurred = False
-        if url != current_url:
-            if page is None:
-                page = await browser_state.get_or_create_page(
-                    url=url,
-                    proxy_location=workflow_run.proxy_location,
-                    task_id=task_v2.task_id,
-                    workflow_run_id=workflow_run_id,
-                    script_id=task_v2.script_id,
-                    organization_id=organization_id,
-                    extra_http_headers=task_v2.extra_http_headers,
-                    browser_profile_id=workflow_run.browser_profile_id,
-                )
-            else:
-                await browser_state.navigate_to_url(page, url)
-
+        page = await browser_state.get_working_page()
+        should_fallback = False
+        # if page is None:
+        #     page = await browser_state.get_or_create_page(
+        #         url=url,
+        #         proxy_location=workflow_run.proxy_location,
+        #         task_id=task_v2.task_id,
+        #         workflow_run_id=workflow_run_id,
+        #         script_id=task_v2.script_id,
+        #         organization_id=organization_id,
+        #         extra_http_headers=task_v2.extra_http_headers,
+        #         browser_profile_id=workflow_run.browser_profile_id,
+        #     )
+        if page:
+            current_url = await SkyvernFrame.get_url(page)
             page_loaded = False
-            if page:
-                try:
-                    # Check if the page has a body element to verify it loaded
-                    # page will always be None if browser state failed to load
-                    page_loaded = await browser_state.validate_browser_context(page)
-                except Exception:
-                    page_loaded = False
-                    LOG.warning(
-                        "Page failed to load properly, fallback to Google",
-                        exc_info=True,
-                        url=url,
-                        current_url=current_url,
-                    )
+            try:
+                # Check if the page has a body element to verify it loaded
+                # page will always be None if browser state failed to load
+                page_loaded = await browser_state.validate_browser_context(page)
+            except Exception:
+                page_loaded = False
+                LOG.warning(
+                    "Page failed to load properly, fallback to Google",
+                    exc_info=True,
+                    url=url,
+                    current_url=current_url,
+                )
 
             if not page_loaded:
                 # Page failed to load properly, fallback to Google
                 if page:
                     try:
                         await page.goto(fallback_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-                        fallback_occurred = True
+                        should_fallback = True
                     except Exception:
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
 
         if i == 0 and current_url != url:
-            if fallback_occurred:
+            if should_fallback:
                 plan = f"Go to Google because the intended website ({url}) failed to load properly."
                 task_type = "goto_url"
                 task_history_record = {"type": task_type, "task": plan}
@@ -757,6 +754,10 @@ async def run_task_v2_helper(
                     task_history=task_history,
                     context=context,
                     screenshots=scraped_page.screenshots,
+                )
+                await app.WORKFLOW_SERVICE.generate_script_if_needed(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
                 )
                 break
 
@@ -966,11 +967,10 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=completion_screenshots,
                 )
-                if task_v2.run_with == "code":
-                    await app.WORKFLOW_SERVICE.generate_script_if_needed(
-                        workflow=workflow,
-                        workflow_run=workflow_run,
-                    )
+                await app.WORKFLOW_SERVICE.generate_script_if_needed(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                )
                 break
 
         # total step number validation
@@ -1799,6 +1799,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
             error_code_mapping=task_v2.error_code_mapping,
         ),
         errors=workflow_run_resp.errors if workflow_run_resp else None,
+        step_count=workflow_run_resp.step_count if workflow_run_resp else None,
     )
 
 

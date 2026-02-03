@@ -20,6 +20,24 @@ class WorkflowDefinitionHasDuplicateBlockLabels(BaseWorkflowHTTPException):
         )
 
 
+class InvalidFinallyBlockLabel(BaseWorkflowHTTPException):
+    def __init__(self, finally_block_label: str, available_labels: list[str]) -> None:
+        super().__init__(
+            f"finally_block_label '{finally_block_label}' does not reference a valid block in the workflow. "
+            f"Available block labels: {', '.join(available_labels) if available_labels else '(none)'}",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
+class NonTerminalFinallyBlock(BaseWorkflowHTTPException):
+    def __init__(self, finally_block_label: str) -> None:
+        super().__init__(
+            f"finally_block_label '{finally_block_label}' must be a terminal block (next_block_label must be null). "
+            "Only blocks without a next_block_label can be used as finally blocks.",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
 class FailedToCreateWorkflow(BaseWorkflowHTTPException):
     def __init__(self, error_message: str) -> None:
         super().__init__(
@@ -33,6 +51,14 @@ class FailedToUpdateWorkflow(BaseWorkflowHTTPException):
         super().__init__(
             f"Failed to update workflow with ID {workflow_permanent_id}. Error: {error_message}",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+class WorkflowVersionConflict(BaseWorkflowHTTPException):
+    def __init__(self, workflow_permanent_id: str) -> None:
+        super().__init__(
+            f"Concurrent update detected for workflow {workflow_permanent_id}. Please retry.",
+            status_code=status.HTTP_409_CONFLICT,
         )
 
 
@@ -101,11 +127,34 @@ class InvalidFileType(BaseWorkflowHTTPException):
         )
 
 
-class WorkflowParameterMissingRequiredValue(BaseWorkflowHTTPException):
+class WorkflowDefinitionValidationException(BaseWorkflowHTTPException):
+    """Base exception for workflow definition validation errors."""
+
+
+class WorkflowParameterMissingRequiredValue(WorkflowDefinitionValidationException):
     def __init__(self, workflow_parameter_type: str, workflow_parameter_key: str, required_value: str) -> None:
         super().__init__(
             f"Missing required value for workflow parameter. Workflow parameter type: {workflow_parameter_type}. workflow_parameter_key: {workflow_parameter_key}. Required value: {required_value}",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class WorkflowDefinitionHasUndefinedParameters(WorkflowDefinitionValidationException):
+    def __init__(self, undefined_parameters: dict[str, list[str]]) -> None:
+        # Format: {"block_label": ["param1", "param2"]}
+        error_details = []
+        for block_label, params in undefined_parameters.items():
+            params_str = ", ".join(f"'{p}'" for p in params)
+            error_details.append(f"  - Block '{block_label}' references undefined parameter(s): {params_str}")
+
+        error_message = (
+            f"Workflow definition has blocks that reference undefined parameters:\n"
+            f"{chr(10).join(error_details)}\n\n"
+            f"Make sure to define all parameters in the workflow parameters list before using them in blocks."
+        )
+        super().__init__(
+            error_message,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
 

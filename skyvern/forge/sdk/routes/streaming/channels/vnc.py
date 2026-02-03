@@ -26,7 +26,7 @@ import structlog
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
-from websockets import ConnectionClosedError, Data
+from websockets import ConnectionClosedError, ConnectionClosedOK, Data
 
 from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
@@ -253,7 +253,7 @@ async def copy_text(vnc_channel: VncChannel) -> None:
             if message_channel:
                 await message_channel.send_copied_text(copied_text)
             else:
-                LOG.warning(
+                LOG.info(
                     f"{class_name} No message channel found for client, or it is not open",
                     message_channel=message_channel,
                     **vnc_channel.identity,
@@ -272,13 +272,50 @@ async def ask_for_clipboard(vnc_channel: VncChannel) -> None:
         if message_channel:
             await message_channel.ask_for_clipboard()
         else:
-            LOG.warning(
+            LOG.info(
                 f"{class_name} No message channel found for client, or it is not open",
                 message_channel=message_channel,
                 **vnc_channel.identity,
             )
     except Exception:
         LOG.exception(f"{class_name} Failed to ask for clipboard via CDP", **vnc_channel.identity)
+
+
+# TODO(benji): I hate this function. It's messy and gross. Once we remove v1,
+# we should clean this up.
+def _build_vnc_url_from_browser_address(browser_address: str) -> str | None:
+    """
+    Build a routed VNC URL from a V2 K8s routed browser_address.
+
+    V2 K8s routed browser_address format:
+        wss://{domain}/{session_id}/{token}/devtools/browser/{browser_id}
+
+    Returns VNC URL in format:
+        wss://{domain}/vnc/{session_id}/{token}
+
+    Returns None if browser_address is not a V2 routed URL.
+    """
+    if not browser_address:
+        return None
+
+    parsed = urlparse(browser_address)
+
+    # Check if this looks like a V2 routed URL (wss:// with token in path)
+    if parsed.scheme not in ("wss", "ws"):
+        return None
+
+    # Parse path: /{session_id}/{token}/devtools/browser/{browser_id}
+    path_parts = parsed.path.strip("/").split("/")
+    if len(path_parts) < 4 or path_parts[2] != "devtools":
+        return None
+
+    session_id = path_parts[0]
+    token = path_parts[1]
+    domain = parsed.netloc
+
+    # Build VNC URL with same domain and token
+    scheme = "wss" if parsed.scheme == "wss" else "ws"
+    return f"{scheme}://{domain}/vnc/{session_id}/{token}"
 
 
 async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
@@ -292,24 +329,28 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
     browser_session = vnc_channel.browser_session
     class_name = vnc_channel.class_name
 
-    if browser_session:
-        if browser_session.ip_address:
-            if ":" in browser_session.ip_address:
-                ip, _ = browser_session.ip_address.split(":")
-                vnc_url = f"ws://{ip}:{vnc_channel.vnc_port}"
-            else:
-                vnc_url = f"ws://{browser_session.ip_address}:{vnc_channel.vnc_port}"
-        else:
-            browser_address = browser_session.browser_address
-
-            parsed_browser_address = urlparse(browser_address)
-            host = parsed_browser_address.hostname
-            vnc_url = f"ws://{host}:{vnc_channel.vnc_port}"
-    else:
+    if not browser_session:
         raise Exception(f"{class_name} No browser session associated with vnc channel.")
 
-    # NOTE(jdo:streaming-local-dev)
-    # vnc_url = "ws://localhost:6080"
+    # First, check if this is a V2 K8s routed session by examining browser_address
+    # V2 sessions have browser_address like: wss://{domain}/{session_id}/{token}/devtools/...
+    # For these, we need to route VNC through the same nginx proxy
+    routed_vnc_url = _build_vnc_url_from_browser_address(browser_session.browser_address)
+    if routed_vnc_url:
+        vnc_url = routed_vnc_url
+    elif browser_session.ip_address:
+        # V1 ECS sessions: Direct IP connection (ip_address is a public/reachable IP)
+        if ":" in browser_session.ip_address:
+            ip, _ = browser_session.ip_address.split(":")
+            vnc_url = f"ws://{ip}:{vnc_channel.vnc_port}"
+        else:
+            vnc_url = f"ws://{browser_session.ip_address}:{vnc_channel.vnc_port}"
+    else:
+        # Last resort: parse browser_address hostname
+        browser_address = browser_session.browser_address
+        parsed_browser_address = urlparse(browser_address)
+        host = parsed_browser_address.hostname
+        vnc_url = f"ws://{host}:{vnc_channel.vnc_port}"
 
     LOG.info(
         f"{class_name} Connecting to vnc url.",
@@ -317,7 +358,12 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
         **vnc_channel.identity,
     )
 
-    async with websockets.connect(vnc_url) as novnc_ws:
+    # For routed VNC URLs (wss://), we need to pass the x-api-key header for authentication
+    extra_headers: dict[str, str] = {}
+    if vnc_url.startswith("wss://") and vnc_channel.x_api_key:
+        extra_headers["x-api-key"] = vnc_channel.x_api_key
+
+    async with websockets.connect(vnc_url, additional_headers=extra_headers) as novnc_ws:
 
         async def frontend_to_browser() -> None:
             nonlocal class_name
@@ -362,6 +408,9 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                 except ConnectionClosedError:
                     LOG.info(f"{class_name} Frontend closed the vnc channel.", **vnc_channel.identity)
                     raise
+                except ConnectionClosedOK:
+                    LOG.info(f"{class_name} Frontend closed the vnc channel cleanly.", **vnc_channel.identity)
+                    raise
                 except asyncio.CancelledError:
                     pass
                 except Exception:
@@ -378,6 +427,9 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     raise
                 except ConnectionClosedError:
                     LOG.info(f"{class_name} Browser closed vnc.", **vnc_channel.identity)
+                    raise
+                except ConnectionClosedOK:
+                    LOG.info(f"{class_name} Browser closed vnc cleanly.", **vnc_channel.identity)
                     raise
                 except asyncio.CancelledError:
                     pass
@@ -404,6 +456,9 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                 except ConnectionClosedError:
                     LOG.info(f"{class_name} Browser closed the vnc channel session.", **vnc_channel.identity)
                     await vnc_channel.close(reason="browser-closed")
+                except ConnectionClosedOK:
+                    LOG.info(f"{class_name} Browser closed the vnc channel session cleanly.", **vnc_channel.identity)
+                    await vnc_channel.close(reason="browser-closed-ok")
                 except asyncio.CancelledError:
                     pass
                 except Exception:
@@ -428,6 +483,9 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                 except ConnectionClosedError:
                     LOG.info(f"{class_name} Frontend closed the vnc channel session.", **vnc_channel.identity)
                     await vnc_channel.close(reason="frontend-closed")
+                except ConnectionClosedOK:
+                    LOG.info(f"{class_name} Frontend closed the vnc channel session cleanly.", **vnc_channel.identity)
+                    await vnc_channel.close(reason="frontend-closed-ok")
                 except asyncio.CancelledError:
                     pass
                 except Exception:
@@ -443,6 +501,8 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
             await collect(loops)
         except WebSocketDisconnect:
             pass
+        except ConnectionClosedOK:
+            LOG.info(f"{class_name} Connection closed cleanly in loop stream.", **vnc_channel.identity)
         except Exception:
             LOG.exception(f"{class_name} An exception occurred in loop stream.", **vnc_channel.identity)
         finally:

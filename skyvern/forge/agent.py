@@ -2661,8 +2661,23 @@ class ForgeAgent:
                 llm_config = LLMConfigRegistry.get_config(resolved_llm_key)
                 extracted_name = None
 
+                # For router configs (LLMRouterConfig), extract from model_list primary model FIRST
+                # This must be checked before model_name since router model_name is just an identifier
+                # (e.g., "gemini-3.0-flash-gpt-5-mini-fallback-router"), not an actual Vertex model
+                if hasattr(llm_config, "model_list") and hasattr(llm_config, "main_model_group"):
+                    # Find the primary model in model_list by matching main_model_group
+                    for model_entry in llm_config.model_list:
+                        if model_entry.model_name == llm_config.main_model_group:
+                            # Extract actual model name from litellm_params
+                            model_param = model_entry.litellm_params.get("model", "")
+                            if "vertex_ai/" in model_param:
+                                extracted_name = model_param.split("/")[-1]
+                            elif model_param.startswith("gemini-"):
+                                extracted_name = model_param
+                            break
+
                 # Try to extract from model_name if it contains "vertex_ai/" or starts with "gemini-"
-                if hasattr(llm_config, "model_name") and isinstance(llm_config.model_name, str):
+                if not extracted_name and hasattr(llm_config, "model_name") and isinstance(llm_config.model_name, str):
                     if "vertex_ai/" in llm_config.model_name:
                         # Direct Vertex config: "vertex_ai/gemini-2.5-flash" -> "gemini-2.5-flash"
                         extracted_name = llm_config.model_name.split("/")[-1]
@@ -2699,8 +2714,11 @@ class ForgeAgent:
             except Exception as e:
                 LOG.debug("Failed to extract model name from config, using default", error=str(e))
 
-            # Normalize model name to the canonical Vertex identifier (e.g., gemini-2.5-pro)
-            match = re.search(r"(gemini-\d+(?:\.\d+)?-(?:flash-lite|flash|pro))", model_name, re.IGNORECASE)
+            # Normalize model name to the canonical Vertex identifier (e.g., gemini-2.5-pro).
+            # Preserve preview suffixes so we don't strip required identifiers (e.g., gemini-3-flash-preview).
+            match = re.search(
+                r"(gemini-\d+(?:\.\d+)?-(?:flash-lite|flash|pro)(?:-preview)?)", model_name, re.IGNORECASE
+            )
             if match:
                 model_name = match.group(1).lower()
 
@@ -3406,11 +3424,13 @@ class ForgeAgent:
         last_step: Step | None = None,
         failure_reason: str | None = None,
         need_browser_log: bool = False,
+        step_count: int | None = None,
     ) -> TaskResponse:
         # no last step means the task didn't start, so we don't have any other artifacts
         if last_step is None:
             return task.to_task_response(
                 failure_reason=failure_reason,
+                step_count=step_count,
             )
 
         screenshot_url = None
@@ -3512,6 +3532,7 @@ class ForgeAgent:
             browser_console_log_url=browser_console_log_url,
             downloaded_files=downloaded_files,
             failure_reason=failure_reason,
+            step_count=step_count,
         )
 
     async def cleanup_browser_and_create_artifacts(

@@ -254,12 +254,13 @@ export class Skyvern extends SkyvernClient {
 
         const browserSessions = await this.getBrowserSessions();
         const browserSession = browserSessions
-            .filter((s) => s.runnable_id == null)
+            .filter((s) => s.runnable_id == null && s.started_at != null && s.browser_address != null)
             .sort((a, b) => {
-                const aTime = a.started_at ? new Date(a.started_at).getTime() : 0;
-                const bTime = b.started_at ? new Date(b.started_at).getTime() : 0;
+                const aTime = new Date(a.started_at!).getTime();
+                const bTime = new Date(b.started_at!).getTime();
                 return bTime - aTime;
-            })[0];
+            })
+            .at(0);
 
         if (!browserSession) {
             LOG.info("No existing cloud browser session found, launching a new session");

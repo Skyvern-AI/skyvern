@@ -90,7 +90,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
     InvalidTemplateWorkflowPermanentId,
-    WorkflowParameterMissingRequiredValue,
+    WorkflowDefinitionValidationException,
 )
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
@@ -262,6 +262,7 @@ async def run_task(
                 model=run_request.model,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolls,
                 extra_http_headers=run_request.extra_http_headers,
+                browser_session_id=run_request.browser_session_id,
                 browser_address=run_request.browser_address,
             )
         except MissingBrowserAddressError as e:
@@ -522,7 +523,7 @@ async def create_workflow_legacy(
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org, request=workflow_create_request
         )
-    except WorkflowParameterMissingRequiredValue as e:
+    except WorkflowDefinitionValidationException as e:
         raise e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
@@ -583,7 +584,7 @@ async def create_workflow(
         )
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
-    except WorkflowParameterMissingRequiredValue as e:
+    except WorkflowDefinitionValidationException as e:
         raise e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
@@ -842,7 +843,7 @@ async def update_workflow_legacy(
             status_code=422,
             detail=str(e),
         ) from e
-    except WorkflowParameterMissingRequiredValue as e:
+    except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
         # Bubble up well-formed client errors so they are not converted to 500s
@@ -916,7 +917,7 @@ async def update_workflow(
         )
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
-    except WorkflowParameterMissingRequiredValue as e:
+    except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
         # Bubble up well-formed client errors so they are not converted to 500s
@@ -1474,6 +1475,12 @@ async def run_block(
     # lines; that'll make the block run happen in a new local browser instance.
     # LOG.critical("REMOVING BROWSER SESSION ID")
     # block_run_request.browser_session_id = None
+
+    await block_service.validate_block_labels(
+        workflow_permanent_id=block_run_request.workflow_id,
+        organization_id=organization.organization_id,
+        block_labels=block_run_request.block_labels,
+    )
 
     workflow_run = await block_service.ensure_workflow_run(
         organization=organization,

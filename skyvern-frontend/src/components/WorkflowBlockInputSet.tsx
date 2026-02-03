@@ -11,6 +11,14 @@ type Props = {
   values: Set<string>;
 };
 
+function areSetsEqual<T>(a: Set<T>, b: Set<T>): boolean {
+  if (a.size !== b.size) return false;
+  for (const item of a) {
+    if (!b.has(item)) return false;
+  }
+  return true;
+}
+
 function WorkflowBlockInputSet(props: Props) {
   const { nodeId, onChange, values } = props;
   const [parameterKeys, setParameterKeys] = useState<Set<string>>(values);
@@ -19,6 +27,13 @@ function WorkflowBlockInputSet(props: Props) {
   const availableParameterKeys = new Set(
     workflowParameters.map((parameter) => parameter.key),
   );
+
+  // Sync local state when values prop changes (e.g., parameter renamed externally)
+  useEffect(() => {
+    if (!areSetsEqual(parameterKeys, values)) {
+      setParameterKeys(values);
+    }
+  }, [values, parameterKeys]);
 
   useEffect(() => {
     onChange(new Set(parameterKeys));

@@ -53,6 +53,9 @@ function WorkflowRunTimeline({
   const workflowRunIsNotFinalized = statusIsNotFinalized(workflowRun);
   const workflowRunIsFinalized = statusIsFinalized(workflowRun);
 
+  const finallyBlockLabel =
+    workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
+
   const numberOfActions = workflowRunTimeline.reduce((total, current) => {
     if (isTaskVariantBlockItem(current)) {
       return total + current.block!.actions!.length;
@@ -104,6 +107,7 @@ function WorkflowRunTimeline({
                     onActionClick={onActionItemSelected}
                     onBlockItemClick={onBlockItemSelected}
                     onThoughtCardClick={onObserverThoughtCardSelected}
+                    finallyBlockLabel={finallyBlockLabel}
                   />
                 );
               }

@@ -30,9 +30,6 @@ type TabName = "stream" | "videos";
 
 function BrowserSession() {
   const { browserSessionId } = useParams();
-  const [hasBrowserSession, setHasBrowserSession] = useState(false);
-  const [browserSession, setBrowserSession] =
-    useState<BrowserSessionType | null>(null);
   const [activeTab, setActiveTab] = useState<TabName>("stream");
   const [isDialogOpen, setIsDialogOpen] = useState(false);
 
@@ -42,21 +39,16 @@ function BrowserSession() {
     queryKey: ["browserSession", browserSessionId],
     queryFn: async () => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-
-      try {
-        const response = await client.get<BrowserSessionType>(
-          `/browser_sessions/${browserSessionId}`,
-        );
-        setHasBrowserSession(true);
-        setBrowserSession(response.data);
-        return response.data;
-      } catch (error) {
-        setHasBrowserSession(false);
-        setBrowserSession(null);
-        return null;
-      }
+      const response = await client.get<BrowserSessionType>(
+        `/browser_sessions/${browserSessionId}`,
+      );
+      return response.data;
     },
+    refetchInterval: (query) =>
+      query.state.data?.status === "running" ? 5000 : false,
   });
+
+  const browserSession = query.data;
 
   const closeBrowserSessionMutation = useCloseBrowserSessionMutation({
     browserSessionId,
@@ -76,7 +68,7 @@ function BrowserSession() {
     );
   }
 
-  if (!hasBrowserSession) {
+  if (query.isError || !browserSession) {
     return (
       <div className="h-screen w-full gap-4 p-6">
         <div className="flex h-full w-full items-center justify-center">
@@ -96,7 +88,20 @@ function BrowserSession() {
             <div className="text-xl">Browser Session</div>
             {browserSession && (
               <div className="ml-auto flex flex-col items-end justify-end overflow-hidden">
-                <div className="flex items-center justify-end">
+                <div className="flex items-center justify-end gap-2">
+                  <span
+                    className={`rounded px-2 py-0.5 text-xs font-medium ${
+                      browserSession.status === "running"
+                        ? "bg-green-500/20 text-green-500"
+                        : browserSession.status === "completed"
+                          ? "bg-blue-500/20 text-blue-500"
+                          : browserSession.status === "failed"
+                            ? "bg-red-500/20 text-red-500"
+                            : "bg-gray-500/20 text-gray-500"
+                    }`}
+                  >
+                    {browserSession.status}
+                  </span>
                   <div className="max-w-[20rem] truncate font-mono text-xs opacity-75">
                     {browserSession.browser_session_id}
                   </div>
@@ -141,7 +146,7 @@ function BrowserSession() {
             ]}
           />
 
-          {browserSessionId && (
+          {browserSessionId && browserSession?.status === "running" && (
             <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
               <DialogTrigger asChild>
                 <Button className="ml-auto" variant="secondary">

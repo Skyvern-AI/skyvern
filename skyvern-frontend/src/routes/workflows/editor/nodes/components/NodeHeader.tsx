@@ -15,7 +15,7 @@ import { useOnChange } from "@/hooks/useOnChange";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useRequestDeleteNodeCallback } from "@/routes/workflows/hooks/useRequestDeleteNodeCallback";
 import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
@@ -180,7 +180,7 @@ function NodeHeader({
     initialValue: blockLabel,
   });
   const blockTitle = workflowBlockTitle[type];
-  const deleteNodeCallback = useDeleteNodeCallback();
+  const requestDeleteNodeCallback = useRequestDeleteNodeCallback();
   const transmuteNodeCallback = useTransmuteNodeCallback();
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const credentialGetter = useCredentialGetter();
@@ -533,35 +533,42 @@ function NodeHeader({
               inputClassName="text-base"
             />
 
-            {transmutations && transmutations.others.length ? (
-              <div className="flex items-center gap-1">
-                <span className="text-xs text-slate-400">
-                  {transmutations.blockTitle}
+            <div className="flex items-center gap-2">
+              {transmutations && transmutations.others.length ? (
+                <div className="flex items-center gap-1">
+                  <span className="text-xs text-slate-400">
+                    {transmutations.blockTitle}
+                  </span>
+                  <NoticeMe trigger="viewport">
+                    <MicroDropdown
+                      selections={[
+                        transmutations.self,
+                        ...transmutations.others.map((t) => t.label),
+                      ]}
+                      selected={transmutations.self}
+                      onChange={(label) => {
+                        const transmutation = transmutations.others.find(
+                          (t) => t.label === label,
+                        );
+
+                        if (!transmutation) {
+                          return;
+                        }
+
+                        transmuteNodeCallback(nodeId, transmutation.nodeName);
+                      }}
+                    />
+                  </NoticeMe>
+                </div>
+              ) : (
+                <span className="text-xs text-slate-400">{blockTitle}</span>
+              )}
+              {workflowSettingsStore.finallyBlockLabel === blockLabel && (
+                <span className="rounded bg-amber-600/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
+                  Runs on any outcome
                 </span>
-                <NoticeMe trigger="viewport">
-                  <MicroDropdown
-                    selections={[
-                      transmutations.self,
-                      ...transmutations.others.map((t) => t.label),
-                    ]}
-                    selected={transmutations.self}
-                    onChange={(label) => {
-                      const transmutation = transmutations.others.find(
-                        (t) => t.label === label,
-                      );
-
-                      if (!transmutation) {
-                        return;
-                      }
-
-                      transmuteNodeCallback(nodeId, transmutation.nodeName);
-                    }}
-                  />
-                </NoticeMe>
-              </div>
-            ) : (
-              <span className="text-xs text-slate-400">{blockTitle}</span>
-            )}
+              )}
+            </div>
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
@@ -618,7 +625,7 @@ function NodeHeader({
                 <NodeActionMenu
                   isScriptable={isScriptable}
                   onDelete={() => {
-                    deleteNodeCallback(nodeId);
+                    requestDeleteNodeCallback(nodeId, blockLabel);
                   }}
                   onShowScript={() =>
                     toggleScriptForNodeCallback({ id: nodeId, show: true })

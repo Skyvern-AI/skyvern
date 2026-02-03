@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    CACHED_ACTION_DELAY_SECONDS: float = 1.0
+    # Page readiness settings for cached action execution
+    # These help prevent cached actions from executing before the page is fully loaded
+    PAGE_READY_NETWORK_IDLE_TIMEOUT_MS: float = 3000  # Wait for network idle (short timeout)
+    PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS: float = 5000  # Wait for loading indicators to disappear
+    PAGE_READY_DOM_STABLE_MS: float = 300  # Time with no DOM mutations to consider stable
+    PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
@@ -94,6 +101,7 @@ class Settings(BaseSettings):
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+    MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
@@ -373,6 +381,7 @@ class Settings(BaseSettings):
     BITWARDEN_SERVER_PORT: int = 8002
 
     SVG_MAX_LENGTH: int = 100000
+    SVG_MAX_PARSING_ELEMENT_CNT: int = 3000
 
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_CODE_BLOCK: bool = True

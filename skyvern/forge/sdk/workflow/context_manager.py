@@ -11,6 +11,7 @@ from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
     CredentialParameterNotFoundError,
+    ImaginarySecretValue,
     SkyvernException,
     WorkflowRunContextNotInitialized,
 )
@@ -51,6 +52,8 @@ LOG = structlog.get_logger()
 BlockMetadata = dict[str, str | int | float | bool | dict | list | None]
 
 jinja_sandbox_env = SandboxedEnvironment()
+
+RANDOM_SECRET_ID_PREFIX = "placeholder_"
 
 
 class WorkflowRunContext:
@@ -174,6 +177,7 @@ class WorkflowRunContext:
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
+        self.workflow_run_outputs: dict[str, Any] = {}
         self._aws_client = aws_client
         self.organization_id: str | None = None
         self.include_secrets_in_templates: bool = False
@@ -242,8 +246,15 @@ class WorkflowRunContext:
         assume it's an actual parameter value and return it.
 
         """
+        if len(self.secrets) == 0:
+            return None
         if isinstance(secret_id_or_value, str):
-            return self.secrets.get(secret_id_or_value)
+            if secret_id_or_value.startswith(RANDOM_SECRET_ID_PREFIX):
+                if secret_id_or_value not in self.secrets:
+                    raise ImaginarySecretValue(secret_id_or_value)
+                return self.secrets[secret_id_or_value]
+            else:
+                return self.secrets.get(secret_id_or_value)
         return None
 
     def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
@@ -273,6 +284,62 @@ class WorkflowRunContext:
             return [self.mask_secrets_in_data(item, mask) for item in data]
         return data
 
+    def build_workflow_run_summary(self) -> dict[str, Any]:
+        """
+        Build a workflow-level summary from per-block outputs.
+
+        Aggregates data across all blocks into a single workflow-level structure
+        suitable for webhook payloads.
+
+        Returns a dict with:
+            - workflow_run_id: The workflow run ID
+            - status: Status from the last block
+            - output.extracted_information: Merged extracted_information from all blocks
+            - downloaded_files: Aggregated list from all blocks
+            - errors: Aggregated list from all blocks
+            - failure_reason: First non-null failure reason found
+        """
+        last_status: str | None = None
+        merged_extracted_information: dict[str, Any] = {}
+        aggregated_downloaded_files: list[Any] = []
+        aggregated_errors: list[Any] = []
+        aggregated_failure_reason: str | None = None
+
+        for _, block_output in self.workflow_run_outputs.items():
+            if not isinstance(block_output, dict):
+                continue
+
+            block_status = block_output.get("status")
+            if block_status:
+                last_status = str(block_status)
+
+            extracted_info = block_output.get("extracted_information")
+            if extracted_info is not None and isinstance(extracted_info, dict):
+                # Merge extracted_information from all blocks together
+                merged_extracted_information.update(extracted_info)
+
+            downloaded_files = block_output.get("downloaded_files")
+            if downloaded_files:
+                aggregated_downloaded_files.extend(downloaded_files)
+
+            errors = block_output.get("errors")
+            if errors:
+                aggregated_errors.extend(errors)
+
+            if aggregated_failure_reason is None:
+                failure_reason = block_output.get("failure_reason")
+                if failure_reason:
+                    aggregated_failure_reason = failure_reason
+
+        return {
+            "workflow_run_id": self.workflow_run_id,
+            "status": last_status,
+            "output": {"extracted_information": merged_extracted_information},
+            "downloaded_files": aggregated_downloaded_files,
+            "errors": aggregated_errors,
+            "failure_reason": aggregated_failure_reason,
+        }
+
     async def get_secrets_from_password_manager(self) -> dict[str, Any]:
         """
         Get the secrets from the password manager. The secrets dict will contain the actual secret values.
@@ -291,7 +358,7 @@ class WorkflowRunContext:
 
     @staticmethod
     def generate_random_secret_id() -> str:
-        return f"placeholder_{generate_random_string()}"
+        return f"{RANDOM_SECRET_ID_PREFIX}{generate_random_string(length=4)}"
 
     async def _get_credential_vault_and_item_ids(self, credential_id: str) -> tuple[str, str]:
         """
@@ -895,6 +962,7 @@ class WorkflowRunContext:
                 LOG.warning(f"Parameter {block_label} already has a value in workflow run context, overwriting")
 
         self.values[block_label] = block_reference_value
+        self.workflow_run_outputs[block_label] = block_reference_value
 
     async def set_parameter_values_for_output_parameter_dependent_blocks(
         self,

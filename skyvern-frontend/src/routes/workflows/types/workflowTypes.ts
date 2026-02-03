@@ -211,7 +211,8 @@ export type WorkflowBlock =
   | PDFParserBlock
   | Taskv2Block
   | URLBlock
-  | HttpRequestBlock;
+  | HttpRequestBlock
+  | PrintPageBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -236,6 +237,7 @@ export const WorkflowBlockTypes = {
   Taskv2: "task_v2",
   URL: "goto_url",
   HttpRequest: "http_request",
+  PrintPage: "print_page",
 } as const;
 
 // all of them
@@ -550,12 +552,25 @@ export type HttpRequestBlock = WorkflowBlockBase & {
   timeout: number;
   follow_redirects: boolean;
   parameters: Array<WorkflowParameter>;
+  download_filename: string | null;
+  save_response_as_file: boolean;
+};
+
+export type PrintPageBlock = WorkflowBlockBase & {
+  block_type: "print_page";
+  include_timestamp: boolean;
+  custom_filename: string | null;
+  format: string;
+  landscape: boolean;
+  print_background: boolean;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type WorkflowDefinition = {
   version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
+  finally_block_label?: string | null;
 };
 
 export type WorkflowApiResponse = {
@@ -601,6 +616,7 @@ export type WorkflowSettings = {
   aiFallback: boolean | null;
   runSequentially: boolean;
   sequentialKey: string | null;
+  finallyBlockLabel: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

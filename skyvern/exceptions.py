@@ -829,6 +829,14 @@ class BrowserSessionNotFound(SkyvernHTTPException):
         )
 
 
+class BrowserSessionStartupTimeout(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} failed to start within the timeout period.",
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        )
+
+
 class BrowserProfileNotFound(SkyvernHTTPException):
     def __init__(self, profile_id: str, organization_id: str | None = None) -> None:
         message = f"Browser profile {profile_id} not found"
@@ -867,9 +875,12 @@ class NoElementFound(SkyvernException):
         super().__init__("No element found.")
 
 
-class OutputParameterNotFound(SkyvernException):
+class OutputParameterNotFound(SkyvernHTTPException):
     def __init__(self, block_label: str, workflow_permanent_id: str) -> None:
-        super().__init__(f"Output parameter for {block_label} not found in workflow {workflow_permanent_id}")
+        super().__init__(
+            f"Output parameter for {block_label} not found in workflow {workflow_permanent_id}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
 
 
 class AzureBaseError(SkyvernException):
@@ -922,4 +933,11 @@ class PDFParsingError(SkyvernException):
         self.pdfplumber_error = pdfplumber_error
         super().__init__(
             f"Failed to parse PDF '{file_identifier}'. pypdf error: {pypdf_error}; pdfplumber error: {pdfplumber_error}"
+        )
+
+
+class ImaginarySecretValue(SkyvernException):
+    def __init__(self, value: str) -> None:
+        super().__init__(
+            f"The value {value} is imaginary. Try to double-check to see if this value is included in the provided information"
         )

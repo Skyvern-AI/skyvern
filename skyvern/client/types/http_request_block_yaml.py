@@ -28,6 +28,8 @@ class HttpRequestBlockYaml(UniversalBaseModel):
     timeout: typing.Optional[int] = None
     follow_redirects: typing.Optional[bool] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
+    download_filename: typing.Optional[str] = None
+    save_response_as_file: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

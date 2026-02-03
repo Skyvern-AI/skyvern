@@ -38,6 +38,7 @@ type Props = {
   onBlockItemClick: (block: WorkflowRunBlock) => void;
   onActionClick: (action: ActionItem) => void;
   onThoughtCardClick: (thought: ObserverThought) => void;
+  finallyBlockLabel?: string | null;
 };
 
 function WorkflowRunTimelineBlockItem({
@@ -47,8 +48,10 @@ function WorkflowRunTimelineBlockItem({
   onBlockItemClick,
   onActionClick,
   onThoughtCardClick,
+  finallyBlockLabel,
 }: Props) {
   const actions = block.actions ?? [];
+  const isFinallyBlock = finallyBlockLabel && block.label === finallyBlockLabel;
 
   const hasActiveAction =
     isAction(activeItem) &&
@@ -128,6 +131,11 @@ function WorkflowRunTimelineBlockItem({
               <span className="flex gap-2 text-xs text-slate-400">
                 {block.label}
               </span>
+              {isFinallyBlock && (
+                <span className="w-fit rounded bg-amber-500 px-1.5 py-0.5 text-[10px] font-medium text-black">
+                  Execute on any outcome
+                </span>
+              )}
             </div>
           </div>
           <div className="flex gap-2">
@@ -235,6 +243,7 @@ function WorkflowRunTimelineBlockItem({
               onActionClick={onActionClick}
               onBlockItemClick={onBlockItemClick}
               onThoughtCardClick={onThoughtCardClick}
+              finallyBlockLabel={finallyBlockLabel}
             />
           );
         }

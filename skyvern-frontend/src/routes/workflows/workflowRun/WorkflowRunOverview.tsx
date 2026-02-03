@@ -77,10 +77,13 @@ function WorkflowRunOverview() {
   }
 
   const workflowRunIsFinalized = statusIsFinalized(workflowRun);
+  const finallyBlockLabel =
+    workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
   const selection = findActiveItem(
     workflowRunTimeline,
     active,
     workflowRunIsFinalized,
+    finallyBlockLabel,
   );
 
   const browserSessionId = workflowRun.browser_session_id;

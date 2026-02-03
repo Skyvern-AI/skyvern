@@ -31,10 +31,26 @@ function findActiveItem(
   timeline: Array<WorkflowRunTimelineItem>,
   target: string | null,
   workflowRunIsFinalized: boolean,
+  finallyBlockLabel?: string | null,
 ): WorkflowRunOverviewActiveElement {
   if (target === null) {
     if (!workflowRunIsFinalized) {
       return "stream";
+    }
+    // If there's a finally block, try to show it first when workflow is finalized
+    if (finallyBlockLabel && timeline?.length > 0) {
+      const finallyBlock = timeline.find(
+        (item) => isBlockItem(item) && item.block.label === finallyBlockLabel,
+      );
+      if (finallyBlock && isBlockItem(finallyBlock)) {
+        if (
+          finallyBlock.block.actions &&
+          finallyBlock.block.actions.length > 0
+        ) {
+          return finallyBlock.block.actions[0]!;
+        }
+        return finallyBlock.block;
+      }
     }
     if (timeline?.length > 0) {
       const timelineItem = timeline![0];

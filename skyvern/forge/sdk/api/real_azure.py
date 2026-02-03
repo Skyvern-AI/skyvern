@@ -23,6 +23,7 @@ from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential
 # Register custom mime types for mimetypes guessing
 add_type("application/json", ".har")
 add_type("text/plain", ".log")
+add_type("application/zstd", ".zst")
 
 LOG = structlog.get_logger()
 

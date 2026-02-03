@@ -6,7 +6,6 @@ import {
 } from "@/components/ui/accordion";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useCallback } from "react";
 import { NodeHeader } from "../components/NodeHeader";
@@ -40,7 +39,12 @@ import { CodeIcon, PlusIcon, MagicWandIcon } from "@radix-ui/react-icons";
 import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 import { CurlImportDialog } from "./CurlImportDialog";
 import { QuickHeadersDialog } from "./QuickHeadersDialog";
-import { MethodBadge, UrlValidator, RequestPreview } from "./HttpUtils";
+import {
+  MethodBadge,
+  UrlValidator,
+  RequestPreview,
+  JsonValidator,
+} from "./HttpUtils";
 import { useRerender } from "@/hooks/useRerender";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
@@ -67,13 +71,11 @@ const filesTooltip =
 const timeoutTooltip = "Request timeout in seconds.";
 const followRedirectsTooltip =
   "Whether to automatically follow HTTP redirects.";
+const downloadFilenameTooltip =
+  "The complete filename (without extension) for downloaded files. Extension is automatically determined from the response Content-Type.";
 
 function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
-  const { editable } = data;
-  const [label] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
+  const { editable, label } = data;
   const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
@@ -274,6 +276,7 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
               minHeight="80px"
               maxHeight="160px"
             />
+            <JsonValidator value={data.headers} />
           </div>
 
           {/* Body Section */}
@@ -315,6 +318,7 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
                 minHeight="100px"
                 maxHeight="200px"
               />
+              <JsonValidator value={data.body} />
             </div>
           )}
 
@@ -336,6 +340,7 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
                 minHeight="80px"
                 maxHeight="160px"
               />
+              <JsonValidator value={data.files} />
             </div>
           )}
 
@@ -430,6 +435,43 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
                       />
                     </div>
                   </div>
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-slate-300">
+                        Save Response as File
+                      </Label>
+                      <HelpTooltip content="When enabled, the response body will be saved as a file instead of being parsed as JSON/text." />
+                    </div>
+                    <Switch
+                      checked={data.saveResponseAsFile}
+                      onCheckedChange={(checked) => {
+                        update({ saveResponseAsFile: checked });
+                      }}
+                      disabled={!editable}
+                    />
+                  </div>
+                  {data.saveResponseAsFile && (
+                    <div className="space-y-2 border-l-2 border-slate-600 pl-4">
+                      <div className="flex gap-2">
+                        <Label className="text-xs text-slate-300">
+                          Download Filename
+                        </Label>
+                        <HelpTooltip content={downloadFilenameTooltip} />
+                      </div>
+                      <Input
+                        type="text"
+                        value={data.downloadFilename}
+                        onChange={(e) => {
+                          update({ downloadFilename: e.target.value });
+                        }}
+                        placeholder="Auto-generated from URL"
+                        className="nopan text-xs"
+                        disabled={!editable}
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
             </AccordionContent>

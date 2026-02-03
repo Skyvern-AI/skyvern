@@ -41,6 +41,7 @@ class BlockType(StrEnum):
     PDF_PARSER = "pdf_parser"
     HTTP_REQUEST = "http_request"
     HUMAN_INTERACTION = "human_interaction"
+    PRINT_PAGE = "print_page"
 
 
 class BlockStatus(StrEnum):
@@ -66,6 +67,13 @@ class FileType(StrEnum):
     CSV = "csv"
     EXCEL = "excel"
     PDF = "pdf"
+
+
+class PDFFormat(StrEnum):
+    A4 = "A4"
+    LETTER = "Letter"
+    LEGAL = "Legal"
+    TABLOID = "Tabloid"
 
 
 class FileStorageType(StrEnum):
@@ -539,8 +547,20 @@ class HttpRequestBlockYAML(BlockYAML):
     files: dict[str, str] | None = None  # Dictionary mapping field names to file paths/URLs for multipart file uploads
     timeout: int = 30
     follow_redirects: bool = True
+    download_filename: str | None = None
+    save_response_as_file: bool = False
 
     # Parameter keys for templating
+    parameter_keys: list[str] | None = None
+
+
+class PrintPageBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.PRINT_PAGE] = BlockType.PRINT_PAGE  # type: ignore
+    include_timestamp: bool = True
+    custom_filename: str | None = None
+    format: PDFFormat = PDFFormat.A4
+    landscape: bool = False
+    print_background: bool = True
     parameter_keys: list[str] | None = None
 
 
@@ -581,6 +601,7 @@ BLOCK_YAML_SUBCLASSES = (
     | TaskV2BlockYAML
     | HttpRequestBlockYAML
     | ConditionalBlockYAML
+    | PrintPageBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
@@ -589,6 +610,7 @@ class WorkflowDefinitionYAML(BaseModel):
     version: int = 1
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
+    finally_block_label: str | None = None
 
     @model_validator(mode="after")
     def validate_unique_block_labels(cls, workflow: "WorkflowDefinitionYAML") -> "WorkflowDefinitionYAML":
@@ -600,6 +622,12 @@ class WorkflowDefinitionYAML(BaseModel):
             raise ValueError(
                 f"Block labels must be unique within a workflow. "
                 f"Found duplicate label(s): {', '.join(unique_duplicates)}"
+            )
+
+        if workflow.finally_block_label and workflow.finally_block_label not in labels:
+            raise ValueError(
+                f"finally_block_label '{workflow.finally_block_label}' does not reference a valid block. "
+                f"Available labels: {', '.join(labels) if labels else '(none)'}"
             )
 
         return workflow

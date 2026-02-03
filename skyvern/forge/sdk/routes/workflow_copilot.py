@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -5,12 +6,17 @@ from typing import Any
 
 import structlog
 import yaml
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
+from pydantic import ValidationError
+from sse_starlette import EventSourceResponse
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
+from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream, FastAPIEventSourceStream
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.routes.run_blocks import DEFAULT_LOGIN_PROMPT
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -19,11 +25,21 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryResponse,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
-    WorkflowCopilotChatResponse,
     WorkflowCopilotChatSender,
+    WorkflowCopilotProcessingUpdate,
+    WorkflowCopilotStreamErrorUpdate,
+    WorkflowCopilotStreamMessageType,
+    WorkflowCopilotStreamResponseUpdate,
 )
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.schemas.workflows import LoginBlockYAML, WorkflowCreateYAMLRequest
+from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
+from skyvern.forge.sdk.workflow.models.parameter import ParameterType
+from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.workflows import (
+    LoginBlockYAML,
+    WorkflowCreateYAMLRequest,
+)
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
 CHAT_HISTORY_CONTEXT_MESSAGES = 10
@@ -44,7 +60,7 @@ async def _get_debug_artifact(organization_id: str, workflow_run_id: str) -> Art
     artifacts = await app.DATABASE.get_artifacts_for_run(
         run_id=workflow_run_id, organization_id=organization_id, artifact_types=[ArtifactType.VISIBLE_ELEMENTS_TREE]
     )
-    return artifacts[0] if isinstance(artifacts, list) else None
+    return artifacts[0] if isinstance(artifacts, list) and artifacts else None
 
 
 async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None) -> RunInfo | None:
@@ -75,19 +91,41 @@ async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None)
     )
 
 
+def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
+    chat_history_text = ""
+    if chat_history:
+        history_lines = [f"{msg.sender}: {msg.content}" for msg in chat_history]
+        chat_history_text = "\n".join(history_lines)
+    return chat_history_text
+
+
+def _parse_llm_response(llm_response: dict[str, Any] | Any) -> Any:
+    if isinstance(llm_response, dict) and "output" in llm_response:
+        action_data = llm_response["output"]
+    else:
+        action_data = llm_response
+
+    if not isinstance(action_data, dict):
+        LOG.error(
+            "LLM response is not valid JSON",
+            response_type=type(action_data).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Invalid response from LLM",
+        )
+    return action_data
+
+
 async def copilot_call_llm(
+    stream: EventSourceStream,
     organization_id: str,
     chat_request: WorkflowCopilotChatRequest,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str | None,
     debug_run_info_text: str,
-) -> tuple[str, str | None, str | None]:
-    current_datetime = datetime.now(timezone.utc).isoformat()
-
-    chat_history_text = ""
-    if chat_history:
-        history_lines = [f"{msg.sender}: {msg.content}" for msg in chat_history]
-        chat_history_text = "\n".join(history_lines)
+) -> tuple[str, Workflow | None, str | None]:
+    chat_history_text = _format_chat_history(chat_history)
 
     workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
 
@@ -98,35 +136,52 @@ async def copilot_call_llm(
         user_message=chat_request.message,
         chat_history=chat_history_text,
         global_llm_context=global_llm_context or "",
-        current_datetime=current_datetime,
+        current_datetime=datetime.now(timezone.utc).isoformat(),
         debug_run_info=debug_run_info_text,
     )
 
     LOG.info(
-        "Calling LLM for workflow copilot",
-        prompt_length=len(llm_prompt),
+        "Calling LLM",
+        workflow_permanent_id=chat_request.workflow_permanent_id,
+        workflow_id=chat_request.workflow_id,
+        user_message_len=len(chat_request.message),
+        user_message=chat_request.message,
+        workflow_yaml_len=len(chat_request.workflow_yaml or ""),
+        workflow_yaml=chat_request.workflow_yaml or "",
+        chat_history_len=len(chat_history_text),
+        chat_history=chat_history_text,
+        global_llm_context_len=len(global_llm_context or ""),
+        global_llm_context=global_llm_context or "",
+        workflow_knowledge_base_len=len(workflow_knowledge_base),
+        debug_run_info_len=len(debug_run_info_text),
+        llm_prompt_len=len(llm_prompt),
     )
-    llm_response = await app.LLM_API_HANDLER(
+    llm_api_handler = (
+        await get_llm_handler_for_prompt_type("workflow-copilot", chat_request.workflow_permanent_id, organization_id)
+        or app.LLM_API_HANDLER
+    )
+    llm_start_time = time.monotonic()
+    llm_response = await llm_api_handler(
         prompt=llm_prompt,
         prompt_name="workflow-copilot",
         organization_id=organization_id,
     )
+    LOG.info(
+        "LLM response",
+        workflow_permanent_id=chat_request.workflow_permanent_id,
+        workflow_id=chat_request.workflow_id,
+        duration_seconds=time.monotonic() - llm_start_time,
+        user_message_len=len(chat_request.message),
+        workflow_yaml_len=len(chat_request.workflow_yaml or ""),
+        chat_history_len=len(chat_history_text),
+        global_llm_context_len=len(global_llm_context or ""),
+        debug_run_info_len=len(debug_run_info_text),
+        workflow_knowledge_base_len=len(workflow_knowledge_base),
+        llm_response_len=len(llm_response),
+        llm_response=llm_response,
+    )
 
-    if isinstance(llm_response, dict) and "output" in llm_response:
-        action_data = llm_response["output"]
-    else:
-        action_data = llm_response
-
-    if not isinstance(action_data, dict):
-        LOG.error(
-            "LLM response is not valid JSON",
-            organization_id=organization_id,
-            response_type=type(action_data).__name__,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Invalid response from LLM",
-        )
+    action_data = _parse_llm_response(llm_response)
 
     action_type = action_data.get("type")
     user_response_value = action_data.get("user_response")
@@ -136,6 +191,8 @@ async def copilot_call_llm(
         user_response = str(user_response_value)
     LOG.info(
         "LLM response received",
+        workflow_permanent_id=chat_request.workflow_permanent_id,
+        workflow_id=chat_request.workflow_id,
         organization_id=organization_id,
         action_type=action_type,
     )
@@ -145,8 +202,40 @@ async def copilot_call_llm(
         global_llm_context = str(global_llm_context)
 
     if action_type == "REPLACE_WORKFLOW":
-        workflow_yaml = await _process_workflow_yaml(action_data)
-        return user_response, workflow_yaml, global_llm_context
+        llm_workflow_yaml = action_data.get("workflow_yaml", "")
+        try:
+            updated_workflow = _process_workflow_yaml(
+                workflow_id=chat_request.workflow_id,
+                workflow_permanent_id=chat_request.workflow_permanent_id,
+                organization_id=organization_id,
+                workflow_yaml=llm_workflow_yaml,
+            )
+        except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
+            await stream.send(
+                WorkflowCopilotProcessingUpdate(
+                    type=WorkflowCopilotStreamMessageType.PROCESSING_UPDATE,
+                    status="Validating workflow definition...",
+                    timestamp=datetime.now(timezone.utc),
+                )
+            )
+            corrected_workflow_yaml = await _auto_correct_workflow_yaml(
+                llm_api_handler=llm_api_handler,
+                organization_id=organization_id,
+                user_response=user_response,
+                workflow_yaml=llm_workflow_yaml,
+                chat_history=chat_history,
+                global_llm_context=global_llm_context,
+                debug_run_info_text=debug_run_info_text,
+                error=e,
+            )
+            updated_workflow = _process_workflow_yaml(
+                workflow_id=chat_request.workflow_id,
+                workflow_permanent_id=chat_request.workflow_permanent_id,
+                organization_id=organization_id,
+                workflow_yaml=corrected_workflow_yaml,
+            )
+
+        return user_response, updated_workflow, global_llm_context
     elif action_type == "REPLY":
         return user_response, None, global_llm_context
     elif action_type == "ASK_QUESTION":
@@ -160,159 +249,264 @@ async def copilot_call_llm(
         return "I received your request but I'm not sure how to help. Could you rephrase?", None, None
 
 
-async def _process_workflow_yaml(action_data: dict[str, Any]) -> None | str:
-    workflow_yaml = action_data.get("workflow_yaml", "")
+async def _auto_correct_workflow_yaml(
+    llm_api_handler: LLMAPIHandler,
+    organization_id: str,
+    user_response: str,
+    workflow_yaml: str,
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+    global_llm_context: str | None,
+    debug_run_info_text: str,
+    error: Exception,
+) -> str:
+    failure_reason = f"{error.__class__.__name__}: {error}"
 
-    try:
-        parsed_yaml = yaml.safe_load(workflow_yaml)
-    except yaml.YAMLError as e:
-        LOG.error(
-            "Invalid YAML from LLM",
-            error=str(e),
-            yaml=f"\n{str(e)}\n{workflow_yaml}",
+    new_chat_history = chat_history[:]
+    new_chat_history.append(
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.AI,
+            content=user_response,
+            created_at=datetime.now(timezone.utc),
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"LLM generated invalid YAML: {str(e)}",
-        )
+    )
 
-    try:
-        # Fixing trivial common LLM mistakes
-        workflow_definition = parsed_yaml.get("workflow_definition", None)
-        if workflow_definition:
-            blocks = workflow_definition.get("blocks", [])
-            for block in blocks:
-                block["title"] = block.get("title", "")
+    workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
+    llm_prompt = prompt_engine.load_prompt(
+        template="workflow-copilot",
+        workflow_knowledge_base=workflow_knowledge_base,
+        workflow_yaml=workflow_yaml,
+        user_message=f"Workflow YAML parsing failed, please fix it: {failure_reason}",
+        chat_history=_format_chat_history(new_chat_history),
+        global_llm_context=global_llm_context or "",
+        current_datetime=datetime.now(timezone.utc).isoformat(),
+        debug_run_info=debug_run_info_text,
+    )
+    llm_start_time = time.monotonic()
+    llm_response = await llm_api_handler(
+        prompt=llm_prompt,
+        prompt_name="workflow-copilot",
+        organization_id=organization_id,
+    )
+    LOG.info(
+        "Auto-correction LLM response",
+        duration_seconds=time.monotonic() - llm_start_time,
+        llm_response_len=len(llm_response),
+        llm_response=llm_response,
+    )
+    action_data = _parse_llm_response(llm_response)
 
-        workflow = WorkflowCreateYAMLRequest.model_validate(parsed_yaml)
+    return action_data.get("workflow_yaml", workflow_yaml)
 
-        # Post-processing
-        for block in workflow.workflow_definition.blocks:
-            if isinstance(block, LoginBlockYAML) and not block.navigation_goal:
-                block.navigation_goal = DEFAULT_LOGIN_PROMPT
 
-        workflow_yaml = yaml.safe_dump(workflow.model_dump(mode="json"), sort_keys=False)
-    except Exception as e:
-        LOG.error(
-            "YAML from LLM does not conform to Skyvern workflow schema",
-            error=str(e),
-            yaml=f"\n{str(e)}\n{workflow_yaml}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"LLM generated YAML that doesn't match workflow schema: {str(e)}",
-        )
-    return workflow_yaml
+def _process_workflow_yaml(
+    workflow_id: str,
+    workflow_permanent_id: str,
+    organization_id: str,
+    workflow_yaml: str,
+) -> Workflow:
+    parsed_yaml = yaml.safe_load(workflow_yaml)
+
+    # Fixing trivial common LLM mistakes
+    workflow_definition = parsed_yaml.get("workflow_definition", None)
+    if workflow_definition:
+        blocks = workflow_definition.get("blocks", [])
+        for block in blocks:
+            block["title"] = block.get("title", "")
+
+    workflow_yaml_request = WorkflowCreateYAMLRequest.model_validate(parsed_yaml)
+
+    # Post-processing
+    for block in workflow_yaml_request.workflow_definition.blocks:
+        if isinstance(block, LoginBlockYAML) and not block.navigation_goal:
+            block.navigation_goal = DEFAULT_LOGIN_PROMPT
+
+    workflow_yaml_request.workflow_definition.parameters = [
+        p for p in workflow_yaml_request.workflow_definition.parameters if p.parameter_type != ParameterType.OUTPUT
+    ]
+
+    updated_workflow_definition = convert_workflow_definition(
+        workflow_definition_yaml=workflow_yaml_request.workflow_definition,
+        workflow_id=workflow_id,
+    )
+
+    now = datetime.now(timezone.utc)
+    return Workflow(
+        workflow_id=workflow_id,
+        organization_id=organization_id,
+        title=workflow_yaml_request.title or "",
+        workflow_permanent_id=workflow_permanent_id,
+        version=1,
+        is_saved_task=workflow_yaml_request.is_saved_task,
+        description=workflow_yaml_request.description,
+        workflow_definition=updated_workflow_definition,
+        proxy_location=workflow_yaml_request.proxy_location,
+        webhook_callback_url=workflow_yaml_request.webhook_callback_url,
+        persist_browser_session=workflow_yaml_request.persist_browser_session or False,
+        model=workflow_yaml_request.model,
+        max_screenshot_scrolls=workflow_yaml_request.max_screenshot_scrolls,
+        extra_http_headers=workflow_yaml_request.extra_http_headers,
+        run_with=workflow_yaml_request.run_with,
+        ai_fallback=workflow_yaml_request.ai_fallback,
+        cache_key=workflow_yaml_request.cache_key,
+        run_sequentially=workflow_yaml_request.run_sequentially,
+        sequential_key=workflow_yaml_request.sequential_key,
+        created_at=now,
+        modified_at=now,
+    )
 
 
 @base_router.post("/workflow/copilot/chat-post", include_in_schema=False)
 async def workflow_copilot_chat_post(
+    request: Request,
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
-) -> WorkflowCopilotChatResponse:
-    LOG.info(
-        "Workflow copilot chat request",
-        workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
-        workflow_run_id=chat_request.workflow_run_id,
-        message=chat_request.message,
-        workflow_yaml_length=len(chat_request.workflow_yaml),
-        organization_id=organization.organization_id,
-    )
-
-    request_started_at = datetime.now(timezone.utc)
-
-    if chat_request.workflow_copilot_chat_id:
-        chat = await app.DATABASE.get_workflow_copilot_chat_by_id(
-            organization_id=organization.organization_id,
+) -> EventSourceResponse:
+    async def stream_handler(stream: EventSourceStream) -> None:
+        LOG.info(
+            "Workflow copilot chat request",
             workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
-        )
-        if not chat:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
-        if chat_request.workflow_permanent_id != chat.workflow_permanent_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wrong workflow permanent ID")
-    else:
-        chat = await app.DATABASE.create_workflow_copilot_chat(
+            workflow_run_id=chat_request.workflow_run_id,
+            message=chat_request.message,
+            workflow_yaml_length=len(chat_request.workflow_yaml),
             organization_id=organization.organization_id,
-            workflow_permanent_id=chat_request.workflow_permanent_id,
         )
 
-    chat_messages = await app.DATABASE.get_workflow_copilot_chat_messages(
-        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-    )
-    global_llm_context = None
-    for message in reversed(chat_messages):
-        if message.global_llm_context is not None:
-            global_llm_context = message.global_llm_context
-            break
+        try:
+            await stream.send(
+                WorkflowCopilotProcessingUpdate(
+                    type=WorkflowCopilotStreamMessageType.PROCESSING_UPDATE,
+                    status="Processing...",
+                    timestamp=datetime.now(timezone.utc),
+                )
+            )
 
-    debug_run_info = await _get_debug_run_info(organization.organization_id, chat_request.workflow_run_id)
+            if chat_request.workflow_copilot_chat_id:
+                chat = await app.DATABASE.get_workflow_copilot_chat_by_id(
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+                )
+                if not chat:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
+                if chat_request.workflow_permanent_id != chat.workflow_permanent_id:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wrong workflow permanent ID")
+            else:
+                chat = await app.DATABASE.create_workflow_copilot_chat(
+                    organization_id=organization.organization_id,
+                    workflow_permanent_id=chat_request.workflow_permanent_id,
+                )
 
-    # Format debug run info for prompt
-    debug_run_info_text = ""
-    if debug_run_info:
-        debug_run_info_text = f"Block Label: {debug_run_info.block_label}"
-        debug_run_info_text += f" Block Type: {debug_run_info.block_type}"
-        debug_run_info_text += f" Status: {debug_run_info.block_status}"
-        if debug_run_info.failure_reason:
-            debug_run_info_text += f"\nFailure Reason: {debug_run_info.failure_reason}"
-        if debug_run_info.html:
-            debug_run_info_text += f"\n\nVisible Elements Tree (HTML):\n{debug_run_info.html}"
+            chat_messages = await app.DATABASE.get_workflow_copilot_chat_messages(
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            )
+            global_llm_context = None
+            for message in reversed(chat_messages):
+                if message.global_llm_context is not None:
+                    global_llm_context = message.global_llm_context
+                    break
 
-    await app.DATABASE.create_workflow_copilot_chat_message(
-        organization_id=chat.organization_id,
-        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-        sender=WorkflowCopilotChatSender.USER,
-        content=chat_request.message,
-    )
+            debug_run_info = await _get_debug_run_info(organization.organization_id, chat_request.workflow_run_id)
 
-    try:
-        user_response, updated_workflow_yaml, updated_global_llm_context = await copilot_call_llm(
-            organization.organization_id,
-            chat_request,
-            convert_to_history_messages(chat_messages[-CHAT_HISTORY_CONTEXT_MESSAGES:]),
-            global_llm_context,
-            debug_run_info_text,
-        )
-    except HTTPException:
-        raise
-    except LLMProviderError as e:
-        LOG.error(
-            "LLM provider error",
-            organization_id=organization.organization_id,
-            error=str(e),
-            exc_info=True,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to process your request. Please try again.",
-        )
-    except Exception as e:
-        LOG.error(
-            "Unexpected error in workflow copilot",
-            organization_id=organization.organization_id,
-            error=str(e),
-            exc_info=True,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred: {str(e)}",
-        )
+            # Format debug run info for prompt
+            debug_run_info_text = ""
+            if debug_run_info:
+                debug_run_info_text = f"Block Label: {debug_run_info.block_label}"
+                debug_run_info_text += f" Block Type: {debug_run_info.block_type}"
+                debug_run_info_text += f" Status: {debug_run_info.block_status}"
+                if debug_run_info.failure_reason:
+                    debug_run_info_text += f"\nFailure Reason: {debug_run_info.failure_reason}"
+                if debug_run_info.html:
+                    debug_run_info_text += f"\n\nVisible Elements Tree (HTML):\n{debug_run_info.html}"
 
-    assistant_message = await app.DATABASE.create_workflow_copilot_chat_message(
-        organization_id=chat.organization_id,
-        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-        sender=WorkflowCopilotChatSender.AI,
-        content=user_response,
-        global_llm_context=updated_global_llm_context,
-    )
+            await stream.send(
+                WorkflowCopilotProcessingUpdate(
+                    type=WorkflowCopilotStreamMessageType.PROCESSING_UPDATE,
+                    status="Thinking...",
+                    timestamp=datetime.now(timezone.utc),
+                )
+            )
 
-    return WorkflowCopilotChatResponse(
-        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-        message=user_response,
-        updated_workflow_yaml=updated_workflow_yaml,
-        request_time=request_started_at,
-        response_time=assistant_message.created_at,
-    )
+            if await stream.is_disconnected():
+                LOG.info(
+                    "Workflow copilot chat request is disconnected before LLM call",
+                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+                )
+                return
+
+            user_response, updated_workflow, updated_global_llm_context = await copilot_call_llm(
+                stream,
+                organization.organization_id,
+                chat_request,
+                convert_to_history_messages(chat_messages[-CHAT_HISTORY_CONTEXT_MESSAGES:]),
+                global_llm_context,
+                debug_run_info_text,
+            )
+
+            if await stream.is_disconnected():
+                LOG.info(
+                    "Workflow copilot chat request is disconnected after LLM call",
+                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+                )
+                return
+
+            await app.DATABASE.create_workflow_copilot_chat_message(
+                organization_id=chat.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                sender=WorkflowCopilotChatSender.USER,
+                content=chat_request.message,
+            )
+
+            assistant_message = await app.DATABASE.create_workflow_copilot_chat_message(
+                organization_id=chat.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                sender=WorkflowCopilotChatSender.AI,
+                content=user_response,
+                global_llm_context=updated_global_llm_context,
+            )
+
+            await stream.send(
+                WorkflowCopilotStreamResponseUpdate(
+                    type=WorkflowCopilotStreamMessageType.RESPONSE,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    message=user_response,
+                    updated_workflow=updated_workflow.model_dump(mode="json") if updated_workflow else None,
+                    response_time=assistant_message.created_at,
+                )
+            )
+        except HTTPException as exc:
+            await stream.send(
+                WorkflowCopilotStreamErrorUpdate(
+                    type=WorkflowCopilotStreamMessageType.ERROR,
+                    error=exc.detail,
+                )
+            )
+        except LLMProviderError as exc:
+            LOG.error(
+                "LLM provider error",
+                organization_id=organization.organization_id,
+                error=str(exc),
+                exc_info=True,
+            )
+            await stream.send(
+                WorkflowCopilotStreamErrorUpdate(
+                    type=WorkflowCopilotStreamMessageType.ERROR,
+                    error="Failed to process your request. Please try again.",
+                )
+            )
+        except Exception as exc:
+            LOG.error(
+                "Unexpected error in workflow copilot",
+                organization_id=organization.organization_id,
+                error=str(exc),
+                exc_info=True,
+            )
+            await stream.send(
+                WorkflowCopilotStreamErrorUpdate(
+                    type=WorkflowCopilotStreamMessageType.ERROR,
+                    error="An error occurred. Please try again.",
+                )
+            )
+
+    return FastAPIEventSourceStream.create(request, stream_handler)
 
 
 @base_router.get("/workflow/copilot/chat-history", include_in_schema=False)

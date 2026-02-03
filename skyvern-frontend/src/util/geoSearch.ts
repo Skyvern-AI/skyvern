@@ -20,13 +20,19 @@ export type GroupedSearchResults = {
   cities: SearchResultItem[];
 };
 
-let cscModule: typeof import("country-state-city") | null = null;
+// Store the promise so concurrent calls share one import
+let cscModulePromise: Promise<typeof import("country-state-city")> | null =
+  null;
 
-async function loadCsc() {
-  if (!cscModule) {
-    cscModule = await import("country-state-city");
+function loadCsc() {
+  if (!cscModulePromise) {
+    cscModulePromise = import("country-state-city").catch((error) => {
+      // Reset on failure so next user action can retry
+      cscModulePromise = null;
+      throw error;
+    });
   }
-  return cscModule;
+  return cscModulePromise;
 }
 
 export async function searchGeoData(

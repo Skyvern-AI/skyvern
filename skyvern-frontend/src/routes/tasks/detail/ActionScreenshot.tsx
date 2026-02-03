@@ -25,9 +25,9 @@ function ActionScreenshot({ artifactId, stepId, index, taskStatus }: Props) {
   } = useQuery<ArtifactApiResponse>({
     queryKey: ["artifact", artifactId],
     queryFn: async () => {
-      const client = await getClient(credentialGetter);
+      const client = await getClient(credentialGetter, "sans-api-v1");
       return client
-        .get(`${apiPathPrefix}/artifacts/${artifactId}`)
+        .get(`/artifacts/${artifactId}`)
         .then((response) => response.data);
     },
     enabled: Boolean(artifactId),

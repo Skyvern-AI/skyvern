@@ -11,6 +11,8 @@ export type HttpRequestNodeData = NodeBaseData & {
   timeout: number;
   followRedirects: boolean;
   parameterKeys: Array<string>;
+  downloadFilename: string;
+  saveResponseAsFile: boolean;
 };
 
 export type HttpRequestNode = Node<HttpRequestNodeData, "http_request">;
@@ -29,6 +31,8 @@ export const httpRequestNodeDefaultData: HttpRequestNodeData = {
   parameterKeys: [],
   editable: true,
   model: null,
+  downloadFilename: "",
+  saveResponseAsFile: false,
 };
 
 export function isHttpRequestNode(node: Node): node is HttpRequestNode {

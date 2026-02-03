@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.6"
+version = "1.0.10"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -41,7 +41,7 @@ dependencies = [
     "filetype>=1.2.0,<2",
     "aioredlock>=0.7.3,<0.8",
     "tldextract>=5.1.2,<6",
-    "websockets~=12.0",
+    "websockets>=12.0,<15.1",
     "email-validator>=2.2.0,<3",
     "requests-toolbelt>=1.0.0,<2",
     "rich[jupyter]>=13.7.0,<14",
@@ -68,6 +68,8 @@ dependencies = [
     "jsonschema>=4.25.1",
     "python-calamine>=0.6.1",
     "urllib3>=2.6.0",
+    "zstandard>=0.25.0",
+    "sse-starlette>=3.0.3,<4",
 ]
 
 [dependency-groups]
@@ -102,6 +104,7 @@ dev = [
     "moto[s3, server]>=5.1.5,<6",
     "curlify>=3.0.0",
     "openpyxl>=3.1.0",
+    "gspread>=6",
 ]
 
 [tool.hatch.build]
@@ -199,4 +202,4 @@ plugins = "sqlalchemy.ext.mypy.plugin"
 skyvern = "skyvern.cli.commands:cli_app"
 
 [tool.pytest.ini_options]
-norecursedirs = ["eval"]
+norecursedirs = ["eval", "tests/sdk"]

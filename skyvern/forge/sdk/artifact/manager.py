@@ -279,13 +279,13 @@ class ArtifactManager:
             path=path,
         )
 
-    async def create_workflow_run_block_artifact(
+    async def _create_workflow_run_block_artifact_internal(
         self,
         workflow_run_block: WorkflowRunBlock,
         artifact_type: ArtifactType,
         data: bytes | None = None,
         path: str | None = None,
-    ) -> str:
+    ) -> tuple[str, str]:
         artifact_id = generate_artifact_id()
         uri = app.STORAGE.build_workflow_run_block_uri(
             organization_id=workflow_run_block.organization_id,
@@ -293,7 +293,7 @@ class ArtifactManager:
             workflow_run_block=workflow_run_block,
             artifact_type=artifact_type,
         )
-        return await self._create_artifact(
+        await self._create_artifact(
             aio_task_primary_key=workflow_run_block.workflow_run_block_id,
             artifact_id=artifact_id,
             artifact_type=artifact_type,
@@ -301,6 +301,36 @@ class ArtifactManager:
             workflow_run_block_id=workflow_run_block.workflow_run_block_id,
             workflow_run_id=workflow_run_block.workflow_run_id,
             organization_id=workflow_run_block.organization_id,
+            data=data,
+            path=path,
+        )
+        return artifact_id, uri
+
+    async def create_workflow_run_block_artifact(
+        self,
+        workflow_run_block: WorkflowRunBlock,
+        artifact_type: ArtifactType,
+        data: bytes | None = None,
+        path: str | None = None,
+    ) -> str:
+        artifact_id, _ = await self._create_workflow_run_block_artifact_internal(
+            workflow_run_block=workflow_run_block,
+            artifact_type=artifact_type,
+            data=data,
+            path=path,
+        )
+        return artifact_id
+
+    async def create_workflow_run_block_artifact_with_uri(
+        self,
+        workflow_run_block: WorkflowRunBlock,
+        artifact_type: ArtifactType,
+        data: bytes | None = None,
+        path: str | None = None,
+    ) -> tuple[str, str]:
+        return await self._create_workflow_run_block_artifact_internal(
+            workflow_run_block=workflow_run_block,
+            artifact_type=artifact_type,
             data=data,
             path=path,
         )

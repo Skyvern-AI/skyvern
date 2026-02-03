@@ -45,19 +45,19 @@ async def verify_browser_session(
     """
     Verify the browser session exists, and is usable.
     """
-
     if settings.ENV == "local":
         dummy_browser_session = AddressablePersistentBrowserSession(
             persistent_browser_session_id=browser_session_id,
             organization_id=organization_id,
             browser_address="0.0.0.0:9223",
+            ip_address="localhost",
             created_at=datetime.now(),
             modified_at=datetime.now(),
         )
 
         return dummy_browser_session
 
-    browser_session = await app.DATABASE.get_persistent_browser_session(browser_session_id, organization_id)
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, organization_id)
 
     if not browser_session:
         LOG.info(
@@ -199,6 +199,7 @@ async def verify_workflow_run(
             persistent_browser_session_id=workflow_run_id,
             organization_id=organization_id,
             browser_address="0.0.0.0:9223",
+            ip_address="localhost",
             created_at=datetime.now(),
             modified_at=datetime.now(),
         )

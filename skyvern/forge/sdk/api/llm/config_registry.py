@@ -97,6 +97,24 @@ if settings.ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_MINI_FLEX",
+        LLMConfig(
+            "gpt-5-mini-2025-08-07",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+            litellm_params=LiteLLMParams(
+                api_key=settings.OPENAI_API_KEY,
+                model_info={"model_name": "gpt-5-mini-2025-08-07"},
+                service_tier="flex",
+                timeout=900.0,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT5_NANO",
         LLMConfig(
             "gpt-5-nano-2025-08-07",

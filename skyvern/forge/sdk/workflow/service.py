@@ -8,11 +8,21 @@ from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any, Literal, cast
 
 import httpx
 import structlog
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+# Import LockError for specific exception handling; fallback for OSS without redis
+try:
+    from redis.exceptions import LockError
+except ImportError:
+    # redis not installed (OSS deployment) - create placeholder that's never raised
+    class LockError(Exception):  # type: ignore[no-redef]
+        pass
+
 
 import skyvern
 from skyvern import analytics
@@ -37,10 +47,10 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -49,45 +59,18 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.exceptions import (
-    ContextParameterSourceNotDefined,
-    InvalidWaitBlockTime,
     InvalidWorkflowDefinition,
-    WorkflowDefinitionHasDuplicateParameterKeys,
-    WorkflowDefinitionHasReservedParameterKeys,
-    WorkflowParameterMissingRequiredValue,
+    WorkflowVersionConflict,
 )
 from skyvern.forge.sdk.workflow.models.block import (
-    ActionBlock,
     BlockTypeVar,
-    BranchCondition,
-    CodeBlock,
     ConditionalBlock,
-    DownloadToS3Block,
     ExtractionBlock,
-    FileDownloadBlock,
-    FileParserBlock,
-    FileUploadBlock,
-    ForLoopBlock,
-    HttpRequestBlock,
-    HumanInteractionBlock,
-    JinjaBranchCriteria,
-    LoginBlock,
     NavigationBlock,
-    PDFParserBlock,
-    PromptBranchCriteria,
-    SendEmailBlock,
-    TaskBlock,
     TaskV2Block,
-    TextPromptBlock,
-    UploadToS3Block,
-    UrlBlock,
-    ValidationBlock,
-    WaitBlock,
     get_all_blocks,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
-    PARAMETER_TYPE,
-    RESERVED_PARAMETER_KEYS,
     AWSSecretParameter,
     AzureVaultCredentialParameter,
     BitwardenCreditCardDataParameter,
@@ -97,8 +80,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     CredentialParameter,
     OnePasswordCredentialParameter,
     OutputParameter,
-    Parameter,
-    ParameterType,
     WorkflowParameter,
     WorkflowParameterType,
 )
@@ -112,6 +93,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunResponseBase,
     WorkflowRunStatus,
 )
+from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.runs import (
     ProxyLocationInput,
     RunStatus,
@@ -125,7 +107,6 @@ from skyvern.schemas.workflows import (
     BlockResult,
     BlockStatus,
     BlockType,
-    ForLoopBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
     WorkflowStatus,
@@ -196,6 +177,7 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
         "disable_cache",
         "next_block_label",
         "version",
+        "model",
     ]
 
     # Use BFS to recursively remove fields from all nested objects
@@ -374,6 +356,78 @@ class WorkflowService:
                 results.extend(WorkflowService._collect_extracted_information(item))
         return results
 
+    async def _generate_urls_from_artifact_ids(
+        self,
+        artifact_ids: list[str],
+        organization_id: str | None,
+    ) -> list[str]:
+        """Generate presigned URLs from artifact IDs."""
+        if not artifact_ids or not organization_id:
+            return []
+
+        artifacts = await app.DATABASE.get_artifacts_by_ids(artifact_ids, organization_id)
+        if not artifacts:
+            return []
+
+        return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
+
+    async def _refresh_output_screenshot_urls(
+        self,
+        value: Any,
+        organization_id: str | None,
+        workflow_run_id: str,
+    ) -> Any:
+        """
+        Recursively walk through output values and generate presigned URLs for screenshots.
+
+        TaskOutput dicts stored in workflow_run_output_parameters contain artifact IDs.
+        This method finds any TaskOutput-like dicts and generates fresh presigned URLs
+        from the stored artifact IDs.
+
+        For backwards compatibility with old data that stored URLs directly (now expired),
+        we also check for task_id and regenerate URLs using the task_id lookup.
+        """
+        if isinstance(value, dict):
+            # Check if this looks like a TaskOutput with screenshot artifact IDs (new format)
+            has_artifact_ids = "task_screenshot_artifact_ids" in value or "workflow_screenshot_artifact_ids" in value
+            # Also check for old format (URLs stored directly) for backwards compat
+            has_old_format = "task_id" in value and ("task_screenshots" in value or "workflow_screenshots" in value)
+
+            if has_artifact_ids:
+                # New format: generate URLs from artifact IDs
+                if value.get("task_screenshot_artifact_ids"):
+                    value["task_screenshots"] = await self._generate_urls_from_artifact_ids(
+                        value["task_screenshot_artifact_ids"],
+                        organization_id,
+                    )
+                if value.get("workflow_screenshot_artifact_ids"):
+                    value["workflow_screenshots"] = await self._generate_urls_from_artifact_ids(
+                        value["workflow_screenshot_artifact_ids"],
+                        organization_id,
+                    )
+            elif has_old_format:
+                # Old format (backwards compat): regenerate URLs using task_id lookup
+                task_id = value.get("task_id")
+                if value.get("task_screenshots"):
+                    value["task_screenshots"] = await self.get_recent_task_screenshot_urls(
+                        organization_id=organization_id,
+                        task_id=task_id,
+                    )
+                if value.get("workflow_screenshots"):
+                    value["workflow_screenshots"] = await self.get_recent_workflow_screenshot_urls(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                    )
+            else:
+                # Recurse into nested dicts
+                for k, v in value.items():
+                    value[k] = await self._refresh_output_screenshot_urls(v, organization_id, workflow_run_id)
+        elif isinstance(value, list):
+            # Recurse into list items
+            for i, item in enumerate(value):
+                value[i] = await self._refresh_output_screenshot_urls(item, organization_id, workflow_run_id)
+        return value
+
     async def _validate_credential_id(self, credential_id: str, organization: Organization) -> None:
         credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
         if credential is None:
@@ -468,6 +522,10 @@ class WorkflowService:
             for workflow_parameter in all_workflow_parameters:
                 if workflow_request.data and workflow_parameter.key in workflow_request.data:
                     request_body_value = workflow_request.data[workflow_parameter.key]
+                    # Fall back to default value if the request explicitly sends null
+                    # This supports API clients (e.g., n8n) that include the key with null value
+                    if request_body_value is None and workflow_parameter.default_value is not None:
+                        request_body_value = workflow_parameter.default_value
                     if self._is_missing_required_value(workflow_parameter, request_body_value):
                         missing_parameters.append(workflow_parameter.key)
                         continue
@@ -768,33 +826,59 @@ class WorkflowService:
             script=workflow_script,
         )
 
+        # Check if there's a finally block configured
+        finally_block_label = workflow.workflow_definition.finally_block_label
+
         if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         ):
             workflow_run = refreshed_workflow_run
-            if workflow_run.status not in (
-                WorkflowRunStatus.canceled,
+
+        pre_finally_status = workflow_run.status
+        pre_finally_failure_reason = workflow_run.failure_reason
+
+        if pre_finally_status not in (
+            WorkflowRunStatus.canceled,
+            WorkflowRunStatus.failed,
+            WorkflowRunStatus.terminated,
+            WorkflowRunStatus.timed_out,
+        ):
+            await self.generate_script_if_needed(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                block_labels=block_labels,
+                blocks_to_update=blocks_to_update,
+            )
+
+        # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
+        should_run_finally = finally_block_label and pre_finally_status != WorkflowRunStatus.canceled
+        if should_run_finally:
+            # Temporarily set to running for terminal workflows (for frontend UX)
+            if pre_finally_status in (
                 WorkflowRunStatus.failed,
                 WorkflowRunStatus.terminated,
                 WorkflowRunStatus.timed_out,
             ):
-                workflow_run = await self.mark_workflow_run_as_completed(
+                workflow_run = await self._update_workflow_run_status(
                     workflow_run_id=workflow_run_id,
+                    status=WorkflowRunStatus.running,
+                    failure_reason=None,
                 )
-                await self.generate_script_if_needed(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                    block_labels=block_labels,
-                    blocks_to_update=blocks_to_update,
-                )
-            else:
-                LOG.info(
-                    "Workflow run is already timed_out, canceled, failed, or terminated, not marking as completed",
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_status=workflow_run.status,
-                    run_with=workflow_run.run_with,
-                )
+            await self._execute_finally_block_if_configured(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                organization=organization,
+                browser_session_id=browser_session_id,
+            )
+
+        workflow_run = await self._finalize_workflow_run_status(
+            workflow_run_id=workflow_run_id,
+            workflow_run=workflow_run,
+            pre_finally_status=pre_finally_status,
+            pre_finally_failure_reason=pre_finally_failure_reason,
+        )
+
         await self.clean_up_workflow(
             workflow=workflow,
             workflow_run=workflow_run,
@@ -1371,6 +1455,46 @@ class WorkflowService:
 
         return workflow_run, False
 
+    async def _execute_finally_block_if_configured(
+        self,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        organization: Organization,
+        browser_session_id: str | None,
+    ) -> None:
+        finally_block_label = workflow.workflow_definition.finally_block_label
+        if not finally_block_label:
+            return
+
+        label_to_block: dict[str, BlockTypeVar] = {block.label: block for block in workflow.workflow_definition.blocks}
+
+        block = label_to_block.get(finally_block_label)
+        if not block:
+            LOG.warning(
+                "Finally block label not found",
+                workflow_run_id=workflow_run.workflow_run_id,
+                finally_block_label=finally_block_label,
+            )
+            return
+
+        try:
+            parameters = block.get_all_parameters(workflow_run.workflow_run_id)
+            await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
+                workflow_run.workflow_run_id, parameters, organization
+            )
+            await block.execute_safe(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=organization.organization_id,
+                browser_session_id=browser_session_id,
+            )
+        except Exception as e:
+            LOG.warning(
+                "Finally block execution failed",
+                workflow_run_id=workflow_run.workflow_run_id,
+                block_label=block.label,
+                error=str(e),
+            )
+
     def _build_workflow_graph(
         self,
         blocks: list[BlockTypeVar],
@@ -1464,30 +1588,35 @@ class WorkflowService:
         sequential_key: str | None = None,
         folder_id: str | None = None,
     ) -> Workflow:
-        return await app.DATABASE.create_workflow(
-            title=title,
-            workflow_definition=workflow_definition.model_dump(),
-            organization_id=organization_id,
-            description=description,
-            proxy_location=proxy_location,
-            webhook_callback_url=webhook_callback_url,
-            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
-            totp_verification_url=totp_verification_url,
-            totp_identifier=totp_identifier,
-            persist_browser_session=persist_browser_session,
-            model=model,
-            workflow_permanent_id=workflow_permanent_id,
-            version=version,
-            is_saved_task=is_saved_task,
-            status=status,
-            extra_http_headers=extra_http_headers,
-            run_with=run_with,
-            cache_key=cache_key,
-            ai_fallback=False if ai_fallback is None else ai_fallback,
-            run_sequentially=run_sequentially,
-            sequential_key=sequential_key,
-            folder_id=folder_id,
-        )
+        try:
+            return await app.DATABASE.create_workflow(
+                title=title,
+                workflow_definition=workflow_definition.model_dump(),
+                organization_id=organization_id,
+                description=description,
+                proxy_location=proxy_location,
+                webhook_callback_url=webhook_callback_url,
+                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
+                persist_browser_session=persist_browser_session,
+                model=model,
+                workflow_permanent_id=workflow_permanent_id,
+                version=version,
+                is_saved_task=is_saved_task,
+                status=status,
+                extra_http_headers=extra_http_headers,
+                run_with=run_with,
+                cache_key=cache_key,
+                ai_fallback=False if ai_fallback is None else ai_fallback,
+                run_sequentially=run_sequentially,
+                sequential_key=sequential_key,
+                folder_id=folder_id,
+            )
+        except IntegrityError as e:
+            if "uc_org_permanent_id_version" in str(e) and workflow_permanent_id:
+                raise WorkflowVersionConflict(workflow_permanent_id) from e
+            raise
 
     async def create_workflow_from_prompt(
         self,
@@ -1843,6 +1972,28 @@ class WorkflowService:
             current_definition = _get_workflow_definition_core_data(previous_valid_workflow.workflow_definition)
             new_definition = _get_workflow_definition_core_data(workflow_definition)
             has_changes = current_definition != new_definition
+
+            # Log definition changes for debugging cache invalidation issues (SKY-7016)
+            if has_changes:
+                LOG.debug(
+                    "Workflow definition has changes, checking for cache invalidation",
+                    workflow_id=workflow.workflow_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=organization_id,
+                    previous_version=previous_valid_workflow.version,
+                    new_version=workflow.version,
+                    current_block_count=len(current_definition.get("blocks", [])),
+                    new_block_count=len(new_definition.get("blocks", [])),
+                    current_param_count=len(current_definition.get("parameters", [])),
+                    new_param_count=len(new_definition.get("parameters", [])),
+                )
+            else:
+                LOG.debug(
+                    "Workflow definition unchanged, skipping cache invalidation check",
+                    workflow_id=workflow.workflow_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=organization_id,
+                )
         else:
             has_changes = False
 
@@ -2162,6 +2313,35 @@ class WorkflowService:
             run_with=run_with,
         )
 
+    async def _finalize_workflow_run_status(
+        self,
+        workflow_run_id: str,
+        workflow_run: WorkflowRun,
+        pre_finally_status: WorkflowRunStatus,
+        pre_finally_failure_reason: str | None,
+    ) -> WorkflowRun:
+        """
+        Set final workflow run status based on pre-finally state.
+        Called unconditionally to ensure unified flow.
+        """
+        if pre_finally_status not in (
+            WorkflowRunStatus.canceled,
+            WorkflowRunStatus.failed,
+            WorkflowRunStatus.terminated,
+            WorkflowRunStatus.timed_out,
+        ):
+            return await self.mark_workflow_run_as_completed(workflow_run_id)
+
+        if workflow_run.status == WorkflowRunStatus.running:
+            # We temporarily set to running for finally block, restore terminal status
+            return await self._update_workflow_run_status(
+                workflow_run_id=workflow_run_id,
+                status=pre_finally_status,
+                failure_reason=pre_finally_failure_reason,
+            )
+
+        return workflow_run
+
     async def mark_workflow_run_as_failed(
         self,
         workflow_run_id: str,
@@ -2299,126 +2479,6 @@ class WorkflowService:
             workflow_id=workflow_id, aws_key=aws_key, key=key, description=description
         )
 
-    async def create_bitwarden_login_credential_parameter(
-        self,
-        workflow_id: str,
-        bitwarden_client_id_aws_secret_key: str,
-        bitwarden_client_secret_aws_secret_key: str,
-        bitwarden_master_password_aws_secret_key: str,
-        key: str,
-        url_parameter_key: str | None = None,
-        description: str | None = None,
-        bitwarden_collection_id: str | None = None,
-        bitwarden_item_id: str | None = None,
-    ) -> BitwardenLoginCredentialParameter:
-        return await app.DATABASE.create_bitwarden_login_credential_parameter(
-            workflow_id=workflow_id,
-            bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
-            bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
-            bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-            key=key,
-            url_parameter_key=url_parameter_key,
-            description=description,
-            bitwarden_collection_id=bitwarden_collection_id,
-            bitwarden_item_id=bitwarden_item_id,
-        )
-
-    async def create_credential_parameter(
-        self,
-        workflow_id: str,
-        key: str,
-        credential_id: str,
-        description: str | None = None,
-    ) -> CredentialParameter:
-        return await app.DATABASE.create_credential_parameter(
-            workflow_id=workflow_id,
-            key=key,
-            credential_id=credential_id,
-            description=description,
-        )
-
-    async def create_onepassword_credential_parameter(
-        self,
-        workflow_id: str,
-        key: str,
-        vault_id: str,
-        item_id: str,
-        description: str | None = None,
-    ) -> OnePasswordCredentialParameter:
-        return await app.DATABASE.create_onepassword_credential_parameter(
-            workflow_id=workflow_id,
-            key=key,
-            vault_id=vault_id,
-            item_id=item_id,
-            description=description,
-        )
-
-    async def create_azure_vault_credential_parameter(
-        self,
-        workflow_id: str,
-        key: str,
-        vault_name: str,
-        username_key: str,
-        password_key: str,
-        totp_secret_key: str | None = None,
-        description: str | None = None,
-    ) -> AzureVaultCredentialParameter:
-        return await app.DATABASE.create_azure_vault_credential_parameter(
-            workflow_id=workflow_id,
-            key=key,
-            vault_name=vault_name,
-            username_key=username_key,
-            password_key=password_key,
-            totp_secret_key=totp_secret_key,
-            description=description,
-        )
-
-    async def create_bitwarden_sensitive_information_parameter(
-        self,
-        workflow_id: str,
-        bitwarden_client_id_aws_secret_key: str,
-        bitwarden_client_secret_aws_secret_key: str,
-        bitwarden_master_password_aws_secret_key: str,
-        bitwarden_collection_id: str,
-        bitwarden_identity_key: str,
-        bitwarden_identity_fields: list[str],
-        key: str,
-        description: str | None = None,
-    ) -> BitwardenSensitiveInformationParameter:
-        return await app.DATABASE.create_bitwarden_sensitive_information_parameter(
-            workflow_id=workflow_id,
-            bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
-            bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
-            bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-            bitwarden_collection_id=bitwarden_collection_id,
-            bitwarden_identity_key=bitwarden_identity_key,
-            bitwarden_identity_fields=bitwarden_identity_fields,
-            key=key,
-            description=description,
-        )
-
-    async def create_bitwarden_credit_card_data_parameter(
-        self,
-        workflow_id: str,
-        bitwarden_client_id_aws_secret_key: str,
-        bitwarden_client_secret_aws_secret_key: str,
-        bitwarden_master_password_aws_secret_key: str,
-        bitwarden_collection_id: str,
-        bitwarden_item_id: str,
-        key: str,
-        description: str | None = None,
-    ) -> BitwardenCreditCardDataParameter:
-        return await app.DATABASE.create_bitwarden_credit_card_data_parameter(
-            workflow_id=workflow_id,
-            bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
-            bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
-            bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-            bitwarden_collection_id=bitwarden_collection_id,
-            bitwarden_item_id=bitwarden_item_id,
-            key=key,
-            description=description,
-        )
-
     async def create_output_parameter(
         self, workflow_id: str, key: str, description: str | None = None
     ) -> OutputParameter:
@@ -2486,15 +2546,15 @@ class WorkflowService:
     async def get_tasks_by_workflow_run_id(self, workflow_run_id: str) -> list[Task]:
         return await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
 
-    async def get_recent_task_screenshot_urls(
+    async def get_recent_task_screenshot_artifacts(
         self,
         *,
         organization_id: str | None,
         task_id: str | None = None,
         task_v2_id: str | None = None,
         limit: int = 3,
-    ) -> list[str]:
-        """Return the latest action/final screenshot URLs for a task (v1 or v2)."""
+    ) -> list[Artifact]:
+        """Return the latest action/final screenshot artifacts for a task (v1 or v2)."""
 
         artifact_types = [ArtifactType.SCREENSHOT_ACTION, ArtifactType.SCREENSHOT_FINAL]
 
@@ -2528,19 +2588,35 @@ class WorkflowService:
                 reverse=True,
             )[:limit]
 
+        return artifacts
+
+    async def get_recent_task_screenshot_urls(
+        self,
+        *,
+        organization_id: str | None,
+        task_id: str | None = None,
+        task_v2_id: str | None = None,
+        limit: int = 3,
+    ) -> list[str]:
+        """Return the latest action/final screenshot URLs for a task (v1 or v2)."""
+        artifacts = await self.get_recent_task_screenshot_artifacts(
+            organization_id=organization_id,
+            task_id=task_id,
+            task_v2_id=task_v2_id,
+            limit=limit,
+        )
         if not artifacts:
             return []
-
         return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
 
-    async def get_recent_workflow_screenshot_urls(
+    async def get_recent_workflow_screenshot_artifacts(
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
         limit: int = 3,
         workflow_run_tasks: list[Task] | None = None,
-    ) -> list[str]:
-        """Return latest screenshots across recent tasks in a workflow run."""
+    ) -> list[Artifact]:
+        """Return latest screenshot artifacts across recent tasks in a workflow run."""
 
         screenshot_artifacts: list[Artifact] = []
         seen_artifact_ids: set[str] = set()
@@ -2586,16 +2662,32 @@ class WorkflowService:
                 if len(screenshot_artifacts) >= limit:
                     break
 
-        if not screenshot_artifacts:
-            return []
+        return screenshot_artifacts
 
-        return await app.ARTIFACT_MANAGER.get_share_links(screenshot_artifacts) or []
+    async def get_recent_workflow_screenshot_urls(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        limit: int = 3,
+        workflow_run_tasks: list[Task] | None = None,
+    ) -> list[str]:
+        """Return latest screenshot URLs across recent tasks in a workflow run."""
+        artifacts = await self.get_recent_workflow_screenshot_artifacts(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            limit=limit,
+            workflow_run_tasks=workflow_run_tasks,
+        )
+        if not artifacts:
+            return []
+        return await app.ARTIFACT_MANAGER.get_share_links(artifacts) or []
 
     async def build_workflow_run_status_response_by_workflow_id(
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
         include_cost: bool = False,
+        include_step_count: bool = False,
     ) -> WorkflowRunResponseBase:
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         if workflow_run is None:
@@ -2607,6 +2699,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             include_cost=include_cost,
+            include_step_count=include_step_count,
         )
 
     async def build_workflow_run_status_response(
@@ -2615,6 +2708,7 @@ class WorkflowService:
         workflow_run_id: str,
         organization_id: str | None = None,
         include_cost: bool = False,
+        include_step_count: bool = False,
     ) -> WorkflowRunResponseBase:
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id)
         if workflow is None:
@@ -2706,6 +2800,10 @@ class WorkflowService:
                 if output.value is not None:
                     extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
+            # Refresh any expired presigned screenshot URLs in the outputs
+            outputs = await self._refresh_output_screenshot_urls(
+                outputs, organization_id=organization_id, workflow_run_id=workflow_run_id
+            )
 
         errors: list[dict[str, Any]] = []
         for task in workflow_run_tasks:
@@ -2713,19 +2811,23 @@ class WorkflowService:
 
         total_steps = None
         total_cost = None
-        if include_cost:
+        if include_step_count or include_cost:
             workflow_run_steps = await app.DATABASE.get_steps_by_task_ids(
                 task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
             )
-            workflow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
-                workflow_run_id=workflow_run_id, organization_id=organization_id
-            )
-            text_prompt_blocks = [block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT]
             total_steps = len(workflow_run_steps)
-            # TODO: This is a temporary cost calculation. We need to implement a more accurate cost calculation.
-            # successful steps are the ones that have a status of completed and the total count of unique step.order
-            successful_steps = [step for step in workflow_run_steps if step.status == StepStatus.completed]
-            total_cost = 0.05 * (len(successful_steps) + len(text_prompt_blocks))
+
+            if include_cost:
+                workflow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
+                    workflow_run_id=workflow_run_id, organization_id=organization_id
+                )
+                text_prompt_blocks = [
+                    block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT
+                ]
+                # TODO: This is a temporary cost calculation. We need to implement a more accurate cost calculation.
+                # successful steps are the ones that have a status of completed and the total count of unique step.order
+                successful_steps = [step for step in workflow_run_steps if step.status == StepStatus.completed]
+                total_cost = 0.05 * (len(successful_steps) + len(text_prompt_blocks))
         return WorkflowRunResponseBase(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
@@ -2836,6 +2938,7 @@ class WorkflowService:
             workflow_permanent_id=workflow_run.workflow_permanent_id,
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow_run.organization_id,
+            include_step_count=True,
         )
         LOG.info(
             "Built workflow run status response",
@@ -2884,6 +2987,7 @@ class WorkflowService:
                 totp_identifier=workflow_run.totp_identifier,
             ),
             errors=workflow_run_status_response.errors,
+            step_count=workflow_run_status_response.total_steps,
         )
         payload_dict: dict = json.loads(workflow_run_status_response.model_dump_json())
         workflow_run_response_dict = json.loads(workflow_run_response.model_dump_json())
@@ -3024,198 +3128,13 @@ class WorkflowService:
         self,
         workflow_id: str,
         workflow_definition_yaml: WorkflowDefinitionYAML,
-        title: str,
-        organization_id: str,
     ) -> WorkflowDefinition:
-        # Create parameters from the request
-        parameters: dict[str, PARAMETER_TYPE] = {}
-        duplicate_parameter_keys = set()
-
-        # Check if user's trying to manually create an output parameter
-        if any(parameter.parameter_type == ParameterType.OUTPUT for parameter in workflow_definition_yaml.parameters):
-            raise InvalidWorkflowDefinition(message="Cannot manually create output parameters")
-
-        # Check if any parameter keys collide with automatically created output parameter keys
-        block_labels = [block.label for block in workflow_definition_yaml.blocks]
-        # TODO (kerem): Check if block labels are unique
-        output_parameter_keys = [f"{block_label}_output" for block_label in block_labels]
-        parameter_keys = [parameter.key for parameter in workflow_definition_yaml.parameters]
-        if any(key in output_parameter_keys for key in parameter_keys):
-            raise WorkflowDefinitionHasReservedParameterKeys(
-                reserved_keys=output_parameter_keys, parameter_keys=parameter_keys
-            )
-
-        if any(key in RESERVED_PARAMETER_KEYS for key in parameter_keys):
-            raise WorkflowDefinitionHasReservedParameterKeys(
-                reserved_keys=RESERVED_PARAMETER_KEYS,
-                parameter_keys=parameter_keys,
-            )
-
-        # Create output parameters for all blocks
-        block_output_parameters = await WorkflowService._create_all_output_parameters_for_workflow(
-            workflow_id=workflow_id,
-            block_yamls=workflow_definition_yaml.blocks,
-        )
-        for block_output_parameter in block_output_parameters.values():
-            parameters[block_output_parameter.key] = block_output_parameter
-
-        # We're going to process context parameters after other parameters since they depend on the other parameters
-        context_parameter_yamls = []
-
-        for parameter in workflow_definition_yaml.parameters:
-            if parameter.key in parameters:
-                LOG.error(f"Duplicate parameter key {parameter.key}")
-                duplicate_parameter_keys.add(parameter.key)
-                continue
-            if parameter.parameter_type == ParameterType.AWS_SECRET:
-                parameters[parameter.key] = await self.create_aws_secret_parameter(
-                    workflow_id=workflow_id,
-                    aws_key=parameter.aws_key,
-                    key=parameter.key,
-                    description=parameter.description,
-                )
-            elif parameter.parameter_type == ParameterType.CREDENTIAL:
-                parameters[parameter.key] = await self.create_credential_parameter(
-                    workflow_id=workflow_id,
-                    key=parameter.key,
-                    description=parameter.description,
-                    credential_id=parameter.credential_id,
-                )
-            elif parameter.parameter_type == ParameterType.ONEPASSWORD:
-                parameters[parameter.key] = await self.create_onepassword_credential_parameter(
-                    workflow_id=workflow_id,
-                    key=parameter.key,
-                    description=parameter.description,
-                    vault_id=parameter.vault_id,
-                    item_id=parameter.item_id,
-                )
-            elif parameter.parameter_type == ParameterType.AZURE_VAULT_CREDENTIAL:
-                parameters[parameter.key] = await self.create_azure_vault_credential_parameter(
-                    workflow_id=workflow_id,
-                    key=parameter.key,
-                    description=parameter.description,
-                    vault_name=parameter.vault_name,
-                    username_key=parameter.username_key,
-                    password_key=parameter.password_key,
-                    totp_secret_key=parameter.totp_secret_key,
-                )
-            elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
-                if not parameter.bitwarden_collection_id and not parameter.bitwarden_item_id:
-                    raise WorkflowParameterMissingRequiredValue(
-                        workflow_parameter_type=ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
-                        workflow_parameter_key=parameter.key,
-                        required_value="bitwarden_collection_id or bitwarden_item_id",
-                    )
-                if parameter.bitwarden_collection_id and not parameter.url_parameter_key:
-                    raise WorkflowParameterMissingRequiredValue(
-                        workflow_parameter_type=ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
-                        workflow_parameter_key=parameter.key,
-                        required_value="url_parameter_key",
-                    )
-                parameters[parameter.key] = await self.create_bitwarden_login_credential_parameter(
-                    workflow_id=workflow_id,
-                    bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
-                    bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
-                    bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
-                    url_parameter_key=parameter.url_parameter_key,
-                    key=parameter.key,
-                    description=parameter.description,
-                    bitwarden_collection_id=parameter.bitwarden_collection_id,
-                    bitwarden_item_id=parameter.bitwarden_item_id,
-                )
-            elif parameter.parameter_type == ParameterType.BITWARDEN_SENSITIVE_INFORMATION:
-                parameters[parameter.key] = await self.create_bitwarden_sensitive_information_parameter(
-                    workflow_id=workflow_id,
-                    bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
-                    bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
-                    bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
-                    # TODO: remove "# type: ignore" after ensuring bitwarden_collection_id is always set
-                    bitwarden_collection_id=parameter.bitwarden_collection_id,  # type: ignore
-                    bitwarden_identity_key=parameter.bitwarden_identity_key,
-                    bitwarden_identity_fields=parameter.bitwarden_identity_fields,
-                    key=parameter.key,
-                    description=parameter.description,
-                )
-            elif parameter.parameter_type == ParameterType.BITWARDEN_CREDIT_CARD_DATA:
-                parameters[parameter.key] = await self.create_bitwarden_credit_card_data_parameter(
-                    workflow_id=workflow_id,
-                    bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
-                    bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
-                    bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
-                    # TODO: remove "# type: ignore" after ensuring bitwarden_collection_id is always set
-                    bitwarden_collection_id=parameter.bitwarden_collection_id,  # type: ignore
-                    bitwarden_item_id=parameter.bitwarden_item_id,  # type: ignore
-                    key=parameter.key,
-                    description=parameter.description,
-                )
-            elif parameter.parameter_type == ParameterType.WORKFLOW:
-                parameters[parameter.key] = await self.create_workflow_parameter(
-                    workflow_id=workflow_id,
-                    workflow_parameter_type=parameter.workflow_parameter_type,
-                    key=parameter.key,
-                    default_value=parameter.default_value,
-                    description=parameter.description,
-                )
-            elif parameter.parameter_type == ParameterType.OUTPUT:
-                parameters[parameter.key] = await self.create_output_parameter(
-                    workflow_id=workflow_id,
-                    key=parameter.key,
-                    description=parameter.description,
-                )
-            elif parameter.parameter_type == ParameterType.CONTEXT:
-                context_parameter_yamls.append(parameter)
-            else:
-                LOG.error(f"Invalid parameter type {parameter.parameter_type}")
-
-        # Now we can process the context parameters since all other parameters have been created
-        for context_parameter in context_parameter_yamls:
-            if context_parameter.source_parameter_key not in parameters:
-                raise ContextParameterSourceNotDefined(
-                    context_parameter_key=context_parameter.key,
-                    source_key=context_parameter.source_parameter_key,
-                )
-
-            if context_parameter.key in parameters:
-                LOG.error(f"Duplicate parameter key {context_parameter.key}")
-                duplicate_parameter_keys.add(context_parameter.key)
-                continue
-
-            # We're only adding the context parameter to the parameters dict, we're not creating it in the database
-            # It'll only be stored in the `workflow.workflow_definition`
-            # todo (kerem): should we have a database table for context parameters?
-            parameters[context_parameter.key] = ContextParameter(
-                key=context_parameter.key,
-                description=context_parameter.description,
-                source=parameters[context_parameter.source_parameter_key],
-                # Context parameters don't have a default value, the value always depends on the source parameter
-                value=None,
-            )
-
-        if duplicate_parameter_keys:
-            raise WorkflowDefinitionHasDuplicateParameterKeys(duplicate_keys=duplicate_parameter_keys)
-        # Create blocks from the request
-        block_label_mapping = {}
-        blocks: list[BlockTypeVar] = []
-        for block_yaml in workflow_definition_yaml.blocks:
-            block = await self.block_yaml_to_block(block_yaml, parameters)
-            blocks.append(block)
-            block_label_mapping[block.label] = block
-
-        # Set the blocks for the workflow definition and derive DAG version metadata
-        dag_version = workflow_definition_yaml.version
-        if dag_version is None:
-            dag_version = 2 if WorkflowService._has_dag_metadata(workflow_definition_yaml.blocks) else 1
-
-        workflow_definition = WorkflowDefinition(parameters=parameters.values(), blocks=blocks, version=dag_version)
-
-        LOG.info(
-            f"Created workflow from request, title: {title}",
-            parameter_keys=[parameter.key for parameter in parameters.values()],
-            block_labels=[block.label for block in blocks],
-            organization_id=organization_id,
-            title=title,
+        workflow_definition = convert_workflow_definition(
+            workflow_definition_yaml=workflow_definition_yaml,
             workflow_id=workflow_id,
         )
+
+        await app.DATABASE.save_workflow_definition_parameters(workflow_definition.parameters)
 
         return workflow_definition
 
@@ -3304,8 +3223,6 @@ class WorkflowService:
             workflow_definition = await self.make_workflow_definition(
                 potential_workflow.workflow_id,
                 request.workflow_definition,
-                request.title,
-                organization_id,
             )
 
             updated_workflow = await self.update_workflow_definition(
@@ -3344,415 +3261,6 @@ class WorkflowService:
             key=output_parameter_key,
             description=f"Output parameter for block {block_yaml.label}",
         )
-
-    @staticmethod
-    async def _create_all_output_parameters_for_workflow(
-        workflow_id: str, block_yamls: list[BLOCK_YAML_TYPES]
-    ) -> dict[str, OutputParameter]:
-        output_parameters = {}
-        for block_yaml in block_yamls:
-            output_parameter = await WorkflowService.create_output_parameter_for_block(
-                workflow_id=workflow_id, block_yaml=block_yaml
-            )
-            output_parameters[block_yaml.label] = output_parameter
-            # Recursively create output parameters for for loop blocks
-            if isinstance(block_yaml, ForLoopBlockYAML):
-                output_parameters.update(
-                    await WorkflowService._create_all_output_parameters_for_workflow(
-                        workflow_id=workflow_id, block_yamls=block_yaml.loop_blocks
-                    )
-                )
-        return output_parameters
-
-    @staticmethod
-    def _build_block_kwargs(
-        block_yaml: BLOCK_YAML_TYPES,
-        output_parameter: OutputParameter,
-    ) -> dict[str, Any]:
-        return {
-            "label": block_yaml.label,
-            "next_block_label": block_yaml.next_block_label,
-            "output_parameter": output_parameter,
-            "continue_on_failure": block_yaml.continue_on_failure,
-            "next_loop_on_failure": block_yaml.next_loop_on_failure,
-            "model": block_yaml.model,
-        }
-
-    @staticmethod
-    async def block_yaml_to_block(
-        block_yaml: BLOCK_YAML_TYPES,
-        parameters: dict[str, PARAMETER_TYPE],
-    ) -> BlockTypeVar:
-        output_parameter = cast(OutputParameter, parameters[f"{block_yaml.label}_output"])
-        base_kwargs = WorkflowService._build_block_kwargs(block_yaml, output_parameter)
-        if block_yaml.block_type == BlockType.TASK:
-            task_block_parameters = (
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            )
-            return TaskBlock(
-                **base_kwargs,
-                url=block_yaml.url,
-                title=block_yaml.title,
-                engine=block_yaml.engine,
-                parameters=task_block_parameters,
-                navigation_goal=block_yaml.navigation_goal,
-                data_extraction_goal=block_yaml.data_extraction_goal,
-                data_schema=block_yaml.data_schema,
-                error_code_mapping=block_yaml.error_code_mapping,
-                max_steps_per_run=block_yaml.max_steps_per_run,
-                max_retries=block_yaml.max_retries,
-                complete_on_download=block_yaml.complete_on_download,
-                download_suffix=block_yaml.download_suffix,
-                totp_verification_url=block_yaml.totp_verification_url,
-                totp_identifier=block_yaml.totp_identifier,
-                disable_cache=block_yaml.disable_cache,
-                complete_criterion=block_yaml.complete_criterion,
-                terminate_criterion=block_yaml.terminate_criterion,
-                complete_verification=block_yaml.complete_verification,
-                include_action_history_in_verification=block_yaml.include_action_history_in_verification,
-            )
-        elif block_yaml.block_type == BlockType.FOR_LOOP:
-            loop_blocks = [
-                await WorkflowService.block_yaml_to_block(loop_block, parameters)
-                for loop_block in block_yaml.loop_blocks
-            ]
-
-            loop_over_parameter: Parameter | None = None
-            if block_yaml.loop_over_parameter_key:
-                loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]
-
-            if block_yaml.loop_variable_reference:
-                # it's backaward compatible with jinja style parameter and context paramter
-                # we trim the format like {{ loop_key }} into loop_key to initialize the context parater,
-                # otherwise it might break the context parameter initialization chain, blow up the worklofw parameters
-                # TODO: consider remove this if we totally give up context parameter
-                trimmed_key = block_yaml.loop_variable_reference.strip(" {}")
-                if trimmed_key in parameters:
-                    loop_over_parameter = parameters[trimmed_key]
-
-            if loop_over_parameter is None and not block_yaml.loop_variable_reference:
-                raise InvalidWorkflowDefinition(
-                    f"For loop block '{block_yaml.label}' requires either loop_over_parameter_key or loop_variable_reference"
-                )
-
-            return ForLoopBlock(
-                **base_kwargs,
-                loop_over=loop_over_parameter,
-                loop_variable_reference=block_yaml.loop_variable_reference,
-                loop_blocks=loop_blocks,
-                complete_if_empty=block_yaml.complete_if_empty,
-            )
-        elif block_yaml.block_type == BlockType.CONDITIONAL:
-            branch_conditions = []
-            for branch in block_yaml.branch_conditions:
-                branch_criteria = None
-                if branch.criteria:
-                    if branch.criteria.criteria_type == "prompt":
-                        branch_criteria = PromptBranchCriteria(
-                            criteria_type=branch.criteria.criteria_type,
-                            expression=branch.criteria.expression,
-                            description=branch.criteria.description,
-                        )
-                    else:
-                        branch_criteria = JinjaBranchCriteria(
-                            criteria_type=branch.criteria.criteria_type,
-                            expression=branch.criteria.expression,
-                            description=branch.criteria.description,
-                        )
-
-                branch_conditions.append(
-                    BranchCondition(
-                        criteria=branch_criteria,
-                        next_block_label=branch.next_block_label,
-                        description=branch.description,
-                        is_default=branch.is_default,
-                    )
-                )
-
-            return ConditionalBlock(
-                **base_kwargs,
-                branch_conditions=branch_conditions,
-            )
-        elif block_yaml.block_type == BlockType.CODE:
-            return CodeBlock(
-                **base_kwargs,
-                code=block_yaml.code,
-                parameters=(
-                    [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                    if block_yaml.parameter_keys
-                    else []
-                ),
-            )
-        elif block_yaml.block_type == BlockType.TEXT_PROMPT:
-            return TextPromptBlock(
-                **base_kwargs,
-                llm_key=block_yaml.llm_key,
-                prompt=block_yaml.prompt,
-                parameters=(
-                    [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                    if block_yaml.parameter_keys
-                    else []
-                ),
-                json_schema=block_yaml.json_schema,
-            )
-        elif block_yaml.block_type == BlockType.DOWNLOAD_TO_S3:
-            return DownloadToS3Block(
-                **base_kwargs,
-                url=block_yaml.url,
-            )
-        elif block_yaml.block_type == BlockType.UPLOAD_TO_S3:
-            return UploadToS3Block(
-                **base_kwargs,
-                path=block_yaml.path,
-            )
-        elif block_yaml.block_type == BlockType.FILE_UPLOAD:
-            return FileUploadBlock(
-                **base_kwargs,
-                storage_type=block_yaml.storage_type,
-                s3_bucket=block_yaml.s3_bucket,
-                aws_access_key_id=block_yaml.aws_access_key_id,
-                aws_secret_access_key=block_yaml.aws_secret_access_key,
-                region_name=block_yaml.region_name,
-                azure_storage_account_name=block_yaml.azure_storage_account_name,
-                azure_storage_account_key=block_yaml.azure_storage_account_key,
-                azure_blob_container_name=block_yaml.azure_blob_container_name,
-                path=block_yaml.path,
-            )
-        elif block_yaml.block_type == BlockType.SEND_EMAIL:
-            return SendEmailBlock(
-                **base_kwargs,
-                smtp_host=parameters[block_yaml.smtp_host_secret_parameter_key],
-                smtp_port=parameters[block_yaml.smtp_port_secret_parameter_key],
-                smtp_username=parameters[block_yaml.smtp_username_secret_parameter_key],
-                smtp_password=parameters[block_yaml.smtp_password_secret_parameter_key],
-                sender=block_yaml.sender,
-                recipients=block_yaml.recipients,
-                subject=block_yaml.subject,
-                body=block_yaml.body,
-                file_attachments=block_yaml.file_attachments or [],
-            )
-        elif block_yaml.block_type == BlockType.FILE_URL_PARSER:
-            return FileParserBlock(
-                **base_kwargs,
-                file_url=block_yaml.file_url,
-                file_type=block_yaml.file_type,
-                json_schema=block_yaml.json_schema,
-            )
-        elif block_yaml.block_type == BlockType.PDF_PARSER:
-            return PDFParserBlock(
-                **base_kwargs,
-                file_url=block_yaml.file_url,
-                json_schema=block_yaml.json_schema,
-            )
-        elif block_yaml.block_type == BlockType.VALIDATION:
-            validation_block_parameters = (
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            )
-
-            if not block_yaml.complete_criterion and not block_yaml.terminate_criterion:
-                raise InvalidWorkflowDefinition(
-                    f"Validation block '{block_yaml.label}' requires at least one of complete_criterion or terminate_criterion"
-                )
-
-            return ValidationBlock(
-                **base_kwargs,
-                task_type=TaskType.validation,
-                parameters=validation_block_parameters,
-                complete_criterion=block_yaml.complete_criterion,
-                terminate_criterion=block_yaml.terminate_criterion,
-                error_code_mapping=block_yaml.error_code_mapping,
-                # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
-                max_steps_per_run=2,
-            )
-
-        elif block_yaml.block_type == BlockType.ACTION:
-            action_block_parameters = (
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            )
-
-            if not block_yaml.navigation_goal:
-                raise InvalidWorkflowDefinition(f"Action block '{block_yaml.label}' requires navigation_goal")
-
-            return ActionBlock(
-                **base_kwargs,
-                url=block_yaml.url,
-                title=block_yaml.title,
-                engine=block_yaml.engine,
-                task_type=TaskType.action,
-                parameters=action_block_parameters,
-                navigation_goal=block_yaml.navigation_goal,
-                error_code_mapping=block_yaml.error_code_mapping,
-                max_retries=block_yaml.max_retries,
-                complete_on_download=block_yaml.complete_on_download,
-                download_suffix=block_yaml.download_suffix,
-                totp_verification_url=block_yaml.totp_verification_url,
-                totp_identifier=block_yaml.totp_identifier,
-                disable_cache=block_yaml.disable_cache,
-                # DO NOT run complete verification for action block
-                complete_verification=False,
-                max_steps_per_run=1,
-            )
-
-        elif block_yaml.block_type == BlockType.NAVIGATION:
-            navigation_block_parameters = (
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            )
-            return NavigationBlock(
-                **base_kwargs,
-                url=block_yaml.url,
-                title=block_yaml.title,
-                engine=block_yaml.engine,
-                parameters=navigation_block_parameters,
-                navigation_goal=block_yaml.navigation_goal,
-                error_code_mapping=block_yaml.error_code_mapping,
-                max_steps_per_run=block_yaml.max_steps_per_run,
-                max_retries=block_yaml.max_retries,
-                complete_on_download=block_yaml.complete_on_download,
-                download_suffix=block_yaml.download_suffix,
-                totp_verification_url=block_yaml.totp_verification_url,
-                totp_identifier=block_yaml.totp_identifier,
-                disable_cache=block_yaml.disable_cache,
-                complete_criterion=block_yaml.complete_criterion,
-                terminate_criterion=block_yaml.terminate_criterion,
-                complete_verification=block_yaml.complete_verification,
-                include_action_history_in_verification=block_yaml.include_action_history_in_verification,
-            )
-
-        elif block_yaml.block_type == BlockType.HUMAN_INTERACTION:
-            return HumanInteractionBlock(
-                **base_kwargs,
-                instructions=block_yaml.instructions,
-                positive_descriptor=block_yaml.positive_descriptor,
-                negative_descriptor=block_yaml.negative_descriptor,
-                timeout_seconds=block_yaml.timeout_seconds,
-                # --
-                sender=block_yaml.sender,
-                recipients=block_yaml.recipients,
-                subject=block_yaml.subject,
-                body=block_yaml.body,
-            )
-
-        elif block_yaml.block_type == BlockType.EXTRACTION:
-            extraction_block_parameters = (
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            )
-            return ExtractionBlock(
-                **base_kwargs,
-                url=block_yaml.url,
-                title=block_yaml.title,
-                engine=block_yaml.engine,
-                parameters=extraction_block_parameters,
-                data_extraction_goal=block_yaml.data_extraction_goal,
-                data_schema=block_yaml.data_schema,
-                max_steps_per_run=block_yaml.max_steps_per_run,
-                max_retries=block_yaml.max_retries,
-                disable_cache=block_yaml.disable_cache,
-                complete_verification=False,
-            )
-
-        elif block_yaml.block_type == BlockType.LOGIN:
-            login_block_parameters = (
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            )
-            return LoginBlock(
-                **base_kwargs,
-                url=block_yaml.url,
-                title=block_yaml.title,
-                engine=block_yaml.engine,
-                parameters=login_block_parameters,
-                navigation_goal=block_yaml.navigation_goal,
-                error_code_mapping=block_yaml.error_code_mapping,
-                max_steps_per_run=block_yaml.max_steps_per_run,
-                max_retries=block_yaml.max_retries,
-                totp_verification_url=block_yaml.totp_verification_url,
-                totp_identifier=block_yaml.totp_identifier,
-                disable_cache=block_yaml.disable_cache,
-                complete_criterion=block_yaml.complete_criterion,
-                terminate_criterion=block_yaml.terminate_criterion,
-                complete_verification=block_yaml.complete_verification,
-            )
-
-        elif block_yaml.block_type == BlockType.WAIT:
-            if block_yaml.wait_sec <= 0 or block_yaml.wait_sec > settings.WORKFLOW_WAIT_BLOCK_MAX_SEC:
-                raise InvalidWaitBlockTime(settings.WORKFLOW_WAIT_BLOCK_MAX_SEC)
-
-            return WaitBlock(
-                **base_kwargs,
-                wait_sec=block_yaml.wait_sec,
-            )
-
-        elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
-            file_download_block_parameters = (
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            )
-            return FileDownloadBlock(
-                **base_kwargs,
-                url=block_yaml.url,
-                title=block_yaml.title,
-                engine=block_yaml.engine,
-                parameters=file_download_block_parameters,
-                navigation_goal=block_yaml.navigation_goal,
-                error_code_mapping=block_yaml.error_code_mapping,
-                max_steps_per_run=block_yaml.max_steps_per_run,
-                max_retries=block_yaml.max_retries,
-                download_suffix=block_yaml.download_suffix,
-                totp_verification_url=block_yaml.totp_verification_url,
-                totp_identifier=block_yaml.totp_identifier,
-                disable_cache=block_yaml.disable_cache,
-                complete_on_download=True,
-                complete_verification=True,
-                include_action_history_in_verification=True,
-                download_timeout=block_yaml.download_timeout,
-            )
-        elif block_yaml.block_type == BlockType.TaskV2:
-            return TaskV2Block(
-                **base_kwargs,
-                prompt=block_yaml.prompt,
-                url=block_yaml.url,
-                totp_verification_url=block_yaml.totp_verification_url,
-                totp_identifier=block_yaml.totp_identifier,
-                max_iterations=block_yaml.max_iterations,
-                max_steps=block_yaml.max_steps,
-            )
-        elif block_yaml.block_type == BlockType.HTTP_REQUEST:
-            http_request_block_parameters = (
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            )
-            return HttpRequestBlock(
-                **base_kwargs,
-                method=block_yaml.method,
-                url=block_yaml.url,
-                headers=block_yaml.headers,
-                body=block_yaml.body,
-                files=block_yaml.files,
-                timeout=block_yaml.timeout,
-                follow_redirects=block_yaml.follow_redirects,
-                parameters=http_request_block_parameters,
-            )
-        elif block_yaml.block_type == BlockType.GOTO_URL:
-            return UrlBlock(
-                **base_kwargs,
-                url=block_yaml.url,
-                complete_verification=False,
-            )
-
-        raise ValueError(f"Invalid block type {block_yaml.block_type}")
 
     async def create_empty_workflow(
         self,
@@ -3906,50 +3414,103 @@ class WorkflowService:
                 )
                 return
 
-            LOG.info(
-                "deleting old workflow script and generating new script",
-                workflow_id=workflow.workflow_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-                cache_key_value=rendered_cache_key_value,
-                script_id=existing_script.script_id,
-                script_revision_id=existing_script.script_revision_id,
-                run_with=workflow_run.run_with,
-                blocks_to_update=list(blocks_to_update),
-                code_gen=code_gen,
-            )
+            async def _regenerate_script() -> None:
+                """Delete old script and generate new one.
 
-            # delete the existing workflow scripts if any
-            await app.DATABASE.delete_workflow_scripts_by_permanent_id(
-                organization_id=workflow.organization_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                script_ids=[existing_script.script_id],
-            )
-
-            # create a new script
-            regenerated_script = await app.DATABASE.create_script(
-                organization_id=workflow.organization_id,
-                run_id=workflow_run.workflow_run_id,
-            )
-
-            await workflow_script_service.generate_workflow_script(
-                workflow_run=workflow_run,
-                workflow=workflow,
-                script=regenerated_script,
-                rendered_cache_key_value=rendered_cache_key_value,
-                cached_script=existing_script,
-                updated_block_labels=blocks_to_update,
-            )
-            aio_task_primary_key = f"{regenerated_script.script_id}_{regenerated_script.version}"
-            if aio_task_primary_key in app.ARTIFACT_MANAGER.upload_aiotasks_map:
-                aio_tasks = app.ARTIFACT_MANAGER.upload_aiotasks_map[aio_task_primary_key]
-                if aio_tasks:
-                    await asyncio.gather(*aio_tasks)
-                else:
-                    LOG.warning(
-                        "No upload aio tasks found for regenerated script",
-                        script_id=regenerated_script.script_id,
-                        version=regenerated_script.version,
+                Uses double-check pattern: re-verify regeneration is needed after acquiring lock
+                to handle race conditions where another process regenerated while we waited.
+                """
+                # Double-check: another process may have regenerated while we waited for lock
+                fresh_script = await workflow_script_service.get_workflow_script_by_cache_key_value(
+                    organization_id=workflow.organization_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    cache_key_value=rendered_cache_key_value,
+                    statuses=[ScriptStatus.published],
+                    use_cache=False,
+                )
+                if fresh_script and fresh_script.script_id != existing_script.script_id:
+                    LOG.info(
+                        "Script already regenerated by another process, skipping",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        cache_key_value=rendered_cache_key_value,
+                        existing_script_id=existing_script.script_id,
+                        fresh_script_id=fresh_script.script_id,
                     )
+                    return
+
+                LOG.info(
+                    "deleting old workflow script and generating new script",
+                    workflow_id=workflow.workflow_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    cache_key_value=rendered_cache_key_value,
+                    script_id=existing_script.script_id,
+                    script_revision_id=existing_script.script_revision_id,
+                    run_with=workflow_run.run_with,
+                    blocks_to_update=list(blocks_to_update),
+                    code_gen=code_gen,
+                )
+
+                await app.DATABASE.delete_workflow_scripts_by_permanent_id(
+                    organization_id=workflow.organization_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    script_ids=[existing_script.script_id],
+                )
+
+                regenerated_script = await app.DATABASE.create_script(
+                    organization_id=workflow.organization_id,
+                    run_id=workflow_run.workflow_run_id,
+                )
+
+                await workflow_script_service.generate_workflow_script(
+                    workflow_run=workflow_run,
+                    workflow=workflow,
+                    script=regenerated_script,
+                    rendered_cache_key_value=rendered_cache_key_value,
+                    cached_script=existing_script,
+                    updated_block_labels=blocks_to_update,
+                )
+                aio_task_primary_key = f"{regenerated_script.script_id}_{regenerated_script.version}"
+                if aio_task_primary_key in app.ARTIFACT_MANAGER.upload_aiotasks_map:
+                    aio_tasks = app.ARTIFACT_MANAGER.upload_aiotasks_map[aio_task_primary_key]
+                    if aio_tasks:
+                        await asyncio.gather(*aio_tasks)
+                    else:
+                        LOG.warning(
+                            "No upload aio tasks found for regenerated script",
+                            script_id=regenerated_script.script_id,
+                            version=regenerated_script.version,
+                        )
+
+            # Use distributed redis lock to prevent concurrent regenerations
+            cache = CacheFactory.get_cache()
+            lock = None
+            if cache is not None:
+                try:
+                    digest = sha256(rendered_cache_key_value.encode("utf-8")).hexdigest()
+                    lock_name = f"workflow_script_regen:{workflow.workflow_permanent_id}:{digest}"
+                    # blocking_timeout=60s to wait for lock, timeout=60s for lock TTL (per wintonzheng: p99=44s)
+                    lock = cache.get_lock(lock_name, blocking_timeout=60, timeout=60)
+                except AttributeError:
+                    LOG.debug("Cache doesn't support locking, proceeding without lock")
+
+            if lock is not None:
+                try:
+                    async with lock:
+                        await _regenerate_script()
+                except LockError as exc:
+                    # Lock acquisition failed (e.g., another process holds the lock, timeout)
+                    # Skip regeneration and trust the lock holder to complete the work.
+                    # The double-check pattern in _regenerate_script() will handle it on the next call.
+                    LOG.info(
+                        "Skipping regeneration - lock acquisition failed, another process may be regenerating",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        error=str(exc),
+                    )
+            else:
+                # No Redis/cache available - proceed without lock (graceful degradation for OSS)
+                await _regenerate_script()
             return
 
         created_script = await app.DATABASE.create_script(
@@ -3988,13 +3549,4 @@ class WorkflowService:
             return False
         if workflow.run_with == "code":
             return True
-        return False
-
-    @staticmethod
-    def _has_dag_metadata(block_yamls: list[BLOCK_YAML_TYPES]) -> bool:
-        for block_yaml in block_yamls:
-            if block_yaml.next_block_label:
-                return True
-            if isinstance(block_yaml, ForLoopBlockYAML) and WorkflowService._has_dag_metadata(block_yaml.loop_blocks):
-                return True
         return False

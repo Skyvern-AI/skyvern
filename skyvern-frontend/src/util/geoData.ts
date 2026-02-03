@@ -149,6 +149,15 @@ export function geoTargetToProxyLocationInput(
     return ProxyLocation.ResidentialISP;
   }
 
+  // Guard against malformed subdivision (e.g., boolean instead of string)
+  if (target.subdivision != null && typeof target.subdivision !== "string") {
+    console.error(
+      "[geoTargetToProxyLocationInput] Invalid subdivision:",
+      target.subdivision,
+    );
+    target = { ...target, subdivision: undefined };
+  }
+
   // Try to map back to legacy enum if it's just a country
   if (target.country && !target.subdivision && !target.city) {
     const legacyLocation = COUNTRY_TO_PROXY_LOCATION[target.country];

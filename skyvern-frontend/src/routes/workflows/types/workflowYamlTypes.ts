@@ -27,6 +27,7 @@ export type WorkflowDefinitionYAML = {
   version?: number | null;
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
+  finally_block_label?: string | null;
 };
 
 export type ParameterYAML =
@@ -140,7 +141,8 @@ export type BlockYAML =
   | PDFParserBlockYAML
   | Taskv2BlockYAML
   | URLBlockYAML
-  | HttpRequestBlockYAML;
+  | HttpRequestBlockYAML
+  | PrintPageBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -399,5 +401,17 @@ export type HttpRequestBlockYAML = BlockYAMLBase & {
   files?: Record<string, string> | null; // Dictionary mapping field names to file paths/URLs
   timeout: number;
   follow_redirects: boolean;
+  parameter_keys?: Array<string> | null;
+  download_filename?: string | null;
+  save_response_as_file?: boolean;
+};
+
+export type PrintPageBlockYAML = BlockYAMLBase & {
+  block_type: "print_page";
+  include_timestamp: boolean;
+  custom_filename: string | null;
+  format: string;
+  landscape: boolean;
+  print_background: boolean;
   parameter_keys?: Array<string> | null;
 };

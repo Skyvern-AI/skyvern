@@ -22,6 +22,7 @@ from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     AWSSecretParameterModel,
     AzureVaultCredentialParameterModel,
+    Base,
     BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
@@ -62,8 +63,6 @@ from skyvern.forge.sdk.db.utils import (
     _custom_json_serializer,
     convert_to_artifact,
     convert_to_aws_secret_parameter,
-    convert_to_bitwarden_login_credential_parameter,
-    convert_to_bitwarden_sensitive_information_parameter,
     convert_to_organization,
     convert_to_organization_auth_token,
     convert_to_output_parameter,
@@ -114,11 +113,13 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
+    PARAMETER_TYPE,
     AWSSecretParameter,
     AzureVaultCredentialParameter,
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
+    ContextParameter,
     CredentialParameter,
     OnePasswordCredentialParameter,
     OutputParameter,
@@ -506,6 +507,22 @@ class AgentDB(BaseAlchemyDB):
                         .order_by(StepModel.retry_index)
                     )
                 ).all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_task_step_count(self, task_id: str, organization_id: str | None = None) -> int:
+        try:
+            async with self.Session() as session:
+                result = await session.scalar(
+                    select(func.count(StepModel.step_id))
+                    .filter_by(task_id=task_id)
+                    .filter_by(organization_id=organization_id)
+                )
+                return result or 0
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1301,6 +1318,30 @@ class AgentDB(BaseAlchemyDB):
                     return convert_to_artifact(artifact, self.debug_enabled)
                 else:
                     return None
+        except SQLAlchemyError:
+            LOG.exception("SQLAlchemyError")
+            raise
+        except Exception:
+            LOG.exception("UnexpectedError")
+            raise
+
+    async def get_artifacts_by_ids(
+        self,
+        artifact_ids: list[str],
+        organization_id: str,
+    ) -> list[Artifact]:
+        if not artifact_ids:
+            return []
+        try:
+            async with self.Session() as session:
+                artifacts = (
+                    await session.scalars(
+                        select(ArtifactModel)
+                        .filter(ArtifactModel.artifact_id.in_(artifact_ids))
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).all()
+                return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
         except SQLAlchemyError:
             LOG.exception("SQLAlchemyError")
             raise
@@ -2663,8 +2704,8 @@ class AgentDB(BaseAlchemyDB):
                 if browser_session_id:
                     workflow_run.browser_session_id = browser_session_id
                 await session.commit()
-                await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
+                await session.refresh(workflow_run)
                 return convert_to_workflow_run(workflow_run)
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
@@ -2747,6 +2788,9 @@ class AgentDB(BaseAlchemyDB):
 
                 if search_key:
                     key_like = f"%{search_key}%"
+                    # Match workflow_run_id directly
+                    id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
+                    # Match parameter key, description, or value
                     param_exists = exists(
                         select(1)
                         .select_from(WorkflowRunParameterModel)
@@ -2765,7 +2809,7 @@ class AgentDB(BaseAlchemyDB):
                             )
                         )
                     )
-                    workflow_run_query = workflow_run_query.where(param_exists)
+                    workflow_run_query = workflow_run_query.where(or_(id_matches, param_exists))
 
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
@@ -3139,91 +3183,6 @@ class AgentDB(BaseAlchemyDB):
             await session.refresh(aws_secret_parameter)
             return convert_to_aws_secret_parameter(aws_secret_parameter)
 
-    async def create_bitwarden_login_credential_parameter(
-        self,
-        workflow_id: str,
-        bitwarden_client_id_aws_secret_key: str,
-        bitwarden_client_secret_aws_secret_key: str,
-        bitwarden_master_password_aws_secret_key: str,
-        key: str,
-        url_parameter_key: str | None = None,
-        description: str | None = None,
-        bitwarden_collection_id: str | None = None,
-        bitwarden_item_id: str | None = None,
-    ) -> BitwardenLoginCredentialParameter:
-        async with self.Session() as session:
-            bitwarden_login_credential_parameter = BitwardenLoginCredentialParameterModel(
-                workflow_id=workflow_id,
-                bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
-                bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
-                bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-                url_parameter_key=url_parameter_key,
-                key=key,
-                description=description,
-                bitwarden_collection_id=bitwarden_collection_id,
-                bitwarden_item_id=bitwarden_item_id,
-            )
-            session.add(bitwarden_login_credential_parameter)
-            await session.commit()
-            await session.refresh(bitwarden_login_credential_parameter)
-            return convert_to_bitwarden_login_credential_parameter(bitwarden_login_credential_parameter)
-
-    async def create_bitwarden_sensitive_information_parameter(
-        self,
-        workflow_id: str,
-        bitwarden_client_id_aws_secret_key: str,
-        bitwarden_client_secret_aws_secret_key: str,
-        bitwarden_master_password_aws_secret_key: str,
-        bitwarden_collection_id: str,
-        bitwarden_identity_key: str,
-        bitwarden_identity_fields: list[str],
-        key: str,
-        description: str | None = None,
-    ) -> BitwardenSensitiveInformationParameter:
-        async with self.Session() as session:
-            bitwarden_sensitive_information_parameter = BitwardenSensitiveInformationParameterModel(
-                workflow_id=workflow_id,
-                bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
-                bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
-                bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-                bitwarden_collection_id=bitwarden_collection_id,
-                bitwarden_identity_key=bitwarden_identity_key,
-                bitwarden_identity_fields=bitwarden_identity_fields,
-                key=key,
-                description=description,
-            )
-            session.add(bitwarden_sensitive_information_parameter)
-            await session.commit()
-            await session.refresh(bitwarden_sensitive_information_parameter)
-            return convert_to_bitwarden_sensitive_information_parameter(bitwarden_sensitive_information_parameter)
-
-    async def create_bitwarden_credit_card_data_parameter(
-        self,
-        workflow_id: str,
-        bitwarden_client_id_aws_secret_key: str,
-        bitwarden_client_secret_aws_secret_key: str,
-        bitwarden_master_password_aws_secret_key: str,
-        bitwarden_collection_id: str,
-        bitwarden_item_id: str,
-        key: str,
-        description: str | None = None,
-    ) -> BitwardenCreditCardDataParameter:
-        async with self.Session() as session:
-            bitwarden_credit_card_data_parameter = BitwardenCreditCardDataParameterModel(
-                workflow_id=workflow_id,
-                bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
-                bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
-                bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-                bitwarden_collection_id=bitwarden_collection_id,
-                bitwarden_item_id=bitwarden_item_id,
-                key=key,
-                description=description,
-            )
-            session.add(bitwarden_credit_card_data_parameter)
-            await session.commit()
-            await session.refresh(bitwarden_credit_card_data_parameter)
-            return BitwardenCreditCardDataParameter.model_validate(bitwarden_credit_card_data_parameter)
-
     async def create_output_parameter(
         self,
         workflow_id: str,
@@ -3240,6 +3199,134 @@ class AgentDB(BaseAlchemyDB):
             await session.commit()
             await session.refresh(output_parameter)
             return convert_to_output_parameter(output_parameter)
+
+    @staticmethod
+    def _convert_parameter_to_model(parameter: PARAMETER_TYPE) -> Base:
+        """Convert a parameter object to its corresponding SQLAlchemy model."""
+        if isinstance(parameter, WorkflowParameter):
+            default_value = (
+                json.dumps(parameter.default_value)
+                if parameter.workflow_parameter_type == WorkflowParameterType.JSON
+                else parameter.default_value
+            )
+            return WorkflowParameterModel(
+                workflow_parameter_id=parameter.workflow_parameter_id,
+                workflow_parameter_type=parameter.workflow_parameter_type.value,
+                key=parameter.key,
+                description=parameter.description,
+                workflow_id=parameter.workflow_id,
+                default_value=default_value,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, OutputParameter):
+            return OutputParameterModel(
+                output_parameter_id=parameter.output_parameter_id,
+                key=parameter.key,
+                description=parameter.description,
+                workflow_id=parameter.workflow_id,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, AWSSecretParameter):
+            return AWSSecretParameterModel(
+                aws_secret_parameter_id=parameter.aws_secret_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                aws_key=parameter.aws_key,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, BitwardenLoginCredentialParameter):
+            return BitwardenLoginCredentialParameterModel(
+                bitwarden_login_credential_parameter_id=parameter.bitwarden_login_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
+                bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
+                bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
+                bitwarden_collection_id=parameter.bitwarden_collection_id,
+                bitwarden_item_id=parameter.bitwarden_item_id,
+                url_parameter_key=parameter.url_parameter_key,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, BitwardenSensitiveInformationParameter):
+            return BitwardenSensitiveInformationParameterModel(
+                bitwarden_sensitive_information_parameter_id=parameter.bitwarden_sensitive_information_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
+                bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
+                bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
+                bitwarden_collection_id=parameter.bitwarden_collection_id,
+                bitwarden_identity_key=parameter.bitwarden_identity_key,
+                bitwarden_identity_fields=parameter.bitwarden_identity_fields,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, BitwardenCreditCardDataParameter):
+            return BitwardenCreditCardDataParameterModel(
+                bitwarden_credit_card_data_parameter_id=parameter.bitwarden_credit_card_data_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
+                bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
+                bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
+                bitwarden_collection_id=parameter.bitwarden_collection_id,
+                bitwarden_item_id=parameter.bitwarden_item_id,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, CredentialParameter):
+            return CredentialParameterModel(
+                credential_parameter_id=parameter.credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                credential_id=parameter.credential_id,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, OnePasswordCredentialParameter):
+            return OnePasswordCredentialParameterModel(
+                onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                vault_id=parameter.vault_id,
+                item_id=parameter.item_id,
+                deleted_at=parameter.deleted_at,
+            )
+        elif isinstance(parameter, AzureVaultCredentialParameter):
+            return AzureVaultCredentialParameterModel(
+                azure_vault_credential_parameter_id=parameter.azure_vault_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                vault_name=parameter.vault_name,
+                username_key=parameter.username_key,
+                password_key=parameter.password_key,
+                totp_secret_key=parameter.totp_secret_key,
+                deleted_at=parameter.deleted_at,
+            )
+        else:
+            raise ValueError(f"Unsupported workflow definition parameter type: {type(parameter).__name__}")
+
+    async def save_workflow_definition_parameters(self, parameters: list[PARAMETER_TYPE]) -> None:
+        """Save multiple workflow definition parameters in a single transaction."""
+
+        # ContextParameter is not persisted
+        parameters_to_save = [p for p in parameters if not isinstance(p, ContextParameter)]
+        if not parameters_to_save:
+            return
+
+        async with self.Session() as session:
+            try:
+                for parameter in parameters_to_save:
+                    model = self._convert_parameter_to_model(parameter)
+                    session.add(model)
+                await session.commit()
+            except SQLAlchemyError:
+                LOG.error("SQLAlchemyError", exc_info=True)
+                raise
 
     async def get_workflow_output_parameters(self, workflow_id: str) -> list[OutputParameter]:
         try:
@@ -3266,93 +3353,6 @@ class AgentDB(BaseAlchemyDB):
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
-
-    async def create_credential_parameter(
-        self, workflow_id: str, key: str, credential_id: str, description: str | None = None
-    ) -> CredentialParameter:
-        async with self.Session() as session:
-            credential_parameter = CredentialParameterModel(
-                workflow_id=workflow_id,
-                key=key,
-                description=description,
-                credential_id=credential_id,
-            )
-            session.add(credential_parameter)
-            await session.commit()
-            await session.refresh(credential_parameter)
-            return CredentialParameter(
-                credential_parameter_id=credential_parameter.credential_parameter_id,
-                workflow_id=credential_parameter.workflow_id,
-                key=credential_parameter.key,
-                description=credential_parameter.description,
-                credential_id=credential_parameter.credential_id,
-                created_at=credential_parameter.created_at,
-                modified_at=credential_parameter.modified_at,
-                deleted_at=credential_parameter.deleted_at,
-            )
-
-    async def create_onepassword_credential_parameter(
-        self, workflow_id: str, key: str, vault_id: str, item_id: str, description: str | None = None
-    ) -> OnePasswordCredentialParameter:
-        async with self.Session() as session:
-            parameter = OnePasswordCredentialParameterModel(
-                workflow_id=workflow_id,
-                key=key,
-                description=description,
-                vault_id=vault_id,
-                item_id=item_id,
-            )
-            session.add(parameter)
-            await session.commit()
-            await session.refresh(parameter)
-            return OnePasswordCredentialParameter(
-                onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
-                workflow_id=parameter.workflow_id,
-                key=parameter.key,
-                description=parameter.description,
-                vault_id=parameter.vault_id,
-                item_id=parameter.item_id,
-                created_at=parameter.created_at,
-                modified_at=parameter.modified_at,
-                deleted_at=parameter.deleted_at,
-            )
-
-    async def create_azure_vault_credential_parameter(
-        self,
-        workflow_id: str,
-        key: str,
-        vault_name: str,
-        username_key: str,
-        password_key: str,
-        totp_secret_key: str | None = None,
-        description: str | None = None,
-    ) -> AzureVaultCredentialParameter:
-        async with self.Session() as session:
-            parameter = AzureVaultCredentialParameterModel(
-                workflow_id=workflow_id,
-                key=key,
-                description=description,
-                vault_name=vault_name,
-                username_key=username_key,
-                password_key=password_key,
-                totp_secret_key=totp_secret_key,
-            )
-            session.add(parameter)
-            await session.commit()
-            await session.refresh(parameter)
-            return AzureVaultCredentialParameter(
-                azure_vault_credential_parameter_id=parameter.azure_vault_credential_parameter_id,
-                workflow_id=parameter.workflow_id,
-                key=parameter.key,
-                description=parameter.description,
-                vault_name=parameter.vault_name,
-                username_key=parameter.username_key,
-                password_key=parameter.password_key,
-                totp_secret_key=parameter.totp_secret_key,
-                created_at=parameter.created_at,
-                modified_at=parameter.modified_at,
-                deleted_at=parameter.deleted_at,
-            )
 
     async def get_workflow_run_output_parameters(self, workflow_run_id: str) -> list[WorkflowRunOutputParameter]:
         try:
@@ -3883,7 +3883,7 @@ class AgentDB(BaseAlchemyDB):
             session.add(new_action)
             await session.commit()
             await session.refresh(new_action)
-            return Action.model_validate(new_action)
+            return hydrate_action(new_action)
 
     async def update_action_screenshot_artifact_id(
         self, *, organization_id: str, action_id: str, screenshot_artifact_id: str
@@ -4705,6 +4705,7 @@ class AgentDB(BaseAlchemyDB):
         status: str | None = None,
         timeout_minutes: int | None = None,
         organization_id: str | None = None,
+        completed_at: datetime | None = None,
     ) -> PersistentBrowserSession:
         try:
             async with self.Session() as session:
@@ -4723,6 +4724,8 @@ class AgentDB(BaseAlchemyDB):
                     persistent_browser_session.status = status
                 if timeout_minutes:
                     persistent_browser_session.timeout_minutes = timeout_minutes
+                if completed_at:
+                    persistent_browser_session.completed_at = completed_at
 
                 await session.commit()
                 await session.refresh(persistent_browser_session)
@@ -4741,7 +4744,7 @@ class AgentDB(BaseAlchemyDB):
         self,
         browser_session_id: str,
         browser_address: str | None,
-        ip_address: str,
+        ip_address: str | None,
         ecs_task_arn: str | None,
         organization_id: str | None = None,
     ) -> None:
@@ -4769,6 +4772,47 @@ class AgentDB(BaseAlchemyDB):
                     await session.refresh(persistent_browser_session)
                 else:
                     raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def update_persistent_browser_session_compute_cost(
+        self,
+        session_id: str,
+        organization_id: str,
+        instance_type: str,
+        vcpu_millicores: int,
+        memory_mb: int,
+        duration_ms: int,
+        compute_cost: float,
+    ) -> None:
+        """Update the compute cost fields for a persistent browser session"""
+        try:
+            async with self.Session() as session:
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if persistent_browser_session:
+                    persistent_browser_session.instance_type = instance_type
+                    persistent_browser_session.vcpu_millicores = vcpu_millicores
+                    persistent_browser_session.memory_mb = memory_mb
+                    persistent_browser_session.duration_ms = duration_ms
+                    persistent_browser_session.compute_cost = compute_cost
+                    await session.commit()
+                    await session.refresh(persistent_browser_session)
+                else:
+                    raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
         except NotFoundError:
             LOG.error("NotFoundError", exc_info=True)
             raise
@@ -5298,6 +5342,21 @@ class AgentDB(BaseAlchemyDB):
 
             return DebugSession.model_validate(model) if model else None
 
+    async def get_debug_session_by_browser_session_id(
+        self,
+        browser_session_id: str,
+        organization_id: str,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(browser_session_id=browser_session_id)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+            )
+            model = (await session.scalars(query)).first()
+            return DebugSession.model_validate(model) if model else None
+
     async def get_workflow_runs_by_debug_session_id(
         self,
         debug_session_id: str,
@@ -5790,9 +5849,16 @@ class AgentDB(BaseAlchemyDB):
         try:
             async with self.Session() as session:
                 # Build the query: join workflow_scripts with scripts
+                # Join on both script_id and organization_id to leverage uc_org_script_version index
                 query = (
                     select(ScriptModel)
-                    .join(WorkflowScriptModel, ScriptModel.script_id == WorkflowScriptModel.script_id)
+                    .join(
+                        WorkflowScriptModel,
+                        and_(
+                            ScriptModel.organization_id == WorkflowScriptModel.organization_id,
+                            ScriptModel.script_id == WorkflowScriptModel.script_id,
+                        ),
+                    )
                     .where(
                         WorkflowScriptModel.organization_id == organization_id,
                         WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,

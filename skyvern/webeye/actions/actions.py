@@ -12,6 +12,16 @@ LOG = structlog.get_logger()
 T = TypeVar("T", bound="Action")
 
 
+class CaptchaType(StrEnum):
+    TEXT_CAPTCHA = "text_captcha"
+    RECAPTCHA = "recaptcha"
+    HCAPTCHA = "hcaptcha"
+    MTCAPTCHA = "mtcaptcha"
+    FUNCAPTCHA = "funcaptcha"
+    CLOUDFLARE = "cloudflare"
+    OTHER = "other"
+
+
 class ActionStatus(StrEnum):
     pending = "pending"
     skipped = "skipped"
@@ -82,9 +92,10 @@ class InputOrSelectContext(BaseModel):
     is_location_input: bool | None = None  # address input usually requires auto completion
     is_date_related: bool | None = None  # date picker mini agent requires some special logic
     date_format: str | None = None
+    is_text_captcha: bool | None = None
 
     def __repr__(self) -> str:
-        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input}, intention={self.intention})"
+        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input}, is_date_related={self.is_date_related}, date_format={self.date_format}, is_text_captcha={self.is_text_captcha}, intention={self.intention})"
 
 
 class ClickContext(BaseModel):
@@ -125,6 +136,8 @@ class Action(BaseModel):
     file_name: str | None = None
     file_url: str | None = None
     download: bool | None = None
+    download_triggered: bool | None = None  # Whether a download was triggered by this action
+    downloaded_files: list[str] | None = None  # List of file names downloaded by this action
     is_upload_file_tag: bool | None = None
     text: str | None = None
     input_or_select_context: InputOrSelectContext | None = None
@@ -264,6 +277,7 @@ class NullAction(Action):
 
 class SolveCaptchaAction(Action):
     action_type: ActionType = ActionType.SOLVE_CAPTCHA
+    captcha_type: CaptchaType | None = None
 
 
 class SelectOptionAction(WebAction):
