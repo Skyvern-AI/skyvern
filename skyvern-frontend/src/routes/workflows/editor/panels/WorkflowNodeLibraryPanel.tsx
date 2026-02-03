@@ -348,7 +348,8 @@ function WorkflowNodeLibraryPanel({
 
     return (
       item.nodeType.toLowerCase().includes(term) ||
-      item.title.toLowerCase().includes(term)
+      item.title.toLowerCase().includes(term) ||
+      item.description.toLowerCase().includes(term)
     );
   });
 
