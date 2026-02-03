@@ -1,0 +1,376 @@
+---
+title: Docker Setup
+subtitle: Get Skyvern running in 10 minutes with Docker Compose
+slug: self-hosted/docker
+---
+
+This guide walks you through deploying Skyvern using Docker Compose. By the end, you'll have a working Skyvern instance with the API server, browser, database, and web UI running on your machine.
+
+## Prerequisites
+
+- Docker and Docker Compose installed ([Get Docker](https://docs.docker.com/get-docker/))
+- 4GB+ RAM available
+- An LLM API key (OpenAI, Anthropic, Azure, Gemini, or Bedrock)
+
+## Quick start
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/Skyvern-AI/skyvern.git
+cd skyvern
+```
+
+### 2. Configure environment variables
+
+Copy the example environment file and configure your LLM provider:
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and set your LLM provider. Here's an example for OpenAI:
+
+```bash .env
+ENABLE_OPENAI=true
+OPENAI_API_KEY=sk-your-api-key-here
+LLM_KEY=OPENAI_GPT4O
+```
+
+For other providers, see [LLM Configuration](/self-hosted/llm-configuration).
+
+### 3. Configure the frontend
+
+Copy the frontend environment file:
+
+```bash
+cp skyvern-frontend/.env.example skyvern-frontend/.env
+```
+
+The default values work for local development. You'll update `VITE_SKYVERN_API_KEY` after the first startup.
+
+### 4. Start the services
+
+```bash
+docker compose up -d
+```
+
+This pulls the images and starts three services:
+- **postgres** — Database on port 5432 (internal only)
+- **skyvern** — API server on port 8000
+- **skyvern-ui** — Web interface on port 8080
+
+First startup takes 1-2 minutes as it runs database migrations and creates your organization.
+
+### 5. Get your API key
+
+Once the services are healthy, retrieve your API key:
+
+```bash
+cat .streamlit/secrets.toml
+```
+
+You'll see output like:
+
+```toml
+[skyvern]
+configs = [
+    {env = "local", host = "http://skyvern:8000/api/v1", orgs = [{name="Skyvern", cred="eyJhbGciOiJIUzI1..."}]}
+]
+```
+
+Copy the `cred` value—this is your API key.
+
+### 6. Update frontend configuration
+
+Add your API key to the frontend environment:
+
+```bash skyvern-frontend/.env
+VITE_SKYVERN_API_KEY=eyJhbGciOiJIUzI1...
+```
+
+Restart the UI to pick up the change:
+
+```bash
+docker compose restart skyvern-ui
+```
+
+### 7. Verify the installation
+
+Open [http://localhost:8080](http://localhost:8080) in your browser. You should see the Skyvern dashboard.
+
+Test the API by listing workflows (should return an empty array on fresh install):
+
+```bash
+curl -s http://localhost:8000/v1/workflows \
+  -H "x-api-key: YOUR_API_KEY_HERE"
+```
+
+---
+
+## Understanding the services
+
+The Docker Compose file defines three services that work together:
+
+```mermaid
+flowchart LR
+    UI[skyvern-ui<br/>:8080] --> API[skyvern<br/>:8000]
+    API --> DB[(postgres<br/>:5432)]
+    API --> Browser[Browser<br/>internal]
+    API --> LLM[Your LLM<br/>Provider]
+```
+
+| Service | Image | Ports | Purpose |
+|---------|-------|-------|---------|
+| `postgres` | postgres:14-alpine | 5432 (internal) | Stores tasks, workflows, credentials, and run history |
+| `skyvern` | public.ecr.aws/skyvern/skyvern | 8000, 9222 | API server + embedded browser |
+| `skyvern-ui` | public.ecr.aws/skyvern/skyvern-ui | 8080, 9090 | Web dashboard and artifact server |
+
+The `skyvern` container includes Playwright with Chromium. The browser runs inside the same container as the API server—no separate browser service is needed.
+
+### Data volumes
+
+Docker Compose mounts several directories for persistent storage:
+
+| Local path | Container path | Contents |
+|------------|----------------|----------|
+| `./postgres-data` | `/var/lib/postgresql/data` | Database files |
+| `./artifacts` | `/data/artifacts` | Extracted data, screenshots |
+| `./videos` | `/data/videos` | Browser session recordings |
+| `./har` | `/data/har` | HTTP Archive files for debugging |
+| `./log` | `/data/log` | Application logs |
+| `./.streamlit` | `/app/.streamlit` | Generated API credentials |
+
+---
+
+## Environment variables reference
+
+The `.env` file controls the Skyvern server. Here are the most important variables grouped by purpose.
+
+### LLM Configuration
+
+Configure at least one LLM provider. See [LLM Configuration](/self-hosted/llm-configuration) for all providers.
+
+```bash
+# OpenAI
+ENABLE_OPENAI=true
+OPENAI_API_KEY=sk-...
+LLM_KEY=OPENAI_GPT4O
+
+# Or Anthropic
+ENABLE_ANTHROPIC=true
+ANTHROPIC_API_KEY=sk-ant-...
+LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
+```
+
+### Browser settings
+
+```bash
+# Browser mode: chromium-headful (visible) or chromium-headless (no display)
+BROWSER_TYPE=chromium-headful
+
+# Timeout for individual browser actions (milliseconds)
+BROWSER_ACTION_TIMEOUT_MS=5000
+
+# Where to save recordings
+VIDEO_PATH=./videos
+```
+
+### Task execution
+
+```bash
+# Maximum steps before a task times out
+MAX_STEPS_PER_RUN=50
+
+# Server port
+PORT=8000
+
+# Log verbosity: DEBUG, INFO, WARNING, ERROR
+LOG_LEVEL=INFO
+```
+
+### Database
+
+The database connection is set in `docker-compose.yml`, not `.env`:
+
+```yaml
+environment:
+  - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
+```
+
+To use an external database, update this connection string and remove the `postgres` service.
+
+---
+
+## Common operations
+
+### View logs
+
+```bash
+# All services
+docker compose logs -f
+
+# Specific service
+docker compose logs -f skyvern
+```
+
+### Restart after configuration changes
+
+```bash
+docker compose restart skyvern
+```
+
+### Stop all services
+
+```bash
+docker compose down
+```
+
+### Update to latest version
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+### Reset everything (including database)
+
+<Warning>
+This deletes all data including task history, credentials, and recordings.
+</Warning>
+
+```bash
+docker compose down -v
+rm -rf postgres-data artifacts videos har log .streamlit
+docker compose up -d
+```
+
+---
+
+## Exposing to the network
+
+By default, Skyvern only accepts connections from localhost. To expose it on your network:
+
+### Option 1: Bind to all interfaces
+
+Edit `docker-compose.yml` to change the port bindings:
+
+```yaml
+services:
+  skyvern:
+    ports:
+      - "0.0.0.0:8000:8000"  # Accept connections from any IP
+```
+
+### Option 2: Use a reverse proxy
+
+For production deployments, put Skyvern behind nginx or Traefik:
+
+```
+your-domain.com → nginx → localhost:8080 (UI)
+api.your-domain.com → nginx → localhost:8000 (API)
+```
+
+Update the frontend environment to use your domain:
+
+```bash skyvern-frontend/.env
+VITE_API_BASE_URL=https://api.your-domain.com/api/v1
+VITE_WSS_BASE_URL=wss://api.your-domain.com/api/v1
+VITE_ARTIFACT_API_BASE_URL=https://artifacts.your-domain.com
+```
+
+<Warning>
+Skyvern has no built-in authentication. If exposing to the internet, add authentication at the reverse proxy layer or use a VPN.
+</Warning>
+
+---
+
+## Troubleshooting
+
+### Container exits immediately
+
+Check the logs for the failing service:
+
+```bash
+docker compose logs skyvern
+```
+
+Common causes:
+- Missing or invalid LLM API key — look for LLM-related errors in logs
+- Database connection failed — check if `postgres` service is healthy with `docker compose ps`
+
+### API returns "Invalid credentials" (403)
+
+The API key is missing, malformed, or doesn't match the organization. Verify:
+
+1. The `x-api-key` header is included in your request
+2. The key matches exactly what's in `.streamlit/secrets.toml`
+3. No extra whitespace or newlines in the key
+
+```bash
+# Correct format
+curl -H "x-api-key: eyJhbGciOiJIUzI1..." http://localhost:8000/v1/workflows
+```
+
+### API returns "Could not validate credentials" (403)
+
+The API key format is invalid (JWT decode failed). This usually means:
+- The key was truncated or corrupted during copy-paste
+- You're using an API key from a different Skyvern installation
+
+Regenerate credentials by resetting the installation:
+
+```bash
+rm -rf .streamlit
+docker compose restart skyvern
+cat .streamlit/secrets.toml  # Get new key
+```
+
+### UI shows blank page or connection errors
+
+Check that `skyvern-frontend/.env` has the correct values:
+
+```bash
+VITE_API_BASE_URL=http://localhost:8000/api/v1
+VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
+VITE_SKYVERN_API_KEY=<your-key-from-secrets.toml>
+```
+
+After updating, restart the UI:
+
+```bash
+docker compose restart skyvern-ui
+```
+
+### Task fails with "Unknown browser type"
+
+The `BROWSER_TYPE` environment variable has an invalid value. Valid options:
+- `chromium-headful` — Browser with visible window (default)
+- `chromium-headless` — No visible window
+- `cdp-connect` — Connect to external Chrome
+
+### Task fails with "Context window exceeded"
+
+The page content is too large for the LLM. Try:
+- Simplifying your prompt
+- Starting from a more specific URL
+- Using a model with a larger context window
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="LLM Configuration" icon="microchip" href="/self-hosted/llm-configuration">
+    Configure OpenAI, Anthropic, Azure, Ollama, and other providers
+  </Card>
+  <Card title="Browser Configuration" icon="window" href="/self-hosted/browser">
+    Customize browser settings, locales, and connect to external Chrome
+  </Card>
+  <Card title="Storage Configuration" icon="hard-drive" href="/self-hosted/storage">
+    Store artifacts in S3 or Azure Blob instead of local disk
+  </Card>
+  <Card title="Proxy Setup" icon="shield" href="/self-hosted/proxy">
+    Configure proxies to avoid bot detection
+  </Card>
+</CardGroup>

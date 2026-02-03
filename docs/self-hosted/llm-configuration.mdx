@@ -1,0 +1,310 @@
+---
+title: LLM Configuration
+subtitle: Connect your preferred language model provider
+slug: self-hosted/llm-configuration
+---
+
+Skyvern uses LLMs to analyze screenshots and decide what actions to take. You'll need to configure at least one LLM provider before running tasks.
+
+## How Skyvern uses LLMs
+
+Skyvern makes multiple LLM calls per task step:
+1. **Screenshot analysis** — Identify interactive elements on the page
+2. **Action planning** — Decide what to click, type, or extract
+3. **Result extraction** — Parse data from the page into structured output
+
+For most deployments, configure a single provider using `LLM_KEY`. Skyvern also supports a `SECONDARY_LLM_KEY` for lighter tasks to reduce costs.
+
+---
+
+## OpenAI
+
+The most common choice. Requires an API key from [platform.openai.com](https://platform.openai.com/).
+
+```bash .env
+ENABLE_OPENAI=true
+OPENAI_API_KEY=sk-...
+LLM_KEY=OPENAI_GPT4O
+```
+
+### Available models
+
+| LLM_KEY | Model | Notes |
+|---------|-------|-------|
+| `OPENAI_GPT4O` | gpt-4o | Recommended for most use cases |
+| `OPENAI_GPT4O_MINI` | gpt-4o-mini | Faster, cheaper, less capable |
+| `OPENAI_GPT4_TURBO` | gpt-4-turbo | Previous generation |
+| `OPENAI_GPT4V` | gpt-4-vision-preview | Vision-specific model |
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint (for proxies or compatible services)
+OPENAI_API_BASE=https://your-proxy.com/v1
+
+# Specify organization ID
+OPENAI_ORGANIZATION=org-...
+```
+
+---
+
+## Anthropic
+
+Claude models from [anthropic.com](https://www.anthropic.com/).
+
+```bash .env
+ENABLE_ANTHROPIC=true
+ANTHROPIC_API_KEY=sk-ant-...
+LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
+```
+
+### Available models
+
+| LLM_KEY | Model | Notes |
+|---------|-------|-------|
+| `ANTHROPIC_CLAUDE3.5_SONNET` | claude-3-5-sonnet | Recommended |
+| `ANTHROPIC_CLAUDE3.7_SONNET` | claude-3-7-sonnet | Latest Sonnet |
+| `ANTHROPIC_CLAUDE4_SONNET` | claude-4-sonnet | Claude 4 |
+| `ANTHROPIC_CLAUDE4.5_SONNET` | claude-4.5-sonnet | Latest |
+
+---
+
+## Azure OpenAI
+
+Microsoft-hosted OpenAI models. Requires an Azure subscription with OpenAI service provisioned.
+
+```bash .env
+ENABLE_AZURE=true
+LLM_KEY=AZURE_OPENAI
+AZURE_DEPLOYMENT=your-deployment-name
+AZURE_API_KEY=your-azure-api-key
+AZURE_API_BASE=https://your-resource.openai.azure.com/
+AZURE_API_VERSION=2024-08-01-preview
+```
+
+### Setup steps
+
+1. Create an Azure OpenAI resource in the [Azure Portal](https://portal.azure.com)
+2. Open the Azure AI Foundry portal from your resource's overview page
+3. Go to **Shared Resources** → **Deployments**
+4. Click **Deploy Model** → **Deploy Base Model** → select GPT-4o or GPT-4
+5. Note the **Deployment Name**—use this for `AZURE_DEPLOYMENT`
+6. Copy your API key and endpoint from the Azure Portal
+
+<Note>
+The `AZURE_DEPLOYMENT` is the name you chose when deploying the model, not the model name itself.
+</Note>
+
+---
+
+## Google Gemini
+
+Gemini models from [Google AI Studio](https://aistudio.google.com/).
+
+```bash .env
+ENABLE_GEMINI=true
+GEMINI_API_KEY=your-gemini-key
+LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
+```
+
+### Available models
+
+| LLM_KEY | Model |
+|---------|-------|
+| `GEMINI_2.5_PRO_PREVIEW_03_25` | Gemini 2.5 Pro (Preview) |
+
+---
+
+## Amazon Bedrock
+
+Run Anthropic Claude through your AWS account.
+
+```bash .env
+ENABLE_BEDROCK=true
+LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET
+AWS_REGION=us-west-2
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+```
+
+### Setup steps
+
+1. Create an IAM user with `AmazonBedrockFullAccess` policy
+2. Generate access keys for the IAM user
+3. In the [Bedrock console](https://console.aws.amazon.com/bedrock/), go to **Model Access**
+4. Enable access to Claude 3.5 Sonnet
+
+### Available models
+
+| LLM_KEY | Model |
+|---------|-------|
+| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET` | Claude 3.5 Sonnet v2 |
+| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1` | Claude 3.5 Sonnet v1 |
+
+---
+
+## Ollama (Local Models)
+
+Run open-source models locally with [Ollama](https://ollama.ai/). No API costs, but requires sufficient local compute.
+
+```bash .env
+ENABLE_OLLAMA=true
+LLM_KEY=OLLAMA
+OLLAMA_MODEL=llama3.1
+OLLAMA_SERVER_URL=http://host.docker.internal:11434
+OLLAMA_SUPPORTS_VISION=false
+```
+
+### Setup steps
+
+1. [Install Ollama](https://ollama.ai/download)
+2. Pull a model: `ollama pull llama3.1`
+3. Start Ollama: `ollama serve`
+4. Configure Skyvern to connect
+
+<Warning>
+Most Ollama models don't support vision. Set `OLLAMA_SUPPORTS_VISION=false`. Without vision, Skyvern relies on DOM analysis instead of screenshot analysis, which may reduce accuracy on complex pages.
+</Warning>
+
+### Docker networking
+
+When running Skyvern in Docker and Ollama on the host:
+
+| Host OS | OLLAMA_SERVER_URL |
+|---------|-------------------|
+| macOS/Windows | `http://host.docker.internal:11434` |
+| Linux | `http://172.17.0.1:11434` (Docker bridge IP) |
+
+---
+
+## OpenAI-Compatible Endpoints
+
+Connect to any service that implements the OpenAI API format, including LiteLLM, LocalAI, vLLM, and text-generation-inference.
+
+```bash .env
+ENABLE_OPENAI_COMPATIBLE=true
+OPENAI_COMPATIBLE_MODEL_NAME=llama3.1
+OPENAI_COMPATIBLE_API_KEY=sk-test
+OPENAI_COMPATIBLE_API_BASE=http://localhost:4000/v1
+LLM_KEY=OPENAI_COMPATIBLE
+```
+
+This is useful for:
+- Running local models with a unified API
+- Using LiteLLM as a proxy to switch between providers
+- Connecting to self-hosted inference servers
+
+---
+
+## OpenRouter
+
+Access multiple models through a single API at [openrouter.ai](https://openrouter.ai/).
+
+```bash .env
+ENABLE_OPENROUTER=true
+LLM_KEY=OPENROUTER
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_MODEL=mistralai/mistral-small-3.1-24b-instruct
+```
+
+OpenRouter lets you use models from multiple providers without separate API keys for each.
+
+---
+
+## Groq
+
+Fast inference on open-source models at [groq.com](https://groq.com/).
+
+```bash .env
+ENABLE_GROQ=true
+LLM_KEY=GROQ
+GROQ_API_KEY=gsk_...
+GROQ_MODEL=llama-3.1-8b-instant
+```
+
+<Note>
+Groq specializes in fast inference for open-source models. Response times are typically much faster than other providers, but model selection is limited.
+</Note>
+
+---
+
+## Using multiple models
+
+### Primary and secondary models
+
+Configure a cheaper model for lightweight operations:
+
+```bash .env
+# Main model for complex decisions
+LLM_KEY=OPENAI_GPT4O
+
+# Cheaper model for simple tasks like dropdown selection
+SECONDARY_LLM_KEY=OPENAI_GPT4O_MINI
+```
+
+### Task-specific models
+
+For fine-grained control, you can override models for specific operations:
+
+```bash .env
+# Model for extraction tasks
+EXTRACTION_LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
+
+# Model for script generation
+SCRIPT_GENERATION_LLM_KEY=OPENAI_GPT4O
+```
+
+Most deployments don't need task-specific models—start with `LLM_KEY` and `SECONDARY_LLM_KEY`.
+
+---
+
+## Troubleshooting
+
+### "To enable svg shape conversion, please set the Secondary LLM key"
+
+Some operations require a secondary model. Set `SECONDARY_LLM_KEY` in your environment:
+
+```bash .env
+SECONDARY_LLM_KEY=OPENAI_GPT4O_MINI
+```
+
+### "Context window exceeded"
+
+The page content is too large for the model's context window. Options:
+- Use a model with a larger context (GPT-4o supports 128k tokens)
+- Simplify your prompt to require less page analysis
+- Start from a more specific URL with less content
+
+### "LLM caller not found"
+
+The configured `LLM_KEY` doesn't match any enabled provider. Verify:
+1. The provider is enabled (`ENABLE_OPENAI=true`, etc.)
+2. The `LLM_KEY` value matches a supported model name exactly
+3. Model names are case-sensitive: `OPENAI_GPT4O` not `openai_gpt4o`
+
+### Container logs show authentication errors
+
+Check your API key configuration:
+- Ensure the key is set correctly without extra whitespace
+- Verify the key hasn't expired or been revoked
+- For Azure, ensure `AZURE_API_BASE` includes the full URL with `https://`
+
+### Slow response times
+
+LLM calls typically take 2-10 seconds. Longer times may indicate:
+- Network latency to the provider
+- Rate limiting (the provider may be throttling requests)
+- For Ollama, insufficient local compute resources
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Browser Configuration" icon="window" href="/self-hosted/browser">
+    Configure browser modes, locales, and display settings
+  </Card>
+  <Card title="Docker Setup" icon="docker" href="/self-hosted/docker">
+    Return to the main Docker setup guide
+  </Card>
+</CardGroup>

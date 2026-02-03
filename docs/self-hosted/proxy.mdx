@@ -1,0 +1,249 @@
+---
+title: Proxy Setup
+subtitle: Configure proxies to avoid bot detection
+slug: self-hosted/proxy
+---
+
+Many websites block requests from datacenter IPs or detect automated browser patterns. Skyvern Cloud includes managed residential proxies that handle this automatically. Self-hosted deployments require you to configure your own proxy provider.
+
+## Why you need proxies
+
+Without proxies, your browser automation traffic originates from your server's IP address. This causes issues when:
+
+- **Target sites block datacenter IPs** — Many sites automatically block traffic from known hosting providers (AWS, GCP, Azure)
+- **Rate limiting** — Repeated requests from one IP trigger rate limits
+- **Geo-restrictions** — Sites serve different content based on location
+- **Bot detection** — Some sites fingerprint datacenter traffic patterns
+
+<Note>
+If you're automating internal tools or sites that don't have bot detection, you may not need proxies at all. Test without proxies first.
+</Note>
+
+---
+
+## Proxy types
+
+### Residential proxies
+
+Traffic appears to come from real home internet connections. Most expensive but least likely to be blocked.
+
+**Providers:**
+- [Bright Data](https://brightdata.com/)
+- [Oxylabs](https://oxylabs.io/)
+- [Smartproxy](https://smartproxy.com/)
+- [IPRoyal](https://iproyal.com/)
+
+### ISP proxies
+
+Static IPs from internet service providers. Good balance between cost and detection avoidance.
+
+### Datacenter proxies
+
+IPs from cloud providers. Cheapest but most likely to be blocked.
+
+### Rotating vs. static
+
+- **Rotating** — New IP for each request or session. Good for scraping at scale.
+- **Static** — Same IP for the duration of a task. Better for sites that track sessions.
+
+---
+
+## Configuration
+
+Skyvern supports proxy configuration at the browser level through Playwright.
+
+### Environment variable approach
+
+Set proxy configuration in your `.env` file:
+
+```bash .env
+ENABLE_PROXY=true
+HOSTED_PROXY_POOL=http://user:pass@proxy.example.com:8080
+```
+
+### Per-task proxy configuration
+
+When calling the API, you can specify proxy settings per task. This requires configuring your proxy endpoint to accept the target URL and handle routing.
+
+<Warning>
+Self-hosted Skyvern does not include the `proxy_location` feature available in Skyvern Cloud. The geo-targeting locations (like `RESIDENTIAL_US`, `RESIDENTIAL_GB`) require Skyvern's managed proxy infrastructure.
+</Warning>
+
+---
+
+## Setting up a proxy provider
+
+### Step 1: Choose a provider
+
+For browser automation, residential proxies work best. Most providers offer:
+- Pay-per-GB pricing
+- Geographic targeting
+- Session persistence (sticky sessions)
+
+### Step 2: Get your proxy credentials
+
+After signing up, you'll receive:
+- Proxy endpoint (e.g., `proxy.example.com:8080`)
+- Username
+- Password
+
+Some providers use a single endpoint that rotates IPs. Others give you access to specific geographic pools.
+
+### Step 3: Configure Skyvern
+
+Add your proxy to the environment:
+
+```bash .env
+ENABLE_PROXY=true
+HOSTED_PROXY_POOL=http://username:password@proxy.provider.com:8080
+```
+
+### Step 4: Test the connection
+
+Run a simple task that checks your IP:
+
+```python
+from skyvern import Skyvern
+
+client = Skyvern(base_url="http://localhost:8000", api_key="your-key")
+
+result = await client.run_task(
+    prompt="Go to whatismyipaddress.com and tell me the IP address shown",
+    url="https://whatismyipaddress.com",
+)
+```
+
+The returned IP should be from your proxy provider, not your server.
+
+---
+
+## Proxy authentication methods
+
+### Basic auth (most common)
+
+Include credentials in the URL:
+
+```bash
+http://username:password@proxy.example.com:8080
+```
+
+### IP whitelist
+
+Some providers allow you to whitelist your server's IP instead of using credentials:
+
+1. Get your server's public IP: `curl ifconfig.me`
+2. Add it to your proxy provider's whitelist
+3. Use the proxy without credentials:
+
+```bash
+http://proxy.example.com:8080
+```
+
+---
+
+## Geographic targeting
+
+If your proxy provider supports geographic targeting, configure it in your proxy URL. The exact format depends on the provider.
+
+### Bright Data example
+
+```bash
+# Target US residential
+http://user-country-us:pass@proxy.brightdata.com:8080
+
+# Target specific US state
+http://user-country-us-state-california:pass@proxy.brightdata.com:8080
+```
+
+### Oxylabs example
+
+```bash
+# Target UK
+http://user-country-gb:pass@proxy.oxylabs.io:8080
+```
+
+Check your provider's documentation for the exact format.
+
+---
+
+## Rotating proxies vs. sticky sessions
+
+### Rotating (new IP per request)
+
+Good for:
+- High-volume scraping
+- Avoiding per-IP rate limits
+- Tasks that don't need session persistence
+
+### Sticky sessions (same IP for duration)
+
+Good for:
+- Multi-step automations where the site tracks your session
+- Login flows
+- Sites that block IP changes mid-session
+
+Most providers support sticky sessions via a session ID parameter:
+
+```bash
+# Bright Data sticky session
+http://user-session-abc123:pass@proxy.brightdata.com:8080
+```
+
+---
+
+## Troubleshooting
+
+### "Connection refused" or timeout errors
+
+- Verify your proxy endpoint and credentials are correct
+- Check if your server can reach the proxy: `curl -x http://user:pass@proxy:port http://example.com`
+- Ensure your provider hasn't blocked your IP
+
+### Target site still blocking requests
+
+- Try a different proxy location
+- Use residential instead of datacenter proxies
+- Enable sticky sessions if the site tracks session changes
+- Verify the proxy is actually being used (check the IP)
+
+### Slow performance
+
+- Proxy overhead adds 100-500ms per request
+- Choose a proxy location geographically close to the target site
+- Use datacenter proxies for sites that allow them (faster than residential)
+
+### High proxy costs
+
+Residential proxy bandwidth is expensive. To reduce costs:
+- Disable video recording (reduces bandwidth)
+- Use datacenter proxies for sites that allow them
+- Cache resources where possible
+- Minimize unnecessary page loads
+
+---
+
+## Running without proxies
+
+For internal tools or development, proxies aren't always necessary:
+
+```bash .env
+ENABLE_PROXY=false
+```
+
+Your browser traffic will originate directly from your server's IP. This works well for:
+- Internal applications
+- Development and testing
+- Sites that don't block datacenter traffic
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Storage Configuration" icon="hard-drive" href="/self-hosted/storage">
+    Store recordings and artifacts in S3 or Azure Blob
+  </Card>
+  <Card title="Kubernetes Deployment" icon="dharmachakra" href="/self-hosted/kubernetes">
+    Deploy Skyvern at scale with Kubernetes
+  </Card>
+</CardGroup>
