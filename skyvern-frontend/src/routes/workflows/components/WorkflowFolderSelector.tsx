@@ -2,10 +2,10 @@ import { useState, useMemo } from "react";
 import {
   CheckIcon,
   Cross2Icon,
-  FileIcon,
   MagnifyingGlassIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
+import { FolderIcon } from "@/components/icons/FolderIcon";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -67,7 +67,7 @@ function WorkflowFolderSelector({
             currentFolderId ? "text-blue-400" : "text-slate-400",
           )}
         >
-          <FileIcon className="h-4 w-4" />
+          <FolderIcon className="h-4 w-4" />
         </Button>
       </PopoverTrigger>
       <PopoverContent
@@ -143,7 +143,7 @@ function WorkflowFolderSelector({
                     className="flex w-full items-center justify-between px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 disabled:opacity-50 dark:hover:bg-slate-800"
                   >
                     <div className="flex items-center gap-2">
-                      <FileIcon className="h-4 w-4 text-blue-400" />
+                      <FolderIcon className="h-4 w-4 text-blue-400" />
                       <div className="flex flex-col">
                         <span>{folder.title}</span>
                         {folder.description && (
