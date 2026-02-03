@@ -4,7 +4,7 @@ subtitle: Route browser traffic through residential proxies worldwide
 slug: going-to-production/proxy-geolocation
 ---
 
-Many websites serve different content based on your location—prices in local currency, region-locked inventory, or outright access blocks. Others detect and block datacenter IPs, treating them as bots. Skyvern's residential proxy network routes your browser through real consumer IP addresses in 19 countries, so sites see a legitimate local visitor. 
+Many websites serve different content based on your location—prices in local currency, region-locked inventory, or outright access blocks. Others detect and block datacenter IPs, treating them as bots. Skyvern's residential proxy network routes your browser through real consumer IP addresses in 20 countries, so sites see a legitimate local visitor. 
 
 <Note>
 Proxy routing is only available in Skyvern Cloud. Self-hosted deployments require your own proxy infrastructure.
@@ -172,6 +172,7 @@ Use these enum values for country-level targeting. Each routes through a residen
 | `RESIDENTIAL_MX` | Mexico | America/Mexico_City |
 | `RESIDENTIAL_NL` | Netherlands | Europe/Amsterdam |
 | `RESIDENTIAL_NZ` | New Zealand | Pacific/Auckland |
+| `RESIDENTIAL_PH` | Philippines | Asia/Manila |
 | `RESIDENTIAL_TR` | Türkiye | Europe/Istanbul |
 | `RESIDENTIAL_ZA` | South Africa | Africa/Johannesburg |
 | `NONE` | No proxy | — |
@@ -263,7 +264,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 | `subdivision` | string | ISO 3166-2 subdivision code without country prefix (e.g., `CA` for California, `NY` for New York). |
 | `city` | string | City name in English (e.g., `San Francisco`, `London`). |
 
-**Supported countries:** `US`, `AR`, `AU`, `BR`, `CA`, `DE`, `ES`, `FR`, `GB`, `IE`, `IN`, `IT`, `JP`, `MX`, `NL`, `NZ`, `TR`, `ZA`
+**Supported countries:** `US`, `AR`, `AU`, `BR`, `CA`, `DE`, `ES`, `FR`, `GB`, `IE`, `IN`, `IT`, `JP`, `MX`, `NL`, `NZ`, `PH`, `TR`, `ZA`
 
 ---
 

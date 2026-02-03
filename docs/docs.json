@@ -60,6 +60,10 @@
           "cloud/getting-started",
           "cloud/running-tasks"
         ]
+      },
+      {
+        "tab": "API Reference",
+        "openapi": "api-reference/openapi.json"
       }
     ]
   },
@@ -84,6 +88,11 @@
     }
   },
   "api": {
+    "baseUrl": "https://api.skyvern.com",
+    "auth": {
+      "method": "key",
+      "name": "x-api-key"
+    },
     "playground": {
       "display": "interactive"
     }

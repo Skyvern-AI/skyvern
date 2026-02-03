@@ -4,7 +4,7 @@ subtitle: Get notified when tasks and workflows complete
 slug: going-to-production/webhooks
 ---
 
-Workflows and task runs are asyncronous. When you call `run_task` or `run_workflow`, the API returns immediately with a run ID, but the actual execution happens in the background and can take variable time.
+Workflows and task runs are asynchronous. When you call `run_task` or `run_workflow`, the API returns immediately with a run ID, but the actual execution happens in the background and can take variable time.
 
 Instead of polling the `get_runs` endpoint, you can use Webhooks to get notified when they finish.
 
@@ -21,15 +21,6 @@ result = await client.run_task(
     prompt="Get the price of this product",
     url="https://example.com/product/123",
     webhook_url="https://your-server.com/webhook",
-)
-```
-
-**Real Example (from testing with Hacker News):**
-```python Python
-result = await client.run_task(
-    prompt="Get the title of the top post on Hacker News",
-    url="https://news.ycombinator.com/",
-    webhook_url="https://webhook.site/d8d013c1-0481-48d0-8d13-281e8563a508",
 )
 ```
 
@@ -56,66 +47,115 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 </CodeGroup>
 
 ### For workflows
-Set it when creating the workflow to make it the default and override it per-run to change the default:
+Set a default webhook when creating the workflow, or override it per-run:
 
 <CodeGroup>
 ```python Python
-# Set default on workflow
+# Set default on workflow (webhook_callback_url goes inside json_definition)
 workflow = await client.create_workflow(
-    title="Invoice Downloader",
-    webhook_url="https://your-server.com/webhook",
-    workflow_definition={...}
+    json_definition={
+        "title": "Invoice Downloader",
+        "webhook_callback_url": "https://your-server.com/webhook",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "task",
+                    "label": "download_invoice",
+                    "url": "https://vendor-portal.example.com",
+                    "prompt": "Download the latest invoice"
+                }
+            ]
+        }
+    }
 )
 
 # Override for a specific run
 run = await client.run_workflow(
-    workflow_permanent_id="wpid_123456789",
-    data={...},
+    workflow_id=workflow.workflow_permanent_id,
+    parameters={},
     webhook_url="https://your-server.com/different-webhook"
 )
 ```
 
 ```typescript TypeScript
-// Set default on workflow
+// Set default on workflow (webhook_callback_url goes inside json_definition)
 const workflow = await client.createWorkflow({
   body: {
-    title: "Invoice Downloader",
-    webhook_url: "https://your-server.com/webhook",
-    workflow_definition: {...},
+    json_definition: {
+      title: "Invoice Downloader",
+      webhook_callback_url: "https://your-server.com/webhook",
+      workflow_definition: {
+        parameters: [],
+        blocks: [
+          {
+            block_type: "task",
+            label: "download_invoice",
+            url: "https://vendor-portal.example.com",
+            prompt: "Download the latest invoice",
+          },
+        ],
+      },
+    },
   },
 });
 
 // Override for a specific run
-const run = await client.runWorkflow("wpid_123456789", {
+const run = await client.runWorkflow({
   body: {
-    data: {...},
+    workflow_id: workflow.workflow_permanent_id,
+    parameters: {},
     webhook_url: "https://your-server.com/different-webhook",
   },
 });
 ```
 
 ```bash cURL
-# Set default on workflow
+# Set default on workflow (webhook_callback_url goes inside json_definition)
 curl -X POST "https://api.skyvern.com/v1/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "title": "Invoice Downloader",
-    "webhook_url": "https://your-server.com/webhook",
-    "workflow_definition": {...}
+    "json_definition": {
+      "title": "Invoice Downloader",
+      "webhook_callback_url": "https://your-server.com/webhook",
+      "workflow_definition": {
+        "parameters": [],
+        "blocks": [
+          {
+            "block_type": "task",
+            "label": "download_invoice",
+            "url": "https://vendor-portal.example.com",
+            "prompt": "Download the latest invoice"
+          }
+        ]
+      }
+    }
   }'
 
-# Override for a specific run
+# Override for a specific run (use workflow_permanent_id from create response)
 curl -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "workflow_permanent_id": "wpid_123456789",
-    "data": {...},
+    "workflow_id": "wpid_123456789",
+    "parameters": {},
     "webhook_url": "https://your-server.com/different-webhook"
   }'
 ```
 </CodeGroup>
+
+<Info>
+When creating a workflow, use `webhook_callback_url` inside `json_definition` — this sets the default for all runs. When running a workflow, use `webhook_url` at the top level to override for that specific run.
+</Info>
+
+**Quick reference:**
+
+| Context | Parameter | Location |
+|---------|-----------|----------|
+| Task run | `webhook_url` | Top-level parameter |
+| Workflow creation | `webhook_callback_url` | Inside `json_definition` |
+| Workflow run (override) | `webhook_url` | Top-level parameter |
 
 ---
 
@@ -159,7 +199,7 @@ Skyvern sends a JSON payload with run results. Here's a real example from a comp
 ```
 
 **Request Headers Sent:**
-```
+```http
 POST /d8d013c1-0481-48d0-8d13-281e8563a508 HTTP/1.1
 Host: webhook.site
 Content-Type: application/json
@@ -190,8 +230,11 @@ User-Agent: python-httpx/0.28.1
 | `app_url` | string | Link to view this run in Skyvern Cloud |
 | `organization_id` | string | Your organization ID |
 | `workflow_run_id` | string | Associated workflow run ID |
+| `workflow_id` | string | Internal workflow ID |
+| `workflow_permanent_id` | string | Permanent workflow ID used to run the workflow |
 | `proxy_location` | string | Proxy location used (e.g., `RESIDENTIAL`) |
 | `webhook_callback_url` | string | The webhook URL that received this payload |
+| `webhook_failure_reason` | string \| null | Error message if a previous webhook delivery failed (always `null` in the payload you receive) |
 | `created_at` | datetime | When the run was created |
 | `modified_at` | datetime | When the run was last updated |
 | `queued_at` | datetime \| null | When the run entered the queue |
@@ -312,31 +355,40 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 Never use simple equality operators (`==` or `===`) for signature comparison as they are vulnerable to timing attacks.
 </Note>
 
+<Warning>
+**Always validate against the raw request body bytes.** Skyvern normalizes JSON before signing: it removes whitespace (using compact separators) and converts whole-number floats to integers (`3.0` becomes `3`). If you parse the JSON and re-serialize it, the byte representation will differ and signature validation will fail.
+</Warning>
+
 ---
 
 ## Handling webhook failures
 
-Webhook delivery can fail even when the run itself completes successfully. 
+Webhook delivery can fail due to network issues, server errors, or misconfigured URLs.
 
-When this happens, Skyvern records the error in the `webhook_failure_reason` field on the run object. To check it, call `get_run` after the run has terminated:
+When this happens, the run is marked as `failed` and the error is recorded in the `failure_reason` field. Check it by calling `get_run` after the run terminates:
 
 <CodeGroup>
 ```python Python
 run = await client.get_run(run_id)
 
-if run.webhook_failure_reason:
-    print(f"Webhook failed: {run.webhook_failure_reason}")
-    # Process the run data directly
-    process_output(run.output)
+if run.status == "failed" and "webhook" in (run.failure_reason or "").lower():
+    print(f"Webhook failed: {run.failure_reason}")
+    # The task may have completed successfully before webhook delivery failed
+    # Output data is still available
+    if run.output:
+        process_output(run.output)
 ```
 
 ```typescript TypeScript
 const run = await client.getRun(runId);
 
-if (run.webhook_failure_reason) {
-  console.log(`Webhook failed: ${run.webhook_failure_reason}`);
-  // Process the run data directly
-  processOutput(run.output);
+if (run.status === "failed" && run.failure_reason?.toLowerCase().includes("webhook")) {
+  console.log(`Webhook failed: ${run.failure_reason}`);
+  // The task may have completed successfully before webhook delivery failed
+  // Output data is still available
+  if (run.output) {
+    processOutput(run.output);
+  }
 }
 ```
 
@@ -344,20 +396,24 @@ if (run.webhook_failure_reason) {
 curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
   -H "x-api-key: $SKYVERN_API_KEY"
 
-# Check the webhook_failure_reason field in response
+# Check status and failure_reason fields in response
 ```
 </CodeGroup>
 
-The field contains the specific error message, for example:
+The `failure_reason` field contains the specific error message, for example:
 
 ```json
 {
   "run_id": "tsk_v2_486305187432193504",
-  "status": "completed",
+  "status": "failed",
   "output": {"price": "$29.99"},
-  "webhook_failure_reason": "Webhook failed with status code 500, error message: Internal Server Error"
+  "failure_reason": "Failed to run task 2.0: Failed to send webhook.    task_v2_id=tsk_v2_486305187432193504"
 }
 ```
+
+<Note>
+Even when webhook delivery fails, the task's `output` field may still contain extracted data if the browser automation completed successfully before the webhook attempt.
+</Note>
 
 **Common reasons webhooks fail:**
 
@@ -374,12 +430,14 @@ Once you've identified and fixed the issue, you can replay the webhook using `re
 
 <CodeGroup>
 ```python Python
-await client.retry_run_webhook(run_id="tsk_v2_486305187432193504")
+from skyvern.client import RetryRunWebhookRequest
+
+await client.retry_run_webhook("tsk_v2_486305187432193504")
 
 # Or send to a different URL
 await client.retry_run_webhook(
-    run_id="tsk_v2_486305187432193504",
-    webhook_url="https://your-server.com/new-webhook"
+    "tsk_v2_486305187432193504",
+    request=RetryRunWebhookRequest(webhook_url="https://your-server.com/new-webhook")
 )
 ```
 
@@ -388,61 +446,25 @@ await client.retryRunWebhook("tsk_v2_486305187432193504");
 
 // Or send to a different URL
 await client.retryRunWebhook("tsk_v2_486305187432193504", {
-  body: {
-    webhook_url: "https://your-server.com/new-webhook",
-  },
+  webhook_url: "https://your-server.com/new-webhook",
 });
 ```
 
 ```bash cURL
-curl -X POST "https://api.skyvern.com/v1/internal/runs/tsk_v2_486305187432193504/test-webhook" \
+curl -X POST "https://api.skyvern.com/v1/runs/tsk_v2_486305187432193504/retry_webhook" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{}'
 
 # Or send to a different URL
-curl -X POST "https://api.skyvern.com/v1/internal/runs/tsk_v2_486305187432193504/test-webhook" \
+curl -X POST "https://api.skyvern.com/v1/runs/tsk_v2_486305187432193504/retry_webhook" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"webhook_url": "https://your-server.com/new-webhook"}'
 ```
 </CodeGroup>
 
-**What the API returns:**
-
-When you call `retry_run_webhook`, the API returns a response showing delivery status:
-
-```json
-{
-  "run_id": "tsk_v2_490440798509980756",
-  "run_type": "task_v2",
-  "default_webhook_url": "https://webhook.site/d8d013c1-0481-48d0-8d13-281e8563a508",
-  "target_webhook_url": "https://webhook.site/d8d013c1-0481-48d0-8d13-281e8563a508",
-  "payload": "{\"run_id\":\"tsk_v2_490440798509980756\",\"status\":\"completed\",...}",
-  "headers": {
-    "x-skyvern-timestamp": "1769874308",
-    "x-skyvern-signature": "b82b0552cf15bf8761fa4953a427ad1301d70c7e6c8fed948f73678edb90aebc",
-    "Content-Type": "application/json"
-  },
-  "status_code": 200,
-  "latency_ms": 388,
-  "response_body": "OK",
-  "error": null
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `run_id` | string | The run that was retried |
-| `run_type` | string | Type of run: `task_v2`, `openai_cua`, `anthropic_cua` |
-| `default_webhook_url` | string | Original webhook URL from the run |
-| `target_webhook_url` | string | Actual URL used (original or override) |
-| `payload` | string | JSON payload that was sent (stringified) |
-| `headers` | object | Headers sent with the retry (signature, timestamp) |
-| `status_code` | integer | HTTP status from your webhook endpoint |
-| `latency_ms` | integer | Time taken for webhook delivery |
-| `response_body` | string | Response from your webhook endpoint |
-| `error` | string \| null | Error message if delivery failed |
+The SDK method is fire-and-forget—it returns immediately without waiting for confirmation. To verify the retry succeeded, check the `failure_reason` field on the run afterward, or monitor your webhook endpoint directly.
 
 You can pass a different `webhook_url` to send the payload to a new endpoint—useful if the original URL was misconfigured.
 

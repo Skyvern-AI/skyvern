@@ -139,10 +139,10 @@ Same polling pattern works for workflow runs:
 
 <CodeGroup>
 ```python Python
-workflow_run_id = result.workflow_run_id
+run_id = result.run_id
 
 while True:
-    run = await client.get_workflow_run(workflow_run_id)
+    run = await client.get_run(run_id)
 
     if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
         break
@@ -156,10 +156,10 @@ else:
 ```
 
 ```typescript TypeScript
-const workflowRunId = result.workflow_run_id;
+const runId = result.run_id;
 
 while (true) {
-  const run = await client.getWorkflowRun(workflowRunId);
+  const run = await client.getRun(runId);
 
   if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
     break;
@@ -265,7 +265,7 @@ fi
 
 <CodeGroup>
 ```python Python
-run = await client.get_workflow_run(workflow_run_id)
+run = await client.get_run(workflow_run_id)
 
 if run.status in ["failed", "terminated"]:
     print(f"Workflow failed: {run.failure_reason}")
@@ -276,7 +276,7 @@ if run.status in ["failed", "terminated"]:
 ```
 
 ```typescript TypeScript
-const run = await client.getWorkflowRun(workflowRunId);
+const run = await client.getRun(workflowRunId);
 
 if (["failed", "terminated"].includes(run.status)) {
   console.log(`Workflow failed: ${run.failure_reason}`);
