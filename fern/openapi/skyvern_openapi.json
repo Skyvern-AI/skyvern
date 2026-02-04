@@ -4712,6 +4712,11 @@
             "type": "integer",
             "title": "Credits Remaining"
           },
+          "cancel_at_period_end": {
+            "type": "boolean",
+            "title": "Cancel At Period End",
+            "default": false
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -8427,7 +8432,8 @@
         "enum": [
           "csv",
           "excel",
-          "pdf"
+          "pdf",
+          "image"
         ],
         "title": "FileType"
       },
