@@ -378,11 +378,10 @@ class AgentDB(BaseAlchemyDB):
     async def get_task(self, task_id: str, organization_id: str | None = None) -> Task | None:
         """Get a task by its id"""
         async with self.Session() as session:
-            if task_obj := (
-                await session.scalars(
-                    select(TaskModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
-                )
-            ).first():
+            query = select(TaskModel).filter_by(task_id=task_id)
+            if organization_id is not None:
+                query = query.filter_by(organization_id=organization_id)
+            if task_obj := (await session.scalars(query)).first():
                 return convert_to_task(task_obj, self.debug_enabled)
             else:
                 LOG.info(
@@ -395,7 +394,7 @@ class AgentDB(BaseAlchemyDB):
     async def get_tasks_by_ids(
         self,
         task_ids: list[str],
-        organization_id: str | None = None,
+        organization_id: str,
     ) -> list[Task]:
         try:
             async with self.Session() as session:

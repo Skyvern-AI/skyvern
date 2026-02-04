@@ -263,6 +263,7 @@ class UploadFileAction(WebAction):
 # This action is deprecated in 'extract-actions' prompt. Only used for the download action triggered by the code.
 class DownloadFileAction(Action):
     action_type: ActionType = ActionType.DOWNLOAD_FILE
+    download: bool = True
     file_name: str
     byte: Annotated[bytes | None, Field(exclude=True)] = None  # bytes data
     download_url: str | None = None  # URL to download file from

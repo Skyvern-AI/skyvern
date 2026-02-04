@@ -857,9 +857,14 @@ function FlowRenderer({
               doLayout(tempNodes, edges);
             }
 
-            // Only track changes after initial load is complete
+            // Only track changes after initial load is complete and not during internal updates
+            // (e.g., switching conditional branches which is UI state, not workflow data)
+            // Use getState() to get real-time value (not stale closure from render time)
+            const isInternalUpdate =
+              useWorkflowHasChangesStore.getState().isInternalUpdate;
             if (
               !isInitialLoadRef.current &&
+              !isInternalUpdate &&
               changes.some((change) => {
                 return (
                   change.type === "add" ||

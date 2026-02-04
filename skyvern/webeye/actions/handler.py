@@ -2,7 +2,6 @@ import asyncio
 import copy
 import json
 import os
-import shutil
 import time
 import urllib.parse
 import uuid
@@ -26,7 +25,6 @@ from skyvern.constants import (
 )
 from skyvern.errors.errors import TOTPExpiredError
 from skyvern.exceptions import (
-    DownloadedFileNotFound,
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
@@ -63,9 +61,6 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
     check_downloading_files_and_wait_for_download_to_complete,
-)
-from skyvern.forge.sdk.api.files import download_file as download_file_api
-from skyvern.forge.sdk.api.files import (
     get_download_dir,
     list_files_in_directory,
 )
@@ -95,6 +90,7 @@ from skyvern.webeye.actions.actions import (
     CheckboxAction,
     ClickAction,
     CompleteVerifyResult,
+    DownloadFileAction,
     InputOrSelectContext,
     InputTextAction,
     ScrapeResult,
@@ -401,7 +397,9 @@ class ActionHandler:
     ) -> list[ActionResult]:
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         # TODO: maybe support all action types in the future(?)
-        trigger_download_action = isinstance(action, (SelectOptionAction, ClickAction)) and action.download
+        trigger_download_action = (
+            isinstance(action, (SelectOptionAction, ClickAction, DownloadFileAction)) and action.download
+        )
         if not trigger_download_action:
             results = await ActionHandler._handle_action(
                 scraped_page=scraped_page,
@@ -1632,35 +1630,20 @@ async def handle_download_file_action(
                 full_file_path=full_file_path,
                 file_size=len(action.byte),
             )
-            return [ActionSuccess(download_triggered=True)]
+            return [ActionSuccess()]
 
         # Priority 2: If download_url is provided, download from URL
         if action.download_url is not None:
-            downloaded_path = await download_file_api(action.download_url)
-            # Check if the downloaded file actually exists
-            if not os.path.exists(downloaded_path):
-                LOG.error(
-                    "DownloadFileAction: Downloaded file path does not exist",
-                    action=action,
-                    downloaded_path=downloaded_path,
-                    download_url=action.download_url,
-                    full_file_path=full_file_path,
-                )
-                return [ActionFailure(DownloadedFileNotFound(downloaded_path, action.download_url))]
-
-            # Move the downloaded file to the target location
-            # If the downloaded file has a different name, use it; otherwise use the specified file_name
-            if os.path.basename(downloaded_path) != file_name:
-                # Copy to target location with specified file_name
-                shutil.copy2(downloaded_path, full_file_path)
-                # Optionally remove the temporary file
-                try:
-                    os.remove(downloaded_path)
-                except Exception:
-                    pass  # Ignore errors when removing temp file
-            else:
-                # Move to target location
-                shutil.move(downloaded_path, full_file_path)
+            # the URL is usally requiring login credentials/cookides, so we should use browser navigation to access the URL instead of downloading the file directly
+            try:
+                await page.goto(action.download_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+            except Exception as e:
+                error = str(e)
+                # some cases use this method to download a file. but it will be redirected away soon
+                # and agent will run into ABORTED error.
+                # some cases playwright will raise error like "Page.goto: Download is starting"
+                if "net::ERR_ABORTED" not in error and "Page.goto: Download is starting" not in error:
+                    raise e
 
             LOG.info(
                 "DownloadFileAction: Downloaded file from URL",
@@ -1668,9 +1651,9 @@ async def handle_download_file_action(
                 full_file_path=full_file_path,
                 download_url=action.download_url,
             )
-            return [ActionSuccess(download_triggered=True)]
+            return [ActionSuccess()]
 
-        return [ActionSuccess(download_triggered=False)]
+        return [ActionSuccess()]
 
     except Exception as e:
         LOG.exception(

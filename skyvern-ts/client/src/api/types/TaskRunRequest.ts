@@ -86,6 +86,8 @@ export interface TaskRunRequest {
     max_screenshot_scrolls?: number;
     /** The CDP address for the task. */
     browser_address?: string;
+    /** Whether to run the task with agent or code. */
+    run_with?: string;
 }
 
 export namespace TaskRunRequest {

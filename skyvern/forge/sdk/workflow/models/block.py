@@ -3063,6 +3063,8 @@ class FileParserBlock(Block):
             return FileType.PDF
         elif suffix == ".tsv":
             return FileType.CSV  # TSV files are handled by the CSV parser
+        elif suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"):
+            return FileType.IMAGE
         else:
             return FileType.CSV  # Default to CSV for .csv and any other extensions
 
@@ -3112,6 +3114,12 @@ class FileParserBlock(Block):
                 validate_pdf_file(file_path, file_identifier=file_url_used)
             except PDFParsingError as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
+        elif self.file_type == FileType.IMAGE:
+            kind = filetype.guess(file_path)
+            if kind is None or not kind.mime.startswith("image/"):
+                raise InvalidFileType(
+                    file_url=file_url_used, file_type=self.file_type, error="File is not a valid image"
+                )
 
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
         """Parse CSV/TSV file and return list of dictionaries."""
@@ -3184,6 +3192,27 @@ class FileParserBlock(Block):
         except PDFParsingError as e:
             raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
+    async def _parse_image_file(self, file_path: str) -> str:
+        """Parse image file using vision LLM for OCR."""
+        try:
+            with open(file_path, "rb") as f:
+                image_bytes = f.read()
+
+            llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                self.override_llm_key, default=app.LLM_API_HANDLER
+            )
+            llm_response = await llm_api_handler(
+                prompt=llm_prompt,
+                prompt_name="extract-text-from-image",
+                screenshots=[image_bytes],
+                force_dict=True,
+            )
+            return llm_response.get("extracted_text", "")
+        except Exception:
+            LOG.exception("Failed to extract text from image via OCR", file_url=self.file_url)
+            raise
+
     async def _extract_with_ai(
         self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext
     ) -> dict[str, Any]:
@@ -3210,9 +3239,8 @@ class FileParserBlock(Block):
             "extract-information-from-file-text", extracted_text_content=content_str, json_schema=schema_to_use
         )
 
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key, default=app.LLM_API_HANDLER
-        )
+        llm_key = self.override_llm_key
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
 
         llm_response = await llm_api_handler(
             prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
@@ -3261,9 +3289,9 @@ class FileParserBlock(Block):
         else:
             file_path = await download_file(self.file_url)
 
-        # Auto-detect file type based on file extension
-        detected_file_type = self._detect_file_type_from_url(self.file_url)
-        self.file_type = detected_file_type
+        # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF are explicit choices)
+        if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF):
+            self.file_type = self._detect_file_type_from_url(self.file_url)
 
         # Validate the file type
         self.validate_file_type(self.file_url, file_path)
@@ -3283,6 +3311,8 @@ class FileParserBlock(Block):
             parsed_data = await self._parse_excel_file(file_path)
         elif self.file_type == FileType.PDF:
             parsed_data = await self._parse_pdf_file(file_path)
+        elif self.file_type == FileType.IMAGE:
+            parsed_data = await self._parse_image_file(file_path)
         else:
             return await self.build_block_result(
                 success=False,

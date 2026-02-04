@@ -23,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/util/utils";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useUpdate } from "../../useUpdate";
 import { NodeHeader } from "../components/NodeHeader";
 import { AppNode, isWorkflowBlockNode } from "..";
@@ -44,6 +45,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   const nodes = useNodes<AppNode>();
   const { setNodes, setEdges } = useReactFlow();
   const node = nodes.find((n) => n.id === id);
+  const { setIsInternalUpdate } = useWorkflowHasChangesStore();
 
   const update = useUpdate<ConditionalNodeData>({
     id,
@@ -109,11 +111,17 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
 
   useEffect(() => {
     if (!data.activeBranchId && orderedBranches.length > 0) {
+      // Mark as internal update to prevent triggering "unsaved changes" dialog
+      setIsInternalUpdate(true);
       update({
         activeBranchId: orderedBranches[0]?.id ?? null,
       });
+      // Clear the flag after layout completes
+      setTimeout(() => {
+        setIsInternalUpdate(false);
+      }, 50);
     }
-  }, [data.activeBranchId, orderedBranches, update]);
+  }, [data.activeBranchId, orderedBranches, update, setIsInternalUpdate]);
 
   // Toggle visibility of branch nodes/edges when activeBranchId changes
   useEffect(() => {
@@ -271,7 +279,14 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
     if (!data.editable) {
       return;
     }
+    // Mark as internal update to prevent triggering "unsaved changes" dialog
+    // Switching branches is UI state, not actual workflow data changes
+    setIsInternalUpdate(true);
     update({ activeBranchId: branchId });
+    // Clear the flag after layout completes (layout uses setTimeout(10))
+    setTimeout(() => {
+      setIsInternalUpdate(false);
+    }, 50);
   };
 
   const handleRemoveBranch = (branchId: string) => {

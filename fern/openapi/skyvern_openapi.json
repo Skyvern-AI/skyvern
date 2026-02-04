@@ -4712,6 +4712,11 @@
             "type": "integer",
             "title": "Credits Remaining"
           },
+          "cancel_at_period_end": {
+            "type": "boolean",
+            "title": "Cancel At Period End",
+            "default": false
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -8427,7 +8432,8 @@
         "enum": [
           "csv",
           "excel",
-          "pdf"
+          "pdf",
+          "image"
         ],
         "title": "FileType"
       },
@@ -15169,9 +15175,11 @@
           "generate_metadata",
           "extract_loop_values",
           "generate_task_in_loop",
-          "generate_general_task"
+          "generate_general_task",
+          "termination"
         ],
-        "title": "ThoughtScenario"
+        "title": "ThoughtScenario",
+        "description": "Scenario in which a thought was generated.\n\nNote: Stored as VARCHAR in the database (not a PostgreSQL ENUM), so new values\ncan be added without database migrations. See observer_thoughts.observer_thought_scenario column."
       },
       "ThoughtType": {
         "type": "string",
@@ -15180,9 +15188,11 @@
           "metadata",
           "user_goal_check",
           "internal_plan",
-          "failure_describe"
+          "failure_describe",
+          "termination"
         ],
-        "title": "ThoughtType"
+        "title": "ThoughtType",
+        "description": "Type of thought recorded during task execution.\n\nNote: Stored as VARCHAR in the database (not a PostgreSQL ENUM), so new values\ncan be added without database migrations. See observer_thoughts.observer_thought_type column."
       },
       "TotpType": {
         "type": "string",

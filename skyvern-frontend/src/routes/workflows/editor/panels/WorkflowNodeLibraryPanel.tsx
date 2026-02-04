@@ -188,7 +188,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "File Parser Block",
-    description: "Parse PDFs, CSVs, and Excel files",
+    description: "Parse PDFs, CSVs, Excel files, and Images",
   },
   // {
   //   nodeType: "pdfParser",
@@ -348,7 +348,8 @@ function WorkflowNodeLibraryPanel({
 
     return (
       item.nodeType.toLowerCase().includes(term) ||
-      item.title.toLowerCase().includes(term)
+      item.title.toLowerCase().includes(term) ||
+      item.description.toLowerCase().includes(term)
     );
   });
 
