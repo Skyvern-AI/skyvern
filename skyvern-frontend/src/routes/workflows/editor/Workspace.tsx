@@ -248,7 +248,9 @@ function Workspace({
   const [toDeleteCacheKeyValue, setToDeleteCacheKeyValue] = useState<
     string | null
   >(null);
-  const [isCopilotOpen, setIsCopilotOpen] = useState(false);
+  const [isCopilotOpen, setIsCopilotOpen] = useState(
+    () => !initialNodes.some(isWorkflowBlockNode),
+  );
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [
