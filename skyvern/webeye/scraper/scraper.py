@@ -20,7 +20,7 @@ from skyvern.experimentation.wait_utils import empty_page_retry_wait
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.browser_state import BrowserState
@@ -136,7 +136,7 @@ def build_element_dict(
     return id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids
 
 
-@TraceManager.traced_async(ignore_input=True)
+@traced()
 async def scrape_website(
     browser_state: BrowserState,
     url: str,
@@ -466,7 +466,7 @@ async def add_frame_interactable_elements(
     return elements, element_tree
 
 
-@TraceManager.traced_async(ignore_input=True)
+@traced()
 async def get_interactable_element_tree(
     page: Page,
     scrape_exclude: ScrapeExcludeFunc | None = None,
@@ -524,7 +524,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
             return True
         return False
 
-    @TraceManager.traced_async(ignore_input=True)
+    @traced()
     async def get_incremental_element_tree(
         self,
         cleanup_element_tree: CleanupElementTreeFunc,
