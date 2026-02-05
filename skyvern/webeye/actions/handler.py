@@ -2867,19 +2867,7 @@ async def input_or_auto_complete_input(
         return None
 
 
-@traced(
-    ignore_inputs=[
-        "input_or_select_context",
-        "page",
-        "dom",
-        "skyvern_element",
-        "skyvern_frame",
-        "incremental_scraped",
-        "dropdown_menu_element",
-        "target_value",
-        "continue_until_close",
-    ]
-)
+@traced()
 async def sequentially_select_from_dropdown(
     action: SelectOptionAction,
     input_or_select_context: InputOrSelectContext,
@@ -3152,19 +3140,7 @@ async def select_from_emerging_elements(
     return ActionSuccess()
 
 
-@traced(
-    ignore_inputs=[
-        "context",
-        "page",
-        "skyvern_element",
-        "skyvern_frame",
-        "incremental_scraped",
-        "check_filter_funcs",
-        "dropdown_menu_element",
-        "select_history",
-        "target_value",
-    ]
-)
+@traced()
 async def select_from_dropdown(
     context: InputOrSelectContext,
     page: Page,
@@ -3358,17 +3334,7 @@ async def select_from_dropdown(
         return single_select_result
 
 
-@traced(
-    ignore_inputs=[
-        "value",
-        "page",
-        "skyvern_element",
-        "skyvern_frame",
-        "dom",
-        "incremental_scraped",
-        "dropdown_menu_element",
-    ]
-)
+@traced()
 async def select_from_dropdown_by_value(
     value: str,
     page: Page,
