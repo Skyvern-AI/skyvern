@@ -4,21 +4,47 @@ subtitle: Common issues, step timeline, and when to adjust what
 slug: debugging/troubleshooting-guide
 ---
 
-When a run fails or produces unexpected results, this guide helps you identify the cause and fix it. The debugging flow is:
+When a run fails or produces unexpected results, this guide helps you identify the cause and fix it.
 
-1. **Check the run status and failure reason** — What happened?
-2. **Read the step timeline** — Where did it go wrong?
-3. **Inspect artifacts** — What did the AI see and decide?
-4. **Determine the fix** — Adjust prompt, parameters, or file a bug?
+## Quick debugging checklist
+
+<Frame>
+  <img src="/images/debugging-checklist.png" alt="Skyvern Debugging Checklist" />
+</Frame>
+
+<Steps>
+  <Step title="Check run status">
+    Call `get_run(run_id)` and check `status` and `failure_reason`
+  </Step>
+  <Step title="Find the failed step">
+    Call `get_run_timeline(run_id)` to see which block failed
+  </Step>
+  <Step title="Inspect artifacts">
+    Check `screenshot_final` to see where it stopped, `recording` to watch what happened
+  </Step>
+  <Step title="Determine the fix">
+    Adjust prompt, parameters, or file a bug based on what you find
+  </Step>
+</Steps>
+
+**Key artifacts to check:**
+- `screenshot_final` — Final page state
+- `recording` — Video of what happened
+- `llm_response_parsed` — What the AI decided to do
+- `visible_elements_tree` — What elements were detected
+- `har` — Network requests if something failed to load
 
 ---
 
 ## Step 1: Check the run
 
-Start with the run response to understand what happened:
-
 <CodeGroup>
 ```python Python
+import os
+from skyvern import Skyvern
+
+client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
 run = await client.get_run(run_id)
 
 print(f"Status: {run.status}")
@@ -28,6 +54,12 @@ print(f"Output: {run.output}")
 ```
 
 ```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+
+const client = new SkyvernClient({
+  apiKey: process.env.SKYVERN_API_KEY,
+});
+
 const run = await client.getRun(runId);
 
 console.log(`Status: ${run.status}`);
@@ -55,7 +87,7 @@ curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
 
 ## Step 2: Read the step timeline
 
-The timeline shows each block and action in execution order. Use it to find exactly where things went wrong.
+The timeline shows each block and action in execution order.
 
 <CodeGroup>
 ```python Python
@@ -98,52 +130,9 @@ curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID/timeline" \
 ```
 </CodeGroup>
 
-**Example timeline response:**
-
-```json
-[
-  {
-    "type": "block",
-    "block": {
-      "workflow_run_block_id": "wrb_123",
-      "label": "login",
-      "block_type": "navigation",
-      "status": "completed",
-      "duration": 12.5,
-      "actions": [
-        {"action_type": "input_text", "status": "completed"},
-        {"action_type": "click", "status": "completed"}
-      ]
-    }
-  },
-  {
-    "type": "block",
-    "block": {
-      "workflow_run_block_id": "wrb_124",
-      "label": "download_invoice",
-      "block_type": "navigation",
-      "status": "terminated",
-      "failure_reason": "Could not find invoice for January 2024",
-      "duration": 8.2,
-      "actions": [
-        {"action_type": "click", "status": "completed"},
-        {"action_type": "click", "status": "failed"}
-      ]
-    }
-  }
-]
-```
-
-The timeline tells you:
-- **Which block failed** — `download_invoice` terminated
-- **What it tried** — Clicked twice, second click failed
-- **Why it stopped** — "Could not find invoice for January 2024"
-
 ---
 
 ## Step 3: Inspect artifacts
-
-Once you know which step failed, pull artifacts for that step:
 
 <CodeGroup>
 ```python Python
@@ -173,162 +162,197 @@ curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID/artifacts?artifact_type=scr
 ```
 </CodeGroup>
 
-Check these in order:
-
-1. **`screenshot_final`** — What did the page look like when it stopped?
-2. **`recording`** — Watch what happened leading up to the failure
-3. **`llm_response_parsed`** — What action did the AI decide to take?
-4. **`skyvern_log`** — Step-by-step execution details
+See [Using Artifacts](/debugging/using-artifacts) for the full list of artifact types.
 
 ---
 
 ## Common issues and fixes
 
-### Run completed but output is wrong
+### Run Status Issues
 
+<Accordion title="Run completed but output is wrong">
 **Symptom:** Status is `completed`, but the extracted data is incorrect or incomplete.
 
-**Check:**
-- `screenshot_final` — Did it end on the right page?
-- `llm_response_parsed` — Did the AI extract from the right elements?
-
-**Likely causes:**
-- Prompt was ambiguous about what to extract
-- `data_extraction_schema` descriptions weren't specific enough
-- Page had multiple similar elements and AI picked the wrong one
+**Check:** `screenshot_final` (right page?) and `llm_response_parsed` (right elements?)
 
 **Fix:**
-- Add more specific descriptions in your schema: `"description": "The price in USD, without currency symbol, as a decimal number"`
-- Add visual hints to your prompt: "The price is displayed in bold below the product title"
+- Add specific descriptions in your schema: `"description": "The price in USD, without currency symbol"`
+- Add visual hints: "The price is displayed in bold below the product title"
+</Accordion>
 
----
-
-### AI clicked the wrong element
-
-**Symptom:** Recording shows the AI clicking something other than what you intended.
-
-**Check:**
-- `visible_elements_tree` — Was the right element detected?
-- `llm_prompt` — Was the target described clearly?
-
-**Likely causes:**
-- Multiple similar elements on the page
-- Element wasn't visible (scrolled out of view, in an iframe)
-- Prompt description matched multiple elements
-
-**Fix:**
-- Add distinguishing details: "Click the **blue** Submit button at the **bottom** of the form"
-- Reference surrounding text: "Click the Download link in the row that says 'January 2024'"
-
----
-
-### Run timed out
-
+<Accordion title="Run timed out">
 **Symptom:** Status is `timed_out`.
 
-**Check:**
-- `recording` — Did the AI get stuck in a loop?
-- `step_count` — How many steps did it take?
-
-**Likely causes:**
-- Task was too complex for `max_steps`
-- AI kept navigating without reaching the goal
-- Missing completion criteria caused infinite loop
+**Check:** `recording` (stuck in a loop?) and `step_count` (how many steps?)
 
 **Fix:**
 - Increase `max_steps` if the task genuinely needs more steps
 - Add explicit completion criteria: "COMPLETE when you see 'Order confirmed'"
-- Simplify the task or break it into multiple workflow blocks
+- Break complex tasks into multiple workflow blocks
+</Accordion>
 
----
+<Accordion title="Run stuck in queued state">
+**Symptom:** Run stays in `queued` status and never starts.
 
-### Element not found
+**Likely causes:** Concurrency limit hit, sequential run lock, or high platform load.
 
+**Fix:**
+- Wait for other runs to complete
+- Check your plan's concurrency limits in Settings
+- If using "Run Sequentially" with credentials, ensure prior runs finish
+</Accordion>
+
+<Accordion title="504 Gateway Timeout on browser session">
+**Symptom:** Getting `504 Gateway Timeout` errors when creating browser sessions.
+
+**Fix:**
+- Retry after a few seconds — usually transient
+- For self-hosted: check infrastructure resources
+- If persistent, contact support with your run IDs
+</Accordion>
+
+### Element & Interaction Issues
+
+<Accordion title="AI clicked the wrong element">
+**Symptom:** Recording shows the AI clicking something other than intended.
+
+**Check:** `visible_elements_tree` (element detected?) and `llm_prompt` (target described clearly?)
+
+**Fix:**
+- Add distinguishing details: "Click the **blue** Submit button at the **bottom** of the form"
+- Reference surrounding text: "Click Download in the row that says 'January 2024'"
+</Accordion>
+
+<Accordion title="Element not found">
 **Symptom:** `failure_reason` mentions an element couldn't be found.
 
-**Check:**
-- `screenshot_final` — Is the element visible on the page?
-- `visible_elements_tree` — Did Skyvern detect it?
+**Check:** `screenshot_final` (element visible?) and `visible_elements_tree` (element detected?)
 
-**Likely causes:**
-- Element loads dynamically after the page appears
-- Element is inside an iframe
-- Element is below the fold (needs scrolling)
-- Element has unusual rendering (canvas, shadow DOM)
+**Likely causes:** Dynamic loading, iframe, below the fold, unusual rendering (canvas, shadow DOM)
 
 **Fix:**
 - Add `max_screenshot_scrolls` to capture lazy-loaded content
-- Describe the element visually rather than by its technical properties
-- Add a wait or explicit scroll instruction in your prompt
+- Describe elements visually rather than by technical properties
+- Add wait or scroll instructions in your prompt
+</Accordion>
 
----
+<Accordion title="Date fields entering wrong values">
+**Symptom:** Dates entered in wrong format (MM/DD vs DD/MM) or wrong date entirely.
 
-### Login failed
+**Check:** `recording` (how did AI interact with the date picker?)
 
+**Fix:**
+- Specify exact format: "Enter the date as **15/01/2024** (DD/MM/YYYY format)"
+- For date pickers: "Click the date field, then select January 15, 2024 from the calendar"
+- If site auto-formats: "Type 01152024 and let the field format it"
+</Accordion>
+
+<Accordion title="Address autocomplete cycling or wrong selection">
+**Symptom:** AI keeps clicking through address suggestions in a loop, or selects wrong address.
+
+**Check:** `recording` (is autocomplete dropdown appearing?)
+
+**Fix:**
+- Specify selection: "Type '123 Main St' and select the first suggestion showing 'New York, NY'"
+- Disable autocomplete: "Type the full address without using autocomplete suggestions"
+- Break into steps: "Enter street address, wait for dropdown, select the matching suggestion"
+</Accordion>
+
+### Authentication Issues
+
+<Accordion title="Login failed">
 **Symptom:** Status is `terminated` with login-related failure reason.
 
-**Check:**
-- `screenshot_final` — What error message appeared?
-- `recording` — Did it fill the fields correctly?
+**Check:** `screenshot_final` (error message?) and `recording` (fields filled correctly?)
 
-**Likely causes:**
-- Credentials are expired or wrong
-- CAPTCHA appeared
-- MFA is required but not configured
-- Site detected automation
+**Likely causes:** Expired credentials, CAPTCHA, MFA required, automation detected
 
 **Fix:**
 - Verify credentials in your credential store
 - Use `RESIDENTIAL_ISP` proxy for more stable IPs
 - Configure TOTP if MFA is required
 - Use a browser profile with an existing session
+</Accordion>
 
----
-
-### CAPTCHA blocked the run
-
+<Accordion title="CAPTCHA blocked the run">
 **Symptom:** `failure_reason` mentions CAPTCHA.
 
 **Fix options:**
-1. **Browser profile** — Create a profile with an authenticated session that skips login
+1. **Browser profile** — Use an authenticated session that skips login
 2. **Human interaction block** — Pause for manual CAPTCHA solving
-3. **Different proxy** — Use `RESIDENTIAL_ISP` for static IPs that sites trust more
+3. **Different proxy** — Use `RESIDENTIAL_ISP` for static IPs sites trust more
+</Accordion>
+
+### Data & Output Issues
+
+<Accordion title="AI hallucinating or inventing data">
+**Symptom:** Extracted data contains information not on the page.
+
+**Check:** `screenshot_final` (data visible?) and `llm_response_parsed` (what did AI claim to see?)
+
+**Fix:**
+- Add instruction: "Only extract data **visibly displayed** on the page. Return null if not found"
+- Make schema fields optional where appropriate
+- Add validation: "If price is not displayed, set price to null instead of guessing"
+</Accordion>
+
+<Accordion title="File downloads not working">
+**Symptom:** Files download repeatedly, wrong files, or downloads don't complete.
+
+**Check:** `recording` (download button clicked correctly?) and `downloaded_files` in response
+
+**Fix:**
+- Be specific: "Click the **PDF** download button, not the Excel one"
+- Add wait time: "Wait for the download to complete"
+- For multi-step downloads: "Click Download, then select PDF format, then click Confirm"
+</Accordion>
+
+### Environment Issues
+
+<Accordion title="Site showing content in wrong language">
+**Symptom:** Site displays in unexpected language based on proxy location.
+
+**Check:** What `proxy_location` is being used? Does site geo-target?
+
+**Fix:**
+- Use appropriate proxy: `RESIDENTIAL_US` for English US sites
+- Add instruction: "If the site asks for language preference, select English"
+- Set language in URL: `https://example.com/en/`
+</Accordion>
+
+<Accordion title="Workflow gets stuck in a loop">
+**Symptom:** Recording shows AI repeating the same actions without progressing.
+
+**Check:** `recording` (what pattern is repeating?) and conditional block exit conditions
+
+**Fix:**
+- Add termination: "STOP if you've attempted this action 3 times without success"
+- Add completion markers: "COMPLETE when you see 'Success' message"
+- Review loop conditions — ensure exit criteria are achievable
+</Accordion>
 
 ---
 
 ## When to adjust prompts vs parameters
 
-**Adjust your prompt if:**
-- The AI misunderstood what to do
-- It clicked the wrong element among similar options
-- Completion criteria were ambiguous
-- It extracted the wrong data
-
-**Adjust parameters if:**
-- Run timed out → increase `max_steps`
-- Site blocked you → change `proxy_location`
-- Content didn't load → increase `max_screenshot_scrolls`
-- Geo-restricted content → set appropriate `proxy_location`
-
-**File a bug if:**
-- Element is clearly visible but Skyvern doesn't detect it
-- Standard UI patterns (dropdowns, checkboxes, date pickers) don't work
-- Actions execute on consistently wrong elements despite clear prompts
-- Recording shows unexpected browser behavior
-
----
-
-## Quick debugging checklist
-
-```
-□ Check run.status and run.failure_reason
-□ Get timeline to find which step failed
-□ View screenshot_final to see final page state
-□ Watch recording to see what happened
-□ Check llm_response_parsed to see AI's decision
-□ Review visible_elements_tree if element wasn't found
-□ Check har file if network request failed
-```
+<CardGroup cols={3}>
+  <Card title="Adjust prompt" icon="pen">
+    - AI misunderstood what to do
+    - Clicked wrong element
+    - Ambiguous completion criteria
+    - Extracted wrong data
+  </Card>
+  <Card title="Adjust parameters" icon="sliders">
+    - Timed out → increase `max_steps`
+    - Site blocked → change `proxy_location`
+    - Content didn't load → increase `max_screenshot_scrolls`
+  </Card>
+  <Card title="File a bug" icon="bug">
+    - Visible element not detected
+    - Standard UI patterns don't work
+    - Consistent wrong element despite clear prompts
+  </Card>
+</CardGroup>
 
 ---
 

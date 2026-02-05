@@ -22,7 +22,8 @@
             "group": "Getting Started",
             "pages": [
               "getting-started/quickstart",
-              "getting-started/core-concepts"
+              "getting-started/core-concepts",
+              "faq"
             ]
           },
           {

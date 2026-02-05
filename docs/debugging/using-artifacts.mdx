@@ -4,9 +4,19 @@ subtitle: Access recordings, screenshots, logs, and network data for every run
 slug: debugging/using-artifacts
 ---
 
-Every run generates artifacts—recordings, screenshots, logs, and more. Use these to understand what happened, debug failures, and verify the AI made the right decisions.
+When a Skyvern run fails or produces unexpected results, artifacts are your debugging toolkit. Every run automatically captures what happened—recordings of the browser session, screenshots at each step, the AI's reasoning, and network traffic.
 
 This page covers how to retrieve artifacts and what each type tells you.
+
+<Tip>
+Looking for a specific artifact type? Jump to the [artifact types reference](#artifact-types-reference) to see all available types, then come back here to learn how to retrieve them.
+</Tip>
+
+---
+
+## Before you start
+
+You need a `run_id` to retrieve artifacts. You get this when you [run a task](/running-automations/run-a-task) or workflow.
 
 ---
 
@@ -16,6 +26,11 @@ Use `get_run_artifacts` with the `run_id` from your task or workflow run:
 
 <CodeGroup>
 ```python Python
+import os
+from skyvern import Skyvern
+
+client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
 artifacts = await client.get_run_artifacts(run_id)
 
 for artifact in artifacts:
@@ -23,6 +38,12 @@ for artifact in artifacts:
 ```
 
 ```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+
+const client = new SkyvernClient({
+  apiKey: process.env.SKYVERN_API_KEY,
+});
+
 const artifacts = await client.getRunArtifacts(runId);
 
 for (const artifact of artifacts) {
@@ -36,27 +57,9 @@ curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID/artifacts" \
 ```
 </CodeGroup>
 
-**Example response:**
-
-```json
-[
-  {
-    "artifact_id": "a_486305284826607484",
-    "artifact_type": "recording",
-    "uri": "s3://skyvern-artifacts/.../recording.webm",
-    "signed_url": "https://skyvern-artifacts.s3.amazonaws.com/.../recording.webm?...",
-    "task_id": "tsk_486305246171901814",
-    "step_id": "stp_486305250466869112",
-    "run_id": "tsk_v2_486305187432193504",
-    "workflow_run_id": "wr_486305187432193510",
-    "organization_id": "o_485917350850524254",
-    "created_at": "2026-01-20T11:52:52.083001",
-    "modified_at": "2026-01-20T11:52:52.083003"
-  }
-]
-```
-
-The `signed_url` is a pre-signed URL valid for a limited time. Download or view it immediately.
+<Note>
+Signed URLs expire after 24 hours. If a URL has expired, call `get_run_artifacts` again to get fresh URLs. When running Skyvern locally, `signed_url` will be `null`—access artifacts directly from your local file system instead.
+</Note>
 
 ---
 
@@ -96,6 +99,7 @@ These show you what the browser looked like at various points.
 | Type | What it contains | Use this to |
 |------|------------------|-------------|
 | `recording` | Full video of the browser session (WebM) | Watch the entire run, see exactly what happened |
+| `screenshot` | Base screenshot capture | General page state capture |
 | `screenshot_final` | Screenshot when the run ended | Check the final state—did it end on the right page? |
 | `screenshot_action` | Screenshot taken after each action | See the page state after each click, type, or navigation |
 | `screenshot_llm` | Screenshot sent to the LLM for decision-making | Understand what the AI "saw" when it made each decision |
@@ -112,8 +116,11 @@ These show you why the AI made each decision.
 | `llm_request` | Full request including context | Check if the right context was included |
 | `llm_response` | Raw LLM response | See the AI's unprocessed output |
 | `llm_response_parsed` | Parsed response (extracted actions) | Understand what actions the AI decided to take |
+| `llm_response_rendered` | Parsed response with real URLs | Debug URL targeting issues (see below) |
 
 **Debugging tip:** If the AI did something unexpected, check `llm_prompt` to see if your prompt was interpreted correctly, then `llm_response_parsed` to see what action it extracted.
+
+**About `llm_response_rendered`:** Skyvern hashes URLs before sending them to the LLM to reduce token usage and avoid confusing the model with long query strings. The `llm_response_parsed` artifact contains these hashed placeholders (like `{{_a1b2c3}}`), while `llm_response_rendered` shows the same response with actual URLs substituted back in. Use this when you need to verify which exact URL the AI targeted.
 
 ### Page structure artifacts
 
@@ -121,13 +128,20 @@ These show how Skyvern interpreted the page.
 
 | Type | What it contains | Use this to |
 |------|------------------|-------------|
-| `visible_elements_tree` | DOM tree of visible elements | See which elements Skyvern detected |
+| `visible_elements_tree` | DOM tree of visible elements (JSON) | See which elements Skyvern detected |
 | `visible_elements_tree_trimmed` | Trimmed tree (sent to LLM) | See what the AI could "see" |
+| `visible_elements_tree_in_prompt` | Element tree as plain text | Read exactly what was embedded in the prompt |
 | `visible_elements_id_css_map` | CSS selectors for each element | Debug element targeting issues |
+| `visible_elements_id_frame_map` | Element-to-iframe mapping | Debug elements inside iframes |
+| `visible_elements_id_xpath_map` | XPath selectors for each element | Alternative element targeting debug |
+| `hashed_href_map` | Mapping of hashed URLs to original URLs | Decode URL placeholders in LLM responses |
+| `html` | Generic HTML capture | Inspect page HTML |
 | `html_scrape` | Full HTML captured during scraping | Inspect the raw page structure |
 | `html_action` | HTML captured after an action | See how the page changed after each action |
 
 **Debugging tip:** If the AI couldn't find an element, check `visible_elements_tree` to see if it was detected. If not, the element might be in an iframe, dynamically loaded, or outside the viewport.
+
+**About the element tree variants:** The `visible_elements_tree` is a JSON structure, while `visible_elements_tree_in_prompt` is the plain-text representation that gets embedded directly into the LLM prompt. The latter is often easier to read when debugging prompt issues. If you're debugging iframe-related problems, `visible_elements_id_frame_map` shows which frame contains each element ID.
 
 ### Log artifacts
 
@@ -154,7 +168,6 @@ These contain structured execution data.
 
 | Type | What it contains | Use this to |
 |------|------------------|-------------|
-| `pdf` | PDF files generated or downloaded | Access downloaded documents |
 | `script_file` | Generated Playwright scripts | See the code Skyvern would use to repeat this task |
 
 ---
@@ -175,148 +188,6 @@ These contain structured execution data.
 | `organization_id` | string | Your organization |
 | `created_at` | datetime | When created |
 | `modified_at` | datetime | When modified |
-
----
-
-## Example: Debug a failed login
-
-Here's a complete example of using artifacts to debug a login failure:
-
-<CodeGroup>
-```python Python
-import asyncio
-
-async def debug_failed_run(run_id: str):
-    # 1. Get the run to see what failed
-    run = await client.get_run(run_id)
-    print(f"Status: {run.status}")
-    print(f"Failure reason: {run.failure_reason}")
-
-    # 2. Get key artifacts
-    artifacts = await client.get_run_artifacts(
-        run_id,
-        artifact_type=[
-            "recording",
-            "screenshot_final",
-            "llm_response_parsed",
-            "skyvern_log"
-        ]
-    )
-
-    # 3. Organize by type
-    by_type = {}
-    for a in artifacts:
-        by_type[a.artifact_type] = a.signed_url
-
-    # 4. Print URLs for manual inspection
-    print("\n=== Debug artifacts ===")
-    if "screenshot_final" in by_type:
-        print(f"Final screenshot: {by_type['screenshot_final']}")
-    if "recording" in by_type:
-        print(f"Recording: {by_type['recording']}")
-    if "skyvern_log" in by_type:
-        print(f"Execution log: {by_type['skyvern_log']}")
-
-    # 5. Download and parse the LLM response to see what action was attempted
-    if "llm_response_parsed" in by_type:
-        import httpx
-        async with httpx.AsyncClient() as http:
-            response = await http.get(by_type["llm_response_parsed"])
-            print(f"\nLast AI decision:\n{response.text[:500]}...")
-
-asyncio.run(debug_failed_run("tsk_v2_486305187432193504"))
-```
-
-```typescript TypeScript
-async function debugFailedRun(runId: string) {
-  // 1. Get the run to see what failed
-  const run = await client.getRun(runId);
-  console.log(`Status: ${run.status}`);
-  console.log(`Failure reason: ${run.failure_reason}`);
-
-  // 2. Get key artifacts
-  const artifacts = await client.getRunArtifacts(runId, {
-    artifact_type: [
-      "recording",
-      "screenshot_final",
-      "llm_response_parsed",
-      "skyvern_log"
-    ]
-  });
-
-  // 3. Organize by type
-  const byType: Record<string, string> = {};
-  for (const a of artifacts) {
-    if (a.signed_url) {
-      byType[a.artifact_type] = a.signed_url;
-    }
-  }
-
-  // 4. Print URLs for manual inspection
-  console.log("\n=== Debug artifacts ===");
-  if (byType["screenshot_final"]) {
-    console.log(`Final screenshot: ${byType["screenshot_final"]}`);
-  }
-  if (byType["recording"]) {
-    console.log(`Recording: ${byType["recording"]}`);
-  }
-  if (byType["skyvern_log"]) {
-    console.log(`Execution log: ${byType["skyvern_log"]}`);
-  }
-
-  // 5. Download and parse the LLM response to see what action was attempted
-  if (byType["llm_response_parsed"]) {
-    const response = await fetch(byType["llm_response_parsed"]);
-    const text = await response.text();
-    console.log(`\nLast AI decision:\n${text.slice(0, 500)}...`);
-  }
-}
-
-debugFailedRun("tsk_v2_486305187432193504");
-```
-
-```bash cURL
-#!/bin/bash
-
-RUN_ID="tsk_v2_486305187432193504"
-
-# 1. Get the run to see what failed
-echo "Fetching run status..."
-curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
-  -H "x-api-key: $SKYVERN_API_KEY" \
-  | jq '{status: .status, failure_reason: .failure_reason}'
-
-# 2. Get key artifacts
-echo -e "\nFetching debug artifacts..."
-ARTIFACTS=$(curl -s -X GET \
-  "https://api.skyvern.com/v1/runs/$RUN_ID/artifacts?artifact_type=recording&artifact_type=screenshot_final&artifact_type=llm_response_parsed&artifact_type=skyvern_log" \
-  -H "x-api-key: $SKYVERN_API_KEY")
-
-# 3. Extract URLs for each artifact type
-echo -e "\n=== Debug artifacts ==="
-echo "$ARTIFACTS" | jq -r '
-  map(select(.artifact_type == "screenshot_final") | .signed_url) | first
-  | "Final screenshot: \(.)"'
-
-echo "$ARTIFACTS" | jq -r '
-  map(select(.artifact_type == "recording") | .signed_url) | first
-  | "Recording: \(.)"'
-
-echo "$ARTIFACTS" | jq -r '
-  map(select(.artifact_type == "skyvern_log") | .signed_url) | first
-  | "Execution log: \(.)"'
-
-# 4. Download and preview the LLM response
-LLM_RESPONSE_URL=$(echo "$ARTIFACTS" | jq -r '
-  map(select(.artifact_type == "llm_response_parsed") | .signed_url) | first')
-
-if [ "$LLM_RESPONSE_URL" != "null" ]; then
-  echo -e "\nLast AI decision:"
-  curl -s "$LLM_RESPONSE_URL" | head -c 500
-  echo "..."
-fi
-```
-</CodeGroup>
 
 ---
 
