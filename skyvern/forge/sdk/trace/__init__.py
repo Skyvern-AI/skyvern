@@ -1,109 +1,50 @@
+import asyncio
 from functools import wraps
-from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
+from typing import Any, Callable
 
-from skyvern.forge import app
-from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace.base import BaseTrace, NoOpTrace
-from skyvern.forge.sdk.trace.experiment_utils import collect_experiment_metadata_safely
-
-P = ParamSpec("P")
-R = TypeVar("R")
+from opentelemetry import trace
 
 
-class TraceManager:
-    __instance: BaseTrace = NoOpTrace()
+def traced(name: str | None = None, tags: list[str] | None = None) -> Callable:
+    """Decorator that creates an OTEL span. No-op without SDK installed.
 
-    @staticmethod
-    def traced_async(
-        *,
-        name: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        tags: list[str] | None = None,
-        **trace_parameters: Any,
-    ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
-        def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+    Args:
+        name: Span name. If not provided, uses func.__qualname__.
+        tags: Tags to add as a span attribute.
+    """
+
+    def decorator(func: Callable) -> Callable:
+        span_name = name or func.__qualname__
+
+        if asyncio.iscoroutinefunction(func):
+
             @wraps(func)
-            async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-                new_metadata: dict[str, Any] = metadata or {}
-                user_id: str | None = None
-                context = skyvern_context.current()
-                if context is not None:
-                    new_metadata["request_id"] = context.request_id
-                    new_metadata["organization_id"] = context.organization_id
-                    new_metadata["task_id"] = context.task_id
-                    new_metadata["workflow_id"] = context.workflow_id
-                    new_metadata["workflow_run_id"] = context.workflow_run_id
-                    new_metadata["task_v2_id"] = context.task_v2_id
-                    new_metadata["run_id"] = context.run_id
-                    new_metadata["organization_name"] = context.organization_name
-                    user_id = context.run_id
+            async def async_wrapper(*args: Any, **kw: Any) -> Any:
+                with trace.get_tracer("skyvern").start_as_current_span(span_name) as span:
+                    if tags:
+                        span.set_attribute("tags", tags)
+                    try:
+                        return await func(*args, **kw)
+                    except Exception as e:
+                        span.record_exception(e)
+                        span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+                        raise
 
-                    # Collect experiment metadata and include it in the span metadata
-                    experiment_metadata = await collect_experiment_metadata_safely(app.EXPERIMENTATION_PROVIDER)
-                    if experiment_metadata:
-                        new_metadata.update(experiment_metadata)
+            return async_wrapper
+        else:
 
-                new_tags: list[str] = tags or []
-                new_tags.append(SettingsManager.get_settings().ENV)
+            @wraps(func)
+            def sync_wrapper(*args: Any, **kw: Any) -> Any:
+                with trace.get_tracer("skyvern").start_as_current_span(span_name) as span:
+                    if tags:
+                        span.set_attribute("tags", tags)
+                    try:
+                        return func(*args, **kw)
+                    except Exception as e:
+                        span.record_exception(e)
+                        span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+                        raise
 
-                return await TraceManager.__instance.traced_async(
-                    name=name, metadata=new_metadata, tags=new_tags, user_id=user_id, **trace_parameters
-                )(func)(*args, **kwargs)
+            return sync_wrapper
 
-            return wrapper
-
-        return decorator
-
-    @staticmethod
-    def traced(
-        *,
-        name: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        tags: list[str] | None = None,
-        **trace_parameters: Any,
-    ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-        def decorator(func: Callable[P, R]) -> Callable[P, R]:
-            def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-                new_metadata: dict[str, Any] = metadata or {}
-                user_id: str | None = None
-                context = skyvern_context.current()
-                if context is not None:
-                    new_metadata["request_id"] = context.request_id
-                    new_metadata["organization_id"] = context.organization_id
-                    new_metadata["task_id"] = context.task_id
-                    new_metadata["workflow_id"] = context.workflow_id
-                    new_metadata["workflow_run_id"] = context.workflow_run_id
-                    new_metadata["task_v2_id"] = context.task_v2_id
-                    new_metadata["run_id"] = context.run_id
-                    new_metadata["organization_name"] = context.organization_name
-                    user_id = context.run_id
-
-                new_tags: list[str] = tags or []
-                new_tags.append(SettingsManager.get_settings().ENV)
-
-                return TraceManager.__instance.traced(
-                    name=name, metadata=new_metadata, tags=new_tags, user_id=user_id, **trace_parameters
-                )(func)(*args, **kwargs)
-
-            return wrapper
-
-        return decorator
-
-    @staticmethod
-    def get_trace_provider() -> BaseTrace:
-        return TraceManager.__instance
-
-    @staticmethod
-    def set_trace_provider(trace_provider: BaseTrace) -> None:
-        TraceManager.__instance = trace_provider
-
-    @staticmethod
-    def add_task_completion_tag(status: str) -> None:
-        """Add a completion tag to the current trace based on task/workflow status."""
-        TraceManager.__instance.add_task_completion_tag(status)
-
-    @staticmethod
-    def add_experiment_metadata(experiment_data: dict[str, Any]) -> None:
-        """Add experiment metadata to the current trace."""
-        TraceManager.__instance.add_experiment_metadata(experiment_data)
+    return decorator

@@ -2305,6 +2305,50 @@ async def generate_workflow_script_python_code(
 
         append_block_code(block_code)
 
+    # Handle for_loop blocks
+    # ForLoop blocks need script_block entries with run_signature so they can be executed via cached scripts
+    for_loop_blocks = [block for block in blocks if block["block_type"] == "for_loop"]
+    for for_loop_block in for_loop_blocks:
+        for_loop_label = for_loop_block.get("label") or f"for_loop_{for_loop_block.get('workflow_run_block_id')}"
+
+        cached_source = cached_blocks.get(for_loop_label)
+        use_cached = cached_source is not None and for_loop_label not in updated_block_labels
+
+        block_workflow_run_id = for_loop_block.get("workflow_run_id") or run_id
+        block_workflow_run_block_id = for_loop_block.get("workflow_run_block_id")
+
+        if use_cached:
+            assert cached_source is not None
+            block_code = cached_source.code
+            run_signature = cached_source.run_signature
+            block_workflow_run_id = cached_source.workflow_run_id
+            block_workflow_run_block_id = cached_source.workflow_run_block_id
+        else:
+            # Build the for loop statement
+            for_loop_stmt = _build_for_loop_statement(for_loop_label, for_loop_block)
+            temp_module = cst.Module(body=[for_loop_stmt])
+            block_code = temp_module.code
+            run_signature = block_code.strip()
+
+        if script_id and script_revision_id and organization_id:
+            try:
+                await create_or_update_script_block(
+                    block_code=block_code,
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    block_label=for_loop_label,
+                    update=pending,
+                    run_signature=run_signature,
+                    workflow_run_id=block_workflow_run_id,
+                    workflow_run_block_id=block_workflow_run_block_id,
+                    input_fields=None,
+                )
+            except Exception as e:
+                LOG.error("Failed to create for_loop script block", error=str(e), exc_info=True)
+
+        append_block_code(block_code)
+
     # --- runner ---------------------------------------------------------
     run_fn = _build_run_fn(blocks, workflow_run_request)
 

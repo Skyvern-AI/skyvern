@@ -305,19 +305,21 @@ def setup_logger() -> None:
 
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(LOG_LEVEL_VAL),
+        logger_factory=structlog.stdlib.LoggerFactory(),
         processors=[
-            structlog.processors.add_log_level,
+            structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
             add_error_processor,
             structlog.processors.format_exc_info,
         ]
         + additional_processors
-        + [skyvern_logs_processor, renderer],
+        + [skyvern_logs_processor, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
     )
     handler = logging.StreamHandler()
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             processors=[
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                 structlog.stdlib.add_log_level,
                 structlog.stdlib.add_logger_name,
                 structlog.processors.TimeStamper(fmt="iso"),

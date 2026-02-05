@@ -1,0 +1,209 @@
+---
+title: CAPTCHA & Bot Detection
+subtitle: How Skyvern detects, solves, and avoids CAPTCHAs and anti-bot systems
+slug: going-to-production/captcha-bot-detection
+---
+
+Websites use CAPTCHAs and bot detection to block automated traffic. Skyvern handles both — it detects CAPTCHAs using vision, solves them automatically on Skyvern Cloud, and configures browsers to avoid triggering anti-bot systems in the first place.
+
+---
+
+## CAPTCHA detection
+
+Skyvern detects CAPTCHAs using its LLM vision model. During each step, the AI analyzes the page screenshot and identifies whether a CAPTCHA is present and what type it is.
+
+**Supported CAPTCHA types:**
+
+| Type | Examples |
+|------|----------|
+| `RECAPTCHA` | Google reCAPTCHA v2, v3 |
+| `HCAPTCHA` | hCaptcha checkbox, image challenges |
+| `CLOUDFLARE` | Cloudflare Turnstile, Challenge pages |
+| `FUNCAPTCHA` | FunCaptcha / ArkoseLabs |
+| `MTCAPTCHA` | MTCaptcha |
+| `TEXT_CAPTCHA` | Distorted text/number images with an input field |
+| `OTHER` | Unrecognized CAPTCHA types |
+
+When the AI detects a CAPTCHA, it emits a `SOLVE_CAPTCHA` action with the identified `captcha_type`. What happens next depends on your deployment.
+
+---
+
+## CAPTCHA solving
+
+### Skyvern Cloud (automatic)
+
+On [Skyvern Cloud](https://app.skyvern.com), CAPTCHAs are solved automatically. When the AI detects a CAPTCHA, Skyvern's solver service handles it in the background. No configuration needed — it works out of the box for all supported CAPTCHA types.
+
+If the solver cannot resolve the CAPTCHA (rare edge cases or novel CAPTCHA types), the task continues with a `SOLVE_CAPTCHA` action failure. Handle this with [error code mapping](/going-to-production/error-handling):
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Submit the application form. COMPLETE when you see confirmation.",
+    url="https://example.com/apply",
+    error_code_mapping={
+        "captcha_failed": "Return this if a CAPTCHA blocks progress after multiple attempts",
+    },
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Submit the application form. COMPLETE when you see confirmation.",
+    url: "https://example.com/apply",
+    error_code_mapping: {
+      captcha_failed: "Return this if a CAPTCHA blocks progress after multiple attempts",
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Submit the application form. COMPLETE when you see confirmation.",
+    "url": "https://example.com/apply",
+    "error_code_mapping": {
+      "captcha_failed": "Return this if a CAPTCHA blocks progress after multiple attempts"
+    }
+  }'
+```
+</CodeGroup>
+
+### Human Interaction block (workflows)
+
+For workflows where you want a human to solve the CAPTCHA manually, use the **Human Interaction** block. The workflow pauses and notifies you, then resumes after you solve it.
+
+```yaml
+blocks:
+  - block_type: navigation
+    label: fill_form
+    url: https://example.com/form
+    navigation_goal: Fill out the registration form
+
+  - block_type: human_interaction
+    label: solve_captcha
+    message: "Please solve the CAPTCHA and click Continue"
+
+  - block_type: navigation
+    label: submit_form
+    navigation_goal: Click the submit button
+```
+
+---
+
+## Bot detection avoidance
+
+Skyvern automatically configures the browser to reduce bot detection triggers. These protections apply to every run — no configuration needed.
+
+### Browser fingerprinting
+
+Skyvern launches Chromium with settings that remove common automation signals:
+
+- **`AutomationControlled` disabled** — Removes the Blink feature flag that marks the browser as automated
+- **`navigator.webdriver` hidden** — The `enable-automation` flag is suppressed so JavaScript detection scripts don't see a webdriver
+- **Viewport and user agent** — Set to match real consumer browsers
+- **Locale and timezone** — Automatically matched to the proxy location (see [Proxy & Geolocation](/going-to-production/proxy-geolocation))
+
+### Reducing detection risk
+
+Beyond fingerprinting, how you structure your automation affects detection. Three patterns that help:
+
+**1. Use residential proxies for sensitive sites.** Datacenter IPs are the most common bot signal. Residential proxies route through real ISP addresses. See [Proxy & Geolocation](/going-to-production/proxy-geolocation).
+
+**2. Reuse browser sessions for multi-step flows.** Creating a fresh browser for every step looks suspicious. A persistent session maintains cookies, cache, and history — appearing as a returning user. See [Browser Sessions](/optimization/browser-sessions).
+
+**3. Use browser profiles for repeat visits.** Profiles save browser state from a previous session. Starting with an existing profile means the site sees a known browser with familiar cookies, not a blank slate. See [Browser Profiles](/optimization/browser-profiles).
+
+---
+
+## Self-hosted deployment
+
+<Note>
+The sections above apply to Skyvern Cloud. If you're running Skyvern locally, the following differences apply.
+</Note>
+
+### CAPTCHA solving
+
+The open-source version does **not** include automatic CAPTCHA solving. When a CAPTCHA is detected, the agent pauses for 30 seconds to allow manual intervention (e.g., solving it in the browser window yourself), then continues.
+
+To handle CAPTCHAs in self-hosted workflows, use the Human Interaction block as described above.
+
+### Browser extensions
+
+Self-hosted deployments can load Chrome extensions for additional stealth or functionality:
+
+```bash
+# .env
+EXTENSIONS=extension1,extension2
+EXTENSIONS_BASE_PATH=/path/to/extensions
+```
+
+Extensions are loaded automatically when the browser launches.
+
+### Proxies
+
+Self-hosted deployments need their own proxy infrastructure. The `proxy_location` parameter is not available — configure proxies at the network level or via environment variables.
+
+---
+
+## Troubleshooting
+
+### CAPTCHA blocks the run
+
+**On Skyvern Cloud:** This is rare. If it happens, the CAPTCHA type may be unsupported or the site changed its challenge. Add an `error_code_mapping` entry to detect the failure, and contact [support@skyvern.com](mailto:support@skyvern.com).
+
+**Self-hosted:** Use a Human Interaction block, or solve it manually within the 30-second window.
+
+### Bot detection triggered (access denied)
+
+1. Switch to a residential proxy — `proxy_location="RESIDENTIAL"` or `RESIDENTIAL_ISP` for static IPs
+2. Reuse a browser session instead of creating fresh browsers
+3. Use a browser profile with existing cookies
+4. Add `wait` blocks between rapid actions to reduce behavioral signals
+
+### Cloudflare challenge page loops
+
+Cloudflare sometimes loops through multiple challenges. If a task gets stuck:
+
+- Increase `max_steps` to give the solver more attempts
+- Use `RESIDENTIAL_ISP` for a static IP that Cloudflare is more likely to trust
+- Use a browser profile that has previously passed the Cloudflare challenge on that domain
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Proxy & Geolocation"
+    icon="globe"
+    href="/going-to-production/proxy-geolocation"
+  >
+    Route traffic through residential proxies in 19 countries
+  </Card>
+  <Card
+    title="Handle 2FA"
+    icon="lock"
+    href="/credentials/handle-2fa"
+  >
+    Configure TOTP, email, and SMS verification codes
+  </Card>
+  <Card
+    title="Browser Sessions"
+    icon="window-restore"
+    href="/optimization/browser-sessions"
+  >
+    Persist browser state across multiple runs
+  </Card>
+  <Card
+    title="Error Handling"
+    icon="triangle-exclamation"
+    href="/going-to-production/error-handling"
+  >
+    Map CAPTCHA and bot failures to custom error codes
+  </Card>
+</CardGroup>
