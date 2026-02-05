@@ -101,8 +101,9 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
             task_count=len(tasks),
         )
 
-        # Single query for all actions
+        # Single query for all actions (returns desc order for timeline; reverse for chronological)
         all_actions = await app.DATABASE.get_tasks_actions(task_ids=task_ids_list, organization_id=organization_id)
+        all_actions.reverse()
         for action in all_actions:
             if action.task_id:
                 actions_by_task_id[action.task_id].append(action)

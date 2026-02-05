@@ -577,10 +577,9 @@ class AgentDB(BaseAlchemyDB):
                     select(ActionModel)
                     .filter(ActionModel.organization_id == organization_id)
                     .filter(ActionModel.task_id.in_(task_ids))
-                    .order_by(ActionModel.created_at)
+                    .order_by(ActionModel.created_at.desc())
                 )
                 actions = (await session.scalars(query)).all()
-                # Must match get_task_actions_hydrated: no empty_element_id so None element_ids stay None
                 return [hydrate_action(action) for action in actions]
 
         except SQLAlchemyError:
