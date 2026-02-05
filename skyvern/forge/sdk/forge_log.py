@@ -319,9 +319,9 @@ def setup_logger() -> None:
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             processors=[
-                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                 structlog.stdlib.add_log_level,
                 structlog.stdlib.add_logger_name,
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                 structlog.processors.TimeStamper(fmt="iso"),
                 structlog.processors.format_exc_info,
                 renderer,
