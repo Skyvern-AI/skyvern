@@ -404,12 +404,6 @@ class Settings(BaseSettings):
     The secret used to sign the email/identity of the user.
     """
 
-    # Trace settings
-    TRACE_ENABLED: bool = False
-    TRACE_PROVIDER: str = ""
-    TRACE_PROVIDER_HOST: str | None = None
-    TRACE_PROVIDER_API_KEY: str = "fillmein"
-
     # Debug Session Settings
     DEBUG_SESSION_TIMEOUT_MINUTES: int = 20
     """
@@ -428,6 +422,14 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
+
+    # OpenTelemetry Settings
+    OTEL_ENABLED: bool = False
+    OTEL_SERVICE_NAME: str = "skyvern"
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://localhost:4317"
+    OTEL_METRICS_ENABLED: bool = True
+    OTEL_LOGS_ENABLED: bool = True
+    OTEL_EXPORTER_INSECURE: bool = True
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
