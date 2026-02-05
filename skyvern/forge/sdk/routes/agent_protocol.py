@@ -2519,12 +2519,18 @@ async def get_workflow_templates() -> list[Workflow]:
 @legacy_base_router.get(
     "/workflows/{workflow_permanent_id}",
     response_model=Workflow,
-    tags=["agent"],
+    include_in_schema=False,
+)
+@legacy_base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow, include_in_schema=False)
+@base_router.get(
+    "/workflows/{workflow_permanent_id}",
+    response_model=Workflow,
+    tags=["Workflows"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow",
     },
 )
-@legacy_base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow, include_in_schema=False)
+@base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow, include_in_schema=False)
 async def get_workflow(
     workflow_permanent_id: str,
     version: int | None = None,
@@ -2546,14 +2552,20 @@ async def get_workflow(
 @legacy_base_router.get(
     "/workflows/{workflow_permanent_id}/versions",
     response_model=list[Workflow],
-    tags=["agent"],
-    openapi_extra={
-        "x-fern-sdk-method-name": "get_workflow_versions",
-    },
+    include_in_schema=False,
 )
 @legacy_base_router.get(
     "/workflows/{workflow_permanent_id}/versions/", response_model=list[Workflow], include_in_schema=False
 )
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/versions",
+    response_model=list[Workflow],
+    tags=["Workflows"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_workflow_versions",
+    },
+)
+@base_router.get("/workflows/{workflow_permanent_id}/versions/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflow_versions(
     workflow_permanent_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
