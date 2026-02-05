@@ -695,6 +695,7 @@ class WorkflowService:
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
@@ -853,6 +854,7 @@ class WorkflowService:
                 block_labels=block_labels,
                 blocks_to_update=blocks_to_update,
                 finalize=True,  # Force regeneration to ensure field mappings have complete action data
+                has_conditionals=has_conditionals,
             )
 
         # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
@@ -1035,6 +1037,7 @@ class WorkflowService:
                 should_stop,
                 _,
             ) = await self._execute_single_block(
+                workflow=workflow,
                 block=block,
                 block_idx=block_idx,
                 blocks_cnt=blocks_cnt,
@@ -1051,6 +1054,56 @@ class WorkflowService:
             if should_stop:
                 break
         return workflow_run, blocks_to_update
+
+    async def _generate_pending_script_for_block(
+        self,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        block_result: BlockResult | None,
+    ) -> None:
+        """Generate pending script after a block completes successfully.
+
+        This is called after each block execution instead of after each action,
+        reducing script generation frequency while maintaining progressive updates.
+        Uses asyncio.create_task() to avoid adding latency between blocks.
+        """
+        if not block_result or block_result.status != BlockStatus.completed:
+            return
+
+        context = skyvern_context.current()
+        if not context or not context.generate_script:
+            return
+
+        disable_script_generation = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "DISABLE_GENERATE_SCRIPT_AFTER_BLOCK",
+            workflow_run.workflow_run_id,
+            properties={"organization_id": workflow_run.organization_id},
+        )
+        if disable_script_generation:
+            return
+
+        asyncio.create_task(
+            self._do_generate_pending_script(workflow, workflow_run),
+            name=f"script_gen_{workflow_run.workflow_run_id}",
+        )
+
+    async def _do_generate_pending_script(
+        self,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+    ) -> None:
+        """Fire-and-forget wrapper for pending script generation with error handling."""
+        try:
+            await workflow_script_service.generate_or_update_pending_workflow_script(
+                workflow_run=workflow_run,
+                workflow=workflow,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to generate pending script after block completion",
+                workflow_run_id=workflow_run.workflow_run_id,
+                exc_info=True,
+            )
 
     async def _execute_workflow_blocks_dag(
         self,
@@ -1102,6 +1155,7 @@ class WorkflowService:
                 should_stop,
                 branch_metadata,
             ) = await self._execute_single_block(
+                workflow=workflow,
                 block=block,
                 block_idx=block_idx,
                 blocks_cnt=total_blocks,
@@ -1155,6 +1209,7 @@ class WorkflowService:
     async def _execute_single_block(
         self,
         *,
+        workflow: Workflow,
         block: BlockTypeVar,
         block_idx: int,
         blocks_cnt: int,
@@ -1325,6 +1380,10 @@ class WorkflowService:
                 workflow_run=workflow_run,
                 workflow_run_id=workflow_run_id,
             )
+
+            # Generate pending script after block completes successfully
+            await self._generate_pending_script_for_block(workflow, workflow_run, workflow_run_block_result)
+
             return workflow_run, blocks_to_update, workflow_run_block_result, should_stop, branch_metadata
 
         except Exception as e:
@@ -3357,6 +3416,7 @@ class WorkflowService:
         block_labels: list[str] | None = None,
         blocks_to_update: set[str] | None = None,
         finalize: bool = False,
+        has_conditionals: bool | None = None,
     ) -> None:
         """
         Generate or regenerate workflow script if needed.
@@ -3369,6 +3429,7 @@ class WorkflowService:
             finalize: If True, check if any actions were skipped during script generation
                      due to missing data (race condition). Only regenerate if needed.
                      This fixes SKY-7653 while avoiding unnecessary regeneration costs.
+            has_conditionals: Whether the workflow has conditional blocks. If None, will be computed.
         """
         code_gen = workflow_run.code_gen
         blocks_to_update = set(blocks_to_update or [])
@@ -3435,12 +3496,28 @@ class WorkflowService:
             should_cache_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
             cached_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
 
+            # For workflows with conditional blocks, "missing" labels from unexecuted branches
+            # should NOT trigger regeneration. They will be cached when those branches execute.
+            # This prevents the bug where every run triggers unnecessary regeneration because
+            # blocks from unexecuted branches are always "missing".
+            if has_conditionals is None:
+                has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
+
             if cached_block_labels != should_cache_block_labels:
                 missing_labels = should_cache_block_labels - cached_block_labels
-                if missing_labels:
+                if missing_labels and not has_conditionals:
+                    # Only add missing labels for workflows WITHOUT conditionals.
+                    # For workflows WITH conditionals, missing labels are expected (unexecuted branches).
                     blocks_to_update.update(missing_labels)
-                # Always rebuild the orchestrator if the definition changed
-                blocks_to_update.add(settings.WORKFLOW_START_BLOCK_LABEL)
+                    # Always rebuild the orchestrator if the definition changed
+                    blocks_to_update.add(settings.WORKFLOW_START_BLOCK_LABEL)
+                elif missing_labels and has_conditionals:
+                    LOG.debug(
+                        "Skipping regeneration for missing labels in workflow with conditionals",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        missing_labels=list(missing_labels),
+                    )
 
             should_regenerate = bool(blocks_to_update) or bool(code_gen)
 
