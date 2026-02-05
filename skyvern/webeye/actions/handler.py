@@ -2551,6 +2551,7 @@ async def choose_auto_completion_dropdown(
     task: Task,
     preserved_elements: list[dict] | None = None,
     relevance_threshold: float = 0.8,
+    is_location_input: bool = False,
 ) -> AutoCompletionResult:
     preserved_elements = preserved_elements or []
     clear_input = True
@@ -2606,6 +2607,34 @@ async def choose_auto_completion_dropdown(
         new_interactable_element_ids = []
         if len(incremental_element) > 0:
             cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
+
+            # Fast path for location inputs: if exactly one option appeared and it contains
+            # what the user typed, click it directly without an LLM call.
+            if is_location_input and len(cleaned_incremental_element) == 1:
+                only_element = cleaned_incremental_element[0]
+                fast_path_element_id = only_element.get("id", "")
+                # Normalize whitespace for comparison (handles double spaces, etc.)
+                option_text = " ".join((only_element.get("text") or "").lower().split())
+                input_normalized = " ".join(text.lower().split())
+                if fast_path_element_id and input_normalized and input_normalized in option_text:
+                    fast_path_locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{fast_path_element_id}"]')
+                    if await fast_path_locator.count() > 0:
+                        LOG.info(
+                            "Location auto-completion fast path: single option found, skipping LLM",
+                            element_id=fast_path_element_id,
+                            input_value=text,
+                        )
+                        try:
+                            await fast_path_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+                            clear_input = False
+                            result.action_result = ActionSuccess()
+                            return result
+                        except Exception:
+                            LOG.info(
+                                "Location fast-path click failed, falling through to LLM",
+                                element_id=fast_path_element_id,
+                            )
+
             html = incremental_scraped.build_html_tree(cleaned_incremental_element)
         else:
             scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
@@ -2747,6 +2776,7 @@ async def input_or_auto_complete_input(
             "Try the potential value for auto completion",
             input_value=current_value,
         )
+        is_location = input_or_select_context.is_location_input or False
         result = await choose_auto_completion_dropdown(
             context=input_or_select_context,
             page=page,
@@ -2757,6 +2787,7 @@ async def input_or_auto_complete_input(
             skyvern_element=skyvern_element,
             step=step,
             task=task,
+            is_location_input=is_location,
         )
         if isinstance(result.action_result, ActionSuccess):
             return ActionSuccess()
@@ -2819,6 +2850,7 @@ async def input_or_auto_complete_input(
                 skyvern_element=skyvern_element,
                 step=step,
                 task=task,
+                is_location_input=is_location,
             )
             if isinstance(result.action_result, ActionSuccess):
                 return ActionSuccess()
