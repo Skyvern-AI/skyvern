@@ -356,6 +356,8 @@ function Workspace({
 
     await saveWorkflow.mutateAsync();
 
+    workflowChangesStore.setSaidOkToCodeCacheDeletion(false);
+
     queryClient.invalidateQueries({
       queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
     });
@@ -1106,6 +1108,40 @@ function Workspace({
               {cycleBrowser.isPending && (
                 <ReloadIcon className="ml-2 size-4 animate-spin" />
               )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* confirm code cache deletion dialog */}
+      <Dialog
+        open={workflowChangesStore.showConfirmCodeCacheDeletion}
+        onOpenChange={(open) => {
+          !open && workflowChangesStore.setShowConfirmCodeCacheDeletion(false);
+          !open && workflowChangesStore.setSaidOkToCodeCacheDeletion(false);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Are you sure?</DialogTitle>
+            <DialogDescription>
+              Saving will delete cached code, and Skyvern will re-generate it in
+              the next run. Proceed?
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="secondary">Cancel</Button>
+            </DialogClose>
+            <Button
+              variant="default"
+              onClick={async () => {
+                workflowChangesStore.setSaidOkToCodeCacheDeletion(true);
+                await handleOnSave();
+                workflowChangesStore.setShowConfirmCodeCacheDeletion(false);
+              }}
+            >
+              Yes
             </Button>
           </DialogFooter>
         </DialogContent>
