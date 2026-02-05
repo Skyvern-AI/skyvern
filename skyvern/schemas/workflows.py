@@ -3,11 +3,325 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
+import structlog
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
+from skyvern.utils.strings import sanitize_identifier
+from skyvern.utils.templating import replace_jinja_reference
+
+LOG = structlog.get_logger()
+
+
+def sanitize_block_label(value: str) -> str:
+    """Sanitizes a block label to be a valid Python/Jinja2 identifier.
+
+    Block labels are used to create output parameter keys (e.g., '{label}_output')
+    which are then used as Jinja2 template variable names.
+
+    Args:
+        value: The raw label value to sanitize
+
+    Returns:
+        A sanitized label that is a valid Python identifier
+    """
+    return sanitize_identifier(value, default="block")
+
+
+def sanitize_parameter_key(value: str) -> str:
+    """Sanitizes a parameter key to be a valid Python/Jinja2 identifier.
+
+    Parameter keys are used as Jinja2 template variable names.
+
+    Args:
+        value: The raw key value to sanitize
+
+    Returns:
+        A sanitized key that is a valid Python identifier
+    """
+    return sanitize_identifier(value, default="parameter")
+
+
+def _replace_references_in_value(value: Any, old_key: str, new_key: str) -> Any:
+    """Recursively replaces Jinja references in a value (string, dict, or list)."""
+    if isinstance(value, str):
+        return replace_jinja_reference(value, old_key, new_key)
+    elif isinstance(value, dict):
+        return {k: _replace_references_in_value(v, old_key, new_key) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_replace_references_in_value(item, old_key, new_key) for item in value]
+    return value
+
+
+def _replace_direct_string_in_value(value: Any, old_key: str, new_key: str) -> Any:
+    """Recursively replaces exact string matches in a value (for fields like source_parameter_key)."""
+    if isinstance(value, str):
+        return new_key if value == old_key else value
+    elif isinstance(value, dict):
+        return {k: _replace_direct_string_in_value(v, old_key, new_key) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_replace_direct_string_in_value(item, old_key, new_key) for item in value]
+    return value
+
+
+def _make_unique(candidate: str, seen: set[str]) -> str:
+    """Appends a numeric suffix to make candidate unique within the seen set.
+
+    Args:
+        candidate: The candidate identifier
+        seen: Set of already-used identifiers (mutated -- the chosen name is added)
+
+    Returns:
+        A unique identifier, either candidate itself or candidate_N
+    """
+    if candidate not in seen:
+        seen.add(candidate)
+        return candidate
+    counter = 2
+    while f"{candidate}_{counter}" in seen:
+        counter += 1
+    unique = f"{candidate}_{counter}"
+    seen.add(unique)
+    return unique
+
+
+def _sanitize_blocks_recursive(
+    blocks: list[dict[str, Any]],
+    label_mapping: dict[str, str],
+    seen_labels: set[str],
+) -> list[dict[str, Any]]:
+    """Recursively sanitizes block labels and collects the label mapping.
+
+    Args:
+        blocks: List of block dictionaries
+        label_mapping: Dictionary to store old_label -> new_label mappings (mutated)
+        seen_labels: Set of already-used labels for collision avoidance (mutated)
+
+    Returns:
+        List of blocks with sanitized labels
+    """
+    sanitized_blocks = []
+    for block in blocks:
+        block = dict(block)  # Make a copy to avoid mutating the original
+
+        # Sanitize the block's label
+        if "label" in block and isinstance(block["label"], str):
+            old_label = block["label"]
+            new_label = sanitize_block_label(old_label)
+            new_label = _make_unique(new_label, seen_labels)
+            if old_label != new_label:
+                label_mapping[old_label] = new_label
+                block["label"] = new_label
+            else:
+                # Even if unchanged, track it as seen for collision avoidance
+                seen_labels.add(old_label)
+
+        # Handle nested blocks in for_loop
+        if "loop_blocks" in block and isinstance(block["loop_blocks"], list):
+            block["loop_blocks"] = _sanitize_blocks_recursive(block["loop_blocks"], label_mapping, seen_labels)
+
+        sanitized_blocks.append(block)
+
+    return sanitized_blocks
+
+
+def _sanitize_parameters(
+    parameters: list[dict[str, Any]],
+    key_mapping: dict[str, str],
+    seen_keys: set[str],
+) -> list[dict[str, Any]]:
+    """Sanitizes parameter keys and collects the key mapping.
+
+    Args:
+        parameters: List of parameter dictionaries
+        key_mapping: Dictionary to store old_key -> new_key mappings (mutated)
+        seen_keys: Set of already-used keys for collision avoidance (mutated)
+
+    Returns:
+        List of parameters with sanitized keys
+    """
+    sanitized_params = []
+    for param in parameters:
+        param = dict(param)  # Make a copy
+
+        if "key" in param and isinstance(param["key"], str):
+            old_key = param["key"]
+            new_key = sanitize_parameter_key(old_key)
+            new_key = _make_unique(new_key, seen_keys)
+            if old_key != new_key:
+                key_mapping[old_key] = new_key
+                param["key"] = new_key
+            else:
+                # Even if unchanged, track it as seen for collision avoidance
+                seen_keys.add(old_key)
+
+        sanitized_params.append(param)
+
+    return sanitized_params
+
+
+def _update_parameter_keys_in_blocks(
+    blocks: list[dict[str, Any]],
+    key_mapping: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Updates parameter_keys arrays in blocks to use new parameter key names.
+
+    Args:
+        blocks: List of block dictionaries
+        key_mapping: Dictionary of old_key -> new_key mappings
+
+    Returns:
+        List of blocks with updated parameter_keys
+    """
+    updated_blocks = []
+    for block in blocks:
+        block = dict(block)
+
+        # Update parameter_keys array if present
+        if "parameter_keys" in block and isinstance(block["parameter_keys"], list):
+            block["parameter_keys"] = [
+                key_mapping.get(key, key) if isinstance(key, str) else key for key in block["parameter_keys"]
+            ]
+
+        # Handle nested blocks in for_loop
+        if "loop_blocks" in block and isinstance(block["loop_blocks"], list):
+            block["loop_blocks"] = _update_parameter_keys_in_blocks(block["loop_blocks"], key_mapping)
+
+        updated_blocks.append(block)
+
+    return updated_blocks
+
+
+def sanitize_workflow_yaml_with_references(workflow_yaml: dict[str, Any]) -> dict[str, Any]:
+    """Sanitizes block labels and parameter keys, and updates all references throughout the workflow.
+
+    This function:
+    1. Sanitizes all block labels to be valid Python identifiers
+    2. Sanitizes all parameter keys to be valid Python identifiers
+    3. Updates all Jinja references from {old_key} to {new_key}
+    4. Updates next_block_label if it references an old label
+    5. Updates finally_block_label if it references an old label
+    6. Updates parameter_keys arrays in blocks
+    7. Updates source_parameter_key and other direct references
+
+    Args:
+        workflow_yaml: The parsed workflow YAML dictionary
+
+    Returns:
+        The workflow YAML with sanitized identifiers and updated references
+    """
+    workflow_yaml = dict(workflow_yaml)  # Make a copy
+
+    workflow_definition = workflow_yaml.get("workflow_definition")
+    if not workflow_definition or not isinstance(workflow_definition, dict):
+        return workflow_yaml
+
+    workflow_definition = dict(workflow_definition)  # Make a copy
+    workflow_yaml["workflow_definition"] = workflow_definition
+
+    # Step 1: Sanitize all block labels and collect the mapping
+    label_mapping: dict[str, str] = {}  # old_label -> new_label
+    seen_labels: set[str] = set()
+    blocks = workflow_definition.get("blocks")
+    if blocks and isinstance(blocks, list):
+        workflow_definition["blocks"] = _sanitize_blocks_recursive(blocks, label_mapping, seen_labels)
+
+    # Step 2: Sanitize all parameter keys and collect the mapping
+    param_key_mapping: dict[str, str] = {}  # old_key -> new_key
+    seen_keys: set[str] = set()
+    parameters = workflow_definition.get("parameters")
+    if parameters and isinstance(parameters, list):
+        workflow_definition["parameters"] = _sanitize_parameters(parameters, param_key_mapping, seen_keys)
+
+    # If nothing was changed, return early
+    if not label_mapping and not param_key_mapping:
+        return workflow_yaml
+
+    LOG.info(
+        "Auto-sanitized workflow identifiers during import",
+        sanitized_labels=label_mapping if label_mapping else None,
+        sanitized_parameter_keys=param_key_mapping if param_key_mapping else None,
+    )
+
+    # Step 3: Update all block label references
+    for old_label, new_label in label_mapping.items():
+        old_output_key = f"{old_label}_output"
+        new_output_key = f"{new_label}_output"
+
+        # Update Jinja references in blocks for {label}_output pattern
+        if "blocks" in workflow_definition:
+            workflow_definition["blocks"] = _replace_references_in_value(
+                workflow_definition["blocks"], old_output_key, new_output_key
+            )
+            # Also update shorthand {{ label }} references (must be done after _output to avoid partial matches)
+            workflow_definition["blocks"] = _replace_references_in_value(
+                workflow_definition["blocks"], old_label, new_label
+            )
+
+        # Update Jinja references in parameters for {label}_output pattern
+        if "parameters" in workflow_definition:
+            workflow_definition["parameters"] = _replace_references_in_value(
+                workflow_definition["parameters"], old_output_key, new_output_key
+            )
+            # Also update shorthand {{ label }} references
+            workflow_definition["parameters"] = _replace_references_in_value(
+                workflow_definition["parameters"], old_label, new_label
+            )
+            # Also update direct string references (e.g., source_parameter_key)
+            workflow_definition["parameters"] = _replace_direct_string_in_value(
+                workflow_definition["parameters"], old_output_key, new_output_key
+            )
+
+    # Step 4: Update all parameter key references
+    for old_key, new_key in param_key_mapping.items():
+        # Update Jinja references in blocks (e.g., {{ old_key }})
+        if "blocks" in workflow_definition:
+            workflow_definition["blocks"] = _replace_references_in_value(
+                workflow_definition["blocks"], old_key, new_key
+            )
+
+        # Update Jinja references in parameters (e.g., default values that reference other params)
+        if "parameters" in workflow_definition:
+            workflow_definition["parameters"] = _replace_references_in_value(
+                workflow_definition["parameters"], old_key, new_key
+            )
+            # Also update direct string references (e.g., source_parameter_key)
+            workflow_definition["parameters"] = _replace_direct_string_in_value(
+                workflow_definition["parameters"], old_key, new_key
+            )
+
+    # Step 5: Update parameter_keys arrays in blocks
+    if param_key_mapping and "blocks" in workflow_definition:
+        workflow_definition["blocks"] = _update_parameter_keys_in_blocks(
+            workflow_definition["blocks"], param_key_mapping
+        )
+
+    # Step 6: Update finally_block_label if it references an old label
+    if "finally_block_label" in workflow_definition:
+        finally_label = workflow_definition["finally_block_label"]
+        if finally_label in label_mapping:
+            workflow_definition["finally_block_label"] = label_mapping[finally_label]
+
+    # Step 7: Update next_block_label in all blocks
+    def update_next_block_label(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        updated_blocks = []
+        for block in blocks:
+            block = dict(block)
+            if "next_block_label" in block:
+                next_label = block["next_block_label"]
+                if next_label in label_mapping:
+                    block["next_block_label"] = label_mapping[next_label]
+            if "loop_blocks" in block and isinstance(block["loop_blocks"], list):
+                block["loop_blocks"] = update_next_block_label(block["loop_blocks"])
+            updated_blocks.append(block)
+        return updated_blocks
+
+    if label_mapping and "blocks" in workflow_definition:
+        workflow_definition["blocks"] = update_next_block_label(workflow_definition["blocks"])
+
+    return workflow_yaml
 
 
 class WorkflowStatus(StrEnum):
@@ -89,9 +403,26 @@ class ParameterYAML(BaseModel, abc.ABC):
 
     @field_validator("key")
     @classmethod
-    def validate_no_whitespace(cls, v: str) -> str:
+    def validate_key_is_valid_identifier(cls, v: str) -> str:
+        """Validate that parameter key is a valid Jinja2/Python identifier.
+
+        Parameter keys are used as Jinja2 template variable names. Jinja2 variable names
+        must be valid Python identifiers (letters, digits, underscores; cannot start with digit).
+
+        Characters like '/', '-', '.', etc. are NOT allowed because they are interpreted as
+        operators in Jinja2 templates, causing parsing errors like "'State_' is undefined"
+        when using a key like "State_/_Province".
+        """
         if any(char in v for char in [" ", "\t", "\n", "\r"]):
-            raise ValueError("Key cannot contain whitespaces")
+            raise ValueError("Key cannot contain whitespace characters")
+
+        if not v.isidentifier():
+            raise ValueError(
+                f"Key '{v}' is not a valid parameter name. "
+                "Parameter keys must be valid Python identifiers "
+                "(only letters, digits, and underscores; cannot start with a digit). "
+                "Characters like '/', '-', '.', etc. are not allowed because they conflict with Jinja2 template syntax."
+            )
         return v
 
 
@@ -222,8 +553,21 @@ class BlockYAML(BaseModel, abc.ABC):
     @field_validator("label")
     @classmethod
     def validate_label(cls, value: str) -> str:
+        """Validate that block label is a valid Python identifier.
+
+        Block labels are used to create output parameter keys (e.g., '{label}_output')
+        which are then used as Jinja2 template variable names. Therefore, block labels
+        must be valid Python identifiers.
+        """
         if not value or not value.strip():
             raise ValueError("Block labels cannot be empty.")
+        if not value.isidentifier():
+            raise ValueError(
+                f"Block label '{value}' is not a valid label. "
+                "Block labels must be valid Python identifiers "
+                "(only letters, digits, and underscores; cannot start with a digit). "
+                "Characters like '/', '-', '.', etc. are not allowed because they conflict with Jinja2 template syntax."
+            )
         return value
 
 
