@@ -118,7 +118,13 @@ from skyvern.schemas.runs import (
     WorkflowRunResponse,
 )
 from skyvern.schemas.webhooks import RetryRunWebhookRequest
-from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest, WorkflowRequest, WorkflowStatus
+from skyvern.schemas.workflows import (
+    BlockType,
+    WorkflowCreateYAMLRequest,
+    WorkflowRequest,
+    WorkflowStatus,
+    sanitize_workflow_yaml_with_references,
+)
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.services.pdf_import_service import pdf_import_service
 from skyvern.webeye.actions.actions import Action
@@ -536,6 +542,9 @@ async def create_workflow_legacy(
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
 
+    # Auto-sanitize block labels and update references for imports
+    workflow_yaml = sanitize_workflow_yaml_with_references(workflow_yaml)
+
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
         # Override folder_id if provided as query parameter
@@ -588,6 +597,8 @@ async def create_workflow(
     try:
         if data.yaml_definition:
             workflow_json_from_yaml = yaml.safe_load(data.yaml_definition)
+            # Auto-sanitize block labels and update references for imports
+            workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
             workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
         elif data.json_definition:
             workflow_definition = data.json_definition

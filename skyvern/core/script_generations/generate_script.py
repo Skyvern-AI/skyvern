@@ -26,6 +26,7 @@ from skyvern.core.script_generations.generate_workflow_parameters import (
 )
 from skyvern.forge import app
 from skyvern.schemas.workflows import FileStorageType
+from skyvern.utils.strings import sanitize_identifier
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger(__name__)
@@ -126,36 +127,23 @@ def sanitize_variable_name(name: str) -> str:
     Sanitize a string to be a valid Python variable name.
 
     - Converts to snake_case
-    - Removes invalid characters
+    - Removes invalid characters (via shared sanitize_identifier)
     - Ensures it doesn't start with a number
     - Handles Python keywords by appending underscore
-    - Removes empty spaces
+    - Converts to lowercase
     """
-    # Remove leading/trailing whitespace and replace internal spaces with underscores
-    name = name.strip().replace(" ", "_")
-
     # Convert to snake_case: handle camelCase and PascalCase
     name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
 
-    # Remove any characters that aren't alphanumeric or underscore
-    name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
-    # Convert to lowercase
+    # Convert to lowercase before sanitizing
     name = name.lower()
 
-    # Remove consecutive underscores
-    name = re.sub(r"_+", "_", name)
+    # Use shared sanitize_identifier for core cleanup (uses "_" prefix for digit-leading names)
+    name = sanitize_identifier(name, default="param")
 
-    # Remove leading/trailing underscores
-    name = name.strip("_")
-
-    # Ensure it doesn't start with a number
-    if name and name[0].isdigit():
-        name = f"param_{name}"
-
-    # Handle empty string or invalid names
-    if not name or name == "_":
-        name = "param"
+    # For script variable names, use "param_" prefix instead of bare "_" for digit-leading names
+    if name.startswith("_") and len(name) > 1 and name[1].isdigit():
+        name = f"param{name}"
 
     # Handle Python keywords
     if keyword.iskeyword(name):
