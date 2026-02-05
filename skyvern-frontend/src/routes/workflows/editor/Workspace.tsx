@@ -708,11 +708,11 @@ function Workspace({
 
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
-      const layoutedElements = layout(nodes, edges);
+      const layoutedElements = layout(nodes, edges, blockLabel);
       setNodes(layoutedElements.nodes);
       setEdges(layoutedElements.edges);
     },
-    [setNodes, setEdges],
+    [setNodes, setEdges, blockLabel],
   );
 
   // Listen for conditional branch changes to trigger re-layout
@@ -724,7 +724,7 @@ function Workspace({
         const currentNodes = getNodes() as Array<AppNode>;
         const currentEdges = getEdges();
 
-        const layoutedElements = layout(currentNodes, currentEdges);
+        const layoutedElements = layout(currentNodes, currentEdges, blockLabel);
         setNodes(layoutedElements.nodes);
         setEdges(layoutedElements.edges);
       }, 10); // Small delay to ensure visibility updates complete
@@ -737,7 +737,7 @@ function Workspace({
         handleBranchChange,
       );
     };
-  }, [getNodes, getEdges, setNodes, setEdges]);
+  }, [getNodes, getEdges, setNodes, setEdges, blockLabel]);
 
   function addNode({
     nodeType,
