@@ -36,6 +36,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { nanoid } from "nanoid";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useDebouncedCallback } from "use-debounce";
 import { useBlocker, useParams } from "react-router-dom";
 import {
   AWSSecretParameter,
@@ -321,6 +322,9 @@ function FlowRenderer({
   // Track if this is the initial load to prevent false "unsaved changes" detection
   const isInitialLoadRef = useRef(true);
 
+  // Track if we're currently in a layout operation to prevent infinite loops
+  const isLayoutingRef = useRef(false);
+
   useEffect(() => {
     if (nodesInitialized) {
       setShouldConstrainPan(true);
@@ -362,6 +366,27 @@ function FlowRenderer({
       setEdges(layoutedElements.edges);
     },
     [setNodes, setEdges, targettedBlockLabel],
+  );
+
+  // Debounced layout for dimension changes to prevent infinite loops (React error #185)
+  // when copy-pasting triggers rapid successive dimension changes
+  const debouncedLayoutForDimensions = useDebouncedCallback(
+    (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
+      if (isLayoutingRef.current) {
+        return;
+      }
+      isLayoutingRef.current = true;
+      try {
+        doLayout(tempNodes, currentEdges);
+      } finally {
+        // Reset the flag after a short delay to allow React to flush updates
+        requestAnimationFrame(() => {
+          isLayoutingRef.current = false;
+        });
+      }
+    },
+    50,
+    { leading: true, trailing: true, maxWait: 200 },
   );
 
   useEffect(() => {
@@ -850,21 +875,37 @@ function FlowRenderer({
             const dimensionChanges = changes.filter(
               (change) => change.type === "dimensions",
             );
-            const tempNodes = [...nodes];
-            dimensionChanges.forEach((change) => {
-              const node = tempNodes.find((node) => node.id === change.id);
-              if (node) {
-                if (node.measured?.width) {
-                  node.measured.width = change.dimensions?.width;
-                }
-                if (node.measured?.height) {
-                  node.measured.height = change.dimensions?.height;
-                }
-              }
-            });
 
-            if (dimensionChanges.length > 0) {
-              doLayout(tempNodes, edges);
+            // Only process dimension changes if we're not already in a layout operation
+            // This prevents infinite loops (React error #185) during copy-paste
+            if (dimensionChanges.length > 0 && !isLayoutingRef.current) {
+              const tempNodes = [...nodes];
+              let hasActualChanges = false;
+
+              dimensionChanges.forEach((change) => {
+                const node = tempNodes.find((node) => node.id === change.id);
+                if (node) {
+                  const newWidth = change.dimensions?.width;
+                  const newHeight = change.dimensions?.height;
+
+                  // Only update if dimensions actually changed
+                  if (
+                    node.measured?.width !== newWidth ||
+                    node.measured?.height !== newHeight
+                  ) {
+                    hasActualChanges = true;
+                    if (node.measured) {
+                      node.measured.width = newWidth;
+                      node.measured.height = newHeight;
+                    }
+                  }
+                }
+              });
+
+              // Only trigger layout if there were actual dimension changes
+              if (hasActualChanges) {
+                debouncedLayoutForDimensions(tempNodes, edges);
+              }
             }
 
             // Only track changes after initial load is complete and not during internal updates
