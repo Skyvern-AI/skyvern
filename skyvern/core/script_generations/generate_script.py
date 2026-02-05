@@ -2028,9 +2028,30 @@ def _build_block_statement(
         stmt = _build_http_request_statement(block)
     elif block_type == "pdf_parser":
         stmt = _build_pdf_parser_statement(block)
+    elif block_type == "conditional":
+        # Conditional blocks are evaluated at runtime by the workflow engine.
+        # Generate a descriptive comment showing this is a runtime branch point.
+        # The blocks inside conditional branches are processed separately when executed.
+        branches = block.get("branches") or block.get("ordered_branches") or []
+        branch_info_lines = []
+        for i, branch in enumerate(branches):
+            next_label = branch.get("next_block_label", "?")
+            condition = branch.get("condition", "")
+            # Truncate long conditions for readability
+            if len(condition) > 50:
+                condition = condition[:47] + "..."
+            branch_info_lines.append(f"#   Branch {i + 1}: {condition!r} → {next_label}")
+
+        if branch_info_lines:
+            branch_info = "\n".join(branch_info_lines)
+            comment_text = f"# === CONDITIONAL: {block_title} ===\n# Evaluated at runtime by workflow engine. One branch executes:\n{branch_info}"
+        else:
+            comment_text = f"# === CONDITIONAL: {block_title} ===\n# Evaluated at runtime by workflow engine."
+
+        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(repr(comment_text)))])
     else:
-        # Default case for unknown block types
-        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"# Unknown block type: {block_type}"))])
+        # Default case for unknown block types - use quoted string literal to avoid libcst validation error
+        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"'# Unknown block type: {block_type}'"))])
 
     return stmt
 
