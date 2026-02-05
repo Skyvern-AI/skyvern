@@ -18,6 +18,7 @@ from fastapi import (
 )
 from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse
+from opentelemetry import trace
 from pydantic import ValidationError
 
 from skyvern import analytics
@@ -214,6 +215,10 @@ async def run_task(
             request=request,
             background_tasks=background_tasks,
         )
+        if settings.OTEL_ENABLED:
+            span = trace.get_current_span()
+            if span and task_v1_response.task_id:
+                span.set_attribute("task_id", task_v1_response.task_id)
         run_type = RunType.task_v1
         if run_request.engine == RunEngine.openai_cua:
             run_type = RunType.openai_cua
@@ -273,6 +278,13 @@ async def run_task(
             raise HTTPException(
                 status_code=500, detail="Skyvern LLM failure to initialize task v2. Please try again later."
             )
+        if settings.OTEL_ENABLED:
+            span = trace.get_current_span()
+            if span:
+                if task_v2.observer_cruise_id:
+                    span.set_attribute("task_v2_id", task_v2.observer_cruise_id)
+                if task_v2.workflow_run_id:
+                    span.set_attribute("workflow_run_id", task_v2.workflow_run_id)
         await AsyncExecutorFactory.get_executor().execute_task_v2(
             request=request,
             background_tasks=background_tasks,
@@ -384,6 +396,14 @@ async def run_workflow(
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if settings.OTEL_ENABLED:
+        span = trace.get_current_span()
+        if span:
+            if workflow_run.workflow_run_id:
+                span.set_attribute("workflow_run_id", workflow_run.workflow_run_id)
+            if workflow_run.workflow_id:
+                span.set_attribute("workflow_id", workflow_run.workflow_id)
 
     # Hydrate workflow title from workflow_run.workflow_id
     workflow = await app.WORKFLOW_SERVICE.get_workflow(

@@ -24,6 +24,11 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes import internal_auth
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 
+try:
+    from cloud.observability.otel_setup import OTELSetup
+except ImportError:
+    OTELSetup = None  # type: ignore[assignment,misc]
+
 LOG = structlog.get_logger()
 
 
@@ -53,14 +58,14 @@ def custom_openapi(app: FastAPI) -> dict:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncGenerator[None, Any]:
+async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     """Lifespan context manager for FastAPI app startup and shutdown."""
 
     LOG.info("Server started")
     if forge_app.api_app_startup_event:
         LOG.info("Calling api app startup event")
         try:
-            await forge_app.api_app_startup_event()
+            await forge_app.api_app_startup_event(fastapi_app)
         except Exception:
             LOG.exception("Failed to execute api app startup event")
     yield
@@ -77,6 +82,17 @@ def create_api_app() -> FastAPI:
     """
     Start the agent server.
     """
+    # CRITICAL: Initialize OTEL FIRST, before any other code runs
+    # This must happen before start_forge_app() because that function
+    # creates database connections. If we don't instrument the libraries
+    # first, the DB spans won't be children of the HTTP request spans.
+    if settings.OTEL_ENABLED and OTELSetup is not None:
+        try:
+            otel = OTELSetup.get_instance()
+            otel.initialize_tracer_provider()
+            LOG.info("OTEL tracer provider initialized before forge app creation")
+        except Exception as e:
+            LOG.warning("Failed to initialize OTEL tracer provider early", error=str(e))
 
     forge_app_instance = start_forge_app()
 

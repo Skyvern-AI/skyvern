@@ -24,6 +24,8 @@ except ImportError:
         pass
 
 
+from opentelemetry import trace as otel_trace
+
 import skyvern
 from skyvern import analytics
 from skyvern.client.types.output_parameter import OutputParameter as BlockOutputParameter
@@ -57,7 +59,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
     WorkflowVersionConflict,
@@ -670,7 +672,7 @@ class WorkflowService:
 
         return None
 
-    @TraceManager.traced_async(ignore_inputs=["organization", "api_key"])
+    @traced()
     async def execute_workflow(
         self,
         workflow_run_id: str,
@@ -2307,7 +2309,7 @@ class WorkflowService:
         )
 
         # Add workflow completion tag to trace
-        TraceManager.add_task_completion_tag(WorkflowRunStatus.completed)
+        otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.completed)
 
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
@@ -2358,7 +2360,7 @@ class WorkflowService:
         )
 
         # Add workflow failure tag to trace
-        TraceManager.add_task_completion_tag(WorkflowRunStatus.failed)
+        otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.failed)
 
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
@@ -2402,7 +2404,7 @@ class WorkflowService:
         )
 
         # Add workflow terminated tag to trace
-        TraceManager.add_task_completion_tag(WorkflowRunStatus.terminated)
+        otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.terminated)
 
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
@@ -2419,7 +2421,7 @@ class WorkflowService:
         )
 
         # Add workflow canceled tag to trace
-        TraceManager.add_task_completion_tag(WorkflowRunStatus.canceled)
+        otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.canceled)
 
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
@@ -2440,7 +2442,7 @@ class WorkflowService:
         )
 
         # Add workflow timed out tag to trace
-        TraceManager.add_task_completion_tag(WorkflowRunStatus.timed_out)
+        otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.timed_out)
 
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,

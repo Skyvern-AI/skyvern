@@ -14,7 +14,7 @@ from playwright.async_api import ElementHandle, Frame, Page
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 
 LOG = structlog.get_logger()
 
@@ -257,7 +257,7 @@ class SkyvernFrame:
         return await SkyvernFrame.evaluate(frame=frame, expression="() => document.location.href")
 
     @staticmethod
-    @TraceManager.traced_async(ignore_inputs=["file_path", "timeout"])
+    @traced()
     async def take_scrolling_screenshot(
         page: Page,
         file_path: str | None = None,
@@ -331,7 +331,7 @@ class SkyvernFrame:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
 
     @staticmethod
-    @TraceManager.traced_async(ignore_inputs=["page"])
+    @traced()
     async def take_split_screenshots(
         page: Page,
         url: str | None = None,
@@ -508,7 +508,7 @@ class SkyvernFrame:
         js_script = "() => removeAllUniqueIds()"
         await self.evaluate(frame=self.frame, expression=js_script)
 
-    @TraceManager.traced_async()
+    @traced()
     async def build_tree_from_body(
         self,
         frame_name: str | None,
@@ -525,7 +525,7 @@ class SkyvernFrame:
             arg=[frame_name, frame_index, must_included_tags],
         )
 
-    @TraceManager.traced_async()
+    @traced()
     async def get_incremental_element_tree(
         self,
         wait_until_finished: bool = True,
@@ -536,7 +536,7 @@ class SkyvernFrame:
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
         )
 
-    @TraceManager.traced_async()
+    @traced()
     async def build_tree_from_element(
         self,
         starter: ElementHandle,

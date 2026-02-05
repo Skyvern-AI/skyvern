@@ -74,7 +74,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.utils.prompt_engine import (
@@ -387,7 +387,7 @@ class ActionHandler:
         cls._teardown_action_types[action_type] = handler
 
     @staticmethod
-    @TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+    @traced()
     async def handle_action(
         scraped_page: ScrapedPage,
         task: Task,
@@ -641,7 +641,7 @@ def check_for_invalid_web_action(
     return []
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_solve_captcha_action(
     action: actions.SolveCaptchaAction,
     page: Page,
@@ -657,7 +657,7 @@ async def handle_solve_captcha_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_click_action(
     action: actions.ClickAction,
     page: Page,
@@ -804,7 +804,7 @@ async def handle_click_action(
     return results
 
 
-@TraceManager.traced_async(ignore_inputs=["anchor_element", "scraped_page", "page", "incremental_scraped", "dom"])
+@traced()
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
     action_history: list[ActionResult],
@@ -930,7 +930,7 @@ async def handle_sequential_click_for_dropdown(
     )
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_click_to_download_file_action(
     action: actions.ClickAction,
     page: Page,
@@ -1074,7 +1074,7 @@ async def _handle_multi_field_totp_sequence(
     return None  # Success
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_input_text_action(
     action: actions.InputTextAction,
     page: Page,
@@ -1520,7 +1520,7 @@ async def handle_input_text_action(
             await skyvern_element.press_key("Tab")
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_upload_file_action(
     action: actions.UploadFileAction,
     page: Page,
@@ -1606,7 +1606,7 @@ async def handle_upload_file_action(
 
 # This function is deprecated in 'extract-actions' prompt. Downloads are handled by the click action handler now.
 # Currently, it's only used for the download action triggered by the code.
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_download_file_action(
     action: actions.DownloadFileAction,
     page: Page,
@@ -1666,7 +1666,7 @@ async def handle_download_file_action(
         return [ActionFailure(e)]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_null_action(
     action: actions.NullAction,
     page: Page,
@@ -1677,7 +1677,7 @@ async def handle_null_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_select_option_action(
     action: actions.SelectOptionAction,
     page: Page,
@@ -1997,7 +1997,7 @@ async def handle_select_option_action(
         await incremental_scraped.stop_listen_dom_increment()
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_checkbox_action(
     action: actions.CheckboxAction,
     page: Page,
@@ -2026,7 +2026,7 @@ async def handle_checkbox_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_wait_action(
     action: actions.WaitAction,
     page: Page,
@@ -2038,7 +2038,7 @@ async def handle_wait_action(
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_hover_action(
     action: actions.HoverAction,
     page: Page,
@@ -2076,7 +2076,7 @@ async def handle_hover_action(
         return [ActionFailure(FailToHover(skyvern_element.get_id(), msg=str(exc)))]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_terminate_action(
     action: actions.TerminateAction,
     page: Page,
@@ -2091,7 +2091,7 @@ async def handle_terminate_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_complete_action(
     action: actions.CompleteAction,
     page: Page,
@@ -2150,7 +2150,7 @@ async def handle_complete_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_extract_action(
     action: actions.ExtractAction,
     page: Page,
@@ -2172,7 +2172,7 @@ async def handle_extract_action(
         return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_scroll_action(
     action: actions.ScrollAction,
     page: Page,
@@ -2186,7 +2186,7 @@ async def handle_scroll_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_keypress_action(
     action: actions.KeypressAction,
     page: Page,
@@ -2198,7 +2198,7 @@ async def handle_keypress_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_move_action(
     action: actions.MoveAction,
     page: Page,
@@ -2210,7 +2210,7 @@ async def handle_move_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_drag_action(
     action: actions.DragAction,
     page: Page,
@@ -2222,7 +2222,7 @@ async def handle_drag_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_verification_code_action(
     action: actions.VerificationCodeAction,
     page: Page,
@@ -2239,7 +2239,7 @@ async def handle_verification_code_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_left_mouse_action(
     action: actions.LeftMouseAction,
     page: Page,
@@ -2251,7 +2251,7 @@ async def handle_left_mouse_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_goto_url_action(
     action: actions.GotoUrlAction,
     page: Page,
@@ -2263,7 +2263,7 @@ async def handle_goto_url_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_close_page_action(
     action: actions.ClosePageAction,
     page: Page,
@@ -2539,7 +2539,7 @@ async def chain_click(
             return [ActionFailure(WrongElementToUploadFile(action.element_id))]
 
 
-@TraceManager.traced_async(ignore_inputs=["context", "page", "dom", "text", "skyvern_element", "preserved_elements"])
+@traced()
 async def choose_auto_completion_dropdown(
     context: InputOrSelectContext,
     page: Page,
@@ -2867,7 +2867,7 @@ async def input_or_auto_complete_input(
         return None
 
 
-@TraceManager.traced_async(
+@traced(
     ignore_inputs=[
         "input_or_select_context",
         "page",
@@ -3059,7 +3059,7 @@ class CustomSelectPromptOptions(BaseModel):
     target_value: str | None = None
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def select_from_emerging_elements(
     current_element_id: str,
     options: CustomSelectPromptOptions,
@@ -3152,7 +3152,7 @@ async def select_from_emerging_elements(
     return ActionSuccess()
 
 
-@TraceManager.traced_async(
+@traced(
     ignore_inputs=[
         "context",
         "page",
@@ -3358,7 +3358,7 @@ async def select_from_dropdown(
         return single_select_result
 
 
-@TraceManager.traced_async(
+@traced(
     ignore_inputs=[
         "value",
         "page",
@@ -3595,9 +3595,7 @@ async def try_to_find_potential_scrollable_element(
     return skyvern_element
 
 
-@TraceManager.traced_async(
-    ignore_inputs=["scrollable_element", "page", "skyvern_frame", "incremental_scraped", "is_continue"]
-)
+@traced()
 async def scroll_down_to_load_all_options(
     scrollable_element: SkyvernElement,
     page: Page,
