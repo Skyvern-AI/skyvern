@@ -68,6 +68,44 @@ import { TableSearchInput } from "@/components/TableSearchInput";
 import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
+import { Folder } from "./types/folderTypes";
+
+// Utility function to create URL-safe folder slugs from folder names
+function slugifyFolderName(name: string): string {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\s-]/g, "") // Remove special characters except spaces and hyphens
+    .replace(/\s+/g, "-") // Replace spaces with hyphens
+    .replace(/-+/g, "-") // Replace multiple hyphens with single hyphen
+    .replace(/^-|-$/g, ""); // Remove leading/trailing hyphens
+}
+
+// Generate a unique slug for a folder, appending a number suffix only if there's a collision
+function getUniqueSlugForFolder(folder: Folder, allFolders: Folder[]): string {
+  const baseSlug = slugifyFolderName(folder.title);
+
+  // Find all folders that would have the same base slug
+  const foldersWithSameSlug = allFolders.filter(
+    (f) => slugifyFolderName(f.title) === baseSlug,
+  );
+
+  // If no collision, return the base slug
+  if (foldersWithSameSlug.length <= 1) {
+    return baseSlug;
+  }
+
+  // Sort by created_at to ensure consistent numbering
+  const sortedFolders = [...foldersWithSameSlug].sort(
+    (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+  );
+
+  const index = sortedFolders.findIndex((f) => f.folder_id === folder.folder_id);
+
+  // First folder (oldest) gets the base slug, others get numbered suffixes
+  return index === 0 ? baseSlug : `${baseSlug}-${index + 1}`;
+}
+
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -93,8 +131,9 @@ function Workflows() {
     ? Number(searchParams.get("page_size"))
     : 10;
 
-  // Folder state
-  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
+  // Folder slug from query param (e.g., /workflows?folder=my-folder-name)
+  const folderSlug = searchParams.get("folder");
+
   const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
   const [isViewAllFoldersOpen, setIsViewAllFoldersOpen] = useState(false);
 
@@ -105,7 +144,54 @@ function Workflows() {
   const { activeImports, startPolling } = useActiveImportsPolling();
 
   // Fetch folders
-  const { data: allFolders = [] } = useFoldersQuery({ page_size: 10 });
+  const { data: allFolders = [], isLoading: isFoldersLoading } = useFoldersQuery({ page_size: 10 });
+
+  // Create a memoized map of slugs to folders to avoid O(n²) lookups
+  const slugToFolderMap = useMemo(() => {
+    const map = new Map<string, Folder>();
+    for (const folder of allFolders) {
+      const slug = getUniqueSlugForFolder(folder, allFolders);
+      map.set(slug, folder);
+    }
+    return map;
+  }, [allFolders]);
+
+  // Folder state - derived from URL query param
+  // Look up the folder by matching the slug (handles collision suffixes like my-folder-2)
+  const selectedFolderId = useMemo(() => {
+    if (!folderSlug || allFolders.length === 0) return null;
+    const matchingFolder = slugToFolderMap.get(folderSlug);
+    return matchingFolder?.folder_id ?? null;
+  }, [folderSlug, allFolders.length, slugToFolderMap]);
+
+  // Clear folder param if the folder slug is invalid (folder deleted/renamed)
+  // Only validate after folders have finished loading to avoid race conditions
+  useEffect(() => {
+    if (folderSlug && !selectedFolderId && allFolders.length > 0 && !isFoldersLoading) {
+      const params = new URLSearchParams(searchParams);
+      params.delete("folder");
+      setSearchParams(params, { replace: true });
+    }
+  }, [folderSlug, selectedFolderId, allFolders.length, isFoldersLoading, searchParams, setSearchParams]);
+
+  // Update folder query param
+  const setSelectedFolderId = (folderId: string | null) => {
+    const params = new URLSearchParams(searchParams);
+    if (folderId) {
+      const folder = allFolders.find((f) => f.folder_id === folderId);
+      if (folder) {
+        const slug = getUniqueSlugForFolder(folder, allFolders);
+        params.set("folder", slug);
+        params.set("page", "1"); // Reset to page 1 when changing folder
+        setSearchParams(params, { replace: true });
+        return;
+      }
+    }
+    // Remove folder filter
+    params.delete("folder");
+    params.set("page", "1");
+    setSearchParams(params, { replace: true });
+  };
 
   // Create folders map for O(1) lookup
   const foldersMap = useMemo(() => {
