@@ -22,8 +22,7 @@
             "group": "Getting Started",
             "pages": [
               "getting-started/quickstart",
-              "getting-started/core-concepts",
-              "faq"
+              "getting-started/core-concepts"
             ]
           },
           {
@@ -57,7 +56,8 @@
             "group": "Debugging",
             "pages": [
               "debugging/using-artifacts",
-              "debugging/troubleshooting-guide"
+              "debugging/troubleshooting-guide",
+              "debugging/faq"
             ]
           }
         ]
