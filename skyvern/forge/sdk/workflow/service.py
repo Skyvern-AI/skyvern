@@ -35,6 +35,7 @@ from skyvern.exceptions import (
     BlockNotFound,
     BrowserProfileNotFound,
     BrowserSessionNotFound,
+    CannotUpdateWorkflowDueToCodeCache,
     FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
@@ -1957,6 +1958,7 @@ class WorkflowService:
         workflow_definition: WorkflowDefinition,
         organization_id: str,
         delete_script: bool = True,
+        delete_code_cache_is_ok: bool = False,
     ) -> None:
         if workflow_definition:
             workflow_definition.validate()
@@ -2032,6 +2034,27 @@ class WorkflowService:
                     )
                     return
 
+                if published_groups and not delete_code_cache_is_ok:
+                    LOG.info(
+                        "Workflow definition changed, asking user if clearing published cached blocks is ok",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                        organization_id=organization_id,
+                        previous_version=previous_valid_workflow.version,
+                        new_version=workflow.version,
+                        invalidate_reason=plan.reason,
+                        invalidate_label=plan.label,
+                        invalidate_index_prev=plan.previous_index,
+                        invalidate_index_new=plan.new_index,
+                        block_labels_to_disable=plan.block_labels_to_disable,
+                        to_clear_published_cnt=len(published_groups),
+                        to_clear_non_published_cnt=len(cached_groups),
+                    )
+
+                    raise CannotUpdateWorkflowDueToCodeCache(
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                    )
+
                 try:
                     groups_to_clear = [*cached_groups, *published_groups]
                     await self._clear_cached_block_groups(
@@ -2073,7 +2096,38 @@ class WorkflowService:
                 )
                 return
 
-            to_delete = candidates
+            to_delete_published = [script for script in candidates if script.status == ScriptStatus.published]
+            to_delete = [script for script in candidates if script.status != ScriptStatus.published]
+
+            if len(to_delete_published) > 0:
+                if not delete_code_cache_is_ok:
+                    LOG.info(
+                        "Workflow definition changed, asking user if deleting published code is ok",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                        organization_id=organization_id,
+                        previous_version=previous_valid_workflow.version,
+                        new_version=workflow.version,
+                        to_delete_non_published_cnt=len(to_delete),
+                        to_delete_published_cnt=len(to_delete_published),
+                    )
+
+                    raise CannotUpdateWorkflowDueToCodeCache(
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                    )
+                else:
+                    LOG.info(
+                        "Workflow definition changed, user answered yes to deleting published code",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                        organization_id=organization_id,
+                        previous_version=previous_valid_workflow.version,
+                        new_version=workflow.version,
+                        to_delete_non_published_cnt=len(to_delete),
+                        to_delete_published_cnt=len(to_delete_published),
+                    )
+
+                    to_delete.extend(to_delete_published)
 
             if len(to_delete) > 0:
                 try:
@@ -3094,6 +3148,7 @@ class WorkflowService:
         request: WorkflowCreateYAMLRequest,
         workflow_permanent_id: str | None = None,
         delete_script: bool = True,
+        delete_code_cache_is_ok: bool = True,
     ) -> Workflow:
         organization_id = organization.organization_id
         LOG.info(
@@ -3187,6 +3242,7 @@ class WorkflowService:
                 workflow_definition=workflow_definition,
                 organization_id=organization_id,
                 delete_script=delete_script,
+                delete_code_cache_is_ok=delete_code_cache_is_ok,
             )
 
             return updated_workflow
