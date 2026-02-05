@@ -1,0 +1,134 @@
+---
+title: Your First Task
+slug: cloud/your-first-task
+subtitle: Run a browser automation from start to finish
+---
+
+Let's run a real automation. You'll tell Skyvern to visit a website, extract data, and return it as JSON — then watch the entire thing happen live.
+
+## Step 1: Write your prompt
+
+Open [app.skyvern.com](https://app.skyvern.com) and you'll land on the **Discover** page.
+
+<img src="/images/cloud/skyvern-cloud-discover.png" alt="Discover page with a prompt entered" />
+
+The Discover page has a single input field — type your instructions and include the target URL in the same prompt. For this example, enter:
+
+```
+Get the title of the #1 post on the front page for https://news.ycombinator.com
+```
+
+That's it. Skyvern parses the URL and figures out how to navigate the page and extract the data.
+
+Below the input, you'll see quick-action chips like "Add a product to cart" and "What's the top post on hackernews" — click any of these to try a pre-filled example instead.
+
+<Tip>
+The more specific your prompt, the better. "Get the title of the #1 post" works much better than "get some data." Include the exact fields you want, what success looks like, and any constraints.
+</Tip>
+
+## Step 2: Pick an engine and run
+
+Next to your prompt, you'll see an engine selector. Click it to switch engines:
+
+| Engine | When to use it |
+|--------|---------------|
+| **Skyvern 1.0** | Tasks with a simple, single goal — filling a form, searching for information on Google, reading content from a page |
+| **Skyvern 2.0** | The default engine. Handles complex, multi-step tasks and scores state-of-the-art 85.85% on the WebVoyager benchmark |
+
+For this example, the default **Skyvern 2.0** works.
+
+Click the **send button** (arrow icon to the right of the input). Skyvern spins up a cloud browser and starts working.
+
+<Accordion title="Optional: Advanced settings">
+Click the **gear icon** next to send to configure additional options before running:
+
+| Setting | What it does |
+|---------|-------------|
+| **Webhook Callback URL** | Endpoint to receive the extracted data when the run completes |
+| **Proxy Location** | Route Skyvern through one of the available proxies |
+| **Browser Session ID** | Reuse a persistent browser session to keep login state |
+| **Browser Address** | Connect to a specific browser server for the task run |
+| **2FA Identifier** | Identifier for a 2FA code to handle two-factor auth automatically |
+| **Extra HTTP Headers** | Custom HTTP request headers (dict format) |
+| **Generate Script** | Auto-generate reusable scripts from a successful run |
+| **Publish Workflow** | Create a workflow alongside this task run |
+| **Max Steps Override** | Cap the number of steps the AI can take |
+| **Data Schema** | Define structured JSON output format |
+| **Max Screenshot Scrolls** | Limit scrolls for post-action screenshots (default: 3) |
+
+These are all optional. The defaults work for most tasks.
+</Accordion>
+
+## Step 3: Watch the live browser
+
+This is where it gets interesting. Once the task starts, you'll see the run detail page with a live view of the browser:
+
+<img src="/images/cloud/discover-prompt-in-process.png" alt="Run detail page showing a live browser navigating Hacker News" />
+
+On the left, a **live browser view**. You'll see pages load, elements highlight, and actions fire.
+
+On the right, the **agent log**. A running stream of the AI's Thoughts, Decisions, and block executions. If something goes wrong, this is where you'll figure out why.
+
+### Take control at any time
+
+If you see something unexpected or would like to intervene, click **"Take Control"** to drop into the browser session yourself. You can navigate, click, type, whatever.  When you're done, release control and the AI picks up where you left off.
+
+This is useful for CAPTCHAs, unusual login flows, or any situation where you want to guide the AI past a tricky spot.
+
+## Step 4: Review the results
+
+When the task finishes, the status badge flips to **completed** and the extracted data appears at the top of the page.
+
+<img src="/images/cloud/discover-workflow-completed.png" alt="Completed run showing extracted data and result tabs" />
+
+### Extracted data
+
+The **Extracted Information** block shows your results as structured JSON:
+
+```json
+{
+  "top_post_title": "Don't rent the cloud, own instead"
+}
+```
+
+The agent log on the right confirms what happened — you'll see a final Thought summarizing the result and a green **"Run Completed"** notification.
+
+### Tabs
+
+Below the extracted data, five tabs give you different views of the run:
+
+- **Overview** — The default view. Shows extracted data and the agent log with every Thought and Decision.
+- **Output** — The raw JSON output from the run.
+- **Parameters** — The exact configuration that was submitted (URL, prompt, engine, schema). Useful for reproducing or tweaking the run.
+- **Recording** — Full video replay of the browser session, start to finish.
+- **Code** — Auto-generated code snippets to reproduce this task via the API or SDK.
+
+## Try something bigger
+
+Now that you've seen the basic flow, here are a few ideas to try next:
+
+- **Fill a form** — Point Skyvern at a contact form and tell it what to enter in each field
+- **Compare prices** — Extract product names and prices from an e-commerce page using a data schema
+- **Navigate a flow** — Use the Advanced engine to walk through a multi-page checkout or signup process
+- **Use an Agent template** — Check the **Agents** section in the sidebar for pre-built automations you can run instantly
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Build a Workflow"
+    icon="diagram-project"
+    href="/workflows/manage-workflows"
+  >
+    Chain multiple steps into reusable, multi-step automations
+  </Card>
+  <Card
+    title="Store Credentials"
+    icon="key"
+    href="/credentials/introduction"
+  >
+    Save logins so Skyvern can authenticate on your behalf
+  </Card>
+</CardGroup>

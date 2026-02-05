@@ -39,9 +39,10 @@
         "tab": "Cloud UI",
         "groups": [
           {
-            "group": "Cloud UI",
+            "group": "Getting Started",
             "pages": [
-              "cloud/getting-started"
+              "cloud/ui-overview",
+              "cloud/your-first-task"
             ]
           }
         ]
