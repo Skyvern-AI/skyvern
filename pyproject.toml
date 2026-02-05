@@ -70,6 +70,7 @@ dependencies = [
     "urllib3>=2.6.0",
     "zstandard>=0.25.0",
     "sse-starlette>=3.0.3,<4",
+    "opentelemetry-api>=1.39.0,<2",
 ]
 
 [dependency-groups]
@@ -83,7 +84,6 @@ cloud = [
     "kr8s>=0.20.14,<1",
     # OpenTelemetry instrumentation
     "opentelemetry-sdk>=1.39.0,<2",
-    "opentelemetry-api>=1.39.0,<2",
     "opentelemetry-instrumentation-fastapi>=0.60b1,<1",
     "opentelemetry-instrumentation-asyncpg>=0.60b1,<1",
     "opentelemetry-instrumentation-sqlalchemy>=0.60b1,<1",
