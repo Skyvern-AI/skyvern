@@ -36,7 +36,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { nanoid } from "nanoid";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useBlocker } from "react-router-dom";
+import { useBlocker, useParams } from "react-router-dom";
 import {
   AWSSecretParameter,
   debuggableWorkflowBlockTypes,
@@ -308,6 +308,7 @@ function FlowRenderer({
   onContainerResize,
   onRequestDeleteNode,
 }: Props) {
+  const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
   const { title, initializeTitle } = useWorkflowTitleStore();
@@ -356,11 +357,11 @@ function FlowRenderer({
 
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
-      const layoutedElements = layout(nodes, edges);
+      const layoutedElements = layout(nodes, edges, targettedBlockLabel);
       setNodes(layoutedElements.nodes);
       setEdges(layoutedElements.edges);
     },
-    [setNodes, setEdges],
+    [setNodes, setEdges, targettedBlockLabel],
   );
 
   useEffect(() => {
@@ -369,6 +370,15 @@ function FlowRenderer({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodesInitialized]);
+
+  // Re-layout when the targetted block changes to account for the status row
+  // that appears when a block is being debugged
+  useEffect(() => {
+    if (nodesInitialized && targettedBlockLabel) {
+      doLayout(nodes, edges);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targettedBlockLabel]);
 
   useEffect(() => {
     const topLevelBlocks = getWorkflowBlocks(nodes, edges);
