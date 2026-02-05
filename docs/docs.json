@@ -51,6 +51,14 @@
               "going-to-production/reliability-tips",
               "going-to-production/captcha-bot-detection"
             ]
+          },
+          {
+            "group": "Debugging",
+            "pages": [
+              "debugging/using-artifacts",
+              "debugging/troubleshooting-guide",
+              "debugging/faq"
+            ]
           }
         ]
       },
