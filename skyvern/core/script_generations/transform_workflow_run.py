@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -8,6 +9,7 @@ from skyvern.forge import app
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger(__name__)
 
@@ -20,6 +22,29 @@ class CodeGenInput:
     workflow_blocks: list[dict[str, Any]]
     actions_by_task: dict[str, list[dict[str, Any]]]
     task_v2_child_blocks: dict[str, list[dict[str, Any]]]  # task_v2_label -> list of child blocks
+
+
+def _process_action_for_block(
+    action: Action,
+    block_dump: dict[str, Any],
+) -> dict[str, Any]:
+    """Process a single action and add block-specific context like data extraction goal."""
+    action_dump = action.model_dump()
+    action_dump["xpath"] = action.get_xpath()
+    action_dump["has_mini_agent"] = action.has_mini_agent
+    if (
+        "data_extraction_goal" in block_dump
+        and block_dump["data_extraction_goal"]
+        and action.action_type == ActionType.EXTRACT
+    ):
+        action_dump["data_extraction_goal"] = block_dump["data_extraction_goal"]
+    if (
+        "extracted_information_schema" in block_dump
+        and block_dump["extracted_information_schema"]
+        and action.action_type == ActionType.EXTRACT
+    ):
+        action_dump["data_extraction_schema"] = block_dump["extracted_information_schema"]
+    return action_dump
 
 
 async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organization_id: str) -> CodeGenInput:
@@ -54,8 +79,42 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
     # Create mapping from definition blocks by label for quick lookup
     workflow_run_blocks_by_label = {block.label: block for block in workflow_run_blocks if block.label}
 
+    # Batch fetch all tasks and actions upfront to avoid N+1 queries
+    # First pass: collect all task_ids from workflow run blocks
+    all_task_ids: set[str] = set()
+    for rb in workflow_run_blocks:
+        if rb.block_type in SCRIPT_TASK_BLOCKS and rb.task_id:
+            all_task_ids.add(rb.task_id)
+
+    # Batch fetch all tasks and actions in 2 queries instead of N+1
+    tasks_by_id: dict[str, Any] = {}
+    actions_by_task_id: dict[str, list[Action]] = defaultdict(list)
+
+    if all_task_ids:
+        task_ids_list = list(all_task_ids)
+        # Single query for all tasks
+        tasks = await app.DATABASE.get_tasks_by_ids(task_ids=task_ids_list, organization_id=organization_id)
+        tasks_by_id = {task.task_id: task for task in tasks}
+        LOG.debug(
+            "Batch fetched tasks for code gen",
+            workflow_run_id=workflow_run_id,
+            task_count=len(tasks),
+        )
+
+        # Single query for all actions (returns desc order for timeline; reverse for chronological)
+        all_actions = await app.DATABASE.get_tasks_actions(task_ids=task_ids_list, organization_id=organization_id)
+        all_actions.reverse()
+        for action in all_actions:
+            if action.task_id:
+                actions_by_task_id[action.task_id].append(action)
+        LOG.debug(
+            "Batch fetched actions for code gen",
+            workflow_run_id=workflow_run_id,
+            action_count=len(all_actions),
+        )
+
     workflow_block_dump = []
-    actions_by_task = {}
+    actions_by_task: dict[str, list[dict[str, Any]]] = {}
     task_v2_child_blocks = {}
 
     # Loop through workflow run blocks and match to original definition blocks by label
@@ -75,7 +134,8 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
 
         # For task blocks, add execution data while preserving templated information
         if run_block.block_type in SCRIPT_TASK_BLOCKS and run_block.task_id:
-            task = await app.DATABASE.get_task(task_id=run_block.task_id, organization_id=organization_id)
+            # Use pre-fetched task data (batch fetched)
+            task = tasks_by_id.get(run_block.task_id)
             if task:
                 # Add task execution data but preserve original templated fields
                 task_dump = task.model_dump()
@@ -94,29 +154,9 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
                     }
                 )
 
-                # Get task actions
-                actions = await app.DATABASE.get_task_actions_hydrated(
-                    task_id=run_block.task_id, organization_id=organization_id
-                )
-                action_dumps = []
-                for action in actions:
-                    action_dump = action.model_dump()
-                    action_dump["xpath"] = action.get_xpath()
-                    action_dump["has_mini_agent"] = action.has_mini_agent
-                    if (
-                        "data_extraction_goal" in final_dump
-                        and final_dump["data_extraction_goal"]
-                        and action.action_type == ActionType.EXTRACT
-                    ):
-                        # use the right data extraction goal for the extract action
-                        action_dump["data_extraction_goal"] = final_dump["data_extraction_goal"]
-                    if (
-                        "extracted_information_schema" in final_dump
-                        and final_dump["extracted_information_schema"]
-                        and action.action_type == ActionType.EXTRACT
-                    ):
-                        action_dump["data_extraction_schema"] = final_dump["extracted_information_schema"]
-                    action_dumps.append(action_dump)
+                # Use pre-fetched actions (batch fetched)
+                actions = actions_by_task_id.get(run_block.task_id, [])
+                action_dumps = [_process_action_for_block(action, final_dump) for action in actions]
                 actions_by_task[run_block.task_id] = action_dumps
             else:
                 LOG.warning("Task not found", task_id=run_block.task_id)
@@ -197,8 +237,8 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
                 child_run_block = child_run_blocks_by_label.get(loop_block_label) if loop_block_label else None
 
                 if child_run_block and child_run_block.block_type in SCRIPT_TASK_BLOCKS and child_run_block.task_id:
-                    # Get task data for this child block
-                    task = await app.DATABASE.get_task(task_id=child_run_block.task_id, organization_id=organization_id)
+                    # Use pre-fetched task data (batch fetched)
+                    task = tasks_by_id.get(child_run_block.task_id)
                     if task:
                         task_dump = task.model_dump()
                         loop_block_dump.update({k: v for k, v in task_dump.items() if k not in loop_block_dump})
@@ -210,28 +250,9 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
                             }
                         )
 
-                        # Get task actions for the child block
-                        actions = await app.DATABASE.get_task_actions_hydrated(
-                            task_id=child_run_block.task_id, organization_id=organization_id
-                        )
-                        action_dumps = []
-                        for action in actions:
-                            action_dump = action.model_dump()
-                            action_dump["xpath"] = action.get_xpath()
-                            action_dump["has_mini_agent"] = action.has_mini_agent
-                            if (
-                                "data_extraction_goal" in loop_block_dump
-                                and loop_block_dump["data_extraction_goal"]
-                                and action.action_type == ActionType.EXTRACT
-                            ):
-                                action_dump["data_extraction_goal"] = loop_block_dump["data_extraction_goal"]
-                            if (
-                                "extracted_information_schema" in loop_block_dump
-                                and loop_block_dump["extracted_information_schema"]
-                                and action.action_type == ActionType.EXTRACT
-                            ):
-                                action_dump["data_extraction_schema"] = loop_block_dump["extracted_information_schema"]
-                            action_dumps.append(action_dump)
+                        # Use pre-fetched actions (batch fetched)
+                        actions = actions_by_task_id.get(child_run_block.task_id, [])
+                        action_dumps = [_process_action_for_block(action, loop_block_dump) for action in actions]
                         actions_by_task[child_run_block.task_id] = action_dumps
                     else:
                         LOG.warning(
