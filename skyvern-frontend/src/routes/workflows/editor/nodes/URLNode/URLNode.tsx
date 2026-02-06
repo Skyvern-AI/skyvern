@@ -80,7 +80,6 @@ function URLNode({ id, data, type }: NodeProps<URLNode>) {
                 ) : null}
               </div>
               <WorkflowBlockInputTextarea
-                canWriteTitle={true}
                 nodeId={id}
                 onChange={(value) => {
                   update({ url: value });

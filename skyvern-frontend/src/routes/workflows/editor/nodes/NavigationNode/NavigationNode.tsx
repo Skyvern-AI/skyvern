@@ -122,7 +122,6 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
               </div>
 
               <WorkflowBlockInputTextarea
-                canWriteTitle={true}
                 nodeId={id}
                 onChange={(value) => {
                   update({ url: value });

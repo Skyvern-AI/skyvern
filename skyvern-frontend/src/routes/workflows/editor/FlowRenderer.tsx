@@ -96,6 +96,7 @@ import {
 import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
+import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -740,6 +741,7 @@ function FlowRenderer({
   const editorElementRef = useRef<HTMLDivElement>(null);
 
   useAutoPan(editorElementRef, nodes);
+  useAutoGenerateWorkflowTitle(nodes, edges);
 
   useEffect(() => {
     doLayout(nodes, edges);

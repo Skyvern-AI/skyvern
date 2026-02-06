@@ -134,6 +134,76 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
 }
 
 
+def _extract_blocks_info(blocks: list[BLOCK_YAML_TYPES]) -> list[dict[str, str]]:
+    """Extract lightweight info from blocks for title generation (limit to first 5)."""
+    blocks_info: list[dict[str, str]] = []
+    for block in blocks[:5]:
+        info: dict[str, str] = {"block_type": block.block_type.value}
+
+        # Extract URL if present
+        if hasattr(block, "url") and block.url:
+            info["url"] = block.url
+
+        # Extract goal/prompt
+        goal = None
+        if hasattr(block, "navigation_goal") and block.navigation_goal:
+            goal = block.navigation_goal
+        elif hasattr(block, "data_extraction_goal") and block.data_extraction_goal:
+            goal = block.data_extraction_goal
+        elif hasattr(block, "prompt") and block.prompt:
+            goal = block.prompt
+
+        if goal:
+            # Truncate long goals
+            info["goal"] = goal[:150] if len(goal) > 150 else goal
+
+        blocks_info.append(info)
+    return blocks_info
+
+
+async def generate_title_from_blocks_info(
+    organization_id: str,
+    blocks_info: list[dict[str, Any]],
+) -> str | None:
+    """Call LLM to generate a workflow title from pre-extracted block info."""
+    if not blocks_info:
+        return None
+
+    try:
+        llm_prompt = prompt_engine.load_prompt(
+            "generate-workflow-title",
+            blocks=blocks_info,
+        )
+
+        response = await app.SECONDARY_LLM_API_HANDLER(
+            prompt=llm_prompt,
+            prompt_name="generate-workflow-title",
+            organization_id=organization_id,
+        )
+
+        if isinstance(response, dict) and "title" in response:
+            title = str(response["title"]).strip()
+            if title and len(title) <= 100:  # Sanity check on length
+                return title
+
+        return None
+    except Exception:
+        LOG.exception("Failed to generate workflow title")
+        return None
+
+
+async def generate_workflow_title(
+    organization_id: str,
+    blocks: list[BLOCK_YAML_TYPES],
+) -> str | None:
+    """Generate a meaningful workflow title based on block content using LLM."""
+    if not blocks:
+        return None
+
+    blocks_info = _extract_blocks_info(blocks)
+    return await generate_title_from_blocks_info(organization_id, blocks_info)
+
+
 @dataclass
 class CacheInvalidationPlan:
     reason: CacheInvalidationReason | None = None
@@ -3210,10 +3280,26 @@ class WorkflowService:
         delete_code_cache_is_ok: bool = True,
     ) -> Workflow:
         organization_id = organization.organization_id
+
+        # Generate meaningful title if using default and has blocks
+        title = request.title
+        if title == DEFAULT_WORKFLOW_TITLE and request.workflow_definition.blocks:
+            generated_title = await generate_workflow_title(
+                organization_id=organization_id,
+                blocks=request.workflow_definition.blocks,
+            )
+            if generated_title:
+                title = generated_title
+                LOG.info(
+                    "Generated workflow title",
+                    organization_id=organization_id,
+                    generated_title=title,
+                )
+
         LOG.info(
             "Creating workflow from request",
             organization_id=organization_id,
-            title=request.title,
+            title=title,
         )
         new_workflow_id: str | None = None
 
@@ -3233,7 +3319,7 @@ class WorkflowService:
 
                 # NOTE: it's only potential, as it may be immediately deleted!
                 potential_workflow = await self.create_workflow(
-                    title=request.title,
+                    title=title,
                     workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
                     description=request.description,
                     organization_id=organization_id,
@@ -3259,7 +3345,7 @@ class WorkflowService:
             else:
                 # NOTE: it's only potential, as it may be immediately deleted!
                 potential_workflow = await self.create_workflow(
-                    title=request.title,
+                    title=title,
                     workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
                     description=request.description,
                     organization_id=organization_id,
@@ -3291,7 +3377,7 @@ class WorkflowService:
             updated_workflow = await self.update_workflow_definition(
                 workflow_id=potential_workflow.workflow_id,
                 organization_id=organization_id,
-                title=request.title,
+                title=title,
                 description=request.description,
                 workflow_definition=workflow_definition,
             )
@@ -3313,7 +3399,7 @@ class WorkflowService:
                 )
                 await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
             else:
-                LOG.exception(f"Failed to create workflow from request, title: {request.title}")
+                LOG.exception(f"Failed to create workflow from request, title: {title}")
             raise e
 
     @staticmethod
