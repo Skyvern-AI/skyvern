@@ -1004,6 +1004,8 @@ async def update_workflow(
     try:
         if data.yaml_definition:
             workflow_json_from_yaml = yaml.safe_load(data.yaml_definition)
+            # Auto-sanitize block labels and update references for imports
+            workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
             workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
         elif data.json_definition:
             workflow_definition = data.json_definition

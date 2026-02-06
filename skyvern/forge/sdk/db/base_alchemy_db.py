@@ -96,4 +96,17 @@ class _SessionFactory:
             yield session
         finally:
             self._session_ctx.reset(token)
-            await session.close()
+            try:
+                await session.close()
+            except SQLAlchemyError as e:
+                # Handle transient errors during session cleanup gracefully.
+                # This can happen on replicas when the connection is terminated due to
+                # WAL replay conflicts. Since the actual DB operation already completed
+                # successfully (we're in finally block cleanup), we just log and continue.
+                if self._db.is_retryable_error(e):
+                    LOG.warning(
+                        "Transient error during session close (suppressed)",
+                        error=str(e),
+                    )
+                else:
+                    raise
