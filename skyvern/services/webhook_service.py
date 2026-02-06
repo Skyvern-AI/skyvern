@@ -471,7 +471,7 @@ async def _deliver_webhook(
 
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, content=payload, headers=headers, timeout=httpx.Timeout(10.0))
+            response = await client.post(url, content=payload, headers=headers, timeout=httpx.Timeout(60.0))
         status_code = response.status_code
         body_text = response.text or ""
         if len(body_text) > RESPONSE_BODY_TRUNCATION_LIMIT:
@@ -479,7 +479,7 @@ async def _deliver_webhook(
         else:
             response_body = body_text or None
     except httpx.TimeoutException:
-        error = "Request timed out after 10 seconds."
+        error = "Request timed out after 60 seconds."
         LOG.warning("Webhook replay timed out", url=url)
     except httpx.NetworkError as exc:
         error = f"Could not reach URL: {exc}"
