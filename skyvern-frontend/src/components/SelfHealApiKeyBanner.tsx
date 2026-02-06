@@ -11,6 +11,7 @@ import {
 
 type BannerStatus = Exclude<AuthStatusValue, "ok"> | "error";
 
+/** Return the user-facing title and description for the given banner status. */
 function getCopy(status: BannerStatus): { title: string; description: string } {
   switch (status) {
     case "missing_env":
@@ -41,7 +42,7 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
       return {
         title: "Local organization missing",
         description:
-          "The backend could not find the Skyvern-local organization. Regenerate the key to recreate it.",
+          "The backend could not find the Skyvern-local organization. Ensure the API key is entered without quotation marks, then regenerate the key to recreate it.",
       };
     case "error":
     default:
@@ -53,6 +54,7 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
   }
 }
 
+/** Banner that diagnoses API-key issues and offers one-click regeneration. */
 function SelfHealApiKeyBanner() {
   const diagnosticsQuery = useAuthDiagnostics();
   const { toast } = useToast();
@@ -60,7 +62,7 @@ function SelfHealApiKeyBanner() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const isProductionBuild = !import.meta.env.DEV;
 
-  const { data, error, isLoading, refetch } = diagnosticsQuery;
+  const { data, error, refetch } = diagnosticsQuery;
 
   const rawStatus = data?.status;
   const bannerStatus: BannerStatus | null = error
@@ -69,12 +71,7 @@ function SelfHealApiKeyBanner() {
       ? rawStatus
       : null;
 
-  if (!bannerStatus && !errorMessage) {
-    if (isLoading) {
-      return null;
-    }
-    return null;
-  }
+  if (!bannerStatus && !errorMessage && !isRepairing) return null;
 
   const copy = getCopy(bannerStatus ?? "missing_env");
   const queryErrorMessage = error?.message ?? null;
@@ -82,8 +79,10 @@ function SelfHealApiKeyBanner() {
   const handleRepair = async () => {
     setIsRepairing(true);
     setErrorMessage(null);
+
     try {
       const client = await getClient(null);
+
       const response = await client.post<{
         fingerprint?: string;
         api_key?: string;
@@ -121,17 +120,27 @@ function SelfHealApiKeyBanner() {
       toast({
         title: "API key regenerated",
         description: (
-          <div>
+          <div className="space-y-2">
             <div>
-              Requests now use the updated key automatically{fingerprintSuffix}{" "}
-              persisted to sessionStorage and written to the following .env
-              paths:
+              Your API key was regenerated and is now used automatically
+              {fingerprintSuffix}. The key is persisted in sessionStorage under{" "}
+              <code>skyvern.apiKey</code> and written to:
             </div>
+
             {pathsElements.length > 0 && (
-              <div className="mt-2 space-y-2">{pathsElements}</div>
+              <div className="ml-3 space-y-1">{pathsElements}</div>
             )}
+
+            <div>
+              To view or update the key, open DevTools, go to Application
+              (Chrome/Edge) or Storage (Firefox), select Session Storage, and
+              inspect <code>skyvern.apiKey</code>. Ensure it matches your{" "}
+              <code>.env</code> file exactly and contains no quotes or non-ASCII
+              characters.
+            </div>
+
             {isProductionBuild && (
-              <div className="mt-3">
+              <div>
                 Restart the UI server for more robust API key persistence.
               </div>
             )}
@@ -158,41 +167,37 @@ function SelfHealApiKeyBanner() {
           {copy.title}
         </AlertTitle>
         <AlertDescription className="space-y-3 text-center text-sm leading-6">
-          {bannerStatus !== "error" ? (
-            <>
-              <p>
-                {copy.description} Update <code>VITE_SKYVERN_API_KEY</code> in{" "}
-                <code className="mx-1">skyvern-frontend/.env</code>
-                by running <code>skyvern init</code> or click the button below
-                to regenerate it automatically.
-              </p>
-              {isProductionBuild && (
-                <p className="text-yellow-300">
-                  When running a production build, the regenerated API key is
-                  stored in sessionStorage. Closing this tab or browser window
-                  will lose the key. Restart the UI server for more robust
-                  persistence.
-                </p>
-              )}
-              <div className="flex justify-center">
-                <Button
-                  onClick={handleRepair}
-                  disabled={isRepairing}
-                  variant="secondary"
-                >
-                  {isRepairing ? "Regenerating…" : "Regenerate API key"}
-                </Button>
-              </div>
-            </>
-          ) : (
-            <p>{copy.description}</p>
+          <p>
+            {copy.description} Update <code>VITE_SKYVERN_API_KEY</code> in{" "}
+            <code>skyvern-frontend/.env</code> by running{" "}
+            <code>skyvern init</code> or click the button below to regenerate it
+            automatically.
+          </p>
+
+          {isProductionBuild && (
+            <p className="text-yellow-300">
+              In production builds, regenerated keys are stored in
+              sessionStorage. Closing the tab will lose the key.
+            </p>
           )}
-          {errorMessage ? (
+
+          <div className="flex justify-center">
+            <Button
+              onClick={handleRepair}
+              disabled={isRepairing}
+              variant="secondary"
+            >
+              {isRepairing ? "Regenerating…" : "Regenerate API key"}
+            </Button>
+          </div>
+
+          {errorMessage && (
             <p className="text-xs text-rose-200">{errorMessage}</p>
-          ) : null}
-          {queryErrorMessage && !errorMessage ? (
+          )}
+
+          {queryErrorMessage && !errorMessage && (
             <p className="text-xs text-rose-200">{queryErrorMessage}</p>
-          ) : null}
+          )}
         </AlertDescription>
       </Alert>
     </div>

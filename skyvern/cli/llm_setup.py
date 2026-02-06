@@ -4,9 +4,9 @@ from dotenv import load_dotenv, set_key
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
+from skyvern.cli.console import console
+from skyvern.cli.utils import strip_quotes
 from skyvern.utils.env_paths import resolve_backend_env_path
-
-from .console import console
 
 
 def update_or_add_env_var(key: str, value: str) -> None:
@@ -51,9 +51,23 @@ def update_or_add_env_var(key: str, value: str) -> None:
         for k, v in defaults.items():
             set_key(env_path, k, v)
 
+    # Only sanitize for keys that are API keys or sensitive
+    sensitive_keys = [
+        "SKYVERN_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AZURE_API_KEY",
+        "AZURE_GPT4O_MINI_API_KEY",
+        "GEMINI_API_KEY",
+        "NOVITA_API_KEY",
+        "VOLCENGINE_API_KEY",
+        "OPENAI_COMPATIBLE_API_KEY",
+    ]
+    sanitized_value = strip_quotes(value) if key in sensitive_keys else value
+
     load_dotenv(env_path)
-    set_key(env_path, key, value)
-    os.environ[key] = value
+    set_key(env_path, key, sanitized_value)
+    os.environ[key] = sanitized_value
 
 
 def setup_llm_providers() -> None:

@@ -15,7 +15,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 
 from skyvern.cli.console import console
-from skyvern.cli.utils import start_services
+from skyvern.cli.utils import start_services, strip_quotes
 from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
@@ -143,8 +143,10 @@ def run_ui() -> None:
     if backend_env_path.exists():
         load_dotenv(backend_env_path)
         skyvern_api_key = os.getenv("SKYVERN_API_KEY")
+
         if skyvern_api_key:
-            set_key(frontend_env_path, "VITE_SKYVERN_API_KEY", skyvern_api_key)
+            sanitized_api_key: str = strip_quotes(skyvern_api_key)
+            set_key(frontend_env_path, "VITE_SKYVERN_API_KEY", sanitized_api_key, quote_mode="never")
         else:
             console.print("[red]ERROR: SKYVERN_API_KEY not found in .env file[/red]")
     else:
