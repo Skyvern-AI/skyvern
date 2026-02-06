@@ -574,7 +574,7 @@ function RunWorkflowForm({
               </ul>
               <p className="mt-2">
                 <Link
-                  to={`/workflows/${workflowPermanentId}/debug`}
+                  to={`/workflows/${workflowPermanentId}/build`}
                   className="underline hover:no-underline"
                 >
                   Go to the editor

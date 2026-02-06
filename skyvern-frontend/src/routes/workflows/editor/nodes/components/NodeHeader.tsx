@@ -261,7 +261,7 @@ function NodeHeader({
       workflowRunId === workflowRun?.workflow_run_id &&
       statusIsFinalized(workflowRun)
     ) {
-      // navigate(`/workflows/${workflowPermanentId}/debug`);
+      // navigate(`/workflows/${workflowPermanentId}/build`);
 
       if (statusIsAFailureType(workflowRun)) {
         toast({
@@ -406,7 +406,7 @@ function NodeHeader({
       });
 
       navigate(
-        `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/debug`,
+        `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
       );
     },
     onError: (error: AxiosError) => {

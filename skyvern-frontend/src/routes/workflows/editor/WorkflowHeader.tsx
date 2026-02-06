@@ -300,7 +300,7 @@ function WorkflowHeader({
                       if (debugStore.isDebugMode) {
                         navigate(`/workflows/${workflowPermanentId}/edit`);
                       } else {
-                        navigate(`/workflows/${workflowPermanentId}/debug`);
+                        navigate(`/workflows/${workflowPermanentId}/build`);
                       }
                     }}
                   >
