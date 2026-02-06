@@ -331,7 +331,11 @@ def setup_logger() -> None:
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
-    root_logger.setLevel(LOG_LEVEL_VAL)
+    # Root at WARNING so third-party loggers (temporalio, grpc, litellm, …)
+    # only surface warnings and errors.  Our packages get the configured level.
+    root_logger.setLevel(logging.WARNING)
+    for name in ("skyvern", "cloud", "workers", "scripts", "browser_controller"):
+        logging.getLogger(name).setLevel(LOG_LEVEL_VAL)
 
     uvicorn_error = logging.getLogger("uvicorn.error")
     uvicorn_error.disabled = True
