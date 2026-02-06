@@ -97,16 +97,17 @@ function getUniqueSlugForFolder(folder: Folder, allFolders: Folder[]): string {
 
   // Sort by created_at to ensure consistent numbering
   const sortedFolders = [...foldersWithSameSlug].sort(
-    (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+    (a, b) =>
+      new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
   );
 
-  const index = sortedFolders.findIndex((f) => f.folder_id === folder.folder_id);
+  const index = sortedFolders.findIndex(
+    (f) => f.folder_id === folder.folder_id,
+  );
 
   // First folder (oldest) gets the base slug, others get numbered suffixes
   return index === 0 ? baseSlug : `${baseSlug}-${index + 1}`;
 }
-
-
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
@@ -144,7 +145,8 @@ function Workflows() {
   const { activeImports, startPolling } = useActiveImportsPolling();
 
   // Fetch folders
-  const { data: allFolders = [], isLoading: isFoldersLoading } = useFoldersQuery({ page_size: 10 });
+  const { data: allFolders = [], isLoading: isFoldersLoading } =
+    useFoldersQuery({ page_size: 10 });
 
   // Create a memoized map of slugs to folders to avoid O(n²) lookups
   const slugToFolderMap = useMemo(() => {
@@ -167,12 +169,24 @@ function Workflows() {
   // Clear folder param if the folder slug is invalid (folder deleted/renamed)
   // Only validate after folders have finished loading to avoid race conditions
   useEffect(() => {
-    if (folderSlug && !selectedFolderId && allFolders.length > 0 && !isFoldersLoading) {
+    if (
+      folderSlug &&
+      !selectedFolderId &&
+      allFolders.length > 0 &&
+      !isFoldersLoading
+    ) {
       const params = new URLSearchParams(searchParams);
       params.delete("folder");
       setSearchParams(params, { replace: true });
     }
-  }, [folderSlug, selectedFolderId, allFolders.length, isFoldersLoading, searchParams, setSearchParams]);
+  }, [
+    folderSlug,
+    selectedFolderId,
+    allFolders.length,
+    isFoldersLoading,
+    searchParams,
+    setSearchParams,
+  ]);
 
   // Update folder query param
   const setSelectedFolderId = (folderId: string | null) => {
