@@ -1,5 +1,8 @@
 FROM node:20.12-slim
 
+# Install tini for proper signal handling and zombie reaping
+RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY ./skyvern-frontend /app
 COPY ./entrypoint-skyvernui.sh /app/entrypoint-skyvernui.sh
@@ -14,5 +17,7 @@ ENV VITE_SKYVERN_API_KEY=__SKYVERN_API_KEY_PLACEHOLDER__
 # Build at image time
 RUN npm run build
 
-CMD [ "/bin/bash", "/app/entrypoint-skyvernui.sh" ]
+# Use tini as init for proper signal handling and zombie reaping
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/bin/bash", "/app/entrypoint-skyvernui.sh"]
 

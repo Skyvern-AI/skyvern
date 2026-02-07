@@ -11,6 +11,7 @@ if [ -n "$VITE_SKYVERN_API_KEY" ]; then
 fi
 
 # Start the servers (no rebuild needed)
-node localServer.js & node artifactServer.js & wait
-
-
+# Tini (configured as ENTRYPOINT) handles signal forwarding and zombie reaping
+node localServer.js &
+node artifactServer.js &
+wait
