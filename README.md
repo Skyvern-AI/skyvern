@@ -23,7 +23,7 @@
   <a href="https://www.linkedin.com/company/95726232"><img src="https://img.shields.io/badge/Follow%20 on%20LinkedIn-8A2BE2?logo=linkedin"/></a>
 </p>
 
-[Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a Playwright-compatible SDK that adds AI functionality on top of playwright, as well as a no-code workflow builder to help both technical and non-technical users automate manual workflows on ay website, replacing brittle or unreliable automation solutions.
+[Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a Playwright-compatible SDK that adds AI functionality on top of playwright, as well as a no-code workflow builder to help both technical and non-technical users automate manual workflows on any website, replacing brittle or unreliable automation solutions.
 
 <p align="center">
   <img src="fern/images/geico_shu_recording_cropped.gif"/>

@@ -384,7 +384,7 @@ if settings.ENABLE_ANTHROPIC:
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_completion_tokens=32000,
+            max_completion_tokens=64000,
         ),
     )
 
@@ -521,7 +521,7 @@ if settings.ENABLE_BEDROCK:
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_completion_tokens=32000,
+            max_completion_tokens=64000,
         ),
     )
 
