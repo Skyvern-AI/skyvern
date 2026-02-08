@@ -356,6 +356,8 @@ function Workspace({
 
     await saveWorkflow.mutateAsync();
 
+    workflowChangesStore.setSaidOkToCodeCacheDeletion(false);
+
     queryClient.invalidateQueries({
       queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
     });
@@ -706,11 +708,11 @@ function Workspace({
 
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
-      const layoutedElements = layout(nodes, edges);
+      const layoutedElements = layout(nodes, edges, blockLabel);
       setNodes(layoutedElements.nodes);
       setEdges(layoutedElements.edges);
     },
-    [setNodes, setEdges],
+    [setNodes, setEdges, blockLabel],
   );
 
   // Listen for conditional branch changes to trigger re-layout
@@ -722,7 +724,7 @@ function Workspace({
         const currentNodes = getNodes() as Array<AppNode>;
         const currentEdges = getEdges();
 
-        const layoutedElements = layout(currentNodes, currentEdges);
+        const layoutedElements = layout(currentNodes, currentEdges, blockLabel);
         setNodes(layoutedElements.nodes);
         setEdges(layoutedElements.edges);
       }, 10); // Small delay to ensure visibility updates complete
@@ -735,7 +737,7 @@ function Workspace({
         handleBranchChange,
       );
     };
-  }, [getNodes, getEdges, setNodes, setEdges]);
+  }, [getNodes, getEdges, setNodes, setEdges, blockLabel]);
 
   function addNode({
     nodeType,
@@ -1106,6 +1108,40 @@ function Workspace({
               {cycleBrowser.isPending && (
                 <ReloadIcon className="ml-2 size-4 animate-spin" />
               )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* confirm code cache deletion dialog */}
+      <Dialog
+        open={workflowChangesStore.showConfirmCodeCacheDeletion}
+        onOpenChange={(open) => {
+          !open && workflowChangesStore.setShowConfirmCodeCacheDeletion(false);
+          !open && workflowChangesStore.setSaidOkToCodeCacheDeletion(false);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Are you sure?</DialogTitle>
+            <DialogDescription>
+              Saving will delete cached code, and Skyvern will re-generate it in
+              the next run. Proceed?
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="secondary">Cancel</Button>
+            </DialogClose>
+            <Button
+              variant="default"
+              onClick={async () => {
+                workflowChangesStore.setSaidOkToCodeCacheDeletion(true);
+                await handleOnSave();
+                workflowChangesStore.setShowConfirmCodeCacheDeletion(false);
+              }}
+            >
+              Yes
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -580,7 +580,7 @@ class AgentDB(BaseAlchemyDB):
                     .order_by(ActionModel.created_at.desc())
                 )
                 actions = (await session.scalars(query)).all()
-                return [hydrate_action(action, empty_element_id=True) for action in actions]
+                return [hydrate_action(action) for action in actions]
 
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)

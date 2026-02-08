@@ -35,6 +35,7 @@ from skyvern.exceptions import (
     BlockNotFound,
     BrowserProfileNotFound,
     BrowserSessionNotFound,
+    CannotUpdateWorkflowDueToCodeCache,
     FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
@@ -131,6 +132,76 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
     BlockType.FILE_DOWNLOAD,
     BlockType.FOR_LOOP,
 }
+
+
+def _extract_blocks_info(blocks: list[BLOCK_YAML_TYPES]) -> list[dict[str, str]]:
+    """Extract lightweight info from blocks for title generation (limit to first 5)."""
+    blocks_info: list[dict[str, str]] = []
+    for block in blocks[:5]:
+        info: dict[str, str] = {"block_type": block.block_type.value}
+
+        # Extract URL if present
+        if hasattr(block, "url") and block.url:
+            info["url"] = block.url
+
+        # Extract goal/prompt
+        goal = None
+        if hasattr(block, "navigation_goal") and block.navigation_goal:
+            goal = block.navigation_goal
+        elif hasattr(block, "data_extraction_goal") and block.data_extraction_goal:
+            goal = block.data_extraction_goal
+        elif hasattr(block, "prompt") and block.prompt:
+            goal = block.prompt
+
+        if goal:
+            # Truncate long goals
+            info["goal"] = goal[:150] if len(goal) > 150 else goal
+
+        blocks_info.append(info)
+    return blocks_info
+
+
+async def generate_title_from_blocks_info(
+    organization_id: str,
+    blocks_info: list[dict[str, Any]],
+) -> str | None:
+    """Call LLM to generate a workflow title from pre-extracted block info."""
+    if not blocks_info:
+        return None
+
+    try:
+        llm_prompt = prompt_engine.load_prompt(
+            "generate-workflow-title",
+            blocks=blocks_info,
+        )
+
+        response = await app.SECONDARY_LLM_API_HANDLER(
+            prompt=llm_prompt,
+            prompt_name="generate-workflow-title",
+            organization_id=organization_id,
+        )
+
+        if isinstance(response, dict) and "title" in response:
+            title = str(response["title"]).strip()
+            if title and len(title) <= 100:  # Sanity check on length
+                return title
+
+        return None
+    except Exception:
+        LOG.exception("Failed to generate workflow title")
+        return None
+
+
+async def generate_workflow_title(
+    organization_id: str,
+    blocks: list[BLOCK_YAML_TYPES],
+) -> str | None:
+    """Generate a meaningful workflow title based on block content using LLM."""
+    if not blocks:
+        return None
+
+    blocks_info = _extract_blocks_info(blocks)
+    return await generate_title_from_blocks_info(organization_id, blocks_info)
 
 
 @dataclass
@@ -694,6 +765,7 @@ class WorkflowService:
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
@@ -852,6 +924,7 @@ class WorkflowService:
                 block_labels=block_labels,
                 blocks_to_update=blocks_to_update,
                 finalize=True,  # Force regeneration to ensure field mappings have complete action data
+                has_conditionals=has_conditionals,
             )
 
         # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
@@ -1005,6 +1078,10 @@ class WorkflowService:
 
         else:
             blocks = top_level_blocks
+            # Exclude the finally block from normal traversal — it runs separately via _execute_finally_block_if_configured
+            finally_block_label = workflow.workflow_definition.finally_block_label
+            if finally_block_label:
+                blocks = self._strip_finally_block_references(blocks, finally_block_label)
 
         if not blocks:
             raise SkyvernException(f"No blocks found for the given block labels: {block_labels}")
@@ -1034,6 +1111,7 @@ class WorkflowService:
                 should_stop,
                 _,
             ) = await self._execute_single_block(
+                workflow=workflow,
                 block=block,
                 block_idx=block_idx,
                 blocks_cnt=blocks_cnt,
@@ -1051,6 +1129,56 @@ class WorkflowService:
                 break
         return workflow_run, blocks_to_update
 
+    async def _generate_pending_script_for_block(
+        self,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        block_result: BlockResult | None,
+    ) -> None:
+        """Generate pending script after a block completes successfully.
+
+        This is called after each block execution instead of after each action,
+        reducing script generation frequency while maintaining progressive updates.
+        Uses asyncio.create_task() to avoid adding latency between blocks.
+        """
+        if not block_result or block_result.status != BlockStatus.completed:
+            return
+
+        context = skyvern_context.current()
+        if not context or not context.generate_script:
+            return
+
+        disable_script_generation = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "DISABLE_GENERATE_SCRIPT_AFTER_BLOCK",
+            workflow_run.workflow_run_id,
+            properties={"organization_id": workflow_run.organization_id},
+        )
+        if disable_script_generation:
+            return
+
+        asyncio.create_task(
+            self._do_generate_pending_script(workflow, workflow_run),
+            name=f"script_gen_{workflow_run.workflow_run_id}",
+        )
+
+    async def _do_generate_pending_script(
+        self,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+    ) -> None:
+        """Fire-and-forget wrapper for pending script generation with error handling."""
+        try:
+            await workflow_script_service.generate_or_update_pending_workflow_script(
+                workflow_run=workflow_run,
+                workflow=workflow,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to generate pending script after block completion",
+                workflow_run_id=workflow_run.workflow_run_id,
+                exc_info=True,
+            )
+
     async def _execute_workflow_blocks_dag(
         self,
         *,
@@ -1063,10 +1191,13 @@ class WorkflowService:
         is_script_run: bool,
         blocks_to_update: set[str],
     ) -> tuple[WorkflowRun, set[str]]:
+        finally_block_label = workflow.workflow_definition.finally_block_label
+        dag_blocks = workflow.workflow_definition.blocks
+        if finally_block_label:
+            dag_blocks = self._strip_finally_block_references(dag_blocks, finally_block_label)
+
         try:
-            start_label, label_to_block, default_next_map = self._build_workflow_graph(
-                workflow.workflow_definition.blocks
-            )
+            start_label, label_to_block, default_next_map = self._build_workflow_graph(dag_blocks)
         except InvalidWorkflowDefinition as exc:
             LOG.error("Workflow graph validation failed", error=str(exc), workflow_id=workflow.workflow_id)
             workflow_run = await self.mark_workflow_run_as_failed(
@@ -1101,6 +1232,7 @@ class WorkflowService:
                 should_stop,
                 branch_metadata,
             ) = await self._execute_single_block(
+                workflow=workflow,
                 block=block,
                 block_idx=block_idx,
                 blocks_cnt=total_blocks,
@@ -1154,6 +1286,7 @@ class WorkflowService:
     async def _execute_single_block(
         self,
         *,
+        workflow: Workflow,
         block: BlockTypeVar,
         block_idx: int,
         blocks_cnt: int,
@@ -1324,6 +1457,10 @@ class WorkflowService:
                 workflow_run=workflow_run,
                 workflow_run_id=workflow_run_id,
             )
+
+            # Generate pending script after block completes successfully
+            await self._generate_pending_script_for_block(workflow, workflow_run, workflow_run_block_result)
+
             return workflow_run, blocks_to_update, workflow_run_block_result, should_stop, branch_metadata
 
         except Exception as e:
@@ -1497,6 +1634,34 @@ class WorkflowService:
                 block_label=block.label,
                 error=str(e),
             )
+
+    @staticmethod
+    def _strip_finally_block_references(
+        blocks: list[BlockTypeVar],
+        finally_block_label: str,
+    ) -> list[BlockTypeVar]:
+        """Remove the finally block and nullify any edges that point to it.
+
+        This prevents _build_workflow_graph from raising InvalidWorkflowDefinition
+        when a block's next_block_label references the (now-excluded) finally block.
+        """
+        result: list[BlockTypeVar] = []
+        for block in blocks:
+            if block.label == finally_block_label:
+                continue
+            if isinstance(block, ConditionalBlock):
+                patched_branches = [
+                    branch.model_copy(update={"next_block_label": None})
+                    if branch.next_block_label == finally_block_label
+                    else branch
+                    for branch in block.branch_conditions
+                ]
+                if patched_branches != block.branch_conditions:
+                    block = block.model_copy(update={"branch_conditions": patched_branches})
+            elif block.next_block_label == finally_block_label:
+                block = block.model_copy(update={"next_block_label": None})
+            result.append(block)
+        return result
 
     def _build_workflow_graph(
         self,
@@ -1957,6 +2122,7 @@ class WorkflowService:
         workflow_definition: WorkflowDefinition,
         organization_id: str,
         delete_script: bool = True,
+        delete_code_cache_is_ok: bool = False,
     ) -> None:
         if workflow_definition:
             workflow_definition.validate()
@@ -2032,6 +2198,27 @@ class WorkflowService:
                     )
                     return
 
+                if published_groups and not delete_code_cache_is_ok:
+                    LOG.info(
+                        "Workflow definition changed, asking user if clearing published cached blocks is ok",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                        organization_id=organization_id,
+                        previous_version=previous_valid_workflow.version,
+                        new_version=workflow.version,
+                        invalidate_reason=plan.reason,
+                        invalidate_label=plan.label,
+                        invalidate_index_prev=plan.previous_index,
+                        invalidate_index_new=plan.new_index,
+                        block_labels_to_disable=plan.block_labels_to_disable,
+                        to_clear_published_cnt=len(published_groups),
+                        to_clear_non_published_cnt=len(cached_groups),
+                    )
+
+                    raise CannotUpdateWorkflowDueToCodeCache(
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                    )
+
                 try:
                     groups_to_clear = [*cached_groups, *published_groups]
                     await self._clear_cached_block_groups(
@@ -2073,7 +2260,38 @@ class WorkflowService:
                 )
                 return
 
-            to_delete = candidates
+            to_delete_published = [script for script in candidates if script.status == ScriptStatus.published]
+            to_delete = [script for script in candidates if script.status != ScriptStatus.published]
+
+            if len(to_delete_published) > 0:
+                if not delete_code_cache_is_ok:
+                    LOG.info(
+                        "Workflow definition changed, asking user if deleting published code is ok",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                        organization_id=organization_id,
+                        previous_version=previous_valid_workflow.version,
+                        new_version=workflow.version,
+                        to_delete_non_published_cnt=len(to_delete),
+                        to_delete_published_cnt=len(to_delete_published),
+                    )
+
+                    raise CannotUpdateWorkflowDueToCodeCache(
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                    )
+                else:
+                    LOG.info(
+                        "Workflow definition changed, user answered yes to deleting published code",
+                        workflow_id=workflow.workflow_id,
+                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+                        organization_id=organization_id,
+                        previous_version=previous_valid_workflow.version,
+                        new_version=workflow.version,
+                        to_delete_non_published_cnt=len(to_delete),
+                        to_delete_published_cnt=len(to_delete_published),
+                    )
+
+                    to_delete.extend(to_delete_published)
 
             if len(to_delete) > 0:
                 try:
@@ -3094,12 +3312,29 @@ class WorkflowService:
         request: WorkflowCreateYAMLRequest,
         workflow_permanent_id: str | None = None,
         delete_script: bool = True,
+        delete_code_cache_is_ok: bool = True,
     ) -> Workflow:
         organization_id = organization.organization_id
+
+        # Generate meaningful title if using default and has blocks
+        title = request.title
+        if title == DEFAULT_WORKFLOW_TITLE and request.workflow_definition.blocks:
+            generated_title = await generate_workflow_title(
+                organization_id=organization_id,
+                blocks=request.workflow_definition.blocks,
+            )
+            if generated_title:
+                title = generated_title
+                LOG.info(
+                    "Generated workflow title",
+                    organization_id=organization_id,
+                    generated_title=title,
+                )
+
         LOG.info(
             "Creating workflow from request",
             organization_id=organization_id,
-            title=request.title,
+            title=title,
         )
         new_workflow_id: str | None = None
 
@@ -3119,7 +3354,7 @@ class WorkflowService:
 
                 # NOTE: it's only potential, as it may be immediately deleted!
                 potential_workflow = await self.create_workflow(
-                    title=request.title,
+                    title=title,
                     workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
                     description=request.description,
                     organization_id=organization_id,
@@ -3145,7 +3380,7 @@ class WorkflowService:
             else:
                 # NOTE: it's only potential, as it may be immediately deleted!
                 potential_workflow = await self.create_workflow(
-                    title=request.title,
+                    title=title,
                     workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
                     description=request.description,
                     organization_id=organization_id,
@@ -3177,7 +3412,7 @@ class WorkflowService:
             updated_workflow = await self.update_workflow_definition(
                 workflow_id=potential_workflow.workflow_id,
                 organization_id=organization_id,
-                title=request.title,
+                title=title,
                 description=request.description,
                 workflow_definition=workflow_definition,
             )
@@ -3187,6 +3422,7 @@ class WorkflowService:
                 workflow_definition=workflow_definition,
                 organization_id=organization_id,
                 delete_script=delete_script,
+                delete_code_cache_is_ok=delete_code_cache_is_ok,
             )
 
             return updated_workflow
@@ -3198,7 +3434,7 @@ class WorkflowService:
                 )
                 await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
             else:
-                LOG.exception(f"Failed to create workflow from request, title: {request.title}")
+                LOG.exception(f"Failed to create workflow from request, title: {title}")
             raise e
 
     @staticmethod
@@ -3301,6 +3537,7 @@ class WorkflowService:
         block_labels: list[str] | None = None,
         blocks_to_update: set[str] | None = None,
         finalize: bool = False,
+        has_conditionals: bool | None = None,
     ) -> None:
         """
         Generate or regenerate workflow script if needed.
@@ -3313,6 +3550,7 @@ class WorkflowService:
             finalize: If True, check if any actions were skipped during script generation
                      due to missing data (race condition). Only regenerate if needed.
                      This fixes SKY-7653 while avoiding unnecessary regeneration costs.
+            has_conditionals: Whether the workflow has conditional blocks. If None, will be computed.
         """
         code_gen = workflow_run.code_gen
         blocks_to_update = set(blocks_to_update or [])
@@ -3379,12 +3617,28 @@ class WorkflowService:
             should_cache_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
             cached_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
 
+            # For workflows with conditional blocks, "missing" labels from unexecuted branches
+            # should NOT trigger regeneration. They will be cached when those branches execute.
+            # This prevents the bug where every run triggers unnecessary regeneration because
+            # blocks from unexecuted branches are always "missing".
+            if has_conditionals is None:
+                has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
+
             if cached_block_labels != should_cache_block_labels:
                 missing_labels = should_cache_block_labels - cached_block_labels
-                if missing_labels:
+                if missing_labels and not has_conditionals:
+                    # Only add missing labels for workflows WITHOUT conditionals.
+                    # For workflows WITH conditionals, missing labels are expected (unexecuted branches).
                     blocks_to_update.update(missing_labels)
-                # Always rebuild the orchestrator if the definition changed
-                blocks_to_update.add(settings.WORKFLOW_START_BLOCK_LABEL)
+                    # Always rebuild the orchestrator if the definition changed
+                    blocks_to_update.add(settings.WORKFLOW_START_BLOCK_LABEL)
+                elif missing_labels and has_conditionals:
+                    LOG.debug(
+                        "Skipping regeneration for missing labels in workflow with conditionals",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        missing_labels=list(missing_labels),
+                    )
 
             should_regenerate = bool(blocks_to_update) or bool(code_gen)
 

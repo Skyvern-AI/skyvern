@@ -54,7 +54,7 @@ function WorkflowTemplates() {
                 }
                 onClick={() => {
                   navigate(
-                    `/workflows/${workflow.workflow_permanent_id}/debug`,
+                    `/workflows/${workflow.workflow_permanent_id}/build`,
                   );
                 }}
               />
