@@ -133,6 +133,7 @@ class Settings(BaseSettings):
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_MAX_PAGES_NUMBER: int = 10
+    BROWSER_ADDITIONAL_ARGS: list[str] = []
 
     # Add extension folders name here to load extension in your browser
     EXTENSIONS_BASE_PATH: str = "./extensions"
