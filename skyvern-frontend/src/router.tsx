@@ -1,4 +1,5 @@
 import { Navigate, Outlet, createBrowserRouter } from "react-router-dom";
+import { DebugToBuildRedirect } from "@/routes/workflows/DebugToBuildRedirect";
 import { BrowserSession } from "@/routes/browserSessions/BrowserSession";
 import { BrowserSessions } from "@/routes/browserSessions/BrowserSessions";
 import { PageLayout } from "./components/PageLayout";
@@ -132,12 +133,20 @@ const router = createBrowserRouter([
                 element: <Navigate to="runs" />,
               },
               {
-                path: "debug",
+                path: "build",
                 element: <Debugger />,
               },
               {
-                path: ":workflowRunId/:blockLabel/debug",
+                path: ":workflowRunId/:blockLabel/build",
                 element: <Debugger />,
+              },
+              {
+                path: "debug",
+                element: <DebugToBuildRedirect />,
+              },
+              {
+                path: ":workflowRunId/:blockLabel/debug",
+                element: <DebugToBuildRedirect />,
               },
               {
                 path: "edit",

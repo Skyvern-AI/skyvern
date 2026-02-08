@@ -26,6 +26,7 @@ from skyvern.core.script_generations.generate_workflow_parameters import (
 )
 from skyvern.forge import app
 from skyvern.schemas.workflows import FileStorageType
+from skyvern.utils.strings import sanitize_identifier
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger(__name__)
@@ -126,36 +127,23 @@ def sanitize_variable_name(name: str) -> str:
     Sanitize a string to be a valid Python variable name.
 
     - Converts to snake_case
-    - Removes invalid characters
+    - Removes invalid characters (via shared sanitize_identifier)
     - Ensures it doesn't start with a number
     - Handles Python keywords by appending underscore
-    - Removes empty spaces
+    - Converts to lowercase
     """
-    # Remove leading/trailing whitespace and replace internal spaces with underscores
-    name = name.strip().replace(" ", "_")
-
     # Convert to snake_case: handle camelCase and PascalCase
     name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
 
-    # Remove any characters that aren't alphanumeric or underscore
-    name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
-    # Convert to lowercase
+    # Convert to lowercase before sanitizing
     name = name.lower()
 
-    # Remove consecutive underscores
-    name = re.sub(r"_+", "_", name)
+    # Use shared sanitize_identifier for core cleanup (uses "_" prefix for digit-leading names)
+    name = sanitize_identifier(name, default="param")
 
-    # Remove leading/trailing underscores
-    name = name.strip("_")
-
-    # Ensure it doesn't start with a number
-    if name and name[0].isdigit():
-        name = f"param_{name}"
-
-    # Handle empty string or invalid names
-    if not name or name == "_":
-        name = "param"
+    # For script variable names, use "param_" prefix instead of bare "_" for digit-leading names
+    if name.startswith("_") and len(name) > 1 and name[1].isdigit():
+        name = f"param{name}"
 
     # Handle Python keywords
     if keyword.iskeyword(name):
@@ -2028,9 +2016,30 @@ def _build_block_statement(
         stmt = _build_http_request_statement(block)
     elif block_type == "pdf_parser":
         stmt = _build_pdf_parser_statement(block)
+    elif block_type == "conditional":
+        # Conditional blocks are evaluated at runtime by the workflow engine.
+        # Generate a descriptive comment showing this is a runtime branch point.
+        # The blocks inside conditional branches are processed separately when executed.
+        branches = block.get("branches") or block.get("ordered_branches") or []
+        branch_info_lines = []
+        for i, branch in enumerate(branches):
+            next_label = branch.get("next_block_label", "?")
+            condition = branch.get("condition", "")
+            # Truncate long conditions for readability
+            if len(condition) > 50:
+                condition = condition[:47] + "..."
+            branch_info_lines.append(f"#   Branch {i + 1}: {condition!r} → {next_label}")
+
+        if branch_info_lines:
+            branch_info = "\n".join(branch_info_lines)
+            comment_text = f"# === CONDITIONAL: {block_title} ===\n# Evaluated at runtime by workflow engine. One branch executes:\n{branch_info}"
+        else:
+            comment_text = f"# === CONDITIONAL: {block_title} ===\n# Evaluated at runtime by workflow engine."
+
+        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(repr(comment_text)))])
     else:
-        # Default case for unknown block types
-        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"# Unknown block type: {block_type}"))])
+        # Default case for unknown block types - use quoted string literal to avoid libcst validation error
+        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"'# Unknown block type: {block_type}'"))])
 
     return stmt
 

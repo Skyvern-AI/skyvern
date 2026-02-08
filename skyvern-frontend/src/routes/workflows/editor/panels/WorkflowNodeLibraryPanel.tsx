@@ -84,24 +84,20 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "AI or Human Validation",
-    description: "Have an AI or Human validate the state of the screen",
+    title: "AI Validation Block",
+    description: "Have an AI validate the state of the screen",
   },
-  /**
-   * The Human Interaction block can be had via a transmutation of the
-   * Validation block.
-   */
-  // {
-  //   nodeType: "human_interaction",
-  //   icon: (
-  //     <WorkflowBlockIcon
-  //       workflowBlockType={WorkflowBlockTypes.HumanInteraction}
-  //       className="size-6"
-  //     />
-  //   ),
-  //   title: "Human Interaction Block",
-  //   description: "Validate via human interaction",
-  // },
+  {
+    nodeType: "human_interaction",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.HumanInteraction}
+        className="size-6"
+      />
+    ),
+    title: "Human Interaction Block",
+    description: "Pause workflow for human review and approval",
+  },
   // {
   //   nodeType: "task",
   //   icon: (
