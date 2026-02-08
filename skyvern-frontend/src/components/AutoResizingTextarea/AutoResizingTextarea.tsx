@@ -1,6 +1,6 @@
 import { Textarea } from "@/components/ui/textarea";
 import type { ChangeEventHandler, HTMLAttributes } from "react";
-import { forwardRef, useEffect, useRef, useCallback } from "react";
+import { forwardRef, useRef, useCallback, useLayoutEffect } from "react";
 import { cn } from "@/util/utils";
 
 type Props = {
@@ -30,6 +30,7 @@ const AutoResizingTextarea = forwardRef<HTMLTextAreaElement, Props>(
     forwardedRef,
   ) => {
     const innerRef = useRef<HTMLTextAreaElement | null>(null);
+    const lastHeightRef = useRef<string>("");
     const getTextarea = useCallback(() => innerRef.current, []);
 
     const setRefs = (element: HTMLTextAreaElement | null) => {
@@ -43,13 +44,25 @@ const AutoResizingTextarea = forwardRef<HTMLTextAreaElement, Props>(
       }
     };
 
-    useEffect(() => {
+    useLayoutEffect(() => {
       const textareaElement = getTextarea();
       if (!textareaElement) {
         return;
       }
+
+      // Temporarily set to auto to measure scrollHeight accurately
       textareaElement.style.height = "auto";
-      textareaElement.style.height = `${textareaElement.scrollHeight + 2}px`;
+      const newHeight = `${textareaElement.scrollHeight + 2}px`;
+
+      // Only apply the final height if it differs from the last applied height
+      // This prevents unnecessary dimension change events in React Flow
+      if (lastHeightRef.current !== newHeight) {
+        lastHeightRef.current = newHeight;
+        textareaElement.style.height = newHeight;
+      } else {
+        // Restore the previous height since nothing changed
+        textareaElement.style.height = lastHeightRef.current;
+      }
     }, [getTextarea, value]);
 
     return (

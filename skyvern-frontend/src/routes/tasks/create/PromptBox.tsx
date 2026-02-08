@@ -219,7 +219,7 @@ function PromptBox() {
         setAutoplay(workflow.workflow_permanent_id, firstBlock.label);
       }
 
-      navigate(`/workflows/${workflow.workflow_permanent_id}/debug`);
+      navigate(`/workflows/${workflow.workflow_permanent_id}/build`);
     },
     onError: (error: AxiosError) => {
       toast({

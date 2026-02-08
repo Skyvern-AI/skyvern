@@ -770,7 +770,7 @@ function Workflows() {
                                       onClick={(event) => {
                                         handleIconClick(
                                           event,
-                                          `/workflows/${workflow.workflow_permanent_id}/debug`,
+                                          `/workflows/${workflow.workflow_permanent_id}/build`,
                                         );
                                       }}
                                     >

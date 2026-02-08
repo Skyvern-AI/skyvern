@@ -4,7 +4,7 @@ import { useLocation } from "react-router-dom";
 function useIsDebugMode() {
   const location = useLocation();
   return useMemo(
-    () => location.pathname.includes("debug"),
+    () => location.pathname.includes("build"),
     [location.pathname],
   );
 }

@@ -11,6 +11,7 @@ from pypdf import PdfReader
 
 from skyvern.constants import MAX_FILE_PARSE_INPUT_TOKENS
 from skyvern.exceptions import PDFParsingError
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.utils.token_counter import count_tokens
 
 LOG = structlog.get_logger(__name__)
@@ -69,6 +70,9 @@ def extract_pdf_file(
                 current_tokens += page_tokens
             extracted_text += page_text + "\n"
 
+        # Sanitize text to remove characters that cannot be stored in PostgreSQL
+        extracted_text = sanitize_postgres_text(extracted_text)
+
         LOG.info(
             "Successfully parsed PDF with pypdf",
             file_identifier=identifier,
@@ -108,6 +112,9 @@ def extract_pdf_file(
                                 break
                             current_tokens += page_tokens
                         extracted_text += page_text + "\n"
+
+                # Sanitize text to remove characters that cannot be stored in PostgreSQL
+                extracted_text = sanitize_postgres_text(extracted_text)
 
                 LOG.info(
                     "Successfully parsed PDF with pdfplumber",

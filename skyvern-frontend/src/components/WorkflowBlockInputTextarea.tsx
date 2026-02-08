@@ -3,7 +3,6 @@ import { cn } from "@/util/utils";
 import { AutoResizingTextarea } from "./AutoResizingTextarea/AutoResizingTextarea";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
-import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useEffect, useRef, useState } from "react";
 import { useDebouncedCallback } from "use-debounce";
 
@@ -19,20 +18,12 @@ type Props = Omit<
   "onChange"
 > & {
   aiImprove?: AiImprove;
-  canWriteTitle?: boolean;
   onChange: (value: string) => void;
   nodeId: string;
 };
 
 function WorkflowBlockInputTextarea(props: Props) {
-  const { maybeAcceptTitle, maybeWriteTitle } = useWorkflowTitleStore();
-  const {
-    aiImprove,
-    nodeId,
-    onChange,
-    canWriteTitle = false,
-    ...textAreaProps
-  } = props;
+  const { aiImprove, nodeId, onChange, ...textAreaProps } = props;
   const [internalValue, setInternalValue] = useState(props.value ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [cursorPosition, setCursorPosition] = useState<{
@@ -46,11 +37,6 @@ function WorkflowBlockInputTextarea(props: Props) {
 
   const doOnChange = useDebouncedCallback((value: string) => {
     onChange(value);
-
-    if (canWriteTitle) {
-      maybeWriteTitle(value);
-      maybeAcceptTitle();
-    }
   }, 300);
 
   const handleTextareaSelect = () => {
