@@ -28,6 +28,8 @@ function useWorkflowQuery({ workflowPermanentId }: Props) {
         .then((response) => response.data);
     },
     enabled: !!globalWorkflows && !!workflowPermanentId,
+    // Keep showing stale data during refetch to prevent flash of empty content
+    placeholderData: (previousData) => previousData,
   });
 }
 
