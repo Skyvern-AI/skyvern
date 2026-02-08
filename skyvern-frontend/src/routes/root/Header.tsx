@@ -8,6 +8,7 @@ function Header() {
   const embed = searchParams.get("embed");
   const match =
     useMatch("/workflows/:workflowPermanentId/edit") ||
+    location.pathname.includes("build") ||
     location.pathname.includes("debug") ||
     embed === "true";
 

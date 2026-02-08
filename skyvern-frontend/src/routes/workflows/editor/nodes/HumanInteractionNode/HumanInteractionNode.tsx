@@ -84,17 +84,6 @@ function HumanInteractionNode({
           nodeId={id}
           totpIdentifier={null}
           totpUrl={null}
-          transmutations={{
-            blockTitle: "Validation",
-            self: "human",
-            others: [
-              {
-                label: "agent",
-                reason: "Convert to automated agent validation",
-                nodeName: "validation",
-              },
-            ],
-          }}
           type={type}
         />
         <div

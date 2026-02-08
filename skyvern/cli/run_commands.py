@@ -10,11 +10,11 @@ import psutil
 import typer
 import uvicorn
 from dotenv import load_dotenv, set_key
-from mcp.server.fastmcp import FastMCP
 from rich.panel import Panel
 from rich.prompt import Confirm
 
 from skyvern.cli.console import console
+from skyvern.cli.mcp_tools import mcp  # Uses standalone fastmcp (v2.x)
 from skyvern.cli.utils import start_services
 from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
@@ -26,8 +26,6 @@ from skyvern.utils import detect_os
 from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
-
-mcp = FastMCP("Skyvern")
 
 
 @mcp.tool()
@@ -53,12 +51,9 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
     res = await skyvern_agent.run_task(prompt=prompt, url=url, user_agent="skyvern-mcp", wait_for_completion=True)
 
     output = res.model_dump()["output"]
-    # Primary: use app_url from API response (handles both task and workflow run IDs correctly)
     if res.app_url:
         task_url = res.app_url
     else:
-        # Fallback when app_url is not available (e.g., older API versions)
-        # Determine route based on run_id prefix: 'wr_' for workflows, otherwise tasks
         if res.run_id and res.run_id.startswith("wr_"):
             task_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{res.run_id}/overview"
         else:
