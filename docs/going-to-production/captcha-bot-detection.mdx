@@ -24,11 +24,9 @@ This guide helps you detect CAPTCHA failures and implement fallbacks to keep you
 
 ---
 
-## Detect CAPTCHA failures
+## Use [`error_code_mapping`](/going-to-production/error-handling#step-3-use-error_code_mapping)
 
-### Using error code mapping
-
-[Use `error_code_mapping`](/going-to-production/error-handling#step-3-use-error_code_mapping) to detect when a CAPTCHA blocks your automation. This gives you a consistent error code instead of parsing free-text failure messages.
+ When a CAPTCHA blocks your automation, this gives you a consistent error code instead of parsing free-text failure messages.
 
 <CodeGroup>
 ```python Python
@@ -73,212 +71,15 @@ When a CAPTCHA blocks the run, the response includes `output.error = "cant_solve
 For more on error code mapping and handling failures programmatically, see [Error Handling](/going-to-production/error-handling).
 </Info>
 
-### Using Human Interaction block
+## Take Control from the browser stream
 
-For workflows, use the **Human Interaction** block to notify a human when a CAPTCHA needs manual solving.
+In the Cloud UI, head to Runs > Click on *your run* > Click on the "Take Control" button over the browser stream.
 
-The block pauses the workflow and sends an email. The recipient can then use the **Take Control** button in Skyvern Cloud to solve the CAPTCHA manually. Once solved, they reply to the email with the positive descriptor (e.g., "Continue") to resume the workflow.
-
-<CodeGroup>
-```python Python
-import os
-import asyncio
-from skyvern import Skyvern
-
-async def main():
-    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
-
-    workflow = await client.create_workflow(
-        json_definition={
-            "title": "Form Submission with CAPTCHA Fallback",
-            "workflow_definition": {
-                "parameters": [
-                    {
-                        "key": "form_url",
-                        "parameter_type": "workflow",
-                        "workflow_parameter_type": "string"
-                    },
-                    {
-                        "key": "form_data",
-                        "parameter_type": "workflow",
-                        "workflow_parameter_type": "json"
-                    }
-                ],
-                "blocks": [
-                    {
-                        "label": "fill_form",
-                        "block_type": "navigation",
-                        "url": "{{ form_url }}",
-                        "navigation_goal": "Fill out the form using the provided data. Stop before submitting if a CAPTCHA appears.",
-                        "parameter_keys": ["form_data"],
-                        "error_code_mapping": {
-                            "captcha_detected": "A CAPTCHA is displayed on the page"
-                        }
-                    },
-                    {
-                        "label": "solve_captcha",
-                        "block_type": "human_interaction",
-                        "instructions": "Please solve the CAPTCHA on the page, then click Continue.",
-                        "positive_descriptor": "Continue",
-                        "negative_descriptor": "Cancel",
-                        "timeout_seconds": 300,
-                        "sender": "workflow@yourcompany.com",
-                        "recipients": ["team@yourcompany.com"],
-                        "subject": "CAPTCHA requires manual solving",
-                        "body": "A CAPTCHA was detected during the workflow. Please solve it to continue."
-                    },
-                    {
-                        "label": "submit_form",
-                        "block_type": "navigation",
-                        "navigation_goal": "Click the submit button. COMPLETE when you see a confirmation message."
-                    }
-                ]
-            }
-        }
-    )
-
-    print(f"Workflow ID: {workflow.workflow_permanent_id}")
-
-asyncio.run(main())
-```
-
-```typescript TypeScript
-import { SkyvernClient } from "@skyvern/client";
-
-async function main() {
-  const client = new SkyvernClient({
-    apiKey: process.env.SKYVERN_API_KEY,
-  });
-
-  const workflow = await client.createWorkflow({
-    body: {
-      json_definition: {
-        title: "Form Submission with CAPTCHA Fallback",
-        workflow_definition: {
-          parameters: [
-            {
-              key: "form_url",
-              parameter_type: "workflow",
-              workflow_parameter_type: "string",
-            },
-            {
-              key: "form_data",
-              parameter_type: "workflow",
-              workflow_parameter_type: "json",
-            },
-          ],
-          blocks: [
-            {
-              label: "fill_form",
-              block_type: "navigation",
-              url: "{{ form_url }}",
-              navigation_goal:
-                "Fill out the form using the provided data. Stop before submitting if a CAPTCHA appears.",
-              parameter_keys: ["form_data"],
-              error_code_mapping: {
-                captcha_detected: "A CAPTCHA is displayed on the page",
-              },
-            },
-            {
-              label: "solve_captcha",
-              block_type: "human_interaction",
-              instructions: "Please solve the CAPTCHA on the page, then click Continue.",
-              positive_descriptor: "Continue",
-              negative_descriptor: "Cancel",
-              timeout_seconds: 300,
-              sender: "workflow@yourcompany.com",
-              recipients: ["team@yourcompany.com"],
-              subject: "CAPTCHA requires manual solving",
-              body: "A CAPTCHA was detected during the workflow. Please solve it to continue.",
-            },
-            {
-              label: "submit_form",
-              block_type: "navigation",
-              navigation_goal:
-                "Click the submit button. COMPLETE when you see a confirmation message.",
-            },
-          ],
-        },
-      },
-    },
-  });
-
-  console.log(`Workflow ID: ${workflow.workflow_permanent_id}`);
-}
-
-main();
-```
-
-```bash cURL
-curl -X POST "https://api.skyvern.com/v1/workflows" \
-  -H "x-api-key: $SKYVERN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "json_definition": {
-      "title": "Form Submission with CAPTCHA Fallback",
-      "workflow_definition": {
-        "parameters": [
-          {
-            "key": "form_url",
-            "parameter_type": "workflow",
-            "workflow_parameter_type": "string"
-          },
-          {
-            "key": "form_data",
-            "parameter_type": "workflow",
-            "workflow_parameter_type": "json"
-          }
-        ],
-        "blocks": [
-          {
-            "label": "fill_form",
-            "block_type": "navigation",
-            "url": "{{ form_url }}",
-            "navigation_goal": "Fill out the form using the provided data. Stop before submitting if a CAPTCHA appears.",
-            "parameter_keys": ["form_data"],
-            "error_code_mapping": {
-              "captcha_detected": "A CAPTCHA is displayed on the page"
-            }
-          },
-          {
-            "label": "solve_captcha",
-            "block_type": "human_interaction",
-            "instructions": "Please solve the CAPTCHA on the page, then click Continue.",
-            "positive_descriptor": "Continue",
-            "negative_descriptor": "Cancel",
-            "timeout_seconds": 300,
-            "sender": "workflow@yourcompany.com",
-            "recipients": ["team@yourcompany.com"],
-            "subject": "CAPTCHA requires manual solving",
-            "body": "A CAPTCHA was detected during the workflow. Please solve it to continue."
-          },
-          {
-            "label": "submit_form",
-            "block_type": "navigation",
-            "navigation_goal": "Click the submit button. COMPLETE when you see a confirmation message."
-          }
-        ]
-      }
-    }
-  }'
-```
-</CodeGroup>
-
----
-
-## Handle CAPTCHA failures
-
-Use the **Take Control** button in the Cloud UI to manually solve CAPTCHAs that the agent can't handle.
+This lets you manually solve CAPTCHAs.
 
 <img src="/images/take-control.png" />
 
-While watching a live run, click **Take Control** to pause the agent and operate the browser yourself. You can click, type, and solve the CAPTCHA directly. Release control when you're done and the agent resumes from where you left off.
-
-<Note>
-To watch a live run, open the run in the Cloud UI. See [Running from the Cloud UI](/getting-started/quickstart#from-the-cloud-ui) for details.
-</Note>
-
-This works both for ad-hoc runs you're monitoring and for workflows that pause via the Human Interaction block.
+Release control when you're done and the agent resumes from where you left off.
 
 ---
 
