@@ -1208,6 +1208,169 @@
         ]
       }
     },
+    "/v1/workflows/{workflow_permanent_id}": {
+      "get": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Get Workflow",
+        "operationId": "get_workflow_v1_workflows__workflow_permanent_id__get",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          },
+          {
+            "name": "template",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Template"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Workflow"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_workflow"
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/versions": {
+      "get": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Get Workflow Versions",
+        "description": "Get all versions of a workflow by its permanent ID.",
+        "operationId": "get_workflow_versions_v1_workflows__workflow_permanent_id__versions_get",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "template",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Template"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Workflow"
+                  },
+                  "title": "Response Get Workflow Versions V1 Workflows  Workflow Permanent Id  Versions Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_workflow_versions"
+      }
+    },
     "/v1/upload_file": {
       "post": {
         "tags": [
@@ -4711,6 +4874,11 @@
           "credits_remaining": {
             "type": "integer",
             "title": "Credits Remaining"
+          },
+          "cancel_at_period_end": {
+            "type": "boolean",
+            "title": "Cancel At Period End",
+            "default": false
           },
           "created_at": {
             "type": "string",
@@ -8427,7 +8595,8 @@
         "enum": [
           "csv",
           "excel",
-          "pdf"
+          "pdf",
+          "image"
         ],
         "title": "FileType"
       },
@@ -15169,9 +15338,11 @@
           "generate_metadata",
           "extract_loop_values",
           "generate_task_in_loop",
-          "generate_general_task"
+          "generate_general_task",
+          "termination"
         ],
-        "title": "ThoughtScenario"
+        "title": "ThoughtScenario",
+        "description": "Scenario in which a thought was generated.\n\nNote: Stored as VARCHAR in the database (not a PostgreSQL ENUM), so new values\ncan be added without database migrations. See observer_thoughts.observer_thought_scenario column."
       },
       "ThoughtType": {
         "type": "string",
@@ -15180,9 +15351,11 @@
           "metadata",
           "user_goal_check",
           "internal_plan",
-          "failure_describe"
+          "failure_describe",
+          "termination"
         ],
-        "title": "ThoughtType"
+        "title": "ThoughtType",
+        "description": "Type of thought recorded during task execution.\n\nNote: Stored as VARCHAR in the database (not a PostgreSQL ENUM), so new values\ncan be added without database migrations. See observer_thoughts.observer_thought_type column."
       },
       "TotpType": {
         "type": "string",

@@ -84,6 +84,7 @@ class RawSkyvern:
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
+        run_with: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[TaskRunResponse]:
         """
@@ -182,6 +183,9 @@ class RawSkyvern:
         browser_address : typing.Optional[str]
             The CDP address for the task.
 
+        run_with : typing.Optional[str]
+            Whether to run the task with agent or code.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -216,6 +220,7 @@ class RawSkyvern:
                 "include_action_history_in_verification": include_action_history_in_verification,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "browser_address": browser_address,
+                "run_with": run_with,
             },
             headers={
                 "content-type": "application/json",
@@ -2911,6 +2916,7 @@ class AsyncRawSkyvern:
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
+        run_with: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[TaskRunResponse]:
         """
@@ -3009,6 +3015,9 @@ class AsyncRawSkyvern:
         browser_address : typing.Optional[str]
             The CDP address for the task.
 
+        run_with : typing.Optional[str]
+            Whether to run the task with agent or code.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -3043,6 +3052,7 @@ class AsyncRawSkyvern:
                 "include_action_history_in_verification": include_action_history_in_verification,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "browser_address": browser_address,
+                "run_with": run_with,
             },
             headers={
                 "content-type": "application/json",

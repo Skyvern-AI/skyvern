@@ -44,22 +44,16 @@ function WorkflowRunParameters() {
 
   const initialValues = getInitialValues(location, workflowParameters ?? []);
 
-  const header = (
-    <header className="space-y-5">
-      <h1 className="text-3xl">
-        Parameters{workflow?.title ? ` - ${workflow.title}` : ""}
-      </h1>
-      <h2 className="text-lg text-slate-400">
-        Fill the placeholder values that you have linked throughout your
-        workflow.
-      </h2>
-    </header>
-  );
-
   if (isFetching) {
     return (
       <div className="space-y-8">
-        {header}
+        <header className="space-y-5">
+          <h1 className="text-3xl">Parameters</h1>
+          <h2 className="text-lg text-slate-400">
+            Fill the placeholder values that you have linked throughout your
+            workflow.
+          </h2>
+        </header>
         <Skeleton className="h-96 w-full" />
       </div>
     );
@@ -70,26 +64,21 @@ function WorkflowRunParameters() {
   }
 
   return (
-    <div className="space-y-8">
-      {header}
-      <RunWorkflowForm
-        initialValues={initialValues}
-        workflowParameters={workflowParameters}
-        initialSettings={{
-          proxyLocation:
-            proxyLocation ??
-            workflow.proxy_location ??
-            ProxyLocation.Residential,
-          webhookCallbackUrl:
-            webhookCallbackUrl ?? workflow.webhook_callback_url ?? "",
-          maxScreenshotScrolls:
-            maxScreenshotScrolls ?? workflow.max_screenshot_scrolls ?? null,
-          extraHttpHeaders:
-            extraHttpHeaders ?? workflow.extra_http_headers ?? null,
-          cdpAddress: null,
-        }}
-      />
-    </div>
+    <RunWorkflowForm
+      initialValues={initialValues}
+      workflowParameters={workflowParameters}
+      initialSettings={{
+        proxyLocation:
+          proxyLocation ?? workflow.proxy_location ?? ProxyLocation.Residential,
+        webhookCallbackUrl:
+          webhookCallbackUrl ?? workflow.webhook_callback_url ?? "",
+        maxScreenshotScrolls:
+          maxScreenshotScrolls ?? workflow.max_screenshot_scrolls ?? null,
+        extraHttpHeaders:
+          extraHttpHeaders ?? workflow.extra_http_headers ?? null,
+        cdpAddress: null,
+      }}
+    />
   );
 }
 

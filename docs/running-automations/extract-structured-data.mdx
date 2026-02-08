@@ -32,11 +32,12 @@ export const SchemaBuilder = () => {
     setFields(fields.map((f) => (f.id === id ? { ...f, [key]: value } : f)))
   }
 
-  // Track duplicate field names
   const duplicateNames = useMemo(() => {
     const names = fields.map((f) => f.name).filter((n) => n.trim() !== "")
     const counts = {}
-    names.forEach((n) => { counts[n] = (counts[n] || 0) + 1 })
+    for (const n of names) {
+      counts[n] = (counts[n] || 0) + 1
+    }
     return new Set(Object.keys(counts).filter((n) => counts[n] > 1))
   }, [fields])
 
@@ -68,7 +69,6 @@ export const SchemaBuilder = () => {
   const formattedOutput = useMemo(() => {
     const jsonStr = JSON.stringify(schema, null, 2)
     if (outputFormat === "python") {
-      // Only replace JSON literals at value positions (after ": "), not inside quoted strings
       return `data_extraction_schema=${jsonStr.replace(/: null/g, ": None").replace(/: true/g, ": True").replace(/: false/g, ": False")}`
     }
     if (outputFormat === "typescript") {
@@ -290,7 +290,7 @@ A schema doesn't guarantee all fields are populated. If the data isn't on the pa
 
 ## Build your schema
 
-Use the interactive builder below to generate a schema, then copy it into your code.
+Use the interactive builder to generate a schema, then copy it into your code.
 
 <SchemaBuilder />
 

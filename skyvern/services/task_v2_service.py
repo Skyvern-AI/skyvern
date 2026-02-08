@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 import structlog
+from opentelemetry import trace as otel_trace
 from sqlalchemy.exc import OperationalError
 
 from skyvern.config import settings
@@ -26,7 +27,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     ExtractionBlock,
@@ -427,7 +428,7 @@ async def initialize_task_v2_metadata(
     return task_v2
 
 
-@TraceManager.traced_async(ignore_inputs=["organization"])
+@traced()
 async def run_task_v2(
     organization: Organization,
     task_v2_id: str,
@@ -1658,7 +1659,7 @@ async def mark_task_v2_as_failed(
         )
 
     # Add task failure tag to trace
-    TraceManager.add_task_completion_tag("failed")
+    otel_trace.get_current_span().set_attribute("task.completion_status", "failed")
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1682,7 +1683,7 @@ async def mark_task_v2_as_completed(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
     # Add task completion tag to trace
-    TraceManager.add_task_completion_tag("completed")
+    otel_trace.get_current_span().set_attribute("task.completion_status", "completed")
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1702,7 +1703,7 @@ async def mark_task_v2_as_canceled(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
 
     # Add task canceled tag to trace
-    TraceManager.add_task_completion_tag("canceled")
+    otel_trace.get_current_span().set_attribute("task.completion_status", "canceled")
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1723,7 +1724,7 @@ async def mark_task_v2_as_terminated(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(workflow_run_id, failure_reason)
 
     # Add task terminated tag to trace
-    TraceManager.add_task_completion_tag("terminated")
+    otel_trace.get_current_span().set_attribute("task.completion_status", "terminated")
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1744,7 +1745,7 @@ async def mark_task_v2_as_timed_out(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
 
     # Add task timed out tag to trace
-    TraceManager.add_task_completion_tag("timed_out")
+    otel_trace.get_current_span().set_attribute("task.completion_status", "timed_out")
 
     await send_task_v2_webhook(task_v2)
     return task_v2

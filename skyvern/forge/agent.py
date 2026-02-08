@@ -16,6 +16,7 @@ from typing import Any, Tuple, cast
 import httpx
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
+from opentelemetry import trace as otel_trace
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
 
@@ -91,7 +92,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -305,9 +306,7 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
-    @TraceManager.traced_async(
-        ignore_inputs=["api_key", "close_browser_on_completion", "task_block", "cua_response", "llm_caller"]
-    )
+    @traced()
     async def execute_step(
         self,
         organization: Organization,
@@ -895,9 +894,7 @@ class ForgeAgent:
             )
             return True
 
-    @TraceManager.traced_async(
-        ignore_inputs=["browser_state", "organization", "task_block", "cua_response", "llm_caller"]
-    )
+    @traced()
     async def agent_step(
         self,
         task: Task,
@@ -3284,7 +3281,7 @@ class ForgeAgent:
         analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
 
         # Add task completion tag to trace
-        TraceManager.add_task_completion_tag(task.status.value)
+        otel_trace.get_current_span().set_attribute("task.completion_status", task.status.value)
         if need_final_screenshot:
             # Take one last screenshot and create an artifact before closing the browser to see the final state
             # We don't need the artifacts and send the webhook response directly only when there is an issue with the browser
