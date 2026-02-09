@@ -634,6 +634,39 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                 ),
             )
         )
+    elif method == "keypress":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("keys"),
+                value=_value(act.get("keys", ["Enter"])),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        if act.get("hold"):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("hold"),
+                    value=_value(act["hold"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+        if act.get("duration"):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("duration"),
+                    value=_value(act["duration"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
     elif method == "wait":
         args.append(
             cst.Arg(
