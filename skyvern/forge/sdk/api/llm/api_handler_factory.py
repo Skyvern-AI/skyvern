@@ -51,8 +51,9 @@ LOG = structlog.get_logger()
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
 
-# Default thinking budget for extract-actions prompt (can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
-EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = 512
+# Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
+EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
+DEFAULT_THINKING_BUDGET = settings.DEFAULT_THINKING_BUDGET
 
 
 def _safe_model_dump_json(response: ModelResponse, indent: int = 2) -> str:
@@ -348,6 +349,14 @@ class LLMAPIHandlerFactory:
         parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
     ) -> None:
         """Apply thinking optimization for Gemini models using exact integer budget value."""
+        # Get model label for logging — prefer main_model_group for router configs
+        model_label = llm_config.main_model_group if isinstance(llm_config, LLMRouterConfig) else llm_config.model_name
+
+        # Models that use thinking_level (e.g. Gemini 3 Pro/Flash) don't support budget_tokens.
+        # Their reasoning is already bounded by the thinking_level set in their config, so skip.
+        if "thinking_level" in parameters:
+            return
+
         if "thinking" in parameters and isinstance(parameters["thinking"], dict):
             parameters["thinking"]["budget_tokens"] = new_budget
         else:
@@ -355,10 +364,6 @@ class LLMAPIHandlerFactory:
             if settings.GEMINI_INCLUDE_THOUGHT:
                 thinking_payload["type"] = "enabled"
             parameters["thinking"] = thinking_payload
-        # Get safe model label for logging
-        model_label = getattr(llm_config, "model_name", None)
-        if model_label is None and isinstance(llm_config, LLMRouterConfig):
-            model_label = getattr(llm_config, "main_model_group", "router")
 
         LOG.info(
             "Applied thinking budget optimization (budget_tokens)",
@@ -457,6 +462,11 @@ class LLMAPIHandlerFactory:
                 # Apply default thinking budget for extract-actions (512) unless overridden by experiment
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     parameters, EXTRACT_ACTION_DEFAULT_THINKING_BUDGET, llm_config, prompt_name
+                )
+            else:
+                # Apply default thinking budget for all other prompts to prevent unbounded reasoning
+                LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+                    parameters, DEFAULT_THINKING_BUDGET, llm_config, prompt_name
                 )
 
             context = skyvern_context.current()
@@ -885,6 +895,11 @@ class LLMAPIHandlerFactory:
                 # Apply default thinking budget for extract-actions (512) unless overridden by experiment
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     active_parameters, EXTRACT_ACTION_DEFAULT_THINKING_BUDGET, llm_config, prompt_name
+                )
+            else:
+                # Apply default thinking budget for all other prompts to prevent unbounded reasoning
+                LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+                    active_parameters, DEFAULT_THINKING_BUDGET, llm_config, prompt_name
                 )
 
             context = skyvern_context.current()
