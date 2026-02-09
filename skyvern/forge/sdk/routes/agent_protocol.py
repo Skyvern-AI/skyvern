@@ -1990,7 +1990,7 @@ async def get_runs(
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     search_key: str | None = Query(
         None,
-        description="Search runs by parameter key, parameter description, or run parameter value.",
+        description="Search runs by run ID, parameter key, parameter description, run parameter value, or extra HTTP headers.",
     ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-get")
@@ -2248,7 +2248,7 @@ async def get_workflow_runs_by_id(
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     search_key: str | None = Query(
         None,
-        description="Search runs by parameter key, parameter description, or run parameter value.",
+        description="Search runs by run ID, parameter key, parameter description, run parameter value, or extra HTTP headers.",
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:

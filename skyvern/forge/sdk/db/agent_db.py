@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
+from sqlalchemy import Text, and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import (
     SQLAlchemyError,
 )
@@ -2790,8 +2790,8 @@ class AgentDB(BaseAlchemyDB):
                     key_like = f"%{search_key}%"
                     # Match workflow_run_id directly
                     id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
-                    # Match parameter key, description, or value
-                    param_exists = exists(
+                    # Match parameter key or description (only for non-deleted parameter definitions)
+                    param_key_desc_exists = exists(
                         select(1)
                         .select_from(WorkflowRunParameterModel)
                         .join(
@@ -2805,11 +2805,24 @@ class AgentDB(BaseAlchemyDB):
                             or_(
                                 WorkflowParameterModel.key.ilike(key_like),
                                 WorkflowParameterModel.description.ilike(key_like),
-                                WorkflowRunParameterModel.value.ilike(key_like),
                             )
                         )
                     )
-                    workflow_run_query = workflow_run_query.where(or_(id_matches, param_exists))
+                    # Match run parameter value directly (searches all values regardless of parameter definition status)
+                    param_value_exists = exists(
+                        select(1)
+                        .select_from(WorkflowRunParameterModel)
+                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                        .where(WorkflowRunParameterModel.value.ilike(key_like))
+                    )
+                    # Match extra HTTP headers (cast JSON to text for search, skip NULLs)
+                    extra_headers_match = and_(
+                        WorkflowRunModel.extra_http_headers.isnot(None),
+                        func.cast(WorkflowRunModel.extra_http_headers, Text()).ilike(key_like),
+                    )
+                    workflow_run_query = workflow_run_query.where(
+                        or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match)
+                    )
 
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
@@ -3068,7 +3081,8 @@ class AgentDB(BaseAlchemyDB):
         search_key: str | None = None,
     ) -> list[WorkflowRun]:
         """
-        Get runs for a workflow, with optional `search_key` on parameter key/description/value.
+        Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
+        or extra HTTP headers.
         """
         try:
             async with self.Session() as session:
@@ -3081,9 +3095,11 @@ class AgentDB(BaseAlchemyDB):
                 )
                 if search_key:
                     key_like = f"%{search_key}%"
-                    # Filter runs where any run parameter matches by key/description/value
+                    # Match workflow_run_id directly
+                    id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
+                    # Match parameter key or description (only for non-deleted parameter definitions)
                     # Use EXISTS to avoid duplicate rows and to keep pagination correct
-                    param_exists = exists(
+                    param_key_desc_exists = exists(
                         select(1)
                         .select_from(WorkflowRunParameterModel)
                         .join(
@@ -3097,11 +3113,22 @@ class AgentDB(BaseAlchemyDB):
                             or_(
                                 WorkflowParameterModel.key.ilike(key_like),
                                 WorkflowParameterModel.description.ilike(key_like),
-                                WorkflowRunParameterModel.value.ilike(key_like),
                             )
                         )
                     )
-                    query = query.where(param_exists)
+                    # Match run parameter value directly (searches all values regardless of parameter definition status)
+                    param_value_exists = exists(
+                        select(1)
+                        .select_from(WorkflowRunParameterModel)
+                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                        .where(WorkflowRunParameterModel.value.ilike(key_like))
+                    )
+                    # Match extra HTTP headers (cast JSON to text for search, skip NULLs)
+                    extra_headers_match = and_(
+                        WorkflowRunModel.extra_http_headers.isnot(None),
+                        func.cast(WorkflowRunModel.extra_http_headers, Text()).ilike(key_like),
+                    )
+                    query = query.where(or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match))
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
                 query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
