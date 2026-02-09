@@ -312,6 +312,8 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
     GEMINI_THINKING_BUDGET: int | None = None
+    DEFAULT_THINKING_BUDGET: int = 1024
+    EXTRACT_ACTION_THINKING_BUDGET: int = 512
 
     # VERTEX_AI
     VERTEX_CREDENTIALS: str | None = None
