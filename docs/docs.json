@@ -32,6 +32,17 @@
               "running-automations/task-parameters",
               "running-automations/extract-structured-data"
             ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/mcp",
+              "integrations/zapier",
+              "integrations/make",
+              "integrations/n8n",
+              "integrations/workato",
+              "integrations/local-llms"
+            ]
           }
         ]
       },
