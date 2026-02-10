@@ -148,7 +148,7 @@ async def test_webhook(
                 validated_url,
                 content=signed_data.signed_payload,
                 headers=signed_data.headers,
-                timeout=httpx.Timeout(10.0),
+                timeout=httpx.Timeout(60.0),
             )
             status_code = response.status_code
 
@@ -160,7 +160,7 @@ async def test_webhook(
                 response_body = response_text
 
     except httpx.TimeoutException:
-        error = "Request timed out after 10 seconds."
+        error = "Request timed out after 60 seconds."
         LOG.warning(
             "Test webhook timeout",
             organization_id=current_org.organization_id,

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
+from sqlalchemy import Text, and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import (
     SQLAlchemyError,
 )
@@ -112,6 +112,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -140,6 +141,7 @@ from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+_UNSET = object()
 
 
 def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
@@ -226,6 +228,18 @@ class AgentDB(BaseAlchemyDB):
         download_timeout: float | None = None,
     ) -> Task:
         try:
+            # Sanitize text fields to remove NUL bytes and control characters
+            # that PostgreSQL cannot store in text columns
+            def _sanitize(v: str | None) -> str | None:
+                return sanitize_postgres_text(v) if isinstance(v, str) else v
+
+            navigation_goal = _sanitize(navigation_goal)
+            data_extraction_goal = _sanitize(data_extraction_goal)
+            title = _sanitize(title)
+            url = sanitize_postgres_text(url)
+            complete_criterion = _sanitize(complete_criterion)
+            terminate_criterion = _sanitize(terminate_criterion)
+
             async with self.Session() as session:
                 new_task = TaskModel(
                     status=status,
@@ -377,11 +391,10 @@ class AgentDB(BaseAlchemyDB):
     async def get_task(self, task_id: str, organization_id: str | None = None) -> Task | None:
         """Get a task by its id"""
         async with self.Session() as session:
-            if task_obj := (
-                await session.scalars(
-                    select(TaskModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
-                )
-            ).first():
+            query = select(TaskModel).filter_by(task_id=task_id)
+            if organization_id is not None:
+                query = query.filter_by(organization_id=organization_id)
+            if task_obj := (await session.scalars(query)).first():
                 return convert_to_task(task_obj, self.debug_enabled)
             else:
                 LOG.info(
@@ -394,7 +407,7 @@ class AgentDB(BaseAlchemyDB):
     async def get_tasks_by_ids(
         self,
         task_ids: list[str],
-        organization_id: str | None = None,
+        organization_id: str,
     ) -> list[Task]:
         try:
             async with self.Session() as session:
@@ -580,7 +593,7 @@ class AgentDB(BaseAlchemyDB):
                     .order_by(ActionModel.created_at.desc())
                 )
                 actions = (await session.scalars(query)).all()
-                return [hydrate_action(action, empty_element_id=True) for action in actions]
+                return [hydrate_action(action) for action in actions]
 
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -2790,8 +2803,8 @@ class AgentDB(BaseAlchemyDB):
                     key_like = f"%{search_key}%"
                     # Match workflow_run_id directly
                     id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
-                    # Match parameter key, description, or value
-                    param_exists = exists(
+                    # Match parameter key or description (only for non-deleted parameter definitions)
+                    param_key_desc_exists = exists(
                         select(1)
                         .select_from(WorkflowRunParameterModel)
                         .join(
@@ -2805,11 +2818,24 @@ class AgentDB(BaseAlchemyDB):
                             or_(
                                 WorkflowParameterModel.key.ilike(key_like),
                                 WorkflowParameterModel.description.ilike(key_like),
-                                WorkflowRunParameterModel.value.ilike(key_like),
                             )
                         )
                     )
-                    workflow_run_query = workflow_run_query.where(or_(id_matches, param_exists))
+                    # Match run parameter value directly (searches all values regardless of parameter definition status)
+                    param_value_exists = exists(
+                        select(1)
+                        .select_from(WorkflowRunParameterModel)
+                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                        .where(WorkflowRunParameterModel.value.ilike(key_like))
+                    )
+                    # Match extra HTTP headers (cast JSON to text for search, skip NULLs)
+                    extra_headers_match = and_(
+                        WorkflowRunModel.extra_http_headers.isnot(None),
+                        func.cast(WorkflowRunModel.extra_http_headers, Text()).ilike(key_like),
+                    )
+                    workflow_run_query = workflow_run_query.where(
+                        or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match)
+                    )
 
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
@@ -3068,7 +3094,8 @@ class AgentDB(BaseAlchemyDB):
         search_key: str | None = None,
     ) -> list[WorkflowRun]:
         """
-        Get runs for a workflow, with optional `search_key` on parameter key/description/value.
+        Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
+        or extra HTTP headers.
         """
         try:
             async with self.Session() as session:
@@ -3081,9 +3108,11 @@ class AgentDB(BaseAlchemyDB):
                 )
                 if search_key:
                     key_like = f"%{search_key}%"
-                    # Filter runs where any run parameter matches by key/description/value
+                    # Match workflow_run_id directly
+                    id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
+                    # Match parameter key or description (only for non-deleted parameter definitions)
                     # Use EXISTS to avoid duplicate rows and to keep pagination correct
-                    param_exists = exists(
+                    param_key_desc_exists = exists(
                         select(1)
                         .select_from(WorkflowRunParameterModel)
                         .join(
@@ -3097,11 +3126,22 @@ class AgentDB(BaseAlchemyDB):
                             or_(
                                 WorkflowParameterModel.key.ilike(key_like),
                                 WorkflowParameterModel.description.ilike(key_like),
-                                WorkflowRunParameterModel.value.ilike(key_like),
                             )
                         )
                     )
-                    query = query.where(param_exists)
+                    # Match run parameter value directly (searches all values regardless of parameter definition status)
+                    param_value_exists = exists(
+                        select(1)
+                        .select_from(WorkflowRunParameterModel)
+                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                        .where(WorkflowRunParameterModel.value.ilike(key_like))
+                    )
+                    # Match extra HTTP headers (cast JSON to text for search, skip NULLs)
+                    extra_headers_match = and_(
+                        WorkflowRunModel.extra_http_headers.isnot(None),
+                        func.cast(WorkflowRunModel.extra_http_headers, Text()).ilike(key_like),
+                    )
+                    query = query.where(or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match))
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
                 query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
@@ -3666,6 +3706,33 @@ class AgentDB(BaseAlchemyDB):
             await session.commit()
             await session.refresh(new_chat)
             return WorkflowCopilotChat.model_validate(new_chat)
+
+    async def update_workflow_copilot_chat(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        proposed_workflow: dict | None | object = _UNSET,
+        auto_accept: bool | None = None,
+    ) -> WorkflowCopilotChat | None:
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                )
+            ).first()
+            if not chat:
+                return None
+
+            if proposed_workflow is not _UNSET:
+                chat.proposed_workflow = proposed_workflow
+            if auto_accept is not None:
+                chat.auto_accept = auto_accept
+
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
 
     async def create_workflow_copilot_chat_message(
         self,

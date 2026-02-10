@@ -21,6 +21,11 @@ from .mcp import setup_local_organization, setup_mcp
 
 def init_env(
     no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
+    database_string: str = typer.Option(
+        "",
+        "--database-string",
+        help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
+    ),
 ) -> bool:
     """Interactive initialization command for Skyvern."""
     console.print(
@@ -40,7 +45,12 @@ def init_env(
     run_local = infra_choice == "local"
 
     if run_local:
-        setup_postgresql(no_postgres)
+        if database_string:
+            console.print("🔗 [bold blue]Using custom database connection...[/bold blue]")
+            update_or_add_env_var("DATABASE_STRING", database_string)
+            console.print("✅ [green]Database connection string set in .env file.[/green]")
+        else:
+            setup_postgresql(no_postgres)
         console.print("📊 [bold blue]Running database migrations...[/bold blue]")
         migrate_db()
         console.print("✅ [green]Database migration complete.[/green]")

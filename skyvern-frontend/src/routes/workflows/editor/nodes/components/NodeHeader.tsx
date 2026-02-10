@@ -26,6 +26,8 @@ import {
   scriptableWorkflowBlockTypes,
   type WorkflowBlockType,
   type WorkflowApiResponse,
+  type WorkflowParameter,
+  type Parameter,
 } from "@/routes/workflows/types/workflowTypes";
 import { getInitialValues } from "@/routes/workflows/utils";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
@@ -49,6 +51,16 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { workflowBlockTitle } from "../types";
 import { MicroDropdown } from "./MicroDropdown";
+import { BlockParametersDialog } from "./BlockParametersDialog";
+
+function isWorkflowParameter(param: Parameter): param is WorkflowParameter {
+  return (
+    param?.parameter_type === "workflow" &&
+    "workflow_parameter_type" in param &&
+    typeof param.workflow_parameter_type === "string" &&
+    param.workflow_parameter_type.length > 0
+  );
+}
 
 interface Transmutations {
   blockTitle: string;
@@ -213,6 +225,13 @@ function NodeHeader({
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
   );
+  const [showParamsDialog, setShowParamsDialog] = useState(false);
+  const [parametersToPrompt, setParametersToPrompt] = useState<
+    WorkflowParameter[]
+  >([]);
+  const [currentParamValues, setCurrentParamValues] = useState<
+    Record<string, unknown>
+  >({});
   const { getAutoplay, setAutoplay } = useAutoplayStore();
 
   useEffect(() => {
@@ -261,7 +280,7 @@ function NodeHeader({
       workflowRunId === workflowRun?.workflow_run_id &&
       statusIsFinalized(workflowRun)
     ) {
-      // navigate(`/workflows/${workflowPermanentId}/debug`);
+      // navigate(`/workflows/${workflowPermanentId}/build`);
 
       if (statusIsAFailureType(workflowRun)) {
         toast({
@@ -286,7 +305,10 @@ function NodeHeader({
   ]);
 
   const runBlock = useMutation({
-    mutationFn: async (opts?: { codeGen: boolean }) => {
+    mutationFn: async (opts?: {
+      codeGen: boolean;
+      parameterOverrides?: Record<string, unknown>;
+    }) => {
       closeWorkflowPanel();
 
       await saveWorkflow.mutateAsync();
@@ -332,6 +354,11 @@ function NodeHeader({
 
       const parameters = getInitialValues(location, workflowParameters ?? []);
 
+      // Merge with parameter overrides if provided
+      const mergedParameters = opts?.parameterOverrides
+        ? { ...parameters, ...opts.parameterOverrides }
+        : parameters;
+
       const client = await getClient(credentialGetter, "sans-api-v1");
 
       const body = getPayload({
@@ -341,7 +368,7 @@ function NodeHeader({
         browserSessionId: debugSession.browser_session_id,
         debugSessionId: debugSession.debug_session_id,
         codeGen: opts?.codeGen ?? false,
-        parameters,
+        parameters: mergedParameters,
         totpIdentifier,
         totpUrl,
         workflowPermanentId,
@@ -406,7 +433,7 @@ function NodeHeader({
       });
 
       navigate(
-        `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/debug`,
+        `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
       );
     },
     onError: (error: AxiosError) => {
@@ -480,9 +507,25 @@ function NodeHeader({
   });
 
   const handleOnPlay = () => {
-    const numBlocksInWorkflow = (workflow?.workflow_definition.blocks ?? [])
-      .length;
+    const blocks = workflow?.workflow_definition?.blocks ?? [];
+    const numBlocksInWorkflow = blocks.length;
 
+    // Get workflow parameters using type guard for proper type narrowing
+    const workflowParameters = (
+      workflow?.workflow_definition?.parameters ?? []
+    ).filter(isWorkflowParameter);
+
+    // If there are any workflow parameters, always prompt the user
+    // The backend requires all params to be specified for each run
+    if (workflowParameters.length > 0) {
+      const currentValues = getInitialValues(location, workflowParameters);
+      setCurrentParamValues(currentValues);
+      setParametersToPrompt(workflowParameters);
+      setShowParamsDialog(true);
+      return;
+    }
+
+    // No parameters, run directly
     runBlock.mutate({ codeGen: numBlocksInWorkflow === 1 });
   };
 
@@ -636,6 +679,33 @@ function NodeHeader({
           )}
         </div>
       </header>
+
+      <BlockParametersDialog
+        open={showParamsDialog}
+        onOpenChange={setShowParamsDialog}
+        blockLabel={blockLabel}
+        parameters={parametersToPrompt}
+        initialValues={currentParamValues}
+        onSubmit={(values) => {
+          const numBlocksInWorkflow = (
+            workflow?.workflow_definition.blocks ?? []
+          ).length;
+          runBlock.mutate(
+            {
+              codeGen: numBlocksInWorkflow === 1,
+              parameterOverrides: values,
+            },
+            {
+              onSuccess: () => {
+                // Close dialog on success - navigation also happens in mutation's onSuccess
+                setShowParamsDialog(false);
+              },
+              // On error, dialog stays open so user can retry. Toast is shown by mutation's onError.
+            },
+          );
+        }}
+        isLoading={runBlock.isPending}
+      />
     </>
   );
 }

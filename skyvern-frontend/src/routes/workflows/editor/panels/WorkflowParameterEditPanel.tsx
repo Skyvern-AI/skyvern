@@ -42,16 +42,21 @@ type Props = {
 
 const workflowParameterTypeOptions = [
   { label: "string", value: WorkflowParameterValueType.String },
+  { label: "credential", value: "credential" },
   { label: "float", value: WorkflowParameterValueType.Float },
   { label: "integer", value: WorkflowParameterValueType.Integer },
   { label: "boolean", value: WorkflowParameterValueType.Boolean },
   { label: "file", value: WorkflowParameterValueType.FileURL },
-  { label: "credential", value: WorkflowParameterValueType.CredentialId },
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
 
 type CredentialDataType = "password" | "secret" | "creditCard";
 type CredentialSource = "bitwarden" | "skyvern" | "onepassword" | "azurevault";
+
+// When selecting from the Value Type dropdown, "credential" is a special value that triggers
+// credential-specific UI. This is separate from WorkflowParameterValueType which only includes
+// data types like string, integer, etc.
+type ParameterTypeSelection = WorkflowParameterValueType | "credential";
 
 // Determine available sources based on credential data type
 function getAvailableSourcesForDataType(
@@ -80,15 +85,59 @@ function getAvailableSourcesForDataType(
   }
 }
 
-function header(type: WorkflowEditorParameterType, isEdit: boolean) {
+function header(
+  type: WorkflowEditorParameterType,
+  isEdit: boolean,
+  isCredentialSelected: boolean,
+) {
   const prefix = isEdit ? "Edit" : "Add";
+  if (type === "workflow" && !isEdit) {
+    // Unified add mode
+    return `${prefix} Parameter`;
+  }
   if (type === "workflow") {
     return `${prefix} Input Parameter`;
   }
-  if (type === "credential") {
+  if (type === "credential" || (!isEdit && isCredentialSelected)) {
     return `${prefix} Credential Parameter`;
   }
   return `${prefix} Context Parameter`;
+}
+
+/**
+ * Validates that a parameter key is a valid Python/Jinja2 identifier.
+ * Parameter keys are used in Jinja2 templates, so they must be valid identifiers.
+ * Returns an error message if invalid, or null if valid.
+ */
+function validateParameterKey(key: string): string | null {
+  if (!key) return null; // Empty key is handled separately
+
+  // Check for whitespace
+  if (/\s/.test(key)) {
+    return "Key cannot contain whitespace characters. Consider using underscores (_) instead.";
+  }
+
+  // Check if it's a valid Python identifier:
+  // - Must start with a letter (a-z, A-Z) or underscore (_)
+  // - Can only contain letters, digits (0-9), and underscores
+  const validIdentifierRegex = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+  if (!validIdentifierRegex.test(key)) {
+    if (/^[0-9]/.test(key)) {
+      return "Key cannot start with a digit. Parameter keys must start with a letter or underscore.";
+    }
+    if (key.includes("/")) {
+      return "Key cannot contain '/' characters. Use underscores instead (e.g., 'State_or_Province' instead of 'State/Province').";
+    }
+    if (key.includes("-")) {
+      return "Key cannot contain '-' characters. Use underscores instead (e.g., 'my_parameter' instead of 'my-parameter').";
+    }
+    if (key.includes(".")) {
+      return "Key cannot contain '.' characters. Use underscores instead.";
+    }
+    return "Key must be a valid identifier (only letters, digits, and underscores; cannot start with a digit).";
+  }
+
+  return null;
 }
 
 // Helper to detect initial credential data type from existing parameter
@@ -104,8 +153,9 @@ function detectInitialCredentialDataType(
 // Helper to detect initial credential source from existing parameter
 function detectInitialCredentialSource(
   initialValues: ParametersState[number] | undefined,
+  isCloud: boolean,
 ): CredentialSource {
-  if (!initialValues) return "bitwarden";
+  if (!initialValues) return isCloud ? "skyvern" : "bitwarden";
 
   if (initialValues.parameterType === "secret") return "bitwarden";
   if (initialValues.parameterType === "creditCardData") return "bitwarden";
@@ -117,7 +167,7 @@ function detectInitialCredentialSource(
     if (parameterIsAzureVaultCredential(initialValues)) return "azurevault";
   }
 
-  return "bitwarden";
+  return isCloud ? "skyvern" : "bitwarden";
 }
 
 function WorkflowParameterEditPanel({
@@ -135,7 +185,7 @@ function WorkflowParameterEditPanel({
   const isCloud = useContext(CloudContext);
   const isEditMode = !!initialValues;
   const [key, setKey] = useState(initialValues?.key ?? "");
-  const hasWhitespace = /\s/.test(key);
+  const keyValidationError = validateParameterKey(key);
 
   // Detect initial values for backward compatibility
   const isBitwardenCredential =
@@ -157,7 +207,7 @@ function WorkflowParameterEditPanel({
       detectInitialCredentialDataType(initialValues),
     );
   const [credentialSource, setCredentialSource] = useState<CredentialSource>(
-    detectInitialCredentialSource(initialValues),
+    detectInitialCredentialSource(initialValues, isCloud),
   );
 
   const [urlParameterKey, setUrlParameterKey] = useState(
@@ -173,12 +223,13 @@ function WorkflowParameterEditPanel({
       ? initialValues?.collectionId ?? ""
       : "",
   );
-  const [parameterType, setParameterType] =
-    useState<WorkflowParameterValueType>(
-      initialValues?.parameterType === "workflow"
+  const [parameterType, setParameterType] = useState<ParameterTypeSelection>(
+    type === "credential"
+      ? "credential"
+      : initialValues?.parameterType === "workflow"
         ? initialValues.dataType
         : "string",
-    );
+  );
 
   const [defaultValueState, setDefaultValueState] = useState<{
     hasDefaultValue: boolean;
@@ -262,41 +313,45 @@ function WorkflowParameterEditPanel({
     isCloud,
   );
 
+  // Check if we're in unified add mode and credential is selected
+  const isCredentialSelected = parameterType === "credential";
+  const showCredentialFields =
+    type === "credential" ||
+    (type === "workflow" && !isEditMode && isCredentialSelected);
+
   // Determine what fields to show based on credential data type and source
   const showBitwardenPasswordFields =
-    type === "credential" &&
+    showCredentialFields &&
     credentialDataType === "password" &&
     credentialSource === "bitwarden";
   const showBitwardenSecretFields =
-    type === "credential" &&
+    showCredentialFields &&
     credentialDataType === "secret" &&
     credentialSource === "bitwarden";
   const showBitwardenCreditCardFields =
-    type === "credential" &&
+    showCredentialFields &&
     credentialDataType === "creditCard" &&
     credentialSource === "bitwarden";
   const showOnePasswordFields =
-    type === "credential" && credentialSource === "onepassword";
+    showCredentialFields && credentialSource === "onepassword";
   const showAzureVaultFields =
-    type === "credential" && credentialSource === "azurevault";
+    showCredentialFields && credentialSource === "azurevault";
   const showSkyvernCredentialSelector =
-    type === "credential" && credentialSource === "skyvern" && isCloud;
+    showCredentialFields && credentialSource === "skyvern" && isCloud;
 
   return (
     <ScrollArea>
       <ScrollAreaViewport className="max-h-[500px]">
         <div className="space-y-4 p-1 px-4">
           <header className="flex items-center justify-between">
-            <span>{header(type, isEditMode)}</span>
+            <span>{header(type, isEditMode, isCredentialSelected)}</span>
             <Cross2Icon className="h-6 w-6 cursor-pointer" onClick={onClose} />
           </header>
           <div className="space-y-1">
             <Label className="text-xs text-slate-300">Key</Label>
             <Input value={key} onChange={(e) => setKey(e.target.value)} />
-            {hasWhitespace && (
-              <p className="text-xs text-destructive">
-                Spaces are not allowed, consider using _
-              </p>
+            {keyValidationError && (
+              <p className="text-xs text-destructive">{keyValidationError}</p>
             )}
           </div>
           <div className="space-y-1">
@@ -313,15 +368,51 @@ function WorkflowParameterEditPanel({
                 <Select
                   value={parameterType}
                   onValueChange={(value) => {
-                    setParameterType(value as WorkflowParameterValueType);
-                    setDefaultValueState((state) => {
-                      return {
-                        ...state,
-                        defaultValue: getDefaultValueForParameterType(
-                          value as WorkflowParameterValueType,
-                        ),
-                      };
-                    });
+                    const newValue = value as ParameterTypeSelection;
+                    const wasCredential = parameterType === "credential";
+                    const isNowCredential = newValue === "credential";
+
+                    setParameterType(newValue);
+
+                    // Clear credential-specific state when switching away from credential
+                    // to prevent stale data if user switches back
+                    if (wasCredential && !isNowCredential) {
+                      setCredentialId("");
+                      setCredentialDataType("password");
+                      setCredentialSource(isCloud ? "skyvern" : "bitwarden");
+                      setBitwardenLoginCredentialItemId("");
+                      setBitwardenCollectionId("");
+                      setUrlParameterKey("");
+                      setIdentityKey("");
+                      setIdentityFields("");
+                      setSensitiveInformationItemId("");
+                      setOpVaultId("");
+                      setOpItemId("");
+                      setAzureVaultName("");
+                      setAzureUsernameKey("");
+                      setAzurePasswordKey("");
+                      setAzureTotpKey("");
+                    }
+
+                    // Clear default value state when switching to credential type
+                    // since credentials don't use default values
+                    if (!wasCredential && isNowCredential) {
+                      setDefaultValueState({
+                        hasDefaultValue: false,
+                        defaultValue: null,
+                      });
+                    }
+
+                    if (!isNowCredential) {
+                      setDefaultValueState((state) => {
+                        return {
+                          ...state,
+                          defaultValue: getDefaultValueForParameterType(
+                            newValue as WorkflowParameterValueType,
+                          ),
+                        };
+                      });
+                    }
                   }}
                 >
                   <SelectTrigger className="w-full">
@@ -329,72 +420,84 @@ function WorkflowParameterEditPanel({
                   </SelectTrigger>
                   <SelectContent>
                     <SelectGroup>
-                      {workflowParameterTypeOptions.map((option) => (
-                        <SelectItem key={option.value} value={option.value}>
-                          {option.label}
-                        </SelectItem>
-                      ))}
+                      {workflowParameterTypeOptions
+                        .filter((option) => {
+                          // In edit mode, don't show credential option
+                          if (isEditMode && option.value === "credential") {
+                            return false;
+                          }
+                          return true;
+                        })
+                        .map((option) => (
+                          <SelectItem key={option.value} value={option.value}>
+                            {option.label}
+                          </SelectItem>
+                        ))}
                     </SelectGroup>
                   </SelectContent>
                 </Select>
               </div>
-              <div className="space-y-4">
-                <div className="flex items-center gap-2">
-                  <Checkbox
-                    checked={defaultValueState.hasDefaultValue}
-                    onCheckedChange={(checked) => {
-                      if (!checked) {
+              {/* Default value section - only for non-credential types */}
+              {!isCredentialSelected && (
+                <div className="space-y-4">
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      checked={defaultValueState.hasDefaultValue}
+                      onCheckedChange={(checked) => {
+                        if (!checked) {
+                          setDefaultValueState({
+                            hasDefaultValue: false,
+                            defaultValue: null,
+                          });
+                          return;
+                        }
                         setDefaultValueState({
-                          hasDefaultValue: false,
-                          defaultValue: null,
+                          hasDefaultValue: true,
+                          defaultValue: getDefaultValueForParameterType(
+                            parameterType as WorkflowParameterValueType,
+                          ),
                         });
-                        return;
-                      }
-                      setDefaultValueState({
-                        hasDefaultValue: true,
-                        defaultValue:
-                          getDefaultValueForParameterType(parameterType),
-                      });
-                    }}
-                  />
-                  <Label className="text-xs text-slate-300">
-                    Use Default Value
-                  </Label>
-                </div>
-                {defaultValueState.hasDefaultValue && (
-                  <WorkflowParameterInput
-                    onChange={(value) => {
-                      if (
-                        parameterType === "file_url" &&
-                        typeof value === "object" &&
-                        value &&
-                        "s3uri" in value
-                      ) {
+                      }}
+                    />
+                    <Label className="text-xs text-slate-300">
+                      Use Default Value
+                    </Label>
+                  </div>
+                  {defaultValueState.hasDefaultValue && (
+                    <WorkflowParameterInput
+                      onChange={(value) => {
+                        if (
+                          parameterType === "file_url" &&
+                          typeof value === "object" &&
+                          value &&
+                          "s3uri" in value
+                        ) {
+                          setDefaultValueState((state) => {
+                            return {
+                              ...state,
+                              defaultValue: value.s3uri,
+                            };
+                          });
+                          return;
+                        }
                         setDefaultValueState((state) => {
                           return {
                             ...state,
-                            defaultValue: value.s3uri,
+                            defaultValue: value,
                           };
                         });
-                        return;
-                      }
-                      setDefaultValueState((state) => {
-                        return {
-                          ...state,
-                          defaultValue: value,
-                        };
-                      });
-                    }}
-                    type={parameterType}
-                    value={defaultValueState.defaultValue}
-                  />
-                )}
-              </div>
+                      }}
+                      type={parameterType as WorkflowParameterValueType}
+                      value={defaultValueState.defaultValue}
+                    />
+                  )}
+                </div>
+              )}
             </>
           )}
 
           {/* Credential Parameter - Unified Flow */}
-          {type === "credential" && (
+          {showCredentialFields && (
             <>
               {/* Step 1: Credential Type */}
               <div className="space-y-1">
@@ -700,12 +803,11 @@ function WorkflowParameterEditPanel({
                   });
                   return;
                 }
-                if (hasWhitespace) {
+                if (keyValidationError) {
                   toast({
                     variant: "destructive",
                     title: "Failed to save parameter",
-                    description:
-                      "Key cannot contain whitespace characters. Consider using underscores (_) instead.",
+                    description: keyValidationError,
                   });
                   return;
                 }
@@ -718,8 +820,8 @@ function WorkflowParameterEditPanel({
                   return;
                 }
 
-                // Handle workflow parameters
-                if (type === "workflow") {
+                // Handle workflow parameters (non-credential)
+                if (type === "workflow" && !isCredentialSelected) {
                   if (
                     parameterType === "json" &&
                     typeof defaultValueState.defaultValue === "string"
@@ -764,7 +866,7 @@ function WorkflowParameterEditPanel({
                   onSave({
                     key,
                     parameterType: "workflow",
-                    dataType: parameterType,
+                    dataType: parameterType as WorkflowParameterValueType,
                     description,
                     defaultValue: defaultValueState.hasDefaultValue
                       ? defaultValue
@@ -793,7 +895,7 @@ function WorkflowParameterEditPanel({
                 }
 
                 // Handle credential parameters based on type + source combination
-                if (type === "credential") {
+                if (type === "credential" || isCredentialSelected) {
                   // Skyvern managed credentials
                   if (credentialSource === "skyvern") {
                     if (!credentialId) {

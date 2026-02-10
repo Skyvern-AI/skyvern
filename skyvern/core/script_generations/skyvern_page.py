@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
@@ -10,7 +11,7 @@ from playwright.async_api import Locator, Page
 
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
-from skyvern.forge.sdk.api.files import download_file
+from skyvern.forge.sdk.api.files import download_file as download_file_from_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.library.ai_locator import AILocator
 from skyvern.webeye.actions import handler_utils
@@ -551,7 +552,7 @@ class SkyvernPage(Page):
             error_to_raise = None
             if selector and files:
                 try:
-                    file_path = await download_file(files)
+                    file_path = await download_file_from_url(files)
                     locator = self.page.locator(selector)
                     await locator.set_input_files(file_path, **kwargs)
                 except Exception as e:
@@ -586,7 +587,7 @@ class SkyvernPage(Page):
         if not files:
             raise ValueError("Parameter 'files' is required but was not provided")
 
-        file_path = await download_file(files)
+        file_path = await download_file_from_url(files)
         locator = self.page.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout, **kwargs)
         return files
@@ -731,6 +732,31 @@ class SkyvernPage(Page):
     @action_wrap(ActionType.COMPLETE)
     async def complete(self, prompt: str | None = None) -> None:
         """Stub for complete. Override in subclasses for specific behavior."""
+
+    @action_wrap(ActionType.DOWNLOAD_FILE)
+    async def download_file(
+        self,
+        file_name: str | None = None,
+        download_url: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Download a file from a URL and save it locally during cached script replay.
+
+        Args:
+            file_name: The original file name (for logging/reference). Defaults to UUID if empty.
+            download_url: The URL to download the file from.
+
+        Returns:
+            The local file path where the file was saved.
+        """
+        if not download_url:
+            raise ValueError("download_url is required for download_file action in cached scripts")
+
+        # Use uuid as fallback for empty file_name, matching handler.py behavior
+        file_name = file_name or str(uuid.uuid4())
+
+        file_path = await download_file_from_url(download_url, filename=file_name)
+        return file_path
 
     @action_wrap(ActionType.RELOAD_PAGE)
     async def reload_page(self, **kwargs: Any) -> None:

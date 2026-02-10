@@ -12,6 +12,7 @@ ThoughtScenario = typing.Union[
         "extract_loop_values",
         "generate_task_in_loop",
         "generate_general_task",
+        "termination",
     ],
     typing.Any,
 ]

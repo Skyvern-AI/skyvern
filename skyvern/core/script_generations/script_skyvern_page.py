@@ -546,10 +546,11 @@ class ScriptSkyvernPage(SkyvernPage):
         3. DOM stability (no significant mutations for 300ms)
         """
         try:
-            if not self._page:
+            # Note: SkyvernPage uses self.page, not self._page
+            if not self.page:
                 return
 
-            skyvern_frame = await SkyvernFrame.create_instance(frame=self._page)
+            skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
             await skyvern_frame.wait_for_page_ready(
                 network_idle_timeout_ms=settings.PAGE_READY_NETWORK_IDLE_TIMEOUT_MS,
                 loading_indicator_timeout_ms=settings.PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS,

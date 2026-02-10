@@ -14,6 +14,7 @@ class WorkflowDefinition(UniversalBaseModel):
     version: typing.Optional[int] = None
     parameters: typing.List[WorkflowDefinitionParametersItem]
     blocks: typing.List[WorkflowDefinitionBlocksItem]
+    finally_block_label: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

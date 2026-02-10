@@ -9,7 +9,10 @@ import pdfplumber
 import structlog
 from pypdf import PdfReader
 
+from skyvern.constants import MAX_FILE_PARSE_INPUT_TOKENS
 from skyvern.exceptions import PDFParsingError
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
+from skyvern.utils.token_counter import count_tokens
 
 LOG = structlog.get_logger(__name__)
 
@@ -17,6 +20,7 @@ LOG = structlog.get_logger(__name__)
 def extract_pdf_file(
     file_path: str,
     file_identifier: str | None = None,
+    max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS,
 ) -> str:
     """
     Extract text from a PDF file with fallback support.
@@ -47,11 +51,27 @@ def extract_pdf_file(
     try:
         reader = PdfReader(file_path)
         extracted_text = ""
+        current_tokens = 0
         page_count = len(reader.pages)
 
         for i in range(page_count):
             page_text = reader.pages[i].extract_text() or ""
+            if max_tokens:
+                page_tokens = count_tokens(page_text)
+                if current_tokens + page_tokens > max_tokens:
+                    LOG.warning(
+                        "PDF text exceeds token limit, truncating at page boundary",
+                        file_identifier=identifier,
+                        pages_included=i,
+                        total_pages=page_count,
+                        max_tokens=max_tokens,
+                    )
+                    break
+                current_tokens += page_tokens
             extracted_text += page_text + "\n"
+
+        # Sanitize text to remove characters that cannot be stored in PostgreSQL
+        extracted_text = sanitize_postgres_text(extracted_text)
 
         LOG.info(
             "Successfully parsed PDF with pypdf",
@@ -73,12 +93,28 @@ def extract_pdf_file(
         try:
             with pdfplumber.open(file_path) as pdf:
                 extracted_text = ""
+                current_tokens = 0
                 page_count = len(pdf.pages)
 
-                for page in pdf.pages:
+                for i, page in enumerate(pdf.pages):
                     page_text = page.extract_text()
                     if page_text:
+                        if max_tokens:
+                            page_tokens = count_tokens(page_text)
+                            if current_tokens + page_tokens > max_tokens:
+                                LOG.warning(
+                                    "PDF text exceeds token limit, truncating at page boundary",
+                                    file_identifier=identifier,
+                                    pages_included=i,
+                                    total_pages=page_count,
+                                    max_tokens=max_tokens,
+                                )
+                                break
+                            current_tokens += page_tokens
                         extracted_text += page_text + "\n"
+
+                # Sanitize text to remove characters that cannot be stored in PostgreSQL
+                extracted_text = sanitize_postgres_text(extracted_text)
 
                 LOG.info(
                     "Successfully parsed PDF with pdfplumber",

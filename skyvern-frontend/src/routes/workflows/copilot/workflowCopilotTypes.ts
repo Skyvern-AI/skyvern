@@ -1,4 +1,7 @@
-import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import {
+  WorkflowApiResponse,
+  WorkflowDefinition,
+} from "@/routes/workflows/types/workflowTypes";
 
 export type WorkflowCopilotChatSender = "user" | "ai";
 
@@ -38,6 +41,13 @@ export interface WorkflowCopilotChatHistoryMessage {
 export interface WorkflowCopilotChatHistoryResponse {
   workflow_copilot_chat_id: string | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
+  proposed_workflow?: WorkflowApiResponse | null;
+  auto_accept?: boolean | null;
+}
+
+export interface WorkflowCopilotClearProposedWorkflowRequest {
+  workflow_copilot_chat_id: string;
+  auto_accept: boolean;
 }
 
 export type WorkflowCopilotStreamMessageType =
@@ -62,4 +72,13 @@ export interface WorkflowCopilotStreamResponseUpdate {
 export interface WorkflowCopilotStreamErrorUpdate {
   type: "error";
   error: string;
+}
+
+export interface WorkflowYAMLConversionRequest {
+  workflow_definition_yaml: string;
+  workflow_id: string;
+}
+
+export interface WorkflowYAMLConversionResponse {
+  workflow_definition: WorkflowDefinition;
 }

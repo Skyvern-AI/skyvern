@@ -1098,6 +1098,8 @@ class WorkflowCopilotChatModel(Base):
     workflow_copilot_chat_id = Column(String, primary_key=True, default=generate_workflow_copilot_chat_id)
     organization_id = Column(String, nullable=False)
     workflow_permanent_id = Column(String, nullable=False, index=True)
+    proposed_workflow = Column(JSON, nullable=True)
+    auto_accept = Column(Boolean, nullable=True, default=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

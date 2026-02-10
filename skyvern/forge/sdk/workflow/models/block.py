@@ -74,7 +74,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, validate_pdf_file
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -476,7 +476,7 @@ class Block(BaseModel, abc.ABC):
                 organization_id=organization_id,
             )
 
-    @TraceManager.traced_async(ignore_inputs=["kwargs"])
+    @traced()
     async def execute_safe(
         self,
         workflow_run_id: str,
@@ -3063,6 +3063,8 @@ class FileParserBlock(Block):
             return FileType.PDF
         elif suffix == ".tsv":
             return FileType.CSV  # TSV files are handled by the CSV parser
+        elif suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"):
+            return FileType.IMAGE
         else:
             return FileType.CSV  # Default to CSV for .csv and any other extensions
 
@@ -3112,6 +3114,12 @@ class FileParserBlock(Block):
                 validate_pdf_file(file_path, file_identifier=file_url_used)
             except PDFParsingError as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
+        elif self.file_type == FileType.IMAGE:
+            kind = filetype.guess(file_path)
+            if kind is None or not kind.mime.startswith("image/"):
+                raise InvalidFileType(
+                    file_url=file_url_used, file_type=self.file_type, error="File is not a valid image"
+                )
 
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
         """Parse CSV/TSV file and return list of dictionaries."""
@@ -3184,6 +3192,27 @@ class FileParserBlock(Block):
         except PDFParsingError as e:
             raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
+    async def _parse_image_file(self, file_path: str) -> str:
+        """Parse image file using vision LLM for OCR."""
+        try:
+            with open(file_path, "rb") as f:
+                image_bytes = f.read()
+
+            llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                self.override_llm_key, default=app.LLM_API_HANDLER
+            )
+            llm_response = await llm_api_handler(
+                prompt=llm_prompt,
+                prompt_name="extract-text-from-image",
+                screenshots=[image_bytes],
+                force_dict=True,
+            )
+            return llm_response.get("extracted_text", "")
+        except Exception:
+            LOG.exception("Failed to extract text from image via OCR", file_url=self.file_url)
+            raise
+
     async def _extract_with_ai(
         self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext
     ) -> dict[str, Any]:
@@ -3210,9 +3239,8 @@ class FileParserBlock(Block):
             "extract-information-from-file-text", extracted_text_content=content_str, json_schema=schema_to_use
         )
 
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key, default=app.LLM_API_HANDLER
-        )
+        llm_key = self.override_llm_key
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
 
         llm_response = await llm_api_handler(
             prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
@@ -3261,9 +3289,9 @@ class FileParserBlock(Block):
         else:
             file_path = await download_file(self.file_url)
 
-        # Auto-detect file type based on file extension
-        detected_file_type = self._detect_file_type_from_url(self.file_url)
-        self.file_type = detected_file_type
+        # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF are explicit choices)
+        if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF):
+            self.file_type = self._detect_file_type_from_url(self.file_url)
 
         # Validate the file type
         self.validate_file_type(self.file_url, file_path)
@@ -3283,6 +3311,8 @@ class FileParserBlock(Block):
             parsed_data = await self._parse_excel_file(file_path)
         elif self.file_type == FileType.PDF:
             parsed_data = await self._parse_pdf_file(file_path)
+        elif self.file_type == FileType.IMAGE:
+            parsed_data = await self._parse_image_file(file_path)
         else:
             return await self.build_block_result(
                 success=False,
@@ -4679,27 +4709,50 @@ class BranchEvaluationContext:
 
     def build_llm_safe_context_snapshot(self) -> dict[str, Any]:
         """
-        Build a non-secret context blob for LLM-facing branch evaluation.
+        Build a minimal context blob for LLM-facing branch evaluation.
 
-        Secrets are stripped/masked; only params/outputs/environment and cached
-        block metadata are included so the LLM can ground purely natural language
-        expressions without requiring inline templating.
+        Only includes essential data the LLM needs to evaluate conditions:
+        - Parameter values (base_date, date_1, etc.)
+        - Extracted information from previous blocks
+        - Loop variables (current_value, current_index, current_item)
         """
         if self.workflow_run_context is None:
             return {}
 
         ctx = self.workflow_run_context
+        raw_values: dict[str, Any] = ctx.values.copy()
 
-        # Start from the recorded values (params, outputs, env, block outputs)
-        snapshot: dict[str, Any] = ctx.values.copy()
+        # Keys to skip - these are not useful for evaluating conditions
+        keys_to_skip = {
+            "blocks_metadata",
+            "params",
+            "outputs",
+            "environment",
+            "env",
+            "llm",
+            "workflow_title",
+            "workflow_id",
+            "workflow_permanent_id",
+            "workflow_run_id",
+        }
 
-        # Add block metadata (e.g., loop indices/current_item) without mutating originals
-        snapshot["blocks_metadata"] = ctx.blocks_metadata.copy()
+        snapshot: dict[str, Any] = {}
+        for key, value in raw_values.items():
+            # Skip noisy keys
+            if key in keys_to_skip:
+                continue
+
+            # For block outputs (dicts with extracted_information), only include extracted_information
+            if isinstance(value, dict) and "extracted_information" in value:
+                extracted = value.get("extracted_information")
+                if extracted is not None:
+                    snapshot[key] = extracted
+            else:
+                # Include parameter values directly
+                snapshot[key] = value
 
         # Copy loop variables (current_value, current_index, current_item) to top level
         # Required for pure NatLang expressions like "current_value['date']" to work
-        # Without this, current_value is buried in blocks_metadata.{block_label}.current_value
-        # and the LLM can't find it when evaluating natural language expressions
         if self.block_label:
             block_metadata = ctx.get_block_metadata(self.block_label)
             if "current_value" in block_metadata:
@@ -4708,19 +4761,6 @@ class BranchEvaluationContext:
                 snapshot["current_index"] = block_metadata["current_index"]
             if "current_item" in block_metadata:
                 snapshot["current_item"] = block_metadata["current_item"]
-
-        # Ensure the common namespaces exist
-        snapshot.setdefault("params", snapshot.get("params", {}))
-        snapshot.setdefault("outputs", snapshot.get("outputs", {}))
-        snapshot.setdefault("environment", snapshot.get("environment", {}))
-        snapshot.setdefault("env", snapshot.get("environment", {}))
-        snapshot.setdefault("llm", snapshot.get("llm", {}))
-
-        # Standard workflow identifiers for additional context
-        snapshot.setdefault("workflow_title", ctx.workflow_title)
-        snapshot.setdefault("workflow_id", ctx.workflow_id)
-        snapshot.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
-        snapshot.setdefault("workflow_run_id", ctx.workflow_run_id)
 
         # Mask any real secret values that may have leaked into values
         snapshot = ctx.mask_secrets_in_data(snapshot)
@@ -4917,6 +4957,135 @@ def _is_pure_jinja_expression(expression: str) -> bool:
     return True
 
 
+def _render_jinja_expression_for_display(
+    expression: str,
+    context_values: dict[str, Any],
+    block_label: str | None = None,
+) -> str:
+    """
+    Render a pure Jinja expression for UI display by substituting variable names with values.
+
+    This is for display purposes only - it shows users what values were compared
+    without actually evaluating the expression. For example:
+    - Input: "{{ base_date == date_1 }}" with context {"base_date": "01-25-2026", "date_1": "01-25-2026"}
+    - Output: '"01-25-2026" == "01-25-2026"'
+
+    Returns the original expression if it's not a pure Jinja expression or if rendering fails.
+    """
+    if not _is_pure_jinja_expression(expression):
+        return expression
+
+    try:
+        # Extract inner expression (strip {{ and }})
+        inner_expr = expression.strip()[2:-2].strip()
+        display_expr = inner_expr
+
+        # Substitute variable names with their values using word boundary regex
+        # This ensures we only match whole variable names, not substrings
+        # e.g., "date" won't match inside "validate_date" or "date_1"
+        for var_name in sorted(context_values.keys(), key=len, reverse=True):
+            pattern = r"\b" + re.escape(var_name) + r"\b"
+            var_value = context_values[var_name]
+            # Quote string values for clarity
+            replacement = f'"{var_value}"' if isinstance(var_value, str) else str(var_value)
+            display_expr = re.sub(pattern, replacement, display_expr)
+
+        return display_expr
+    except Exception as exc:
+        LOG.debug(
+            "Failed to render Jinja expression for display",
+            block_label=block_label,
+            expression=expression,
+            error=str(exc),
+        )
+        return expression
+
+
+def _find_evaluations_array(output_value: dict[str, Any]) -> list[Any]:
+    """
+    Extract the evaluations array from LLM output.
+
+    ExtractionBlock wraps output in 'extracted_information', so we check there first.
+    Falls back to direct access if not found in the nested structure.
+
+    Args:
+        output_value: The raw output from ExtractionBlock
+
+    Returns:
+        List of evaluation objects from the LLM
+
+    Raises:
+        ValueError: If evaluations array is not found or has wrong type
+    """
+    # Try standard ExtractionBlock format: output_value.extracted_information.evaluations
+    extracted_info = output_value.get("extracted_information")
+    if isinstance(extracted_info, dict):
+        raw_evaluations = extracted_info.get("evaluations")
+    else:
+        # Fallback: try direct access at output_value.evaluations
+        raw_evaluations = output_value.get("evaluations")
+
+    if not isinstance(raw_evaluations, list):
+        raise ValueError(f"Expected array of evaluations, got: {type(raw_evaluations)}")
+
+    return raw_evaluations
+
+
+def _parse_single_evaluation(
+    evaluation: Any,
+    idx: int,
+    fallback_rendered_expressions: list[str],
+) -> tuple[bool, str]:
+    """
+    Parse a single evaluation from the LLM response.
+
+    Handles two formats:
+    - New format (dict): {result: bool, rendered_condition: str, reasoning: str}
+    - Legacy format: just a boolean value
+
+    Args:
+        evaluation: Single evaluation object from LLM (dict or bool)
+        idx: Index of this evaluation (for fallback lookup)
+        fallback_rendered_expressions: Pre-rendered expressions to use if LLM didn't provide one
+
+    Returns:
+        Tuple of (boolean_result, rendered_condition_string)
+    """
+    # Determine fallback rendered expression
+    fallback_rendered = fallback_rendered_expressions[idx] if idx < len(fallback_rendered_expressions) else ""
+
+    if isinstance(evaluation, dict):
+        # New format: {result, rendered_condition, reasoning}
+        result = evaluation.get("result")
+        if isinstance(result, bool):
+            bool_result = result
+        else:
+            bool_result = _evaluate_truthy_string(str(result))
+            LOG.warning(
+                "Prompt branch evaluation returned non-boolean result",
+                branch_index=idx,
+                result=result,
+                evaluated_result=bool_result,
+            )
+
+        # Get rendered_condition, fallback to pre-rendered expression
+        rendered_cond = evaluation.get("rendered_condition")
+        if rendered_cond and isinstance(rendered_cond, str):
+            rendered_expression = rendered_cond
+        else:
+            rendered_expression = fallback_rendered
+
+        return (bool_result, rendered_expression)
+    else:
+        # Legacy format: just a boolean
+        if isinstance(evaluation, bool):
+            bool_result = evaluation
+        else:
+            bool_result = _evaluate_truthy_string(str(evaluation))
+
+        return (bool_result, fallback_rendered)
+
+
 class BranchCondition(BaseModel):
     """Represents a single conditional branch edge within a ConditionalBlock."""
 
@@ -4993,7 +5162,7 @@ class ConditionalBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-    ) -> list[bool]:
+    ) -> tuple[list[bool], list[str], str | None, dict | None]:
         """
         Evaluate natural language branch conditions using a single ExtractionBlock.
 
@@ -5004,12 +5173,19 @@ class ConditionalBlock(Block):
         - Browser/page access for expressions like "comment count > 100"
         - UI visibility (shows up in workflow timeline with prompt/response)
         - Proper LLM integration with data_schema
+
+        Returns:
+            A tuple of (results, rendered_expressions, extraction_goal, llm_response):
+            - results: List of boolean results for each branch
+            - rendered_expressions: List of expressions after Jinja pre-rendering
+            - extraction_goal: The prompt sent to the LLM (for UI display)
+            - llm_response: The raw LLM response for debugging
         """
         if organization_id is None:
             raise ValueError("organization_id is required to evaluate natural language branches")
 
         if not branches:
-            return []
+            return ([], [], None, None)
 
         workflow_run_context = evaluation_context.workflow_run_context
 
@@ -5068,22 +5244,39 @@ class ConditionalBlock(Block):
             context_json=context_json,
         )
 
-        # Step 3: Build schema for array of boolean results
+        # Step 3: Build schema for array of evaluation results
+        # Order matters: rendered_condition -> reasoning -> result (chain-of-thought)
         data_schema = {
             "type": "object",
             "properties": {
-                "results": {
+                "evaluations": {
                     "type": "array",
-                    "items": {"type": "boolean"},
-                    "description": (
-                        "Array of boolean results for each condition in the same order. "
-                        "TRUE if the condition is satisfied, FALSE otherwise."
-                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "rendered_condition": {
+                                "type": "string",
+                                "description": (
+                                    "The condition with all variable names and references replaced with actual values."
+                                ),
+                            },
+                            "reasoning": {
+                                "type": "string",
+                                "description": "Explanation of the reasoning behind evaluating the rendered condition.",
+                            },
+                            "result": {
+                                "type": "boolean",
+                                "description": "TRUE if the rendered condition is satisfied, FALSE otherwise.",
+                            },
+                        },
+                        "required": ["rendered_condition", "reasoning", "result"],
+                    },
+                    "description": "Array of evaluation results for each condition in the same order.",
                     "minItems": len(branches),
                     "maxItems": len(branches),
                 }
             },
-            "required": ["results"],
+            "required": ["evaluations"],
         }
 
         # Step 4: Create and execute single ExtractionBlock
@@ -5145,41 +5338,32 @@ class ConditionalBlock(Block):
                         exc_info=True,
                     )
 
-            # Step 5: Extract the boolean results array
+            # Step 5: Extract the evaluation results (result + rendered_condition)
             output_value = extraction_result.output_parameter_value
             results_array: list[bool] = []
+            llm_rendered_expressions: list[str] = []
 
-            if isinstance(output_value, dict):
-                # Check if results is in extracted_information (standard ExtractionBlock output)
-                extracted_info = output_value.get("extracted_information")
-                if isinstance(extracted_info, dict):
-                    raw_results = extracted_info.get("results")
-                else:
-                    # Fallback: try direct access
-                    raw_results = output_value.get("results")
-
-                if isinstance(raw_results, list):
-                    for idx, result in enumerate(raw_results):
-                        if isinstance(result, bool):
-                            results_array.append(result)
-                        else:
-                            evaluated_result = _evaluate_truthy_string(str(result))
-                            LOG.warning(
-                                "Prompt branch evaluation returned non-boolean result",
-                                branch_index=idx,
-                                result=result,
-                                evaluated_result=evaluated_result,
-                            )
-                            results_array.append(evaluated_result)
-                else:
-                    raise ValueError(f"Expected array of results, got: {type(raw_results)}")
-            else:
+            if not isinstance(output_value, dict):
                 raise ValueError(f"Unexpected output format: {type(output_value)}")
+
+            # Find evaluations array from LLM output (handles ExtractionBlock nesting)
+            raw_evaluations = _find_evaluations_array(output_value)
+
+            # Parse each evaluation to extract result and rendered_condition
+            for idx, evaluation in enumerate(raw_evaluations):
+                bool_result, rendered_expr = _parse_single_evaluation(
+                    evaluation=evaluation,
+                    idx=idx,
+                    fallback_rendered_expressions=rendered_expressions,
+                )
+                results_array.append(bool_result)
+                llm_rendered_expressions.append(rendered_expr)
 
             LOG.info(
                 "Conditional branch evaluation results",
                 block_label=self.label,
                 results=results_array,
+                llm_rendered_expressions=llm_rendered_expressions,
                 raw_output=output_value,
             )
 
@@ -5188,7 +5372,7 @@ class ConditionalBlock(Block):
                     f"Prompt branch evaluation returned {len(results_array)} results for {len(branches)} branches"
                 )
 
-            return results_array
+            return (results_array, llm_rendered_expressions, extraction_goal, output_value)
 
         except Exception as exc:
             LOG.error(
@@ -5229,13 +5413,24 @@ class ConditionalBlock(Block):
         matched_branch = None
         failure_reason: str | None = None
 
+        # Track all branch evaluations for UI display
+        branch_evaluations_list: list[dict] = []
+        prompt_rendered_by_id: dict[str, str] = {}
+
         natural_language_branches = [
             branch for branch in self.ordered_branches if isinstance(branch.criteria, PromptBranchCriteria)
         ]
         prompt_results_by_id: dict[str, bool] = {}
+        prompt_llm_response: dict | None = None
+        prompt_extraction_goal: str | None = None
         if natural_language_branches:
             try:
-                prompt_results = await self._evaluate_prompt_branches(
+                (
+                    prompt_results,
+                    prompt_rendered_expressions,
+                    prompt_extraction_goal,
+                    prompt_llm_response,
+                ) = await self._evaluate_prompt_branches(
                     branches=natural_language_branches,
                     evaluation_context=evaluation_context,
                     workflow_run_id=workflow_run_id,
@@ -5245,6 +5440,10 @@ class ConditionalBlock(Block):
                 )
                 prompt_results_by_id = {
                     branch.id: result for branch, result in zip(natural_language_branches, prompt_results, strict=False)
+                }
+                prompt_rendered_by_id = {
+                    branch.id: rendered
+                    for branch, rendered in zip(natural_language_branches, prompt_rendered_expressions, strict=False)
                 }
             except Exception as exc:
                 failure_reason = f"Failed to evaluate natural language branches: {str(exc)}"
@@ -5256,24 +5455,49 @@ class ConditionalBlock(Block):
                 )
 
         for idx, branch in enumerate(self.ordered_branches):
+            branch_eval: dict = {
+                "branch_id": branch.id,
+                "branch_index": idx,
+                "criteria_type": branch.criteria.criteria_type if branch.criteria else None,
+                "original_expression": branch.criteria.expression if branch.criteria else None,
+                "rendered_expression": None,
+                "result": None,
+                "is_matched": False,
+                "is_default": branch.is_default,
+                "next_block_label": branch.next_block_label,
+                "error": None,
+            }
+
+            # Handle default branch (no criteria to evaluate)
             if branch.criteria is None:
+                # Default branch - only matched if no other branch matches
+                branch_evaluations_list.append(branch_eval)
                 continue
 
             if branch.criteria.criteria_type == "prompt":
                 if failure_reason:
+                    branch_eval["error"] = failure_reason
+                    branch_evaluations_list.append(branch_eval)
                     break
                 prompt_result = prompt_results_by_id.get(branch.id)
+                rendered_expr = prompt_rendered_by_id.get(branch.id)
+                branch_eval["rendered_expression"] = rendered_expr
                 if prompt_result is None:
                     failure_reason = "Missing result for natural language branch evaluation"
+                    branch_eval["error"] = failure_reason
                     LOG.error(
                         "Missing prompt evaluation result",
                         block_label=self.label,
                         branch_index=idx,
                         branch_id=branch.id,
                     )
+                    branch_evaluations_list.append(branch_eval)
                     break
+                branch_eval["result"] = prompt_result
+                branch_evaluations_list.append(branch_eval)
                 if prompt_result:
                     matched_branch = branch
+                    branch_eval["is_matched"] = True
                     LOG.info(
                         "Conditional natural language branch matched",
                         block_label=self.label,
@@ -5283,9 +5507,25 @@ class ConditionalBlock(Block):
                     break
                 continue
 
+            # Jinja template branch
             try:
-                if await branch.criteria.evaluate(evaluation_context):
+                # Render the expression for UI display - substitute variables without evaluating
+                rendered_expression = _render_jinja_expression_for_display(
+                    expression=branch.criteria.expression,
+                    context_values=evaluation_context.workflow_run_context.values
+                    if evaluation_context.workflow_run_context
+                    else {},
+                    block_label=self.label,
+                )
+                branch_eval["rendered_expression"] = rendered_expression
+
+                result = await branch.criteria.evaluate(evaluation_context)
+                branch_eval["result"] = result
+                branch_evaluations_list.append(branch_eval)
+
+                if result:
                     matched_branch = branch
+                    branch_eval["is_matched"] = True
                     LOG.info(
                         "Conditional branch matched",
                         block_label=self.label,
@@ -5295,6 +5535,9 @@ class ConditionalBlock(Block):
                     break
             except Exception as exc:
                 failure_reason = f"Failed to evaluate branch {idx} for {self.label}: {str(exc)}"
+                branch_eval["error"] = str(exc)
+                branch_eval["result"] = None
+                branch_evaluations_list.append(branch_eval)
                 LOG.error(
                     "Failed to evaluate conditional branch",
                     block_label=self.label,
@@ -5306,6 +5549,12 @@ class ConditionalBlock(Block):
 
         if matched_branch is None and failure_reason is None:
             matched_branch = self.get_default_branch()
+            # Update is_matched for default branch in evaluations
+            if matched_branch:
+                for eval_entry in branch_evaluations_list:
+                    if eval_entry["branch_id"] == matched_branch.id:
+                        eval_entry["is_matched"] = True
+                        break
 
         matched_index = self.ordered_branches.index(matched_branch) if matched_branch in self.ordered_branches else None
         next_block_label = matched_branch.next_block_label if matched_branch else None
@@ -5339,6 +5588,20 @@ class ConditionalBlock(Block):
             if matched_branch and matched_branch.criteria
             else None,
             "next_block_label": next_block_label,
+            # Detailed evaluation info for all branches
+            "evaluations": branch_evaluations_list if branch_evaluations_list else None,
+            # Raw LLM response for debugging prompt-based evaluations (masked for secrets)
+            "llm_response": (
+                workflow_run_context.mask_secrets_in_data(prompt_llm_response)
+                if workflow_run_context and prompt_llm_response
+                else prompt_llm_response
+            ),
+            # The exact prompt sent to LLM for debugging (masked for secrets)
+            "llm_prompt": (
+                workflow_run_context.mask_secrets_in_data(prompt_extraction_goal)
+                if workflow_run_context and prompt_extraction_goal
+                else prompt_extraction_goal
+            ),
         }
 
         status = BlockStatus.completed

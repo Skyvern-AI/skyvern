@@ -16,18 +16,18 @@
 
 /* Smooth transitions for node position and size changes */
 .react-flow__node {
-  transition: transform 0.3s ease-in-out;
+  transition: transform 0.2s ease-out;
 }
 
 /* Smooth transitions for edge position updates */
 .react-flow__edge path,
 .react-flow__edge-path {
-  transition: d 0.3s ease-in-out;
+  transition: d 0.2s ease-out;
 }
 
 .react-flow__edge text,
 .react-flow__edge-text {
-  transition: transform 0.3s ease-in-out;
+  transition: transform 0.2s ease-out;
 }
 
 .react-flow__handle-top {

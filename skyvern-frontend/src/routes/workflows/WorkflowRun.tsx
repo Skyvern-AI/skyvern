@@ -392,7 +392,7 @@ function WorkflowRun() {
               hideTrigger
             />
             <Button asChild variant="secondary">
-              <Link to={`/workflows/${workflowPermanentId}/debug`}>
+              <Link to={`/workflows/${workflowPermanentId}/build`}>
                 <Pencil2Icon className="mr-2 h-4 w-4" />
                 Edit
               </Link>

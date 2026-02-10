@@ -30,15 +30,16 @@ export interface TaskRunRequest {
      * - RESIDENTIAL_FR: France
      * - RESIDENTIAL_DE: Germany
      * - RESIDENTIAL_NZ: New Zealand
+     * - RESIDENTIAL_PH: Philippines
      * - RESIDENTIAL_ZA: South Africa
      * - RESIDENTIAL_AR: Argentina
      * - RESIDENTIAL_AU: Australia
      * - RESIDENTIAL_ISP: ISP proxy
-     * - US-CA: California
-     * - US-NY: New York
-     * - US-TX: Texas
-     * - US-FL: Florida
-     * - US-WA: Washington
+     * - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
      * - NONE: No proxy
      *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
      */
@@ -85,6 +86,8 @@ export interface TaskRunRequest {
     max_screenshot_scrolls?: number;
     /** The CDP address for the task. */
     browser_address?: string;
+    /** Whether to run the task with agent or code. */
+    run_with?: string;
 }
 
 export namespace TaskRunRequest {
@@ -102,15 +105,16 @@ export namespace TaskRunRequest {
      * - RESIDENTIAL_FR: France
      * - RESIDENTIAL_DE: Germany
      * - RESIDENTIAL_NZ: New Zealand
+     * - RESIDENTIAL_PH: Philippines
      * - RESIDENTIAL_ZA: South Africa
      * - RESIDENTIAL_AR: Argentina
      * - RESIDENTIAL_AU: Australia
      * - RESIDENTIAL_ISP: ISP proxy
-     * - US-CA: California
-     * - US-NY: New York
-     * - US-TX: Texas
-     * - US-FL: Florida
-     * - US-WA: Washington
+     * - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
      * - NONE: No proxy
      *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
      */

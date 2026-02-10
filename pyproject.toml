@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.10"
+version = "1.0.13"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -12,7 +12,7 @@ dependencies = [
     "openai>=1.68.2",
     "sqlalchemy[mypy]>=2.0.29,<3",
     "aiohttp>=3.8.5,<4",
-    "python-multipart>=0.0.18,<0.0.19",
+    "python-multipart>=0.0.18,<0.0.23",
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.2,<4",
     "uvicorn[standard]>=0.24.0.post1,<0.25",
@@ -50,7 +50,7 @@ dependencies = [
     "pyotp>=2.9.0,<3",
     "asyncpg>=0.30.0,<0.31",
     "json-repair>=0.34.0,<0.35",
-    "pypdf>=5.1.0,<6",
+    "pypdf>=5.1.0,<7",
     "pdfplumber>=0.11.0,<0.12",
     "fastmcp>=2.10.1,<3",
     "psutil>=7.0.0",
@@ -70,18 +70,32 @@ dependencies = [
     "urllib3>=2.6.0",
     "zstandard>=0.25.0",
     "sse-starlette>=3.0.3,<4",
+    "opentelemetry-api>=1.39.0,<2",
 ]
 
 [dependency-groups]
 cloud = [
-    "ddtrace>=2.3.2,<3",
     "stripe>=9.7.0,<10",
     "temporalio[opentelemetry]>=1.6.0,<2",
     "temporalio>=1.6.0,<2",
     "redis>=5.0.3,<6",
     "pyrate-limiter>=3.7.0,<4",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.38.0,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.39.1,<2",
     "kr8s>=0.20.14,<1",
+    # OpenTelemetry instrumentation
+    "opentelemetry-sdk>=1.39.0,<2",
+    "opentelemetry-instrumentation-fastapi>=0.60b1,<1",
+    "opentelemetry-instrumentation-asyncpg>=0.60b1,<1",
+    "opentelemetry-instrumentation-sqlalchemy>=0.60b1,<1",
+    "opentelemetry-instrumentation-redis>=0.60b1,<1",
+    "opentelemetry-instrumentation-httpx>=0.60b1,<1",
+    "opentelemetry-instrumentation-aiohttp-client>=0.60b1,<1",
+    "opentelemetry-instrumentation-logging>=0.60b1,<1",
+    "opentelemetry-instrumentation-asyncio>=0.60b1,<1",
+    "opentelemetry-instrumentation-botocore>=0.60b1,<1",
+    "opentelemetry-instrumentation-grpc>=0.60b1,<1",
+    "opentelemetry-instrumentation-requests>=0.60b1,<1",
+    "opentelemetry-instrumentation-urllib3>=0.60b1,<1",
 ]
 dev = [
     "isort>=5.13.2",

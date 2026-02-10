@@ -117,14 +117,29 @@ class TaskV2(BaseModel):
 
 
 class ThoughtType(StrEnum):
+    """
+    Type of thought recorded during task execution.
+
+    Note: Stored as VARCHAR in the database (not a PostgreSQL ENUM), so new values
+    can be added without database migrations. See observer_thoughts.observer_thought_type column.
+    """
+
     plan = "plan"
     metadata = "metadata"
     user_goal_check = "user_goal_check"
     internal_plan = "internal_plan"
     failure_describe = "failure_describe"
+    termination = "termination"
 
 
 class ThoughtScenario(StrEnum):
+    """
+    Scenario in which a thought was generated.
+
+    Note: Stored as VARCHAR in the database (not a PostgreSQL ENUM), so new values
+    can be added without database migrations. See observer_thoughts.observer_thought_scenario column.
+    """
+
     generate_plan = "generate_plan"
     user_goal_check = "user_goal_check"
     failure_describe = "failure_describe"
@@ -133,6 +148,7 @@ class ThoughtScenario(StrEnum):
     extract_loop_values = "extract_loop_values"
     generate_task_in_loop = "generate_task_in_loop"
     generate_task = "generate_general_task"
+    termination = "termination"
 
 
 class Thought(BaseModel):

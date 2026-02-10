@@ -36,6 +36,7 @@ class GetRunResponse_TaskV1(UniversalBaseModel):
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
+    step_count: typing.Optional[int] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -68,6 +69,7 @@ class GetRunResponse_TaskV2(UniversalBaseModel):
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
+    step_count: typing.Optional[int] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -100,6 +102,7 @@ class GetRunResponse_OpenaiCua(UniversalBaseModel):
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
+    step_count: typing.Optional[int] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -132,6 +135,7 @@ class GetRunResponse_AnthropicCua(UniversalBaseModel):
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
+    step_count: typing.Optional[int] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -164,6 +168,7 @@ class GetRunResponse_UiTars(UniversalBaseModel):
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
+    step_count: typing.Optional[int] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -196,6 +201,7 @@ class GetRunResponse_WorkflowRun(UniversalBaseModel):
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
+    step_count: typing.Optional[int] = None
     run_with: typing.Optional[str] = None
     ai_fallback: typing.Optional[bool] = None
     run_request: typing.Optional[WorkflowRunRequest] = None

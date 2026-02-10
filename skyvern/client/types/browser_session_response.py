@@ -5,7 +5,9 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .extensions import Extensions
 from .file_info import FileInfo
+from .persistent_browser_type import PersistentBrowserType
 
 
 class BrowserSessionResponse(UniversalBaseModel):
@@ -21,6 +23,11 @@ class BrowserSessionResponse(UniversalBaseModel):
     organization_id: str = pydantic.Field()
     """
     ID of the organization that owns this session
+    """
+
+    status: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Current status of the browser session
     """
 
     runnable_type: typing.Optional[str] = pydantic.Field(default=None)
@@ -46,6 +53,16 @@ class BrowserSessionResponse(UniversalBaseModel):
     app_url: typing.Optional[str] = pydantic.Field(default=None)
     """
     Url for the browser session page
+    """
+
+    extensions: typing.Optional[typing.List[Extensions]] = pydantic.Field(default=None)
+    """
+    A list of extensions installed in the browser session.
+    """
+
+    browser_type: typing.Optional[PersistentBrowserType] = pydantic.Field(default=None)
+    """
+    The type of browser used for the session.
     """
 
     vnc_streaming_supported: typing.Optional[bool] = pydantic.Field(default=None)
