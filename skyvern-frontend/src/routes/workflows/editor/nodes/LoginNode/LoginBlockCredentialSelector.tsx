@@ -251,7 +251,9 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
               <div className="flex items-center gap-2">
                 <span>{option.label}</span>
                 {"hasBrowserProfile" in option && option.hasBrowserProfile && (
-                  <CheckCircledIcon className="size-3 text-green-400" title="Browser profile saved" />
+                  <span title="Browser profile saved">
+                    <CheckCircledIcon className="size-3 text-green-400" />
+                  </span>
                 )}
               </div>
             </SelectItem>

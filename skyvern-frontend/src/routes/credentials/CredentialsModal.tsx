@@ -119,9 +119,7 @@ function CredentialsModal({
   const [testStatus, setTestStatus] = useState<
     "idle" | "testing" | "completed" | "failed"
   >("idle");
-  const [testWorkflowRunId, setTestWorkflowRunId] = useState<string | null>(
-    null,
-  );
+  const [, setTestWorkflowRunId] = useState<string | null>(null);
   const [testFailureReason, setTestFailureReason] = useState<string | null>(
     null,
   );
