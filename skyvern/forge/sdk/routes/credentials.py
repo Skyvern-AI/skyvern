@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import structlog
@@ -939,11 +940,27 @@ async def get_test_credential_status(
         )
         if workflow and getattr(workflow, "persist_browser_session", False):
             try:
-                # Retrieve the persisted browser session (stored by workflow_permanent_id)
-                session_dir = await app.STORAGE.retrieve_browser_session(
-                    organization_id=organization_id,
-                    workflow_permanent_id=workflow.workflow_permanent_id,
-                )
+                # The workflow status is set to "completed" before browser session
+                # persistence finishes (cleanup runs after status update). Retry a
+                # few times with a short delay to wait for the session data.
+                session_dir = None
+                max_retries = 5
+                for attempt in range(max_retries):
+                    session_dir = await app.STORAGE.retrieve_browser_session(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                    )
+                    if session_dir:
+                        break
+                    if attempt < max_retries - 1:
+                        LOG.info(
+                            "Browser session not yet persisted, retrying",
+                            credential_id=credential_id,
+                            workflow_run_id=workflow_run_id,
+                            attempt=attempt + 1,
+                            max_retries=max_retries,
+                        )
+                        await asyncio.sleep(2)
 
                 if session_dir:
                     # Create the browser profile in DB
@@ -976,10 +993,11 @@ async def get_test_credential_status(
                     )
                 else:
                     LOG.warning(
-                        "No persisted session found for credential test workflow",
+                        "No persisted session found after retries for credential test workflow",
                         credential_id=credential_id,
                         workflow_run_id=workflow_run_id,
                         workflow_permanent_id=workflow.workflow_permanent_id,
+                        max_retries=max_retries,
                     )
             except Exception:
                 LOG.exception(
