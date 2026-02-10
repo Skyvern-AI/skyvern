@@ -30,7 +30,7 @@ import { useRunsQuery } from "@/hooks/useRunsQuery";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -61,9 +61,43 @@ function RunHistory() {
   const itemsPerPage = searchParams.get("page_size")
     ? Number(searchParams.get("page_size"))
     : 10;
-  const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
+
+  // Initialize status filters from URL params
+  const getStatusFiltersFromUrl = (params: URLSearchParams): Array<Status> => {
+    const statusParams = params.getAll("status");
+    const validStatuses = Object.values(Status);
+    return statusParams.filter((status): status is Status =>
+      validStatuses.includes(status as Status),
+    );
+  };
+
+  const [statusFilters, setStatusFilters] = useState<Array<Status>>(() =>
+    getStatusFiltersFromUrl(searchParams),
+  );
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
+  const isUserUpdatingFilters = useRef(false);
+
+  // Sync status filters from URL when URL changes (e.g., browser back/forward)
+  // Skip sync if the update was initiated by user action
+  useEffect(() => {
+    if (isUserUpdatingFilters.current) {
+      isUserUpdatingFilters.current = false;
+      return;
+    }
+
+    const urlStatusFilters = getStatusFiltersFromUrl(searchParams);
+    // Only update if different to avoid unnecessary re-renders
+    const isDifferent =
+      urlStatusFilters.length !== statusFilters.length ||
+      !urlStatusFilters.every((status) => statusFilters.includes(status)) ||
+      !statusFilters.every((status) => urlStatusFilters.includes(status));
+
+    if (isDifferent) {
+      setStatusFilters(urlStatusFilters);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   const { data: runs, isFetching } = useRunsQuery({
     page,
@@ -164,7 +198,30 @@ function RunHistory() {
         />
         <StatusFilterDropdown
           values={statusFilters}
-          onChange={setStatusFilters}
+          onChange={(newStatusFilters) => {
+            // Mark that this is a user-initiated update
+            isUserUpdatingFilters.current = true;
+
+            // Update state immediately for UI responsiveness
+            setStatusFilters(newStatusFilters);
+
+            // Update URL - create new params from current search params
+            const params = new URLSearchParams();
+            // Copy all existing params except status
+            searchParams.forEach((value, key) => {
+              if (key !== "status") {
+                params.append(key, value);
+              }
+            });
+            // Add new status params
+            newStatusFilters.forEach((status) => {
+              params.append("status", status);
+            });
+            // Reset to page 1 when filters change
+            params.set("page", "1");
+
+            setSearchParams(params, { replace: true });
+          }}
         />
       </div>
       <div className="rounded-lg border">
