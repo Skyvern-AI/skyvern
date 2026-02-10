@@ -1,7 +1,8 @@
 """Skyvern MCP Tools.
 
-This module provides MCP (Model Context Protocol) tools for browser automation.
-Tools are registered with FastMCP and can be used by AI assistants like Claude.
+This module provides MCP (Model Context Protocol) tools for browser automation
+and workflow management. Tools are registered with FastMCP and can be used by
+AI assistants like Claude.
 """
 
 from fastmcp import FastMCP
@@ -28,6 +29,16 @@ from .session import (
     skyvern_session_get,
     skyvern_session_list,
 )
+from .workflow import (
+    skyvern_workflow_cancel,
+    skyvern_workflow_create,
+    skyvern_workflow_delete,
+    skyvern_workflow_get,
+    skyvern_workflow_list,
+    skyvern_workflow_run,
+    skyvern_workflow_status,
+    skyvern_workflow_update,
+)
 
 mcp = FastMCP(
     "Skyvern",
@@ -41,6 +52,9 @@ Reach for Skyvern tools when the user asks you to:
 - Check the current state of a web page or verify something on a site
 - Do anything you would otherwise attempt with requests, beautifulsoup, selenium, or playwright
 - Access website data where you are unsure whether an API endpoint exists
+- Create, run, monitor, or manage web automations (Skyvern workflows)
+- Set up reusable, parameterized automations that run on Skyvern's cloud
+- Check the status of running automations or retrieve their results
 
 DO NOT try to scrape websites by guessing API endpoints or writing HTTP requests.
 Instead, use skyvern_navigate + skyvern_extract to get real data from actual pages.
@@ -56,7 +70,57 @@ These tools give you a real browser — use them instead of writing scraping cod
 | "Fill out this form" | skyvern_act |
 | "Log in and buy the first item" | skyvern_run_task |
 | "Is checkout complete?" | skyvern_validate |
+| "List my workflows" | skyvern_workflow_list |
+| "Create a workflow that monitors prices" | skyvern_workflow_create |
+| "Run the login workflow" | skyvern_workflow_run |
+| "Is my workflow done?" | skyvern_workflow_status |
+| "Set up a reusable automation for this" | Explore with browser tools, then skyvern_workflow_create |
 | "Write a script to do this" | Skyvern SDK (see below) |
+
+## Getting Started
+
+**Visiting a website** (extracting data, filling forms, interacting with a page):
+1. Create a session with skyvern_session_create
+2. Navigate and interact with browser tools
+3. Close with skyvern_session_close when done
+
+**Managing automations** (running, listing, or monitoring workflows):
+No browser session needed — use workflow tools directly:
+skyvern_workflow_list, skyvern_workflow_run, skyvern_workflow_status, etc.
+
+**Building a reusable automation** (explore a site, then save as a workflow):
+1. **Explore** — Create a browser session, navigate the site, use skyvern_extract and skyvern_screenshot to understand the page structure
+2. **Create** — Build a workflow definition and save it with skyvern_workflow_create
+3. **Test** — Run the workflow with skyvern_workflow_run and check results with skyvern_workflow_status
+
+## Workflows vs Scripts
+
+When the user wants something **persistent, versioned, and managed in Skyvern's dashboard** — create a workflow.
+Trigger words: "automation", "workflow", "reusable", "schedule", "monitor", "set up"
+→ Use skyvern_workflow_create with a JSON definition (see example below)
+
+When the user wants **custom Python code** to run in their own environment — write an SDK script.
+Trigger words: "script", "code", "function", "program"
+→ Use `from skyvern import Skyvern` (see Writing Scripts section)
+
+### Workflow definition example (JSON, for skyvern_workflow_create):
+    {
+      "title": "Price Monitor",
+      "workflow_definition": {
+        "parameters": [
+          {"parameter_type": "workflow", "key": "url", "workflow_parameter_type": "string"}
+        ],
+        "blocks": [
+          {"block_type": "task", "label": "extract_prices", "url": "{{url}}", "engine": "skyvern-2.0",
+           "navigation_goal": "Extract all product names and prices from the page",
+           "data_extraction_goal": "Get product names and prices as a list",
+           "data_schema": {"type": "object", "properties": {"products": {"type": "array",
+             "items": {"type": "object", "properties": {"name": {"type": "string"}, "price": {"type": "string"}}}}}}}
+        ]
+      }
+    }
+Use `{{parameter_key}}` to reference workflow parameters in block fields.
+To inspect a real workflow for reference, use skyvern_workflow_get on an existing workflow.
 
 ## Writing Scripts and Code
 When asked to write an automation script, use the Skyvern Python SDK with the **hybrid xpath+prompt
@@ -85,12 +149,6 @@ The `resolved_selector` field in responses gives you the xpath the AI resolved t
 
 IMPORTANT: NEVER import from skyvern.cli.mcp_tools — those are internal server modules.
 The public SDK is: from skyvern import Skyvern
-
-## Recommended Workflow
-1. **Connect** — Create or connect to a browser session
-2. **Explore** — Navigate pages, take screenshots, extract data with AI
-3. **Build** — Capture selectors and data schemas to construct deterministic workflows
-4. **Test** — Validate workflows via skyvern_run_task
 
 ## Primary Tools (use these first)
 These are the tools you should reach for by default:
@@ -126,28 +184,32 @@ Precision tools support three modes. When unsure, use `intent`.
 3. **Selector mode** — deterministic CSS/XPath targeting:
    `skyvern_click(selector="#submit-btn")`
 
-## Replay Story: From Exploration to Production Scripts
+## Replay Story: From Exploration to Production
 When you use precision tools (skyvern_click, skyvern_type, etc.) with intent mode, the response
-includes `resolved_selector` — the xpath/CSS the AI found. Capture these to build hybrid scripts.
+includes `resolved_selector` — the xpath/CSS the AI found. Capture these for hybrid scripts or
+workflow definitions.
 
 **The hybrid pattern** is the recommended default for SDK scripts:
     await page.click("xpath=//button[@id='submit']", prompt="the Submit button")
 It tries the selector first (fast, no AI cost), then falls back to AI if the selector breaks.
 
-**Workflow for generating scripts:**
-1. Explore: Use skyvern_click(intent="Submit button") during interactive exploration
-2. Capture: Note the `resolved_selector` from the response (e.g., "//button[@id='submit']")
-3. Script: Write `page.click("xpath=//button[@id='submit']", prompt="Submit button")`
-
 The `sdk_equivalent` field in each tool response shows the correct hybrid call to use in scripts.
-Always prefer hybrid xpath+prompt over prompt-only in generated scripts.
 
 Note: Currently only skyvern_click returns resolved_selector. Support for skyvern_type and
-skyvern_select_option is planned (SKY-7905). For those tools, use the selector you provided
-as input, or fall back to prompt-only until SKY-7905 ships.
+skyvern_select_option is planned (SKY-7905).
 
-## Getting Started
-Create a session with skyvern_session_create, then use browser tools to interact with pages.
+## Workflow Management
+Use these tools to create, manage, and run Skyvern workflows programmatically.
+Workflows are persistent, versioned, multi-step automations that can be parameterized and scheduled.
+
+- **skyvern_workflow_list** — Find workflows by name or browse all available workflows
+- **skyvern_workflow_get** — Get the full definition of a workflow to inspect its blocks and parameters
+- **skyvern_workflow_create** — Create a new workflow from a YAML or JSON definition
+- **skyvern_workflow_update** — Update an existing workflow's definition (creates a new version)
+- **skyvern_workflow_delete** — Delete a workflow (requires force=true confirmation)
+- **skyvern_workflow_run** — Execute a workflow with parameters (returns immediately by default, or wait for completion)
+- **skyvern_workflow_status** — Check the status and progress of a running or completed workflow run
+- **skyvern_workflow_cancel** — Cancel a running workflow
 """,
 )
 
@@ -175,6 +237,16 @@ mcp.tool()(skyvern_select_option)
 mcp.tool()(skyvern_press_key)
 mcp.tool()(skyvern_wait)
 
+# -- Workflow management (CRUD + execution, no browser needed) --
+mcp.tool()(skyvern_workflow_list)
+mcp.tool()(skyvern_workflow_get)
+mcp.tool()(skyvern_workflow_create)
+mcp.tool()(skyvern_workflow_update)
+mcp.tool()(skyvern_workflow_delete)
+mcp.tool()(skyvern_workflow_run)
+mcp.tool()(skyvern_workflow_status)
+mcp.tool()(skyvern_workflow_cancel)
+
 __all__ = [
     "mcp",
     # Session
@@ -198,4 +270,13 @@ __all__ = [
     "skyvern_select_option",
     "skyvern_press_key",
     "skyvern_wait",
+    # Workflow management
+    "skyvern_workflow_list",
+    "skyvern_workflow_get",
+    "skyvern_workflow_create",
+    "skyvern_workflow_update",
+    "skyvern_workflow_delete",
+    "skyvern_workflow_run",
+    "skyvern_workflow_status",
+    "skyvern_workflow_cancel",
 ]
