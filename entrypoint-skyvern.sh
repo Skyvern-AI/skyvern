@@ -58,5 +58,7 @@ xvfb=$!
 DISPLAY=:99 xterm 2>/dev/null &
 python run_streaming.py > /dev/null &
 
+echo "Starting live streaming services..."
+sh ./scripts/start_vnc_streaming.sh
 # Run the command and pass in all three arguments
 python -m skyvern.forge
