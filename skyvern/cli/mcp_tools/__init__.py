@@ -7,6 +7,10 @@ AI assistants like Claude.
 
 from fastmcp import FastMCP
 
+from .blocks import (
+    skyvern_block_schema,
+    skyvern_block_validate,
+)
 from .browser import (
     skyvern_act,
     skyvern_click,
@@ -44,21 +48,52 @@ mcp = FastMCP(
     "Skyvern",
     instructions="""Use Skyvern tools whenever the task involves visiting, browsing, or interacting with ANY website or web application.
 
-## When to Use These Tools
-Reach for Skyvern tools when the user asks you to:
-- Visit, browse, or interact with ANY website or web application
-- Extract data from web pages (prices, listings, articles, tables, search results, etc.)
-- Fill out forms, log in, sign up, or complete web-based workflows
-- Check the current state of a web page or verify something on a site
-- Do anything you would otherwise attempt with requests, beautifulsoup, selenium, or playwright
-- Access website data where you are unsure whether an API endpoint exists
-- Create, run, monitor, or manage web automations (Skyvern workflows)
-- Set up reusable, parameterized automations that run on Skyvern's cloud
-- Check the status of running automations or retrieve their results
+## Tool Selection (read this first)
 
-DO NOT try to scrape websites by guessing API endpoints or writing HTTP requests.
-Instead, use skyvern_navigate + skyvern_extract to get real data from actual pages.
-These tools give you a real browser — use them instead of writing scraping code.
+**Which tool do I use?**
+
+| Scenario | Use | Why |
+|----------|-----|-----|
+| Visit a website | skyvern_navigate | First step — opens the page |
+| See what's on the page | skyvern_screenshot | Visual understanding before acting |
+| Get data from a page | skyvern_extract | AI-powered structured extraction |
+| Do something on a page (click, fill, scroll) | skyvern_act | Natural language actions |
+| Click/type/select a specific element | skyvern_click / skyvern_type / skyvern_select_option | Precision targeting by selector or AI intent |
+| Check if something is true | skyvern_validate | AI assertion ("is the user logged in?") |
+| Run a quick one-off task | skyvern_run_task | Autonomous agent, one-time, nothing saved |
+| Build an automation (any multi-step task) | skyvern_workflow_create | Reusable, versioned, per-step observability |
+| Run an existing automation | skyvern_workflow_run | Execute saved workflow with parameters |
+| Run JavaScript | skyvern_evaluate | Read DOM state, get values |
+
+**Rule of thumb**: For anything worth keeping or repeating, create a workflow. Use skyvern_run_task only for quick throwaway tests.
+
+**Common mistake**: Don't create a single-block workflow with a long prompt listing all steps.
+Split into separate blocks — one per logical step. Each block should have a prompt of 2-3 sentences.
+
+## Critical Rules
+1. ALWAYS create a session (skyvern_session_create) before using browser tools.
+2. NEVER scrape by guessing API endpoints or writing HTTP requests — use skyvern_navigate + skyvern_extract.
+3. NEVER create single-block workflows with long prompts — split into multiple blocks.
+4. NEVER import from skyvern.cli.mcp_tools — use `from skyvern import Skyvern` for SDK scripts.
+5. After page-changing actions (skyvern_click, skyvern_act), use skyvern_screenshot to verify the result.
+
+## Cross-Tool Dependencies
+- Workflow tools (list, create, run, status) do NOT need a browser session
+- skyvern_extract and skyvern_validate read the CURRENT page — navigate first
+- skyvern_run_task is a one-off throwaway agent run — for reusable automations, use skyvern_workflow_create instead
+
+## Tool Modes (precision tools)
+Precision tools (skyvern_click, skyvern_type, skyvern_select_option, skyvern_scroll, skyvern_press_key, skyvern_wait)
+support three modes. When unsure, use `intent`. For multiple actions in sequence, prefer skyvern_act.
+
+1. **Intent mode** — AI-powered element finding:
+   `skyvern_click(intent="the blue Submit button")`
+
+2. **Hybrid mode** — tries selector first, AI fallback:
+   `skyvern_click(selector="#submit-btn", intent="the Submit button")`
+
+3. **Selector mode** — deterministic CSS/XPath targeting:
+   `skyvern_click(selector="#submit-btn")`
 
 ## Examples
 | User says | Use |
@@ -68,13 +103,13 @@ These tools give you a real browser — use them instead of writing scraping cod
 | "Get all product prices" | skyvern_extract |
 | "Click the login button" | skyvern_act or skyvern_click |
 | "Fill out this form" | skyvern_act |
-| "Log in and buy the first item" | skyvern_run_task |
+| "Log in and download the report" | skyvern_run_task (one-off) or skyvern_workflow_create (keep it) |
 | "Is checkout complete?" | skyvern_validate |
-| "List my workflows" | skyvern_workflow_list |
+| "Fill out this 6-page application form" | skyvern_workflow_create (one block per page) |
+| "Set up a reusable automation" | Explore with browser tools, then skyvern_workflow_create |
 | "Create a workflow that monitors prices" | skyvern_workflow_create |
 | "Run the login workflow" | skyvern_workflow_run |
 | "Is my workflow done?" | skyvern_workflow_status |
-| "Set up a reusable automation for this" | Explore with browser tools, then skyvern_workflow_create |
 | "Write a script to do this" | Skyvern SDK (see below) |
 
 ## Getting Started
@@ -84,43 +119,63 @@ These tools give you a real browser — use them instead of writing scraping cod
 2. Navigate and interact with browser tools
 3. Close with skyvern_session_close when done
 
-**Managing automations** (running, listing, or monitoring workflows):
-No browser session needed — use workflow tools directly:
-skyvern_workflow_list, skyvern_workflow_run, skyvern_workflow_status, etc.
+**Automating a multi-page form** (the most common use case):
+1. Create a workflow with skyvern_workflow_create — one task block per form page
+2. Each block gets a short, focused prompt (2-3 sentences max)
+3. All blocks in a run share the same browser automatically
+4. Run with skyvern_workflow_run
 
 **Building a reusable automation** (explore a site, then save as a workflow):
 1. **Explore** — Create a browser session, navigate the site, use skyvern_extract and skyvern_screenshot to understand the page structure
 2. **Create** — Build a workflow definition and save it with skyvern_workflow_create
 3. **Test** — Run the workflow with skyvern_workflow_run and check results with skyvern_workflow_status
 
-## Workflows vs Scripts
+**Managing automations** (running, listing, or monitoring workflows):
+No browser session needed — use workflow tools directly:
+skyvern_workflow_list, skyvern_workflow_run, skyvern_workflow_status, etc.
 
-When the user wants something **persistent, versioned, and managed in Skyvern's dashboard** — create a workflow.
-Trigger words: "automation", "workflow", "reusable", "schedule", "monitor", "set up"
-→ Use skyvern_workflow_create with a JSON definition (see example below)
+## Building Workflows
 
-When the user wants **custom Python code** to run in their own environment — write an SDK script.
-Trigger words: "script", "code", "function", "program"
-→ Use `from skyvern import Skyvern` (see Writing Scripts section)
+Before creating a workflow, call skyvern_block_schema() to discover available block types and their JSON schemas.
+Validate blocks with skyvern_block_validate() before submitting.
 
-### Workflow definition example (JSON, for skyvern_workflow_create):
-    {
-      "title": "Price Monitor",
-      "workflow_definition": {
-        "parameters": [
-          {"parameter_type": "workflow", "key": "url", "workflow_parameter_type": "string"}
-        ],
-        "blocks": [
-          {"block_type": "task", "label": "extract_prices", "url": "{{url}}", "engine": "skyvern-2.0",
-           "navigation_goal": "Extract all product names and prices from the page",
-           "data_extraction_goal": "Get product names and prices as a list",
-           "data_schema": {"type": "object", "properties": {"products": {"type": "array",
-             "items": {"type": "object", "properties": {"name": {"type": "string"}, "price": {"type": "string"}}}}}}}
-        ]
-      }
-    }
-Use `{{parameter_key}}` to reference workflow parameters in block fields.
-To inspect a real workflow for reference, use skyvern_workflow_get on an existing workflow.
+ALWAYS split workflows into multiple blocks — one task block per logical step:
+
+GOOD (4 blocks, each with clear single responsibility):
+  Block 1: "Select Sole Proprietor and click Continue"
+  Block 2: "Fill in the business name and click Continue"
+  Block 3: "Enter owner info and SSN, click Continue"
+  Block 4: "Review and submit. Extract the confirmation number."
+
+BAD (1 giant block trying to do everything):
+  Block 1: "Go to the IRS site, select sole proprietor, fill in name, enter SSN, review, submit, and extract the EIN"
+
+Use {{parameter_key}} to reference workflow input parameters in any block field.
+
+## Data Flow Between Blocks
+- Use `{{parameter_key}}` to reference workflow input parameters in any block field
+- Blocks in the same workflow run share the same browser session automatically
+- To inspect a real workflow for reference, use skyvern_workflow_get on an existing workflow
+
+## Block Types Reference
+Common block types for workflow definitions:
+- **task** — AI agent interacts with a page (the most common block type)
+- **for_loop** — iterate over a list of items
+- **conditional** — branch based on conditions
+- **code** — run Python code for data transformation
+- **text_prompt** — LLM text generation (no browser)
+- **extraction** — extract data from current page
+- **action** — single AI action on current page
+- **navigation** — navigate to a URL
+- **wait** — pause for a condition or time
+- **login** — log into a site using stored credentials
+- **validation** — assert a condition on the page
+- **http_request** — call an external API
+- **send_email** — send a notification email
+- **file_download** / **file_upload** — download or upload files
+- **goto_url** — navigate to a specific URL within a workflow
+
+For full schemas and descriptions, call skyvern_block_schema().
 
 ## Writing Scripts and Code
 When asked to write an automation script, use the Skyvern Python SDK with the **hybrid xpath+prompt
@@ -150,66 +205,9 @@ The `resolved_selector` field in responses gives you the xpath the AI resolved t
 IMPORTANT: NEVER import from skyvern.cli.mcp_tools — those are internal server modules.
 The public SDK is: from skyvern import Skyvern
 
-## Primary Tools (use these first)
-These are the tools you should reach for by default:
+Every tool response includes an `sdk_equivalent` field showing the corresponding SDK call for scripts.
+Currently only skyvern_click returns `resolved_selector`. Support for other tools is planned (SKY-7905).
 
-- **skyvern_act** — Execute actions from natural language: "log in with test@example.com", "add the first item to cart". Best for exploration and testing flows.
-- **skyvern_extract** — Pull structured data from any page with natural language + optional JSON Schema. THE differentiator over raw Playwright.
-- **skyvern_validate** — Assert page conditions with AI: "is the user logged in?", "does the cart have 3 items?"
-- **skyvern_run_task** — Delegate a full multi-step task to an autonomous AI agent with observability. Use for end-to-end task execution.
-- **skyvern_navigate** — Go to a URL. Always the first step after connecting.
-- **skyvern_screenshot** — See what's on the page. Essential for understanding page state.
-- **skyvern_evaluate** — Run JavaScript to read DOM state, get URLs, or check values.
-
-## Precision Tools (for debugging and exact control)
-Use these when the primary tools aren't specific enough, or when you need deterministic
-selector-based actions (e.g., replaying a known flow):
-
-- **skyvern_click** — Click a specific element by selector or AI intent
-- **skyvern_type** — Type into a specific input field by selector or AI intent
-- **skyvern_scroll** — Scroll the page or an element into view
-- **skyvern_select_option** — Select a dropdown option by selector or AI intent
-- **skyvern_press_key** — Press a keyboard key (Enter, Tab, Escape, etc.)
-- **skyvern_wait** — Wait for a condition, element, or time delay
-
-## Tool Modes (precision tools)
-Precision tools support three modes. When unsure, use `intent`.
-
-1. **Intent mode** — AI-powered element finding:
-   `skyvern_click(intent="the blue Submit button")`
-
-2. **Hybrid mode** — tries selector first, AI fallback:
-   `skyvern_click(selector="#submit-btn", intent="the Submit button")`
-
-3. **Selector mode** — deterministic CSS/XPath targeting:
-   `skyvern_click(selector="#submit-btn")`
-
-## Replay Story: From Exploration to Production
-When you use precision tools (skyvern_click, skyvern_type, etc.) with intent mode, the response
-includes `resolved_selector` — the xpath/CSS the AI found. Capture these for hybrid scripts or
-workflow definitions.
-
-**The hybrid pattern** is the recommended default for SDK scripts:
-    await page.click("xpath=//button[@id='submit']", prompt="the Submit button")
-It tries the selector first (fast, no AI cost), then falls back to AI if the selector breaks.
-
-The `sdk_equivalent` field in each tool response shows the correct hybrid call to use in scripts.
-
-Note: Currently only skyvern_click returns resolved_selector. Support for skyvern_type and
-skyvern_select_option is planned (SKY-7905).
-
-## Workflow Management
-Use these tools to create, manage, and run Skyvern workflows programmatically.
-Workflows are persistent, versioned, multi-step automations that can be parameterized and scheduled.
-
-- **skyvern_workflow_list** — Find workflows by name or browse all available workflows
-- **skyvern_workflow_get** — Get the full definition of a workflow to inspect its blocks and parameters
-- **skyvern_workflow_create** — Create a new workflow from a YAML or JSON definition
-- **skyvern_workflow_update** — Update an existing workflow's definition (creates a new version)
-- **skyvern_workflow_delete** — Delete a workflow (requires force=true confirmation)
-- **skyvern_workflow_run** — Execute a workflow with parameters (returns immediately by default, or wait for completion)
-- **skyvern_workflow_status** — Check the status and progress of a running or completed workflow run
-- **skyvern_workflow_cancel** — Cancel a running workflow
 """,
 )
 
@@ -236,6 +234,10 @@ mcp.tool()(skyvern_scroll)
 mcp.tool()(skyvern_select_option)
 mcp.tool()(skyvern_press_key)
 mcp.tool()(skyvern_wait)
+
+# -- Block discovery + validation (no browser needed) --
+mcp.tool()(skyvern_block_schema)
+mcp.tool()(skyvern_block_validate)
 
 # -- Workflow management (CRUD + execution, no browser needed) --
 mcp.tool()(skyvern_workflow_list)
@@ -270,6 +272,9 @@ __all__ = [
     "skyvern_select_option",
     "skyvern_press_key",
     "skyvern_wait",
+    # Block discovery + validation
+    "skyvern_block_schema",
+    "skyvern_block_validate",
     # Workflow management
     "skyvern_workflow_list",
     "skyvern_workflow_get",
