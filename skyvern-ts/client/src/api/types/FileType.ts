@@ -4,5 +4,6 @@ export const FileType = {
     Csv: "csv",
     Excel: "excel",
     Pdf: "pdf",
+    Image: "image",
 } as const;
 export type FileType = (typeof FileType)[keyof typeof FileType];
