@@ -23,6 +23,7 @@ class BillingStateResponse(UniversalBaseModel):
     topup_credits_used: int
     topup_credits_remaining: int
     credits_remaining: int
+    cancel_at_period_end: typing.Optional[bool] = None
     created_at: dt.datetime
     modified_at: dt.datetime
 

@@ -1452,6 +1452,317 @@ describe("SkyvernClient", () => {
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
+    test("get_workflow (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = {
+            workflow_id: "workflow_id",
+            organization_id: "organization_id",
+            title: "title",
+            workflow_permanent_id: "workflow_permanent_id",
+            version: 1,
+            is_saved_task: true,
+            is_template: true,
+            description: "description",
+            workflow_definition: {
+                version: 1,
+                parameters: [
+                    {
+                        parameter_type: "aws_secret",
+                        key: "key",
+                        aws_secret_parameter_id: "aws_secret_parameter_id",
+                        workflow_id: "workflow_id",
+                        aws_key: "aws_key",
+                        created_at: "2024-01-15T09:30:00Z",
+                        modified_at: "2024-01-15T09:30:00Z",
+                    },
+                ],
+                blocks: [
+                    {
+                        block_type: "action",
+                        label: "label",
+                        output_parameter: {
+                            key: "key",
+                            output_parameter_id: "output_parameter_id",
+                            workflow_id: "workflow_id",
+                            created_at: "2024-01-15T09:30:00Z",
+                            modified_at: "2024-01-15T09:30:00Z",
+                        },
+                    },
+                ],
+                finally_block_label: "finally_block_label",
+            },
+            proxy_location: "RESIDENTIAL",
+            webhook_callback_url: "webhook_callback_url",
+            totp_verification_url: "totp_verification_url",
+            totp_identifier: "totp_identifier",
+            persist_browser_session: true,
+            model: { key: "value" },
+            status: "published",
+            max_screenshot_scrolls: 1,
+            extra_http_headers: { key: "value" },
+            run_with: "run_with",
+            ai_fallback: true,
+            cache_key: "cache_key",
+            run_sequentially: true,
+            sequential_key: "sequential_key",
+            folder_id: "folder_id",
+            import_error: "import_error",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        };
+        server
+            .mockEndpoint()
+            .get("/v1/workflows/workflow_permanent_id")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.getWorkflow("workflow_permanent_id", {
+            version: 1,
+            template: true,
+        });
+        expect(response).toEqual({
+            workflow_id: "workflow_id",
+            organization_id: "organization_id",
+            title: "title",
+            workflow_permanent_id: "workflow_permanent_id",
+            version: 1,
+            is_saved_task: true,
+            is_template: true,
+            description: "description",
+            workflow_definition: {
+                version: 1,
+                parameters: [
+                    {
+                        parameter_type: "aws_secret",
+                        key: "key",
+                        aws_secret_parameter_id: "aws_secret_parameter_id",
+                        workflow_id: "workflow_id",
+                        aws_key: "aws_key",
+                        created_at: "2024-01-15T09:30:00Z",
+                        modified_at: "2024-01-15T09:30:00Z",
+                    },
+                ],
+                blocks: [
+                    {
+                        block_type: "action",
+                        label: "label",
+                        output_parameter: {
+                            key: "key",
+                            output_parameter_id: "output_parameter_id",
+                            workflow_id: "workflow_id",
+                            created_at: "2024-01-15T09:30:00Z",
+                            modified_at: "2024-01-15T09:30:00Z",
+                        },
+                    },
+                ],
+                finally_block_label: "finally_block_label",
+            },
+            proxy_location: "RESIDENTIAL",
+            webhook_callback_url: "webhook_callback_url",
+            totp_verification_url: "totp_verification_url",
+            totp_identifier: "totp_identifier",
+            persist_browser_session: true,
+            model: {
+                key: "value",
+            },
+            status: "published",
+            max_screenshot_scrolls: 1,
+            extra_http_headers: {
+                key: "value",
+            },
+            run_with: "run_with",
+            ai_fallback: true,
+            cache_key: "cache_key",
+            run_sequentially: true,
+            sequential_key: "sequential_key",
+            folder_id: "folder_id",
+            import_error: "import_error",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        });
+    });
+
+    test("get_workflow (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .get("/v1/workflows/workflow_permanent_id")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.getWorkflow("workflow_permanent_id");
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("get_workflow_versions (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = [
+            {
+                workflow_id: "workflow_id",
+                organization_id: "organization_id",
+                title: "title",
+                workflow_permanent_id: "workflow_permanent_id",
+                version: 1,
+                is_saved_task: true,
+                is_template: true,
+                description: "description",
+                workflow_definition: {
+                    version: 1,
+                    parameters: [
+                        {
+                            parameter_type: "aws_secret",
+                            key: "key",
+                            aws_secret_parameter_id: "aws_secret_parameter_id",
+                            workflow_id: "workflow_id",
+                            aws_key: "aws_key",
+                            created_at: "2024-01-15T09:30:00Z",
+                            modified_at: "2024-01-15T09:30:00Z",
+                        },
+                    ],
+                    blocks: [
+                        {
+                            block_type: "action",
+                            label: "label",
+                            output_parameter: {
+                                key: "key",
+                                output_parameter_id: "output_parameter_id",
+                                workflow_id: "workflow_id",
+                                created_at: "2024-01-15T09:30:00Z",
+                                modified_at: "2024-01-15T09:30:00Z",
+                            },
+                        },
+                    ],
+                    finally_block_label: "finally_block_label",
+                },
+                proxy_location: "RESIDENTIAL",
+                webhook_callback_url: "webhook_callback_url",
+                totp_verification_url: "totp_verification_url",
+                totp_identifier: "totp_identifier",
+                persist_browser_session: true,
+                model: { key: "value" },
+                status: "published",
+                max_screenshot_scrolls: 1,
+                extra_http_headers: { key: "value" },
+                run_with: "run_with",
+                ai_fallback: true,
+                cache_key: "cache_key",
+                run_sequentially: true,
+                sequential_key: "sequential_key",
+                folder_id: "folder_id",
+                import_error: "import_error",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+                deleted_at: "2024-01-15T09:30:00Z",
+            },
+        ];
+        server
+            .mockEndpoint()
+            .get("/v1/workflows/workflow_permanent_id/versions")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.getWorkflowVersions("workflow_permanent_id", {
+            template: true,
+        });
+        expect(response).toEqual([
+            {
+                workflow_id: "workflow_id",
+                organization_id: "organization_id",
+                title: "title",
+                workflow_permanent_id: "workflow_permanent_id",
+                version: 1,
+                is_saved_task: true,
+                is_template: true,
+                description: "description",
+                workflow_definition: {
+                    version: 1,
+                    parameters: [
+                        {
+                            parameter_type: "aws_secret",
+                            key: "key",
+                            aws_secret_parameter_id: "aws_secret_parameter_id",
+                            workflow_id: "workflow_id",
+                            aws_key: "aws_key",
+                            created_at: "2024-01-15T09:30:00Z",
+                            modified_at: "2024-01-15T09:30:00Z",
+                        },
+                    ],
+                    blocks: [
+                        {
+                            block_type: "action",
+                            label: "label",
+                            output_parameter: {
+                                key: "key",
+                                output_parameter_id: "output_parameter_id",
+                                workflow_id: "workflow_id",
+                                created_at: "2024-01-15T09:30:00Z",
+                                modified_at: "2024-01-15T09:30:00Z",
+                            },
+                        },
+                    ],
+                    finally_block_label: "finally_block_label",
+                },
+                proxy_location: "RESIDENTIAL",
+                webhook_callback_url: "webhook_callback_url",
+                totp_verification_url: "totp_verification_url",
+                totp_identifier: "totp_identifier",
+                persist_browser_session: true,
+                model: {
+                    key: "value",
+                },
+                status: "published",
+                max_screenshot_scrolls: 1,
+                extra_http_headers: {
+                    key: "value",
+                },
+                run_with: "run_with",
+                ai_fallback: true,
+                cache_key: "cache_key",
+                run_sequentially: true,
+                sequential_key: "sequential_key",
+                folder_id: "folder_id",
+                import_error: "import_error",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+                deleted_at: "2024-01-15T09:30:00Z",
+            },
+        ]);
+    });
+
+    test("get_workflow_versions (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .get("/v1/workflows/workflow_permanent_id/versions")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.getWorkflowVersions("workflow_permanent_id");
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
     test("list_browser_profiles (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
@@ -3099,6 +3410,7 @@ describe("SkyvernClient", () => {
             topup_credits_used: 1,
             topup_credits_remaining: 1,
             credits_remaining: 1,
+            cancel_at_period_end: true,
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
         };
@@ -3126,6 +3438,7 @@ describe("SkyvernClient", () => {
             topup_credits_used: 1,
             topup_credits_remaining: 1,
             credits_remaining: 1,
+            cancel_at_period_end: true,
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
         });
