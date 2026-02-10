@@ -5,6 +5,7 @@ import {
   isSecretCredential,
 } from "@/api/types";
 import { DeleteCredentialButton } from "./DeleteCredentialButton";
+import { CheckCircledIcon } from "@radix-ui/react-icons";
 
 type Props = {
   credential: CredentialApiResponse;
@@ -96,6 +97,12 @@ function CredentialItem({ credential }: Props) {
           {credential.name}
         </p>
         <p className="text-sm text-slate-400">{credential.credential_id}</p>
+        {credential.browser_profile_id && (
+          <div className="flex items-center gap-1 text-xs text-green-400">
+            <CheckCircledIcon className="size-3" />
+            <span>Browser profile saved</span>
+          </div>
+        )}
       </div>
       {credentialDetails}
       <div className="ml-auto">

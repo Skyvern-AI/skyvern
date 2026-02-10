@@ -5132,7 +5132,12 @@ class AgentDB(BaseAlchemyDB):
             return [Credential.model_validate(credential) for credential in credentials]
 
     async def update_credential(
-        self, credential_id: str, organization_id: str, name: str | None = None, website_url: str | None = None
+        self,
+        credential_id: str,
+        organization_id: str,
+        name: str | None = None,
+        website_url: str | None = None,
+        browser_profile_id: str | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -5148,6 +5153,8 @@ class AgentDB(BaseAlchemyDB):
                 credential.name = name
             if website_url:
                 credential.website_url = website_url
+            if browser_profile_id is not None:
+                credential.browser_profile_id = browser_profile_id
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)

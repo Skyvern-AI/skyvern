@@ -11,17 +11,29 @@ import {
 } from "./useCredentialModalState";
 import { PasswordCredentialContent } from "./PasswordCredentialContent";
 import { SecretCredentialContent } from "./SecretCredentialContent";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { CreditCardCredentialContent } from "./CreditCardCredentialContent";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CreateCredentialRequest } from "@/api/types";
+import {
+  CreateCredentialRequest,
+  TestCredentialResponse,
+  TestCredentialStatusResponse,
+} from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
 import { AxiosError } from "axios";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import {
+  CheckCircledIcon,
+  CrossCircledIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Separator } from "@/components/ui/separator";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -101,6 +113,29 @@ function CredentialsModal({
     SECRET_CREDENTIAL_INITIAL_VALUES,
   );
 
+  // Test & Save Browser Profile state
+  const [testAndSave, setTestAndSave] = useState(false);
+  const [testUrl, setTestUrl] = useState("");
+  const [testStatus, setTestStatus] = useState<
+    "idle" | "testing" | "completed" | "failed"
+  >("idle");
+  const [testWorkflowRunId, setTestWorkflowRunId] = useState<string | null>(
+    null,
+  );
+  const [testFailureReason, setTestFailureReason] = useState<string | null>(
+    null,
+  );
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
+    };
+  }, []);
+
   // Set default name when modal opens
   useEffect(() => {
     if (isOpen && credentials) {
@@ -126,7 +161,101 @@ function CredentialsModal({
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
     setCreditCardCredentialValues(CREDIT_CARD_CREDENTIAL_INITIAL_VALUES);
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
+    setTestAndSave(false);
+    setTestUrl("");
+    setTestStatus("idle");
+    setTestWorkflowRunId(null);
+    setTestFailureReason(null);
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
   }
+
+  const pollTestStatus = useCallback(
+    async (credentialId: string, workflowRunId: string) => {
+      try {
+        const client = await getClient(credentialGetter);
+        const response = await client.get<TestCredentialStatusResponse>(
+          `/credentials/${credentialId}/test/${workflowRunId}`,
+        );
+        const data = response.data;
+
+        if (data.status === "completed") {
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+          }
+          setTestStatus("completed");
+          queryClient.invalidateQueries({ queryKey: ["credentials"] });
+          toast({
+            title: "Credential test passed",
+            description: data.browser_profile_id
+              ? "Login successful! Browser profile saved."
+              : "Login successful!",
+            variant: "success",
+          });
+        } else if (
+          data.status === "failed" ||
+          data.status === "terminated" ||
+          data.status === "timed_out" ||
+          data.status === "canceled"
+        ) {
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+          }
+          setTestStatus("failed");
+          setTestFailureReason(data.failure_reason ?? "Unknown error");
+          toast({
+            title: "Credential test failed",
+            description:
+              data.failure_reason ?? "The login test did not succeed",
+            variant: "destructive",
+          });
+        }
+        // If still running/queued/created, continue polling
+      } catch {
+        // Silently continue polling on network errors
+      }
+    },
+    [credentialGetter, queryClient],
+  );
+
+  const startTest = useCallback(
+    async (credentialId: string) => {
+      try {
+        const client = await getClient(credentialGetter);
+        const response = await client.post<TestCredentialResponse>(
+          `/credentials/${credentialId}/test`,
+          {
+            url: testUrl,
+            save_browser_profile: true,
+          },
+        );
+        const data = response.data;
+        setTestWorkflowRunId(data.workflow_run_id);
+        setTestStatus("testing");
+
+        // Start polling every 3 seconds
+        pollIntervalRef.current = setInterval(() => {
+          pollTestStatus(data.credential_id, data.workflow_run_id);
+        }, 3000);
+      } catch (error) {
+        setTestStatus("failed");
+        const detail = (
+          (error as AxiosError)?.response?.data as { detail?: string }
+        )?.detail;
+        setTestFailureReason(detail ?? "Failed to start credential test");
+        toast({
+          title: "Error",
+          description: detail ?? "Failed to start credential test",
+          variant: "destructive",
+        });
+      }
+    },
+    [credentialGetter, testUrl, pollTestStatus],
+  );
 
   const createCredentialMutation = useMutation({
     mutationFn: async (request: CreateCredentialRequest) => {
@@ -135,17 +264,32 @@ function CredentialsModal({
       return response.data;
     },
     onSuccess: (data) => {
-      reset();
-      setIsOpen(false);
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
-      toast({
-        title: "Credential created",
-        description: "Your credential has been created successfully",
-        variant: "success",
-      });
       onCredentialCreated?.(data.credential_id);
+
+      if (
+        testAndSave &&
+        type === CredentialModalTypes.PASSWORD &&
+        testUrl.trim() !== ""
+      ) {
+        // Don't close the modal — start the test
+        toast({
+          title: "Credential created",
+          description: "Starting login test...",
+          variant: "success",
+        });
+        startTest(data.credential_id);
+      } else {
+        reset();
+        setIsOpen(false);
+        toast({
+          title: "Credential created",
+          description: "Your credential has been created successfully",
+          variant: "success",
+        });
+      }
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -187,6 +331,16 @@ function CredentialsModal({
         });
         return;
       }
+
+      if (testAndSave && testUrl.trim() === "") {
+        toast({
+          title: "Error",
+          description: "Login URL is required when testing credentials",
+          variant: "destructive",
+        });
+        return;
+      }
+
       createCredentialMutation.mutate({
         name,
         credential_type: "password",
@@ -303,6 +457,9 @@ function CredentialsModal({
     );
   })();
 
+  const isTestInProgress = testStatus === "testing";
+  const isTestComplete = testStatus === "completed" || testStatus === "failed";
+
   return (
     <Dialog
       open={isOpen}
@@ -318,16 +475,105 @@ function CredentialsModal({
           <DialogTitle className="font-bold">Add Credential</DialogTitle>
         </DialogHeader>
         {credentialContent}
+
+        {/* Test & Save Browser Profile section — only for password credentials */}
+        {type === CredentialModalTypes.PASSWORD && (
+          <>
+            <Separator />
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <Checkbox
+                  id="test-and-save"
+                  checked={testAndSave}
+                  onCheckedChange={(checked) =>
+                    setTestAndSave(checked === true)
+                  }
+                  disabled={isTestInProgress}
+                />
+                <Label
+                  htmlFor="test-and-save"
+                  className="cursor-pointer text-sm font-medium"
+                >
+                  Test credential & save browser profile
+                </Label>
+              </div>
+              {testAndSave && (
+                <div className="space-y-2 pl-7">
+                  <p className="text-xs text-muted-foreground">
+                    Skyvern will log in using your credentials, verify success,
+                    and save the browser profile. You can then attach this
+                    profile to workflow login blocks to skip future logins.
+                  </p>
+                  <div className="flex items-center gap-4">
+                    <div className="w-32 shrink-0">
+                      <Label className="text-xs">Login Page URL</Label>
+                    </div>
+                    <Input
+                      value={testUrl}
+                      onChange={(e) => setTestUrl(e.target.value)}
+                      placeholder="https://example.com/login"
+                      className="text-xs"
+                      disabled={isTestInProgress}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Test status display */}
+              {isTestInProgress && (
+                <div className="flex items-center gap-2 pl-7 text-sm text-muted-foreground">
+                  <ReloadIcon className="size-4 animate-spin" />
+                  <span>Testing credential login...</span>
+                </div>
+              )}
+              {testStatus === "completed" && (
+                <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
+                  <CheckCircledIcon className="size-4" />
+                  <span>Login test passed — browser profile saved!</span>
+                </div>
+              )}
+              {testStatus === "failed" && (
+                <div className="space-y-1 pl-7">
+                  <div className="flex items-center gap-2 text-sm text-destructive">
+                    <CrossCircledIcon className="size-4" />
+                    <span>Login test failed</span>
+                  </div>
+                  {testFailureReason && (
+                    <p className="text-xs text-destructive/70">
+                      {testFailureReason}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
         <DialogFooter>
-          <Button
-            onClick={handleSave}
-            disabled={createCredentialMutation.isPending}
-          >
-            {createCredentialMutation.isPending ? (
-              <ReloadIcon className="mr-2 size-4 animate-spin" />
-            ) : null}
-            Save
-          </Button>
+          {isTestComplete ? (
+            <Button
+              onClick={() => {
+                reset();
+                setIsOpen(false);
+              }}
+            >
+              Done
+            </Button>
+          ) : (
+            <Button
+              onClick={handleSave}
+              disabled={
+                createCredentialMutation.isPending || isTestInProgress
+              }
+            >
+              {createCredentialMutation.isPending || isTestInProgress ? (
+                <ReloadIcon className="mr-2 size-4 animate-spin" />
+              ) : null}
+              {testAndSave && type === CredentialModalTypes.PASSWORD
+                ? "Save & Test"
+                : "Save"}
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>
