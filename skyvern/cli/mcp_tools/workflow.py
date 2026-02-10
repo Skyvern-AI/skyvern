@@ -344,7 +344,42 @@ async def skyvern_workflow_create(
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
 ) -> dict[str, Any]:
     """Create a new Skyvern workflow from a YAML or JSON definition. Use when you need to save
-    a new automation workflow that can be run repeatedly with different parameters."""
+    a new automation workflow that can be run repeatedly with different parameters.
+
+    Best practice: use one task block per logical step with a short focused prompt (2-3 sentences).
+    Common block types: task, for_loop, conditional, code, text_prompt, extraction, action, navigation, wait, login.
+    Call skyvern_block_schema() for the full list with schemas and examples.
+
+    Example JSON definition (multi-block EIN application):
+
+        {
+          "title": "Apply for EIN",
+          "workflow_definition": {
+            "parameters": [
+              {"parameter_type": "workflow", "key": "business_name", "workflow_parameter_type": "string"},
+              {"parameter_type": "workflow", "key": "owner_name", "workflow_parameter_type": "string"},
+              {"parameter_type": "workflow", "key": "owner_ssn", "workflow_parameter_type": "string"}
+            ],
+            "blocks": [
+              {"block_type": "task", "label": "select_entity_type",
+               "url": "https://sa.www4.irs.gov/modiein/individual/index.jsp",
+               "engine": "skyvern-2.0",
+               "navigation_goal": "Select 'Sole Proprietor' as the entity type and click Continue."},
+              {"block_type": "task", "label": "enter_business_info", "engine": "skyvern-2.0",
+               "navigation_goal": "Fill in the business name as '{{business_name}}' and click Continue."},
+              {"block_type": "task", "label": "enter_owner_info", "engine": "skyvern-2.0",
+               "navigation_goal": "Enter the responsible party name '{{owner_name}}' and SSN '{{owner_ssn}}'. Click Continue."},
+              {"block_type": "task", "label": "confirm_and_submit", "engine": "skyvern-2.0",
+               "navigation_goal": "Review the information on the confirmation page and click Submit.",
+               "data_extraction_goal": "Extract the assigned EIN number",
+               "data_schema": {"type": "object", "properties": {"ein": {"type": "string"}}}}
+            ]
+          }
+        }
+
+    Use {{parameter_key}} to reference workflow input parameters in any block field.
+    Blocks in the same run share the same browser session automatically.
+    """
     if format not in ("json", "yaml", "auto"):
         return make_result(
             "skyvern_workflow_create",
