@@ -47,7 +47,11 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
     return (
       <Input
         value={value === null ? "" : Number(value)}
-        onChange={(e) => onChange(parseInt(e.target.value))}
+        onChange={(e) => {
+          const val = e.target.value;
+          // Return null for empty input, otherwise parse as integer
+          onChange(val === "" ? null : parseInt(val, 10));
+        }}
         type="number"
       />
     );
@@ -57,7 +61,11 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
     return (
       <Input
         value={value === null ? "" : Number(value)}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
+        onChange={(e) => {
+          const val = e.target.value;
+          // Return null for empty input, otherwise parse as float
+          onChange(val === "" ? null : parseFloat(val));
+        }}
         type="number"
         step="any"
       />

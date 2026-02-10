@@ -96,17 +96,6 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
             nodeId={id}
             totpIdentifier={null}
             totpUrl={null}
-            transmutations={{
-              blockTitle: "Validation",
-              self: "agent",
-              others: [
-                {
-                  label: "human",
-                  reason: "Convert to human validation",
-                  nodeName: "human_interaction",
-                },
-              ],
-            }}
             type={type}
           />
           <div className="space-y-2">

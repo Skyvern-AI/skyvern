@@ -30,6 +30,7 @@ describe("SkyvernClient", () => {
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
+            step_count: 1,
             run_request: {
                 prompt: "Find the top 3 posts on Hacker News.",
                 url: "url",
@@ -49,6 +50,7 @@ describe("SkyvernClient", () => {
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
+                run_with: "run_with",
             },
         };
         server
@@ -101,6 +103,7 @@ describe("SkyvernClient", () => {
                     key: "value",
                 },
             ],
+            step_count: 1,
             run_request: {
                 prompt: "Find the top 3 posts on Hacker News.",
                 url: "url",
@@ -128,6 +131,7 @@ describe("SkyvernClient", () => {
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
+                run_with: "run_with",
             },
         });
     });
@@ -203,6 +207,7 @@ describe("SkyvernClient", () => {
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
+            step_count: 1,
             run_with: "run_with",
             ai_fallback: true,
             run_request: {
@@ -275,6 +280,7 @@ describe("SkyvernClient", () => {
                     key: "value",
                 },
             ],
+            step_count: 1,
             run_with: "run_with",
             ai_fallback: true,
             run_request: {
@@ -372,6 +378,7 @@ describe("SkyvernClient", () => {
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
+            step_count: 1,
             run_request: {
                 prompt: "Find the top 3 posts on Hacker News.",
                 url: "url",
@@ -391,6 +398,7 @@ describe("SkyvernClient", () => {
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
+                run_with: "run_with",
             },
         };
         server.mockEndpoint().get("/v1/runs/tsk_123").respondWith().statusCode(200).jsonBody(rawResponseBody).build();
@@ -431,6 +439,7 @@ describe("SkyvernClient", () => {
                     key: "value",
                 },
             ],
+            step_count: 1,
             run_request: {
                 prompt: "Find the top 3 posts on Hacker News.",
                 url: "url",
@@ -458,6 +467,7 @@ describe("SkyvernClient", () => {
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
+                run_with: "run_with",
             },
         });
     });
@@ -563,6 +573,7 @@ describe("SkyvernClient", () => {
                             },
                         },
                     ],
+                    finally_block_label: "finally_block_label",
                 },
                 proxy_location: "RESIDENTIAL",
                 webhook_callback_url: "webhook_callback_url",
@@ -634,6 +645,7 @@ describe("SkyvernClient", () => {
                             },
                         },
                     ],
+                    finally_block_label: "finally_block_label",
                 },
                 proxy_location: "RESIDENTIAL",
                 webhook_callback_url: "webhook_callback_url",
@@ -713,6 +725,7 @@ describe("SkyvernClient", () => {
                         },
                     },
                 ],
+                finally_block_label: "finally_block_label",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
@@ -782,6 +795,7 @@ describe("SkyvernClient", () => {
                         },
                     },
                 ],
+                finally_block_label: "finally_block_label",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
@@ -869,6 +883,7 @@ describe("SkyvernClient", () => {
                         },
                     },
                 ],
+                finally_block_label: "finally_block_label",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
@@ -935,6 +950,7 @@ describe("SkyvernClient", () => {
                         },
                     },
                 ],
+                finally_block_label: "finally_block_label",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
@@ -1436,6 +1452,317 @@ describe("SkyvernClient", () => {
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
+    test("get_workflow (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = {
+            workflow_id: "workflow_id",
+            organization_id: "organization_id",
+            title: "title",
+            workflow_permanent_id: "workflow_permanent_id",
+            version: 1,
+            is_saved_task: true,
+            is_template: true,
+            description: "description",
+            workflow_definition: {
+                version: 1,
+                parameters: [
+                    {
+                        parameter_type: "aws_secret",
+                        key: "key",
+                        aws_secret_parameter_id: "aws_secret_parameter_id",
+                        workflow_id: "workflow_id",
+                        aws_key: "aws_key",
+                        created_at: "2024-01-15T09:30:00Z",
+                        modified_at: "2024-01-15T09:30:00Z",
+                    },
+                ],
+                blocks: [
+                    {
+                        block_type: "action",
+                        label: "label",
+                        output_parameter: {
+                            key: "key",
+                            output_parameter_id: "output_parameter_id",
+                            workflow_id: "workflow_id",
+                            created_at: "2024-01-15T09:30:00Z",
+                            modified_at: "2024-01-15T09:30:00Z",
+                        },
+                    },
+                ],
+                finally_block_label: "finally_block_label",
+            },
+            proxy_location: "RESIDENTIAL",
+            webhook_callback_url: "webhook_callback_url",
+            totp_verification_url: "totp_verification_url",
+            totp_identifier: "totp_identifier",
+            persist_browser_session: true,
+            model: { key: "value" },
+            status: "published",
+            max_screenshot_scrolls: 1,
+            extra_http_headers: { key: "value" },
+            run_with: "run_with",
+            ai_fallback: true,
+            cache_key: "cache_key",
+            run_sequentially: true,
+            sequential_key: "sequential_key",
+            folder_id: "folder_id",
+            import_error: "import_error",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        };
+        server
+            .mockEndpoint()
+            .get("/v1/workflows/workflow_permanent_id")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.getWorkflow("workflow_permanent_id", {
+            version: 1,
+            template: true,
+        });
+        expect(response).toEqual({
+            workflow_id: "workflow_id",
+            organization_id: "organization_id",
+            title: "title",
+            workflow_permanent_id: "workflow_permanent_id",
+            version: 1,
+            is_saved_task: true,
+            is_template: true,
+            description: "description",
+            workflow_definition: {
+                version: 1,
+                parameters: [
+                    {
+                        parameter_type: "aws_secret",
+                        key: "key",
+                        aws_secret_parameter_id: "aws_secret_parameter_id",
+                        workflow_id: "workflow_id",
+                        aws_key: "aws_key",
+                        created_at: "2024-01-15T09:30:00Z",
+                        modified_at: "2024-01-15T09:30:00Z",
+                    },
+                ],
+                blocks: [
+                    {
+                        block_type: "action",
+                        label: "label",
+                        output_parameter: {
+                            key: "key",
+                            output_parameter_id: "output_parameter_id",
+                            workflow_id: "workflow_id",
+                            created_at: "2024-01-15T09:30:00Z",
+                            modified_at: "2024-01-15T09:30:00Z",
+                        },
+                    },
+                ],
+                finally_block_label: "finally_block_label",
+            },
+            proxy_location: "RESIDENTIAL",
+            webhook_callback_url: "webhook_callback_url",
+            totp_verification_url: "totp_verification_url",
+            totp_identifier: "totp_identifier",
+            persist_browser_session: true,
+            model: {
+                key: "value",
+            },
+            status: "published",
+            max_screenshot_scrolls: 1,
+            extra_http_headers: {
+                key: "value",
+            },
+            run_with: "run_with",
+            ai_fallback: true,
+            cache_key: "cache_key",
+            run_sequentially: true,
+            sequential_key: "sequential_key",
+            folder_id: "folder_id",
+            import_error: "import_error",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        });
+    });
+
+    test("get_workflow (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .get("/v1/workflows/workflow_permanent_id")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.getWorkflow("workflow_permanent_id");
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("get_workflow_versions (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = [
+            {
+                workflow_id: "workflow_id",
+                organization_id: "organization_id",
+                title: "title",
+                workflow_permanent_id: "workflow_permanent_id",
+                version: 1,
+                is_saved_task: true,
+                is_template: true,
+                description: "description",
+                workflow_definition: {
+                    version: 1,
+                    parameters: [
+                        {
+                            parameter_type: "aws_secret",
+                            key: "key",
+                            aws_secret_parameter_id: "aws_secret_parameter_id",
+                            workflow_id: "workflow_id",
+                            aws_key: "aws_key",
+                            created_at: "2024-01-15T09:30:00Z",
+                            modified_at: "2024-01-15T09:30:00Z",
+                        },
+                    ],
+                    blocks: [
+                        {
+                            block_type: "action",
+                            label: "label",
+                            output_parameter: {
+                                key: "key",
+                                output_parameter_id: "output_parameter_id",
+                                workflow_id: "workflow_id",
+                                created_at: "2024-01-15T09:30:00Z",
+                                modified_at: "2024-01-15T09:30:00Z",
+                            },
+                        },
+                    ],
+                    finally_block_label: "finally_block_label",
+                },
+                proxy_location: "RESIDENTIAL",
+                webhook_callback_url: "webhook_callback_url",
+                totp_verification_url: "totp_verification_url",
+                totp_identifier: "totp_identifier",
+                persist_browser_session: true,
+                model: { key: "value" },
+                status: "published",
+                max_screenshot_scrolls: 1,
+                extra_http_headers: { key: "value" },
+                run_with: "run_with",
+                ai_fallback: true,
+                cache_key: "cache_key",
+                run_sequentially: true,
+                sequential_key: "sequential_key",
+                folder_id: "folder_id",
+                import_error: "import_error",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+                deleted_at: "2024-01-15T09:30:00Z",
+            },
+        ];
+        server
+            .mockEndpoint()
+            .get("/v1/workflows/workflow_permanent_id/versions")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.getWorkflowVersions("workflow_permanent_id", {
+            template: true,
+        });
+        expect(response).toEqual([
+            {
+                workflow_id: "workflow_id",
+                organization_id: "organization_id",
+                title: "title",
+                workflow_permanent_id: "workflow_permanent_id",
+                version: 1,
+                is_saved_task: true,
+                is_template: true,
+                description: "description",
+                workflow_definition: {
+                    version: 1,
+                    parameters: [
+                        {
+                            parameter_type: "aws_secret",
+                            key: "key",
+                            aws_secret_parameter_id: "aws_secret_parameter_id",
+                            workflow_id: "workflow_id",
+                            aws_key: "aws_key",
+                            created_at: "2024-01-15T09:30:00Z",
+                            modified_at: "2024-01-15T09:30:00Z",
+                        },
+                    ],
+                    blocks: [
+                        {
+                            block_type: "action",
+                            label: "label",
+                            output_parameter: {
+                                key: "key",
+                                output_parameter_id: "output_parameter_id",
+                                workflow_id: "workflow_id",
+                                created_at: "2024-01-15T09:30:00Z",
+                                modified_at: "2024-01-15T09:30:00Z",
+                            },
+                        },
+                    ],
+                    finally_block_label: "finally_block_label",
+                },
+                proxy_location: "RESIDENTIAL",
+                webhook_callback_url: "webhook_callback_url",
+                totp_verification_url: "totp_verification_url",
+                totp_identifier: "totp_identifier",
+                persist_browser_session: true,
+                model: {
+                    key: "value",
+                },
+                status: "published",
+                max_screenshot_scrolls: 1,
+                extra_http_headers: {
+                    key: "value",
+                },
+                run_with: "run_with",
+                ai_fallback: true,
+                cache_key: "cache_key",
+                run_sequentially: true,
+                sequential_key: "sequential_key",
+                folder_id: "folder_id",
+                import_error: "import_error",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+                deleted_at: "2024-01-15T09:30:00Z",
+            },
+        ]);
+    });
+
+    test("get_workflow_versions (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .get("/v1/workflows/workflow_permanent_id/versions")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.getWorkflowVersions("workflow_permanent_id");
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
     test("list_browser_profiles (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
@@ -1715,11 +2042,14 @@ describe("SkyvernClient", () => {
             {
                 browser_session_id: "pbs_123456",
                 organization_id: "organization_id",
+                status: "status",
                 runnable_type: "runnable_type",
                 runnable_id: "runnable_id",
                 timeout: 1,
                 browser_address: "browser_address",
                 app_url: "app_url",
+                extensions: ["ad-blocker"],
+                browser_type: "msedge",
                 vnc_streaming_supported: true,
                 download_path: "download_path",
                 downloaded_files: [{ url: "url" }],
@@ -1744,11 +2074,14 @@ describe("SkyvernClient", () => {
             {
                 browser_session_id: "pbs_123456",
                 organization_id: "organization_id",
+                status: "status",
                 runnable_type: "runnable_type",
                 runnable_id: "runnable_id",
                 timeout: 1,
                 browser_address: "browser_address",
                 app_url: "app_url",
+                extensions: ["ad-blocker"],
+                browser_type: "msedge",
                 vnc_streaming_supported: true,
                 download_path: "download_path",
                 downloaded_files: [
@@ -1813,11 +2146,14 @@ describe("SkyvernClient", () => {
         const rawResponseBody = {
             browser_session_id: "pbs_123456",
             organization_id: "organization_id",
+            status: "status",
             runnable_type: "runnable_type",
             runnable_id: "runnable_id",
             timeout: 1,
             browser_address: "browser_address",
             app_url: "app_url",
+            extensions: ["ad-blocker"],
+            browser_type: "msedge",
             vnc_streaming_supported: true,
             download_path: "download_path",
             downloaded_files: [
@@ -1845,11 +2181,14 @@ describe("SkyvernClient", () => {
         expect(response).toEqual({
             browser_session_id: "pbs_123456",
             organization_id: "organization_id",
+            status: "status",
             runnable_type: "runnable_type",
             runnable_id: "runnable_id",
             timeout: 1,
             browser_address: "browser_address",
             app_url: "app_url",
+            extensions: ["ad-blocker"],
+            browser_type: "msedge",
             vnc_streaming_supported: true,
             download_path: "download_path",
             downloaded_files: [
@@ -1976,11 +2315,14 @@ describe("SkyvernClient", () => {
         const rawResponseBody = {
             browser_session_id: "pbs_123456",
             organization_id: "organization_id",
+            status: "status",
             runnable_type: "runnable_type",
             runnable_id: "runnable_id",
             timeout: 1,
             browser_address: "browser_address",
             app_url: "app_url",
+            extensions: ["ad-blocker"],
+            browser_type: "msedge",
             vnc_streaming_supported: true,
             download_path: "download_path",
             downloaded_files: [
@@ -2007,11 +2349,14 @@ describe("SkyvernClient", () => {
         expect(response).toEqual({
             browser_session_id: "pbs_123456",
             organization_id: "organization_id",
+            status: "status",
             runnable_type: "runnable_type",
             runnable_id: "runnable_id",
             timeout: 1,
             browser_address: "browser_address",
             app_url: "app_url",
+            extensions: ["ad-blocker"],
+            browser_type: "msedge",
             vnc_streaming_supported: true,
             download_path: "download_path",
             downloaded_files: [
@@ -2107,6 +2452,7 @@ describe("SkyvernClient", () => {
             source: "source",
             content: "Hello, your verification code is 123456",
             expired_at: "2024-01-15T09:30:00Z",
+            type: "totp",
             totp_code_id: "totp_code_id",
             code: "code",
             organization_id: "organization_id",
@@ -2135,6 +2481,7 @@ describe("SkyvernClient", () => {
             source: "source",
             content: "Hello, your verification code is 123456",
             expired_at: "2024-01-15T09:30:00Z",
+            type: "totp",
             totp_code_id: "totp_code_id",
             code: "code",
             organization_id: "organization_id",
@@ -2398,6 +2745,7 @@ describe("SkyvernClient", () => {
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
+            step_count: 1,
             run_with: "run_with",
             ai_fallback: true,
             run_request: {
@@ -2463,6 +2811,7 @@ describe("SkyvernClient", () => {
                     key: "value",
                 },
             ],
+            step_count: 1,
             run_with: "run_with",
             ai_fallback: true,
             run_request: {
@@ -2534,6 +2883,7 @@ describe("SkyvernClient", () => {
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
+            step_count: 1,
             run_with: "run_with",
             ai_fallback: true,
             run_request: {
@@ -2599,6 +2949,7 @@ describe("SkyvernClient", () => {
                     key: "value",
                 },
             ],
+            step_count: 1,
             run_with: "run_with",
             ai_fallback: true,
             run_request: {
@@ -2955,6 +3306,203 @@ describe("SkyvernClient", () => {
                 action: {
                     type: "ai_act",
                 },
+            });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("create_checkout_session_api_v1_billing_checkout_post (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { tier: "free" };
+        const rawResponseBody = { id: "id", url: "url" };
+        server
+            .mockEndpoint()
+            .post("/api/v1/billing/checkout")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.createCheckoutSessionApiV1BillingCheckoutPost({
+            tier: "free",
+        });
+        expect(response).toEqual({
+            id: "id",
+            url: "url",
+        });
+    });
+
+    test("create_checkout_session_api_v1_billing_checkout_post (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { tier: "free" };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/api/v1/billing/checkout")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.createCheckoutSessionApiV1BillingCheckoutPost({
+                tier: "free",
+            });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("create_portal_session_api_v1_billing_portal_post (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { url: "url" };
+        server
+            .mockEndpoint()
+            .post("/api/v1/billing/portal")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.createPortalSessionApiV1BillingPortalPost();
+        expect(response).toEqual({
+            url: "url",
+        });
+    });
+
+    test("create_portal_session_api_v1_billing_portal_post (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/api/v1/billing/portal")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.createPortalSessionApiV1BillingPortalPost();
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("get_organization_billing_api_v1_billing_state_get (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = {
+            billing_id: "billing_id",
+            organization_id: "organization_id",
+            plan_tier: "free",
+            current_period_start: "2024-01-15T09:30:00Z",
+            current_period_end: "2024-01-15T09:30:00Z",
+            included_credits_this_period: 1,
+            credits_consumed_this_period: 1,
+            cached_credits_consumed_this_period: 1,
+            overage_enabled: true,
+            browser_uptime_seconds_consumed: 1,
+            topup_credits_total: 1,
+            topup_credits_used: 1,
+            topup_credits_remaining: 1,
+            credits_remaining: 1,
+            cancel_at_period_end: true,
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+        };
+        server
+            .mockEndpoint()
+            .get("/api/v1/billing/state")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.getOrganizationBillingApiV1BillingStateGet();
+        expect(response).toEqual({
+            billing_id: "billing_id",
+            organization_id: "organization_id",
+            plan_tier: "free",
+            current_period_start: "2024-01-15T09:30:00Z",
+            current_period_end: "2024-01-15T09:30:00Z",
+            included_credits_this_period: 1,
+            credits_consumed_this_period: 1,
+            cached_credits_consumed_this_period: 1,
+            overage_enabled: true,
+            browser_uptime_seconds_consumed: 1,
+            topup_credits_total: 1,
+            topup_credits_used: 1,
+            topup_credits_remaining: 1,
+            credits_remaining: 1,
+            cancel_at_period_end: true,
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+        });
+    });
+
+    test("get_organization_billing_api_v1_billing_state_get (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .get("/api/v1/billing/state")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.getOrganizationBillingApiV1BillingStateGet();
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("change_tier_api_v1_billing_change_tier_post (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { tier: "free" };
+        const rawResponseBody = { status: "status", tier: "tier", redirect_url: "redirect_url" };
+        server
+            .mockEndpoint()
+            .post("/api/v1/billing/change-tier")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.changeTierApiV1BillingChangeTierPost({
+            tier: "free",
+        });
+        expect(response).toEqual({
+            status: "status",
+            tier: "tier",
+            redirect_url: "redirect_url",
+        });
+    });
+
+    test("change_tier_api_v1_billing_change_tier_post (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { tier: "free" };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/api/v1/billing/change-tier")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.changeTierApiV1BillingChangeTierPost({
+                tier: "free",
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });

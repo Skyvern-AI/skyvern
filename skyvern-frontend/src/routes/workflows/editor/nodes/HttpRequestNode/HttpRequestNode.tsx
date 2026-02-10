@@ -167,7 +167,7 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
         id="b"
         className="opacity-0"
       />
-      <div className="w-[36rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
+      <div className="transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all">
         <NodeHeader
           blockLabel={label}
           editable={editable}
@@ -233,7 +233,6 @@ function HttpRequestNode({ id, data, type }: NodeProps<HttpRequestNodeType>) {
                 ) : null}
               </div>
               <WorkflowBlockInputTextarea
-                canWriteTitle={true}
                 nodeId={id}
                 onChange={(value) => {
                   update({ url: value });

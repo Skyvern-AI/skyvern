@@ -44,6 +44,11 @@ class TotpCode(UniversalBaseModel):
     The timestamp when the TOTP code expires
     """
 
+    type: typing.Optional[OtpType] = pydantic.Field(default=None)
+    """
+    Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
+    """
+
     totp_code_id: str = pydantic.Field()
     """
     The skyvern ID of the TOTP code.

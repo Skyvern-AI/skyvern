@@ -1,5 +1,5 @@
 # Reference
-<details><summary><code>client.<a href="/src/Client.ts">runSdkAction</a>({ ...params }) -> Skyvern.RunSdkActionResponse</code></summary>
+<details><summary><code>client.<a href="/src/Client.ts">changeTierApiV1BillingChangeTierPost</a>({ ...params }) -> Skyvern.ChangeTierResponse</code></summary>
 <dl>
 <dd>
 
@@ -11,7 +11,10 @@
 <dl>
 <dd>
 
-Execute a single SDK action with the specified parameters
+Redirect to Stripe Portal for tier changes.
+Portal handles proration based on configured settings:
+- Upgrades: Immediate proration charge
+- Downgrades: Apply at end of billing period
 </dd>
 </dl>
 </dd>
@@ -26,11 +29,8 @@ Execute a single SDK action with the specified parameters
 <dd>
 
 ```typescript
-await client.runSdkAction({
-    url: "url",
-    action: {
-        type: "ai_act"
-    }
+await client.changeTierApiV1BillingChangeTierPost({
+    tier: "free"
 });
 
 ```
@@ -47,7 +47,7 @@ await client.runSdkAction({
 <dl>
 <dd>
 
-**request:** `Skyvern.RunSdkActionRequest` 
+**request:** `Skyvern.ChangeTierRequest` 
     
 </dd>
 </dl>

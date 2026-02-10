@@ -26,10 +26,13 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
+    WorkflowCopilotClearProposedWorkflowRequest,
     WorkflowCopilotProcessingUpdate,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotStreamResponseUpdate,
+    WorkflowYAMLConversionRequest,
+    WorkflowYAMLConversionResponse,
 )
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
@@ -39,6 +42,7 @@ from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_wor
 from skyvern.schemas.workflows import (
     LoginBlockYAML,
     WorkflowCreateYAMLRequest,
+    WorkflowDefinitionYAML,
 )
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
@@ -448,6 +452,13 @@ async def workflow_copilot_chat_post(
                 )
                 return
 
+            if updated_workflow and chat.auto_accept is not True:
+                await app.DATABASE.update_workflow_copilot_chat(
+                    organization_id=chat.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    proposed_workflow=updated_workflow.model_dump(mode="json"),
+                )
+
             await app.DATABASE.create_workflow_copilot_chat_message(
                 organization_id=chat.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -518,15 +529,33 @@ async def workflow_copilot_chat_history(
         organization_id=organization.organization_id,
         workflow_permanent_id=workflow_permanent_id,
     )
-    if not latest_chat:
-        return WorkflowCopilotChatHistoryResponse(workflow_copilot_chat_id=None, chat_history=[])
-    chat_messages = await app.DATABASE.get_workflow_copilot_chat_messages(
-        workflow_copilot_chat_id=latest_chat.workflow_copilot_chat_id,
-    )
+    if latest_chat:
+        chat_messages = await app.DATABASE.get_workflow_copilot_chat_messages(latest_chat.workflow_copilot_chat_id)
+    else:
+        chat_messages = []
     return WorkflowCopilotChatHistoryResponse(
-        workflow_copilot_chat_id=latest_chat.workflow_copilot_chat_id,
+        workflow_copilot_chat_id=latest_chat.workflow_copilot_chat_id if latest_chat else None,
         chat_history=convert_to_history_messages(chat_messages),
+        proposed_workflow=latest_chat.proposed_workflow if latest_chat else None,
+        auto_accept=latest_chat.auto_accept if latest_chat else None,
     )
+
+
+@base_router.post(
+    "/workflow/copilot/clear-proposed-workflow", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT
+)
+async def workflow_copilot_clear_proposed_workflow(
+    clear_request: WorkflowCopilotClearProposedWorkflowRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    updated_chat = await app.DATABASE.update_workflow_copilot_chat(
+        organization_id=organization.organization_id,
+        workflow_copilot_chat_id=clear_request.workflow_copilot_chat_id,
+        proposed_workflow=None,
+        auto_accept=clear_request.auto_accept,
+    )
+    if not updated_chat:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
 
 
 def convert_to_history_messages(
@@ -540,3 +569,30 @@ def convert_to_history_messages(
         )
         for message in messages
     ]
+
+
+@base_router.post("/workflow/copilot/convert-yaml-to-blocks", include_in_schema=False)
+async def workflow_copilot_convert_yaml_to_blocks(
+    request: WorkflowYAMLConversionRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowYAMLConversionResponse:
+    """
+    Convert workflow definition YAML to blocks format for comparison view.
+    This endpoint is used by the frontend to convert YAML to the proper blocks structure
+    that the comparison panel expects.
+    """
+    try:
+        parsed_yaml = yaml.safe_load(request.workflow_definition_yaml)
+        workflow_definition_yaml = WorkflowDefinitionYAML.model_validate(parsed_yaml)
+
+        workflow_definition = convert_workflow_definition(
+            workflow_definition_yaml=workflow_definition_yaml,
+            workflow_id=request.workflow_id,
+        )
+
+        return WorkflowYAMLConversionResponse(workflow_definition=workflow_definition.model_dump(mode="json"))
+    except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to convert workflow YAML: {str(e)}",
+        )

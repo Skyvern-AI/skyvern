@@ -28,6 +28,7 @@ from .login_block_parameters_item import LoginBlockParametersItem
 from .navigation_block_data_schema import NavigationBlockDataSchema
 from .navigation_block_parameters_item import NavigationBlockParametersItem
 from .output_parameter import OutputParameter
+from .print_page_block_parameters_item import PrintPageBlockParametersItem
 from .run_engine import RunEngine
 from .task_block_data_schema import TaskBlockDataSchema
 from .task_block_parameters_item import TaskBlockParametersItem
@@ -359,6 +360,8 @@ class WorkflowDefinitionBlocksItem_HttpRequest(UniversalBaseModel):
     files: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     timeout: typing.Optional[int] = None
     follow_redirects: typing.Optional[bool] = None
+    download_filename: typing.Optional[str] = None
+    save_response_as_file: typing.Optional[bool] = None
     parameters: typing.Optional[typing.List[HttpRequestBlockParametersItem]] = None
 
     if IS_PYDANTIC_V2:
@@ -510,6 +513,32 @@ class WorkflowDefinitionBlocksItem_PdfParser(UniversalBaseModel):
     next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class WorkflowDefinitionBlocksItem_PrintPage(UniversalBaseModel):
+    block_type: typing.Literal["print_page"] = "print_page"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    output_parameter: OutputParameter
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    include_timestamp: typing.Optional[bool] = None
+    custom_filename: typing.Optional[str] = None
+    format: typing.Optional[str] = None
+    landscape: typing.Optional[bool] = None
+    print_background: typing.Optional[bool] = None
+    parameters: typing.Optional[typing.List[PrintPageBlockParametersItem]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -741,6 +770,7 @@ WorkflowDefinitionBlocksItem = typing.Union[
     WorkflowDefinitionBlocksItem_Login,
     WorkflowDefinitionBlocksItem_Navigation,
     WorkflowDefinitionBlocksItem_PdfParser,
+    WorkflowDefinitionBlocksItem_PrintPage,
     WorkflowDefinitionBlocksItem_SendEmail,
     WorkflowDefinitionBlocksItem_Task,
     WorkflowDefinitionBlocksItem_TaskV2,
@@ -759,6 +789,7 @@ update_forward_refs(WorkflowDefinitionBlocksItem_HttpRequest)
 update_forward_refs(WorkflowDefinitionBlocksItem_HumanInteraction)
 update_forward_refs(WorkflowDefinitionBlocksItem_Login)
 update_forward_refs(WorkflowDefinitionBlocksItem_Navigation)
+update_forward_refs(WorkflowDefinitionBlocksItem_PrintPage)
 update_forward_refs(WorkflowDefinitionBlocksItem_Task)
 update_forward_refs(WorkflowDefinitionBlocksItem_TextPrompt)
 update_forward_refs(WorkflowDefinitionBlocksItem_Validation)

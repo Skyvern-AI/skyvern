@@ -3,7 +3,6 @@ import {
   BookmarkIcon,
   ChevronDownIcon,
   ChevronUpIcon,
-  ClockIcon,
   CodeIcon,
   CopyIcon,
   PlayIcon,
@@ -13,6 +12,7 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { SaveIcon } from "@/components/icons/SaveIcon";
 import { BrowserIcon } from "@/components/icons/BrowserIcon";
+import { VersionHistoryIcon } from "@/components/icons/VersionHistoryIcon";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -300,7 +300,7 @@ function WorkflowHeader({
                       if (debugStore.isDebugMode) {
                         navigate(`/workflows/${workflowPermanentId}/edit`);
                       } else {
-                        navigate(`/workflows/${workflowPermanentId}/debug`);
+                        navigate(`/workflows/${workflowPermanentId}/build`);
                       }
                     }}
                   >
@@ -386,7 +386,7 @@ function WorkflowHeader({
                         onHistory?.();
                       }}
                     >
-                      <ClockIcon className="size-6" />
+                      <VersionHistoryIcon size={24} />
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent>History</TooltipContent>

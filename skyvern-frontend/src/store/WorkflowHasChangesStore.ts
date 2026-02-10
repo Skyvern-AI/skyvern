@@ -31,11 +31,13 @@ type WorkflowHasChangesStore = {
   saveIsPending: boolean;
   saidOkToCodeCacheDeletion: boolean;
   showConfirmCodeCacheDeletion: boolean;
+  isInternalUpdate: boolean;
   setGetSaveData: (getSaveData: () => SaveData) => void;
   setHasChanges: (hasChanges: boolean) => void;
   setSaveIsPending: (isPending: boolean) => void;
   setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => void;
   setShowConfirmCodeCacheDeletion: (show: boolean) => void;
+  setIsInternalUpdate: (isInternalUpdate: boolean) => void;
 };
 
 interface WorkflowSaveOpts {
@@ -48,6 +50,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     saveIsPending: false,
     saidOkToCodeCacheDeletion: false,
     showConfirmCodeCacheDeletion: false,
+    isInternalUpdate: false,
     getSaveData: () => null,
     setGetSaveData: (getSaveData: () => SaveData) => {
       set({ getSaveData });
@@ -63,6 +66,9 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     },
     setShowConfirmCodeCacheDeletion: (show: boolean) => {
       set({ showConfirmCodeCacheDeletion: show });
+    },
+    setIsInternalUpdate: (isInternalUpdate: boolean) => {
+      set({ isInternalUpdate });
     },
   };
 });

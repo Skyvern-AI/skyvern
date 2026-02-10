@@ -145,6 +145,7 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
   return (
     <>
       <Select
+        key={value ?? "no-credential"}
         value={isCredentialMissing ? undefined : selectedCredentialId ?? value}
         onValueChange={(newValue) => {
           if (newValue === "new") {
