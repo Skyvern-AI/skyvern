@@ -112,6 +112,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -227,6 +228,18 @@ class AgentDB(BaseAlchemyDB):
         download_timeout: float | None = None,
     ) -> Task:
         try:
+            # Sanitize text fields to remove NUL bytes and control characters
+            # that PostgreSQL cannot store in text columns
+            def _sanitize(v: str | None) -> str | None:
+                return sanitize_postgres_text(v) if isinstance(v, str) else v
+
+            navigation_goal = _sanitize(navigation_goal)
+            data_extraction_goal = _sanitize(data_extraction_goal)
+            title = _sanitize(title)
+            url = sanitize_postgres_text(url)
+            complete_criterion = _sanitize(complete_criterion)
+            terminate_criterion = _sanitize(terminate_criterion)
+
             async with self.Session() as session:
                 new_task = TaskModel(
                     status=status,

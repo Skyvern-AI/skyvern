@@ -1795,6 +1795,7 @@ class ForgeAgent:
 
     async def _speculate_next_step_plan(
         self,
+        organization: Organization,
         task: Task,
         current_step: Step,
         next_step: Step,
@@ -1811,6 +1812,9 @@ class ForgeAgent:
 
         try:
             next_step.is_speculative = True
+
+            if page := await browser_state.get_working_page():
+                await self.register_async_operations(organization, task, page)
 
             scraped_page, extract_action_prompt, use_caching, prompt_name = await self.build_and_record_step_prompt(
                 task,
@@ -1829,6 +1833,8 @@ class ForgeAgent:
                 task.llm_key,
                 default=app.LLM_API_HANDLER,
             )
+
+            self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
 
             llm_json_response = await llm_api_handler(
                 prompt=extract_action_prompt,
@@ -3766,6 +3772,7 @@ class ForgeAgent:
 
         speculative_task = asyncio.create_task(
             self._speculate_next_step_plan(
+                organization=organization,
                 task=task,
                 current_step=step,
                 next_step=next_step,
