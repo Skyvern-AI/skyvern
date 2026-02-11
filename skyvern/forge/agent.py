@@ -3397,7 +3397,7 @@ class ForgeAgent:
                 "Sending task response to webhook callback url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
-                payload=signed_data.signed_payload,
+                payload=signed_data.payload_for_log,
                 headers=signed_data.headers,
             )
 
