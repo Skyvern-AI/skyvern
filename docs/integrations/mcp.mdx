@@ -1,0 +1,103 @@
+---
+title: MCP Server
+subtitle: Connect AI applications to browser automation via Model Context Protocol
+slug: integrations/mcp
+---
+
+The Skyvern MCP server lets you connect AI applications like Claude Desktop, Cursor, and Windsurf to browser automation.
+
+Use it to fill out forms, download files, research information on the web, and more—directly from your AI assistant.
+
+---
+
+## What you'll need
+
+- A local Skyvern deployment, or
+- A Skyvern Cloud API key
+
+---
+
+## Option A: Setup Wizard
+
+The interactive wizard configures your MCP client and sets up credentials automatically.
+
+```bash
+pip install skyvern
+skyvern init
+```
+
+The wizard will:
+1. Detect your MCP client (Claude Desktop, Cursor, or Windsurf)
+2. Ask whether to use Skyvern Cloud or local mode
+3. Configure your LLM provider and start the server (if local)
+
+---
+
+## Option B: Manual Configuration
+
+For other MCP-enabled applications, add this to your MCP configuration file:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "env": {
+        "SKYVERN_BASE_URL": "https://api.skyvern.com",
+        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
+      },
+      "command": "PATH_TO_PYTHON",
+      "args": [
+        "-m",
+        "skyvern",
+        "run",
+        "mcp"
+      ]
+    }
+  }
+}
+```
+
+For local mode, set `SKYVERN_BASE_URL` to `http://localhost:8000`. Find your local `SKYVERN_API_KEY` in the `.env` file after running `skyvern init`.
+
+---
+
+## See it in action
+
+### Claude Desktop looking up Hacker News
+
+<video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
+  <source src="https://github.com/user-attachments/assets/0c10dd96-c6ff-4b99-ad99-f34a5afd04fe" type="video/mp4" />
+</video>
+
+### Cursor finding programming jobs
+
+<video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
+  <source src="https://github.com/user-attachments/assets/084c89c9-6229-4bac-adc9-6ad69b41327d" type="video/mp4" />
+</video>
+
+### Windsurf searching Form 5500 and downloading files
+
+<video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
+  <source src="https://github.com/user-attachments/assets/70cfe310-24dc-431a-adde-e72691f198a7" type="video/mp4" />
+</video>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Run a Task"
+    icon="play"
+    href="/running-automations/run-a-task"
+  >
+    Learn the API for running browser automations
+  </Card>
+  <Card
+    title="API Quickstart"
+    icon="rocket"
+    href="/getting-started/quickstart"
+  >
+    Get started with the Skyvern SDK
+  </Card>
+</CardGroup>
