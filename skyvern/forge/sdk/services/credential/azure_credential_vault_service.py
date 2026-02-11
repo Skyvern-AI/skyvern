@@ -66,6 +66,35 @@ class AzureCredentialVaultService(CredentialVaultService):
 
         return credential
 
+    async def update_credential(self, credential: Credential, data: CreateCredentialRequest) -> Credential:
+        # Azure supports in-place secret updates, so we reuse the same item_id.
+        # NOTE: If the DB update below fails, the vault will contain the new data
+        # while DB metadata (name, type, username) remains stale. The actual credential
+        # data in the vault is still correct since it uses the same item_id. A retry
+        # of the update call will reconcile the DB metadata.
+        await self._update_azure_secret_item(
+            item_id=credential.item_id,
+            credential=data.credential,
+        )
+
+        try:
+            updated_credential = await self._update_db_credential(
+                credential=credential,
+                data=data,
+                item_id=credential.item_id,
+            )
+        except Exception:
+            LOG.error(
+                "DB update failed after Azure vault secret was already overwritten. "
+                "Vault data is updated but DB metadata may be stale.",
+                organization_id=credential.organization_id,
+                credential_id=credential.credential_id,
+                item_id=credential.item_id,
+            )
+            raise
+
+        return updated_credential
+
     async def delete_credential(
         self,
         credential: Credential,
@@ -78,7 +107,7 @@ class AzureCredentialVaultService(CredentialVaultService):
             secret_value="",
         )
 
-    async def post_delete_credential_item(self, item_id: str) -> None:
+    async def post_delete_credential_item(self, item_id: str, _organization_id: str | None = None) -> None:
         """
         Background task to delete the credential item from Azure Key Vault.
         This allows the API to respond quickly while the deletion happens asynchronously.
@@ -182,5 +211,44 @@ class AzureCredentialVaultService(CredentialVaultService):
         return await self._client.create_or_update_secret(
             vault_name=self._vault_name,
             secret_name=secret_name,
+            secret_value=secret_value,
+        )
+
+    async def _update_azure_secret_item(
+        self,
+        item_id: str,
+        credential: PasswordCredential | CreditCardCredential | SecretCredential,
+    ) -> None:
+        if isinstance(credential, PasswordCredential):
+            data = AzureCredentialVaultService._PasswordCredentialDataImage(
+                type="password",
+                username=credential.username,
+                password=credential.password,
+                totp=credential.totp,
+            )
+        elif isinstance(credential, CreditCardCredential):
+            data = AzureCredentialVaultService._CreditCardCredentialDataImage(
+                type="credit_card",
+                card_number=credential.card_number,
+                card_cvv=credential.card_cvv,
+                card_exp_month=credential.card_exp_month,
+                card_exp_year=credential.card_exp_year,
+                card_brand=credential.card_brand,
+                card_holder_name=credential.card_holder_name,
+            )
+        elif isinstance(credential, SecretCredential):
+            data = AzureCredentialVaultService._SecretCredentialDataImage(
+                type="secret",
+                secret_value=credential.secret_value,
+                secret_label=credential.secret_label,
+            )
+        else:
+            raise TypeError(f"Invalid credential type: {type(credential)}")
+
+        secret_value = data.model_dump_json(exclude_none=True)
+
+        await self._client.create_or_update_secret(
+            vault_name=self._vault_name,
+            secret_name=item_id,
             secret_value=secret_value,
         )

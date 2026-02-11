@@ -1,0 +1,262 @@
+---
+title: Browser Configuration
+subtitle: Configure browser modes, display settings, and external Chrome connections
+slug: self-hosted/browser
+---
+
+Skyvern uses Playwright with Chromium to execute browser automations.
+
+## Browser modes
+
+The `BROWSER_TYPE` setting controls how Skyvern runs the browser.
+
+### Headful (default)
+
+```bash .env
+BROWSER_TYPE=chromium-headful
+```
+
+The browser runs with a visible window. In Docker, this displays on a virtual framebuffer (Xvfb).
+
+### Headless
+
+```bash .env
+BROWSER_TYPE=chromium-headless
+```
+
+The browser runs without any display.
+
+<Note>
+Some websites detect and block headless browsers. If you encounter issues with bot detection, try headful mode with a virtual display.
+</Note>
+
+### CDP Connect (External Chrome)
+
+```bash .env
+BROWSER_TYPE=cdp-connect
+BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
+```
+
+Connect to an existing Chrome instance running with remote debugging enabled. Useful for:
+- Using your existing browser profile with saved logins
+- Debugging with Chrome DevTools
+- Running automations on a browser with specific extensions
+
+---
+
+## Setting up CDP Connect
+
+CDP (Chrome DevTools Protocol) lets Skyvern control an external Chrome browser instead of launching its own.
+
+### Step 1: Start Chrome with remote debugging
+
+<CodeGroup>
+```bash macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/chrome-cdp-profile" \
+  --no-first-run \
+  --no-default-browser-check
+```
+
+```powershell Windows
+"C:\Program Files\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9222 `
+  --user-data-dir="C:\chrome-cdp-profile" `
+  --no-first-run `
+  --no-default-browser-check
+```
+
+```bash Linux
+google-chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/chrome-cdp-profile" \
+  --no-first-run \
+  --no-default-browser-check
+```
+</CodeGroup>
+
+The `--user-data-dir` flag creates a separate profile for Skyvern, preserving your main Chrome profile.
+
+### Step 2: Configure Skyvern
+
+```bash .env
+BROWSER_TYPE=cdp-connect
+BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
+```
+
+When running Skyvern in Docker:
+
+| Host OS | URL |
+|---------|-----|
+| macOS/Windows | `http://host.docker.internal:9222/` |
+| Linux | `http://172.17.0.1:9222/` |
+
+### Step 3: Verify connection
+
+Test that Skyvern can reach Chrome:
+
+```bash
+curl http://localhost:9222/json/version
+```
+
+You should see Chrome's version information.
+
+<Warning>
+CDP mode exposes Chrome to network access. Only use this in trusted environments and bind to localhost when possible.
+</Warning>
+
+---
+
+## Display settings
+
+Configure how the browser appears to websites. These settings affect geolocation detection and content rendering.
+
+### Locale and timezone
+
+```bash .env
+# Optional, unset by default. Set to match your target region.
+BROWSER_LOCALE=en-US
+BROWSER_TIMEZONE=America/New_York
+```
+
+Set these to match your target audience or the expected user location. Mismatched locale/timezone can trigger bot detection on some sites.
+
+Common combinations:
+
+| Region | BROWSER_LOCALE | BROWSER_TIMEZONE |
+|--------|----------------|------------------|
+| US East | `en-US` | `America/New_York` |
+| US West | `en-US` | `America/Los_Angeles` |
+| UK | `en-GB` | `Europe/London` |
+| Germany | `de-DE` | `Europe/Berlin` |
+| Japan | `ja-JP` | `Asia/Tokyo` |
+
+### Viewport size
+
+```bash .env
+BROWSER_WIDTH=1920
+BROWSER_HEIGHT=1080
+```
+
+The default 1920x1080 works for most sites.
+
+---
+
+## Timeout settings
+
+Control how long Skyvern waits for various browser operations.
+
+```bash .env
+# Time to wait for individual actions (clicks, typing)
+BROWSER_ACTION_TIMEOUT_MS=5000
+
+# Time to wait for screenshots to capture
+BROWSER_SCREENSHOT_TIMEOUT_MS=20000
+
+# Time to wait for page loads
+BROWSER_LOADING_TIMEOUT_MS=60000
+
+# Time to wait for DOM tree analysis
+BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS=60000
+```
+
+### When to adjust timeouts
+
+| Symptom | Adjustment |
+|---------|------------|
+| Actions fail on slow sites | Increase `BROWSER_ACTION_TIMEOUT_MS` |
+| Screenshots timeout on complex pages | Increase `BROWSER_SCREENSHOT_TIMEOUT_MS` |
+| Page load timeouts | Increase `BROWSER_LOADING_TIMEOUT_MS` |
+| DOM analysis fails on large pages | Increase `BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS` |
+
+---
+
+## Advanced settings
+
+### Browser logging
+
+```bash .env
+BROWSER_LOGS_ENABLED=true
+```
+
+When enabled, browser console logs are captured in artifacts. Useful for debugging JavaScript errors on target sites.
+
+### Maximum pages
+
+```bash .env
+BROWSER_MAX_PAGES_NUMBER=10
+```
+
+Limits the number of browser tabs Skyvern can open simultaneously. Increase if your workflows navigate multiple pages in parallel; decrease to reduce memory usage.
+
+### Chrome policies
+
+```bash .env
+BROWSER_POLICY_FILE=/etc/chromium/policies/managed/policies.json
+```
+
+Path to a Chrome policy file for enterprise configurations.
+
+### Video recording path
+
+```bash .env
+VIDEO_PATH=./videos
+```
+
+Directory where browser session recordings are saved. Recordings are useful for debugging but consume disk space.
+
+---
+
+## Memory considerations
+
+Browser instances are memory-intensive. These are approximate guidelines. Actual usage depends on page complexity and browser settings.
+
+| Concurrent tasks | Recommended RAM |
+|------------------|-----------------|
+| 1-2 | 4GB |
+| 3-5 | 8GB |
+| 6-10 | 16GB |
+| 10+ | 32GB+ |
+
+If you experience out-of-memory errors:
+1. Reduce `BROWSER_MAX_PAGES_NUMBER`
+2. Use a smaller viewport (`BROWSER_WIDTH`, `BROWSER_HEIGHT`)
+3. Run in headless mode (`BROWSER_TYPE=chromium-headless`)
+4. Limit concurrent task execution
+
+---
+
+## Scaling browsers
+
+The default Docker Compose setup runs one browser instance inside the Skyvern container. For higher concurrency:
+
+### Option 1: Vertical scaling
+
+Add more RAM to your server and increase `MAX_STEPS_PER_RUN` and `BROWSER_MAX_PAGES_NUMBER`.
+
+### Option 2: Horizontal scaling
+
+Deploy multiple Skyvern instances behind a load balancer. Each instance runs its own browser. See [Kubernetes Deployment](/self-hosted/kubernetes) for orchestrated scaling.
+
+### Option 3: External browser pool
+
+Use a browser pool service like Browserless or your own Playwright grid, then connect via CDP:
+
+```bash .env
+BROWSER_TYPE=cdp-connect
+BROWSER_REMOTE_DEBUGGING_URL=http://browserless:3000/
+```
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Proxy Setup" icon="shield" href="/self-hosted/proxy">
+    Configure proxies to avoid bot detection
+  </Card>
+  <Card title="Storage Configuration" icon="hard-drive" href="/self-hosted/storage">
+    Store recordings and artifacts in S3 or Azure Blob
+  </Card>
+</CardGroup>
