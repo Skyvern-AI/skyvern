@@ -1,7 +1,7 @@
 ---
 title: The Discover Page
 subtitle: Run ad-hoc browser automations with natural language
-slug: cloud/discover-page
+slug: cloud/run-a-task
 ---
 
 The **Discover** page is where you run one-off browser automations. Type what you want done in plain language, and Skyvern opens a browser and does it for you.
@@ -67,7 +67,7 @@ Click the **gear icon** next to the prompt box to expand the settings panel.
 
 The **Data Schema** field in advanced settings lets you define the structure of extracted output as [JSON Schema](https://json-schema.org/).
 
-Without a schema, the AI returns data in whatever format it chooses. With a schema, output conforms to your structure — making it predictable for downstream use.
+Without a schema, the AI returns data in whatever format it chooses. With a schema, output conforms to your structure, making it predictable for downstream use.
 
 <img src="/images/cloud/data-schema-field.png" alt="Data schema field with JSON" />
 
@@ -127,7 +127,7 @@ Use the `description` field on each property to guide the AI on what to extract.
 
 ## Workflow templates
 
-Below the prompt box, the Discover page shows a gallery of **workflow templates** — pre-built automations for common use cases.
+Below the prompt box, the Discover page shows a gallery of **workflow templates**: pre-built automations for common use cases.
 
 <img src="/images/cloud/workflow-templates.png" alt="Workflow template gallery" />
 
@@ -140,5 +140,5 @@ Click any template to launch it with pre-filled configuration, or use it as a st
 1. Your prompt is sent to Skyvern
 2. A cloud browser opens and navigates to the target URL (or finds one from your prompt)
 3. The AI analyzes the page, plans actions, and executes them step by step
-4. You're taken to the [live execution view](/cloud/live-execution) where you can watch it happen in real time
+4. You're taken to the [live execution view](/cloud/monitor-a-run) where you can watch it happen in real time
 5. When complete, results appear on the run detail page under **Runs**
