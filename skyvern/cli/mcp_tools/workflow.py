@@ -14,6 +14,7 @@ from typing import Annotated, Any
 import structlog
 from pydantic import Field
 
+from skyvern import analytics
 from skyvern.client.errors import NotFoundError
 from skyvern.client.types import WorkflowCreateYamlRequest
 from skyvern.schemas.runs import ProxyLocation
@@ -279,6 +280,15 @@ async def skyvern_workflow_list(
                 error=make_error(ErrorCode.API_ERROR, str(e), "Check your API key and Skyvern connection"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-workflow-list",
+        data={
+            "count": len(workflows),
+            "has_search": search is not None,
+            "only_workflows": only_workflows,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_workflow_list",
         data={
@@ -326,6 +336,13 @@ async def skyvern_workflow_get(
             )
 
     version_str = f", version={version}" if version is not None else ""
+    analytics.capture(
+        "skyvern-oss-mcp-workflow-get",
+        data={
+            "has_version": version is not None,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_workflow_get",
         data={
@@ -422,6 +439,14 @@ async def skyvern_workflow_create(
             )
 
     LOG.info("workflow_created", workflow_id=workflow.workflow_permanent_id)
+    analytics.capture(
+        "skyvern-oss-mcp-workflow-create",
+        data={
+            "format": "json" if json_def is not None else "yaml",
+            "has_folder": folder_id is not None,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     data = _serialize_workflow(workflow)
     fmt_label = "json_definition" if json_def is not None else "yaml_definition"
     folder_str = f", folder_id={folder_id!r}" if folder_id is not None else ""
@@ -481,6 +506,13 @@ async def skyvern_workflow_update(
                 ),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-workflow-update",
+        data={
+            "format": "json" if json_def is not None else "yaml",
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     data = _serialize_workflow(workflow)
     fmt_label = "json_definition" if json_def is not None else "yaml_definition"
     data["sdk_equivalent"] = f"await skyvern.update_workflow({workflow_id!r}, {fmt_label}=<definition>)"
@@ -534,6 +566,10 @@ async def skyvern_workflow_delete(
             )
 
     LOG.info("workflow_deleted", workflow_id=workflow_id)
+    analytics.capture(
+        "skyvern-oss-mcp-workflow-delete",
+        data={"timing_ms": timer.timing_ms.get("total")},
+    )
     return make_result(
         "skyvern_workflow_delete",
         data={
@@ -648,6 +684,17 @@ async def skyvern_workflow_run(
             )
 
     LOG.info("workflow_run_started", workflow_id=workflow_id, run_id=run.run_id, wait=wait)
+    analytics.capture(
+        "skyvern-oss-mcp-workflow-run",
+        data={
+            "wait": wait,
+            "has_parameters": parsed_params is not None,
+            "has_browser_session": browser_session_id is not None,
+            "has_proxy": proxy_location is not None,
+            "status": str(run.status) if run.status else None,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     data = _serialize_run(run)
     params_str = f", parameters={parsed_params}" if parsed_params else ""
     wait_str = f", wait_for_completion=True, timeout={timeout_seconds}" if wait else ""
@@ -688,6 +735,13 @@ async def skyvern_workflow_status(
                 error=make_error(ErrorCode.API_ERROR, str(e), "Check the run ID and your API key"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-workflow-status",
+        data={
+            "status": str(run.status) if run.status else None,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     data = _serialize_run(run)
     data["sdk_equivalent"] = f"await skyvern.get_run({run_id!r})"
     return make_result("skyvern_workflow_status", data=data, timing_ms=timer.timing_ms)
@@ -728,6 +782,10 @@ async def skyvern_workflow_cancel(
             )
 
     LOG.info("workflow_cancelled", run_id=run_id)
+    analytics.capture(
+        "skyvern-oss-mcp-workflow-cancel",
+        data={"timing_ms": timer.timing_ms.get("total")},
+    )
     return make_result(
         "skyvern_workflow_cancel",
         data={

@@ -15,6 +15,7 @@ from typing import Annotated, Any
 import structlog
 from pydantic import Field, TypeAdapter, ValidationError
 
+from skyvern import analytics
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     ActionBlockYAML,
@@ -319,6 +320,10 @@ async def skyvern_block_schema(
     action = "skyvern_block_schema"
 
     if block_type is None:
+        analytics.capture(
+            "skyvern-oss-mcp-block-schema",
+            data={"mode": "list_all"},
+        )
         return make_result(
             action,
             data={
@@ -344,6 +349,10 @@ async def skyvern_block_schema(
     kb = _parse_knowledge_base()
     kb_entry = kb.get(normalized, {})
 
+    analytics.capture(
+        "skyvern-oss-mcp-block-schema",
+        data={"mode": "get_schema", "block_type": normalized},
+    )
     return make_result(
         action,
         data={
@@ -418,6 +427,10 @@ async def skyvern_block_validate(
     adapter = _get_block_adapter()
     try:
         block = adapter.validate_python(raw)
+        analytics.capture(
+            "skyvern-oss-mcp-block-validate",
+            data={"valid": True, "block_type": block.block_type},
+        )
         return make_result(
             action,
             data={
@@ -432,6 +445,10 @@ async def skyvern_block_validate(
         for err in exc.errors():
             loc = " → ".join(str(p) for p in err["loc"]) if err["loc"] else "(root)"
             errors.append(f"{loc}: {err['msg']}")
+        analytics.capture(
+            "skyvern-oss-mcp-block-validate",
+            data={"valid": False, "error_count": len(exc.errors())},
+        )
         return make_result(
             action,
             ok=False,

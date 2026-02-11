@@ -9,6 +9,8 @@ from typing import Annotated, Any
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
 
+from skyvern import analytics
+
 from ._common import (
     ErrorCode,
     Timer,
@@ -89,6 +91,10 @@ async def skyvern_navigate(
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the URL is valid and accessible"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-browser-navigate",
+        data={"timing_ms": timer.timing_ms.get("total")},
+    )
     return make_result(
         "skyvern_navigate",
         browser_context=ctx,
@@ -203,6 +209,15 @@ async def skyvern_click(
     elif selector:
         data["sdk_equivalent"] = f'await page.click("{selector}")'
 
+    analytics.capture(
+        "skyvern-oss-mcp-browser-click",
+        data={
+            "ai_mode": ai_mode,
+            "has_selector": selector is not None,
+            "has_intent": intent is not None,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_click",
         browser_context=ctx,
@@ -313,6 +328,16 @@ async def skyvern_type(
         data["sdk_equivalent"] = f'await page.fill(prompt="{intent}", value="{text}")'
     elif selector:
         data["sdk_equivalent"] = f'await page.fill("{selector}", "{text}")'
+    analytics.capture(
+        "skyvern-oss-mcp-browser-type",
+        data={
+            "ai_mode": ai_mode,
+            "has_selector": selector is not None,
+            "has_intent": intent is not None,
+            "text_length": len(text),
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_type",
         browser_context=ctx,
@@ -359,6 +384,16 @@ async def skyvern_screenshot(
 
     if inline:
         data_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        analytics.capture(
+            "skyvern-oss-mcp-browser-screenshot",
+            data={
+                "inline": True,
+                "full_page": full_page,
+                "has_selector": selector is not None,
+                "bytes": len(screenshot_bytes),
+                "timing_ms": timer.timing_ms.get("total"),
+            },
+        )
         return make_result(
             "skyvern_screenshot",
             browser_context=ctx,
@@ -383,6 +418,16 @@ async def skyvern_screenshot(
         session_id=ctx.session_id,
     )
 
+    analytics.capture(
+        "skyvern-oss-mcp-browser-screenshot",
+        data={
+            "inline": False,
+            "full_page": full_page,
+            "has_selector": selector is not None,
+            "bytes": len(screenshot_bytes),
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_screenshot",
         browser_context=ctx,
@@ -439,6 +484,14 @@ async def skyvern_scroll(
                     error=make_error(code, str(e), "Could not find element to scroll into view"),
                 )
 
+        analytics.capture(
+            "skyvern-oss-mcp-browser-scroll",
+            data={
+                "mode": "into_view",
+                "ai_mode": ai_mode,
+                "timing_ms": timer.timing_ms.get("total"),
+            },
+        )
         return make_result(
             "skyvern_scroll",
             browser_context=ctx,
@@ -480,6 +533,15 @@ async def skyvern_scroll(
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "Scroll action failed"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-browser-scroll",
+        data={
+            "mode": "direction",
+            "direction": direction,
+            "pixels": pixels,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_scroll",
         browser_context=ctx,
@@ -559,6 +621,15 @@ async def skyvern_select_option(
         data["sdk_equivalent"] = f'await page.select_option(prompt="{intent}", value="{value}")'
     elif selector:
         data["sdk_equivalent"] = f'await page.select_option("{selector}", value="{value}")'
+    analytics.capture(
+        "skyvern-oss-mcp-browser-select-option",
+        data={
+            "ai_mode": ai_mode,
+            "has_selector": selector is not None,
+            "has_intent": intent is not None,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_select_option",
         browser_context=ctx,
@@ -617,6 +688,14 @@ async def skyvern_press_key(
     else:
         sdk_eq = f'await page.keyboard.press("{key}")'
 
+    analytics.capture(
+        "skyvern-oss-mcp-browser-press-key",
+        data={
+            "has_selector": selector is not None,
+            "has_intent": intent is not None,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_press_key",
         browser_context=ctx,
@@ -729,6 +808,13 @@ async def skyvern_wait(
         sdk_eq = f'await page.validate("{intent}")'
     elif waited_for == "selector":
         sdk_eq = f'await page.wait_for_selector("{selector}")'
+    analytics.capture(
+        "skyvern-oss-mcp-browser-wait",
+        data={
+            "waited_for": waited_for,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_wait",
         browser_context=ctx,
@@ -764,6 +850,10 @@ async def skyvern_evaluate(
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check JavaScript syntax"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-browser-evaluate",
+        data={"timing_ms": timer.timing_ms.get("total")},
+    )
     return make_result(
         "skyvern_evaluate",
         browser_context=ctx,
@@ -819,6 +909,14 @@ async def skyvern_extract(
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Check that the page has loaded and the prompt is clear"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-browser-extract",
+        data={
+            "has_schema": schema is not None,
+            "prompt_length": len(prompt),
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_extract",
         browser_context=ctx,
@@ -855,6 +953,14 @@ async def skyvern_validate(
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Check that the page has loaded and the prompt is clear"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-browser-validate",
+        data={
+            "valid": valid,
+            "prompt_length": len(prompt),
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_validate",
         browser_context=ctx,
@@ -893,6 +999,13 @@ async def skyvern_act(
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Simplify the prompt or break the task into steps"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-browser-act",
+        data={
+            "prompt_length": len(prompt),
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_act",
         browser_context=ctx,
@@ -961,6 +1074,16 @@ async def skyvern_run_task(
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Check the prompt, URL, and timeout settings"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-browser-run-task",
+        data={
+            "status": response.status,
+            "has_url": url is not None,
+            "has_schema": data_extraction_schema is not None,
+            "prompt_length": len(prompt),
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_run_task",
         browser_context=ctx,
