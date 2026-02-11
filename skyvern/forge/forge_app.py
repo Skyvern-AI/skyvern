@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Awaitable, Callable
 
+import structlog
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
 from fastapi import FastAPI
 from openai import AsyncAzureOpenAI, AsyncOpenAI
@@ -35,11 +36,14 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.services.browser_recording.service import BrowserSessionRecordingService
+from skyvern.services.streaming.service import StreamingService
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
+
+LOG = structlog.get_logger()
 
 
 class ForgeApp:
@@ -76,6 +80,7 @@ class ForgeApp:
     AGENT_FUNCTION: AgentFunction
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
     BROWSER_SESSION_RECORDING_SERVICE: BrowserSessionRecordingService
+    STREAMING_SERVICE: StreamingService
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
     CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
@@ -194,6 +199,7 @@ def create_forge_app() -> ForgeApp:
     app.AGENT_FUNCTION = AgentFunction()
     app.PERSISTENT_SESSIONS_MANAGER = DefaultPersistentSessionsManager(database=app.DATABASE)
     app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
+    app.STREAMING_SERVICE = StreamingService()
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
     app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = BitwardenCredentialVaultService()
@@ -244,6 +250,13 @@ def create_forge_app() -> ForgeApp:
     app.setup_api_app = None
     app.api_app_startup_event = None
     app.api_app_shutdown_event = None
+
+    # Set up startup event to start streaming service monitoring
+    async def _startup_event(fastapi_app: FastAPI) -> None:
+        structlog.get_logger(__name__).info("Starting streaming service monitoring loop")
+        await app.STREAMING_SERVICE.start_monitoring()
+
+    app.api_app_startup_event = _startup_event
 
     app.agent = ForgeAgent()
 

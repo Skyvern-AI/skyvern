@@ -55,8 +55,8 @@ export DISPLAY=:99
 Xvfb :99 -screen 0 1920x1080x16 &
 xvfb=$!
 
-DISPLAY=:99 xterm 2>/dev/null &
-python run_streaming.py > /dev/null &
+# The streaming service is now integrated into the ForgeApp
+# and will be started automatically when the API app starts
 
 echo "Starting live streaming services..."
 sh ./scripts/start_vnc_streaming.sh
