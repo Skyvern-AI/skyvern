@@ -1,0 +1,107 @@
+---
+title: Running Workflows
+subtitle: Execute workflows, fill parameters, and track status
+slug: cloud/run-a-workflow
+---
+
+Once you've built and saved a workflow, you can run it from the editor or the workflows list. Each run creates an independent execution with its own status, logs, and output.
+
+## Starting a run
+
+Two ways to start:
+
+1. **From the editor**: Click the **Run** button (play icon) in the header bar. The editor saves your workflow first.
+2. **From the workflows list**: Click the **play icon** on the workflow's row.
+
+Both take you to the parameters page where you fill in runtime values before the run starts.
+
+
+## Filling in parameters
+
+The parameters page shows all [workflow parameters](/cloud/add-parameters) defined in the editor. Fill in a value for each one, or leave them at their defaults. Parameters without defaults must be filled in before running.
+
+
+## Run settings
+
+Below the parameters, you can configure settings for this specific run:
+
+| Setting | Description |
+|---------|-------------|
+| **Proxy Location** | Route browser traffic through a proxy in a specific country. Default: US Residential. |
+| **Webhook Callback URL** | URL that receives a POST request when the run completes |
+| **Max Screenshot Scrolls** | Override screenshot scroll depth for this run |
+| **Extra HTTP Headers** | Custom headers included in all browser requests (JSON) |
+| **CDP Address** | Connect to your own browser for local development |
+
+---
+
+## Monitoring a run
+
+After clicking **Run**, you're taken to the live execution view, the same interface described in [Watching Live Execution](/cloud/monitor-a-run).
+
+For workflows, the left panel also shows a **block timeline**: a list of all blocks in the workflow. Completed blocks show a checkmark. The currently executing block is highlighted.
+
+<img src="/images/cloud/workflow-run-timeline.png" alt="Workflow run block timeline" />
+
+---
+
+## Run statuses
+
+| Status | Description |
+|--------|-------------|
+| `created` | Run initialized |
+| `queued` | Waiting for an available browser |
+| `running` | Blocks are executing |
+| `completed` | All blocks finished successfully |
+| `failed` | A block failed and the workflow stopped |
+| `canceled` | You canceled the run |
+| `timed_out` | The run exceeded its time limit |
+| `terminated` | The run was terminated by the system |
+
+---
+
+## Viewing results
+
+After a run completes, open it from **Runs** in the sidebar. The run detail page shows:
+
+- **Block-by-block results**: Each block's output, status, and execution time
+- **Recording**: Full video replay of the browser session
+- **Parameters**: The values you submitted for this run
+
+See [Reviewing results](/cloud/monitor-a-run#reviewing-results) for details on the Actions, Recording, Parameters, and Diagnostics tabs.
+
+---
+
+## Canceling a run
+
+Click the **Cancel** button during execution. A confirmation dialog appears. The run moves to `canceled` status and any configured webhook fires.
+
+---
+
+## Run history
+
+Access past runs from two places:
+
+1. **Runs** in the left sidebar: shows all runs across all workflows
+2. **History** button (clock icon) in the workflow editor: shows runs for this specific workflow
+
+---
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card
+    title="Build a Workflow"
+    icon="pen-to-square"
+    href="/cloud/build-a-workflow"
+  >
+    Create and edit workflows in the visual editor
+  </Card>
+  <Card
+    title="Block Reference"
+    icon="cube"
+    href="/cloud/configure-blocks"
+  >
+    Configuration fields for every block type
+  </Card>
+</CardGroup>

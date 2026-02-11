@@ -1,0 +1,144 @@
+---
+title: The Discover Page
+subtitle: Run ad-hoc browser automations with natural language
+slug: cloud/run-a-task
+---
+
+The **Discover** page is where you run one-off browser automations. Type what you want done in plain language, and Skyvern opens a browser and does it for you.
+
+<img src="/images/cloud/discover-page-overview.png" alt="Discover page overview" />
+
+---
+
+## The prompt box
+
+Type a natural language instruction describing what you want automated. Be specific about the goal and any data you want extracted.
+
+**Examples:**
+- "Go to amazon.com and find the price of the MacBook Air M4"
+- "Fill out the contact form at example.com/contact with name John Doe and email john@example.com"
+- "Get an insurance quote from geico.com for a 2020 Toyota Camry"
+
+<img src="/images/cloud/prompt-box-filled.png" alt="Prompt box with a sample prompt" />
+
+Click the **send button** or press **Enter** to start.
+
+Below the prompt box, **quick-action buttons** offer pre-built examples like "Add a product to cart" or "Get an insurance quote." Click one to run it immediately or use it as a starting point.
+
+---
+
+## Choosing an engine
+
+The dropdown next to the send button controls which engine runs the task.
+
+| Engine | Best for |
+|--------|----------|
+| **Skyvern 2.0 with Code** | Complex, multi-step tasks. Generates reusable scripts. **(Default)** |
+| **Skyvern 2.0** | Complex tasks without script generation |
+| **Skyvern 1.0** | Simple, single-objective tasks. Faster and cheaper. |
+
+<Tip>
+Start with the default. Switch to Skyvern 1.0 when you have a straightforward, single-page task and want faster execution.
+</Tip>
+
+---
+
+## Advanced settings
+
+Click the **gear icon** next to the prompt box to expand the settings panel.
+
+<img src="/images/cloud/advanced-settings-panel.png" alt="Advanced settings panel" />
+
+| Setting | What it does |
+|---------|-------------|
+| **Proxy Location** | Route the browser through a residential proxy in a specific country. Default is `RESIDENTIAL` (US). Set to `NONE` to disable. Available: US, UK, Germany, France, Spain, Ireland, India, Japan, Australia, Canada, Brazil, Mexico, Argentina, New Zealand, South Africa, Italy, Netherlands, Philippines, Turkey. |
+| **Webhook URL** | URL that receives a POST request when the task finishes. The payload includes status, extracted data, screenshots, and recording URL. |
+| **Browser Session ID** | Run inside an existing persistent browser session (`pbs_xxx`). Preserves cookies and login state across multiple tasks. |
+| **CDP Address** | Connect to your own browser via Chrome DevTools Protocol (e.g., `http://127.0.0.1:9222`). For local development. |
+| **2FA Identifier** | Links your TOTP credentials to this task. Skyvern uses it to retrieve the correct code when a 2FA prompt appears. |
+| **Extra HTTP Headers** | Custom headers sent with every browser request, as JSON (e.g., `{"Authorization": "Bearer token"}`). |
+| **Publish Workflow** | Save a reusable workflow alongside the task run. Re-run the same automation later from the Workflows page. |
+| **Max Steps Override** | Cap the number of AI reasoning steps. Each step = one screenshot-analyze-act cycle. Useful for controlling cost during development. |
+| **Max Screenshot Scrolls** | Number of scrolls for post-action screenshots. Increase for pages with lazy-loaded content. `0` = viewport only. |
+
+---
+
+## Data extraction schema
+
+The **Data Schema** field in advanced settings lets you define the structure of extracted output as [JSON Schema](https://json-schema.org/).
+
+Without a schema, the AI returns data in whatever format it chooses. With a schema, output conforms to your structure, making it predictable for downstream use.
+
+<img src="/images/cloud/data-schema-field.png" alt="Data schema field with JSON" />
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "product_name": {
+      "type": "string",
+      "description": "The name of the product"
+    },
+    "price": {
+      "type": "number",
+      "description": "The price in USD"
+    },
+    "in_stock": {
+      "type": "boolean",
+      "description": "Whether the product is in stock"
+    }
+  }
+}
+```
+
+Use the `description` field on each property to guide the AI on what to extract.
+
+<Accordion title="Example: Extracting a list of items">
+```json
+{
+  "type": "object",
+  "properties": {
+    "quotes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "premium_amount": {
+            "type": "string",
+            "description": "Total premium in USD (e.g., '$321.57')"
+          },
+          "coverage_type": {
+            "type": "string",
+            "description": "Type of coverage (e.g., 'Full Coverage')"
+          },
+          "deductible": {
+            "type": "string",
+            "description": "Deductible amount"
+          }
+        }
+      }
+    }
+  }
+}
+```
+</Accordion>
+
+---
+
+## Workflow templates
+
+Below the prompt box, the Discover page shows a gallery of **workflow templates**: pre-built automations for common use cases.
+
+<img src="/images/cloud/workflow-templates.png" alt="Workflow template gallery" />
+
+Click any template to launch it with pre-filled configuration, or use it as a starting point and customize.
+
+---
+
+## What happens next
+
+1. Your prompt is sent to Skyvern
+2. A cloud browser opens and navigates to the target URL (or finds one from your prompt)
+3. The AI analyzes the page, plans actions, and executes them step by step
+4. You're taken to the [live execution view](/cloud/monitor-a-run) where you can watch it happen in real time
+5. When complete, results appear on the run detail page under **Runs**
