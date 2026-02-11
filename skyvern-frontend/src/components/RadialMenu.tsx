@@ -18,8 +18,8 @@ interface RadialMenuProps {
    */
   buttonSize?: string;
   /**
-   * The gap between items in degrees. If not provided, items are evenly spaced
-   * around the circle.
+   * The gap between items in degrees (for radial layout) or pixels (for vertical layout).
+   * If not provided, items are evenly spaced around the circle (radial) or use 8px gap (vertical).
    */
   gap?: number;
   /**
@@ -35,6 +35,11 @@ interface RadialMenuProps {
    * If true, rotates the text so its baseline runs parallel to the radial line.
    */
   rotateText?: boolean;
+  /**
+   * Layout mode: "radial" (circular) or "vertical" (stacked list to the right).
+   * Defaults to "radial".
+   */
+  layout?: "radial" | "vertical";
 }
 
 const proportionalAngle = (
@@ -76,6 +81,7 @@ export function RadialMenu({
   gap,
   startAt,
   rotateText,
+  layout = "radial",
 }: RadialMenuProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [calculatedRadius, setCalculatedRadius] = useState<number>(100);
@@ -137,13 +143,72 @@ export function RadialMenu({
       </div>
 
       {visibleItems.map((item, index) => {
+        const isEnabled = item.enabled !== false;
+        const btnSize = buttonSize ?? "40px";
+        const btnSizeNum = parseFloat(btnSize);
+
+        if (layout === "vertical") {
+          // Vertical layout: stack items to the right of center
+          const verticalGap = gap ?? 8;
+          const xOffset = numRadius;
+          // Center the stack vertically around the middle item
+          const totalHeight =
+            visibleItems.length * btnSizeNum +
+            (visibleItems.length - 1) * verticalGap;
+          const startY = -totalHeight / 2 + btnSizeNum / 2;
+          const yOffset = startY + index * (btnSizeNum + verticalGap);
+
+          return (
+            <div
+              key={item.id}
+              onClick={() => {
+                if (isEnabled) {
+                  item.onClick();
+                  setIsOpen(false);
+                }
+              }}
+              className="absolute left-1/2 top-1/2 z-30 flex cursor-pointer items-center gap-2 transition-all duration-300 ease-out"
+              style={{
+                transform: isOpen
+                  ? `translate(0%, -50%) translate(${xOffset}px, ${yOffset}px) scale(1)`
+                  : `translate(0%, -50%) translate(0, 0) scale(0)`,
+                opacity: isOpen ? (isEnabled ? 1 : 0.5) : 0,
+                pointerEvents: isOpen ? (isEnabled ? "auto" : "none") : "none",
+                transitionDelay: isOpen ? `${index * 50}ms` : "0ms",
+              }}
+            >
+              <button
+                disabled={!isEnabled}
+                className="flex items-center justify-center rounded-full bg-white shadow-lg hover:bg-gray-50 disabled:cursor-not-allowed"
+                style={{
+                  width: btnSize,
+                  height: btnSize,
+                }}
+              >
+                <div className="text-gray-700">{item.icon}</div>
+              </button>
+              {item.text && (
+                <span
+                  className="whitespace-nowrap rounded bg-white px-2 py-1 text-xs text-gray-700 shadow-md"
+                  style={{
+                    opacity: isEnabled ? 1 : 0.5,
+                    cursor: isEnabled ? "pointer" : "not-allowed",
+                  }}
+                >
+                  {item.text}
+                </span>
+              )}
+            </div>
+          );
+        }
+
+        // Radial layout (default)
         const angle =
           gap !== undefined
             ? gappedAngle(index, gap, startAt)
             : proportionalAngle(index, visibleItems.length, startAt);
         const x = Math.cos(angle) * parseFloat(radiusValue);
         const y = Math.sin(angle) * parseFloat(radiusValue);
-        const isEnabled = item.enabled !== false;
 
         // calculate text offset along the radial line
         const textDistance = 0.375 * numRadius;
@@ -170,8 +235,8 @@ export function RadialMenu({
               disabled={!isEnabled}
               className="absolute left-1/2 top-1/2 z-30 flex items-center justify-center rounded-full bg-white shadow-lg transition-all duration-300 ease-out hover:bg-gray-50 disabled:cursor-not-allowed"
               style={{
-                width: buttonSize ?? "40px",
-                height: buttonSize ?? "40px",
+                width: btnSize,
+                height: btnSize,
                 transform: isOpen
                   ? `translate(-50%, -50%) translate(${x}px, ${y}px) scale(1)`
                   : "translate(-50%, -50%) translate(0, 0) scale(0)",

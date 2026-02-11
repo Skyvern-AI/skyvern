@@ -30,3 +30,20 @@ class ImprovePromptResponse(BaseModel):
     error: str | None = Field(None, description="Error message if prompt improvement failed")
     improved: str = Field(..., description="The improved version of the prompt")
     original: str = Field(..., description="The original prompt provided for improvement")
+
+
+class BlockInfoForTitle(BaseModel):
+    block_type: str = Field(..., description="The type of the workflow block")
+    url: str | None = Field(None, description="URL associated with the block")
+    goal: str | None = Field(None, description="Goal or prompt text for the block")
+
+
+class GenerateWorkflowTitleRequest(BaseModel):
+    blocks: list[BlockInfoForTitle] = Field(
+        ...,
+        description="List of block info objects for title generation",
+    )
+
+
+class GenerateWorkflowTitleResponse(BaseModel):
+    title: str | None = Field(None, description="The generated workflow title")

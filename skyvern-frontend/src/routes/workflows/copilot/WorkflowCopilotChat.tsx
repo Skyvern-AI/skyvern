@@ -16,6 +16,7 @@ import {
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
+  WorkflowCopilotClearProposedWorkflowRequest,
 } from "./workflowCopilotTypes";
 
 interface ChatMessage {
@@ -41,7 +42,12 @@ const formatChatTimestamp = (value: string) => {
   });
 };
 
-const MessageItem = memo(({ message }: { message: ChatMessage }) => {
+interface MessageItemProps {
+  message: ChatMessage;
+  footer?: React.ReactNode;
+}
+
+const MessageItem = memo(({ message, footer }: MessageItemProps) => {
   return (
     <div className="flex items-start gap-3">
       <div
@@ -55,6 +61,7 @@ const MessageItem = memo(({ message }: { message: ChatMessage }) => {
         <p className="whitespace-pre-wrap pr-3 text-sm text-slate-200">
           {message.content}
         </p>
+        {footer ? <div className="mt-3 flex gap-2">{footer}</div> : null}
         {message.timestamp ? (
           <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-900/70 px-1.5 py-0.5 text-[10px] text-slate-400">
             {formatChatTimestamp(message.timestamp)}
@@ -67,6 +74,10 @@ const MessageItem = memo(({ message }: { message: ChatMessage }) => {
 
 interface WorkflowCopilotChatProps {
   onWorkflowUpdate?: (workflow: WorkflowApiResponse) => void;
+  onReviewWorkflow?: (
+    workflow: WorkflowApiResponse,
+    clearPending: () => void,
+  ) => void;
   isOpen?: boolean;
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
@@ -117,12 +128,16 @@ const constrainPosition = (
 
 export function WorkflowCopilotChat({
   onWorkflowUpdate,
+  onReviewWorkflow,
   isOpen = true,
   onClose,
   onMessageCountChange,
   buttonRef,
 }: WorkflowCopilotChatProps = {}) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [proposedWorkflow, setProposedWorkflow] =
+    useState<WorkflowApiResponse | null>(null);
+  const [autoAccept, setAutoAccept] = useState<boolean>(false);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [processingStatus, setProcessingStatus] = useState<string>("");
@@ -184,7 +199,72 @@ export function WorkflowCopilotChat({
   const handleNewChat = () => {
     setMessages([]);
     setWorkflowCopilotChatId(null);
+    setProposedWorkflow(null);
+    setAutoAccept(false);
     hasScrolledOnLoad.current = false;
+  };
+
+  const applyWorkflowUpdate = (workflow: WorkflowApiResponse): boolean => {
+    if (!onWorkflowUpdate) {
+      return true;
+    }
+    try {
+      onWorkflowUpdate(workflow);
+      return true;
+    } catch (updateError) {
+      console.error("Failed to update workflow:", updateError);
+      toast({
+        title: "Update failed",
+        description: "Failed to apply workflow changes. Please try again.",
+        variant: "destructive",
+      });
+      return false;
+    }
+  };
+
+  const handleAcceptWorkflow = (
+    workflow: WorkflowApiResponse,
+    alwaysAccept: boolean = false,
+  ) => {
+    if (!applyWorkflowUpdate(workflow)) {
+      return;
+    }
+    setProposedWorkflow(null);
+    if (alwaysAccept) {
+      setAutoAccept(true);
+    }
+    void clearProposedWorkflow(alwaysAccept);
+  };
+
+  const handleRejectWorkflow = () => {
+    setProposedWorkflow(null);
+    void clearProposedWorkflow(false);
+  };
+
+  const clearProposedWorkflow = async (autoAcceptValue: boolean) => {
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      await client.post<WorkflowCopilotClearProposedWorkflowRequest>(
+        "/workflow/copilot/clear-proposed-workflow",
+        {
+          workflow_copilot_chat_id: workflowCopilotChatId ?? "",
+          auto_accept: autoAcceptValue,
+        } as WorkflowCopilotClearProposedWorkflowRequest,
+      );
+    } catch (error) {
+      console.error("Failed to clear proposed workflow:", error);
+      toast({
+        title: "Copilot update failed",
+        description: autoAcceptValue
+          ? "Workflow was applied, but auto-accept did not update."
+          : "Failed to clear copilot proposal. Please try again.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleReviewWorkflow = (workflow: WorkflowApiResponse) => {
+    onReviewWorkflow?.(workflow, () => setProposedWorkflow(null));
   };
 
   // Notify parent of message count changes
@@ -214,6 +294,8 @@ export function WorkflowCopilotChat({
     if (!workflowPermanentId) {
       setMessages([]);
       setWorkflowCopilotChatId(null);
+      setProposedWorkflow(null);
+      setAutoAccept(false);
       return;
     }
 
@@ -243,6 +325,8 @@ export function WorkflowCopilotChat({
         );
         setMessages(historyMessages);
         setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
+        setProposedWorkflow(response.data.proposed_workflow ?? null);
+        setAutoAccept(response.data.auto_accept ?? false);
       } catch (error) {
         console.error("Failed to load chat history:", error);
       } finally {
@@ -306,6 +390,7 @@ export function WorkflowCopilotChat({
 
     pendingMessageId.current = userMessageId;
     setMessages((prev) => [...prev, userMessage]);
+    setProposedWorkflow(null);
     const messageContent = inputValue;
     setInputValue("");
     setIsLoading(true);
@@ -398,10 +483,7 @@ export function WorkflowCopilotChat({
         setMessages((prev) =>
           prev.map((message) =>
             message.id === pendingId
-              ? {
-                  ...message,
-                  timestamp: payload.timestamp,
-                }
+              ? { ...message, timestamp: payload.timestamp }
               : message,
           ),
         );
@@ -420,19 +502,10 @@ export function WorkflowCopilotChat({
         };
 
         setMessages((prev) => [...prev, aiMessage]);
-
-        if (response.updated_workflow && onWorkflowUpdate) {
-          try {
-            onWorkflowUpdate(response.updated_workflow);
-          } catch (updateError) {
-            console.error("Failed to update workflow:", updateError);
-            toast({
-              title: "Update failed",
-              description:
-                "Failed to apply workflow changes. Please try again.",
-              variant: "destructive",
-            });
-          }
+        if (response.updated_workflow && autoAccept) {
+          applyWorkflowUpdate(response.updated_workflow);
+        } else {
+          setProposedWorkflow(response.updated_workflow ?? null);
         }
       };
 
@@ -708,9 +781,52 @@ export function WorkflowCopilotChat({
               </p>
             </div>
           ) : null}
-          {messages.map((message) => (
-            <MessageItem key={message.id} message={message} />
-          ))}
+          {messages.map((message, index) => {
+            const isLastMessage = index === messages.length - 1;
+            const showProposedPanel = isLastMessage && proposedWorkflow;
+            return (
+              <MessageItem
+                key={message.id}
+                message={message}
+                footer={
+                  showProposedPanel ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleReviewWorkflow(proposedWorkflow)}
+                        className="rounded border border-blue-500/60 bg-blue-500/10 px-3 py-1 text-xs text-blue-100 hover:bg-blue-500/20"
+                      >
+                        Review
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleAcceptWorkflow(proposedWorkflow)}
+                        className="rounded bg-green-600 px-3 py-1 text-xs text-white hover:bg-green-700"
+                      >
+                        Accept
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleAcceptWorkflow(proposedWorkflow, true)
+                        }
+                        className="rounded bg-emerald-600 px-3 py-1 text-xs text-white hover:bg-emerald-700"
+                      >
+                        Always accept
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleRejectWorkflow}
+                        className="rounded bg-red-600 px-3 py-1 text-xs text-white hover:bg-red-700"
+                      >
+                        Reject
+                      </button>
+                    </>
+                  ) : null
+                }
+              />
+            );
+          })}
           {isLoading && (
             <div className="flex items-start gap-3">
               <div className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">

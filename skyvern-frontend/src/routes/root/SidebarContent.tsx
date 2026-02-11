@@ -5,7 +5,7 @@ import { Link } from "react-router-dom";
 import { SideNav } from "./SideNav";
 import { cn } from "@/util/utils";
 import { Button } from "@/components/ui/button";
-import { PinLeftIcon, PinRightIcon } from "@radix-ui/react-icons";
+import { ChevronLeftIcon, ChevronRightIcon } from "@radix-ui/react-icons";
 
 type Props = {
   useCollapsedState?: boolean;
@@ -37,9 +37,9 @@ function SidebarContent({ useCollapsedState }: Props) {
           }}
         >
           {collapsed ? (
-            <PinRightIcon className="h-6 w-6" />
+            <ChevronRightIcon className="h-6 w-6" />
           ) : (
-            <PinLeftIcon className="hidden h-6 w-6 lg:block" />
+            <ChevronLeftIcon className="hidden h-6 w-6 lg:block" />
           )}
         </Button>
       </div>

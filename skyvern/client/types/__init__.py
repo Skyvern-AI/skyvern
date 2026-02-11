@@ -35,6 +35,7 @@ if typing.TYPE_CHECKING:
     from .azure_secret_parameter import AzureSecretParameter
     from .azure_vault_credential_parameter import AzureVaultCredentialParameter
     from .azure_vault_credential_parameter_yaml import AzureVaultCredentialParameterYaml
+    from .billing_state_response import BillingStateResponse
     from .bitwarden_credit_card_data_parameter import BitwardenCreditCardDataParameter
     from .bitwarden_credit_card_data_parameter_yaml import BitwardenCreditCardDataParameterYaml
     from .bitwarden_login_credential_parameter import BitwardenLoginCredentialParameter
@@ -53,6 +54,8 @@ if typing.TYPE_CHECKING:
     from .branch_criteria_yaml_criteria_type import BranchCriteriaYamlCriteriaType
     from .browser_profile import BrowserProfile
     from .browser_session_response import BrowserSessionResponse
+    from .change_tier_response import ChangeTierResponse
+    from .checkout_session_response import CheckoutSessionResponse
     from .click_action import ClickAction
     from .click_action_data import ClickActionData
     from .click_context import ClickContext
@@ -101,6 +104,7 @@ if typing.TYPE_CHECKING:
     from .credit_card_credential_response import CreditCardCredentialResponse
     from .download_to_s3block import DownloadToS3Block
     from .download_to_s3block_yaml import DownloadToS3BlockYaml
+    from .extensions import Extensions
     from .extract_action import ExtractAction
     from .extract_action_data import ExtractActionData
     from .extract_action_extract_schema import ExtractActionExtractSchema
@@ -166,6 +170,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockLoopBlocksItem_Login,
         ForLoopBlockLoopBlocksItem_Navigation,
         ForLoopBlockLoopBlocksItem_PdfParser,
+        ForLoopBlockLoopBlocksItem_PrintPage,
         ForLoopBlockLoopBlocksItem_SendEmail,
         ForLoopBlockLoopBlocksItem_Task,
         ForLoopBlockLoopBlocksItem_TaskV2,
@@ -206,6 +211,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockYamlLoopBlocksItem_Login,
         ForLoopBlockYamlLoopBlocksItem_Navigation,
         ForLoopBlockYamlLoopBlocksItem_PdfParser,
+        ForLoopBlockYamlLoopBlocksItem_PrintPage,
         ForLoopBlockYamlLoopBlocksItem_SendEmail,
         ForLoopBlockYamlLoopBlocksItem_Task,
         ForLoopBlockYamlLoopBlocksItem_TaskV2,
@@ -305,8 +311,28 @@ if typing.TYPE_CHECKING:
     from .output_parameter import OutputParameter
     from .output_parameter_yaml import OutputParameterYaml
     from .password_credential_response import PasswordCredentialResponse
+    from .pdf_format import PdfFormat
     from .pdf_parser_block import PdfParserBlock
     from .pdf_parser_block_yaml import PdfParserBlockYaml
+    from .persistent_browser_type import PersistentBrowserType
+    from .plan_tier import PlanTier
+    from .portal_session_response import PortalSessionResponse
+    from .print_page_block import PrintPageBlock
+    from .print_page_block_parameters_item import (
+        PrintPageBlockParametersItem,
+        PrintPageBlockParametersItem_AwsSecret,
+        PrintPageBlockParametersItem_AzureSecret,
+        PrintPageBlockParametersItem_AzureVaultCredential,
+        PrintPageBlockParametersItem_BitwardenCreditCardData,
+        PrintPageBlockParametersItem_BitwardenLoginCredential,
+        PrintPageBlockParametersItem_BitwardenSensitiveInformation,
+        PrintPageBlockParametersItem_Context,
+        PrintPageBlockParametersItem_Credential,
+        PrintPageBlockParametersItem_Onepassword,
+        PrintPageBlockParametersItem_Output,
+        PrintPageBlockParametersItem_Workflow,
+    )
+    from .print_page_block_yaml import PrintPageBlockYaml
     from .prompt_action import PromptAction
     from .prompt_branch_criteria import PromptBranchCriteria
     from .proxy_location import ProxyLocation
@@ -464,6 +490,7 @@ if typing.TYPE_CHECKING:
         WorkflowDefinitionBlocksItem_Login,
         WorkflowDefinitionBlocksItem_Navigation,
         WorkflowDefinitionBlocksItem_PdfParser,
+        WorkflowDefinitionBlocksItem_PrintPage,
         WorkflowDefinitionBlocksItem_SendEmail,
         WorkflowDefinitionBlocksItem_Task,
         WorkflowDefinitionBlocksItem_TaskV2,
@@ -504,6 +531,7 @@ if typing.TYPE_CHECKING:
         WorkflowDefinitionYamlBlocksItem_Login,
         WorkflowDefinitionYamlBlocksItem_Navigation,
         WorkflowDefinitionYamlBlocksItem_PdfParser,
+        WorkflowDefinitionYamlBlocksItem_PrintPage,
         WorkflowDefinitionYamlBlocksItem_SendEmail,
         WorkflowDefinitionYamlBlocksItem_Task,
         WorkflowDefinitionYamlBlocksItem_TaskV2,
@@ -571,6 +599,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "AzureSecretParameter": ".azure_secret_parameter",
     "AzureVaultCredentialParameter": ".azure_vault_credential_parameter",
     "AzureVaultCredentialParameterYaml": ".azure_vault_credential_parameter_yaml",
+    "BillingStateResponse": ".billing_state_response",
     "BitwardenCreditCardDataParameter": ".bitwarden_credit_card_data_parameter",
     "BitwardenCreditCardDataParameterYaml": ".bitwarden_credit_card_data_parameter_yaml",
     "BitwardenLoginCredentialParameter": ".bitwarden_login_credential_parameter",
@@ -587,6 +616,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BranchCriteriaYamlCriteriaType": ".branch_criteria_yaml_criteria_type",
     "BrowserProfile": ".browser_profile",
     "BrowserSessionResponse": ".browser_session_response",
+    "ChangeTierResponse": ".change_tier_response",
+    "CheckoutSessionResponse": ".checkout_session_response",
     "ClickAction": ".click_action",
     "ClickActionData": ".click_action_data",
     "ClickContext": ".click_context",
@@ -631,6 +662,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "CreditCardCredentialResponse": ".credit_card_credential_response",
     "DownloadToS3Block": ".download_to_s3block",
     "DownloadToS3BlockYaml": ".download_to_s3block_yaml",
+    "Extensions": ".extensions",
     "ExtractAction": ".extract_action",
     "ExtractActionData": ".extract_action_data",
     "ExtractActionExtractSchema": ".extract_action_extract_schema",
@@ -691,6 +723,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockLoopBlocksItem_Login": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Navigation": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_PdfParser": ".for_loop_block_loop_blocks_item",
+    "ForLoopBlockLoopBlocksItem_PrintPage": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_SendEmail": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Task": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_TaskV2": ".for_loop_block_loop_blocks_item",
@@ -727,6 +760,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockYamlLoopBlocksItem_Login": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Navigation": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_PdfParser": ".for_loop_block_yaml_loop_blocks_item",
+    "ForLoopBlockYamlLoopBlocksItem_PrintPage": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_SendEmail": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Task": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_TaskV2": ".for_loop_block_yaml_loop_blocks_item",
@@ -815,8 +849,26 @@ _dynamic_imports: typing.Dict[str, str] = {
     "OutputParameter": ".output_parameter",
     "OutputParameterYaml": ".output_parameter_yaml",
     "PasswordCredentialResponse": ".password_credential_response",
+    "PdfFormat": ".pdf_format",
     "PdfParserBlock": ".pdf_parser_block",
     "PdfParserBlockYaml": ".pdf_parser_block_yaml",
+    "PersistentBrowserType": ".persistent_browser_type",
+    "PlanTier": ".plan_tier",
+    "PortalSessionResponse": ".portal_session_response",
+    "PrintPageBlock": ".print_page_block",
+    "PrintPageBlockParametersItem": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_AwsSecret": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_AzureSecret": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_AzureVaultCredential": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_BitwardenCreditCardData": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_BitwardenLoginCredential": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_BitwardenSensitiveInformation": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_Context": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_Credential": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_Onepassword": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_Output": ".print_page_block_parameters_item",
+    "PrintPageBlockParametersItem_Workflow": ".print_page_block_parameters_item",
+    "PrintPageBlockYaml": ".print_page_block_yaml",
     "PromptAction": ".prompt_action",
     "PromptBranchCriteria": ".prompt_branch_criteria",
     "ProxyLocation": ".proxy_location",
@@ -961,6 +1013,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowDefinitionBlocksItem_Login": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_Navigation": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_PdfParser": ".workflow_definition_blocks_item",
+    "WorkflowDefinitionBlocksItem_PrintPage": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_SendEmail": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_Task": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_TaskV2": ".workflow_definition_blocks_item",
@@ -997,6 +1050,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowDefinitionYamlBlocksItem_Login": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_Navigation": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_PdfParser": ".workflow_definition_yaml_blocks_item",
+    "WorkflowDefinitionYamlBlocksItem_PrintPage": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_SendEmail": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_Task": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_TaskV2": ".workflow_definition_yaml_blocks_item",
@@ -1085,6 +1139,7 @@ __all__ = [
     "AzureSecretParameter",
     "AzureVaultCredentialParameter",
     "AzureVaultCredentialParameterYaml",
+    "BillingStateResponse",
     "BitwardenCreditCardDataParameter",
     "BitwardenCreditCardDataParameterYaml",
     "BitwardenLoginCredentialParameter",
@@ -1101,6 +1156,8 @@ __all__ = [
     "BranchCriteriaYamlCriteriaType",
     "BrowserProfile",
     "BrowserSessionResponse",
+    "ChangeTierResponse",
+    "CheckoutSessionResponse",
     "ClickAction",
     "ClickActionData",
     "ClickContext",
@@ -1145,6 +1202,7 @@ __all__ = [
     "CreditCardCredentialResponse",
     "DownloadToS3Block",
     "DownloadToS3BlockYaml",
+    "Extensions",
     "ExtractAction",
     "ExtractActionData",
     "ExtractActionExtractSchema",
@@ -1205,6 +1263,7 @@ __all__ = [
     "ForLoopBlockLoopBlocksItem_Login",
     "ForLoopBlockLoopBlocksItem_Navigation",
     "ForLoopBlockLoopBlocksItem_PdfParser",
+    "ForLoopBlockLoopBlocksItem_PrintPage",
     "ForLoopBlockLoopBlocksItem_SendEmail",
     "ForLoopBlockLoopBlocksItem_Task",
     "ForLoopBlockLoopBlocksItem_TaskV2",
@@ -1241,6 +1300,7 @@ __all__ = [
     "ForLoopBlockYamlLoopBlocksItem_Login",
     "ForLoopBlockYamlLoopBlocksItem_Navigation",
     "ForLoopBlockYamlLoopBlocksItem_PdfParser",
+    "ForLoopBlockYamlLoopBlocksItem_PrintPage",
     "ForLoopBlockYamlLoopBlocksItem_SendEmail",
     "ForLoopBlockYamlLoopBlocksItem_Task",
     "ForLoopBlockYamlLoopBlocksItem_TaskV2",
@@ -1329,8 +1389,26 @@ __all__ = [
     "OutputParameter",
     "OutputParameterYaml",
     "PasswordCredentialResponse",
+    "PdfFormat",
     "PdfParserBlock",
     "PdfParserBlockYaml",
+    "PersistentBrowserType",
+    "PlanTier",
+    "PortalSessionResponse",
+    "PrintPageBlock",
+    "PrintPageBlockParametersItem",
+    "PrintPageBlockParametersItem_AwsSecret",
+    "PrintPageBlockParametersItem_AzureSecret",
+    "PrintPageBlockParametersItem_AzureVaultCredential",
+    "PrintPageBlockParametersItem_BitwardenCreditCardData",
+    "PrintPageBlockParametersItem_BitwardenLoginCredential",
+    "PrintPageBlockParametersItem_BitwardenSensitiveInformation",
+    "PrintPageBlockParametersItem_Context",
+    "PrintPageBlockParametersItem_Credential",
+    "PrintPageBlockParametersItem_Onepassword",
+    "PrintPageBlockParametersItem_Output",
+    "PrintPageBlockParametersItem_Workflow",
+    "PrintPageBlockYaml",
     "PromptAction",
     "PromptBranchCriteria",
     "ProxyLocation",
@@ -1475,6 +1553,7 @@ __all__ = [
     "WorkflowDefinitionBlocksItem_Login",
     "WorkflowDefinitionBlocksItem_Navigation",
     "WorkflowDefinitionBlocksItem_PdfParser",
+    "WorkflowDefinitionBlocksItem_PrintPage",
     "WorkflowDefinitionBlocksItem_SendEmail",
     "WorkflowDefinitionBlocksItem_Task",
     "WorkflowDefinitionBlocksItem_TaskV2",
@@ -1511,6 +1590,7 @@ __all__ = [
     "WorkflowDefinitionYamlBlocksItem_Login",
     "WorkflowDefinitionYamlBlocksItem_Navigation",
     "WorkflowDefinitionYamlBlocksItem_PdfParser",
+    "WorkflowDefinitionYamlBlocksItem_PrintPage",
     "WorkflowDefinitionYamlBlocksItem_SendEmail",
     "WorkflowDefinitionYamlBlocksItem_Task",
     "WorkflowDefinitionYamlBlocksItem_TaskV2",

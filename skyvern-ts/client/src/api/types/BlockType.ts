@@ -23,5 +23,6 @@ export const BlockType = {
     PdfParser: "pdf_parser",
     HttpRequest: "http_request",
     HumanInteraction: "human_interaction",
+    PrintPage: "print_page",
 } as const;
 export type BlockType = (typeof BlockType)[keyof typeof BlockType];

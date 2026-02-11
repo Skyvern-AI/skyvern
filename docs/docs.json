@@ -32,6 +32,33 @@
               "running-automations/task-parameters",
               "running-automations/extract-structured-data"
             ]
+          },
+          {
+            "group": "Multi-Step Automations",
+            "pages": [
+              "multi-step-automations/build-a-workflow",
+              "multi-step-automations/workflow-blocks-reference",
+              "multi-step-automations/file-operations",
+              "multi-step-automations/workflow-parameters"
+            ]
+          },
+          {
+            "group": "Going to Production",
+            "pages": [
+              "going-to-production/webhooks",
+              "going-to-production/proxy-geolocation",
+              "going-to-production/error-handling",
+              "going-to-production/reliability-tips",
+              "going-to-production/captcha-bot-detection"
+            ]
+          },
+          {
+            "group": "Debugging",
+            "pages": [
+              "debugging/using-artifacts",
+              "debugging/troubleshooting-guide",
+              "debugging/faq"
+            ]
           }
         ]
       },
@@ -46,6 +73,10 @@
             ]
           }
         ]
+      },
+      {
+        "tab": "API Reference",
+        "openapi": "api-reference/openapi.json"
       }
     ]
   },
@@ -70,6 +101,11 @@
     }
   },
   "api": {
+    "baseUrl": "https://api.skyvern.com",
+    "auth": {
+      "method": "key",
+      "name": "x-api-key"
+    },
     "playground": {
       "display": "interactive"
     }

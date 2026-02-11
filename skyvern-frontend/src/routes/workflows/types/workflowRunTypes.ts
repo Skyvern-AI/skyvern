@@ -167,3 +167,33 @@ export function hasNavigationGoal(
 ): item is { navigation_goal: unknown } {
   return item !== null && typeof item === "object" && "navigation_goal" in item;
 }
+
+// Branch evaluation types for conditional blocks
+export type BranchEvaluation = {
+  branch_id: string;
+  branch_index: number;
+  criteria_type: "jinja2_template" | "prompt" | null;
+  original_expression: string | null;
+  rendered_expression: string | null;
+  result: boolean | null;
+  is_matched: boolean;
+  is_default: boolean;
+  next_block_label: string | null;
+  error: string | null;
+};
+
+export type ConditionalBlockOutput = {
+  evaluations?: Array<BranchEvaluation>;
+  matched_branch_index?: number | null;
+};
+
+export function hasEvaluations(
+  output: unknown,
+): output is ConditionalBlockOutput {
+  return (
+    output !== null &&
+    typeof output === "object" &&
+    "evaluations" in output &&
+    Array.isArray((output as ConditionalBlockOutput).evaluations)
+  );
+}

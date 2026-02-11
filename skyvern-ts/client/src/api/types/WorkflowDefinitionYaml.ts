@@ -6,4 +6,5 @@ export interface WorkflowDefinitionYaml {
     version?: number;
     parameters: Skyvern.WorkflowDefinitionYamlParametersItem[];
     blocks: Skyvern.WorkflowDefinitionYamlBlocksItem[];
+    finally_block_label?: string;
 }

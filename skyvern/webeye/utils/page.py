@@ -14,7 +14,7 @@ from playwright.async_api import ElementHandle, Frame, Page
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 
 LOG = structlog.get_logger()
 
@@ -74,6 +74,15 @@ async def _current_viewpoint_screenshot_helper(
 ) -> bytes:
     if page.is_closed():
         raise FailedToTakeScreenshot(error_message="Page is closed")
+
+    # Capture page context for debugging screenshot issues
+    url = page.url
+    try:
+        viewport = page.viewport_size
+        viewport_info = f"{viewport['width']}x{viewport['height']}" if viewport else "unknown"
+    except Exception:
+        viewport_info = "unknown"
+
     try:
         if mode == ScreenshotMode.DETAILED:
             await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
@@ -94,10 +103,25 @@ async def _current_viewpoint_screenshot_helper(
         )
         return screenshot
     except TimeoutError as e:
-        LOG.exception(f"Timeout error while taking screenshot: {str(e)}")
+        LOG.error(
+            "Screenshot timeout",
+            timeout_ms=timeout,
+            url=url,
+            viewport=viewport_info,
+            full_page=full_page,
+            mode=mode.value if hasattr(mode, "value") else str(mode),
+            error=str(e),
+        )
         raise FailedToTakeScreenshot(error_message=str(e)) from e
     except Exception as e:
-        LOG.exception(f"Unknown error while taking screenshot: {str(e)}")
+        LOG.error(
+            "Screenshot failed",
+            url=url,
+            viewport=viewport_info,
+            full_page=full_page,
+            error=str(e),
+            exc_info=True,
+        )
         raise FailedToTakeScreenshot(error_message=str(e)) from e
 
 
@@ -233,7 +257,7 @@ class SkyvernFrame:
         return await SkyvernFrame.evaluate(frame=frame, expression="() => document.location.href")
 
     @staticmethod
-    @TraceManager.traced_async(ignore_inputs=["file_path", "timeout"])
+    @traced()
     async def take_scrolling_screenshot(
         page: Page,
         file_path: str | None = None,
@@ -307,7 +331,7 @@ class SkyvernFrame:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
 
     @staticmethod
-    @TraceManager.traced_async(ignore_inputs=["page"])
+    @traced()
     async def take_split_screenshots(
         page: Page,
         url: str | None = None,
@@ -484,7 +508,7 @@ class SkyvernFrame:
         js_script = "() => removeAllUniqueIds()"
         await self.evaluate(frame=self.frame, expression=js_script)
 
-    @TraceManager.traced_async()
+    @traced()
     async def build_tree_from_body(
         self,
         frame_name: str | None,
@@ -501,7 +525,7 @@ class SkyvernFrame:
             arg=[frame_name, frame_index, must_included_tags],
         )
 
-    @TraceManager.traced_async()
+    @traced()
     async def get_incremental_element_tree(
         self,
         wait_until_finished: bool = True,
@@ -512,7 +536,7 @@ class SkyvernFrame:
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
         )
 
-    @TraceManager.traced_async()
+    @traced()
     async def build_tree_from_element(
         self,
         starter: ElementHandle,
@@ -565,28 +589,84 @@ class SkyvernFrame:
         This is designed for cached action execution to ensure the page is ready
         before attempting to interact with elements.
         """
+        total_start_time = time.time()
+
         # 1. Wait for loading indicators to disappear (longest timeout first)
+        loading_indicator_duration_ms = 0.0
+        step_start_time = time.time()
+        loading_indicator_result = "success"
         try:
             await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
         except (TimeoutError, asyncio.TimeoutError):
+            loading_indicator_result = "timeout"
             LOG.warning("Loading indicator timeout - some indicators may still be present, proceeding")
         except Exception:
+            loading_indicator_result = "error"
             LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
+        finally:
+            loading_indicator_duration_ms = (time.time() - step_start_time) * 1000
+            LOG.info(
+                "page_readiness_check",
+                step="loading_indicators",
+                result=loading_indicator_result,
+                duration_ms=loading_indicator_duration_ms,
+                timeout_ms=loading_indicator_timeout_ms,
+            )
 
         # 2. Wait for network idle (with short timeout - some pages never go idle)
+        network_idle_duration_ms = 0.0
+        step_start_time = time.time()
+        network_idle_result = "success"
         try:
             await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
-            LOG.debug("Network idle achieved")
         except (TimeoutError, asyncio.TimeoutError):
+            network_idle_result = "timeout"
             LOG.warning("Network idle timeout - page may have constant activity, proceeding")
+        finally:
+            network_idle_duration_ms = (time.time() - step_start_time) * 1000
+            LOG.info(
+                "page_readiness_check",
+                step="network_idle",
+                result=network_idle_result,
+                duration_ms=network_idle_duration_ms,
+                timeout_ms=network_idle_timeout_ms,
+            )
 
         # 3. Wait for DOM to stabilize
+        dom_stability_duration_ms = 0.0
+        step_start_time = time.time()
+        dom_stability_result = "success"
         try:
             await self._wait_for_dom_stable(stable_ms=dom_stable_ms, timeout_ms=dom_stability_timeout_ms)
         except (TimeoutError, asyncio.TimeoutError):
+            dom_stability_result = "timeout"
             LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
         except Exception:
+            dom_stability_result = "error"
             LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
+        finally:
+            dom_stability_duration_ms = (time.time() - step_start_time) * 1000
+            LOG.info(
+                "page_readiness_check",
+                step="dom_stability",
+                result=dom_stability_result,
+                duration_ms=dom_stability_duration_ms,
+                timeout_ms=dom_stability_timeout_ms,
+                stable_ms=dom_stable_ms,
+            )
+
+        # Log total page readiness check duration
+        total_duration_ms = (time.time() - total_start_time) * 1000
+        LOG.info(
+            "page_readiness_check_complete",
+            total_duration_ms=total_duration_ms,
+            loading_indicator_duration_ms=loading_indicator_duration_ms,
+            network_idle_duration_ms=network_idle_duration_ms,
+            dom_stability_duration_ms=dom_stability_duration_ms,
+            loading_indicator_result=loading_indicator_result,
+            network_idle_result=network_idle_result,
+            dom_stability_result=dom_stability_result,
+        )
 
     async def _wait_for_loading_indicators_gone(self, timeout_ms: float = 5000) -> None:
         """

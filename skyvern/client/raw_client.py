@@ -19,12 +19,20 @@ from .errors.not_found_error import NotFoundError
 from .errors.unprocessable_entity_error import UnprocessableEntityError
 from .types.artifact import Artifact
 from .types.artifact_type import ArtifactType
+from .types.billing_state_response import BillingStateResponse
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
+from .types.change_tier_response import ChangeTierResponse
+from .types.checkout_session_response import CheckoutSessionResponse
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
+from .types.extensions import Extensions
 from .types.get_run_response import GetRunResponse
+from .types.otp_type import OtpType
+from .types.persistent_browser_type import PersistentBrowserType
+from .types.plan_tier import PlanTier
+from .types.portal_session_response import PortalSessionResponse
 from .types.proxy_location import ProxyLocation
 from .types.retry_run_webhook_request import RetryRunWebhookRequest
 from .types.run_engine import RunEngine
@@ -76,6 +84,7 @@ class RawSkyvern:
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
+        run_with: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[TaskRunResponse]:
         """
@@ -114,15 +123,16 @@ class RawSkyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
@@ -173,6 +183,9 @@ class RawSkyvern:
         browser_address : typing.Optional[str]
             The CDP address for the task.
 
+        run_with : typing.Optional[str]
+            Whether to run the task with agent or code.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -207,6 +220,7 @@ class RawSkyvern:
                 "include_action_history_in_verification": include_action_history_in_verification,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "browser_address": browser_address,
+                "run_with": run_with,
             },
             headers={
                 "content-type": "application/json",
@@ -308,15 +322,16 @@ class RawSkyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
@@ -1096,6 +1111,124 @@ class RawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    def get_workflow(
+        self,
+        workflow_permanent_id: str,
+        *,
+        version: typing.Optional[int] = None,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[Workflow]:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        version : typing.Optional[int]
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[Workflow]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}",
+            method="GET",
+            params={
+                "version": version,
+                "template": template,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    Workflow,
+                    parse_obj_as(
+                        type_=Workflow,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def get_workflow_versions(
+        self,
+        workflow_permanent_id: str,
+        *,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[typing.List[Workflow]]:
+        """
+        Get all versions of a workflow by its permanent ID.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[typing.List[Workflow]]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/versions",
+            method="GET",
+            params={
+                "template": template,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    typing.List[Workflow],
+                    parse_obj_as(
+                        type_=typing.List[Workflow],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
     def upload_file(
         self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
     ) -> HttpResponse[UploadFileResponse]:
@@ -1477,6 +1610,8 @@ class RawSkyvern:
         *,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
+        browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[BrowserSessionResponse]:
         """
@@ -1501,16 +1636,23 @@ class RawSkyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+        extensions : typing.Optional[typing.Sequence[Extensions]]
+            A list of extensions to install in the browser session.
+
+        browser_type : typing.Optional[PersistentBrowserType]
+            The type of browser to use for the session.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1526,6 +1668,8 @@ class RawSkyvern:
             json={
                 "timeout": timeout,
                 "proxy_location": proxy_location,
+                "extensions": extensions,
+                "browser_type": browser_type,
             },
             headers={
                 "content-type": "application/json",
@@ -1715,6 +1859,7 @@ class RawSkyvern:
         workflow_run_id: typing.Optional[str] = OMIT,
         source: typing.Optional[str] = OMIT,
         expired_at: typing.Optional[dt.datetime] = OMIT,
+        type: typing.Optional[OtpType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[TotpCode]:
         """
@@ -1743,6 +1888,9 @@ class RawSkyvern:
         expired_at : typing.Optional[dt.datetime]
             The timestamp when the TOTP code expires
 
+        type : typing.Optional[OtpType]
+            Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -1762,6 +1910,7 @@ class RawSkyvern:
                 "source": source,
                 "content": content,
                 "expired_at": expired_at,
+                "type": type,
             },
             headers={
                 "content-type": "application/json",
@@ -2636,6 +2785,228 @@ class RawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    def create_checkout_session_api_v1billing_checkout_post(
+        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
+    ) -> HttpResponse[CheckoutSessionResponse]:
+        """
+        Create a Stripe Checkout Session for subscribing to a tier.
+
+        Frontend should redirect the user to the returned URL.
+        After successful checkout, Stripe will send a webhook that we handle
+        to store the subscription and initialize billing state.
+
+        Returns 400 if org already has an active subscription (use portal instead).
+
+        Parameters
+        ----------
+        tier : PlanTier
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[CheckoutSessionResponse]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "api/v1/billing/checkout",
+            method="POST",
+            json={
+                "tier": tier,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    CheckoutSessionResponse,
+                    parse_obj_as(
+                        type_=CheckoutSessionResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def create_portal_session_api_v1billing_portal_post(
+        self, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> HttpResponse[PortalSessionResponse]:
+        """
+        Create a Stripe Customer Portal session for managing subscription.
+
+        Frontend should redirect the user to the returned URL.
+        The portal allows users to:
+        - Update payment methods
+        - Upgrade/downgrade plans
+        - Cancel subscription
+        - View invoices
+
+        Parameters
+        ----------
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[PortalSessionResponse]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "api/v1/billing/portal",
+            method="POST",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    PortalSessionResponse,
+                    parse_obj_as(
+                        type_=PortalSessionResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def get_organization_billing_api_v1billing_state_get(
+        self, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> HttpResponse[typing.Optional[BillingStateResponse]]:
+        """
+        Parameters
+        ----------
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[typing.Optional[BillingStateResponse]]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "api/v1/billing/state",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if _response is None or not _response.text.strip():
+                return HttpResponse(response=_response, data=None)
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    typing.Optional[BillingStateResponse],
+                    parse_obj_as(
+                        type_=typing.Optional[BillingStateResponse],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def change_tier_api_v1billing_change_tier_post(
+        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
+    ) -> HttpResponse[ChangeTierResponse]:
+        """
+        Redirect to Stripe Portal for tier changes.
+        Portal handles proration based on configured settings:
+        - Upgrades: Immediate proration charge
+        - Downgrades: Apply at end of billing period
+
+        Parameters
+        ----------
+        tier : PlanTier
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[ChangeTierResponse]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "api/v1/billing/change-tier",
+            method="POST",
+            json={
+                "tier": tier,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    ChangeTierResponse,
+                    parse_obj_as(
+                        type_=ChangeTierResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
 
 class AsyncRawSkyvern:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
@@ -2663,6 +3034,7 @@ class AsyncRawSkyvern:
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
+        run_with: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[TaskRunResponse]:
         """
@@ -2701,15 +3073,16 @@ class AsyncRawSkyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
@@ -2760,6 +3133,9 @@ class AsyncRawSkyvern:
         browser_address : typing.Optional[str]
             The CDP address for the task.
 
+        run_with : typing.Optional[str]
+            Whether to run the task with agent or code.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -2794,6 +3170,7 @@ class AsyncRawSkyvern:
                 "include_action_history_in_verification": include_action_history_in_verification,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "browser_address": browser_address,
+                "run_with": run_with,
             },
             headers={
                 "content-type": "application/json",
@@ -2895,15 +3272,16 @@ class AsyncRawSkyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
@@ -3683,6 +4061,124 @@ class AsyncRawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    async def get_workflow(
+        self,
+        workflow_permanent_id: str,
+        *,
+        version: typing.Optional[int] = None,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[Workflow]:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        version : typing.Optional[int]
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[Workflow]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}",
+            method="GET",
+            params={
+                "version": version,
+                "template": template,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    Workflow,
+                    parse_obj_as(
+                        type_=Workflow,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def get_workflow_versions(
+        self,
+        workflow_permanent_id: str,
+        *,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[typing.List[Workflow]]:
+        """
+        Get all versions of a workflow by its permanent ID.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[typing.List[Workflow]]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/versions",
+            method="GET",
+            params={
+                "template": template,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    typing.List[Workflow],
+                    parse_obj_as(
+                        type_=typing.List[Workflow],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
     async def upload_file(
         self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
     ) -> AsyncHttpResponse[UploadFileResponse]:
@@ -4064,6 +4560,8 @@ class AsyncRawSkyvern:
         *,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
+        browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[BrowserSessionResponse]:
         """
@@ -4088,16 +4586,23 @@ class AsyncRawSkyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+        extensions : typing.Optional[typing.Sequence[Extensions]]
+            A list of extensions to install in the browser session.
+
+        browser_type : typing.Optional[PersistentBrowserType]
+            The type of browser to use for the session.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4113,6 +4618,8 @@ class AsyncRawSkyvern:
             json={
                 "timeout": timeout,
                 "proxy_location": proxy_location,
+                "extensions": extensions,
+                "browser_type": browser_type,
             },
             headers={
                 "content-type": "application/json",
@@ -4302,6 +4809,7 @@ class AsyncRawSkyvern:
         workflow_run_id: typing.Optional[str] = OMIT,
         source: typing.Optional[str] = OMIT,
         expired_at: typing.Optional[dt.datetime] = OMIT,
+        type: typing.Optional[OtpType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[TotpCode]:
         """
@@ -4330,6 +4838,9 @@ class AsyncRawSkyvern:
         expired_at : typing.Optional[dt.datetime]
             The timestamp when the TOTP code expires
 
+        type : typing.Optional[OtpType]
+            Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -4349,6 +4860,7 @@ class AsyncRawSkyvern:
                 "source": source,
                 "content": content,
                 "expired_at": expired_at,
+                "type": type,
             },
             headers={
                 "content-type": "application/json",
@@ -5203,6 +5715,228 @@ class AsyncRawSkyvern:
                     RunSdkActionResponse,
                     parse_obj_as(
                         type_=RunSdkActionResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def create_checkout_session_api_v1billing_checkout_post(
+        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
+    ) -> AsyncHttpResponse[CheckoutSessionResponse]:
+        """
+        Create a Stripe Checkout Session for subscribing to a tier.
+
+        Frontend should redirect the user to the returned URL.
+        After successful checkout, Stripe will send a webhook that we handle
+        to store the subscription and initialize billing state.
+
+        Returns 400 if org already has an active subscription (use portal instead).
+
+        Parameters
+        ----------
+        tier : PlanTier
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[CheckoutSessionResponse]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "api/v1/billing/checkout",
+            method="POST",
+            json={
+                "tier": tier,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    CheckoutSessionResponse,
+                    parse_obj_as(
+                        type_=CheckoutSessionResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def create_portal_session_api_v1billing_portal_post(
+        self, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> AsyncHttpResponse[PortalSessionResponse]:
+        """
+        Create a Stripe Customer Portal session for managing subscription.
+
+        Frontend should redirect the user to the returned URL.
+        The portal allows users to:
+        - Update payment methods
+        - Upgrade/downgrade plans
+        - Cancel subscription
+        - View invoices
+
+        Parameters
+        ----------
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[PortalSessionResponse]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "api/v1/billing/portal",
+            method="POST",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    PortalSessionResponse,
+                    parse_obj_as(
+                        type_=PortalSessionResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def get_organization_billing_api_v1billing_state_get(
+        self, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> AsyncHttpResponse[typing.Optional[BillingStateResponse]]:
+        """
+        Parameters
+        ----------
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[typing.Optional[BillingStateResponse]]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "api/v1/billing/state",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if _response is None or not _response.text.strip():
+                return AsyncHttpResponse(response=_response, data=None)
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    typing.Optional[BillingStateResponse],
+                    parse_obj_as(
+                        type_=typing.Optional[BillingStateResponse],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def change_tier_api_v1billing_change_tier_post(
+        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
+    ) -> AsyncHttpResponse[ChangeTierResponse]:
+        """
+        Redirect to Stripe Portal for tier changes.
+        Portal handles proration based on configured settings:
+        - Upgrades: Immediate proration charge
+        - Downgrades: Apply at end of billing period
+
+        Parameters
+        ----------
+        tier : PlanTier
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[ChangeTierResponse]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "api/v1/billing/change-tier",
+            method="POST",
+            json={
+                "tier": tier,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    ChangeTierResponse,
+                    parse_obj_as(
+                        type_=ChangeTierResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )

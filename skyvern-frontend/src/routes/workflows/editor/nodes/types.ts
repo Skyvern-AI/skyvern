@@ -59,7 +59,7 @@ export const workflowBlockTitle: {
   text_prompt: "Text Prompt",
   upload_to_s3: "Upload To S3",
   file_upload: "Cloud Storage",
-  validation: "Validation",
+  validation: "AI Validation",
   human_interaction: "Human Interaction",
   wait: "Wait",
   pdf_parser: "PDF Parser",

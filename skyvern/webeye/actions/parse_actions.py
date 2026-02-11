@@ -87,7 +87,11 @@ def parse_action(
         return NullAction(**base_action_dict)
 
     # `.upper()` handles the case where the LLM returns a lowercase action type (e.g. "click" instead of "CLICK")
-    action_type = ActionType[action["action_type"].upper()]
+    action_type_str = action["action_type"].upper()
+    # Backward compat: map PRESS_ENTER to KEYPRESS (old prompt used PRESS_ENTER)
+    if action_type_str == "PRESS_ENTER":
+        action_type_str = "KEYPRESS"
+    action_type = ActionType[action_type_str]
 
     if not action_type.is_web_action():
         # LLM sometimes hallucinates and returns element id for non-web actions such as WAIT, TERMINATE, COMPLETE etc.
@@ -186,6 +190,23 @@ def parse_action(
         return SolveCaptchaAction(
             **base_action_dict, captcha_type=CaptchaType[captcha_type.upper()] if captcha_type else None
         )
+
+    if action_type == ActionType.KEYPRESS:
+        # KEYPRESS is a global keyboard action, not element-targeted
+        base_action_dict["skyvern_element_hash"] = None
+        base_action_dict["skyvern_element_data"] = None
+        # Support both "key" (single key from prompt) and "keys" (list, from code/legacy)
+        # Limited to navigation/submission keys to prevent misuse on regular form fields
+        allowed_keys = {"Enter", "Tab", "Escape", "ArrowDown", "ArrowUp"}
+        key = action.get("key")
+        if key:
+            if key not in allowed_keys:
+                LOG.warning("KEYPRESS action has unsupported key, skipping action", key=key)
+                return NullAction(**base_action_dict)
+            keys = [key]
+        else:
+            keys = action.get("keys", ["Enter"])
+        return KeypressAction(**base_action_dict, keys=keys)
 
     if action_type == ActionType.CLOSE_PAGE:
         return ClosePageAction(**base_action_dict)
@@ -370,12 +391,13 @@ async def parse_cua_actions(
                             intention=reasoning,
                         )
                     else:
-                        start_x, start_y = whole_path[0][0], whole_path[0][1]
+                        # ActionDragPath objects have x and y attributes
+                        start_x, start_y = whole_path[0].x, whole_path[0].y
                         reasoning = reasoning or f"Drag action path: {whole_path}"
                         action = DragAction(
                             start_x=start_x,
                             start_y=start_y,
-                            path=whole_path[1:],
+                            path=[(p.x, p.y) for p in whole_path[1:]],
                             reasoning=reasoning,
                             intention=reasoning,
                         )

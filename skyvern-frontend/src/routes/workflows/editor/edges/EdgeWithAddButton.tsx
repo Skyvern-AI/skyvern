@@ -6,6 +6,7 @@ import {
   getBezierPath,
   useNodes,
 } from "@xyflow/react";
+import { useRef } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -13,11 +14,13 @@ import {
   useWorkflowPanelStore,
 } from "@/store/WorkflowPanelStore";
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
+import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksMutation";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
+import { toast } from "@/components/ui/use-toast";
 
 import { REACT_FLOW_EDGE_Z_INDEX } from "../constants";
 import type { NodeBaseData } from "../nodes/types";
@@ -55,6 +58,11 @@ function EdgeWithAddButton({
   const setWorkflowPanelState = useWorkflowPanelStore(
     (state) => state.setWorkflowPanelState,
   );
+  // SOP upload
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const sourceNode = nodes.find((node) => node.id === source);
+
   const processRecordingMutation = useProcessRecordingMutation({
     browserSessionId: settingsStore.browserSessionId,
     onSuccess: (result) => {
@@ -67,9 +75,22 @@ function EdgeWithAddButton({
     },
   });
 
-  const isProcessing = processRecordingMutation.isPending;
+  const sopToBlocksMutation = useSopToBlocksMutation({
+    onSuccess: (result) => {
+      // Reuse existing block insertion pattern
+      setRecordedBlocks(result, {
+        previous: source,
+        next: target,
+        parent: sourceNode?.parentId,
+        connectingEdgeType: "edgeWithAddButton",
+      });
+    },
+  });
 
-  const sourceNode = nodes.find((node) => node.id === source);
+  // Derive upload state directly from mutation to avoid race conditions
+  const isUploadingSOP = sopToBlocksMutation.isPending;
+
+  const isProcessing = processRecordingMutation.isPending;
 
   const isBusy =
     (isProcessing || recordingStore.isRecording) &&
@@ -170,6 +191,28 @@ function EdgeWithAddButton({
     processRecordingMutation.mutate();
   };
 
+  const onUploadSOP = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleSOPFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      toast({
+        variant: "destructive",
+        title: "Invalid file type",
+        description: "Please select a PDF file",
+      });
+      e.target.value = "";
+      return;
+    }
+    sopToBlocksMutation.mutate(file);
+    e.target.value = "";
+  };
+
   const adder = (
     <Button
       size="icon"
@@ -189,6 +232,8 @@ function EdgeWithAddButton({
       radius="40px"
       onAdd={onAdd}
       onRecord={onRecord}
+      onUploadSOP={onUploadSOP}
+      isUploadingSOP={isUploadingSOP}
     >
       {adder}
     </WorkflowAddMenu>
@@ -207,6 +252,22 @@ function EdgeWithAddButton({
     </WorkflowAdderBusy>
   );
 
+  const handleCancelUpload = () => {
+    sopToBlocksMutation.cancel();
+  };
+
+  const sopUploadBusy = (
+    <WorkflowAdderBusy
+      color="#3b82f6"
+      operation="uploading"
+      size="small"
+      onComplete={() => {}}
+      onCancel={handleCancelUpload}
+    >
+      {adder}
+    </WorkflowAdderBusy>
+  );
+
   return (
     <>
       <BaseEdge path={edgePath} markerEnd={markerEnd} style={style} />
@@ -215,6 +276,7 @@ function EdgeWithAddButton({
           style={{
             position: "absolute",
             transform: `translate(-50%, -50%) translate(${labelX}px,${labelY}px)`,
+            transition: "transform 0.2s ease-out",
             fontSize: 12,
             // everything inside EdgeLabelRenderer has no pointer events by default
             // if you have an interactive element, set pointer-events: all
@@ -223,7 +285,20 @@ function EdgeWithAddButton({
           }}
           className="nodrag nopan"
         >
-          {isBusy ? busy : isDisabled ? adder : menu}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pdf"
+            className="hidden"
+            onChange={handleSOPFileChange}
+          />
+          {isUploadingSOP
+            ? sopUploadBusy
+            : isBusy
+              ? busy
+              : isDisabled
+                ? adder
+                : menu}
         </div>
       </EdgeLabelRenderer>
     </>

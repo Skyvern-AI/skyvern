@@ -262,9 +262,13 @@ function getNestingLevel(node: AppNode, nodes: Array<AppNode>): number {
   return level;
 }
 
+// Extra margin to add when a block is being debugged and shows the status row
+const TARGETTED_BLOCK_EXTRA_MARGIN = 48;
+
 function layout(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
+  targettedBlockLabel?: string,
 ): { nodes: Array<AppNode>; edges: Array<Edge> } {
   const loopNodes = nodes.filter(
     (node) => node.type === "loop" && !node.hidden,
@@ -288,12 +292,18 @@ function layout(
       ...n,
       position: { x: 0, y: 0 },
     }));
+    // Check if this loop node is the targetted block (being debugged)
+    // If so, add extra margin to account for the status row that appears
+    const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
+    const isTargetted =
+      targettedBlockLabel && nodeLabel === targettedBlockLabel;
+    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
       {
         marginx: (loopNodeWidth - maxChildWidth) / 2,
-        marginy: 225,
+        marginy,
       },
       nodes,
     );
@@ -337,12 +347,18 @@ function layout(
       position: { x: 0, y: 0 },
     }));
 
+    // Check if this conditional node is the targetted block (being debugged)
+    // If so, add extra margin to account for the status row that appears
+    const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
+    const isTargetted =
+      targettedBlockLabel && nodeLabel === targettedBlockLabel;
+    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
       {
         marginx: (conditionalNodeWidth - maxChildWidth) / 2,
-        marginy: 225,
+        marginy,
       },
       nodes,
     );

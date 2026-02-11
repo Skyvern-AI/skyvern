@@ -103,6 +103,11 @@ class WorkflowRunResponse(UniversalBaseModel):
     The errors for the run
     """
 
+    step_count: typing.Optional[int] = pydantic.Field(default=None)
+    """
+    Total number of steps executed in this run
+    """
+
     run_with: typing.Optional[str] = pydantic.Field(default=None)
     """
     Whether the workflow run was executed with agent or code

@@ -166,7 +166,10 @@ class InvalidWaitBlockTime(SkyvernException):
 class FailedToFormatJinjaStyleParameter(SkyvernException):
     def __init__(self, template: str, msg: str) -> None:
         super().__init__(
-            f"Failed to format Jinja style parameter {template}. Please make sure the variable reference is correct. reason: {msg}"
+            f"Failed to format Jinja style parameter '{template}'. "
+            f"Reason: {msg}. "
+            "If your block labels or parameter keys contain characters like '/', '-', or '.', "
+            "please rename them to use only letters, numbers, and underscores (e.g., 'State_Province' instead of 'State/Province')."
         )
 
 
@@ -175,7 +178,9 @@ class MissingJinjaVariables(SkyvernException):
         self.variables = variables
 
         super().__init__(
-            f"There are missing variables for '{template}'. Please make sure the variables are supplied. Missing variables: {variables}"
+            f"Missing variables for '{template}'. Missing: {variables}. "
+            "If your block labels or parameter keys contain characters like '/', '-', or '.', "
+            "please rename them to use only letters, numbers, and underscores (e.g., 'State_Province' instead of 'State/Province')."
         )
 
 
