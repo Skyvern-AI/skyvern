@@ -1004,10 +1004,7 @@ if settings.ENABLE_GEMINI:
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
             ),
         ),
     )
