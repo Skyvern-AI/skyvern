@@ -50,7 +50,7 @@
         "playwright": "^1.48.0"
     },
     "devDependencies": {
-        "webpack": "^5.97.1",
+        "webpack": "^5.104.1",
         "ts-loader": "^9.5.1",
         "vitest": "^3.2.4",
         "msw": "2.11.2",
