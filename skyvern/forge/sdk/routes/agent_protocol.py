@@ -2217,14 +2217,41 @@ async def get_workflow_runs(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    search_key: str | None = Query(
+        None,
+        max_length=500,
+        description="Search runs by run ID, parameter key, parameter description, run parameter value, or extra HTTP headers.",
+        examples=["login_url", "credential_value"],
+    ),
+    error_code: str | None = Query(
+        None,
+        max_length=500,
+        description="Filter runs by user-defined error code stored in task errors. "
+        "Matches against the error_code field in the task errors JSON array.",
+        examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
+    """
+    Get all workflow runs for the current organization.
+
+    Supports filtering by status, parameter search, and error code. All filters
+    are combined with AND logic.
+
+    **Examples:**
+    - All failed runs: `?status=failed`
+    - Failed runs with a specific error: `?status=failed&error_code=INVALID_CREDENTIALS`
+    - Runs matching a parameter value: `?search_key=https://example.com`
+    - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
+    """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs(
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
         status=status,
+        search_key=search_key,
+        error_code=error_code,
     )
 
 
@@ -2248,12 +2275,29 @@ async def get_workflow_runs_by_id(
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     search_key: str | None = Query(
         None,
+        max_length=500,
         description="Search runs by run ID, parameter key, parameter description, run parameter value, or extra HTTP headers.",
+    ),
+    error_code: str | None = Query(
+        None,
+        max_length=500,
+        description="Filter runs by user-defined error code stored in task errors. "
+        "Matches against the error_code field in the task errors JSON array.",
+        examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
     Get workflow runs for a specific workflow permanent id.
+
+    Supports filtering by status, parameter search, and error code. All filters
+    are combined with AND logic.
+
+    **Examples:**
+    - All failed runs: `?status=failed`
+    - Failed runs with a specific error: `?status=failed&error_code=INVALID_CREDENTIALS`
+    - Runs matching a parameter value: `?search_key=https://example.com`
+    - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
     """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
@@ -2263,6 +2307,7 @@ async def get_workflow_runs_by_id(
         page_size=page_size,
         status=status,
         search_key=search_key,
+        error_code=error_code,
     )
 
 
