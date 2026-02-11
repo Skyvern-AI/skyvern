@@ -626,12 +626,6 @@ export type PylonEmailHash = {
 
 export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;
 
-export type TestCredentialRequest = {
-  url: string;
-  navigation_goal?: string | null;
-  save_browser_profile?: boolean;
-};
-
 export type TestCredentialResponse = {
   credential_id: string;
   workflow_run_id: string;

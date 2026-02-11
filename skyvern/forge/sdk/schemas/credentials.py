@@ -172,10 +172,6 @@ class TestCredentialRequest(BaseModel):
         description="The login page URL to test the credential against",
         examples=["https://example.com/login"],
     )
-    navigation_goal: str | None = Field(
-        default=None,
-        description="Custom navigation goal for the login. If not provided, a default login prompt is used.",
-    )
     save_browser_profile: bool = Field(
         default=True,
         description="Whether to save the browser profile after a successful login test",

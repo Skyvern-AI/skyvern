@@ -741,9 +741,8 @@ async def update_custom_credential_service_config(
 
 DEFAULT_LOGIN_PROMPT = (
     "Navigate to the login page if needed and log in with the provided credentials. "
-    "Fill in the username and password fields, then click the submit/login button immediately. "
-    "Do NOT ask for confirmation — just proceed with submitting the form. "
-    "After submitting, verify the login was successful by checking the page content."
+    "Fill in the username and password fields, submit the form, "
+    "and verify the login was successful by checking the page content."
 )
 
 
@@ -809,7 +808,6 @@ async def test_credential(
     # Build a login workflow
     parameter_key = "credential"
     label = "login"
-    navigation_goal = data.navigation_goal or DEFAULT_LOGIN_PROMPT
 
     yaml_parameters = [
         WorkflowParameterYAML(
@@ -824,7 +822,7 @@ async def test_credential(
         label=label,
         title=label,
         url=data.url,
-        navigation_goal=navigation_goal,
+        navigation_goal=DEFAULT_LOGIN_PROMPT,
         max_steps_per_run=25,
         parameter_keys=[parameter_key],
         totp_verification_url=None,
