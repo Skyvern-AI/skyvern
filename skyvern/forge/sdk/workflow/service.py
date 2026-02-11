@@ -3176,7 +3176,7 @@ class WorkflowService:
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
-            payload=signed_data.signed_payload,
+            payload=signed_data.payload_for_log,
             headers=signed_data.headers,
         )
         try:
@@ -3204,7 +3204,7 @@ class WorkflowService:
                     "Webhook failed",
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
-                    webhook_data=signed_data.signed_payload,
+                    webhook_data=signed_data.payload_for_log,
                     resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,

@@ -59,18 +59,29 @@ def generate_skyvern_signature(
     return hash_obj.hexdigest()
 
 
+MAX_WEBHOOK_PAYLOAD_LOG_SIZE = 8000  # ~8KB – keeps Datadog log entries manageable
+
+
 @dataclass
 class WebhookSignature:
     timestamp: str
     signature: str
     signed_payload: str
     headers: dict[str, str]
+    # Truncated version of signed_payload safe for logging
+    payload_for_log: str
 
 
 def generate_skyvern_webhook_signature(payload: dict, api_key: str) -> WebhookSignature:
     payload_str = _normalize_json_dumps(payload)
     signature = generate_skyvern_signature(payload=payload_str, api_key=api_key)
     timestamp = str(int(datetime.utcnow().timestamp()))
+    if len(payload_str) > MAX_WEBHOOK_PAYLOAD_LOG_SIZE:
+        payload_for_log = (
+            payload_str[:MAX_WEBHOOK_PAYLOAD_LOG_SIZE] + f"... (truncated, original size: {len(payload_str)})"
+        )
+    else:
+        payload_for_log = payload_str
     return WebhookSignature(
         timestamp=timestamp,
         signature=signature,
@@ -80,4 +91,5 @@ def generate_skyvern_webhook_signature(payload: dict, api_key: str) -> WebhookSi
             "x-skyvern-signature": signature,
             "Content-Type": "application/json",
         },
+        payload_for_log=payload_for_log,
     )
