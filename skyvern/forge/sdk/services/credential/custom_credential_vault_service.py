@@ -160,6 +160,102 @@ class CustomCredentialVaultService(CredentialVaultService):
             )
             raise
 
+    async def update_credential(self, credential: Credential, data: CreateCredentialRequest) -> Credential:
+        LOG.info(
+            "Updating credential in custom vault",
+            organization_id=credential.organization_id,
+            credential_id=credential.credential_id,
+            name=data.name,
+            credential_type=data.credential_type,
+        )
+
+        try:
+            client = await self._get_client_for_organization(credential.organization_id)
+
+            # Create new credential in the external API
+            new_item_id = await client.create_credential(
+                name=data.name,
+                credential=data.credential,
+            )
+
+            # Update DB record to point to the new vault item
+            try:
+                updated_credential = await self._update_db_credential(
+                    credential=credential,
+                    data=data,
+                    item_id=new_item_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "DB update failed, attempting to clean up new external credential",
+                    organization_id=credential.organization_id,
+                    new_item_id=new_item_id,
+                )
+                try:
+                    await client.delete_credential(new_item_id)
+                except Exception as cleanup_error:
+                    LOG.error(
+                        "Failed to clean up orphaned external credential",
+                        organization_id=credential.organization_id,
+                        new_item_id=new_item_id,
+                        error=str(cleanup_error),
+                    )
+                raise
+
+            LOG.info(
+                "Successfully updated credential in custom vault",
+                organization_id=credential.organization_id,
+                credential_id=credential.credential_id,
+                old_item_id=credential.item_id,
+                new_item_id=new_item_id,
+            )
+
+            return updated_credential
+
+        except Exception as e:
+            LOG.error(
+                "Failed to update credential in custom vault",
+                organization_id=credential.organization_id,
+                credential_id=credential.credential_id,
+                error=str(e),
+                exc_info=True,
+            )
+            raise
+
+    async def post_delete_credential_item(self, item_id: str, organization_id: str | None = None) -> None:
+        """
+        Background task to delete the old credential item from the custom vault
+        after an update or delete operation.
+        """
+        try:
+            if organization_id is None and self._client is None:
+                LOG.warning(
+                    "Skipping custom vault cleanup; organization_id is required for per-organization configuration",
+                    item_id=item_id,
+                    organization_id=organization_id,
+                )
+                return
+
+            if self._client is not None:
+                client = self._client
+            else:
+                assert organization_id is not None
+                client = await self._get_client_for_organization(organization_id)
+            await client.delete_credential(item_id)
+            LOG.info(
+                "Successfully deleted credential item from custom vault in background",
+                organization_id=organization_id,
+                item_id=item_id,
+            )
+        except Exception as e:
+            LOG.warning(
+                "Failed to delete credential item from custom vault in background",
+                organization_id=organization_id,
+                item_id=item_id,
+                error=str(e),
+                exc_info=True,
+            )
+
     async def delete_credential(self, credential: Credential) -> None:
         """
         Delete a credential from the custom vault and database.

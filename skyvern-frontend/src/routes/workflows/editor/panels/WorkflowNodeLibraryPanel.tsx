@@ -44,17 +44,6 @@ const nodeLibraryItems: Array<{
     description: "Take actions to achieve a task.",
   },
   {
-    nodeType: "taskv2",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Taskv2}
-        className="size-6"
-      />
-    ),
-    title: "Browser Task v2 Block",
-    description: "Achieve complex tasks with deep thinking.",
-  },
-  {
     nodeType: "action",
     icon: (
       <WorkflowBlockIcon

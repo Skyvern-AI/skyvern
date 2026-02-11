@@ -280,6 +280,75 @@ async def create_credential(
         raise HTTPException(status_code=400, detail=f"Unsupported credential type: {data.credential_type}")
 
 
+@legacy_base_router.put("/credentials/{credential_id}")
+@legacy_base_router.put("/credentials/{credential_id}/", include_in_schema=False)
+@base_router.post(
+    "/credentials/{credential_id}/update",
+    response_model=CredentialResponse,
+    summary="Update credential",
+    description="Overwrites the stored credential data (e.g. username/password) while keeping the same credential_id.",
+    tags=["Credentials"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "update_credential",
+    },
+)
+@base_router.post(
+    "/credentials/{credential_id}/update/",
+    response_model=CredentialResponse,
+    include_in_schema=False,
+)
+async def update_credential(
+    background_tasks: BackgroundTasks,
+    credential_id: str = Path(
+        ...,
+        description="The unique identifier of the credential to update",
+        examples=["cred_1234567890"],
+        openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
+    ),
+    data: CreateCredentialRequest = Body(
+        ...,
+        description="The new credential data to store",
+        example={
+            "name": "My Credential",
+            "credential_type": "PASSWORD",
+            "credential": {"username": "user@example.com", "password": "newpassword123"},
+        },
+        openapi_extra={"x-fern-sdk-parameter-name": "data"},
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialResponse:
+    existing_credential = await app.DATABASE.get_credential(
+        credential_id=credential_id, organization_id=current_org.organization_id
+    )
+    if not existing_credential:
+        raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
+
+    vault_type = existing_credential.vault_type or CredentialVaultType.BITWARDEN
+    credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+    if not credential_service:
+        raise HTTPException(status_code=400, detail="Unsupported credential storage type")
+
+    old_item_id = existing_credential.item_id
+
+    updated_credential = await credential_service.update_credential(
+        credential=existing_credential,
+        data=data,
+    )
+
+    # Schedule background cleanup of old vault item if the item_id changed
+    if old_item_id != updated_credential.item_id:
+        background_tasks.add_task(
+            credential_service.post_delete_credential_item,
+            old_item_id,
+            existing_credential.organization_id,
+        )
+
+    if updated_credential.vault_type == CredentialVaultType.BITWARDEN:
+        background_tasks.add_task(fetch_credential_item_background, updated_credential.item_id)
+
+    return _convert_to_response(updated_credential)
+
+
 @legacy_base_router.delete("/credentials/{credential_id}")
 @legacy_base_router.delete("/credentials/{credential_id}/", include_in_schema=False)
 @base_router.post(
@@ -329,7 +398,12 @@ async def delete_credential(
     await credential_service.delete_credential(credential)
 
     # Schedule background cleanup if the service implements it
-    background_tasks.add_task(credential_service.post_delete_credential_item, credential.item_id)
+    if vault_type != CredentialVaultType.CUSTOM:
+        background_tasks.add_task(
+            credential_service.post_delete_credential_item,
+            credential.item_id,
+            credential.organization_id,
+        )
 
     return None
 
