@@ -12,7 +12,7 @@ jobs:
       - name: Check if author is approved
         id: check-author
         run: |
-          APPROVED_USERS="wintonzheng LawyZheng suchintan jomido pedrohsdb stanislaw89 marcmuon celalzamanoglu"
+          APPROVED_USERS="wintonzheng LawyZheng suchintan pedrohsdb marcmuon celalzamanoglu"
           PR_AUTHOR="${{ github.event.pull_request.user.login }}"
 
           if echo "$APPROVED_USERS" | grep -qw "$PR_AUTHOR"; then
