@@ -1,0 +1,119 @@
+---
+title: Managing Workflows
+subtitle: Create, organize, clone, import, and export reusable automations
+slug: cloud/workflows-list
+---
+
+The **Workflows** page is where you build and manage multi-step automations. Each workflow is a reusable sequence of blocks that you can run with different inputs each time.
+
+Click **Workflows** in the left sidebar to open it.
+
+<img src="/images/cloud/workflows-page-overview.png" alt="Workflows page overview" />
+
+---
+
+## The workflows table
+
+The table lists all workflows in your organization with the following columns:
+
+| Column | Description |
+|--------|-------------|
+| **ID** | Unique workflow identifier |
+| **Title** | Display name (click to open in the editor) |
+| **Folder** | Folder assignment, if any |
+| **Created At** | When the workflow was created |
+| **Actions** | Inline buttons and three-dot menu |
+
+Each row also has inline action buttons: folder assignment, parameter toggle, open in editor (pencil icon), run (play icon), and a three-dot menu for additional actions.
+
+---
+
+## Creating a workflow
+
+Click the **Create** dropdown button at the top right of the table.
+
+| Option | What it does |
+|--------|-------------|
+| **Blank Workflow** | Creates a new empty workflow and opens it in the [editor](/cloud/workflow-editor) |
+| **From Template** | Opens a dialog showing organization templates to start from |
+
+<img src="/images/cloud/create-workflow-dropdown.png" alt="Create workflow dropdown" />
+
+---
+
+## Organizing with folders
+
+The top of the page shows your recent folders as cards. Use folders to group related workflows.
+
+- Click **+ New folder** to create one
+- Click a folder card to filter the table to that folder's workflows
+- Assign a workflow to a folder using the folder icon in the table row
+- Click **View all** to see all folders when you have more than five
+
+<img src="/images/cloud/workflow-folders.png" alt="Workflow folders" />
+
+---
+
+## Searching and filtering
+
+Use the search bar above the table to filter workflows by title or parameter. The results highlight matching text and auto-expand parameter rows when a parameter matches.
+
+The items-per-page selector at the bottom lets you choose 5, 10, 20, or 50 rows per page.
+
+---
+
+## Workflow actions
+
+Click the **three-dot menu** on any workflow row to access these actions:
+
+| Action | What it does |
+|--------|-------------|
+| **Clone Workflow** | Creates a copy named "Copy of ..." with the original title |
+| **Save as Template** | Makes this workflow available in the organization template gallery. A bookmark icon appears next to the title. |
+| **Remove from Templates** | Removes the workflow from the template gallery (appears instead of "Save as Template" for templates) |
+| **Export as... > YAML** | Downloads the workflow definition as a `.yaml` file |
+| **Export as... > JSON** | Downloads the workflow definition as a `.json` file |
+| **Delete Workflow** | Opens a confirmation dialog, then permanently deletes the workflow |
+
+<img src="/images/cloud/workflow-actions-menu.png" alt="Workflow actions menu" />
+
+<Warning>
+Deleting a workflow is permanent. Clone it first if you want to keep a backup.
+</Warning>
+
+---
+
+## Importing workflows
+
+Click the **Import** button to upload workflow files.
+
+| Format | Behavior |
+|--------|----------|
+| `.yaml` / `.yml` | Parsed and created as a new workflow |
+| `.json` | Converted to YAML internally, then created |
+| `.pdf` | Sent to the AI to generate a workflow from a Standard Operating Procedure document |
+
+<Tip>
+Upload a PDF of your Standard Operating Procedure and Skyvern generates a workflow from it automatically.
+</Tip>
+
+---
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card
+    title="Open the Editor"
+    icon="pen-to-square"
+    href="/cloud/workflow-editor"
+  >
+    Build automations visually with the drag-and-drop canvas
+  </Card>
+  <Card
+    title="Add Parameters"
+    icon="sliders"
+    href="/cloud/workflow-parameters"
+  >
+    Make workflows reusable with dynamic input values
+  </Card>
+</CardGroup>

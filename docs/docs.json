@@ -64,9 +64,30 @@
       },
       {
         "tab": "Cloud UI",
-        "pages": [
-          "cloud/getting-started",
-          "cloud/running-tasks"
+        "groups": [
+          {
+            "group": "Cloud UI",
+            "pages": [
+              "cloud/getting-started"
+            ]
+          },
+          {
+            "group": "Running Tasks",
+            "pages": [
+              "cloud/discover-page",
+              "cloud/live-execution"
+            ]
+          },
+          {
+            "group": "Building Workflows",
+            "pages": [
+              "cloud/workflows-list",
+              "cloud/workflow-editor",
+              "cloud/workflow-parameters",
+              "cloud/block-configuration",
+              "cloud/running-workflows"
+            ]
+          }
         ]
       },
       {

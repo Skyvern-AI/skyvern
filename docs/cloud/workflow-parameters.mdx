@@ -1,0 +1,153 @@
+---
+title: Workflow Parameters
+subtitle: Pass dynamic values into your workflows at runtime
+slug: cloud/workflow-parameters
+---
+
+Parameters let you create reusable workflows that accept different input values each time they run. Instead of hardcoding a URL or search term into a block, reference a parameter and fill in the value when you run the workflow.
+
+---
+
+## Opening the parameters panel
+
+In the [workflow editor](/cloud/workflow-editor), click the **Parameters** button in the header bar. A panel appears below the header showing all defined parameters and controls to add new ones.
+
+<img src="/images/cloud/parameters-panel-open.png" alt="Parameters panel" />
+
+---
+
+## Adding a parameter
+
+Click **Add Parameter** in the panel. Two types are available:
+
+| Type | Use for |
+|------|---------|
+| **Input Parameter** | Values the user provides when running the workflow (text, numbers, JSON, etc.) |
+| **Credential Parameter** | Securely inject login credentials from a vault (Bitwarden, 1Password, Azure, AWS, or Skyvern) |
+
+Each parameter requires a unique **key** — the name you use to reference it in blocks. Keys cannot contain spaces and cannot use [reserved names](#reserved-variables).
+
+You can also add an optional **description** (shown as help text when running) and a **default value**.
+
+---
+
+## Parameter value types
+
+Input parameters support these value types:
+
+| Type | Input control | Example |
+|------|---------------|---------|
+| **String** | Text field | `"https://example.com"` |
+| **Integer** | Number field | `10` |
+| **Float** | Number field | `19.99` |
+| **Boolean** | Toggle switch | `true` |
+| **JSON** | Code editor | `{"key": "value"}` |
+| **File URL** | Text field (paste a URL) | `"https://example.com/data.csv"` |
+| **Credential ID** | Dropdown selector (shown at runtime) | Selected from stored credentials |
+
+---
+
+## Referencing parameters in blocks
+
+Use Jinja2 double-brace syntax to reference parameters inside block fields like prompts, URLs, and data schemas.
+
+**Basic reference:**
+```
+{{ url }}
+```
+
+**Nested field access** (for JSON parameters):
+```
+{{ config.search_term }}
+```
+
+**Convert to JSON string:**
+```
+{{ my_data | tojson }}
+```
+
+**Example in a Navigation block prompt:**
+```
+Navigate to {{ url }} and search for {{ search_term }}
+```
+
+Any block field that accepts text supports parameter references.
+
+---
+
+## Credential parameters
+
+Credential parameters securely inject login credentials into blocks without exposing them in prompts or logs.
+
+| Source | What it provides |
+|--------|-----------------|
+| **Skyvern Credential** | Username and password stored on the Skyvern Credentials page |
+| **Bitwarden Login** | Username, password, and optional TOTP from your Bitwarden vault |
+| **Bitwarden Credit Card** | Card number, holder name, expiry, and CVV from Bitwarden |
+| **Bitwarden Sensitive Information** | Sensitive data fields from Bitwarden |
+| **1Password** | Username, password, card data, or TOTP from 1Password |
+| **Azure Key Vault** | Secrets stored in Azure Key Vault |
+| **AWS Secret** | Secrets stored in AWS Secrets Manager |
+| **Azure Secret** | Secrets stored in Azure Secret |
+
+When you add a credential parameter, you configure the source and connection details (collection ID, vault ID, etc.). At runtime, Skyvern fetches the real credentials from the vault and injects them into the workflow. Credential values are masked in logs and outputs.
+
+---
+
+## Output parameters
+
+Every block automatically produces an **output parameter** containing its results. You can reference a previous block's output in any downstream block.
+
+The syntax uses the block's label (lowercased, spaces replaced with underscores) followed by `_output`:
+
+```
+{{ extraction_block_output.extracted_information }}
+```
+
+```
+{{ login_output.success }}
+```
+
+This is how you chain data between blocks — extract data in one block, then use it in the next.
+
+---
+
+## Reserved variables
+
+These variable names are built-in and cannot be used as parameter keys:
+
+| Variable | Available in | Description |
+|----------|-------------|-------------|
+| `current_value` | Loop blocks | The current item being iterated |
+| `current_item` | Loop blocks | Alias for `current_value` |
+| `current_index` | Loop blocks | Zero-based index of the current iteration |
+| `workflow_run_id` | All blocks | Unique ID of the current run |
+| `workflow_id` | All blocks | The workflow's ID |
+| `workflow_permanent_id` | All blocks | The workflow's permanent ID |
+| `workflow_title` | All blocks | The workflow's title |
+
+**Example in a loop:**
+```
+Process item {{ current_index }}: {{ current_value.name }}
+```
+
+---
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card
+    title="Block Reference"
+    icon="cube"
+    href="/cloud/block-configuration"
+  >
+    Configuration fields for every block type
+  </Card>
+  <Card
+    title="Run Your Workflow"
+    icon="play"
+    href="/cloud/running-workflows"
+  >
+    Execute workflows and fill in parameter values
+  </Card>
+</CardGroup>

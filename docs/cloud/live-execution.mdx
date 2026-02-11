@@ -1,0 +1,92 @@
+---
+title: Watching Live Execution
+subtitle: Monitor, interact with, and control running tasks
+slug: cloud/live-execution
+---
+
+When you run a task from the [Discover page](/cloud/discover-page), you're taken to the live execution screen where you can watch the browser in real time.
+
+<img src="/images/cloud/live-execution-overview.png" alt="Live execution screen" />
+
+---
+
+## The execution screen
+
+The execution view has three panels:
+
+| Panel | What it shows |
+|-------|---------------|
+| **Left: Task configuration** | The block being executed, its URL, and prompt. A status badge shows the current state. |
+| **Center: Live browser** | Real-time view of the browser. You see pages load, forms fill, and buttons click. |
+| **Right: Agent logs** | Real-time LLM reasoning and action decisions. Shows why the AI made each choice. |
+
+---
+
+## When the live view is available
+
+The live browser stream is active while the task is still in progress:
+
+| Status | Live view |
+|--------|-----------|
+| `created` | Waiting to start |
+| `queued` | Waiting for a browser |
+| `running` | **Active** — the browser is navigating |
+| `paused` | Waiting for human interaction |
+| `completed` | Stream closed — view the recording instead |
+| `failed` | Stream closed — view the recording instead |
+| `terminated` | Stream closed |
+| `timed_out` | Stream closed |
+| `canceled` | Stream closed |
+
+Once a task reaches a final state, the live stream closes. Open the run from **Runs** in the sidebar to access the full recording, screenshots, and action history.
+
+---
+
+## Taking control of the browser
+
+The **Take Control** button lets you interact directly with the browser. This is useful when:
+- A CAPTCHA appears that the AI can't solve
+- The site has an unusual login flow
+- You need to navigate past an unexpected popup
+
+Click **Take Control** to start interacting — your mouse and keyboard input goes directly to the browser. Click **Stop Controlling** to hand control back to the AI.
+
+<Warning>
+Taking control pauses the AI agent. Remember to release control so the agent can resume.
+</Warning>
+
+---
+
+## Stopping a running task
+
+You can cancel a task at any time while it's running or queued. Click the **Cancel** button in the task header. A confirmation dialog appears before the task is stopped. The task transitions to `canceled` and any configured webhook fires with the canceled status.
+
+---
+
+## Reviewing results
+
+Once a task finishes, open it from **Runs** to see the full results.
+
+### Actions tab
+
+Step-by-step breakdown of every action the AI took. Each entry shows:
+
+- **Action type** — Click, Type, Scroll, Select, etc.
+- **Success or failure** indicator
+- **AI reasoning** — Why the agent chose this action
+- **Input details** — For type actions, the text that was entered
+
+### Recording tab
+
+Full video replay of the browser session. Every task is recorded automatically.
+
+### Parameters tab
+
+The configuration you submitted: URL, prompt, engine, proxy location, webhook URL, data schema, and other settings.
+
+### Diagnostics tab
+
+Debug information for troubleshooting:
+- **LLM prompts** — The exact prompts sent to the AI model
+- **Element trees** — The DOM structure the AI analyzed
+- **Annotated screenshots** — Screenshots with element labels the AI used for decisions
