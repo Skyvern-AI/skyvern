@@ -52,12 +52,12 @@ services:
     # - ENABLE_OPENAI=true
     # - LLM_KEY=OPENAI_GPT4O
     # - OPENAI_API_KEY=<your_openai_key>
-    #  Gemini Support:
-    # Gemini is a new LLM provider that is currently in beta. You can use it by uncommenting the following lines and filling in your Gemini API key.
-    # - LLM_KEY=GEMINI
-    # - ENABLE_GEMINI=true
-    # - GEMINI_API_KEY=YOUR_GEMINI_KEY
-    # - LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
+    #  Gemini Support (via Vertex AI):
+    # - ENABLE_VERTEX_AI=true
+    # - LLM_KEY=VERTEX_GEMINI_3.0_FLASH
+    # - GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+    # - GCP_PROJECT_ID=your-gcp-project-id
+    # - GCP_REGION=us-central1
     # If you want to use other LLM provider, like azure and anthropic:
     # - ENABLE_ANTHROPIC=true
     # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET

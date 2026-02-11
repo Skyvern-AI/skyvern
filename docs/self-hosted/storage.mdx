@@ -1,0 +1,355 @@
+---
+title: Storage Configuration
+subtitle: Configure where Skyvern stores artifacts and recordings
+slug: self-hosted/storage
+---
+
+Skyvern generates several types of artifacts during task execution: screenshots, browser recordings, HAR files, and extracted data. By default, these are stored on the local filesystem. For production deployments, you can configure S3 or Azure Blob Storage.
+
+## Storage types
+
+Skyvern supports three storage backends:
+
+| Type | `SKYVERN_STORAGE_TYPE` | Best for |
+|------|------------------------|----------|
+| Local filesystem | `local` | Development, single-server deployments |
+| AWS S3 | `s3` | Production on AWS, multi-server deployments |
+| Azure Blob | `azureblob` | Production on Azure |
+
+---
+
+## Local storage (default)
+
+By default, Skyvern stores all artifacts in a local directory.
+
+```bash .env
+SKYVERN_STORAGE_TYPE=local
+ARTIFACT_STORAGE_PATH=/data/artifacts
+VIDEO_PATH=/data/videos
+HAR_PATH=/data/har
+LOG_PATH=/data/log
+```
+
+### Docker volume mounts
+
+When using Docker Compose, these paths are mounted from your host:
+
+```yaml docker-compose.yml
+volumes:
+  - ./artifacts:/data/artifacts
+  - ./videos:/data/videos
+  - ./har:/data/har
+  - ./log:/data/log
+```
+
+### Limitations
+
+Local storage works well for single-server deployments but has limitations:
+- Not accessible across multiple servers
+- No automatic backup or redundancy
+- Requires manual cleanup to manage disk space
+
+---
+
+## AWS S3
+
+Store artifacts in S3 for durability, scalability, and access from multiple servers.
+
+### Configuration
+
+```bash .env
+SKYVERN_STORAGE_TYPE=s3
+AWS_REGION=us-east-1
+AWS_S3_BUCKET_ARTIFACTS=your-skyvern-artifacts
+AWS_S3_BUCKET_SCREENSHOTS=your-skyvern-screenshots
+AWS_S3_BUCKET_BROWSER_SESSIONS=your-skyvern-browser-sessions
+AWS_S3_BUCKET_UPLOADS=your-skyvern-uploads
+
+# Pre-signed URL expiration (seconds) - default 24 hours
+PRESIGNED_URL_EXPIRATION=86400
+
+# Maximum upload file size (bytes) - default 10MB
+MAX_UPLOAD_FILE_SIZE=10485760
+```
+
+### Authentication
+
+Skyvern uses the standard AWS credential chain. Configure credentials using one of these methods:
+
+**Environment variables:**
+
+```bash .env
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+```
+
+**IAM role (recommended for EC2/ECS/EKS):**
+
+Attach an IAM role with S3 permissions to your instance or pod. No credentials needed in environment.
+
+**AWS profile:**
+
+```bash .env
+AWS_PROFILE=your-profile-name
+```
+
+### Required IAM permissions
+
+Create an IAM policy with these permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-skyvern-artifacts",
+        "arn:aws:s3:::your-skyvern-artifacts/*",
+        "arn:aws:s3:::your-skyvern-screenshots",
+        "arn:aws:s3:::your-skyvern-screenshots/*",
+        "arn:aws:s3:::your-skyvern-browser-sessions",
+        "arn:aws:s3:::your-skyvern-browser-sessions/*",
+        "arn:aws:s3:::your-skyvern-uploads",
+        "arn:aws:s3:::your-skyvern-uploads/*"
+      ]
+    }
+  ]
+}
+```
+
+### Creating the buckets
+
+Create the S3 buckets in your AWS account:
+
+```bash
+aws s3 mb s3://your-skyvern-artifacts --region us-east-1
+aws s3 mb s3://your-skyvern-screenshots --region us-east-1
+aws s3 mb s3://your-skyvern-browser-sessions --region us-east-1
+aws s3 mb s3://your-skyvern-uploads --region us-east-1
+```
+
+<Note>
+Bucket names must be globally unique across all AWS accounts. Add a unique prefix or suffix (e.g., your company name or a random string).
+</Note>
+
+### Bucket configuration recommendations
+
+**Lifecycle rules:** Configure automatic deletion of old artifacts to control costs.
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket your-skyvern-artifacts \
+  --lifecycle-configuration '{
+    "Rules": [
+      {
+        "ID": "DeleteOldArtifacts",
+        "Status": "Enabled",
+        "Filter": {},
+        "Expiration": {
+          "Days": 30
+        }
+      }
+    ]
+  }'
+```
+
+**Encryption:** Enable server-side encryption for data at rest.
+
+**Access logging:** Enable access logging for audit trails.
+
+---
+
+## Azure Blob Storage
+
+Store artifacts in Azure Blob Storage for Azure-based deployments.
+
+### Configuration
+
+```bash .env
+SKYVERN_STORAGE_TYPE=azureblob
+AZURE_STORAGE_ACCOUNT_NAME=yourstorageaccount
+AZURE_STORAGE_ACCOUNT_KEY=your-storage-account-key
+AZURE_STORAGE_CONTAINER_ARTIFACTS=skyvern-artifacts
+AZURE_STORAGE_CONTAINER_SCREENSHOTS=skyvern-screenshots
+AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS=skyvern-browser-sessions
+AZURE_STORAGE_CONTAINER_UPLOADS=skyvern-uploads
+
+# Pre-signed URL expiration (seconds) - default 24 hours
+PRESIGNED_URL_EXPIRATION=86400
+
+# Maximum upload file size (bytes) - default 10MB
+MAX_UPLOAD_FILE_SIZE=10485760
+```
+
+### Creating the storage account and containers
+
+Using Azure CLI:
+
+```bash
+# Create resource group
+az group create --name skyvern-rg --location eastus
+
+# Create storage account
+az storage account create \
+  --name yourstorageaccount \
+  --resource-group skyvern-rg \
+  --location eastus \
+  --sku Standard_LRS
+
+# Get the account key
+az storage account keys list \
+  --account-name yourstorageaccount \
+  --resource-group skyvern-rg \
+  --query '[0].value' -o tsv
+
+# Create containers
+az storage container create --name skyvern-artifacts --account-name yourstorageaccount
+az storage container create --name skyvern-screenshots --account-name yourstorageaccount
+az storage container create --name skyvern-browser-sessions --account-name yourstorageaccount
+az storage container create --name skyvern-uploads --account-name yourstorageaccount
+```
+
+### Using Managed Identity (recommended)
+
+For Azure VMs or AKS, use Managed Identity instead of storage account keys:
+
+1. Enable Managed Identity on your VM or AKS cluster
+2. Grant the identity "Storage Blob Data Contributor" role on the storage account
+3. Omit `AZURE_STORAGE_ACCOUNT_KEY` from your configuration
+
+---
+
+## What gets stored where
+
+| Artifact type | S3 bucket / Azure container | Contents |
+|---------------|---------------------------|----------|
+| Artifacts | `*-artifacts` | Extracted data, HTML snapshots, logs |
+| Screenshots | `*-screenshots` | Page screenshots at each step |
+| Browser Sessions | `*-browser-sessions` | Saved browser state for profiles |
+| Uploads | `*-uploads` | User-uploaded files for workflows |
+
+Videos (recordings) are currently always stored locally in `VIDEO_PATH` regardless of storage type.
+
+---
+
+## Pre-signed URLs
+
+When artifacts are stored in S3 or Azure Blob, Skyvern generates pre-signed URLs for access. These URLs:
+
+- Expire after `PRESIGNED_URL_EXPIRATION` seconds (default: 24 hours)
+- Allow direct download without additional authentication
+- Are included in task responses (`recording_url`, `screenshot_urls`)
+
+Adjust the expiration based on your needs:
+
+```bash .env
+# 1 hour
+PRESIGNED_URL_EXPIRATION=3600
+
+# 7 days
+PRESIGNED_URL_EXPIRATION=604800
+```
+
+---
+
+## Migrating from local to cloud storage
+
+To migrate existing artifacts from local storage to S3 or Azure:
+
+### S3
+
+```bash
+# Sync local artifacts to S3
+aws s3 sync ./artifacts s3://your-skyvern-artifacts/
+
+# Update configuration
+# SKYVERN_STORAGE_TYPE=s3
+# ...
+
+# Restart Skyvern
+docker compose restart skyvern
+```
+
+### Azure
+
+```bash
+# Install azcopy
+# https://docs.microsoft.com/en-us/azure/storage/common/storage-use-azcopy-v10
+
+# Sync local artifacts to Azure
+azcopy copy './artifacts/*' 'https://yourstorageaccount.blob.core.windows.net/skyvern-artifacts' --recursive
+
+# Update configuration and restart
+```
+
+<Warning>
+After migration, new artifacts will be stored in cloud storage, but existing local artifacts won't be automatically moved. The sync is a one-time operation.
+</Warning>
+
+---
+
+## Disk space management
+
+### Local storage
+
+Monitor disk usage and clean up old artifacts periodically:
+
+```bash
+# Check disk usage
+du -sh ./artifacts ./videos ./har ./log
+
+# Remove artifacts older than 30 days
+find ./artifacts -type f -mtime +30 -delete
+find ./videos -type f -mtime +30 -delete
+```
+
+### Cloud storage
+
+Use lifecycle policies to automatically delete old objects:
+
+**S3:** Configure lifecycle rules to expire objects after N days.
+
+**Azure:** Configure lifecycle management policies in the Azure portal or via CLI.
+
+---
+
+## Troubleshooting
+
+### "Access Denied" errors
+
+- Verify your credentials are correct
+- Check IAM permissions include all required actions
+- Ensure the buckets/containers exist
+- For S3, verify the AWS region matches your bucket location
+
+### Pre-signed URLs not working
+
+- Check that `PRESIGNED_URL_EXPIRATION` hasn't elapsed
+- Verify bucket policy allows public access to pre-signed URLs
+- For S3, ensure the bucket isn't blocking public access if needed
+
+### Artifacts not appearing
+
+- Check Skyvern logs for storage errors: `docker compose logs skyvern | grep -i storage`
+- Verify the storage type is correctly set: `SKYVERN_STORAGE_TYPE`
+- Ensure network connectivity to the storage endpoint
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Docker Setup" icon="docker" href="/self-hosted/docker">
+    Return to the Docker setup guide
+  </Card>
+  <Card title="Kubernetes Deployment" icon="dharmachakra" href="/self-hosted/kubernetes">
+    Deploy Skyvern at scale
+  </Card>
+</CardGroup>

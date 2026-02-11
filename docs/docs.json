@@ -34,6 +34,18 @@
             ]
           },
           {
+            "group": "Self-Hosted Deployment",
+            "pages": [
+              "self-hosted/overview",
+              "self-hosted/docker",
+              "self-hosted/llm-configuration",
+              "self-hosted/browser",
+              "self-hosted/proxy",
+              "self-hosted/kubernetes",
+              "self-hosted/storage"
+            ]
+          },
+          {
             "group": "Multi-Step Automations",
             "pages": [
               "multi-step-automations/build-a-workflow",
@@ -66,9 +78,10 @@
         "tab": "Cloud UI",
         "groups": [
           {
-            "group": "Cloud UI",
+            "group": "Getting Started",
             "pages": [
-              "cloud/getting-started"
+              "cloud/ui-overview",
+              "cloud/your-first-task"
             ]
           },
           {

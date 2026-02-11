@@ -2340,6 +2340,8 @@ class WorkflowService:
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
         ordering: tuple[str, str] | None = None,
+        search_key: str | None = None,
+        error_code: str | None = None,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.get_workflow_runs(
             organization_id=organization_id,
@@ -2347,6 +2349,8 @@ class WorkflowService:
             page_size=page_size,
             status=status,
             ordering=ordering,
+            search_key=search_key,
+            error_code=error_code,
         )
 
     async def get_workflow_runs_count(
@@ -2367,6 +2371,7 @@ class WorkflowService:
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
         search_key: str | None = None,
+        error_code: str | None = None,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
@@ -2375,6 +2380,7 @@ class WorkflowService:
             page_size=page_size,
             status=status,
             search_key=search_key,
+            error_code=error_code,
         )
 
     async def create_workflow_run(
