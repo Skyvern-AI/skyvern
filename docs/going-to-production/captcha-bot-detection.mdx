@@ -26,7 +26,7 @@ This guide helps you detect CAPTCHA failures and implement fallbacks to keep you
 
 ## Use [`error_code_mapping`](/going-to-production/error-handling#step-3-use-error_code_mapping)
 
- When a CAPTCHA blocks your automation, this gives you a consistent error code instead of parsing free-text failure messages.
+When a CAPTCHA blocks your automation, this gives you a consistent error code instead of parsing free-text failure messages.
 
 <CodeGroup>
 ```python Python
@@ -65,7 +65,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 ```
 </CodeGroup>
 
-When a CAPTCHA blocks the run, the response includes `output.error = "cant_solve_captcha"` — you can branch your logic on this code.
+When a CAPTCHA blocks the run, the response includes `output.error = "cant_solve_captcha"`. You can branch your logic on this code.
 
 <Info>
 For more on error code mapping and handling failures programmatically, see [Error Handling](/going-to-production/error-handling).
@@ -85,12 +85,12 @@ Release control when you're done and the agent resumes from where you left off.
 
 ## Built-in bot detection avoidance
 
-Skyvern automatically configures the browser to reduce bot detection triggers. These protections apply to every run — no configuration needed.
+Skyvern automatically configures the browser to reduce bot detection triggers. These protections apply to every run. No configuration needed.
 
-- **`AutomationControlled` disabled** — Removes the Blink feature flag that marks the browser as automated
-- **`navigator.webdriver` hidden** — The `enable-automation` flag is suppressed so JavaScript detection scripts don't see a webdriver
-- **Viewport and user agent** — Set to match real consumer browsers
-- **Locale and timezone** — Automatically matched to the proxy location (see [Proxy & Geolocation](/going-to-production/proxy-geolocation))
+- **`AutomationControlled` disabled**: Removes the Blink feature flag that marks the browser as automated
+- **`navigator.webdriver` hidden**: The `enable-automation` flag is suppressed so JavaScript detection scripts don't see a webdriver
+- **Viewport and user agent**: Set to match real consumer browsers
+- **Locale and timezone**: Automatically matched to the proxy location (see [Proxy & Geolocation](/going-to-production/proxy-geolocation))
 
 ---
 
@@ -98,17 +98,17 @@ Skyvern automatically configures the browser to reduce bot detection triggers. T
 
 Beyond fingerprinting, how you structure your automation affects detection:
 
-- **Use residential proxies for sensitive sites** — Datacenter IPs are the most common bot signal. Residential proxies route through real ISP addresses. Set `proxy_location="RESIDENTIAL"` or use `RESIDENTIAL_ISP` for static IPs.
-- **Reuse browser sessions for multi-step flows** — Creating a fresh browser for every step looks suspicious. A persistent session maintains cookies, cache, and history. See [Browser Sessions](/optimization/browser-sessions).
-- **Use browser profiles for repeat visits** — Profiles save browser state from a previous session. The site sees a known browser with familiar cookies instead of a blank slate. See [Browser Profiles](/optimization/browser-profiles).
-- **Add wait blocks between rapid actions** — Instant actions can trigger behavioral detection. A short pause between steps looks more human.
+- **Use residential proxies for sensitive sites**: Datacenter IPs are the most common bot signal. Residential proxies route through real ISP addresses. Set `proxy_location="RESIDENTIAL"` or use `RESIDENTIAL_ISP` for static IPs.
+- **Reuse browser sessions for multi-step flows**: Creating a fresh browser for every step looks suspicious. A persistent session maintains cookies, cache, and history. See [Browser Sessions](/optimization/browser-sessions).
+- **Use browser profiles for repeat visits**: Profiles save browser state from a previous session. The site sees a known browser with familiar cookies instead of a blank slate. See [Browser Profiles](/optimization/browser-profiles).
+- **Add wait blocks between rapid actions**: Instant actions can trigger behavioral detection. A short pause between steps looks more human.
 
 ### If you get blocked
 
-- **Increase `max_steps`** — Some bot challenges (like Cloudflare) loop through multiple verification pages. More steps give the solver more attempts.
-- **Switch to a residential proxy** — `RESIDENTIAL_ISP` provides a static IP that services are more likely to trust.
-- **Use a browser profile that previously passed** — If a profile has already cleared a Cloudflare challenge on a domain, it's more likely to pass again.
-- **Load Chrome extensions** — Extensions can add additional stealth capabilities. Set `EXTENSIONS` and `EXTENSIONS_BASE_PATH` in your environment.
+- **Increase `max_steps`**: Some bot challenges (like Cloudflare) loop through multiple verification pages. More steps give the solver more attempts.
+- **Switch to a residential proxy**: `RESIDENTIAL_ISP` provides a static IP that services are more likely to trust.
+- **Use a browser profile that previously passed**: If a profile has already cleared a Cloudflare challenge on a domain, it's more likely to pass again.
+- **Load Chrome extensions**: Extensions can add additional stealth capabilities. Set `EXTENSIONS` and `EXTENSIONS_BASE_PATH` in your environment.
 
 ---
 
@@ -116,7 +116,7 @@ Beyond fingerprinting, how you structure your automation affects detection:
 
 Automatic CAPTCHA solving is not available for self-hosted deployments.
 
-Instead, when a CAPTCHA is detected, the agent pauses for 30 seconds to allow manual intervention — solve it in the browser window yourself, then the agent continues automatically.
+Instead, when a CAPTCHA is detected, the agent pauses for 30 seconds to allow manual intervention. Solve it in the browser window yourself, then the agent continues automatically.
 
 ---
 
