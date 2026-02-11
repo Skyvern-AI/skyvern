@@ -43,6 +43,9 @@
               "self-hosted/proxy",
               "self-hosted/kubernetes",
               "self-hosted/storage"
+            ]
+          },
+          {
             "group": "Multi-Step Automations",
             "pages": [
               "multi-step-automations/build-a-workflow",
