@@ -36,20 +36,10 @@ jobs:
               echo "GIT_EMAIL=suchintansingh@gmail.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=Suchintan Singh" >> $GITHUB_OUTPUT
               ;;
-            jomido)
-              echo "GH_PAT=${{ secrets.JON_GH_PAT }}" >> $GITHUB_OUTPUT
-              echo "GIT_EMAIL=jon@skyvern.com" >> $GITHUB_OUTPUT
-              echo "GIT_USERNAME=Jonathan Dobson" >> $GITHUB_OUTPUT
-              ;;
             pedrohsdb)
               echo "GH_PAT=${{ secrets.PEDROHSDB_GH_PAT }}" >> $GITHUB_OUTPUT
               echo "GIT_EMAIL=pedro@skyvern.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=pedrohsdb" >> $GITHUB_OUTPUT
-              ;;
-            stanislaw89)
-              echo "GH_PAT=${{ secrets.STAS_GH_PAT }}" >> $GITHUB_OUTPUT
-              echo "GIT_EMAIL=stas@skyvern.com" >> $GITHUB_OUTPUT
-              echo "GIT_USERNAME=stas" >> $GITHUB_OUTPUT
               ;;
             marcmuon)
               echo "GH_PAT=${{ secrets.MARC_GH_PAT }}" >> $GITHUB_OUTPUT
