@@ -341,3 +341,9 @@ def setup_logger() -> None:
     uvicorn_error.disabled = True
     uvicorn_access = logging.getLogger("uvicorn.access")
     uvicorn_access.disabled = True
+
+    # Suppress noisy websockets library INFO logs ("connection open", "connection closed")
+    # These are high-volume and not useful for debugging
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("websockets.server").setLevel(logging.WARNING)
+    logging.getLogger("websockets.client").setLevel(logging.WARNING)
