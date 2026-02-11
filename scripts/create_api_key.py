@@ -3,10 +3,10 @@ from datetime import timedelta
 
 import typer
 
-from skyvern.forge import app
-from skyvern.forge.forge_app_initializer import start_forge_app
-from skyvern.forge.sdk.core import security
-from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken, OrganizationAuthTokenType
+from testcharmvision.forge import app
+from testcharmvision.forge.forge_app_initializer import start_forge_app
+from testcharmvision.forge.sdk.core import security
+from testcharmvision.forge.sdk.schemas.organizations import OrganizationAuthToken, OrganizationAuthTokenType
 
 API_KEY_LIFETIME = timedelta(weeks=5200)
 

@@ -1,3 +1,0 @@
-[submodule "integrations/n8n"]
-	path = integrations/n8n
-	url = https://github.com/Skyvern-AI/skyvern-n8n

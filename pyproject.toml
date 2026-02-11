@@ -1,8 +1,8 @@
 [project]
-name = "skyvern"
+name = "testcharmvision"
 version = "1.0.13"
 description = ""
-authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
+authors = [{ name = "Testcharmvision AI", email = "info@testcharmvision.com" }]
 requires-python = ">=3.11,<3.14"
 readme = "README.md"
 
@@ -52,7 +52,6 @@ dependencies = [
     "json-repair>=0.34.0,<0.35",
     "pypdf>=5.1.0,<7",
     "pdfplumber>=0.11.0,<0.12",
-    "fastmcp>=2.10.1,<3",
     "psutil>=7.0.0",
     "tiktoken>=0.9.0",
     "anthropic>=0.50.0,<0.51",
@@ -122,40 +121,40 @@ dev = [
 ]
 
 [tool.hatch.build]
-packages = ["skyvern", "alembic"]
+packages = ["testcharmvision", "alembic"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "skyvern",
+    "testcharmvision",
     "alembic",
 ]
 exclude = [
-    "skyvern-frontend/node_modules",
-    "skyvern-frontend/dist",
+    "testcharmvision-frontend/node_modules",
+    "testcharmvision-frontend/dist",
 ]
 [tool.hatch.build.targets.sdist.force-include]
-"skyvern-frontend" = "skyvern-frontend"
+"testcharmvision-frontend" = "testcharmvision-frontend"
 
 [tool.hatch.build.targets.wheel]
 include = [
-    "skyvern",
+    "testcharmvision",
     "alembic",
 ]
 [tool.hatch.build.targets.wheel.force-include]
-"skyvern-frontend/src" = "skyvern-frontend/src"
-"skyvern-frontend/public" = "skyvern-frontend/public"
-"skyvern-frontend/package.json" = "skyvern-frontend/package.json"
-"skyvern-frontend/package-lock.json" = "skyvern-frontend/package-lock.json"
-"skyvern-frontend/postcss.config.js" = "skyvern-frontend/postcss.config.js"
-"skyvern-frontend/tailwind.config.js" = "skyvern-frontend/tailwind.config.js"
-"skyvern-frontend/vite.config.ts" = "skyvern-frontend/vite.config.ts"
-"skyvern-frontend/index.html" = "skyvern-frontend/index.html"
-"skyvern-frontend/README.md" = "skyvern-frontend/README.md"
-"skyvern-frontend/.env.example" = "skyvern-frontend/.env.example"
-"skyvern-frontend/artifactServer.js" = "skyvern-frontend/artifactServer.js"
-"skyvern-frontend/localServer.js" = "skyvern-frontend/localServer.js"
-"skyvern-frontend/tsconfig.json" = "skyvern-frontend/tsconfig.json"
-"skyvern-frontend/tsconfig.node.json" = "skyvern-frontend/tsconfig.node.json"
+"testcharmvision-frontend/src" = "testcharmvision-frontend/src"
+"testcharmvision-frontend/public" = "testcharmvision-frontend/public"
+"testcharmvision-frontend/package.json" = "testcharmvision-frontend/package.json"
+"testcharmvision-frontend/package-lock.json" = "testcharmvision-frontend/package-lock.json"
+"testcharmvision-frontend/postcss.config.js" = "testcharmvision-frontend/postcss.config.js"
+"testcharmvision-frontend/tailwind.config.js" = "testcharmvision-frontend/tailwind.config.js"
+"testcharmvision-frontend/vite.config.ts" = "testcharmvision-frontend/vite.config.ts"
+"testcharmvision-frontend/index.html" = "testcharmvision-frontend/index.html"
+"testcharmvision-frontend/README.md" = "testcharmvision-frontend/README.md"
+"testcharmvision-frontend/.env.example" = "testcharmvision-frontend/.env.example"
+"testcharmvision-frontend/artifactServer.js" = "testcharmvision-frontend/artifactServer.js"
+"testcharmvision-frontend/localServer.js" = "testcharmvision-frontend/localServer.js"
+"testcharmvision-frontend/tsconfig.json" = "testcharmvision-frontend/tsconfig.json"
+"testcharmvision-frontend/tsconfig.node.json" = "testcharmvision-frontend/tsconfig.node.json"
 
 [build-system]
 requires = ["hatchling"]
@@ -213,7 +212,7 @@ skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 plugins = "sqlalchemy.ext.mypy.plugin"
 
 [project.scripts]
-skyvern = "skyvern.cli.commands:cli_app"
+testcharmvision = "testcharmvision.cli.commands:cli_app"
 
 [tool.pytest.ini_options]
 norecursedirs = ["eval", "tests/sdk"]

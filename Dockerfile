@@ -1,5 +1,5 @@
 FROM python:3.11 AS requirements-stage
-# Run `skyvern init llm` before building to generate the .env file
+# Run `testcharmvision init llm` before building to generate the .env file
 
 WORKDIR /tmp
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
@@ -47,7 +47,7 @@ ENV ARTIFACT_STORAGE_PATH=/data/artifacts
 # cache tiktoken
 RUN python /app/scripts/load_tiktoken.py
 
-COPY ./entrypoint-skyvern.sh /app/entrypoint-skyvern.sh
-RUN chmod +x /app/entrypoint-skyvern.sh
+COPY ./entrypoint-testcharmvision.sh /app/entrypoint-testcharmvision.sh
+RUN chmod +x /app/entrypoint-testcharmvision.sh
 
-CMD [ "/bin/bash", "/app/entrypoint-skyvern.sh" ]
+CMD [ "/bin/bash", "/app/entrypoint-testcharmvision.sh" ]

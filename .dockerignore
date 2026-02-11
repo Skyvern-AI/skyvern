@@ -1,6 +1,6 @@
 **/videos
 **/artifacts
-!skyvern/client/artifacts
+!testcharmvision/client/artifacts
 **/traces
 **/inputs
 **/har
@@ -14,14 +14,14 @@
 # Streamlit ignores
 **/secrets*.toml
 
-# Skyvern
+# Testcharmvision
 docs
 images
 
 # Front
-skyvern-frontend/.env*
-skyvern-frontend/dist
-skyvern-frontend/node_modules
+testcharmvision-frontend/.env*
+testcharmvision-frontend/dist
+testcharmvision-frontend/node_modules
 
 .dockerignore
 .gitignore

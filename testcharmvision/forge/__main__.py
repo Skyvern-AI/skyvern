@@ -1,0 +1,46 @@
+import os
+import sys
+
+import structlog
+import uvicorn
+from dotenv import load_dotenv
+
+from testcharmvision import analytics
+from testcharmvision.config import settings
+
+LOG = structlog.stdlib.get_logger()
+
+
+if __name__ == "__main__":
+    analytics.capture("testcharmvision-oss-run-server")
+    port = settings.PORT
+    LOG.info("Agent server starting.", host="0.0.0.0", port=port)
+    load_dotenv()
+
+    # Disable reload on Windows - uvicorn forces WindowsSelectorEventLoopPolicy when reload=True,
+    # but Windows needs WindowsProactorEventLoopPolicy for async subprocess operations
+    reload = settings.ENV == "local" and sys.platform != "win32"
+
+    # Configure reload settings
+    # Convert TEMP_PATH to relative path if it's absolute to avoid pathlib.glob() issues
+    temp_path_for_excludes = (
+        os.path.relpath(settings.TEMP_PATH) if os.path.isabs(settings.TEMP_PATH) else settings.TEMP_PATH
+    )
+    artifact_path_for_excludes = (
+        os.path.relpath(settings.ARTIFACT_STORAGE_PATH)
+        if os.path.isabs(settings.ARTIFACT_STORAGE_PATH)
+        else settings.ARTIFACT_STORAGE_PATH
+    )
+
+    uvicorn.run(
+        "testcharmvision.forge.api_app:create_api_app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        reload=reload,
+        reload_excludes=[
+            f"{temp_path_for_excludes}/**/*.py",
+            f"{artifact_path_for_excludes}/{settings.ENV}/**/scripts/**/**/*.py",
+        ],
+        factory=True,
+    )

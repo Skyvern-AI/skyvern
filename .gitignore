@@ -159,14 +159,15 @@ ig_*
 # IntelliJ
 .idea/
 
-# Skyvern ignores
+# Testcharmvision ignores
 videos/
-skyvern/artifacts/
+testcharmvision/artifacts/
 artifacts/
 traces/
 *.pkl
 har/
 postgres-data
+app-data
 files/
 temp/
 

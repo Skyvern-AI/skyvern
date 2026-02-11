@@ -20,7 +20,7 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 # from myapp import mymodel
 # target_metadata = mymodel.Base.metadata
-from skyvern.forge.sdk.db import models
+from testcharmvision.forge.sdk.db import models
 
 target_metadata = models.Base.metadata
 
@@ -28,7 +28,7 @@ target_metadata = models.Base.metadata
 # can be acquired:
 # my_important_option = config.get_main_option("my_important_option")
 # ... etc.
-from skyvern.forge.sdk.settings_manager import SettingsManager
+from testcharmvision.forge.sdk.settings_manager import SettingsManager
 
 config.set_main_option("sqlalchemy.url", SettingsManager.get_settings().DATABASE_STRING)
 

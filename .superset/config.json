@@ -1,9 +1,0 @@
-{
-  "setup": [
-    "cp \"$SUPERSET_ROOT_PATH/skyvern-frontend/.env\" ./skyvern-frontend/.env",
-    "cp \"$SUPERSET_ROOT_PATH/.env\" ./.env",
-    "uv sync --group cloud --reinstall",
-    "pre-commit install"
-  ],
-  "teardown": []
-}

@@ -9,20 +9,20 @@ services:
       - ./postgres-data:/var/lib/postgresql/data
     environment:
       - PGDATA=/var/lib/postgresql/data/pgdata
-      - POSTGRES_USER=skyvern
-      - POSTGRES_PASSWORD=skyvern
-      - POSTGRES_DB=skyvern
+      - POSTGRES_USER=testcharmvision
+      - POSTGRES_PASSWORD=testcharmvision
+      - POSTGRES_DB=testcharmvision
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U skyvern"]
+      test: ["CMD-SHELL", "pg_isready -U testcharmvision"]
       interval: 5s
       timeout: 5s
       retries: 5
-  skyvern:
-    image: public.ecr.aws/skyvern/skyvern:latest
+  testcharmvision:
+    image: public.ecr.aws/testcharmvision/testcharmvision:latest
     restart: on-failure
     env_file:
       - .env
-    # comment out if you want to externally call skyvern API
+    # comment out if you want to externally call testcharmvision API
     ports:
       - 8000:8000
       - 9222:9222 # for cdp browser forwarding
@@ -31,21 +31,22 @@ services:
       - ./videos:/data/videos
       - ./har:/data/har
       - ./log:/data/log
-      - ./.streamlit:/app/.streamlit
+      - ./app-data:/app/data
       # Uncomment the following two lines if you want to connect to any local changes
-      # - ./skyvern:/app/skyvern
+      # - ./testcharmvision:/app/testcharmvision
       # - ./alembic:/app/alembic
     environment:
-      - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
+      - DATABASE_STRING=postgresql+psycopg://testcharmvision:testcharmvision@postgres:5432/testcharmvision
       - BROWSER_TYPE=chromium-headful
       - ENABLE_CODE_BLOCK=true
+      - API_KEY_FILE=/app/data/api_key.txt
       # - BROWSER_TYPE=cdp-connect
       # Use this command to start Chrome with remote debugging:
       # "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\chrome-cdp-profile" --no-first-run --no-default-browser-check
       # /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir="/Users/yourusername/chrome-cdp-profile" --no-first-run --no-default-browser-check
       # - BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
     # =========================
-    #       LLM Settings - Recommended to use skyvern CLI, `skyvern init llm` to setup your LLM's
+    #       LLM Settings - Recommended to use testcharmvision CLI, `testcharmvision init llm` to setup your LLM's
     # =========================
     # OpenAI Support:
     # If you want to use OpenAI as your LLM provider, uncomment the following lines and fill in your OpenAI API key.
@@ -63,7 +64,7 @@ services:
     # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
     # - ANTHROPIC_API_KEY=<your_anthropic_key>
     # Microsoft Azure OpenAI support:
-    # If you'd like to use Microsoft Azure OpenAI as your managed LLM service integration with Skyvern, use the environment variables below.
+    # If you'd like to use Microsoft Azure OpenAI as your managed LLM service integration with Testcharmvision, use the environment variables below.
     # In your Microsoft Azure subscription, you will need to provision the OpenAI service and deploy a model, in order to utilize it.
     # 1. Login to the Azure Portal
     # 2. Create an Azure Resource Group
@@ -79,7 +80,7 @@ services:
     # - AZURE_API_VERSION=<your_azure_api_version>    # Specify a valid Azure OpenAI data-plane API version (eg. 2024-08-01-preview) Docs: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference
     # Amazon Bedrock Support:
     # Amazon Bedrock is a managed service that enables you to invoke LLMs and bill them through your AWS account.
-    # To use Amazon Bedrock as the LLM provider for Skyvern, specify the following environment variables.
+    # To use Amazon Bedrock as the LLM provider for Testcharmvision, specify the following environment variables.
     # 1. In the AWS IAM console, create a new AWS IAM User (name it whatever you want)
     # 2. Assign the "AmazonBedrockFullAccess" policy to the user
     # 3. Generate an IAM Access Key under the IAM User's Security Credentials tab
@@ -113,27 +114,27 @@ services:
     # - LLM_CONFIG_MAX_TOKENS=128000
 
     # Bitwarden Settings
-    # If you are looking to integrate Skyvern with a password manager (eg Bitwarden), you can use the following environment variables.
+    # If you are looking to integrate Testcharmvision with a password manager (eg Bitwarden), you can use the following environment variables.
     # - BITWARDEN_SERVER=http://localhost  # OPTIONAL IF YOU ARE SELF HOSTING BITWARDEN
     # - BITWARDEN_SERVER_PORT=8002 # IF YOU ARE SELF HOSTING BITWARDEN AND USE THIS COMPOSE FILE, PORT IS 8002 UNLESS CHANGED
-    # - SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID=your-org-id-here
-    # - SKYVERN_AUTH_BITWARDEN_CLIENT_ID=user.your-client-id-here
-    # - SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET=your-client-secret-here
-    # - SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD=your-master-password-here
+    # - TESTCHARMVISION_AUTH_BITWARDEN_ORGANIZATION_ID=your-org-id-here
+    # - TESTCHARMVISION_AUTH_BITWARDEN_CLIENT_ID=user.your-client-id-here
+    # - TESTCHARMVISION_AUTH_BITWARDEN_CLIENT_SECRET=your-client-secret-here
+    # - TESTCHARMVISION_AUTH_BITWARDEN_MASTER_PASSWORD=your-master-password-here
 
     # 1Password Integration
-    # If you are looking to integrate Skyvern with 1Password, you can use the following environment variables.
+    # If you are looking to integrate Testcharmvision with 1Password, you can use the following environment variables.
     # OP_SERVICE_ACCOUNT_TOKEN=""
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "test", "-f", "/app/.streamlit/secrets.toml"]
+      test: ["CMD", "test", "-f", "/app/data/api_key.txt"]
       interval: 5s
       timeout: 5s
       retries: 5
-  skyvern-ui:
-    image: public.ecr.aws/skyvern/skyvern-ui:latest
+  testcharmvision-ui:
+    image: public.ecr.aws/testcharmvision/testcharmvision-ui:latest
     restart: on-failure
     ports:
       - 8080:8080
@@ -142,12 +143,13 @@ services:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
       - ./har:/data/har
-      - ./.streamlit:/app/.streamlit
+      - ./app-data:/app/data
+    environment:
+      - API_KEY_FILE=/app/data/api_key.txt
     env_file:
-      - skyvern-frontend/.env
-    environment: {}
+      - testcharmvision-frontend/.env
     #  - VITE_ENABLE_CODE_BLOCK=true
-    # if you want to run skyvern on a remote server,
+    # if you want to run testcharmvision on a remote server,
     # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip
     # If you're self-hosting this behind a dns, you'll want to set:
     #   A route for the API: api.yourdomain.com -> localhost:8000
@@ -156,14 +158,14 @@ services:
     # - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
     #   - VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
     #   - VITE_API_BASE_URL=http://localhost:8000/api/v1
-    #   - VITE_SKYVERN_API_KEY=<get this from "settings" in the Skyvern UI>
+    #   - VITE_TESTCHARMVISION_API_KEY=<get this from "settings" in the Testcharmvision UI>
     depends_on:
-      skyvern:
+      testcharmvision:
         condition: service_healthy
 
 # uncomment for local usage of `vaultwarden` & bitwarden-cli - see more at: https://github.com/dani-garcia/vaultwarden
 # First this container needs to be started and configured to sign up, create master password and organization
-# Once created, under SETTINGS/SECURITY/KEYS/API you should be able to get client id and secret for CLI & Skyvern integrations
+# Once created, under SETTINGS/SECURITY/KEYS/API you should be able to get client id and secret for CLI & Testcharmvision integrations
 #  vaultwarden:
 #    image: vaultwarden/server:latest-alpine
 #    container_name: vaultwarden
@@ -176,8 +178,8 @@ services:
 #    ports:
 #      - 127.0.0.1:11002:80 # you can replace the 11002 with your preferred port
 
-# Bitwarden CLI Server (provides REST API endpoints for Skyvern)
-# Once you have master password and api credentials, you can set them below and this CLI should start providing secure access for Skyvern to Vaultwarden
+# Bitwarden CLI Server (provides REST API endpoints for Testcharmvision)
+# Once you have master password and api credentials, you can set them below and this CLI should start providing secure access for Testcharmvision to Vaultwarden
 #  bitwarden-cli:
 #    build:
 #      context: ./bitwarden-cli-server
