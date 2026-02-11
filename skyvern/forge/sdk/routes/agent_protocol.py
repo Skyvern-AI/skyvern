@@ -1580,34 +1580,44 @@ async def run_block(
     # LOG.critical("REMOVING BROWSER SESSION ID")
     # block_run_request.browser_session_id = None
 
-    await block_service.validate_block_labels(
-        workflow_permanent_id=block_run_request.workflow_id,
-        organization_id=organization.organization_id,
-        block_labels=block_run_request.block_labels,
-    )
+    try:
+        await block_service.validate_block_labels(
+            workflow_permanent_id=block_run_request.workflow_id,
+            organization_id=organization.organization_id,
+            block_labels=block_run_request.block_labels,
+        )
 
-    workflow_run = await block_service.ensure_workflow_run(
-        organization=organization,
-        template=template,
-        workflow_permanent_id=block_run_request.workflow_id,
-        block_run_request=block_run_request,
-    )
+        workflow_run = await block_service.ensure_workflow_run(
+            organization=organization,
+            template=template,
+            workflow_permanent_id=block_run_request.workflow_id,
+            block_run_request=block_run_request,
+        )
 
-    browser_session_id = block_run_request.browser_session_id
+        browser_session_id = block_run_request.browser_session_id
 
-    await block_service.execute_blocks(
-        request=request,
-        background_tasks=background_tasks,
-        api_key=x_api_key or "",
-        block_labels=block_run_request.block_labels,
-        workflow_id=block_run_request.workflow_id,
-        workflow_run_id=workflow_run.workflow_run_id,
-        workflow_permanent_id=workflow_run.workflow_permanent_id,
-        organization=organization,
-        user_id=user_id,
-        browser_session_id=browser_session_id,
-        block_outputs=block_run_request.block_outputs,
-    )
+        await block_service.execute_blocks(
+            request=request,
+            background_tasks=background_tasks,
+            api_key=x_api_key or "",
+            block_labels=block_run_request.block_labels,
+            workflow_id=block_run_request.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id,
+            organization=organization,
+            user_id=user_id,
+            browser_session_id=browser_session_id,
+            block_outputs=block_run_request.block_outputs,
+        )
+    except SkyvernHTTPException:
+        raise
+    except Exception:
+        LOG.exception(
+            "Unexpected error running blocks",
+            workflow_id=block_run_request.workflow_id,
+            organization_id=organization.organization_id,
+        )
+        raise
 
     return BlockRunResponse(
         block_labels=block_run_request.block_labels,

@@ -41,6 +41,7 @@ from skyvern.exceptions import (
     MissingValueForParameter,
     ScriptTerminationException,
     SkyvernException,
+    SkyvernHTTPException,
     WorkflowNotFound,
     WorkflowNotFoundForWorkflowRun,
     WorkflowRunNotFound,
@@ -3432,6 +3433,12 @@ class WorkflowService:
             )
 
             return updated_workflow
+        except SkyvernHTTPException:
+            # Bubble up well-formed client errors (e.g. WorkflowNotFound 404)
+            # so they are not wrapped in a 500 by the caller.
+            if new_workflow_id:
+                await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
+            raise
         except Exception as e:
             if new_workflow_id:
                 LOG.error(
