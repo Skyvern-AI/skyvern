@@ -4,141 +4,110 @@ subtitle: Trigger browser automations from Zapier workflows
 slug: integrations/zapier
 ---
 
-The Skyvern Zapier integration lets you connect Skyvern with Zapier's directory of 5000+ apps.
-
-Use it to trigger browser automation jobs from other tools, or to send Skyvern results into other apps.
-
----
-
-## What you'll need
-
-- A Skyvern Cloud API key from [Settings](https://app.skyvern.com/settings)
-
----
+Connect Skyvern to 7,000+ apps through Zapier. Trigger browser automations from any Zap, or feed Skyvern's results into downstream steps.
 
 ## Available Triggers
 
-Triggers start your Zap automatically when something happens in Skyvern.
-
-| Trigger | Use this to |
-|---------|-------------|
-| New or Updated Skyvern Workflow | Start a Zap whenever a workflow is created or modified in your Skyvern account. |
-
----
+- **New or Updated Skyvern Workflow** — Starts a Zap whenever a workflow is created or modified.
 
 ## Available Actions
 
-Actions are steps your Zap performs after it's triggered.
+- **Create and Run a Task** — Run an automation using **Skyvern 1.0** (simple, single-step goals)
+- **Create and Run Task V2** — Run an automation using **Skyvern 2.0** (complex, multi-step goals)
+- **Run a Workflow** — Run a pre-built Skyvern workflow with parameters
+- **Get a Task / Get a Task V2** — Retrieve results from a previously run task
+- **Get a Workflow** — Retrieve results from a previously run workflow
 
-| Action | Use this to |
-|--------|-------------|
-| Create and Run a Task | Run an automation using the `skyvern-1.0` engine. Best for simple tasks like filling a form or searching for information. |
-| Create and Run Task V2 | Run an automation using the `skyvern-2.0` engine. Best for complex, multi-step goals with dynamic planning. |
-| Run a Workflow | Run a pre-built Skyvern workflow with parameters. |
-| Get a Task | Retrieve results from a previously run task (v1). |
-| Get a Task V2 | Retrieve results from a previously run task (v2). |
-| Get a Workflow | Retrieve results from a previously run workflow. |
+## Setup
 
----
+<Steps>
+  <Step title="Add the Skyvern block">
+    Create a new Zap or edit an existing one, search for "Skyvern" in the Apps section, and choose the action or trigger you want.
 
-## Step 1: Add the Skyvern block
+    <Frame>
+      <video
+        autoPlay
+        muted
+        loop
+        playsInline
+        className="w-full aspect-video rounded-xl"
+        src="/images/zapier/zap1.mp4"
+      ></video>
+    </Frame>
+  </Step>
 
-1. Create a new Zap or edit an existing one
-2. Select the action/trigger by searching for "Skyvern" in the Apps section
-3. Choose the action/trigger event from the right panel
+  <Step title="Connect your account">
+    Click *Sign in* on the left panel and paste your API key from [Settings](https://app.skyvern.com/settings/api-keys).
 
-<video
-  autoPlay
-  muted
-  loop
-  playsInline
-  className="w-full aspect-video rounded-xl"
-  src="/images/zapier/zap1.mp4"
-></video>
+    <Frame>
+      <video
+        autoPlay
+        muted
+        loop
+        playsInline
+        className="w-full aspect-video rounded-xl"
+        src="/images/zapier/zap2.mp4"
+      ></video>
+    </Frame>
+  </Step>
 
----
+  <Step title="Configure">
+    Fill in the fields for your chosen action. See the field reference below.
+  </Step>
 
-## Step 2: Connect your account
+  <Step title="Test">
+    Review "Data In" to verify what will be sent, click **Test step**, and monitor progress in your [Skyvern dashboard](https://app.skyvern.com).
 
-1. Click on *Sign in* on the left panel for the action/trigger you're editing
-2. Go to [Settings](https://app.skyvern.com/settings) in Skyvern and copy your API key
-3. Submit your API key 
+    <Frame>
+      <img src="/images/zapier/z.5.png" alt="Test the Zapier step" />
+    </Frame>
+  </Step>
+</Steps>
 
-<video
-  autoPlay
-  muted
-  loop
-  playsInline
-  className="w-full aspect-video rounded-xl"
-  src="/images/zapier/zap2.mp4"
-></video>
-
----
-
-## Step 3: Set configuration fields
-
-Configuration varies by action type.
+## Field reference
 
 ### Create and Run a Task
 
-Both task actions use the same configuration fields. The difference is the underlying engine:
-
-- **Create and Run a Task** uses `skyvern-1.0` — optimized for simple, single-step goals
-- **Create and Run Task V2** uses `skyvern-2.0` — uses dynamic planning for complex, multi-step goals
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| URL | Yes | The starting page for the automation. |
-| Navigation Goal | Often | What Skyvern should do on the page. End with "COMPLETE" when done or "TERMINATE" to stop. Omit if only extracting data. |
-| Data Extraction Goal | No | What data to extract after navigation completes. Be specific about what to return. |
-| Navigation Payload | No | JSON object with input data for forms. Use this to run the same task with different data. |
-| Extracted Information Schema | No | JSON schema specifying how extracted data should be formatted. |
-| Webhook Callback URL | No | URL to notify when Skyvern finishes executing. |
-| Max Steps | No | Limit the number of steps to control costs. |
+- **URL** (required) — The starting page for the automation
+- **Navigation Goal** — What Skyvern should do on the page. Omit if only extracting data.
+- **Data Extraction Goal** — What data to pull from the page
+- **Navigation Payload** — JSON input data for forms. Lets you reuse the same task with different data.
+- **Extracted Information Schema** — JSON schema defining the shape of extracted data
+- **Webhook Callback URL** — URL to notify when the task finishes
+- **Max Steps** — Cap the number of steps to control costs
 
 <Note>
-The navigation goal describes what to do *after* loading the URL. Don't include "go to website X" in the navigation goal—use the URL field instead.
+The navigation goal describes what to do *after* loading the URL. Don't include "go to website X" — use the URL field instead.
 </Note>
 
-<img src="/images/zapier/z.3.png" alt="Configure task fields in Zapier" />
+<Frame>
+  <img src="/images/zapier/z.3.png" alt="Configure task fields in Zapier" />
+</Frame>
 
 ### Run a Workflow
 
 First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| Workflow | Yes | Select the workflow you want to run from the dropdown. |
-| Parameters | Depends | Fill in any parameters defined in your workflow. Skip if your workflow uses fixed values. |
+- **Workflow** (required) — Select the workflow to run
+- **Parameters** — Fill in any parameters defined in your workflow
 
-<img src="/images/zapier/z.7w.png" alt="Select workflow in Zapier" />
-<img src="/images/zapier/z.8w.png" alt="Configure workflow parameters in Zapier" />
+<Frame>
+  <img src="/images/zapier/z.7w.png" alt="Select workflow in Zapier" />
+</Frame>
+<Frame>
+  <img src="/images/zapier/z.8w.png" alt="Configure workflow parameters in Zapier" />
+</Frame>
 
 ### Get a Task / Workflow
 
-Use these actions to retrieve the output of a previous run into your Zap. The run must have already completed.
+Retrieve the output of a completed run.
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| Task ID | Yes | The ID of the task run. Starts with `tsk_`. |
-| Workflow Run ID | Yes | The ID of the workflow run. Starts with `wr_`. |
+- **Task ID** (required) — Starts with `tsk_`
+- **Workflow Run ID** (required) — Starts with `wr_`
 
-<img src="/images/zapier/z.11ag.png" alt="Enter Task ID field in Zapier" />
-<img src="/images/zapier/z.11bg.png" alt="Enter Workflow Run ID field in Zapier" />
-
----
-
-## Step 4: Test
-
-1. Review the "Data In" section to verify what information will be sent to Skyvern.
-
-2. Click **Test step** to run the action.
-
-3. Monitor progress in your [Skyvern dashboard](https://app.skyvern.com).
-
-<img src="/images/zapier/z.5.png" alt="Test the Zapier step" />
-
----
+<Frame>
+  <img src="/images/zapier/z.11ag.png" alt="Enter Task ID field in Zapier" />
+</Frame>
 
 ## Next steps
 
@@ -146,14 +115,14 @@ Use these actions to retrieve the output of a previous run into your Zap. The ru
   <Card
     title="Build Workflows"
     icon="diagram-project"
-    href="/workflows/manage-workflows"
+    href="/cloud/manage-workflows"
   >
     Create reusable multi-step automations in Skyvern
   </Card>
   <Card
     title="Use Webhooks"
     icon="webhook"
-    href="/running-tasks/webhooks-faq"
+    href="/going-to-production/webhooks"
   >
     Get notified when tasks complete
   </Card>
