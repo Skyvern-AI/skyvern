@@ -4,6 +4,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from skyvern import analytics
 from skyvern.schemas.runs import ProxyLocation
 
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
@@ -36,6 +37,14 @@ async def skyvern_session_create(
                 ctx = BrowserContext(mode="local")
                 set_current_session(SessionState(browser=browser, context=ctx))
                 timer.mark("sdk")
+                analytics.capture(
+                    "skyvern-oss-mcp-session-create",
+                    data={
+                        "mode": "local",
+                        "headless": headless,
+                        "timing_ms": timer.timing_ms.get("total"),
+                    },
+                )
                 return make_result(
                     "skyvern_session_create",
                     browser_context=ctx,
@@ -68,6 +77,15 @@ async def skyvern_session_create(
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Failed to create browser session"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-session-create",
+        data={
+            "mode": "cloud",
+            "timeout_minutes": timeout,
+            "proxy_location": proxy_location,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_session_create",
         browser_context=ctx,
@@ -126,6 +144,10 @@ async def skyvern_session_close(
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Failed to close session"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-session-close",
+        data={"timing_ms": timer.timing_ms.get("total")},
+    )
     return make_result(
         "skyvern_session_close",
         data={"session_id": closed_id, "closed": True},
@@ -175,6 +197,10 @@ async def skyvern_session_list() -> dict[str, Any]:
     current = get_current_session()
     current_id = current.context.session_id if current.context else None
 
+    analytics.capture(
+        "skyvern-oss-mcp-session-list",
+        data={"count": len(session_data), "timing_ms": timer.timing_ms.get("total")},
+    )
     return make_result(
         "skyvern_session_list",
         data={
@@ -206,6 +232,10 @@ async def skyvern_session_get(
     current = get_current_session()
     is_current = current.context and current.context.session_id == session_id
 
+    analytics.capture(
+        "skyvern-oss-mcp-session-get",
+        data={"timing_ms": timer.timing_ms.get("total")},
+    )
     return make_result(
         "skyvern_session_get",
         browser_context=BrowserContext(mode="cloud_session", session_id=session_id) if is_current else None,
@@ -253,6 +283,13 @@ async def skyvern_session_connect(
                 error=make_error(ErrorCode.BROWSER_NOT_FOUND, str(e), "Check the session ID or CDP URL is valid"),
             )
 
+    analytics.capture(
+        "skyvern-oss-mcp-session-connect",
+        data={
+            "mode": ctx.mode if ctx else None,
+            "timing_ms": timer.timing_ms.get("total"),
+        },
+    )
     return make_result(
         "skyvern_session_connect",
         browser_context=ctx,
