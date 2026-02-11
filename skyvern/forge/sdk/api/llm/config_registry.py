@@ -995,6 +995,22 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
+    LLMConfigRegistry.register_config(
+        "GEMINI_3.0_FLASH",
+        LLMConfig(
+            "gemini/gemini-3-flash-preview",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
+        ),
+    )
 
 
 if settings.ENABLE_NOVITA:
