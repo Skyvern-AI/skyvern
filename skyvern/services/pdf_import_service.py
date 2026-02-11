@@ -21,6 +21,7 @@ class PDFImportService:
     def _sanitize_workflow_json(raw: dict[str, Any]) -> dict[str, Any]:
         """Clean LLM JSON to match Skyvern schema conventions and avoid Jinja errors.
 
+        - Replace whitespace in block labels with underscores
         - Replace Jinja refs like {{workflow.foo}} or {{parameters.foo}} with {{foo}}
         - Auto-populate block.parameter_keys with any referenced parameter keys
         - Ensure all block labels are unique by appending indices to duplicates
@@ -47,7 +48,23 @@ class PDFImportService:
 
         blocks = workflow_def.get("blocks", []) or []
 
-        # First pass: deduplicate block labels
+        # First pass: sanitize block labels (replace whitespace with underscores)
+        for blk in blocks:
+            if not isinstance(blk, dict):
+                continue
+            label = blk.get("label", "")
+            if label:
+                # Replace any whitespace with underscores (same as frontend behavior)
+                sanitized_label = re.sub(r"\s+", "_", label)
+                if sanitized_label != label:
+                    LOG.info(
+                        "Sanitizing block label",
+                        original_label=label,
+                        sanitized_label=sanitized_label,
+                    )
+                    blk["label"] = sanitized_label
+
+        # Second pass: deduplicate block labels
         seen_labels: dict[str, int] = {}
         deduplicated_count = 0
         for blk in blocks:
@@ -130,6 +147,9 @@ class PDFImportService:
                 if blk.get("url") is None:
                     blk["url"] = ""
 
+            # Note: parameter_keys is kept in backend format for WorkflowCreateYAMLRequest validation
+            # The sop-to-blocks endpoint transforms to frontend format separately
+
         return raw
 
     def extract_text_from_pdf(self, file_contents: bytes, file_name: str) -> str:
@@ -211,6 +231,20 @@ class PDFImportService:
                 organization_id=organization.organization_id,
             )
             raise HTTPException(status_code=422, detail="LLM returned invalid response format - expected JSON object")
+
+        # Check if LLM detected non-SOP content
+        if response.get("error") == "not_sop":
+            LOG.info(
+                "LLM detected non-SOP content",
+                reason=response.get("reason"),
+                organization_id=organization.organization_id,
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=response.get(
+                    "reason", "The uploaded PDF does not appear to contain a Standard Operating Procedure."
+                ),
+            )
 
         # Validate that it has the required structure
         if "workflow_definition" not in response:

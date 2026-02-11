@@ -84,7 +84,7 @@ class ForgeApp:
     authentication_function: Callable[[str], Awaitable[Organization]] | None
     authenticate_user_function: Callable[[str], Awaitable[str | None]] | None
     setup_api_app: Callable[[FastAPI], None] | None
-    api_app_startup_event: Callable[[], Awaitable[None]] | None
+    api_app_startup_event: Callable[[FastAPI], Awaitable[None]] | None
     api_app_shutdown_event: Callable[[], Awaitable[None]] | None
     agent: ForgeAgent
 

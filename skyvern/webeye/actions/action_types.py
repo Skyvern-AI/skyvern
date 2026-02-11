@@ -52,4 +52,5 @@ POST_ACTION_EXECUTION_ACTION_TYPES = [
     ActionType.WAIT,
     ActionType.SOLVE_CAPTCHA,
     ActionType.EXTRACT,
+    ActionType.KEYPRESS,
 ]

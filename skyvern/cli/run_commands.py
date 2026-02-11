@@ -10,11 +10,11 @@ import psutil
 import typer
 import uvicorn
 from dotenv import load_dotenv, set_key
-from mcp.server.fastmcp import FastMCP
 from rich.panel import Panel
 from rich.prompt import Confirm
 
 from skyvern.cli.console import console
+from skyvern.cli.mcp_tools import mcp  # Uses standalone fastmcp (v2.x)
 from skyvern.cli.utils import start_services
 from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
@@ -26,8 +26,6 @@ from skyvern.utils import detect_os
 from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
-
-mcp = FastMCP("Skyvern")
 
 
 @mcp.tool()
@@ -53,12 +51,9 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
     res = await skyvern_agent.run_task(prompt=prompt, url=url, user_agent="skyvern-mcp", wait_for_completion=True)
 
     output = res.model_dump()["output"]
-    # Primary: use app_url from API response (handles both task and workflow run IDs correctly)
     if res.app_url:
         task_url = res.app_url
     else:
-        # Fallback when app_url is not available (e.g., older API versions)
-        # Determine route based on run_id prefix: 'wr_' for workflows, otherwise tasks
         if res.run_id and res.run_id.startswith("wr_"):
             task_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{res.run_id}/overview"
         else:
@@ -163,10 +158,101 @@ def run_ui() -> None:
         return
 
 
+@run_app.command(name="ui-dev")
+def run_ui_dev() -> None:
+    """Run the Skyvern UI server in development mode (npm run start-local)."""
+    console.print(Panel("[bold blue]Starting Skyvern UI Server (dev mode)...[/bold blue]", border_style="blue"))
+    try:
+        with console.status("[bold green]Checking for existing process on port 8080...") as status:
+            pids = get_pids_on_port(8080)
+            if pids:
+                status.stop()
+                response = Confirm.ask("Process already running on port 8080. [yellow]Kill it?[/yellow]")
+                if response:
+                    kill_pids(pids)
+                    console.print("✅ [green]Process killed.[/green]")
+                else:
+                    console.print("[yellow]UI server not started. Process already running on port 8080.[/yellow]")
+                    return
+            status.stop()
+    except Exception as e:  # pragma: no cover - CLI safeguards
+        console.print(f"[red]Error checking for process: {e}[/red]")
+
+    frontend_env_path = resolve_frontend_env_path()
+    if frontend_env_path is None:
+        console.print("[bold red]ERROR: Skyvern Frontend directory not found.[/bold red]")
+        return
+
+    frontend_dir = frontend_env_path.parent
+
+    os.chdir(frontend_dir)
+
+    try:
+        console.print("📦 [bold blue]Running npm ci...[/bold blue]")
+        subprocess.run("npm ci", shell=True, check=True)
+        console.print("✅ [green]npm ci complete.[/green]")
+        console.print("🚀 [bold blue]Starting npm UI server (start-local)...[/bold blue]")
+        subprocess.run("npm run start-local", shell=True, check=True)
+    except subprocess.CalledProcessError as e:
+        console.print(f"[bold red]Error running UI server: {e}[/bold red]")
+        return
+
+
 @run_app.command(name="all")
 def run_all() -> None:
     """Run the Skyvern API server and UI server in parallel."""
     asyncio.run(start_services())
+
+
+@run_app.command(name="dev")
+def run_dev() -> None:
+    """Run the Skyvern API server and UI server in the background (detached).
+
+    This command starts both services and immediately returns control to your terminal.
+    Use 'skyvern stop all' to stop the services.
+    """
+    load_dotenv(resolve_backend_env_path())
+    from skyvern.config import settings as skyvern_settings  # noqa: PLC0415
+
+    console.print(Panel("[bold green]Starting Skyvern in development mode...[/bold green]", border_style="green"))
+
+    # Start server in background (detached) - call uvicorn directly
+    server_process = subprocess.Popen(
+        [
+            "uvicorn",
+            "skyvern.forge.api_app:create_api_app",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(skyvern_settings.PORT),
+            "--factory",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    console.print(f"✅ [green]Server started in background (PID: {server_process.pid})[/green]")
+
+    # Start UI (dev mode) in background (detached) - call npm directly
+    frontend_env_path = resolve_frontend_env_path()
+    if frontend_env_path is None:
+        console.print("[bold red]ERROR: Skyvern Frontend directory not found.[/bold red]")
+        return
+    frontend_dir = frontend_env_path.parent
+
+    ui_process = subprocess.Popen(
+        ["npm", "run", "start-local"],
+        cwd=frontend_dir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    console.print(f"✅ [green]UI (dev mode) started in background (PID: {ui_process.pid})[/green]")
+
+    console.print("\n🎉 [bold green]Skyvern is starting![/bold green]")
+    console.print(f"🌐 [bold]API server:[/bold] [cyan]http://localhost:{skyvern_settings.PORT}[/cyan]")
+    console.print("🖥️  [bold]UI:[/bold] [cyan]http://localhost:8080[/cyan]")
+    console.print("\n[dim]Use 'skyvern stop all' to stop the services.[/dim]")
 
 
 @run_app.command(name="mcp")

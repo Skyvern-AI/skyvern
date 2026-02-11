@@ -18,6 +18,27 @@ from skyvern.services import script_service
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
 
+
+def workflow_has_conditionals(workflow: Workflow) -> bool:
+    """
+    Check if a workflow contains any conditional blocks.
+
+    This is used to determine whether "missing" blocks in the cache should trigger
+    regeneration. For workflows with conditionals, blocks in unexecuted branches
+    are legitimately missing and should NOT trigger regeneration.
+    """
+    try:
+        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+        return any(block.block_type == BlockType.CONDITIONAL for block in all_blocks)
+    except Exception:
+        LOG.warning(
+            "Failed to check workflow for conditional blocks",
+            workflow_id=workflow.workflow_id,
+            exc_info=True,
+        )
+        return False
+
+
 # Cache for workflow scripts - only stores non-None results
 _workflow_script_cache: TTLCache[tuple, "Script"] = TTLCache(maxsize=128, ttl=60 * 60)
 
@@ -232,27 +253,10 @@ async def generate_workflow_script(
     cached_script: Script | None = None,
     updated_block_labels: set[str] | None = None,
 ) -> None:
-    # Disable script generation for workflows containing conditional blocks to avoid caching divergent paths.
-    try:
-        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
-        has_conditional = any(block.block_type == BlockType.CONDITIONAL for block in all_blocks)
-    except Exception:
-        has_conditional = False
-        LOG.warning(
-            "Failed to inspect workflow blocks for conditional types; continuing with script generation",
-            workflow_id=workflow.workflow_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            exc_info=True,
-        )
-
-    if has_conditional:
-        LOG.info(
-            "Skipping script generation for workflow containing conditional blocks",
-            workflow_id=workflow.workflow_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-        )
-        return
-
+    # Note: Workflows with conditional blocks ARE supported. The conditional block itself
+    # is not cached (it's evaluated at runtime), but cacheable blocks in branches are
+    # cached progressively as they execute. See workflow_has_conditionals() for the
+    # regeneration logic that prevents unnecessary regeneration for unexecuted branches.
     try:
         LOG.info(
             "Generating script for workflow",

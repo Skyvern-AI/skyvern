@@ -2,6 +2,12 @@ name: Build Docker Image and Push to ECR
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for the release (e.g., v1.0.11)'
+        required: true
+        type: string
 env:
   AWS_REGION: us-east-1
   ECR_BACKEND_REPOSITORY: skyvern
@@ -50,10 +56,10 @@ jobs:
           cache-to: type=gha,mode=max
           tags: |
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}
-            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.event.release.tag_name }}
+            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ inputs.tag_name || github.event.release.tag_name }}
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:latest
             ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}
-            ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.event.release.tag_name }}
+            ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ inputs.tag_name || github.event.release.tag_name }}
             ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_BACKEND_REPOSITORY }}:latest
       - name: Build, tag, and push ui image to Amazon Public ECR and Docker Hub
         id: build-ui-image
@@ -71,8 +77,8 @@ jobs:
           push: true
           tags: |
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_UI_REPOSITORY }}:${{ github.sha }}
-            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_UI_REPOSITORY }}:${{ github.event.release.tag_name }}
+            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_UI_REPOSITORY }}:${{ inputs.tag_name || github.event.release.tag_name }}
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_UI_REPOSITORY }}:latest
             ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_UI_REPOSITORY }}:${{ github.sha }}
-            ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_UI_REPOSITORY }}:${{ github.event.release.tag_name }}
+            ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_UI_REPOSITORY }}:${{ inputs.tag_name || github.event.release.tag_name }}
             ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_UI_REPOSITORY }}:latest

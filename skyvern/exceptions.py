@@ -113,14 +113,6 @@ class ImaginaryFileUrl(SkyvernException):
         super().__init__(f"File url {file_url} is imaginary.")
 
 
-class DownloadedFileNotFound(SkyvernException):
-    def __init__(self, downloaded_path: str, download_url: str | None = None) -> None:
-        message = f"Downloaded file does not exist at path: {downloaded_path}. This may indicate the download failed silently or the file was removed."
-        if download_url:
-            message += f" Download URL: {download_url}"
-        super().__init__(message)
-
-
 class MissingBrowserState(SkyvernException):
     def __init__(self, task_id: str | None = None, workflow_run_id: str | None = None) -> None:
         task_str = f"task_id={task_id}" if task_id else ""

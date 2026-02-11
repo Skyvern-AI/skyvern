@@ -74,12 +74,12 @@ def setup_llm_providers() -> None:
             update_or_add_env_var("ENABLE_OPENAI", "true")
             model_options.extend(
                 [
+                    "OPENAI_GPT5",
+                    "OPENAI_GPT5_2",
                     "OPENAI_GPT4_1",
-                    "OPENAI_GPT4_1_MINI",
-                    "OPENAI_GPT4_1_NANO",
-                    "OPENAI_GPT4O",
-                    "OPENAI_O4_MINI",
                     "OPENAI_O3",
+                    "OPENAI_O4_MINI",
+                    "OPENAI_GPT4O",
                 ]
             )
     else:
@@ -97,13 +97,11 @@ def setup_llm_providers() -> None:
             update_or_add_env_var("ENABLE_ANTHROPIC", "true")
             model_options.extend(
                 [
-                    "ANTHROPIC_CLAUDE3.5_SONNET",
-                    "ANTHROPIC_CLAUDE3.7_SONNET",
-                    "ANTHROPIC_CLAUDE3.5_HAIKU",
+                    "ANTHROPIC_CLAUDE4.5_OPUS",
+                    "ANTHROPIC_CLAUDE4.5_SONNET",
                     "ANTHROPIC_CLAUDE4_OPUS",
                     "ANTHROPIC_CLAUDE4_SONNET",
                     "ANTHROPIC_CLAUDE4.5_HAIKU",
-                    "ANTHROPIC_CLAUDE4.5_SONNET",
                 ]
             )
     else:

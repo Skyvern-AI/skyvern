@@ -1,7 +1,9 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
+import { useRef } from "react";
 
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
+import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksMutation";
 import { useDebugStore } from "@/store/useDebugStore";
 import {
   BranchContext,
@@ -13,6 +15,7 @@ import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
+import { toast } from "@/components/ui/use-toast";
 
 import type { NodeAdderNode } from "./types";
 import { WorkflowAddMenu } from "../../WorkflowAddMenu";
@@ -32,6 +35,9 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const setRecordedBlocks = useRecordedBlocksStore(
     (state) => state.setRecordedBlocks,
   );
+
+  // SOP upload
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const deriveBranchContext = (previousNodeId: string | undefined) => {
     const previousNode = nodes.find((node) => node.id === previousNodeId);
@@ -123,6 +129,21 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     },
   });
 
+  const sopToBlocksMutation = useSopToBlocksMutation({
+    onSuccess: (result) => {
+      // Reuse existing block insertion pattern
+      setRecordedBlocks(result, {
+        previous: previous ?? null,
+        next: id,
+        parent: parentId,
+        connectingEdgeType: "default",
+      });
+    },
+  });
+
+  // Derive upload state directly from mutation to avoid race conditions
+  const isUploadingSOP = sopToBlocksMutation.isPending;
+
   const isProcessing = processRecordingMutation.isPending;
 
   const isBusy =
@@ -181,6 +202,28 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     processRecordingMutation.mutate();
   };
 
+  const onUploadSOP = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleSOPFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      toast({
+        variant: "destructive",
+        title: "Invalid file type",
+        description: "Please select a PDF file",
+      });
+      e.target.value = "";
+      return;
+    }
+    sopToBlocksMutation.mutate(file);
+    e.target.value = "";
+  };
+
   const adder = (
     <div
       className={cn("rounded-full bg-slate-50 p-2", {
@@ -206,14 +249,41 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     </WorkflowAdderBusy>
   );
 
+  const handleCancelUpload = () => {
+    sopToBlocksMutation.cancel();
+  };
+
+  const sopUploadBusy = (
+    <WorkflowAdderBusy
+      color="#3b82f6"
+      operation="uploading"
+      onComplete={() => {}}
+      onCancel={handleCancelUpload}
+    >
+      {adder}
+    </WorkflowAdderBusy>
+  );
+
   const menu = (
-    <WorkflowAddMenu onAdd={onAdd} onRecord={onRecord}>
+    <WorkflowAddMenu
+      onAdd={onAdd}
+      onRecord={onRecord}
+      onUploadSOP={onUploadSOP}
+      isUploadingSOP={isUploadingSOP}
+    >
       {adder}
     </WorkflowAddMenu>
   );
 
   return (
     <div>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".pdf"
+        className="hidden"
+        onChange={handleSOPFileChange}
+      />
       <Handle
         type="source"
         position={Position.Bottom}
@@ -226,7 +296,13 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
         id="b"
         className="opacity-0"
       />
-      {isBusy ? busy : isDisabled ? adder : menu}
+      {isUploadingSOP
+        ? sopUploadBusy
+        : isBusy
+          ? busy
+          : isDisabled
+            ? adder
+            : menu}
     </div>
   );
 }

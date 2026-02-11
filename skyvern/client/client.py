@@ -13,12 +13,20 @@ from .environment import SkyvernEnvironment
 from .raw_client import AsyncRawSkyvern, RawSkyvern
 from .types.artifact import Artifact
 from .types.artifact_type import ArtifactType
+from .types.billing_state_response import BillingStateResponse
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
+from .types.change_tier_response import ChangeTierResponse
+from .types.checkout_session_response import CheckoutSessionResponse
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
+from .types.extensions import Extensions
 from .types.get_run_response import GetRunResponse
+from .types.otp_type import OtpType
+from .types.persistent_browser_type import PersistentBrowserType
+from .types.plan_tier import PlanTier
+from .types.portal_session_response import PortalSessionResponse
 from .types.proxy_location import ProxyLocation
 from .types.retry_run_webhook_request import RetryRunWebhookRequest
 from .types.run_engine import RunEngine
@@ -147,6 +155,7 @@ class Skyvern:
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
+        run_with: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TaskRunResponse:
         """
@@ -185,15 +194,16 @@ class Skyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
@@ -244,6 +254,9 @@ class Skyvern:
         browser_address : typing.Optional[str]
             The CDP address for the task.
 
+        run_with : typing.Optional[str]
+            Whether to run the task with agent or code.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -284,6 +297,7 @@ class Skyvern:
             include_action_history_in_verification=include_action_history_in_verification,
             max_screenshot_scrolls=max_screenshot_scrolls,
             browser_address=browser_address,
+            run_with=run_with,
             request_options=request_options,
         )
         return _response.data
@@ -344,15 +358,16 @@ class Skyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
@@ -863,6 +878,90 @@ class Skyvern:
         _response = self._raw_client.get_run_timeline(run_id, request_options=request_options)
         return _response.data
 
+    def get_workflow(
+        self,
+        workflow_permanent_id: str,
+        *,
+        version: typing.Optional[int] = None,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        version : typing.Optional[int]
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow(
+            workflow_permanent_id="workflow_permanent_id",
+            version=1,
+            template=True,
+        )
+        """
+        _response = self._raw_client.get_workflow(
+            workflow_permanent_id, version=version, template=template, request_options=request_options
+        )
+        return _response.data
+
+    def get_workflow_versions(
+        self,
+        workflow_permanent_id: str,
+        *,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Workflow]:
+        """
+        Get all versions of a workflow by its permanent ID.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Workflow]
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow_versions(
+            workflow_permanent_id="workflow_permanent_id",
+            template=True,
+        )
+        """
+        _response = self._raw_client.get_workflow_versions(
+            workflow_permanent_id, template=template, request_options=request_options
+        )
+        return _response.data
+
     def upload_file(
         self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
     ) -> UploadFileResponse:
@@ -1079,6 +1178,8 @@ class Skyvern:
         *,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
+        browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserSessionResponse:
         """
@@ -1103,16 +1204,23 @@ class Skyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+        extensions : typing.Optional[typing.Sequence[Extensions]]
+            A list of extensions to install in the browser session.
+
+        browser_type : typing.Optional[PersistentBrowserType]
+            The type of browser to use for the session.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1132,7 +1240,11 @@ class Skyvern:
         client.create_browser_session()
         """
         _response = self._raw_client.create_browser_session(
-            timeout=timeout, proxy_location=proxy_location, request_options=request_options
+            timeout=timeout,
+            proxy_location=proxy_location,
+            extensions=extensions,
+            browser_type=browser_type,
+            request_options=request_options,
         )
         return _response.data
 
@@ -1212,6 +1324,7 @@ class Skyvern:
         workflow_run_id: typing.Optional[str] = OMIT,
         source: typing.Optional[str] = OMIT,
         expired_at: typing.Optional[dt.datetime] = OMIT,
+        type: typing.Optional[OtpType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TotpCode:
         """
@@ -1239,6 +1352,9 @@ class Skyvern:
 
         expired_at : typing.Optional[dt.datetime]
             The timestamp when the TOTP code expires
+
+        type : typing.Optional[OtpType]
+            Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1268,6 +1384,7 @@ class Skyvern:
             workflow_run_id=workflow_run_id,
             source=source,
             expired_at=expired_at,
+            type=type,
             request_options=request_options,
         )
         return _response.data
@@ -1893,6 +2010,144 @@ class Skyvern:
         )
         return _response.data
 
+    def create_checkout_session_api_v1billing_checkout_post(
+        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
+    ) -> CheckoutSessionResponse:
+        """
+        Create a Stripe Checkout Session for subscribing to a tier.
+
+        Frontend should redirect the user to the returned URL.
+        After successful checkout, Stripe will send a webhook that we handle
+        to store the subscription and initialize billing state.
+
+        Returns 400 if org already has an active subscription (use portal instead).
+
+        Parameters
+        ----------
+        tier : PlanTier
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        CheckoutSessionResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.create_checkout_session_api_v1billing_checkout_post(
+            tier="free",
+        )
+        """
+        _response = self._raw_client.create_checkout_session_api_v1billing_checkout_post(
+            tier=tier, request_options=request_options
+        )
+        return _response.data
+
+    def create_portal_session_api_v1billing_portal_post(
+        self, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> PortalSessionResponse:
+        """
+        Create a Stripe Customer Portal session for managing subscription.
+
+        Frontend should redirect the user to the returned URL.
+        The portal allows users to:
+        - Update payment methods
+        - Upgrade/downgrade plans
+        - Cancel subscription
+        - View invoices
+
+        Parameters
+        ----------
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        PortalSessionResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.create_portal_session_api_v1billing_portal_post()
+        """
+        _response = self._raw_client.create_portal_session_api_v1billing_portal_post(request_options=request_options)
+        return _response.data
+
+    def get_organization_billing_api_v1billing_state_get(
+        self, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> typing.Optional[BillingStateResponse]:
+        """
+        Parameters
+        ----------
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.Optional[BillingStateResponse]
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_organization_billing_api_v1billing_state_get()
+        """
+        _response = self._raw_client.get_organization_billing_api_v1billing_state_get(request_options=request_options)
+        return _response.data
+
+    def change_tier_api_v1billing_change_tier_post(
+        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
+    ) -> ChangeTierResponse:
+        """
+        Redirect to Stripe Portal for tier changes.
+        Portal handles proration based on configured settings:
+        - Upgrades: Immediate proration charge
+        - Downgrades: Apply at end of billing period
+
+        Parameters
+        ----------
+        tier : PlanTier
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        ChangeTierResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.change_tier_api_v1billing_change_tier_post(
+            tier="free",
+        )
+        """
+        _response = self._raw_client.change_tier_api_v1billing_change_tier_post(
+            tier=tier, request_options=request_options
+        )
+        return _response.data
+
     @property
     def scripts(self):
         if self._scripts is None:
@@ -2003,6 +2258,7 @@ class AsyncSkyvern:
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
+        run_with: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TaskRunResponse:
         """
@@ -2041,15 +2297,16 @@ class AsyncSkyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
@@ -2100,6 +2357,9 @@ class AsyncSkyvern:
         browser_address : typing.Optional[str]
             The CDP address for the task.
 
+        run_with : typing.Optional[str]
+            Whether to run the task with agent or code.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -2148,6 +2408,7 @@ class AsyncSkyvern:
             include_action_history_in_verification=include_action_history_in_verification,
             max_screenshot_scrolls=max_screenshot_scrolls,
             browser_address=browser_address,
+            run_with=run_with,
             request_options=request_options,
         )
         return _response.data
@@ -2208,15 +2469,16 @@ class AsyncSkyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
@@ -2817,6 +3079,106 @@ class AsyncSkyvern:
         _response = await self._raw_client.get_run_timeline(run_id, request_options=request_options)
         return _response.data
 
+    async def get_workflow(
+        self,
+        workflow_permanent_id: str,
+        *,
+        version: typing.Optional[int] = None,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        version : typing.Optional[int]
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow(
+                workflow_permanent_id="workflow_permanent_id",
+                version=1,
+                template=True,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow(
+            workflow_permanent_id, version=version, template=template, request_options=request_options
+        )
+        return _response.data
+
+    async def get_workflow_versions(
+        self,
+        workflow_permanent_id: str,
+        *,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Workflow]:
+        """
+        Get all versions of a workflow by its permanent ID.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Workflow]
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow_versions(
+                workflow_permanent_id="workflow_permanent_id",
+                template=True,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow_versions(
+            workflow_permanent_id, template=template, request_options=request_options
+        )
+        return _response.data
+
     async def upload_file(
         self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
     ) -> UploadFileResponse:
@@ -3081,6 +3443,8 @@ class AsyncSkyvern:
         *,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
+        browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserSessionResponse:
         """
@@ -3105,16 +3469,23 @@ class AsyncSkyvern:
             - RESIDENTIAL_FR: France
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
-            - US-CA: California
-            - US-NY: New York
-            - US-TX: Texas
-            - US-FL: Florida
-            - US-WA: Washington
+            - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+            - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+            - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+            - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+            - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+        extensions : typing.Optional[typing.Sequence[Extensions]]
+            A list of extensions to install in the browser session.
+
+        browser_type : typing.Optional[PersistentBrowserType]
+            The type of browser to use for the session.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3142,7 +3513,11 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.create_browser_session(
-            timeout=timeout, proxy_location=proxy_location, request_options=request_options
+            timeout=timeout,
+            proxy_location=proxy_location,
+            extensions=extensions,
+            browser_type=browser_type,
+            request_options=request_options,
         )
         return _response.data
 
@@ -3238,6 +3613,7 @@ class AsyncSkyvern:
         workflow_run_id: typing.Optional[str] = OMIT,
         source: typing.Optional[str] = OMIT,
         expired_at: typing.Optional[dt.datetime] = OMIT,
+        type: typing.Optional[OtpType] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TotpCode:
         """
@@ -3265,6 +3641,9 @@ class AsyncSkyvern:
 
         expired_at : typing.Optional[dt.datetime]
             The timestamp when the TOTP code expires
+
+        type : typing.Optional[OtpType]
+            Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3302,6 +3681,7 @@ class AsyncSkyvern:
             workflow_run_id=workflow_run_id,
             source=source,
             expired_at=expired_at,
+            type=type,
             request_options=request_options,
         )
         return _response.data
@@ -4016,6 +4396,180 @@ class AsyncSkyvern:
             browser_address=browser_address,
             workflow_run_id=workflow_run_id,
             request_options=request_options,
+        )
+        return _response.data
+
+    async def create_checkout_session_api_v1billing_checkout_post(
+        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
+    ) -> CheckoutSessionResponse:
+        """
+        Create a Stripe Checkout Session for subscribing to a tier.
+
+        Frontend should redirect the user to the returned URL.
+        After successful checkout, Stripe will send a webhook that we handle
+        to store the subscription and initialize billing state.
+
+        Returns 400 if org already has an active subscription (use portal instead).
+
+        Parameters
+        ----------
+        tier : PlanTier
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        CheckoutSessionResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.create_checkout_session_api_v1billing_checkout_post(
+                tier="free",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.create_checkout_session_api_v1billing_checkout_post(
+            tier=tier, request_options=request_options
+        )
+        return _response.data
+
+    async def create_portal_session_api_v1billing_portal_post(
+        self, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> PortalSessionResponse:
+        """
+        Create a Stripe Customer Portal session for managing subscription.
+
+        Frontend should redirect the user to the returned URL.
+        The portal allows users to:
+        - Update payment methods
+        - Upgrade/downgrade plans
+        - Cancel subscription
+        - View invoices
+
+        Parameters
+        ----------
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        PortalSessionResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.create_portal_session_api_v1billing_portal_post()
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.create_portal_session_api_v1billing_portal_post(
+            request_options=request_options
+        )
+        return _response.data
+
+    async def get_organization_billing_api_v1billing_state_get(
+        self, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> typing.Optional[BillingStateResponse]:
+        """
+        Parameters
+        ----------
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.Optional[BillingStateResponse]
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_organization_billing_api_v1billing_state_get()
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_organization_billing_api_v1billing_state_get(
+            request_options=request_options
+        )
+        return _response.data
+
+    async def change_tier_api_v1billing_change_tier_post(
+        self, *, tier: PlanTier, request_options: typing.Optional[RequestOptions] = None
+    ) -> ChangeTierResponse:
+        """
+        Redirect to Stripe Portal for tier changes.
+        Portal handles proration based on configured settings:
+        - Upgrades: Immediate proration charge
+        - Downgrades: Apply at end of billing period
+
+        Parameters
+        ----------
+        tier : PlanTier
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        ChangeTierResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.change_tier_api_v1billing_change_tier_post(
+                tier="free",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.change_tier_api_v1billing_change_tier_post(
+            tier=tier, request_options=request_options
         )
         return _response.data
 

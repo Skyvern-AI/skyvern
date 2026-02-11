@@ -32,6 +32,7 @@ class Action(UniversalBaseModel):
     element_id: typing.Optional[str] = None
     skyvern_element_hash: typing.Optional[str] = None
     skyvern_element_data: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    screenshot_artifact_id: typing.Optional[str] = None
     tool_call_id: typing.Optional[str] = None
     xpath: typing.Optional[str] = None
     errors: typing.Optional[typing.List[UserDefinedError]] = None
@@ -39,6 +40,8 @@ class Action(UniversalBaseModel):
     file_name: typing.Optional[str] = None
     file_url: typing.Optional[str] = None
     download: typing.Optional[bool] = None
+    download_triggered: typing.Optional[bool] = None
+    downloaded_files: typing.Optional[typing.List[str]] = None
     is_upload_file_tag: typing.Optional[bool] = None
     text: typing.Optional[str] = None
     input_or_select_context: typing.Optional[InputOrSelectContext] = None
