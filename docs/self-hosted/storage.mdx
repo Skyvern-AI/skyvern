@@ -14,7 +14,7 @@ Skyvern supports three storage backends:
 |------|------------------------|----------|
 | Local filesystem | `local` | Development, single-server deployments |
 | AWS S3 | `s3` | Production on AWS, multi-server deployments |
-| Azure Blob | `azure` | Production on Azure |
+| Azure Blob | `azureblob` | Production on Azure |
 
 ---
 
@@ -173,7 +173,7 @@ Store artifacts in Azure Blob Storage for Azure-based deployments.
 ### Configuration
 
 ```bash .env
-SKYVERN_STORAGE_TYPE=azure
+SKYVERN_STORAGE_TYPE=azureblob
 AZURE_STORAGE_ACCOUNT_NAME=yourstorageaccount
 AZURE_STORAGE_ACCOUNT_KEY=your-storage-account-key
 AZURE_STORAGE_CONTAINER_ARTIFACTS=skyvern-artifacts

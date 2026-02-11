@@ -7,7 +7,7 @@ slug: self-hosted/kubernetes
 This guide walks through deploying Skyvern on Kubernetes for production environments. Use this when you need horizontal scaling, high availability, or integration with existing Kubernetes infrastructure.
 
 <Warning>
-Skyvern has no built-in authentication. Do not expose this deployment to the public internet without adding authentication at the ingress layer.
+Do not expose this deployment to the public internet without adding authentication at the ingress layer.
 </Warning>
 
 ## Prerequisites
@@ -185,7 +185,7 @@ The backend pod takes 1-2 minutes to become ready as it runs database migrations
 
 ### 7. Get your API key
 
-Once the backend is ready, retrieve the generated API key:
+Wait for the backend pod to show `1/1` in the `READY` column of `kubectl get pods -n skyvern` before running this command. The API key file is generated during startup and won't exist until the pod is ready.
 
 ```bash
 kubectl exec -n skyvern deployment/skyvern-backend -- cat /app/.streamlit/secrets.toml
@@ -201,7 +201,7 @@ Reapply the frontend secrets and restart:
 
 ```bash
 kubectl apply -f frontend/frontend-secrets.yaml -n skyvern
-kubectl delete pod -n skyvern -l app=skyvern-frontend
+kubectl rollout restart deployment/skyvern-frontend -n skyvern
 ```
 
 ### 8. Access the UI

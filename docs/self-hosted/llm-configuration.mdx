@@ -9,9 +9,11 @@ Skyvern uses LLMs to analyze screenshots and decide what actions to take. You'll
 ## How Skyvern uses LLMs
 
 Skyvern makes multiple LLM calls per task step:
-1. **Screenshot analysis** — Identify interactive elements on the page
-2. **Action planning** — Decide what to click, type, or extract
-3. **Result extraction** — Parse data from the page into structured output
+1. **Screenshot analysis**: Identify interactive elements on the page
+2. **Action planning**: Decide what to click, type, or extract
+3. **Result extraction**: Parse data from the page into structured output
+
+A task that runs for 10 steps makes roughly 30+ LLM calls. Choose your provider and model tier with this in mind.
 
 For most deployments, configure a single provider using `LLM_KEY`. Skyvern also supports a `SECONDARY_LLM_KEY` for lighter tasks to reduce costs.
 
@@ -32,9 +34,13 @@ LLM_KEY=OPENAI_GPT4O
 | LLM_KEY | Model | Notes |
 |---------|-------|-------|
 | `OPENAI_GPT4O` | gpt-4o | Recommended for most use cases |
-| `OPENAI_GPT4O_MINI` | gpt-4o-mini | Faster, cheaper, less capable |
+| `OPENAI_GPT4O_MINI` | gpt-4o-mini | Cheaper, less capable |
+| `OPENAI_GPT4_1` | gpt-4.1 | Latest GPT-4 family |
+| `OPENAI_GPT4_1_MINI` | gpt-4.1-mini | Cheaper GPT-4.1 variant |
+| `OPENAI_O3` | o3 | Reasoning model |
+| `OPENAI_O3_MINI` | o3-mini | Cheaper reasoning model |
 | `OPENAI_GPT4_TURBO` | gpt-4-turbo | Previous generation |
-| `OPENAI_GPT4V` | gpt-4-vision-preview | Vision-specific model |
+| `OPENAI_GPT4V` | gpt-4-turbo | Legacy alias for gpt-4-turbo |
 
 ### Optional settings
 
@@ -62,10 +68,13 @@ LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
 
 | LLM_KEY | Model | Notes |
 |---------|-------|-------|
-| `ANTHROPIC_CLAUDE3.5_SONNET` | claude-3-5-sonnet | Recommended |
-| `ANTHROPIC_CLAUDE3.7_SONNET` | claude-3-7-sonnet | Latest Sonnet |
+| `ANTHROPIC_CLAUDE4.5_SONNET` | claude-4.5-sonnet | Latest Sonnet |
+| `ANTHROPIC_CLAUDE4.5_OPUS` | claude-4.5-opus | Most capable |
 | `ANTHROPIC_CLAUDE4_SONNET` | claude-4-sonnet | Claude 4 |
-| `ANTHROPIC_CLAUDE4.5_SONNET` | claude-4.5-sonnet | Latest |
+| `ANTHROPIC_CLAUDE4_OPUS` | claude-4-opus | Claude 4 Opus |
+| `ANTHROPIC_CLAUDE3.7_SONNET` | claude-3-7-sonnet | Previous generation |
+| `ANTHROPIC_CLAUDE3.5_SONNET` | claude-3-5-sonnet | Previous generation |
+| `ANTHROPIC_CLAUDE3.5_HAIKU` | claude-3-5-haiku | Cheap and fast |
 
 ---
 
@@ -88,7 +97,7 @@ AZURE_API_VERSION=2024-08-01-preview
 2. Open the Azure AI Foundry portal from your resource's overview page
 3. Go to **Shared Resources** → **Deployments**
 4. Click **Deploy Model** → **Deploy Base Model** → select GPT-4o or GPT-4
-5. Note the **Deployment Name**—use this for `AZURE_DEPLOYMENT`
+5. Note the **Deployment Name**. Use this for `AZURE_DEPLOYMENT`
 6. Copy your API key and endpoint from the Azure Portal
 
 <Note>
@@ -99,19 +108,31 @@ The `AZURE_DEPLOYMENT` is the name you chose when deploying the model, not the m
 
 ## Google Gemini
 
-Gemini models from [Google AI Studio](https://aistudio.google.com/).
+Gemini models through [Vertex AI](https://cloud.google.com/vertex-ai). Requires a GCP project with Vertex AI enabled.
 
 ```bash .env
-ENABLE_GEMINI=true
-GEMINI_API_KEY=your-gemini-key
-LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
+ENABLE_VERTEX_AI=true
+LLM_KEY=VERTEX_GEMINI_3.0_FLASH
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+GCP_PROJECT_ID=your-gcp-project-id
+GCP_REGION=us-central1
 ```
+
+### Setup steps
+
+1. Create a [GCP project](https://console.cloud.google.com/) with billing enabled
+2. Enable the **Vertex AI API** in your project
+3. Create a service account with the **Vertex AI User** role
+4. Download the service account JSON key file
+5. Set `GOOGLE_APPLICATION_CREDENTIALS` to the path of that file
 
 ### Available models
 
-| LLM_KEY | Model |
-|---------|-------|
-| `GEMINI_2.5_PRO_PREVIEW_03_25` | Gemini 2.5 Pro (Preview) |
+| LLM_KEY | Model | Notes |
+|---------|-------|-------|
+| `VERTEX_GEMINI_3.0_FLASH` | gemini-3-flash-preview | Recommended |
+| `VERTEX_GEMINI_2.5_PRO` | gemini-2.5-pro | Stable |
+| `VERTEX_GEMINI_2.5_FLASH` | gemini-2.5-flash | Cheaper, faster |
 
 ---
 
@@ -140,6 +161,13 @@ AWS_SECRET_ACCESS_KEY=...
 |---------|-------|
 | `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET` | Claude 3.5 Sonnet v2 |
 | `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1` | Claude 3.5 Sonnet v1 |
+| `BEDROCK_ANTHROPIC_CLAUDE3.7_SONNET_INFERENCE_PROFILE` | Claude 3.7 Sonnet (cross-region) |
+| `BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE` | Claude 4 Sonnet (cross-region) |
+| `BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE` | Claude 4.5 Sonnet (cross-region) |
+
+<Note>
+Bedrock inference profile keys (`*_INFERENCE_PROFILE`) use cross-region inference and require `AWS_REGION` only. No access keys needed if running on an IAM-authenticated instance.
+</Note>
 
 ---
 
@@ -207,13 +235,11 @@ OPENROUTER_API_KEY=sk-or-...
 OPENROUTER_MODEL=mistralai/mistral-small-3.1-24b-instruct
 ```
 
-OpenRouter lets you use models from multiple providers without separate API keys for each.
-
 ---
 
 ## Groq
 
-Fast inference on open-source models at [groq.com](https://groq.com/).
+Inference on open-source models at [groq.com](https://groq.com/).
 
 ```bash .env
 ENABLE_GROQ=true
@@ -247,14 +273,14 @@ SECONDARY_LLM_KEY=OPENAI_GPT4O_MINI
 For fine-grained control, you can override models for specific operations:
 
 ```bash .env
-# Model for extraction tasks
+# Model for data extraction from pages (defaults to LLM_KEY if not set)
 EXTRACTION_LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
 
-# Model for script generation
+# Model for generating code/scripts in code blocks (defaults to LLM_KEY if not set)
 SCRIPT_GENERATION_LLM_KEY=OPENAI_GPT4O
 ```
 
-Most deployments don't need task-specific models—start with `LLM_KEY` and `SECONDARY_LLM_KEY`.
+Most deployments don't need task-specific models. Start with `LLM_KEY` and `SECONDARY_LLM_KEY`.
 
 ---
 

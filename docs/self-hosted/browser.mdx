@@ -4,7 +4,7 @@ subtitle: Configure browser modes, display settings, and external Chrome connect
 slug: self-hosted/browser
 ---
 
-Skyvern uses Playwright with Chromium to execute browser automations. This guide covers the browser configuration options available for self-hosted deployments.
+Skyvern uses Playwright with Chromium to execute browser automations.
 
 ## Browser modes
 
@@ -16,10 +16,7 @@ The `BROWSER_TYPE` setting controls how Skyvern runs the browser.
 BROWSER_TYPE=chromium-headful
 ```
 
-The browser runs with a visible window. In Docker, this displays on a virtual framebuffer (Xvfb). Useful for:
-- Debugging automation issues
-- Watching tasks execute in real-time
-- Development and testing
+The browser runs with a visible window. In Docker, this displays on a virtual framebuffer (Xvfb).
 
 ### Headless
 
@@ -27,10 +24,7 @@ The browser runs with a visible window. In Docker, this displays on a virtual fr
 BROWSER_TYPE=chromium-headless
 ```
 
-The browser runs without any display. Useful for:
-- Production deployments
-- CI/CD pipelines
-- Servers without display capabilities
+The browser runs without any display.
 
 <Note>
 Some websites detect and block headless browsers. If you encounter issues with bot detection, try headful mode with a virtual display.
@@ -121,6 +115,7 @@ Configure how the browser appears to websites. These settings affect geolocation
 ### Locale and timezone
 
 ```bash .env
+# Optional, unset by default. Set to match your target region.
 BROWSER_LOCALE=en-US
 BROWSER_TIMEZONE=America/New_York
 ```
@@ -144,10 +139,7 @@ BROWSER_WIDTH=1920
 BROWSER_HEIGHT=1080
 ```
 
-The default 1920x1080 works for most sites. Adjust if you need to:
-- Test mobile layouts (e.g., 375x812 for iPhone)
-- Handle sites that require specific dimensions
-- Reduce memory usage with smaller viewports
+The default 1920x1080 works for most sites.
 
 ---
 
@@ -204,10 +196,7 @@ Limits the number of browser tabs Skyvern can open simultaneously. Increase if y
 BROWSER_POLICY_FILE=/etc/chromium/policies/managed/policies.json
 ```
 
-Path to a Chrome policy file for enterprise configurations. Use this to:
-- Disable specific Chrome features
-- Configure proxy settings at the browser level
-- Set security policies
+Path to a Chrome policy file for enterprise configurations.
 
 ### Video recording path
 
@@ -221,7 +210,7 @@ Directory where browser session recordings are saved. Recordings are useful for 
 
 ## Memory considerations
 
-Browser instances are memory-intensive. Guidelines:
+Browser instances are memory-intensive. These are approximate guidelines. Actual usage depends on page complexity and browser settings.
 
 | Concurrent tasks | Recommended RAM |
 |------------------|-----------------|

@@ -10,10 +10,10 @@ Many websites block requests from datacenter IPs or detect automated browser pat
 
 Without proxies, your browser automation traffic originates from your server's IP address. This causes issues when:
 
-- **Target sites block datacenter IPs** — Many sites automatically block traffic from known hosting providers (AWS, GCP, Azure)
-- **Rate limiting** — Repeated requests from one IP trigger rate limits
-- **Geo-restrictions** — Sites serve different content based on location
-- **Bot detection** — Some sites fingerprint datacenter traffic patterns
+- **Target sites block datacenter IPs**: Many sites automatically block traffic from known hosting providers (AWS, GCP, Azure)
+- **Rate limiting**: Repeated requests from one IP trigger rate limits
+- **Geo-restrictions**: Sites serve different content based on location
+- **Bot detection**: Some sites fingerprint datacenter traffic patterns
 
 <Note>
 If you're automating internal tools or sites that don't have bot detection, you may not need proxies at all. Test without proxies first.
@@ -25,7 +25,7 @@ If you're automating internal tools or sites that don't have bot detection, you 
 
 ### Residential proxies
 
-Traffic appears to come from real home internet connections. Most expensive but least likely to be blocked.
+Traffic appears to come from real home internet connections. Most expensive but least likely to be blocked. Recommended for browser automation. Start here unless cost is a primary concern.
 
 **Providers:**
 - [Bright Data](https://brightdata.com/)
@@ -43,8 +43,7 @@ IPs from cloud providers. Cheapest but most likely to be blocked.
 
 ### Rotating vs. static
 
-- **Rotating** — New IP for each request or session. Good for scraping at scale.
-- **Static** — Same IP for the duration of a task. Better for sites that track sessions.
+See [Rotating proxies vs. sticky sessions](#rotating-proxies-vs-sticky-sessions) for guidance on which to use.
 
 ---
 
@@ -58,16 +57,17 @@ Set proxy configuration in your `.env` file:
 
 ```bash .env
 ENABLE_PROXY=true
+
+# Single proxy
 HOSTED_PROXY_POOL=http://user:pass@proxy.example.com:8080
+
+# Multiple proxies: Skyvern randomly selects one per browser session
+HOSTED_PROXY_POOL=http://user:pass@proxy1.example.com:8080,http://user:pass@proxy2.example.com:8080
 ```
 
-### Per-task proxy configuration
-
-When calling the API, you can specify proxy settings per task. This requires configuring your proxy endpoint to accept the target URL and handle routing.
-
-<Warning>
-Self-hosted Skyvern does not include the `proxy_location` feature available in Skyvern Cloud. The geo-targeting locations (like `RESIDENTIAL_US`, `RESIDENTIAL_GB`) require Skyvern's managed proxy infrastructure.
-</Warning>
+<Note>
+Skyvern Cloud supports a `proxy_location` parameter on task requests for geographic targeting (e.g., `RESIDENTIAL_US`). This feature is not available in self-hosted deployments. All tasks use the proxy configured in `HOSTED_PROXY_POOL`.
+</Note>
 
 ---
 
@@ -75,21 +75,9 @@ Self-hosted Skyvern does not include the `proxy_location` feature available in S
 
 ### Step 1: Choose a provider
 
-For browser automation, residential proxies work best. Most providers offer:
-- Pay-per-GB pricing
-- Geographic targeting
-- Session persistence (sticky sessions)
+For browser automation, residential proxies work best. See [proxy types](#proxy-types) above.
 
-### Step 2: Get your proxy credentials
-
-After signing up, you'll receive:
-- Proxy endpoint (e.g., `proxy.example.com:8080`)
-- Username
-- Password
-
-Some providers use a single endpoint that rotates IPs. Others give you access to specific geographic pools.
-
-### Step 3: Configure Skyvern
+### Step 2: Configure Skyvern
 
 Add your proxy to the environment:
 
@@ -98,22 +86,21 @@ ENABLE_PROXY=true
 HOSTED_PROXY_POOL=http://username:password@proxy.provider.com:8080
 ```
 
-### Step 4: Test the connection
+### Step 3: Test the connection
 
 Run a simple task that checks your IP:
 
-```python
-from skyvern import Skyvern
-
-client = Skyvern(base_url="http://localhost:8000", api_key="your-key")
-
-result = await client.run_task(
-    prompt="Go to whatismyipaddress.com and tell me the IP address shown",
-    url="https://whatismyipaddress.com",
-)
+```bash
+curl -s http://localhost:8000/v1/tasks \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "What is the IP address shown on this page?",
+    "url": "https://whatismyipaddress.com"
+  }'
 ```
 
-The returned IP should be from your proxy provider, not your server.
+The task result should show an IP from your proxy provider, not your server's IP.
 
 ---
 
