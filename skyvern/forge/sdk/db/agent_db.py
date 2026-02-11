@@ -5192,6 +5192,45 @@ class AgentDB(BaseAlchemyDB):
             await session.refresh(credential)
             return Credential.model_validate(credential)
 
+    async def update_credential_vault_data(
+        self,
+        credential_id: str,
+        organization_id: str,
+        item_id: str,
+        name: str,
+        credential_type: CredentialType,
+        username: str | None = None,
+        totp_type: str = "none",
+        totp_identifier: str | None = None,
+        card_last4: str | None = None,
+        card_brand: str | None = None,
+        secret_label: str | None = None,
+    ) -> Credential:
+        async with self.Session() as session:
+            credential = (
+                await session.scalars(
+                    select(CredentialModel)
+                    .filter_by(credential_id=credential_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(CredentialModel.deleted_at.is_(None))
+                    .with_for_update()
+                )
+            ).first()
+            if not credential:
+                raise NotFoundError(f"Credential {credential_id} not found")
+            credential.item_id = item_id
+            credential.name = name
+            credential.credential_type = credential_type
+            credential.username = username
+            credential.totp_type = totp_type
+            credential.totp_identifier = totp_identifier
+            credential.card_last4 = card_last4
+            credential.card_brand = card_brand
+            credential.secret_label = secret_label
+            await session.commit()
+            await session.refresh(credential)
+            return Credential.model_validate(credential)
+
     async def delete_credential(self, credential_id: str, organization_id: str) -> None:
         async with self.Session() as session:
             credential = (
