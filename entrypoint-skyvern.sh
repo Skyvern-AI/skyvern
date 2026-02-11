@@ -59,6 +59,6 @@ xvfb=$!
 # and will be started automatically when the API app starts
 
 echo "Starting live streaming services..."
-sh ./scripts/start_vnc_streaming.sh
+./scripts/start_vnc_streaming.sh
 # Run the command and pass in all three arguments
 python -m skyvern.forge
