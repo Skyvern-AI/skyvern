@@ -3,7 +3,24 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import Text, and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
+from sqlalchemy import (
+    Text,
+    and_,
+    asc,
+    case,
+    cast,
+    delete,
+    distinct,
+    exists,
+    func,
+    literal,
+    or_,
+    pool,
+    select,
+    tuple_,
+    update,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import (
     SQLAlchemyError,
 )
@@ -3011,6 +3028,42 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    @staticmethod
+    def _apply_search_key_filter(query, search_key: str | None):  # type: ignore[no-untyped-def]
+        if not search_key:
+            return query
+        key_like = f"%{search_key}%"
+        param_exists = exists(
+            select(1)
+            .select_from(WorkflowRunParameterModel)
+            .join(
+                WorkflowParameterModel,
+                WorkflowParameterModel.workflow_parameter_id == WorkflowRunParameterModel.workflow_parameter_id,
+            )
+            .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+            .where(WorkflowParameterModel.deleted_at.is_(None))
+            .where(
+                or_(
+                    WorkflowParameterModel.key.ilike(key_like),
+                    WorkflowParameterModel.description.ilike(key_like),
+                    WorkflowRunParameterModel.value.ilike(key_like),
+                )
+            )
+        )
+        return query.where(param_exists)
+
+    @staticmethod
+    def _apply_error_code_filter(query, error_code: str | None):  # type: ignore[no-untyped-def]
+        if not error_code:
+            return query
+        error_code_exists = exists(
+            select(1)
+            .select_from(TaskModel)
+            .where(TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+            .where(cast(TaskModel.errors, JSONB).contains(literal([{"error_code": error_code}], type_=JSONB)))
+        )
+        return query.where(error_code_exists)
+
     async def get_workflow_runs(
         self,
         organization_id: str,
@@ -3018,6 +3071,8 @@ class AgentDB(BaseAlchemyDB):
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
         ordering: tuple[str, str] | None = None,
+        search_key: str | None = None,
+        error_code: str | None = None,
     ) -> list[WorkflowRun]:
         try:
             async with self.Session() as session:
@@ -3029,6 +3084,9 @@ class AgentDB(BaseAlchemyDB):
                     .filter(WorkflowRunModel.organization_id == organization_id)
                     .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 )
+
+                query = self._apply_search_key_filter(query, search_key)
+                query = self._apply_error_code_filter(query, error_code)
 
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
@@ -3092,6 +3150,7 @@ class AgentDB(BaseAlchemyDB):
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
         search_key: str | None = None,
+        error_code: str | None = None,
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
@@ -3142,6 +3201,7 @@ class AgentDB(BaseAlchemyDB):
                         func.cast(WorkflowRunModel.extra_http_headers, Text()).ilike(key_like),
                     )
                     query = query.where(or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match))
+                query = self._apply_error_code_filter(query, error_code)
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
                 query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
