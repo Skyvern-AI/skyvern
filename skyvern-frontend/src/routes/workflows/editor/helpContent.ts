@@ -27,6 +27,8 @@ export const baseHelpTooltipContent = {
     "When inside a for loop, continue to the next iteration if this block fails.",
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
+  engine:
+    "Skyvern 1.0: Fast, single-goal tasks. Skyvern 2.0: Complex, multi-goal tasks (slower).",
 } as const;
 
 export const basePlaceholderContent = {
