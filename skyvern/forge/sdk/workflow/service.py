@@ -41,6 +41,7 @@ from skyvern.exceptions import (
     MissingValueForParameter,
     ScriptTerminationException,
     SkyvernException,
+    SkyvernHTTPException,
     WorkflowNotFound,
     WorkflowNotFoundForWorkflowRun,
     WorkflowRunNotFound,
@@ -2340,6 +2341,8 @@ class WorkflowService:
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
         ordering: tuple[str, str] | None = None,
+        search_key: str | None = None,
+        error_code: str | None = None,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.get_workflow_runs(
             organization_id=organization_id,
@@ -2347,6 +2350,8 @@ class WorkflowService:
             page_size=page_size,
             status=status,
             ordering=ordering,
+            search_key=search_key,
+            error_code=error_code,
         )
 
     async def get_workflow_runs_count(
@@ -2367,6 +2372,7 @@ class WorkflowService:
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
         search_key: str | None = None,
+        error_code: str | None = None,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
@@ -2375,6 +2381,7 @@ class WorkflowService:
             page_size=page_size,
             status=status,
             search_key=search_key,
+            error_code=error_code,
         )
 
     async def create_workflow_run(
@@ -3426,6 +3433,12 @@ class WorkflowService:
             )
 
             return updated_workflow
+        except SkyvernHTTPException:
+            # Bubble up well-formed client errors (e.g. WorkflowNotFound 404)
+            # so they are not wrapped in a 500 by the caller.
+            if new_workflow_id:
+                await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
+            raise
         except Exception as e:
             if new_workflow_id:
                 LOG.error(
