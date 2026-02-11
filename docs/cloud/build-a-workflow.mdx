@@ -1,0 +1,298 @@
+---
+title: Build a Workflow
+subtitle: Create multi-step automations with the visual workflow editor
+slug: cloud/build-a-workflow
+---
+
+A task handles one goal on one page. When your automation needs multiple steps, you need a workflow. This page explains how workflows work, walks you through building one from scratch, and covers the editor's features.
+
+## How workflows work
+
+A workflow is a sequence of **blocks** that run one after another. Each block does one thing: navigate to a page, extract data, send an email, run custom code, loop, or branch. You connect blocks on a visual canvas, pass data between them, and run the whole chain with one click.
+
+```
+[Browser Task] → [Extraction] → [Loop] → [Send Email]
+       ↓               ↓            ↓           ↓
+  opens the page   JSON output  per-item     digest sent
+                                processing
+```
+
+### How data flows between blocks
+
+Every block produces an output. Downstream blocks reference it using the pattern `{{ block_label_output }}`.
+
+For example, an Extraction block labeled `scrape_listings` produces output that later blocks access as `{{ scrape_listings_output }}`. This is how you chain steps together. One block's output becomes the next block's input.
+
+### Block categories
+
+| Category | What it does | Examples |
+|----------|-------------|----------|
+| **Browser Automation** | Interact with web pages using AI | Browser Task, Extraction, Browser Action, Login, File Download |
+| **Data Processing** | Transform data without a browser | Text Prompt, File Parser, Code |
+| **Control Flow** | Branch, loop, validate, or pause | Loop, Conditional, AI Validation, Wait |
+| **Communication** | Send data to external services | Send Email, HTTP Request |
+
+See [Block Reference](/cloud/configure-blocks) for every block type and its configuration fields.
+
+<Tip>
+If your block needs a browser, pick a browser automation block. If it just needs to process data, use Text Prompt or Code. If you need to repeat or branch, use control flow.
+</Tip>
+
+---
+
+## Tutorial: Build a job listing tracker
+
+Let's build a real workflow. You'll create an automation that finds the top 5 job listings from Hacker News's monthly "Who is Hiring" thread, summarizes each one, and emails you a digest.
+
+This uses 5 blocks across 3 categories: browser automation, data processing, and communication.
+
+<Steps>
+  <Step title="Create a new workflow">
+
+    Go to **Workflows** in the left sidebar and click **Create → Blank Workflow**.
+
+    <img src="/images/cloud/create-workflow-dropdown.png" alt="Create workflow dropdown showing Blank Workflow and From Template options" />
+
+    The editor opens with an empty canvas showing a single start node. Click the workflow title at the top left and rename it to **HN Job Tracker**.
+
+  </Step>
+
+  <Step title="Add a Browser Task block">
+
+    Hover over the **+** button on the edge below the start node and select **Add Block**. A searchable block library opens on the right. Find and select **Browser Task Block**.
+
+    The block appears on the canvas with a configuration panel on the right. Fill in:
+
+    | Field | Value |
+    |-------|-------|
+    | **Label** | `find_hiring_thread` |
+    | **URL** | `https://news.ycombinator.com` |
+    | **Prompt** | `Find and open the latest monthly "Ask HN: Who is hiring?" thread. The task is complete when the thread is open and job listing comments are visible.` |
+
+    The Browser Task block uses AI to navigate the page and accomplish the goal described in your prompt. Include your success criteria directly in the prompt so the AI knows when it's done.
+
+    <img src="/images/cloud/tutorial-browser-task.png" alt="Browser Task block configured with find_hiring_thread label, URL, and prompt" />
+
+    <Accordion title="Why Browser Task instead of Go to URL?">
+    The URL for the latest hiring thread changes every month. The Browser Task block uses AI to find the right link on the page. Use Go to URL when you know the exact destination URL upfront.
+    </Accordion>
+
+  </Step>
+
+  <Step title="Add an Extraction block">
+
+    Hover over the **+** on the edge after `find_hiring_thread`, select **Add Block**, then choose **Extraction Block**.
+
+    Configure:
+
+    | Field | Value |
+    |-------|-------|
+    | **Label** | `scrape_listings` |
+    | **Data Extraction Goal** | `Extract the top 5 job listings. For each listing, get the company name, role title, and a brief description of the position.` |
+
+    Now enable the **Data Schema** checkbox to reveal the JSON editor, and paste:
+
+    ```json
+    {
+      "type": "object",
+      "properties": {
+        "listings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "company": { "type": "string" },
+              "role": { "type": "string" },
+              "description": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+    ```
+
+    The schema tells Skyvern exactly what structure to return. Without it, the AI picks its own format. You can also click **Generate with AI** next to the schema field to have Skyvern suggest a schema based on your extraction goal.
+
+    <img src="/images/cloud/tutorial-extraction.png" alt="Extraction block configured with scrape_listings label, extraction goal, Data Schema checkbox enabled, and JSON schema" />
+
+    <Tip>
+    Label your blocks descriptively. The label determines the output variable name. `scrape_listings` means downstream blocks reference its data as `{{ scrape_listings_output }}`.
+    </Tip>
+
+  </Step>
+
+  <Step title="Add a Loop with a Text Prompt inside">
+
+    Hover over the **+** after `scrape_listings`, select **Add Block**, then choose **Loop Block**.
+
+    Configure the loop:
+
+    | Field | Value |
+    |-------|-------|
+    | **Label** | `process_each` |
+    | **Loop Value** | `{{ scrape_listings_output.listings }}` |
+
+    This iterates over the 5 listings extracted in the previous step. Now add a block *inside* the loop. Hover over the **+** inside the loop body, select **Add Block**, and choose **Text Prompt Block**.
+
+    Configure the Text Prompt:
+
+    | Field | Value |
+    |-------|-------|
+    | **Label** | `summarize` |
+    | **Prompt** | `Summarize this job listing in one sentence. Company: {{ current_value.company }}, Role: {{ current_value.role }}, Description: {{ current_value.description }}` |
+
+    Enable the **Data Schema** checkbox and paste:
+
+    ```json
+    {
+      "type": "object",
+      "properties": {
+        "summary": { "type": "string" }
+      }
+    }
+    ```
+
+    The Text Prompt block sends text to the LLM without opening a browser. It processes data only. Each iteration produces a one-line summary of that job listing.
+
+    <img src="/images/cloud/tutorial-loop-text-prompt.png" alt="Loop block with process_each label containing a summarize Text Prompt block inside" />
+
+    <Accordion title="What are current_value and current_index?">
+    Inside a loop, two reserved variables are available:
+
+    - `{{ current_value }}`: the current item from the list being iterated
+    - `{{ current_index }}`: the item's position, starting from 0
+
+    These only exist inside loop blocks. In this example, `{{ current_value.company }}` gives you the company name for the current listing.
+    </Accordion>
+
+  </Step>
+
+  <Step title="Add a Send Email block">
+
+    Hover over the **+** on the edge *after* the loop (back on the main flow, not inside it), select **Add Block**, then choose **Send Email Block**.
+
+    Configure:
+
+    | Field | Value |
+    |-------|-------|
+    | **Label** | `send_digest` |
+    | **Recipients** | Your email address |
+    | **Subject** | `HN Job Digest - Top 5 Listings` |
+    | **Body** | `Here are today's top job listings from Hacker News:\n\n{{ process_each_output }}` |
+
+    The `{{ process_each_output }}` reference pulls in the collected summaries from every loop iteration.
+
+  </Step>
+
+  <Step title="Save and run">
+
+    <Warning>
+    Workflows are **not** auto-saved. Click the **Save** button (disk icon) in the header bar before navigating away or you'll lose your work.
+    </Warning>
+
+    Click **Save**, then click **Run** in the top right. A parameters page opens where you can review and confirm the workflow's settings. Click **Run Workflow** to start execution.
+
+    The [live execution view](/cloud/monitor-a-run) opens. Watch as Skyvern navigates Hacker News, extracts listings, summarizes each one, and sends your email.
+
+  </Step>
+</Steps>
+
+### What you built
+
+```
+[find_hiring_thread] → [scrape_listings] → [process_each (loop)] → [send_digest]
+    Browser Task           Extraction        └─ [summarize]          Send Email
+                                                Text Prompt
+```
+
+Five blocks, three categories, zero code. You can now re-run this workflow anytime, tweak the extraction schema to pull different fields, swap the email for an HTTP Request to post to Slack, or add a Conditional block to only email when listings match certain criteria.
+
+---
+
+## Editor reference
+
+### Layout
+
+<img src="/images/cloud/workflow-editor-overview.png" alt="Workflow editor overview" />
+
+| Area | What it shows |
+|------|---------------|
+| **Header bar** (top) | Workflow title (click to rename), Parameters button, Save button, Template toggle, History button, Run button |
+| **Canvas** (center) | Visual graph of blocks connected in sequence. Zoom with the scroll wheel, pan by dragging the background. |
+| **Configuration panel** (right) | Opens when you click a block. Shows that block's settings form. |
+
+### Adding blocks
+
+Hover over the **+** button on any edge (the connecting line between blocks) to reveal the menu. Select **Add Block** to open the block library, a searchable list of all available block types. Click a block to insert it at that position.
+
+The menu also offers **Record Browser** (record actions in a live browser to generate blocks) and **Upload SOP** (upload a PDF procedure to auto-generate a workflow).
+
+When you create a blank workflow, hover over the **+** on the start edge to add your first block.
+
+<img src="/images/cloud/add-block-panel.png" alt="Add block panel" />
+
+### Configuring blocks
+
+Click any block on the canvas to open its configuration panel on the right. Each block has a **Label** field (which determines its output variable name) and block-specific settings. Browser-based blocks share additional fields like URL, Engine, and Max Retries.
+
+See [Block Reference](/cloud/configure-blocks) for the full list of fields on each block type.
+
+### Connecting and reordering blocks
+
+Blocks auto-connect when you insert them via the **+** button. They execute top to bottom in the order shown on the canvas.
+
+**Conditional blocks** create branches. Each branch connects to a different sequence of blocks and merges back at a common point.
+
+**Loop blocks** contain child blocks that repeat for each item in the loop's list.
+
+To reorder blocks, delete the block you want to move and re-add it at the desired position using the **+** button.
+
+### Deleting blocks
+
+Click the **three-dot menu** on a block's header and select **Delete Block**. Downstream blocks reconnect to the previous block automatically.
+
+### Saving
+
+<Warning>
+Workflows are **not** auto-saved. Click the **Save** button (disk icon) in the header bar to persist your changes. The editor warns you if you try to navigate away with unsaved work.
+</Warning>
+
+The **Run** button also saves before starting execution.
+
+### Header bar actions
+
+| Button | Description |
+|--------|-------------|
+| **Save** (disk icon) | Save the current workflow definition |
+| **Template** (bookmark icon) | Toggle whether this workflow is saved as an organization template |
+| **History** (clock icon) | View past runs of this workflow |
+| **Parameters** | Open the parameters panel (see [Workflow Parameters](/cloud/add-parameters)) |
+| **Run** (play icon) | Save and start a new execution (see [Running Workflows](/cloud/run-a-workflow)) |
+
+---
+
+## What's next
+
+<CardGroup cols={3}>
+  <Card
+    title="Block Reference"
+    icon="cube"
+    href="/cloud/configure-blocks"
+  >
+    Configuration fields for every block type
+  </Card>
+  <Card
+    title="Add Parameters"
+    icon="sliders"
+    href="/cloud/add-parameters"
+  >
+    Pass dynamic values into your workflows
+  </Card>
+  <Card
+    title="Run Your Workflow"
+    icon="play"
+    href="/cloud/run-a-workflow"
+  >
+    Execute workflows and track results
+  </Card>
+</CardGroup>

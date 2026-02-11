@@ -41,6 +41,7 @@ from skyvern.exceptions import (
     MissingValueForParameter,
     ScriptTerminationException,
     SkyvernException,
+    SkyvernHTTPException,
     WorkflowNotFound,
     WorkflowNotFoundForWorkflowRun,
     WorkflowRunNotFound,
@@ -3175,7 +3176,7 @@ class WorkflowService:
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
-            payload=signed_data.signed_payload,
+            payload=signed_data.payload_for_log,
             headers=signed_data.headers,
         )
         try:
@@ -3203,7 +3204,7 @@ class WorkflowService:
                     "Webhook failed",
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
-                    webhook_data=signed_data.signed_payload,
+                    webhook_data=signed_data.payload_for_log,
                     resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
@@ -3432,6 +3433,12 @@ class WorkflowService:
             )
 
             return updated_workflow
+        except SkyvernHTTPException:
+            # Bubble up well-formed client errors (e.g. WorkflowNotFound 404)
+            # so they are not wrapped in a 500 by the caller.
+            if new_workflow_id:
+                await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
+            raise
         except Exception as e:
             if new_workflow_id:
                 LOG.error(

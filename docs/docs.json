@@ -80,8 +80,20 @@
           {
             "group": "Getting Started",
             "pages": [
-              "cloud/ui-overview",
-              "cloud/your-first-task"
+              "cloud/overview",
+              "cloud/run-your-first-task",
+              "cloud/run-a-task",
+              "cloud/monitor-a-run"
+            ]
+          },
+          {
+            "group": "Building Workflows",
+            "pages": [
+              "cloud/build-a-workflow",
+              "cloud/manage-workflows",
+              "cloud/add-parameters",
+              "cloud/configure-blocks",
+              "cloud/run-a-workflow"
             ]
           }
         ]
