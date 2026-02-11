@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, cast
 
 import structlog
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
@@ -126,11 +126,15 @@ def create_forge_app() -> ForgeApp:
         http_client=ForgeAsyncHttpxClientWrapper(),
     )
     if settings.ENABLE_AZURE_CUA:
+        if settings.AZURE_CUA_ENDPOINT is None or settings.AZURE_CUA_DEPLOYMENT is None:
+            raise RuntimeError("Azure CUA enabled but endpoint or deployment is not configured")
+        azure_endpoint = cast(str, settings.AZURE_CUA_ENDPOINT)
+        azure_deployment = cast(str, settings.AZURE_CUA_DEPLOYMENT)
         app.OPENAI_CLIENT = AsyncAzureOpenAI(
             api_key=settings.AZURE_CUA_API_KEY,
             api_version=settings.AZURE_CUA_API_VERSION,
-            azure_endpoint=settings.AZURE_CUA_ENDPOINT,
-            azure_deployment=settings.AZURE_CUA_DEPLOYMENT,
+            azure_endpoint=azure_endpoint,
+            azure_deployment=azure_deployment,
         )
 
     app.ANTHROPIC_CLIENT = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
@@ -251,12 +255,17 @@ def create_forge_app() -> ForgeApp:
     app.api_app_startup_event = None
     app.api_app_shutdown_event = None
 
-    # Set up startup event to start streaming service monitoring
+    # Set up startup/shutdown events to manage streaming service monitoring
     async def _startup_event(fastapi_app: FastAPI) -> None:
         structlog.get_logger(__name__).info("Starting streaming service monitoring loop")
-        await app.STREAMING_SERVICE.start_monitoring()
+        app.STREAMING_SERVICE.start_monitoring()
+
+    async def _shutdown_event() -> None:
+        structlog.get_logger(__name__).info("Stopping streaming service monitoring loop")
+        await app.STREAMING_SERVICE.stop_monitoring()
 
     app.api_app_startup_event = _startup_event
+    app.api_app_shutdown_event = _shutdown_event
 
     app.agent = ForgeAgent()
 
