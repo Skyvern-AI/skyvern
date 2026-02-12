@@ -1,0 +1,23 @@
+name: Auto Update PRs
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  update-prs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update PRs with auto-merge enabled
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get all open PRs with auto-merge enabled
+          prs=$(gh pr list --json number,autoMergeRequest --jq '.[] | select(.autoMergeRequest != null) | .number')
+
+          for pr in $prs; do
+            echo "Updating PR #$pr"
+            gh pr update-branch "$pr" --rebase || gh pr update-branch "$pr" || echo "Failed to update PR #$pr"
+          done

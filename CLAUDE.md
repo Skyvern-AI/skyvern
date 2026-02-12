@@ -87,3 +87,14 @@ Configure via environment variables or `skyvern init llm`:
 - TypeScript: ESLint + Prettier (configured in skyvern-frontend/)
 - Line length: 120 characters
 - Use type hints and async/await patterns
+
+### Before Pushing Changes
+Always run pre-commit hooks before pushing to ensure code passes CI:
+```bash
+uv run pre-commit run --all-files
+```
+Or to run only on staged/changed files:
+```bash
+uv run pre-commit run --files <file1> <file2> ...
+```
+Fix any issues found, commit the fixes, then push.
