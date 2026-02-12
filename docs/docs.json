@@ -34,18 +34,6 @@
             ]
           },
           {
-            "group": "Self-Hosted Deployment",
-            "pages": [
-              "self-hosted/overview",
-              "self-hosted/docker",
-              "self-hosted/llm-configuration",
-              "self-hosted/browser",
-              "self-hosted/proxy",
-              "self-hosted/kubernetes",
-              "self-hosted/storage"
-            ]
-          },
-          {
             "group": "Multi-Step Automations",
             "pages": [
               "multi-step-automations/build-a-workflow",
@@ -61,7 +49,8 @@
               "going-to-production/proxy-geolocation",
               "going-to-production/error-handling",
               "going-to-production/reliability-tips",
-              "going-to-production/captcha-bot-detection"
+              "going-to-production/captcha-bot-detection",
+              "integrations/mcp"
             ]
           },
           {
@@ -70,6 +59,19 @@
               "debugging/using-artifacts",
               "debugging/troubleshooting-guide",
               "debugging/faq"
+            ]
+          },
+          {
+            "group": "Self-Hosted Deployment",
+            "pages": [
+              "self-hosted/overview",
+              "self-hosted/docker",
+              "self-hosted/llm-configuration",
+              "self-hosted/browser",
+              "self-hosted/proxy",
+              "self-hosted/kubernetes",
+              "self-hosted/storage",
+              "integrations/local-llms"
             ]
           }
         ]
@@ -94,6 +96,15 @@
               "cloud/add-parameters",
               "cloud/configure-blocks",
               "cloud/run-a-workflow"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/zapier",
+              "integrations/make",
+              "integrations/n8n",
+              "integrations/workato"
             ]
           }
         ]

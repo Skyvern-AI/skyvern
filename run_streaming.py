@@ -16,6 +16,7 @@ LOG = structlog.get_logger()
 
 
 async def run() -> None:
+    start_forge_app()
     await initialize_skyvern_state_file(task_id=None, workflow_run_id=None, organization_id=None)
     start_forge_app()
 
