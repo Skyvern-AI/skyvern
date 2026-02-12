@@ -3,6 +3,8 @@ import { NodeBaseData } from "../types";
 import { RunEngine } from "@/api/types";
 import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
+export const MAX_STEPS_DEFAULT = 25;
+
 export type NavigationNodeData = NodeBaseData & {
   url: string;
   navigationGoal: string;
@@ -19,6 +21,9 @@ export type NavigationNodeData = NodeBaseData & {
   totpIdentifier: string | null;
   disableCache: boolean;
   includeActionHistoryInVerification: boolean;
+  // V2-specific fields (used when engine is SkyvernV2)
+  prompt: string;
+  maxSteps: number | null;
 };
 
 export type NavigationNode = Node<NavigationNodeData, "navigation">;
@@ -44,6 +49,9 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   continueOnFailure: false,
   disableCache: false,
   includeActionHistoryInVerification: false,
+  // V2-specific fields
+  prompt: "",
+  maxSteps: MAX_STEPS_DEFAULT,
 } as const;
 
 export function isNavigationNode(node: Node): node is NavigationNode {

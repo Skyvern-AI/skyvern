@@ -1,0 +1,709 @@
+---
+title: Browser Sessions
+subtitle: Persist live browser state across multiple tasks and workflows
+slug: optimization/browser-sessions
+---
+
+A **Browser Session** is a live browser instance that persists cookies, local storage, and page state between task or workflow runs. Think of it as keeping a browser tab open. Use sessions when you need back-to-back tasks to share state, human-in-the-loop approval, or real-time agents.
+
+---
+
+## Create a session
+
+Start a session with optional configuration for timeout, proxy, browser type, and extensions.
+
+<CodeGroup>
+```python Python
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key="YOUR_API_KEY")
+
+    session = await client.create_browser_session(
+        timeout=60,                    # Max 60 minutes
+        proxy_location="RESIDENTIAL",  # US residential proxy
+        browser_type="chrome",         # Chrome or Edge
+        extensions=["ad-blocker"],     # Optional extensions
+    )
+
+    print(f"Session ID: {session.browser_session_id}")
+    print(f"Status: {session.status}")
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+async function main() {
+  const client = new Skyvern({
+    apiKey: process.env.SKYVERN_API_KEY!,
+  });
+
+  const session = await client.createBrowserSession({
+    timeout: 60,
+    proxy_location: "RESIDENTIAL",
+    browser_type: "chrome",
+    extensions: ["ad-blocker"],
+  });
+
+  console.log(`Session ID: ${session.browser_session_id}`);
+  console.log(`Status: ${session.status}`);
+}
+
+main();
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "timeout": 60,
+    "proxy_location": "RESIDENTIAL",
+    "browser_type": "chrome",
+    "extensions": ["ad-blocker"]
+  }'
+```
+</CodeGroup>
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `timeout` | integer | Session lifetime in minutes. Min: 5, Max: 1440 (24 hours). Default: `60` |
+| `proxy_location` | string | Geographic proxy location (Cloud only). See [Proxy & Geolocation](/going-to-production/proxy-geolocation) for available options |
+| `browser_type` | string | Browser type: `chrome` or `msedge` |
+| `extensions` | array | Extensions to install: `ad-blocker`, `captcha-solver` |
+
+**Example response:**
+
+```json
+{
+  "browser_session_id": "pbs_490705123456789012",
+  "organization_id": "o_485917350850524254",
+  "status": "running",
+  "timeout": 60,
+  "browser_type": "chrome",
+  "extensions": ["ad-blocker"],
+  "vnc_streaming_supported": true,
+  "app_url": "https://app.skyvern.com/browser-session/pbs_490705123456789012",
+  "started_at": "2026-02-01T10:30:03.110Z",
+  "created_at": "2026-02-01T10:30:00.000Z",
+  "modified_at": "2026-02-01T10:30:03.251Z"
+}
+```
+
+**Session statuses:**
+
+| Status | Description |
+|--------|-------------|
+| `running` | Browser is live and accepting tasks. This is the status returned on creation. The browser launches within seconds. |
+| `closed` | Session was closed manually or by timeout. No further tasks can run. |
+
+<Warning>
+Sessions close automatically when the timeout expires, **even if a task is still running**. The timeout countdown begins when the browser launches. Set timeouts with enough margin for your longest expected task.
+</Warning>
+
+---
+
+## Run tasks with a session
+
+Pass `browser_session_id` to `run_task` to execute tasks in an existing session. Each task continues from where the previous one left off: same page, same cookies, same form data.
+
+<CodeGroup>
+```python Python
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key="YOUR_API_KEY")
+
+    # Create session
+    session = await client.create_browser_session(timeout=30)
+    session_id = session.browser_session_id
+
+    try:
+        # Task 1: Login (wait for completion before continuing)
+        await client.run_task(
+            prompt="Login with username 'support@company.com'",
+            url="https://dashboard.example.com/login",
+            browser_session_id=session_id,
+            wait_for_completion=True,
+        )
+
+        # Task 2: Search (already logged in from Task 1)
+        result = await client.run_task(
+            prompt="Find customer with email 'customer@example.com'",
+            browser_session_id=session_id,
+            wait_for_completion=True,
+        )
+
+        print(f"Customer: {result.output}")
+
+    finally:
+        # Always close when done
+        await client.close_browser_session(browser_session_id=session_id)
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+async function main() {
+  const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+  const session = await client.createBrowserSession({ timeout: 30 });
+  const sessionId = session.browser_session_id;
+
+  try {
+    // Task 1: Login (wait for completion)
+    await client.runTask({
+      body: {
+        prompt: "Login with username 'support@company.com'",
+        url: "https://dashboard.example.com/login",
+        browser_session_id: sessionId,
+      },
+      waitForCompletion: true,
+    });
+
+    // Task 2: Search (reuses login state)
+    const result = await client.runTask({
+      body: {
+        prompt: "Find customer with email 'customer@example.com'",
+        browser_session_id: sessionId,
+      },
+      waitForCompletion: true,
+    });
+
+    console.log(`Customer: ${JSON.stringify(result.output)}`);
+
+  } finally {
+    await client.closeBrowserSession(sessionId);
+  }
+}
+
+main();
+```
+
+```bash cURL
+# Create session
+SESSION_ID=$(curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"timeout": 30}' | jq -r '.browser_session_id')
+
+echo "Session: $SESSION_ID"
+
+# Task 1: Login
+RUN_ID=$(curl -s -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"prompt\": \"Login with username 'support@company.com'\",
+    \"url\": \"https://dashboard.example.com/login\",
+    \"browser_session_id\": \"$SESSION_ID\"
+  }" | jq -r '.run_id')
+
+# Poll until complete
+while true; do
+  STATUS=$(curl -s "https://api.skyvern.com/v1/runs/$RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY" | jq -r '.status')
+  [ "$STATUS" != "created" ] && [ "$STATUS" != "queued" ] && [ "$STATUS" != "running" ] && break
+  sleep 5
+done
+
+# Task 2: Search (reuses login state)
+curl -s -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"prompt\": \"Find customer with email 'customer@example.com'\",
+    \"browser_session_id\": \"$SESSION_ID\"
+  }"
+
+# Close session when done
+curl -s -X POST "https://api.skyvern.com/v1/browser_sessions/$SESSION_ID/close" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+---
+
+## Run workflows with a session
+
+Pass `browser_session_id` to `run_workflow` to execute a workflow in an existing session. This is useful when you need to run a predefined workflow but want it to continue from your current browser state.
+
+<CodeGroup>
+```python Python
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key="YOUR_API_KEY")
+
+    # Create session
+    session = await client.create_browser_session(timeout=60)
+    session_id = session.browser_session_id
+
+    try:
+        # First, login manually via a task
+        await client.run_task(
+            prompt="Login with username 'admin@company.com'",
+            url="https://app.example.com/login",
+            browser_session_id=session_id,
+            wait_for_completion=True,
+        )
+
+        # Then run a workflow in the same session (already logged in)
+        result = await client.run_workflow(
+            workflow_id="wf_export_monthly_report",
+            browser_session_id=session_id,
+            wait_for_completion=True,
+        )
+
+        print(f"Workflow completed: {result.status}")
+
+    finally:
+        await client.close_browser_session(browser_session_id=session_id)
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+async function main() {
+  const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+  const session = await client.createBrowserSession({ timeout: 60 });
+  const sessionId = session.browser_session_id;
+
+  try {
+    // First, login manually via a task
+    await client.runTask({
+      body: {
+        prompt: "Login with username 'admin@company.com'",
+        url: "https://app.example.com/login",
+        browser_session_id: sessionId,
+      },
+      waitForCompletion: true,
+    });
+
+    // Then run a workflow in the same session (already logged in)
+    const result = await client.runWorkflow({
+      body: {
+        workflow_id: "wf_export_monthly_report",
+        browser_session_id: sessionId,
+      },
+      waitForCompletion: true,
+    });
+
+    console.log(`Workflow completed: ${result.status}`);
+
+  } finally {
+    await client.closeBrowserSession(sessionId);
+  }
+}
+
+main();
+```
+
+```bash cURL
+# Create session
+SESSION_ID=$(curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"timeout": 60}' | jq -r '.browser_session_id')
+
+# Login via a task
+RUN_ID=$(curl -s -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"prompt\": \"Login with username 'admin@company.com'\",
+    \"url\": \"https://app.example.com/login\",
+    \"browser_session_id\": \"$SESSION_ID\"
+  }" | jq -r '.run_id')
+
+# Poll until login completes
+while true; do
+  STATUS=$(curl -s "https://api.skyvern.com/v1/runs/$RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY" | jq -r '.status')
+  [ "$STATUS" != "created" ] && [ "$STATUS" != "queued" ] && [ "$STATUS" != "running" ] && break
+  sleep 5
+done
+
+# Run workflow in the same session (already logged in)
+curl -s -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"workflow_id\": \"wf_export_monthly_report\",
+    \"browser_session_id\": \"$SESSION_ID\"
+  }"
+
+# Close session when done
+curl -s -X POST "https://api.skyvern.com/v1/browser_sessions/$SESSION_ID/close" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+<Note>
+You cannot use both `browser_session_id` and `browser_profile_id` in the same request. Choose one or the other.
+</Note>
+
+---
+
+## Close a session
+
+Close a session to release resources and stop billing. The browser shuts down immediately.
+
+<CodeGroup>
+```python Python
+await client.close_browser_session(
+    browser_session_id="pbs_490705123456789012"
+)
+```
+
+```typescript TypeScript
+await client.closeBrowserSession("pbs_490705123456789012");
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/browser_sessions/pbs_490705123456789012/close" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+<Warning>
+**Always close sessions when done.** Active sessions continue billing even when idle. Use try/finally blocks to ensure cleanup.
+</Warning>
+
+<CodeGroup>
+```python Python
+try:
+    session = await client.create_browser_session(timeout=30)
+    session_id = session.browser_session_id
+
+    # Do work...
+    await client.run_task(
+        prompt="...",
+        browser_session_id=session_id,
+        wait_for_completion=True,
+    )
+
+finally:
+    # Always close, even if task fails
+    await client.close_browser_session(browser_session_id=session_id)
+```
+
+```typescript TypeScript
+const session = await client.createBrowserSession({ timeout: 30 });
+const sessionId = session.browser_session_id;
+
+try {
+  await client.runTask({
+    body: {
+      prompt: "...",
+      browser_session_id: sessionId,
+    },
+    waitForCompletion: true,
+  });
+
+} finally {
+  // Always close, even if task fails
+  await client.closeBrowserSession(sessionId);
+}
+```
+</CodeGroup>
+
+---
+
+## Example: Human-in-the-loop
+
+A shopping bot that pauses for human approval before completing a purchase.
+
+<CodeGroup>
+```python Python
+import asyncio
+from skyvern import Skyvern
+
+async def shopping_with_approval():
+    client = Skyvern(api_key="YOUR_API_KEY")
+
+    session = await client.create_browser_session(timeout=15)
+    session_id = session.browser_session_id
+
+    try:
+        # Step 1: Add to cart
+        await client.run_task(
+            prompt="Find wireless headphones under $100, add top result to cart",
+            url="https://shop.example.com",
+            browser_session_id=session_id,
+            wait_for_completion=True,
+        )
+
+        # Step 2: Wait for human approval
+        approval = input("Approve purchase? (yes/no): ")
+
+        if approval.lower() == "yes":
+            # Step 3: Checkout (cart persists from Step 1)
+            result = await client.run_task(
+                prompt="Complete checkout and confirm order",
+                browser_session_id=session_id,
+                wait_for_completion=True,
+            )
+            print(f"Order placed: {result.output}")
+        else:
+            print("Purchase cancelled")
+
+    finally:
+        await client.close_browser_session(browser_session_id=session_id)
+
+asyncio.run(shopping_with_approval())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+import * as readline from "readline";
+
+async function shoppingWithApproval() {
+  const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+  const session = await client.createBrowserSession({ timeout: 15 });
+  const sessionId = session.browser_session_id;
+
+  try {
+    // Step 1: Add to cart
+    await client.runTask({
+      body: {
+        prompt: "Find wireless headphones under $100, add top result to cart",
+        url: "https://shop.example.com",
+        browser_session_id: sessionId,
+      },
+      waitForCompletion: true,
+    });
+
+    // Step 2: Wait for human approval
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const approval = await new Promise<string>((resolve) =>
+      rl.question("Approve purchase? (yes/no): ", resolve)
+    );
+    rl.close();
+
+    if (approval.toLowerCase() === "yes") {
+      // Step 3: Checkout (cart persists from Step 1)
+      const result = await client.runTask({
+        body: {
+          prompt: "Complete checkout and confirm order",
+          browser_session_id: sessionId,
+        },
+        waitForCompletion: true,
+      });
+      console.log(`Order placed: ${JSON.stringify(result.output)}`);
+    } else {
+      console.log("Purchase cancelled");
+    }
+
+  } finally {
+    await client.closeBrowserSession(sessionId);
+  }
+}
+
+shoppingWithApproval();
+```
+</CodeGroup>
+
+The browser maintains the cart contents during the approval pause. No state is lost.
+
+---
+
+## Best practices
+
+### Set appropriate timeouts
+
+Sessions bill while open, so match the timeout to your use case. A task typically completes in 30 to 90 seconds, so a 10-minute timeout covers most multi-step sequences with margin. Human-in-the-loop flows need longer timeouts to account for wait time.
+
+<CodeGroup>
+```python Python
+# Quick multi-step task (2-3 tasks back to back)
+session = await client.create_browser_session(timeout=10)
+
+# Human-in-the-loop with wait time for approval
+session = await client.create_browser_session(timeout=60)
+
+# Long-running agent that monitors a dashboard
+session = await client.create_browser_session(timeout=480)  # 8 hours
+```
+
+```typescript TypeScript
+// Quick multi-step task (2-3 tasks back to back)
+const session1 = await client.createBrowserSession({ timeout: 10 });
+
+// Human-in-the-loop with wait time for approval
+const session2 = await client.createBrowserSession({ timeout: 60 });
+
+// Long-running agent that monitors a dashboard
+const session3 = await client.createBrowserSession({ timeout: 480 }); // 8 hours
+```
+
+```bash cURL
+# Quick multi-step task (2-3 tasks back to back)
+curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"timeout": 10}'
+
+# Human-in-the-loop with wait time for approval
+curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"timeout": 60}'
+
+# Long-running agent that monitors a dashboard
+curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"timeout": 480}'
+```
+</CodeGroup>
+
+### Use workflows for predetermined sequences
+
+If your steps don't need pauses between them, a workflow runs them in a single browser instance without the overhead of creating and managing a session. Each task in a session incurs its own startup cost, while workflow blocks share one browser.
+
+<CodeGroup>
+```python Python
+# Less efficient: multiple tasks in a session (each task has startup overhead)
+session = await client.create_browser_session()
+await client.run_task(prompt="Step 1", browser_session_id=session.browser_session_id, wait_for_completion=True)
+await client.run_task(prompt="Step 2", browser_session_id=session.browser_session_id, wait_for_completion=True)
+
+# More efficient: single workflow (blocks share one browser, no inter-task overhead)
+await client.run_workflow(workflow_id="wf_abc", wait_for_completion=True)
+```
+
+```typescript TypeScript
+// Less efficient: multiple tasks in a session (each task has startup overhead)
+const session = await client.createBrowserSession({});
+await client.runTask({ body: { prompt: "Step 1", browser_session_id: session.browser_session_id }, waitForCompletion: true });
+await client.runTask({ body: { prompt: "Step 2", browser_session_id: session.browser_session_id }, waitForCompletion: true });
+
+// More efficient: single workflow (blocks share one browser, no inter-task overhead)
+await client.runWorkflow({ body: { workflow_id: "wf_abc" }, waitForCompletion: true });
+```
+</CodeGroup>
+
+### Choose the right browser type
+
+Chrome has the widest compatibility. Use Edge only when a site requires or detects it specifically.
+
+<CodeGroup>
+```python Python
+# Chrome (default) - widest compatibility
+session = await client.create_browser_session(browser_type="chrome")
+
+# Edge - for sites that require or fingerprint Edge
+session = await client.create_browser_session(browser_type="msedge")
+```
+
+```typescript TypeScript
+// Chrome (default) - widest compatibility
+const chromeSession = await client.createBrowserSession({ browser_type: "chrome" });
+
+// Edge - for sites that require or fingerprint Edge
+const edgeSession = await client.createBrowserSession({ browser_type: "msedge" });
+```
+
+```bash cURL
+# Chrome (default) - widest compatibility
+curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"browser_type": "chrome"}'
+
+# Edge - for sites that require or fingerprint Edge
+curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"browser_type": "msedge"}'
+```
+</CodeGroup>
+
+### Use extensions strategically
+
+Extensions add startup time, so only enable them when needed. The ad-blocker removes overlay ads that can interfere with automation. The captcha-solver handles CAPTCHAs automatically but is only available on Cloud.
+
+<CodeGroup>
+```python Python
+# Block ads that overlay content and interfere with clicks
+session = await client.create_browser_session(extensions=["ad-blocker"])
+
+# Auto-solve captchas (Cloud only)
+session = await client.create_browser_session(extensions=["captcha-solver"])
+```
+
+```typescript TypeScript
+// Block ads that overlay content and interfere with clicks
+const adBlockSession = await client.createBrowserSession({ extensions: ["ad-blocker"] });
+
+// Auto-solve captchas (Cloud only)
+const captchaSession = await client.createBrowserSession({ extensions: ["captcha-solver"] });
+```
+
+```bash cURL
+# Block ads that overlay content and interfere with clicks
+curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"extensions": ["ad-blocker"]}'
+
+# Auto-solve captchas (Cloud only)
+curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"extensions": ["captcha-solver"]}'
+```
+</CodeGroup>
+
+---
+
+## Sessions vs Profiles
+
+Skyvern also offers [Browser Profiles](/optimization/browser-profiles), saved snapshots of browser state (cookies, storage, session files) that you can reuse across days or weeks. Choose based on your use case:
+
+| Aspect | Browser Session | Browser Profile |
+|--------|----------------|-----------------|
+| **What it is** | Live browser instance | Saved snapshot of browser state |
+| **Lifetime** | Minutes to hours | Days to months |
+| **State** | Current page, cookies, open connections | Cookies, storage, session files |
+| **Billing** | Charged while open | No cost when not in use |
+| **Best for** | Back-to-back tasks, human-in-the-loop, real-time agents | Repeated logins, scheduled workflows, shared auth state |
+
+<Tip>
+You can create a [Browser Profile](/optimization/browser-profiles) from a completed session to save its authenticated state for future reuse.
+</Tip>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Browser Profiles"
+    icon="floppy-disk"
+    href="/optimization/browser-profiles"
+  >
+    Save session state for reuse across days
+  </Card>
+  <Card
+    title="Cost Control"
+    icon="dollar-sign"
+    href="/optimization/cost-control"
+  >
+    Optimize costs with max_steps and efficient prompts
+  </Card>
+</CardGroup>

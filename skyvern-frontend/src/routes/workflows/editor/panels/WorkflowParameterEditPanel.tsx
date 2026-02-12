@@ -104,6 +104,42 @@ function header(
   return `${prefix} Context Parameter`;
 }
 
+/**
+ * Validates that a parameter key is a valid Python/Jinja2 identifier.
+ * Parameter keys are used in Jinja2 templates, so they must be valid identifiers.
+ * Returns an error message if invalid, or null if valid.
+ */
+function validateParameterKey(key: string): string | null {
+  if (!key) return null; // Empty key is handled separately
+
+  // Check for whitespace
+  if (/\s/.test(key)) {
+    return "Key cannot contain whitespace characters. Consider using underscores (_) instead.";
+  }
+
+  // Check if it's a valid Python identifier:
+  // - Must start with a letter (a-z, A-Z) or underscore (_)
+  // - Can only contain letters, digits (0-9), and underscores
+  const validIdentifierRegex = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+  if (!validIdentifierRegex.test(key)) {
+    if (/^[0-9]/.test(key)) {
+      return "Key cannot start with a digit. Parameter keys must start with a letter or underscore.";
+    }
+    if (key.includes("/")) {
+      return "Key cannot contain '/' characters. Use underscores instead (e.g., 'State_or_Province' instead of 'State/Province').";
+    }
+    if (key.includes("-")) {
+      return "Key cannot contain '-' characters. Use underscores instead (e.g., 'my_parameter' instead of 'my-parameter').";
+    }
+    if (key.includes(".")) {
+      return "Key cannot contain '.' characters. Use underscores instead.";
+    }
+    return "Key must be a valid identifier (only letters, digits, and underscores; cannot start with a digit).";
+  }
+
+  return null;
+}
+
 // Helper to detect initial credential data type from existing parameter
 function detectInitialCredentialDataType(
   initialValues: ParametersState[number] | undefined,
@@ -149,7 +185,7 @@ function WorkflowParameterEditPanel({
   const isCloud = useContext(CloudContext);
   const isEditMode = !!initialValues;
   const [key, setKey] = useState(initialValues?.key ?? "");
-  const hasWhitespace = /\s/.test(key);
+  const keyValidationError = validateParameterKey(key);
 
   // Detect initial values for backward compatibility
   const isBitwardenCredential =
@@ -314,10 +350,8 @@ function WorkflowParameterEditPanel({
           <div className="space-y-1">
             <Label className="text-xs text-slate-300">Key</Label>
             <Input value={key} onChange={(e) => setKey(e.target.value)} />
-            {hasWhitespace && (
-              <p className="text-xs text-destructive">
-                Spaces are not allowed, consider using _
-              </p>
+            {keyValidationError && (
+              <p className="text-xs text-destructive">{keyValidationError}</p>
             )}
           </div>
           <div className="space-y-1">
@@ -769,12 +803,11 @@ function WorkflowParameterEditPanel({
                   });
                   return;
                 }
-                if (hasWhitespace) {
+                if (keyValidationError) {
                   toast({
                     variant: "destructive",
                     title: "Failed to save parameter",
-                    description:
-                      "Key cannot contain whitespace characters. Consider using underscores (_) instead.",
+                    description: keyValidationError,
                   });
                   return;
                 }

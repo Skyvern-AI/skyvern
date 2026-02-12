@@ -23,6 +23,7 @@ import { useState } from "react";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { errorMappingExampleValue } from "../types";
 import type { NavigationNode } from "./types";
+import { MAX_STEPS_DEFAULT } from "./types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
 import {
@@ -35,9 +36,11 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { cn } from "@/util/utils";
 import { useParams } from "react-router-dom";
 import { NodeHeader } from "../components/NodeHeader";
+import { NodeTabs } from "../components/NodeTabs";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
+import { RunEngine } from "@/api/types";
 
 import { DisableCache } from "../DisableCache";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
@@ -64,9 +67,483 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const update = useUpdate<NavigationNode["data"]>({ id, editable });
   const isInsideForLoop = isNodeInsideForLoop(nodes, id);
 
+  // Determine if we're in V2 mode (Skyvern 2.0)
+  const isV2Mode = data.engine === RunEngine.SkyvernV2;
+
+  const handleEngineChange = (value: RunEngine) => {
+    const updates: Partial<NavigationNode["data"]> = { engine: value };
+    if (value === RunEngine.SkyvernV2) {
+      // Switching to V2 — clear V1-specific fields
+      updates.navigationGoal = "";
+      updates.completeCriterion = "";
+      updates.terminateCriterion = "";
+      updates.errorCodeMapping = "null";
+      updates.parameterKeys = [];
+      updates.maxRetries = null;
+      updates.maxStepsOverride = null;
+      updates.allowDownloads = false;
+      updates.downloadSuffix = null;
+      updates.includeActionHistoryInVerification = false;
+    } else if (data.engine === RunEngine.SkyvernV2) {
+      // Switching away from V2 — clear V2-specific fields
+      updates.prompt = "";
+      updates.maxSteps = MAX_STEPS_DEFAULT;
+    }
+    update(updates);
+  };
+
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
   }, [data.showCode]);
+
+  // V2 Mode UI (simpler interface)
+  const renderV2Content = () => (
+    <>
+      <div
+        className={cn("space-y-4", {
+          "opacity-50": thisBlockIsPlaying,
+        })}
+      >
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <Label className="text-xs text-slate-300">URL</Label>
+            <HelpTooltip content={helpTooltips["navigation"]["url"]} />
+          </div>
+          <WorkflowBlockInputTextarea
+            nodeId={id}
+            onChange={(value) => {
+              update({ url: value });
+            }}
+            value={data.url}
+            placeholder={placeholders["taskv2"]["url"]}
+            className="nopan text-xs"
+          />
+        </div>
+        <div className="space-y-2">
+          <div className="flex justify-between">
+            <Label className="text-xs text-slate-300">Prompt</Label>
+            {isFirstWorkflowBlock ? (
+              <div className="flex justify-end text-xs text-slate-400">
+                Tip: Use the {"+"} button to add parameters!
+              </div>
+            ) : null}
+          </div>
+          <WorkflowBlockInputTextarea
+            aiImprove={AI_IMPROVE_CONFIGS.taskV2.prompt}
+            nodeId={id}
+            onChange={(value) => {
+              update({ prompt: value });
+            }}
+            value={data.prompt}
+            placeholder={placeholders["taskv2"]["prompt"]}
+            className="nopan text-xs"
+          />
+        </div>
+        <div className="flex items-center justify-between">
+          <div className="flex gap-2">
+            <Label className="text-xs font-normal text-slate-300">Engine</Label>
+            <HelpTooltip content={helpTooltips["navigation"]["engine"]} />
+          </div>
+          <RunEngineSelector
+            value={data.engine}
+            onChange={handleEngineChange}
+            className="nopan w-72 text-xs"
+            availableEngines={[
+              RunEngine.SkyvernV1,
+              RunEngine.SkyvernV2,
+              RunEngine.OpenaiCua,
+              RunEngine.AnthropicCua,
+            ]}
+          />
+        </div>
+      </div>
+      <Separator />
+      <Accordion
+        type="single"
+        collapsible
+        onValueChange={() => rerender.bump()}
+      >
+        <AccordionItem value="advanced" className="border-b-0">
+          <AccordionTrigger className="py-0">
+            Advanced Settings
+          </AccordionTrigger>
+          <AccordionContent key={rerender.key} className="pl-6 pr-1 pt-4">
+            <div className="space-y-4">
+              <ModelSelector
+                className="nopan w-52 text-xs"
+                value={data.model}
+                onChange={(value) => {
+                  update({ model: value });
+                }}
+              />
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Max Steps</Label>
+                  <HelpTooltip content={helpTooltips["taskv2"]["maxSteps"]} />
+                </div>
+                <Input
+                  type="number"
+                  placeholder={`${MAX_STEPS_DEFAULT}`}
+                  className="nopan text-xs"
+                  value={data.maxSteps ?? MAX_STEPS_DEFAULT}
+                  onChange={(event) => {
+                    update({
+                      maxSteps: Number(event.target.value),
+                    });
+                  }}
+                />
+              </div>
+              <Separator />
+              <DisableCache
+                disableCache={data.disableCache}
+                editable={editable}
+                onDisableCacheChange={(disableCache) => {
+                  update({ disableCache });
+                }}
+              />
+              <Separator />
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    2FA Identifier
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltips["taskv2"]["totpIdentifier"]}
+                  />
+                </div>
+                <WorkflowBlockInputTextarea
+                  nodeId={id}
+                  onChange={(value) => {
+                    update({ totpIdentifier: value });
+                  }}
+                  value={data.totpIdentifier ?? ""}
+                  placeholder={placeholders["navigation"]["totpIdentifier"]}
+                  className="nopan text-xs"
+                />
+              </div>
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    2FA Verification URL
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltips["task"]["totpVerificationUrl"]}
+                  />
+                </div>
+                <WorkflowBlockInputTextarea
+                  nodeId={id}
+                  onChange={(value) => {
+                    update({ totpVerificationUrl: value });
+                  }}
+                  value={data.totpVerificationUrl ?? ""}
+                  placeholder={placeholders["task"]["totpVerificationUrl"]}
+                  className="nopan text-xs"
+                />
+              </div>
+            </div>
+          </AccordionContent>
+        </AccordionItem>
+      </Accordion>
+    </>
+  );
+
+  // V1 Mode UI (full navigation interface)
+  const renderV1Content = () => (
+    <>
+      <div
+        className={cn("space-y-4", {
+          "opacity-50": thisBlockIsPlaying,
+        })}
+      >
+        <div className="space-y-2">
+          <div className="flex justify-between">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">URL</Label>
+              <HelpTooltip content={helpTooltips["navigation"]["url"]} />
+            </div>
+            {isFirstWorkflowBlock ? (
+              <div className="flex justify-end text-xs text-slate-400">
+                Tip: Use the {"+"} button to add parameters!
+              </div>
+            ) : null}
+          </div>
+
+          <WorkflowBlockInputTextarea
+            nodeId={id}
+            onChange={(value) => {
+              update({ url: value });
+            }}
+            value={data.url}
+            placeholder={placeholders["navigation"]["url"]}
+            className="nopan text-xs"
+          />
+        </div>
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <Label className="text-xs text-slate-300">Prompt</Label>
+            <HelpTooltip
+              content={helpTooltips["navigation"]["navigationGoal"]}
+            />
+          </div>
+          <WorkflowBlockInputTextarea
+            aiImprove={AI_IMPROVE_CONFIGS.navigation.navigationGoal}
+            nodeId={id}
+            onChange={(value) => {
+              update({ navigationGoal: value });
+            }}
+            value={data.navigationGoal}
+            placeholder={placeholders["navigation"]["navigationGoal"]}
+            className="nopan text-xs"
+          />
+        </div>
+        <div className="rounded-md bg-slate-800 p-2">
+          <div className="space-y-1 text-xs text-slate-400">
+            Tip: Try to phrase your prompt as a goal with an explicit completion
+            criteria. While executing, Skyvern will take as many actions as
+            necessary to accomplish the goal. Use words like "Complete" or
+            "Terminate" to help Skyvern identify when it's finished or when it
+            should give up.
+          </div>
+        </div>
+        <div className="flex items-center justify-between">
+          <div className="flex gap-2">
+            <Label className="text-xs font-normal text-slate-300">Engine</Label>
+            <HelpTooltip content={helpTooltips["navigation"]["engine"]} />
+          </div>
+          <RunEngineSelector
+            value={data.engine}
+            onChange={handleEngineChange}
+            className="nopan w-72 text-xs"
+            availableEngines={[
+              RunEngine.SkyvernV1,
+              RunEngine.SkyvernV2,
+              RunEngine.OpenaiCua,
+              RunEngine.AnthropicCua,
+            ]}
+          />
+        </div>
+      </div>
+      <Separator />
+      <Accordion
+        className={cn({
+          "pointer-events-none opacity-50": thisBlockIsPlaying,
+        })}
+        type="single"
+        collapsible
+        onValueChange={() => rerender.bump()}
+      >
+        <AccordionItem value="advanced" className="border-b-0">
+          <AccordionTrigger className="py-0">
+            Advanced Settings
+          </AccordionTrigger>
+          <AccordionContent className="pl-6 pr-1 pt-1">
+            <div key={rerender.key} className="space-y-4">
+              <div className="space-y-2">
+                <ParametersMultiSelect
+                  availableOutputParameters={outputParameterKeys}
+                  parameters={data.parameterKeys}
+                  onParametersChange={(parameterKeys) => {
+                    update({ parameterKeys });
+                  }}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs text-slate-300">Complete if...</Label>
+                <WorkflowBlockInputTextarea
+                  aiImprove={AI_IMPROVE_CONFIGS.navigation.completeCriterion}
+                  nodeId={id}
+                  onChange={(value) => {
+                    update({ completeCriterion: value });
+                  }}
+                  value={data.completeCriterion}
+                  className="nopan text-xs"
+                />
+              </div>
+              <Separator />
+              <ModelSelector
+                className="nopan w-52 text-xs"
+                value={data.model}
+                onChange={(value) => {
+                  update({ model: value });
+                }}
+              />
+              <div className="flex items-center justify-between">
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-slate-300">
+                    Max Steps Override
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltips["navigation"]["maxStepsOverride"]}
+                  />
+                </div>
+                <Input
+                  type="number"
+                  placeholder={placeholders["navigation"]["maxStepsOverride"]}
+                  className="nopan w-52 text-xs"
+                  min="0"
+                  value={data.maxStepsOverride ?? ""}
+                  onChange={(event) => {
+                    const value =
+                      event.target.value === ""
+                        ? null
+                        : Number(event.target.value);
+                    update({ maxStepsOverride: value });
+                  }}
+                />
+              </div>
+              <div className="space-y-2">
+                <div className="flex gap-4">
+                  <div className="flex gap-2">
+                    <Label className="text-xs font-normal text-slate-300">
+                      Error Messages
+                    </Label>
+                    <HelpTooltip
+                      content={helpTooltips["navigation"]["errorCodeMapping"]}
+                    />
+                  </div>
+                  <Checkbox
+                    checked={data.errorCodeMapping !== "null"}
+                    disabled={!editable}
+                    onCheckedChange={(checked) => {
+                      update({
+                        errorCodeMapping: checked
+                          ? JSON.stringify(errorMappingExampleValue, null, 2)
+                          : "null",
+                      });
+                    }}
+                  />
+                </div>
+                {data.errorCodeMapping !== "null" && (
+                  <div>
+                    <CodeEditor
+                      language="json"
+                      value={data.errorCodeMapping}
+                      onChange={(value) => {
+                        update({ errorCodeMapping: value });
+                      }}
+                      className="nopan"
+                      fontSize={8}
+                    />
+                  </div>
+                )}
+              </div>
+              <BlockExecutionOptions
+                continueOnFailure={data.continueOnFailure}
+                nextLoopOnFailure={data.nextLoopOnFailure}
+                includeActionHistoryInVerification={
+                  data.includeActionHistoryInVerification
+                }
+                editable={editable}
+                isInsideForLoop={isInsideForLoop}
+                blockType="navigation"
+                showOptions={{
+                  continueOnFailure: true,
+                  nextLoopOnFailure: true,
+                  includeActionHistoryInVerification: true,
+                }}
+                onContinueOnFailureChange={(checked) => {
+                  update({ continueOnFailure: checked });
+                }}
+                onNextLoopOnFailureChange={(checked) => {
+                  update({ nextLoopOnFailure: checked });
+                }}
+                onIncludeActionHistoryInVerificationChange={(checked) => {
+                  update({
+                    includeActionHistoryInVerification: checked,
+                  });
+                }}
+              />
+              <DisableCache
+                disableCache={data.disableCache}
+                editable={editable}
+                onDisableCacheChange={(disableCache) => {
+                  update({ disableCache });
+                }}
+              />
+              <Separator />
+              <div className="flex items-center justify-between">
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-slate-300">
+                    Complete on Download
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltips["navigation"]["completeOnDownload"]}
+                  />
+                </div>
+                <div className="w-52">
+                  <Switch
+                    checked={data.allowDownloads}
+                    onCheckedChange={(checked) => {
+                      update({ allowDownloads: checked });
+                    }}
+                  />
+                </div>
+              </div>
+              <div className="flex items-center justify-between">
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-slate-300">
+                    File Name
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltips["navigation"]["fileSuffix"]}
+                  />
+                </div>
+                <WorkflowBlockInput
+                  nodeId={id}
+                  type="text"
+                  placeholder={placeholders["navigation"]["downloadSuffix"]}
+                  className="nopan w-52 text-xs"
+                  value={data.downloadSuffix ?? ""}
+                  onChange={(value) => {
+                    update({ downloadSuffix: value });
+                  }}
+                />
+              </div>
+              <Separator />
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    2FA Identifier
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltips["navigation"]["totpIdentifier"]}
+                  />
+                </div>
+                <WorkflowBlockInputTextarea
+                  nodeId={id}
+                  onChange={(value) => {
+                    update({ totpIdentifier: value });
+                  }}
+                  value={data.totpIdentifier ?? ""}
+                  placeholder={placeholders["navigation"]["totpIdentifier"]}
+                  className="nopan text-xs"
+                />
+              </div>
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    2FA Verification URL
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltips["task"]["totpVerificationUrl"]}
+                  />
+                </div>
+                <WorkflowBlockInputTextarea
+                  nodeId={id}
+                  onChange={(value) => {
+                    update({ totpVerificationUrl: value });
+                  }}
+                  value={data.totpVerificationUrl ?? ""}
+                  placeholder={placeholders["task"]["totpVerificationUrl"]}
+                  className="nopan text-xs"
+                />
+              </div>
+            </div>
+          </AccordionContent>
+        </AccordionItem>
+      </Accordion>
+    </>
+  );
 
   return (
     <Flippable facing={facing} preserveFrontsideHeight={true}>
@@ -101,318 +578,18 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
             nodeId={id}
             totpIdentifier={data.totpIdentifier}
             totpUrl={data.totpVerificationUrl}
-            type={type}
+            type={isV2Mode ? "task_v2" : type}
           />
-          <div
-            className={cn("space-y-4", {
-              "opacity-50": thisBlockIsPlaying,
-            })}
-          >
-            <div className="space-y-2">
-              <div className="flex justify-between">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">URL</Label>
-                  <HelpTooltip content={helpTooltips["navigation"]["url"]} />
-                </div>
-                {isFirstWorkflowBlock ? (
-                  <div className="flex justify-end text-xs text-slate-400">
-                    Tip: Use the {"+"} button to add parameters!
-                  </div>
-                ) : null}
-              </div>
-
-              <WorkflowBlockInputTextarea
-                canWriteTitle={true}
-                nodeId={id}
-                onChange={(value) => {
-                  update({ url: value });
-                }}
-                value={data.url}
-                placeholder={placeholders["navigation"]["url"]}
-                className="nopan text-xs"
-              />
-            </div>
-            <div className="space-y-2">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
-                  Navigation Goal
-                </Label>
-                <HelpTooltip
-                  content={helpTooltips["navigation"]["navigationGoal"]}
-                />
-              </div>
-              <WorkflowBlockInputTextarea
-                aiImprove={AI_IMPROVE_CONFIGS.navigation.navigationGoal}
-                nodeId={id}
-                onChange={(value) => {
-                  update({ navigationGoal: value });
-                }}
-                value={data.navigationGoal}
-                placeholder={placeholders["navigation"]["navigationGoal"]}
-                className="nopan text-xs"
-              />
-            </div>
-            <div className="rounded-md bg-slate-800 p-2">
-              <div className="space-y-1 text-xs text-slate-400">
-                Tip: Try to phrase your prompt as a goal with an explicit
-                completion criteria. While executing, Skyvern will take as many
-                actions as necessary to accomplish the goal. Use words like
-                "Complete" or "Terminate" to help Skyvern identify when it's
-                finished or when it should give up.
-              </div>
-            </div>
-          </div>
-          <Separator />
-          <Accordion
-            className={cn({
-              "pointer-events-none opacity-50": thisBlockIsPlaying,
-            })}
-            type="single"
-            collapsible
-            onValueChange={() => rerender.bump()}
-          >
-            <AccordionItem value="advanced" className="border-b-0">
-              <AccordionTrigger className="py-0">
-                Advanced Settings
-              </AccordionTrigger>
-              <AccordionContent className="pl-6 pr-1 pt-1">
-                <div key={rerender.key} className="space-y-4">
-                  <div className="space-y-2">
-                    <ParametersMultiSelect
-                      availableOutputParameters={outputParameterKeys}
-                      parameters={data.parameterKeys}
-                      onParametersChange={(parameterKeys) => {
-                        update({ parameterKeys });
-                      }}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label className="text-xs text-slate-300">
-                      Complete if...
-                    </Label>
-                    <WorkflowBlockInputTextarea
-                      aiImprove={
-                        AI_IMPROVE_CONFIGS.navigation.completeCriterion
-                      }
-                      nodeId={id}
-                      onChange={(value) => {
-                        update({ completeCriterion: value });
-                      }}
-                      value={data.completeCriterion}
-                      className="nopan text-xs"
-                    />
-                  </div>
-                  <Separator />
-                  <ModelSelector
-                    className="nopan w-52 text-xs"
-                    value={data.model}
-                    onChange={(value) => {
-                      update({ model: value });
-                    }}
-                  />
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Engine
-                      </Label>
-                    </div>
-                    <RunEngineSelector
-                      value={data.engine}
-                      onChange={(value) => {
-                        update({ engine: value });
-                      }}
-                      className="nopan w-52 text-xs"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Max Steps Override
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["navigation"]["maxStepsOverride"]}
-                      />
-                    </div>
-                    <Input
-                      type="number"
-                      placeholder={
-                        placeholders["navigation"]["maxStepsOverride"]
-                      }
-                      className="nopan w-52 text-xs"
-                      min="0"
-                      value={data.maxStepsOverride ?? ""}
-                      onChange={(event) => {
-                        const value =
-                          event.target.value === ""
-                            ? null
-                            : Number(event.target.value);
-                        update({ maxStepsOverride: value });
-                      }}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <div className="flex gap-4">
-                      <div className="flex gap-2">
-                        <Label className="text-xs font-normal text-slate-300">
-                          Error Messages
-                        </Label>
-                        <HelpTooltip
-                          content={
-                            helpTooltips["navigation"]["errorCodeMapping"]
-                          }
-                        />
-                      </div>
-                      <Checkbox
-                        checked={data.errorCodeMapping !== "null"}
-                        disabled={!editable}
-                        onCheckedChange={(checked) => {
-                          update({
-                            errorCodeMapping: checked
-                              ? JSON.stringify(
-                                  errorMappingExampleValue,
-                                  null,
-                                  2,
-                                )
-                              : "null",
-                          });
-                        }}
-                      />
-                    </div>
-                    {data.errorCodeMapping !== "null" && (
-                      <div>
-                        <CodeEditor
-                          language="json"
-                          value={data.errorCodeMapping}
-                          onChange={(value) => {
-                            update({ errorCodeMapping: value });
-                          }}
-                          className="nopan"
-                          fontSize={8}
-                        />
-                      </div>
-                    )}
-                  </div>
-                  <BlockExecutionOptions
-                    continueOnFailure={data.continueOnFailure}
-                    nextLoopOnFailure={data.nextLoopOnFailure}
-                    includeActionHistoryInVerification={
-                      data.includeActionHistoryInVerification
-                    }
-                    editable={editable}
-                    isInsideForLoop={isInsideForLoop}
-                    blockType="navigation"
-                    showOptions={{
-                      continueOnFailure: true,
-                      nextLoopOnFailure: true,
-                      includeActionHistoryInVerification: true,
-                    }}
-                    onContinueOnFailureChange={(checked) => {
-                      update({ continueOnFailure: checked });
-                    }}
-                    onNextLoopOnFailureChange={(checked) => {
-                      update({ nextLoopOnFailure: checked });
-                    }}
-                    onIncludeActionHistoryInVerificationChange={(checked) => {
-                      update({
-                        includeActionHistoryInVerification: checked,
-                      });
-                    }}
-                  />
-                  <DisableCache
-                    disableCache={data.disableCache}
-                    editable={editable}
-                    onDisableCacheChange={(disableCache) => {
-                      update({ disableCache });
-                    }}
-                  />
-                  <Separator />
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Complete on Download
-                      </Label>
-                      <HelpTooltip
-                        content={
-                          helpTooltips["navigation"]["completeOnDownload"]
-                        }
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={data.allowDownloads}
-                        onCheckedChange={(checked) => {
-                          update({ allowDownloads: checked });
-                        }}
-                      />
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        File Name
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["navigation"]["fileSuffix"]}
-                      />
-                    </div>
-                    <WorkflowBlockInput
-                      nodeId={id}
-                      type="text"
-                      placeholder={placeholders["navigation"]["downloadSuffix"]}
-                      className="nopan w-52 text-xs"
-                      value={data.downloadSuffix ?? ""}
-                      onChange={(value) => {
-                        update({ downloadSuffix: value });
-                      }}
-                    />
-                  </div>
-                  <Separator />
-                  <div className="space-y-2">
-                    <div className="flex gap-2">
-                      <Label className="text-xs text-slate-300">
-                        2FA Identifier
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["navigation"]["totpIdentifier"]}
-                      />
-                    </div>
-                    <WorkflowBlockInputTextarea
-                      nodeId={id}
-                      onChange={(value) => {
-                        update({ totpIdentifier: value });
-                      }}
-                      value={data.totpIdentifier ?? ""}
-                      placeholder={placeholders["navigation"]["totpIdentifier"]}
-                      className="nopan text-xs"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <div className="flex gap-2">
-                      <Label className="text-xs text-slate-300">
-                        2FA Verification URL
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["task"]["totpVerificationUrl"]}
-                      />
-                    </div>
-                    <WorkflowBlockInputTextarea
-                      nodeId={id}
-                      onChange={(value) => {
-                        update({ totpVerificationUrl: value });
-                      }}
-                      value={data.totpVerificationUrl ?? ""}
-                      placeholder={placeholders["task"]["totpVerificationUrl"]}
-                      className="nopan text-xs"
-                    />
-                  </div>
-                </div>
-              </AccordionContent>
-            </AccordionItem>
-          </Accordion>
+          {isV2Mode ? renderV2Content() : renderV1Content()}
+          <NodeTabs blockLabel={label} />
         </div>
       </div>
 
-      <BlockCodeEditor blockLabel={label} blockType={type} script={script} />
+      <BlockCodeEditor
+        blockLabel={label}
+        blockType={isV2Mode ? "task_v2" : type}
+        script={script}
+      />
     </Flippable>
   );
 }

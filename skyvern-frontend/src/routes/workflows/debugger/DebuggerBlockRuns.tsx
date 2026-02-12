@@ -61,7 +61,7 @@ function DebuggerBlockRuns() {
     }
 
     navigate(
-      `/workflows/${run.workflow_permanent_id}/${run.workflow_run_id}/${blockLabel}/debug`,
+      `/workflows/${run.workflow_permanent_id}/${run.workflow_run_id}/${blockLabel}/build`,
     );
   };
 

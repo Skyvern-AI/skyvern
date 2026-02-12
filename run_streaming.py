@@ -6,6 +6,7 @@ import structlog
 import typer
 
 from skyvern.forge import app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.utils.files import get_json_from_file, get_skyvern_state_file_path, initialize_skyvern_state_file
@@ -15,6 +16,7 @@ LOG = structlog.get_logger()
 
 
 async def run() -> None:
+    start_forge_app()
     await initialize_skyvern_state_file(task_id=None, workflow_run_id=None, organization_id=None)
 
     while True:

@@ -26,6 +26,7 @@ from skyvern.core.script_generations.generate_workflow_parameters import (
 )
 from skyvern.forge import app
 from skyvern.schemas.workflows import FileStorageType
+from skyvern.utils.strings import sanitize_identifier
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger(__name__)
@@ -126,36 +127,23 @@ def sanitize_variable_name(name: str) -> str:
     Sanitize a string to be a valid Python variable name.
 
     - Converts to snake_case
-    - Removes invalid characters
+    - Removes invalid characters (via shared sanitize_identifier)
     - Ensures it doesn't start with a number
     - Handles Python keywords by appending underscore
-    - Removes empty spaces
+    - Converts to lowercase
     """
-    # Remove leading/trailing whitespace and replace internal spaces with underscores
-    name = name.strip().replace(" ", "_")
-
     # Convert to snake_case: handle camelCase and PascalCase
     name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
 
-    # Remove any characters that aren't alphanumeric or underscore
-    name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
-    # Convert to lowercase
+    # Convert to lowercase before sanitizing
     name = name.lower()
 
-    # Remove consecutive underscores
-    name = re.sub(r"_+", "_", name)
+    # Use shared sanitize_identifier for core cleanup (uses "_" prefix for digit-leading names)
+    name = sanitize_identifier(name, default="param")
 
-    # Remove leading/trailing underscores
-    name = name.strip("_")
-
-    # Ensure it doesn't start with a number
-    if name and name[0].isdigit():
-        name = f"param_{name}"
-
-    # Handle empty string or invalid names
-    if not name or name == "_":
-        name = "param"
+    # For script variable names, use "param_" prefix instead of bare "_" for digit-leading names
+    if name.startswith("_") and len(name) > 1 and name[1].isdigit():
+        name = f"param{name}"
 
     # Handle Python keywords
     if keyword.iskeyword(name):
@@ -646,6 +634,39 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                 ),
             )
         )
+    elif method == "keypress":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("keys"),
+                value=_value(act.get("keys", ["Enter"])),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        if act.get("hold"):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("hold"),
+                    value=_value(act["hold"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+        if act.get("duration"):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("duration"),
+                    value=_value(act["duration"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
     elif method == "wait":
         args.append(
             cst.Arg(
@@ -2028,9 +2049,30 @@ def _build_block_statement(
         stmt = _build_http_request_statement(block)
     elif block_type == "pdf_parser":
         stmt = _build_pdf_parser_statement(block)
+    elif block_type == "conditional":
+        # Conditional blocks are evaluated at runtime by the workflow engine.
+        # Generate a descriptive comment showing this is a runtime branch point.
+        # The blocks inside conditional branches are processed separately when executed.
+        branches = block.get("branches") or block.get("ordered_branches") or []
+        branch_info_lines = []
+        for i, branch in enumerate(branches):
+            next_label = branch.get("next_block_label", "?")
+            condition = branch.get("condition", "")
+            # Truncate long conditions for readability
+            if len(condition) > 50:
+                condition = condition[:47] + "..."
+            branch_info_lines.append(f"#   Branch {i + 1}: {condition!r} → {next_label}")
+
+        if branch_info_lines:
+            branch_info = "\n".join(branch_info_lines)
+            comment_text = f"# === CONDITIONAL: {block_title} ===\n# Evaluated at runtime by workflow engine. One branch executes:\n{branch_info}"
+        else:
+            comment_text = f"# === CONDITIONAL: {block_title} ===\n# Evaluated at runtime by workflow engine."
+
+        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(repr(comment_text)))])
     else:
-        # Default case for unknown block types
-        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"# Unknown block type: {block_type}"))])
+        # Default case for unknown block types - use quoted string literal to avoid libcst validation error
+        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"'# Unknown block type: {block_type}'"))])
 
     return stmt
 
@@ -2302,6 +2344,50 @@ async def generate_workflow_script_python_code(
                 )
             except Exception as e:
                 LOG.error("Failed to create task_v2 script block", error=str(e), exc_info=True)
+
+        append_block_code(block_code)
+
+    # Handle for_loop blocks
+    # ForLoop blocks need script_block entries with run_signature so they can be executed via cached scripts
+    for_loop_blocks = [block for block in blocks if block["block_type"] == "for_loop"]
+    for for_loop_block in for_loop_blocks:
+        for_loop_label = for_loop_block.get("label") or f"for_loop_{for_loop_block.get('workflow_run_block_id')}"
+
+        cached_source = cached_blocks.get(for_loop_label)
+        use_cached = cached_source is not None and for_loop_label not in updated_block_labels
+
+        block_workflow_run_id = for_loop_block.get("workflow_run_id") or run_id
+        block_workflow_run_block_id = for_loop_block.get("workflow_run_block_id")
+
+        if use_cached:
+            assert cached_source is not None
+            block_code = cached_source.code
+            run_signature = cached_source.run_signature
+            block_workflow_run_id = cached_source.workflow_run_id
+            block_workflow_run_block_id = cached_source.workflow_run_block_id
+        else:
+            # Build the for loop statement
+            for_loop_stmt = _build_for_loop_statement(for_loop_label, for_loop_block)
+            temp_module = cst.Module(body=[for_loop_stmt])
+            block_code = temp_module.code
+            run_signature = block_code.strip()
+
+        if script_id and script_revision_id and organization_id:
+            try:
+                await create_or_update_script_block(
+                    block_code=block_code,
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    block_label=for_loop_label,
+                    update=pending,
+                    run_signature=run_signature,
+                    workflow_run_id=block_workflow_run_id,
+                    workflow_run_block_id=block_workflow_run_block_id,
+                    input_fields=None,
+                )
+            except Exception as e:
+                LOG.error("Failed to create for_loop script block", error=str(e), exc_info=True)
 
         append_block_code(block_code)
 

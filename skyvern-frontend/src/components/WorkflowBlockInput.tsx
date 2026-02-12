@@ -1,5 +1,5 @@
 import { PlusIcon, EyeOpenIcon, EyeClosedIcon } from "@radix-ui/react-icons";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { cn } from "@/util/utils";
 import { Input } from "./ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
@@ -11,8 +11,22 @@ type Props = Omit<React.ComponentProps<typeof Input>, "onChange"> & {
 };
 
 function WorkflowBlockInput(props: Props) {
-  const { nodeId, onChange, type, ...inputProps } = props;
+  const { nodeId, onChange, type, value, ...inputProps } = props;
   const [showPassword, setShowPassword] = useState(false);
+
+  // Buffer input value locally so keystrokes update the DOM immediately
+  // without waiting for the React Flow store roundtrip (which can reset the
+  // cursor position — especially in nodes like ConditionalNode that replace
+  // complex nested data on every keystroke).
+  const [localValue, setLocalValue] = useState(value ?? "");
+  const isLocalChangeRef = useRef(false);
+
+  useEffect(() => {
+    if (!isLocalChangeRef.current) {
+      setLocalValue(value ?? "");
+    }
+    isLocalChangeRef.current = false;
+  }, [value]);
 
   const isPasswordField = type === "password";
   const actualType = isPasswordField && showPassword ? "text" : type;
@@ -21,9 +35,12 @@ function WorkflowBlockInput(props: Props) {
     <div className="relative">
       <Input
         {...inputProps}
+        value={localValue}
         type={actualType}
         className={cn(isPasswordField ? "pr-18" : "pr-9", props.className)}
         onChange={(event) => {
+          isLocalChangeRef.current = true;
+          setLocalValue(event.target.value);
           onChange(event.target.value);
         }}
       />
@@ -53,7 +70,10 @@ function WorkflowBlockInput(props: Props) {
               <WorkflowBlockParameterSelect
                 nodeId={nodeId}
                 onAdd={(parameterKey) => {
-                  onChange(`${props.value ?? ""}{{${parameterKey}}}`);
+                  const newValue = `${localValue}{{${parameterKey}}}`;
+                  isLocalChangeRef.current = true;
+                  setLocalValue(newValue);
+                  onChange(newValue);
                 }}
               />
             </PopoverContent>

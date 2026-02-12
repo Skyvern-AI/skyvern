@@ -133,6 +133,7 @@ class Settings(BaseSettings):
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_MAX_PAGES_NUMBER: int = 10
+    BROWSER_ADDITIONAL_ARGS: list[str] = []
 
     # Add extension folders name here to load extension in your browser
     EXTENSIONS_BASE_PATH: str = "./extensions"
@@ -311,6 +312,8 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
     GEMINI_THINKING_BUDGET: int | None = None
+    DEFAULT_THINKING_BUDGET: int = 1024
+    EXTRACT_ACTION_THINKING_BUDGET: int = 512
 
     # VERTEX_AI
     VERTEX_CREDENTIALS: str | None = None
@@ -404,12 +407,6 @@ class Settings(BaseSettings):
     The secret used to sign the email/identity of the user.
     """
 
-    # Trace settings
-    TRACE_ENABLED: bool = False
-    TRACE_PROVIDER: str = ""
-    TRACE_PROVIDER_HOST: str | None = None
-    TRACE_PROVIDER_API_KEY: str = "fillmein"
-
     # Debug Session Settings
     DEBUG_SESSION_TIMEOUT_MINUTES: int = 20
     """
@@ -428,6 +425,14 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
+
+    # OpenTelemetry Settings
+    OTEL_ENABLED: bool = False
+    OTEL_SERVICE_NAME: str = "skyvern"
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://localhost:4317"
+    OTEL_METRICS_ENABLED: bool = True
+    OTEL_LOGS_ENABLED: bool = True
+    OTEL_EXPORTER_INSECURE: bool = True
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
@@ -453,6 +458,7 @@ class Settings(BaseSettings):
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
+                "azure/gpt-5-mini": {"llm_key": "AZURE_OPENAI_GPT5_MINI", "label": "GPT 5 Mini"},
                 "azure/gpt-5.2": {"llm_key": "AZURE_OPENAI_GPT5_2", "label": "GPT 5.2"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
                 "us.anthropic.claude-opus-4-20250514-v1:0": {
@@ -492,6 +498,7 @@ class Settings(BaseSettings):
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
+                "azure/gpt-5-mini": {"llm_key": "AZURE_OPENAI_GPT5_MINI", "label": "GPT 5 Mini"},
                 "azure/gpt-5.2": {"llm_key": "AZURE_OPENAI_GPT5_2", "label": "GPT 5.2"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
                 "us.anthropic.claude-opus-4-20250514-v1:0": {

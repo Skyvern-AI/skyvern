@@ -1,0 +1,56 @@
+name: Auto-merge sync PRs
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, labeled, synchronize]
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+jobs:
+  auto-merge:
+    if: >
+      contains(join(github.event.pull_request.labels.*.name, ','), 'sync') && contains('suchintan,wintonzheng,LawyZheng,pedrohsdb,marcmuon,celalzamanoglu', github.event.pull_request.user.login)
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for all required checks to pass
+        uses: lewagon/wait-on-check-action@v1.4.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 10
+          ignore-checks: auto-merge
+      - name: Set token for author
+        id: set-token
+        run: |
+          case "${{ github.event.pull_request.user.login }}" in
+            wintonzheng)
+              echo "GH_PAT=${{ secrets.SKYVERN_OSS_GH_PAT }}" >> $GITHUB_OUTPUT
+              ;;
+            LawyZheng)
+              echo "GH_PAT=${{ secrets.LAWY_GH_PAT }}" >> $GITHUB_OUTPUT
+              ;;
+            suchintan)
+              echo "GH_PAT=${{ secrets.SUCHINTAN_GH_PAT }}" >> $GITHUB_OUTPUT
+              ;;
+            pedrohsdb)
+              echo "GH_PAT=${{ secrets.PEDROHSDB_GH_PAT }}" >> $GITHUB_OUTPUT
+              ;;
+            marcmuon)
+              echo "GH_PAT=${{ secrets.MARC_GH_PAT }}" >> $GITHUB_OUTPUT
+              ;;
+            celalzamanoglu)
+              echo "GH_PAT=${{ secrets.CELAL_GH_PAT }}" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "GH_PAT=${{ secrets.SKYVERN_OSS_GH_PAT }}" >> $GITHUB_OUTPUT
+              ;;
+          esac
+      - name: Auto-merge PR
+        env:
+          GH_TOKEN: ${{ steps.set-token.outputs.GH_PAT }}
+        run: |
+          gh pr merge ${{ github.event.pull_request.number }} \
+            --squash \
+            --admin \
+            --repo "${{ github.repository }}"

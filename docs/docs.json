@@ -32,6 +32,55 @@
               "running-automations/task-parameters",
               "running-automations/extract-structured-data"
             ]
+          },
+          {
+            "group": "Multi-Step Automations",
+            "pages": [
+              "multi-step-automations/build-a-workflow",
+              "multi-step-automations/workflow-blocks-reference",
+              "multi-step-automations/file-operations",
+              "multi-step-automations/workflow-parameters"
+            ]
+          },
+          {
+            "group": "Optimization",
+            "pages": [
+              "optimization/browser-sessions",
+              "optimization/browser-profiles",
+              "optimization/cost-control"
+            ]
+          },
+          {
+            "group": "Going to Production",
+            "pages": [
+              "going-to-production/webhooks",
+              "going-to-production/proxy-geolocation",
+              "going-to-production/error-handling",
+              "going-to-production/reliability-tips",
+              "going-to-production/captcha-bot-detection",
+              "integrations/mcp"
+            ]
+          },
+          {
+            "group": "Debugging",
+            "pages": [
+              "debugging/using-artifacts",
+              "debugging/troubleshooting-guide",
+              "debugging/faq"
+            ]
+          },
+          {
+            "group": "Self-Hosted Deployment",
+            "pages": [
+              "self-hosted/overview",
+              "self-hosted/docker",
+              "self-hosted/llm-configuration",
+              "self-hosted/browser",
+              "self-hosted/proxy",
+              "self-hosted/kubernetes",
+              "self-hosted/storage",
+              "integrations/local-llms"
+            ]
           }
         ]
       },
@@ -39,12 +88,57 @@
         "tab": "Cloud UI",
         "groups": [
           {
-            "group": "Cloud UI",
+            "group": "Getting Started",
             "pages": [
-              "cloud/getting-started"
+              "cloud/overview",
+              "cloud/run-your-first-task",
+              "cloud/run-a-task",
+              "cloud/monitor-a-run"
+            ]
+          },
+          {
+            "group": "Building Workflows",
+            "pages": [
+              "cloud/build-a-workflow",
+              "cloud/manage-workflows",
+              "cloud/add-parameters",
+              "cloud/configure-blocks",
+              "cloud/run-a-workflow"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/zapier",
+              "integrations/make",
+              "integrations/n8n",
+              "integrations/workato"
             ]
           }
         ]
+      },
+      {
+        "tab": "Python SDK",
+        "groups": [
+          {
+            "group": "Python SDK",
+            "pages": [
+              "sdk-reference/overview",
+              "sdk-reference/tasks",
+              "sdk-reference/workflows",
+              "sdk-reference/browser-sessions",
+              "sdk-reference/browser-profiles",
+              "sdk-reference/credentials",
+              "sdk-reference/helpers",
+              "sdk-reference/error-handling",
+              "sdk-reference/complete-reference"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "openapi": "api-reference/openapi.json"
       }
     ]
   },
@@ -69,6 +163,11 @@
     }
   },
   "api": {
+    "baseUrl": "https://api.skyvern.com",
+    "auth": {
+      "method": "key",
+      "name": "x-api-key"
+    },
     "playground": {
       "display": "interactive"
     }

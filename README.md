@@ -23,7 +23,7 @@
   <a href="https://www.linkedin.com/company/95726232"><img src="https://img.shields.io/badge/Follow%20 on%20LinkedIn-8A2BE2?logo=linkedin"/></a>
 </p>
 
-[Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a simple API endpoint to fully automate manual workflows on a large number of websites, replacing brittle or unreliable automation solutions.
+[Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a Playwright-compatible SDK that adds AI functionality on top of playwright, as well as a no-code workflow builder to help both technical and non-technical users automate manual workflows on any website, replacing brittle or unreliable automation solutions.
 
 <p align="center">
   <img src="fern/images/geico_shu_recording_cropped.gif"/>
@@ -48,31 +48,11 @@ This approach has a few advantages:
 1. Skyvern can operate on websites it's never seen before, as it's able to map visual elements to actions necessary to complete a workflow, without any customized code
 1. Skyvern is resistant to website layout changes, as there are no pre-determined XPaths or other selectors our system is looking for while trying to navigate
 1. Skyvern is able to take a single workflow and apply it to a large number of websites, as it's able to reason through the interactions necessary to complete the workflow
-1. Skyvern leverages LLMs to reason through interactions to ensure we can cover complex situations. Examples include:
-    1. If you wanted to get an auto insurance quote from Geico, the answer to a common question "Were you eligible to drive at 18?" could be inferred from the driver receiving their license at age 16
-    1. If you were doing competitor analysis, it's understanding that an Arnold Palmer 22 oz can at 7/11 is almost definitely the same product as a 23 oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
-
 A detailed technical report can be found [here](https://www.skyvern.com/blog/skyvern-2-0-state-of-the-art-web-navigation-with-85-8-on-webvoyager-eval/).
 
 # Demo
 <!-- Redo demo -->
 https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f
-
-# Performance & Evaluation
-
-Skyvern has SOTA performance on the [WebBench benchmark](webbench.ai) with a 64.4% accuracy. The technical report + evaluation can be found [here](https://www.skyvern.com/blog/web-bench-a-new-way-to-compare-ai-browser-agents/)
-
-<p align="center">
-  <img src="fern/images/performance/webbench_overall.png"/>
-</p>
-
-## Performance on WRITE tasks (eg filling out forms, logging in, downloading files, etc)
-
-Skyvern is the best performing agent on WRITE tasks (eg filling out forms, logging in, downloading files, etc), which is primarily used for RPA (Robotic Process Automation) adjacent tasks.
-
-<p align="center">
-  <img src="fern/images/performance/webbench_write.png"/>
-</p>
 
 # Quickstart
 
@@ -81,7 +61,11 @@ Skyvern is the best performing agent on WRITE tasks (eg filling out forms, loggi
 
 If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.com) and create an account.
 
-## Install & Run
+## Run Locally (UI + Server)
+
+Choose your preferred setup method:
+
+### Option A: pip install (Recommended)
 
 Dependencies needed:
 - [Python 3.11.x](https://www.python.org/downloads/), works with 3.12, not ready yet for 3.13
@@ -91,14 +75,13 @@ Additionally, for Windows:
 - [Rust](https://rustup.rs/)
 - VS Code with C++ dev tools and Windows SDK
 
-### 1. Install Skyvern
+#### 1. Install Skyvern
 
 ```bash
 pip install skyvern
 ```
 
-### 2. Run Skyvern
-This is most helpful for first time run (db setup, db migrations etc).
+#### 2. Run Skyvern
 
 ```bash
 skyvern quickstart
@@ -111,108 +94,146 @@ local Docker PostgreSQL setup:
 skyvern quickstart --database-string "postgresql+psycopg://user:password@localhost:5432/skyvern"
 ```
 
-### 3. Run task
+### Option B: Docker Compose
 
-#### UI (Recommended)
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+2. Clone the repository:
+   ```bash
+   git clone https://github.com/skyvern-ai/skyvern.git && cd skyvern
+   ```
+3. Run quickstart with Docker Compose:
+   ```bash
+   pip install skyvern && skyvern quickstart
+   ```
+   When prompted, choose "Docker Compose" for the full containerized setup.
+4. Navigate to http://localhost:8080
 
-Start the Skyvern service and UI (when DB is up and running)
+## SDK
 
+**Skyvern is a Playwright extension that adds AI-powered browser automation.** It gives you the full power of Playwright with additional AI capabilities—use natural language prompts to interact with elements, extract data, and automate complex multi-step workflows.
+
+**Installation:**
+- Python: `pip install skyvern` then run `skyvern quickstart` for local setup
+- TypeScript: `npm install @skyvern/client`
+
+### AI-Powered Page Commands
+
+Skyvern adds four core AI commands directly on the page object:
+
+| Command | Description |
+|---------|-------------|
+| `page.act(prompt)` | Perform actions using natural language (e.g., "Click the login button") |
+| `page.extract(prompt, schema)` | Extract structured data from the page with optional JSON schema |
+| `page.validate(prompt)` | Validate page state, returns `bool` (e.g., "Check if user is logged in") |
+| `page.prompt(prompt, schema)` | Send arbitrary prompts to the LLM with optional response schema |
+
+Additionally, `page.agent` provides higher-level workflow commands:
+
+| Command | Description |
+|---------|-------------|
+| `page.agent.run_task(prompt)` | Execute complex multi-step tasks |
+| `page.agent.login(credential_type, credential_id)` | Authenticate with stored credentials (Skyvern, Bitwarden, 1Password) |
+| `page.agent.download_files(prompt)` | Navigate and download files |
+| `page.agent.run_workflow(workflow_id)` | Execute pre-built workflows |
+
+### AI-Augmented Playwright Actions
+
+All standard Playwright actions support an optional `prompt` parameter for AI-powered element location:
+
+| Action | Playwright | AI-Augmented |
+|--------|------------|--------------|
+| Click | `page.click("#btn")` | `page.click(prompt="Click login button")` |
+| Fill | `page.fill("#email", "a@b.com")` | `page.fill(prompt="Email field", value="a@b.com")` |
+| Select | `page.select_option("#country", "US")` | `page.select_option(prompt="Country dropdown", value="US")` |
+| Upload | `page.upload_file("#file", "doc.pdf")` | `page.upload_file(prompt="Upload area", files="doc.pdf")` |
+
+**Three interaction modes:**
+```python
+# 1. Traditional Playwright - CSS/XPath selectors
+await page.click("#submit-button")
+
+# 2. AI-powered - natural language
+await page.click(prompt="Click the green Submit button")
+
+# 3. AI fallback - tries selector first, falls back to AI if it fails
+await page.click("#submit-btn", prompt="Click the Submit button")
+```
+
+### Core AI Commands - Examples
+
+```python
+# act - Perform actions using natural language
+await page.act("Click the login button and wait for the dashboard to load")
+
+# extract - Extract structured data with optional JSON schema
+result = await page.extract("Get the product name and price")
+result = await page.extract(
+    prompt="Extract order details",
+    schema={"order_id": "string", "total": "number", "items": "array"}
+)
+
+# validate - Check page state (returns bool)
+is_logged_in = await page.validate("Check if the user is logged in")
+
+# prompt - Send arbitrary prompts to the LLM
+summary = await page.prompt("Summarize what's on this page")
+```
+
+### Quick Start Examples
+
+**Run via UI:**
 ```bash
 skyvern run all
 ```
+Navigate to http://localhost:8080 to run tasks through the web interface.
 
-Go to http://localhost:8080 and use the UI to run a task
+**Python SDK:**
+```python
+from skyvern import Skyvern
 
-#### Code
+# Local mode
+skyvern = Skyvern.local()
 
+# Or connect to Skyvern Cloud
+skyvern = Skyvern(api_key="your-api-key")
+
+# Launch browser and get page
+browser = await skyvern.launch_cloud_browser()
+page = await browser.get_working_page()
+
+# Mix Playwright with AI-powered actions
+await page.goto("https://example.com")
+await page.click("#login-button")  # Traditional Playwright
+await page.agent.login(credential_type="skyvern", credential_id="cred_123")  # AI login
+await page.click(prompt="Add first item to cart")  # AI-augmented click
+await page.agent.run_task("Complete checkout with: John Snow, 12345")  # AI task
+```
+
+**TypeScript SDK:**
+```typescript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "your-api-key" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+
+// Mix Playwright with AI-powered actions
+await page.goto("https://example.com");
+await page.click("#login-button");  // Traditional Playwright
+await page.agent.login("skyvern", { credentialId: "cred_123" });  // AI login
+await page.click({ prompt: "Add first item to cart" });  // AI-augmented click
+await page.agent.runTask("Complete checkout with: John Snow, 12345");  // AI task
+
+await browser.close();
+```
+
+**Simple task execution:**
 ```python
 from skyvern import Skyvern
 
 skyvern = Skyvern()
 task = await skyvern.run_task(prompt="Find the top post on hackernews today")
 print(task)
-```
-Skyvern starts running the task in a browser that pops up and closes it when the task is done. You will be able to view the task from http://localhost:8080/history
-
-You can also run a task on different targets:
-```python
-from skyvern import Skyvern
-
-# Run on Skyvern Cloud
-skyvern = Skyvern(api_key="SKYVERN API KEY")
-
-# Local Skyvern service
-skyvern = Skyvern(base_url="http://localhost:8000", api_key="LOCAL SKYVERN API KEY")
-
-task = await skyvern.run_task(prompt="Find the top post on hackernews today")
-print(task)
-```
-
-## SDK
-
-**Installation:**
-- Python: `pip install skyvern` then run `skyvern quickstart` for local setup
-- TypeScript: `npm install @skyvern/client`
-
-Skyvern provides SDKs for both Python and TypeScript to integrate browser automation into your applications.
-
-### Python SDK
-
-```python
-from skyvern import Skyvern
-
-# Connect to Skyvern Cloud
-skyvern = Skyvern(api_key="your-api-key")
-
-# Or run locally
-skyvern = Skyvern.local()
-
-# Launch a cloud browser
-browser = await skyvern.launch_cloud_browser()
-page = await browser.get_working_page()
-
-# Use AI-powered actions for complex workflows
-await page.agent.run_task("Navigate to the most recent invoice and download it")
-
-# Or mix with Playwright actions
-await page.goto("https://example.com")
-await page.click("#button")
-```
-
-### TypeScript SDK
-
-```typescript
-import { Skyvern } from "@skyvern/client";
-
-// Connect to Skyvern Cloud
-const skyvern = new Skyvern({ apiKey: "your-api-key" });
-
-// Launch a cloud browser
-const browser = await skyvern.launchCloudBrowser();
-const page = await browser.getWorkingPage();
-
-// Use AI-powered actions for complex workflows
-await page.agent.runTask("Navigate to the most recent invoice and download it");
-
-// Or mix with Playwright actions
-await page.goto("https://example.com");
-await page.click("#button");
-```
-
-Skyvern enhances Playwright methods with AI capabilities. Use regular Playwright syntax with a `prompt` parameter to make any action AI-powered:
-
-```python
-# Traditional Playwright - uses selectors
-await page.click("#submit-button")
-
-# AI-augmented Playwright - uses natural language
-await page.click(prompt="Click on the Submit button")
-await page.fill(prompt="Enter email address", value="user@example.com")
-
-# Mix both approaches in the same workflow
-await page.goto("https://example.com/dashboard")
-await page.click(prompt="Click on the most recent unpaid invoice")
-await page.click("#download-button")
 ```
 
 ## Advanced Usage
@@ -311,28 +332,21 @@ skyvern stop ui
 skyvern stop server
 ```
 
-## Docker Compose setup
+# Performance & Evaluation
 
-1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
-1. Make sure you don't have postgres running locally (Run `docker ps` to check)
-1. Clone the repository and navigate to the root directory
-1. Run `skyvern init llm` to generate a `.env` file. This will be copied into the Docker image.
-1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml). *If you want to run Skyvern on a remote server, make sure you set the correct server ip for the UI container in [docker-compose.yml](./docker-compose.yml).*
-2. Run the following command via the commandline:
-   ```bash
-    docker compose up -d
-   ```
-3. Navigate to `http://localhost:8080` in your browser to start using the UI
+Skyvern has SOTA performance on the [WebBench benchmark](webbench.ai) with a 64.4% accuracy. The technical report + evaluation can be found [here](https://www.skyvern.com/blog/web-bench-a-new-way-to-compare-ai-browser-agents/)
 
-> [!Important]
-> Only one Postgres container can run on port 5432 at a time. If you switch from the CLI-managed Postgres to Docker Compose, you must first remove the original container:
-> ```bash
-> docker rm -f postgresql-container
-> ```
+<p align="center">
+  <img src="fern/images/performance/webbench_overall.png"/>
+</p>
 
-If you encounter any database related errors while using Docker to run Skyvern, check which Postgres container is running with `docker ps`.
+## Performance on WRITE tasks (eg filling out forms, logging in, downloading files, etc)
 
+Skyvern is the best performing agent on WRITE tasks (eg filling out forms, logging in, downloading files, etc), which is primarily used for RPA (Robotic Process Automation) adjacent tasks.
 
+<p align="center">
+  <img src="fern/images/performance/webbench_write.png"/>
+</p>
 
 # Skyvern Features
 
@@ -494,11 +508,11 @@ More extensive documentation can be found on our [📕 docs page](https://www.sk
 # Supported LLMs
 | Provider | Supported Models |
 | -------- | ------- |
-| OpenAI   | gpt4-turbo, gpt-4o, gpt-4o-mini |
-| Anthropic | Claude 3 (Haiku, Sonnet, Opus), Claude 3.5 (Sonnet) |
+| OpenAI   | GPT-5, GPT-5.2, GPT-4.1, o3, o4-mini |
+| Anthropic | Claude 4 (Sonnet, Opus), Claude 4.5 (Haiku, Sonnet, Opus) |
 | Azure OpenAI | Any GPT models. Better performance with a multimodal llm (azure/gpt4-o) |
-| AWS Bedrock | Anthropic Claude 3 (Haiku, Sonnet, Opus), Claude 3.5 (Sonnet) |
-| Gemini | Gemini 2.5 Pro and flash, Gemini 2.0 |
+| AWS Bedrock | Claude 3.5, Claude 3.7, Claude 4 (Sonnet, Opus), Claude 4.5 (Sonnet, Opus) |
+| Gemini | Gemini 3 Pro/Flash, Gemini 2.5 Pro/Flash |
 | Ollama | Run any locally hosted model via [Ollama](https://github.com/ollama/ollama) |
 | OpenRouter | Access models through [OpenRouter](https://openrouter.ai) |
 | OpenAI-compatible | Any custom API endpoint that follows OpenAI's API format (via [liteLLM](https://docs.litellm.ai/docs/providers/openai_compatible)) |
@@ -513,7 +527,7 @@ More extensive documentation can be found on our [📕 docs page](https://www.sk
 | `OPENAI_API_BASE` | OpenAI API Base, optional | String | `https://openai.api.base` |
 | `OPENAI_ORGANIZATION` | OpenAI Organization ID, optional | String | `your-org-id` |
 
-Recommended `LLM_KEY`: `OPENAI_GPT4O`, `OPENAI_GPT4O_MINI`, `OPENAI_GPT4_1`, `OPENAI_O4_MINI`, `OPENAI_O3`
+Recommended `LLM_KEY`: `OPENAI_GPT5`, `OPENAI_GPT5_2`, `OPENAI_GPT4_1`, `OPENAI_O3`, `OPENAI_O4_MINI`
 
 ##### Anthropic
 | Variable | Description| Type | Sample Value|
@@ -521,7 +535,7 @@ Recommended `LLM_KEY`: `OPENAI_GPT4O`, `OPENAI_GPT4O_MINI`, `OPENAI_GPT4_1`, `OP
 | `ENABLE_ANTHROPIC` | Register Anthropic models| Boolean | `true`, `false` |
 | `ANTHROPIC_API_KEY` | Anthropic API key| String | `sk-1234567890` |
 
-Recommended`LLM_KEY`: `ANTHROPIC_CLAUDE3.5_SONNET`, `ANTHROPIC_CLAUDE3.7_SONNET`, `ANTHROPIC_CLAUDE4_OPUS`, `ANTHROPIC_CLAUDE4_SONNET`
+Recommended `LLM_KEY`: `ANTHROPIC_CLAUDE4.5_OPUS`, `ANTHROPIC_CLAUDE4.5_SONNET`, `ANTHROPIC_CLAUDE4_OPUS`, `ANTHROPIC_CLAUDE4_SONNET`
 
 ##### Azure OpenAI
 | Variable | Description| Type | Sample Value|
@@ -539,7 +553,7 @@ Recommended `LLM_KEY`: `AZURE_OPENAI`
 | -------- | ------- | ------- | ------- |
 | `ENABLE_BEDROCK` | Register AWS Bedrock models. To use AWS Bedrock, you need to make sure your [AWS configurations](https://github.com/boto/boto3?tab=readme-ov-file#using-boto3) are set up correctly first. | Boolean | `true`, `false` |
 
-Recommended `LLM_KEY`: `BEDROCK_ANTHROPIC_CLAUDE3.7_SONNET_INFERENCE_PROFILE`, `BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE`, `BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE`
+Recommended `LLM_KEY`: `BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE`, `BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE`, `BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE`
 
 ##### Gemini
 | Variable | Description| Type | Sample Value|
@@ -547,7 +561,7 @@ Recommended `LLM_KEY`: `BEDROCK_ANTHROPIC_CLAUDE3.7_SONNET_INFERENCE_PROFILE`, `
 | `ENABLE_GEMINI` | Register Gemini models| Boolean | `true`, `false` |
 | `GEMINI_API_KEY` | Gemini API Key| String | `your_google_gemini_api_key`|
 
-Recommended `LLM_KEY`: `GEMINI_2.5_PRO_PREVIEW`, `GEMINI_2.5_FLASH_PREVIEW`
+Recommended `LLM_KEY`: `GEMINI_3.0_FLASH`, `GEMINI_2.5_PRO`, `GEMINI_2.5_FLASH`, `GEMINI_2.5_PRO_PREVIEW`, `GEMINI_2.5_FLASH_PREVIEW`
 
 ##### Ollama
 | Variable | Description| Type | Sample Value|

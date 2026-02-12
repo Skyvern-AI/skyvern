@@ -57,7 +57,9 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
   if (isWorkflowRunBlock(item)) {
     const showExtractedInformationTab = item.status === Status.Completed;
     const showFailureReasonTab =
-      item.status && statusIsAFailureType({ status: item.status });
+      item.status &&
+      (statusIsAFailureType({ status: item.status }) ||
+        item.status === Status.Canceled);
     const defaultTab = showExtractedInformationTab
       ? "extracted_information"
       : showFailureReasonTab
@@ -81,7 +83,7 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
                   Extracted Information
                 </TabsTrigger>
               )}
-              {item.status && statusIsAFailureType({ status: item.status }) && (
+              {showFailureReasonTab && (
                 <TabsTrigger value="failure_reason">Failure Reason</TabsTrigger>
               )}
               <TabsTrigger value="navigation_goal">Navigation Goal</TabsTrigger>
@@ -116,7 +118,7 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
                 />
               </TabsContent>
             )}
-            {item.status && statusIsAFailureType({ status: item.status }) && (
+            {showFailureReasonTab && (
               <TabsContent value="failure_reason">
                 <AutoResizingTextarea
                   value={
@@ -212,12 +214,30 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
       return null;
     }
 
+    const fallbackDefaultTab = showFailureReasonTab
+      ? "failure_reason"
+      : "output";
     return (
       <div className="rounded bg-slate-elevation1 p-4">
-        <Tabs key={item.block_type} defaultValue="output">
+        <Tabs key={item.block_type} defaultValue={fallbackDefaultTab}>
           <TabsList>
+            {showFailureReasonTab && (
+              <TabsTrigger value="failure_reason">Failure Reason</TabsTrigger>
+            )}
             <TabsTrigger value="output">Output</TabsTrigger>
           </TabsList>
+          {showFailureReasonTab && (
+            <TabsContent value="failure_reason">
+              <AutoResizingTextarea
+                value={
+                  item.status === "canceled"
+                    ? "This block was cancelled"
+                    : item.failure_reason ?? ""
+                }
+                readOnly
+              />
+            </TabsContent>
+          )}
           <TabsContent value="output">
             <CodeEditor
               value={JSON.stringify(item.output, null, 2)}

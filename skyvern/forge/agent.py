@@ -16,6 +16,7 @@ from typing import Any, Tuple, cast
 import httpx
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
+from opentelemetry import trace as otel_trace
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
 
@@ -91,7 +92,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -305,9 +306,7 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
-    @TraceManager.traced_async(
-        ignore_inputs=["api_key", "close_browser_on_completion", "task_block", "cua_response", "llm_caller"]
-    )
+    @traced()
     async def execute_step(
         self,
         organization: Organization,
@@ -895,9 +894,7 @@ class ForgeAgent:
             )
             return True
 
-    @TraceManager.traced_async(
-        ignore_inputs=["browser_state", "organization", "task_block", "cua_response", "llm_caller"]
-    )
+    @traced()
     async def agent_step(
         self,
         task: Task,
@@ -1798,6 +1795,7 @@ class ForgeAgent:
 
     async def _speculate_next_step_plan(
         self,
+        organization: Organization,
         task: Task,
         current_step: Step,
         next_step: Step,
@@ -1814,6 +1812,9 @@ class ForgeAgent:
 
         try:
             next_step.is_speculative = True
+
+            if page := await browser_state.get_working_page():
+                await self.register_async_operations(organization, task, page)
 
             scraped_page, extract_action_prompt, use_caching, prompt_name = await self.build_and_record_step_prompt(
                 task,
@@ -1832,6 +1833,8 @@ class ForgeAgent:
                 task.llm_key,
                 default=app.LLM_API_HANDLER,
             )
+
+            self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
 
             llm_json_response = await llm_api_handler(
                 prompt=extract_action_prompt,
@@ -3284,7 +3287,7 @@ class ForgeAgent:
         analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
 
         # Add task completion tag to trace
-        TraceManager.add_task_completion_tag(task.status.value)
+        otel_trace.get_current_span().set_attribute("task.completion_status", task.status.value)
         if need_final_screenshot:
             # Take one last screenshot and create an artifact before closing the browser to see the final state
             # We don't need the artifacts and send the webhook response directly only when there is an issue with the browser
@@ -3394,7 +3397,7 @@ class ForgeAgent:
                 "Sending task response to webhook callback url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
-                payload=signed_data.signed_payload,
+                payload=signed_data.payload_for_log,
                 headers=signed_data.headers,
             )
 
@@ -3769,6 +3772,7 @@ class ForgeAgent:
 
         speculative_task = asyncio.create_task(
             self._speculate_next_step_plan(
+                organization=organization,
                 task=task,
                 current_step=step,
                 next_step=next_step,

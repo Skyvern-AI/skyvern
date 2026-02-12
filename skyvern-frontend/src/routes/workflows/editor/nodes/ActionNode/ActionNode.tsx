@@ -127,7 +127,6 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
               </div>
 
               <WorkflowBlockInputTextarea
-                canWriteTitle={true}
                 nodeId={id}
                 onChange={(value) => {
                   update({ url: value });

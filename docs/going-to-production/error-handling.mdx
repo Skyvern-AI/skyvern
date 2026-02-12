@@ -1,0 +1,694 @@
+---
+title: Error Handling
+subtitle: Build systems that detect, classify, and recover from failures
+slug: going-to-production/error-handling
+---
+
+Skyvern lets you make your workflows and tasks handle errors gracefully instead of failing silently.
+
+Every run returns a `status`. When it's not `completed`, you need to know what went wrong and respond programmatically. The flow is:
+
+1. **Check `status`** to detect failure states
+2. **Read `failure_reason`** to get the raw error description
+3. **Set up `error_code_mapping`** to map failures to your own error codes
+4. **Respond in code** to branch your logic based on the error code
+
+This page covers each step with exact field locations and full code examples.
+
+---
+
+## Step 1: Check `status`
+
+Every run transitions through these states:
+
+| Status | What it means |
+|--------|---------------|
+| `created` | Run initialized, not yet queued |
+| `queued` | Waiting for an available browser |
+| `running` | AI is navigating and executing |
+| `completed` | Success—check `output` for results |
+| `failed` | System error (browser crash, network failure, exception) |
+| `terminated` | AI determined the goal is unachievable (login blocked, page unavailable) |
+| `timed_out` | Exceeded `max_steps` or time limit |
+| `canceled` | Manually stopped |
+
+**Terminal states:** `completed`, `failed`, `terminated`, `timed_out`, `canceled`
+
+You can detect failures in two ways: 
+
+1. by polling `get_run`
+2. by checking the webhook payload
+
+Both contain the same `status` field.
+
+<CodeGroup>
+```json Polling Response
+{
+  "run_id": "tsk_v2_486305187432193504",
+  "status": "failed",  // <-- Check this field
+  "output": null,
+  "failure_reason": "Login failed: Invalid credentials",
+  ...
+}
+```
+
+```json Webhook Payload
+{
+  "run_id": "tsk_v2_486306851394503256",
+  "status": "completed",  // <-- Check this field
+  "output": {
+    "top_post_title": "Linux kernel framework for PCIe device emulation, in userspace"
+  },
+  "failure_reason": null,
+  "errors": [],
+  "webhook_callback_url": "https://your-server.com/webhook",
+  "created_at": "2026-01-20T11:58:57.414123",
+  "finished_at": "2026-01-20T12:00:31.512692",
+  ...
+}
+```
+</CodeGroup>
+
+The `status` field is at the top level of both responses.
+
+### For tasks
+
+Poll `get_run` until the status is terminal:
+
+<CodeGroup>
+```python Python
+run_id = result.run_id
+
+while True:
+    run = await client.get_run(run_id)
+
+    if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+        break
+
+    await asyncio.sleep(5)
+
+if run.status == "completed":
+    process_output(run.output)
+else:
+    handle_failure(run)
+```
+
+```typescript TypeScript
+const runId = result.run_id;
+
+while (true) {
+  const run = await client.getRun(runId);
+
+  if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
+    break;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+
+if (run.status === "completed") {
+  processOutput(run.output);
+} else {
+  handleFailure(run);
+}
+```
+
+```bash cURL
+# Poll until terminal state
+while true; do
+  RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY")
+
+  STATUS=$(echo $RESPONSE | jq -r '.status')
+
+  if [[ "$STATUS" == "completed" ]] || [[ "$STATUS" == "failed" ]] || \
+     [[ "$STATUS" == "terminated" ]] || [[ "$STATUS" == "timed_out" ]] || \
+     [[ "$STATUS" == "canceled" ]]; then
+    echo $RESPONSE | jq
+    break
+  fi
+
+  sleep 5
+done
+```
+</CodeGroup>
+
+### For workflows
+
+Same polling pattern works for workflow runs:
+
+<CodeGroup>
+```python Python
+run_id = result.run_id
+
+while True:
+    run = await client.get_run(run_id)
+
+    if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+        break
+
+    await asyncio.sleep(5)
+
+if run.status == "completed":
+    process_output(run.output)
+else:
+    handle_failure(run)
+```
+
+```typescript TypeScript
+const runId = result.run_id;
+
+while (true) {
+  const run = await client.getRun(runId);
+
+  if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
+    break;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+
+if (run.status === "completed") {
+  processOutput(run.output);
+} else {
+  handleFailure(run);
+}
+```
+
+```bash cURL
+# Poll workflow run until terminal state
+while true; do
+  RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/workflow_runs/$WORKFLOW_RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY")
+
+  STATUS=$(echo $RESPONSE | jq -r '.status')
+
+  if [[ "$STATUS" == "completed" ]] || [[ "$STATUS" == "failed" ]] || \
+     [[ "$STATUS" == "terminated" ]] || [[ "$STATUS" == "timed_out" ]] || \
+     [[ "$STATUS" == "canceled" ]]; then
+    echo $RESPONSE | jq
+    break
+  fi
+
+  sleep 5
+done
+```
+</CodeGroup>
+
+**`failed` vs `terminated`:** A `failed` run hit infrastructure problems—retry might work. A `terminated` run means the AI recognized the goal is unachievable with current conditions. Retrying without changes (new credentials, different URL) will produce the same result.
+
+---
+
+## Step 2: Read `failure_reason`
+
+When a run fails or terminates, the `failure_reason` field contains a description of what went wrong. This is a free-text string—useful for logging but hard to branch on programmatically.
+
+The field is available in both the polling response and webhook payload:
+
+```json
+{
+  "run_id": "tsk_v2_486305187432193504",
+  "status": "terminated",
+  "output": null,
+  "failure_reason": "Login failed: The page displayed 'Invalid username or password' after submitting credentials",  // <-- Raw error text
+  ...
+}
+```
+
+### For tasks
+
+<CodeGroup>
+```python Python
+run = await client.get_run(run_id)
+
+if run.status in ["failed", "terminated"]:
+    print(f"Run failed: {run.failure_reason}")
+
+    # Fragile: parsing free text
+    if "login" in run.failure_reason.lower():
+        refresh_credentials()
+```
+
+```typescript TypeScript
+const run = await client.getRun(runId);
+
+if (["failed", "terminated"].includes(run.status)) {
+  console.log(`Run failed: ${run.failure_reason}`);
+
+  // Fragile: parsing free text
+  if (run.failure_reason?.toLowerCase().includes("login")) {
+    refreshCredentials();
+  }
+}
+```
+
+```bash cURL
+RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
+  -H "x-api-key: $SKYVERN_API_KEY")
+
+STATUS=$(echo $RESPONSE | jq -r '.status')
+FAILURE_REASON=$(echo $RESPONSE | jq -r '.failure_reason')
+
+if [[ "$STATUS" == "failed" ]] || [[ "$STATUS" == "terminated" ]]; then
+  echo "Run failed: $FAILURE_REASON"
+
+  # Fragile: parsing free text
+  if echo "$FAILURE_REASON" | grep -qi "login"; then
+    # refresh_credentials
+    echo "Login error detected"
+  fi
+fi
+```
+</CodeGroup>
+
+### For workflows
+
+<CodeGroup>
+```python Python
+run = await client.get_run(workflow_run_id)
+
+if run.status in ["failed", "terminated"]:
+    print(f"Workflow failed: {run.failure_reason}")
+
+    # Fragile: parsing free text
+    if "login" in run.failure_reason.lower():
+        refresh_credentials()
+```
+
+```typescript TypeScript
+const run = await client.getRun(workflowRunId);
+
+if (["failed", "terminated"].includes(run.status)) {
+  console.log(`Workflow failed: ${run.failure_reason}`);
+
+  // Fragile: parsing free text
+  if (run.failure_reason?.toLowerCase().includes("login")) {
+    refreshCredentials();
+  }
+}
+```
+
+```bash cURL
+RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/workflow_runs/$WORKFLOW_RUN_ID" \
+  -H "x-api-key: $SKYVERN_API_KEY")
+
+STATUS=$(echo $RESPONSE | jq -r '.status')
+FAILURE_REASON=$(echo $RESPONSE | jq -r '.failure_reason')
+
+if [[ "$STATUS" == "failed" ]] || [[ "$STATUS" == "terminated" ]]; then
+  echo "Workflow failed: $FAILURE_REASON"
+
+  # Fragile: parsing free text
+  if echo "$FAILURE_REASON" | grep -qi "login"; then
+    # refresh_credentials
+    echo "Login error detected"
+  fi
+fi
+```
+</CodeGroup>
+
+---
+
+## Step 3: Use `error_code_mapping`
+
+`failure_reason` contains an AI-generated description of what went wrong. Define custom error codes to get consistent, actionable error messages. 
+
+When the run fails, Skyvern evaluates your natural language error descriptions against the page state and returns the matching code.
+
+**How it works:** The `error_code_mapping` values are LLM-evaluated descriptions—you don't need exact string matches. For example, `"The login credentials are incorrect"` will match pages showing "Invalid password", "Wrong username", "Authentication failed", etc.
+
+### In tasks
+
+Pass `error_code_mapping` as a parameter to `run_task`:
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Log in and download the invoice for January 2024",
+    url="https://vendor-portal.example.com",
+    error_code_mapping={
+        "login_failed": "The login credentials are incorrect, account is locked, or MFA is required",
+        "invoice_not_found": "No invoice exists for the requested date range",
+        "maintenance": "The website is down for maintenance or unavailable",
+        "access_denied": "User does not have permission to view invoices"
+    }
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Log in and download the invoice for January 2024",
+    url: "https://vendor-portal.example.com",
+    error_code_mapping: {
+      login_failed: "The login credentials are incorrect, account is locked, or MFA is required",
+      invoice_not_found: "No invoice exists for the requested date range",
+      maintenance: "The website is down for maintenance or unavailable",
+      access_denied: "User does not have permission to view invoices",
+    },
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Log in and download the invoice for January 2024",
+    "url": "https://vendor-portal.example.com",
+    "error_code_mapping": {
+      "login_failed": "The login credentials are incorrect, account is locked, or MFA is required",
+      "invoice_not_found": "No invoice exists for the requested date range",
+      "maintenance": "The website is down for maintenance or unavailable",
+      "access_denied": "User does not have permission to view invoices"
+    }
+  }'
+```
+</CodeGroup>
+
+### In workflows
+
+Add `error_code_mapping` to individual blocks (navigation, task, validation):
+
+<Note>
+The JSON examples below include comments (`//`) for clarity. Remove comments before using in actual workflow definitions—JSON does not support comments.
+</Note>
+
+<CodeGroup>
+```json JSON
+{
+  "blocks": [
+    {
+      "block_type": "navigation",
+      "label": "login_step",
+      "url": "https://vendor-portal.example.com/login",
+      "navigation_goal": "Log in using the stored credentials",
+      "error_code_mapping": {
+        "login_failed": "Login credentials are incorrect or account is locked",
+        "mfa_required": "Two-factor authentication is being requested",
+        "captcha_blocked": "CAPTCHA is displayed and cannot be bypassed"
+      }
+    },
+    {
+      "block_type": "navigation",
+      "label": "download_invoice",
+      "navigation_goal": "Download the invoice for {{invoice_date}}",
+      "error_code_mapping": {
+        "invoice_not_found": "No invoice found for the specified date",
+        "download_failed": "Invoice exists but download button is broken or missing"
+      }
+    }
+  ]
+}
+```
+
+```yaml YAML
+- block_type: navigation
+  label: login_step
+  url: "https://vendor-portal.example.com/login"
+  navigation_goal: "Log in using the stored credentials"
+  error_code_mapping:
+    login_failed: "Login credentials are incorrect or account is locked"
+    mfa_required: "Two-factor authentication is being requested"
+    captcha_blocked: "CAPTCHA is displayed and cannot be bypassed"
+
+- block_type: navigation
+  label: download_invoice
+  navigation_goal: "Download the invoice for {{invoice_date}}"
+  error_code_mapping:
+    invoice_not_found: "No invoice found for the specified date"
+    download_failed: "Invoice exists but download button is broken or missing"
+```
+</CodeGroup>
+
+### Where the error code appears
+
+When a mapped error occurs, your code appears in `output.error`. This field is available in both polling responses and webhook payloads:
+
+<CodeGroup>
+```json Polling Response
+{
+  "run_id": "tsk_v2_486305187432193504",
+  "status": "terminated",
+  "output": {
+    "error": "login_failed"  // <-- Your custom code
+  },
+  "failure_reason": "Login failed: The page displayed 'Invalid username or password'"
+}
+```
+
+```json Webhook Payload
+{
+  "run_id": "tsk_v2_486305187432193504",
+  "status": "terminated",
+  "output": {
+    "error": "login_failed"  // <-- Your custom code
+  },
+  "failure_reason": "Login failed: The page displayed 'Invalid username or password'",
+  "webhook_callback_url": "https://your-server.com/webhook",
+  "created_at": "2026-01-20T11:58:57.414123",
+  "finished_at": "2026-01-20T12:00:31.512692"
+}
+```
+</CodeGroup>
+
+Both `output.error` (your code) and `failure_reason` (raw text) are present. Use `output.error` for branching, `failure_reason` for logging.
+
+**Quick reference:** Where error codes appear
+
+| Context | Field | Example |
+|---------|-------|---------|
+| Polling response | `run.output.error` | `run.output.get("error")` in Python |
+| Webhook payload | `output.error` | Same structure as polling |
+| Successful run | `output` contains your extracted data | No `error` key present |
+
+---
+
+## Step 4: Respond in code
+
+Now you can write clean switch/match logic:
+
+<CodeGroup>
+```python Python
+import asyncio
+from skyvern import Skyvern
+
+client = Skyvern(api_key="your-api-key")
+
+async def run_with_error_handling(retries=1):
+    result = await client.run_task(
+        prompt="Log in and download the invoice",
+        url="https://vendor-portal.example.com",
+        error_code_mapping={
+            "login_failed": "Login credentials are incorrect or account is locked",
+            "invoice_not_found": "No invoice for the requested date",
+            "maintenance": "Site is down for maintenance"
+        }
+    )
+
+    run_id = result.run_id
+
+    # Poll until terminal state
+    while True:
+        run = await client.get_run(run_id)
+        if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+            break
+        await asyncio.sleep(5)
+
+    # Handle based on status and error code
+    if run.status == "completed":
+        return {"success": True, "data": run.output}
+
+    error_code = run.output.get("error") if run.output else None
+
+    if error_code == "login_failed":
+        if retries > 0:
+            await refresh_credentials("vendor-portal")
+            return await run_with_error_handling(retries=retries - 1)
+        return {"success": False, "reason": "login_failed", "details": "Retry limit reached"}
+
+    elif error_code == "invoice_not_found":
+        # Expected condition—no invoice for this period
+        return {"success": False, "reason": "no_invoice", "date": invoice_date}
+
+    elif error_code == "maintenance":
+        # Schedule retry for later
+        await schedule_retry(run_id, delay_minutes=60)
+        return {"success": False, "reason": "scheduled_retry"}
+
+    else:
+        # Unknown error—log and alert
+        log_error(run_id, run.failure_reason)
+        return {"success": False, "reason": "unknown", "details": run.failure_reason}
+```
+
+```typescript TypeScript
+async function runWithErrorHandling(retries = 1) {
+  const result = await client.runTask({
+    body: {
+      prompt: "Log in and download the invoice",
+      url: "https://vendor-portal.example.com",
+      error_code_mapping: {
+        login_failed: "Login credentials are incorrect or account is locked",
+        invoice_not_found: "No invoice for the requested date",
+        maintenance: "Site is down for maintenance",
+      },
+    },
+  });
+
+  const runId = result.run_id;
+
+  // Poll until terminal state
+  let run;
+  while (true) {
+    run = await client.getRun(runId);
+    if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+
+  // Handle based on status and error code
+  if (run.status === "completed") {
+    return { success: true, data: run.output };
+  }
+
+  const errorCode = run.output?.error;
+
+  switch (errorCode) {
+    case "login_failed":
+      if (retries > 0) {
+        await refreshCredentials("vendor-portal");
+        return runWithErrorHandling(retries - 1);
+      }
+      return { success: false, reason: "login_failed", details: "Retry limit reached" };
+
+    case "invoice_not_found":
+      return { success: false, reason: "no_invoice", date: invoiceDate };
+
+    case "maintenance":
+      await scheduleRetry(runId, { delayMinutes: 60 });
+      return { success: false, reason: "scheduled_retry" };
+
+    default:
+      logError(runId, run.failure_reason);
+      return { success: false, reason: "unknown", details: run.failure_reason };
+  }
+}
+```
+</CodeGroup>
+
+---
+
+## Validation blocks as assertions
+
+Validation blocks are assertions that check conditions at critical points—like unit test assertions. If validation fails, the workflow terminates immediately with your error code instead of continuing and failing later with a confusing error.
+
+Use validation blocks after steps where you need to confirm success before proceeding:
+
+<CodeGroup>
+```json JSON
+{
+  "blocks": [
+    {
+      // First, attempt to log in
+      "block_type": "navigation",
+      "label": "login",
+      "url": "https://vendor-portal.example.com/login",
+      "navigation_goal": "Log in using stored credentials"
+    },
+    {
+      // Then verify login succeeded before continuing
+      "block_type": "validation",
+      "label": "verify_login",
+      "complete_criterion": "Dashboard or account overview page is visible",
+      "terminate_criterion": "Login error message, CAPTCHA, or still on login page",
+      "error_code_mapping": {
+        "login_failed": "Login error message is displayed",
+        "captcha_required": "CAPTCHA verification is shown",
+        "session_expired": "Session timeout message appeared"
+      }
+    },
+    {
+      // Only runs if validation passed
+      "block_type": "navigation",
+      "label": "download_invoice",
+      "navigation_goal": "Navigate to invoices and download {{invoice_date}}",
+      "error_code_mapping": {
+        "invoice_not_found": "No invoice for the specified date"
+      }
+    }
+  ]
+}
+```
+
+```yaml YAML
+blocks:
+  # First, attempt to log in
+  - block_type: navigation
+    label: login
+    url: "https://vendor-portal.example.com/login"
+    navigation_goal: "Log in using stored credentials"
+
+  # Then verify login succeeded before continuing
+  - block_type: validation
+    label: verify_login
+    complete_criterion: "Dashboard or account overview page is visible"
+    terminate_criterion: "Login error message, CAPTCHA, or still on login page"
+    error_code_mapping:
+      login_failed: "Login error message is displayed"
+      captcha_required: "CAPTCHA verification is shown"
+      session_expired: "Session timeout message appeared"
+
+  # Only runs if validation passed
+  - block_type: navigation
+    label: download_invoice
+    navigation_goal: "Navigate to invoices and download {{invoice_date}}"
+    error_code_mapping:
+      invoice_not_found: "No invoice for the specified date"
+```
+</CodeGroup>
+
+| Parameter | Purpose |
+|-----------|---------|
+| `complete_criterion` | Condition that must be true to continue to the next block |
+| `terminate_criterion` | Condition that stops the workflow immediately |
+| `error_code_mapping` | Maps termination conditions to your error codes |
+
+If `verify_login` sees a login error, the workflow terminates with `output.error = "login_failed"`. Your Step 4 code handles it the same way as any other error code.
+
+---
+
+## Common error patterns
+
+| Error Code | Description | Typical Response |
+|------------|-------------|------------------|
+| `login_failed` | Credentials wrong, account locked, or MFA | Refresh credentials, retry |
+| `captcha_required` | CAPTCHA blocking automation | Use `human_interaction` block or browser profile |
+| `not_found` | Target data doesn't exist | Return empty result, don't retry |
+| `maintenance` | Site temporarily down | Schedule retry with backoff |
+| `rate_limited` | Too many requests | Add delays, use different proxy |
+| `access_denied` | Permission issue | Check account permissions |
+| `timeout` | Task took too long | Increase `max_steps`, simplify task |
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Reliability Tips"
+    icon="shield-check"
+    href="/going-to-production/reliability-tips"
+  >
+    Write prompts that fail less often
+  </Card>
+  <Card
+    title="Webhooks"
+    icon="webhook"
+    href="/going-to-production/webhooks"
+  >
+    Get notified when runs complete or fail
+  </Card>
+</CardGroup>

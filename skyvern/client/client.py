@@ -878,6 +878,90 @@ class Skyvern:
         _response = self._raw_client.get_run_timeline(run_id, request_options=request_options)
         return _response.data
 
+    def get_workflow(
+        self,
+        workflow_permanent_id: str,
+        *,
+        version: typing.Optional[int] = None,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        version : typing.Optional[int]
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow(
+            workflow_permanent_id="workflow_permanent_id",
+            version=1,
+            template=True,
+        )
+        """
+        _response = self._raw_client.get_workflow(
+            workflow_permanent_id, version=version, template=template, request_options=request_options
+        )
+        return _response.data
+
+    def get_workflow_versions(
+        self,
+        workflow_permanent_id: str,
+        *,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Workflow]:
+        """
+        Get all versions of a workflow by its permanent ID.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Workflow]
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow_versions(
+            workflow_permanent_id="workflow_permanent_id",
+            template=True,
+        )
+        """
+        _response = self._raw_client.get_workflow_versions(
+            workflow_permanent_id, template=template, request_options=request_options
+        )
+        return _response.data
+
     def upload_file(
         self, *, file: core.File, request_options: typing.Optional[RequestOptions] = None
     ) -> UploadFileResponse:
@@ -2993,6 +3077,106 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    async def get_workflow(
+        self,
+        workflow_permanent_id: str,
+        *,
+        version: typing.Optional[int] = None,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        version : typing.Optional[int]
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow(
+                workflow_permanent_id="workflow_permanent_id",
+                version=1,
+                template=True,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow(
+            workflow_permanent_id, version=version, template=template, request_options=request_options
+        )
+        return _response.data
+
+    async def get_workflow_versions(
+        self,
+        workflow_permanent_id: str,
+        *,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Workflow]:
+        """
+        Get all versions of a workflow by its permanent ID.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Workflow]
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow_versions(
+                workflow_permanent_id="workflow_permanent_id",
+                template=True,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow_versions(
+            workflow_permanent_id, template=template, request_options=request_options
+        )
         return _response.data
 
     async def upload_file(

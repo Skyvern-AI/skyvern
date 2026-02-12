@@ -18,6 +18,7 @@ from fastapi import (
 )
 from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse
+from opentelemetry import trace
 from pydantic import ValidationError
 
 from skyvern import analytics
@@ -117,7 +118,13 @@ from skyvern.schemas.runs import (
     WorkflowRunResponse,
 )
 from skyvern.schemas.webhooks import RetryRunWebhookRequest
-from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest, WorkflowRequest, WorkflowStatus
+from skyvern.schemas.workflows import (
+    BlockType,
+    WorkflowCreateYAMLRequest,
+    WorkflowRequest,
+    WorkflowStatus,
+    sanitize_workflow_yaml_with_references,
+)
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.services.pdf_import_service import pdf_import_service
 from skyvern.webeye.actions.actions import Action
@@ -214,6 +221,10 @@ async def run_task(
             request=request,
             background_tasks=background_tasks,
         )
+        if settings.OTEL_ENABLED:
+            span = trace.get_current_span()
+            if span and task_v1_response.task_id:
+                span.set_attribute("task_id", task_v1_response.task_id)
         run_type = RunType.task_v1
         if run_request.engine == RunEngine.openai_cua:
             run_type = RunType.openai_cua
@@ -273,6 +284,13 @@ async def run_task(
             raise HTTPException(
                 status_code=500, detail="Skyvern LLM failure to initialize task v2. Please try again later."
             )
+        if settings.OTEL_ENABLED:
+            span = trace.get_current_span()
+            if span:
+                if task_v2.observer_cruise_id:
+                    span.set_attribute("task_v2_id", task_v2.observer_cruise_id)
+                if task_v2.workflow_run_id:
+                    span.set_attribute("workflow_run_id", task_v2.workflow_run_id)
         await AsyncExecutorFactory.get_executor().execute_task_v2(
             request=request,
             background_tasks=background_tasks,
@@ -384,6 +402,14 @@ async def run_workflow(
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if settings.OTEL_ENABLED:
+        span = trace.get_current_span()
+        if span:
+            if workflow_run.workflow_run_id:
+                span.set_attribute("workflow_run_id", workflow_run.workflow_run_id)
+            if workflow_run.workflow_id:
+                span.set_attribute("workflow_id", workflow_run.workflow_id)
 
     # Hydrate workflow title from workflow_run.workflow_id
     workflow = await app.WORKFLOW_SERVICE.get_workflow(
@@ -516,6 +542,9 @@ async def create_workflow_legacy(
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
 
+    # Auto-sanitize block labels and update references for imports
+    workflow_yaml = sanitize_workflow_yaml_with_references(workflow_yaml)
+
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
         # Override folder_id if provided as query parameter
@@ -568,6 +597,8 @@ async def create_workflow(
     try:
         if data.yaml_definition:
             workflow_json_from_yaml = yaml.safe_load(data.yaml_definition)
+            # Auto-sanitize block labels and update references for imports
+            workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
             workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
         elif data.json_definition:
             workflow_definition = data.json_definition
@@ -973,6 +1004,8 @@ async def update_workflow(
     try:
         if data.yaml_definition:
             workflow_json_from_yaml = yaml.safe_load(data.yaml_definition)
+            # Auto-sanitize block labels and update references for imports
+            workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
             workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
         elif data.json_definition:
             workflow_definition = data.json_definition
@@ -1547,34 +1580,44 @@ async def run_block(
     # LOG.critical("REMOVING BROWSER SESSION ID")
     # block_run_request.browser_session_id = None
 
-    await block_service.validate_block_labels(
-        workflow_permanent_id=block_run_request.workflow_id,
-        organization_id=organization.organization_id,
-        block_labels=block_run_request.block_labels,
-    )
+    try:
+        await block_service.validate_block_labels(
+            workflow_permanent_id=block_run_request.workflow_id,
+            organization_id=organization.organization_id,
+            block_labels=block_run_request.block_labels,
+        )
 
-    workflow_run = await block_service.ensure_workflow_run(
-        organization=organization,
-        template=template,
-        workflow_permanent_id=block_run_request.workflow_id,
-        block_run_request=block_run_request,
-    )
+        workflow_run = await block_service.ensure_workflow_run(
+            organization=organization,
+            template=template,
+            workflow_permanent_id=block_run_request.workflow_id,
+            block_run_request=block_run_request,
+        )
 
-    browser_session_id = block_run_request.browser_session_id
+        browser_session_id = block_run_request.browser_session_id
 
-    await block_service.execute_blocks(
-        request=request,
-        background_tasks=background_tasks,
-        api_key=x_api_key or "",
-        block_labels=block_run_request.block_labels,
-        workflow_id=block_run_request.workflow_id,
-        workflow_run_id=workflow_run.workflow_run_id,
-        workflow_permanent_id=workflow_run.workflow_permanent_id,
-        organization=organization,
-        user_id=user_id,
-        browser_session_id=browser_session_id,
-        block_outputs=block_run_request.block_outputs,
-    )
+        await block_service.execute_blocks(
+            request=request,
+            background_tasks=background_tasks,
+            api_key=x_api_key or "",
+            block_labels=block_run_request.block_labels,
+            workflow_id=block_run_request.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id,
+            organization=organization,
+            user_id=user_id,
+            browser_session_id=browser_session_id,
+            block_outputs=block_run_request.block_outputs,
+        )
+    except SkyvernHTTPException:
+        raise
+    except Exception:
+        LOG.exception(
+            "Unexpected error running blocks",
+            workflow_id=block_run_request.workflow_id,
+            organization_id=organization.organization_id,
+        )
+        raise
 
     return BlockRunResponse(
         block_labels=block_run_request.block_labels,
@@ -1957,7 +2000,7 @@ async def get_runs(
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     search_key: str | None = Query(
         None,
-        description="Search runs by parameter key, parameter description, or run parameter value.",
+        description="Search runs by run ID, parameter key, parameter description, run parameter value, or extra HTTP headers.",
     ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-get")
@@ -2167,6 +2210,25 @@ async def run_workflow_legacy(
     )
 
 
+@base_router.get(
+    "/workflows/runs",
+    response_model=list[WorkflowRun],
+    tags=["Workflows"],
+    description=(
+        "List workflow runs across all workflows for the current organization. "
+        "Results are paginated and can be filtered by status, search key, and error code. "
+        "All filters are combined with AND logic."
+    ),
+    summary="List workflow runs",
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_workflow_runs",
+    },
+)
+@base_router.get(
+    "/workflows/runs/",
+    response_model=list[WorkflowRun],
+    include_in_schema=False,
+)
 @legacy_base_router.get(
     "/workflows/runs",
     response_model=list[WorkflowRun],
@@ -2181,17 +2243,44 @@ async def run_workflow_legacy(
     include_in_schema=False,
 )
 async def get_workflow_runs(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
-    status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    page: int = Query(1, ge=1, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
+    search_key: str | None = Query(
+        None,
+        max_length=500,
+        description="Search runs by run ID, parameter key, parameter description, run parameter value, or extra HTTP headers.",
+        examples=["login_url", "credential_value"],
+    ),
+    error_code: str | None = Query(
+        None,
+        max_length=500,
+        description="Filter runs by user-defined error code stored in task errors. "
+        "Matches against the error_code field in the task errors JSON array.",
+        examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
+    """
+    List workflow runs across all workflows for the current organization.
+
+    Results are paginated and can be filtered by status, search key, and error code.
+    All filters are combined with AND logic.
+
+    **Examples:**
+    - All failed runs: `?status=failed`
+    - Failed runs with a specific error: `?status=failed&error_code=INVALID_CREDENTIALS`
+    - Runs matching a parameter value: `?search_key=https://example.com`
+    - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
+    """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs(
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
         status=status,
+        search_key=search_key,
+        error_code=error_code,
     )
 
 
@@ -2215,12 +2304,29 @@ async def get_workflow_runs_by_id(
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     search_key: str | None = Query(
         None,
-        description="Search runs by parameter key, parameter description, or run parameter value.",
+        max_length=500,
+        description="Search runs by run ID, parameter key, parameter description, run parameter value, or extra HTTP headers.",
+    ),
+    error_code: str | None = Query(
+        None,
+        max_length=500,
+        description="Filter runs by user-defined error code stored in task errors. "
+        "Matches against the error_code field in the task errors JSON array.",
+        examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
     Get workflow runs for a specific workflow permanent id.
+
+    Supports filtering by status, parameter search, and error code. All filters
+    are combined with AND logic.
+
+    **Examples:**
+    - All failed runs: `?status=failed`
+    - Failed runs with a specific error: `?status=failed&error_code=INVALID_CREDENTIALS`
+    - Runs matching a parameter value: `?search_key=https://example.com`
+    - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
     """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
@@ -2230,6 +2336,7 @@ async def get_workflow_runs_by_id(
         page_size=page_size,
         status=status,
         search_key=search_key,
+        error_code=error_code,
     )
 
 
@@ -2499,12 +2606,18 @@ async def get_workflow_templates() -> list[Workflow]:
 @legacy_base_router.get(
     "/workflows/{workflow_permanent_id}",
     response_model=Workflow,
-    tags=["agent"],
+    include_in_schema=False,
+)
+@legacy_base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow, include_in_schema=False)
+@base_router.get(
+    "/workflows/{workflow_permanent_id}",
+    response_model=Workflow,
+    tags=["Workflows"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow",
     },
 )
-@legacy_base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow, include_in_schema=False)
+@base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow, include_in_schema=False)
 async def get_workflow(
     workflow_permanent_id: str,
     version: int | None = None,
@@ -2526,14 +2639,20 @@ async def get_workflow(
 @legacy_base_router.get(
     "/workflows/{workflow_permanent_id}/versions",
     response_model=list[Workflow],
-    tags=["agent"],
-    openapi_extra={
-        "x-fern-sdk-method-name": "get_workflow_versions",
-    },
+    include_in_schema=False,
 )
 @legacy_base_router.get(
     "/workflows/{workflow_permanent_id}/versions/", response_model=list[Workflow], include_in_schema=False
 )
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/versions",
+    response_model=list[Workflow],
+    tags=["Workflows"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_workflow_versions",
+    },
+)
+@base_router.get("/workflows/{workflow_permanent_id}/versions/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflow_versions(
     workflow_permanent_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
