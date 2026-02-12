@@ -35,6 +35,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 
+function getHostname(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
   username: "",
@@ -123,13 +131,13 @@ function CredentialsModal({
   const [testFailureReason, setTestFailureReason] = useState<string | null>(
     null,
   );
-  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Cleanup polling on unmount
   useEffect(() => {
     return () => {
       if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
+        clearTimeout(pollIntervalRef.current);
       }
     };
   }, []);
@@ -165,7 +173,7 @@ function CredentialsModal({
     setTestWorkflowRunId(null);
     setTestFailureReason(null);
     if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
+      clearTimeout(pollIntervalRef.current);
       pollIntervalRef.current = null;
     }
   }
@@ -180,29 +188,29 @@ function CredentialsModal({
         const data = response.data;
 
         if (data.status === "completed") {
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current);
-            pollIntervalRef.current = null;
-          }
+          pollIntervalRef.current = null;
           setTestStatus("completed");
           queryClient.invalidateQueries({ queryKey: ["credentials"] });
+          const profileHost = data.browser_profile_url
+            ? getHostname(data.browser_profile_url)
+            : null;
           toast({
             title: "Credential test passed",
             description: data.browser_profile_id
-              ? "Login successful! Browser profile saved."
+              ? profileHost
+                ? `Login successful! Browser profile saved for ${profileHost}`
+                : "Login successful! Browser profile saved."
               : "Login successful!",
             variant: "success",
           });
+          return;
         } else if (
           data.status === "failed" ||
           data.status === "terminated" ||
           data.status === "timed_out" ||
           data.status === "canceled"
         ) {
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current);
-            pollIntervalRef.current = null;
-          }
+          pollIntervalRef.current = null;
           setTestStatus("failed");
           setTestFailureReason(data.failure_reason ?? "Unknown error");
           toast({
@@ -211,10 +219,17 @@ function CredentialsModal({
               data.failure_reason ?? "The login test did not succeed",
             variant: "destructive",
           });
+          return;
         }
-        // If still running/queued/created, continue polling
+        // Still running — schedule next poll (no overlap possible)
+        pollIntervalRef.current = setTimeout(() => {
+          pollTestStatus(credentialId, workflowRunId);
+        }, 3000);
       } catch {
-        // Silently continue polling on network errors
+        // Network error — retry after delay
+        pollIntervalRef.current = setTimeout(() => {
+          pollTestStatus(credentialId, workflowRunId);
+        }, 3000);
       }
     },
     [credentialGetter, queryClient],
@@ -235,8 +250,8 @@ function CredentialsModal({
         setTestWorkflowRunId(data.workflow_run_id);
         setTestStatus("testing");
 
-        // Start polling every 3 seconds
-        pollIntervalRef.current = setInterval(() => {
+        // Start first poll after 3 seconds (subsequent polls scheduled by pollTestStatus)
+        pollIntervalRef.current = setTimeout(() => {
           pollTestStatus(data.credential_id, data.workflow_run_id);
         }, 3000);
       } catch (error) {

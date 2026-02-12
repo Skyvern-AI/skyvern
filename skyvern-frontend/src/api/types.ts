@@ -521,6 +521,7 @@ export type CredentialApiResponse = {
   credential_type: "password" | "credit_card" | "secret";
   name: string;
   browser_profile_id?: string | null;
+  browser_profile_url?: string | null;
 };
 
 export function isPasswordCredential(
@@ -638,4 +639,5 @@ export type TestCredentialStatusResponse = {
   status: "created" | "queued" | "running" | "completed" | "failed" | "timed_out" | "terminated" | "canceled";
   failure_reason?: string | null;
   browser_profile_id?: string | null;
+  browser_profile_url?: string | null;
 };

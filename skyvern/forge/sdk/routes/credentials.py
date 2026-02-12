@@ -761,6 +761,16 @@ DEFAULT_LOGIN_PROMPT = (
     response_model=TestCredentialResponse,
     include_in_schema=False,
 )
+@legacy_base_router.post(
+    "/credentials/{credential_id}/test",
+    response_model=TestCredentialResponse,
+    include_in_schema=False,
+)
+@legacy_base_router.post(
+    "/credentials/{credential_id}/test/",
+    response_model=TestCredentialResponse,
+    include_in_schema=False,
+)
 async def test_credential(
     background_tasks: BackgroundTasks,
     credential_id: str = Path(
@@ -899,6 +909,16 @@ async def test_credential(
     response_model=TestCredentialStatusResponse,
     include_in_schema=False,
 )
+@legacy_base_router.get(
+    "/credentials/{credential_id}/test/{workflow_run_id}",
+    response_model=TestCredentialStatusResponse,
+    include_in_schema=False,
+)
+@legacy_base_router.get(
+    "/credentials/{credential_id}/test/{workflow_run_id}/",
+    response_model=TestCredentialStatusResponse,
+    include_in_schema=False,
+)
 async def get_test_credential_status(
     credential_id: str = Path(
         ...,
@@ -930,6 +950,7 @@ async def get_test_credential_status(
 
     status = str(workflow_run.status)
     browser_profile_id = credential.browser_profile_id
+    browser_profile_url = credential.browser_profile_url
 
     # If completed successfully and no browser profile yet, try to create one
     if status == "completed" and not browser_profile_id:
@@ -975,13 +996,22 @@ async def get_test_credential_status(
                         directory=session_dir,
                     )
 
+                    # Extract URL from the workflow's login block
+                    login_url = None
+                    if workflow.workflow_definition:
+                        blocks = workflow.workflow_definition.get("blocks", [])
+                        if blocks and "url" in blocks[0]:
+                            login_url = blocks[0]["url"]
+
                     # Link browser profile to credential
                     await app.DATABASE.update_credential(
                         credential_id=credential_id,
                         organization_id=organization_id,
                         browser_profile_id=profile.browser_profile_id,
+                        browser_profile_url=login_url,
                     )
                     browser_profile_id = profile.browser_profile_id
+                    browser_profile_url = login_url
 
                     LOG.info(
                         "Browser profile created from credential test",
@@ -1010,6 +1040,7 @@ async def get_test_credential_status(
         status=status,
         failure_reason=workflow_run.failure_reason,
         browser_profile_id=browser_profile_id,
+        browser_profile_url=browser_profile_url,
     )
 
 
@@ -1040,6 +1071,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             browser_profile_id=credential.browser_profile_id,
+            browser_profile_url=credential.browser_profile_url,
         )
     elif credential.credential_type == CredentialType.CREDIT_CARD:
         credential_response = CreditCardCredentialResponse(
@@ -1052,6 +1084,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             browser_profile_id=credential.browser_profile_id,
+            browser_profile_url=credential.browser_profile_url,
         )
     elif credential.credential_type == CredentialType.SECRET:
         credential_response = SecretCredentialResponse(secret_label=credential.secret_label)
@@ -1061,6 +1094,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             browser_profile_id=credential.browser_profile_id,
+            browser_profile_url=credential.browser_profile_url,
         )
     else:
         raise HTTPException(status_code=400, detail="Credential type not supported")

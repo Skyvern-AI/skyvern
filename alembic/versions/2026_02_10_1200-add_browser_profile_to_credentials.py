@@ -21,7 +21,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     op.add_column("credentials", sa.Column("browser_profile_id", sa.String(), nullable=True))
+    op.add_column("credentials", sa.Column("browser_profile_url", sa.String(), nullable=True))
 
 
 def downgrade() -> None:
+    op.drop_column("credentials", "browser_profile_url")
     op.drop_column("credentials", "browser_profile_id")

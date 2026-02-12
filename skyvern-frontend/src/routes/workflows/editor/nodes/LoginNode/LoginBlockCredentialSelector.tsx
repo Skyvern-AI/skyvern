@@ -118,6 +118,7 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
     value: credential.credential_id,
     type: "credential" as const,
     hasBrowserProfile: !!credential.browser_profile_id,
+    browserProfileUrl: credential.browser_profile_url ?? null,
   }));
 
   // Only show non-Skyvern credential parameters (Bitwarden, 1Password, Azure Vault)
@@ -251,7 +252,7 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
               <div className="flex items-center gap-2">
                 <span>{option.label}</span>
                 {"hasBrowserProfile" in option && option.hasBrowserProfile && (
-                  <span title="Browser profile saved">
+                  <span title={option.browserProfileUrl ? `Browser profile saved for ${option.browserProfileUrl}` : "Browser profile saved"}>
                     <CheckCircledIcon className="size-3 text-green-400" />
                   </span>
                 )}

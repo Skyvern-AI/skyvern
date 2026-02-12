@@ -7,6 +7,14 @@ import {
 import { DeleteCredentialButton } from "./DeleteCredentialButton";
 import { CheckCircledIcon } from "@radix-ui/react-icons";
 
+function getHostname(url: string): string | null {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
+
 type Props = {
   credential: CredentialApiResponse;
 };
@@ -100,7 +108,11 @@ function CredentialItem({ credential }: Props) {
         {credential.browser_profile_id && (
           <div className="flex items-center gap-1 text-xs text-green-400">
             <CheckCircledIcon className="size-3" />
-            <span>Browser profile saved</span>
+            <span>
+              {credential.browser_profile_url
+                ? `Browser profile saved for ${getHostname(credential.browser_profile_url) ?? credential.browser_profile_url}`
+                : "Browser profile saved"}
+            </span>
           </div>
         )}
       </div>
