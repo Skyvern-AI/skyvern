@@ -264,6 +264,14 @@ class RealBrowserManager(BrowserManager):
             if path and os.path.exists(path=path):
                 with open(path, "rb") as f:
                     browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+            else:
+                LOG.debug(
+                    "Video path not found",
+                    task_id=task_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    video_path=path,
+                )
 
         return browser_state.browser_artifacts.video_artifacts
 
