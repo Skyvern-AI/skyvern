@@ -117,6 +117,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     ExtractAction,
     GotoUrlAction,
+    KeypressAction,
     ReloadPageAction,
     TerminateAction,
     WebAction,
@@ -1284,6 +1285,16 @@ class ForgeAgent:
                         "totp_secret": totp_secret,
                         "is_retry": step.retry_index > 0,
                     }
+
+                # Tell the handler to skip the auto-completion Tab hack when the
+                # next batched action would be broken by a focus change — e.g. a
+                # KEYPRESS Enter or another action on the same element.
+                if action.action_type == ActionType.INPUT_TEXT and action_idx + 1 < len(action_linked_list):
+                    next_action = action_linked_list[action_idx + 1].action
+                    if isinstance(next_action, KeypressAction) or (
+                        isinstance(next_action, WebAction) and next_action.element_id == action.element_id
+                    ):
+                        action.skip_auto_complete_tab = True
 
                 results = await ActionHandler.handle_action(
                     scraped_page=scraped_page,
