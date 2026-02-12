@@ -1,0 +1,112 @@
+---
+title: n8n
+subtitle: Run browser automations in your n8n workflows
+slug: integrations/n8n
+---
+
+Connect Skyvern to n8n's open-source automation platform. Trigger browser automations from any workflow, or pipe Skyvern's results into downstream nodes.
+
+## Available Operations
+
+- **Task → Dispatch a Task** — Run a browser automation with a prompt
+- **Task → Get a Task** — Retrieve results from a previously run task
+- **Workflow → Dispatch a Workflow Run** — Run a pre-built Skyvern workflow with parameters
+- **Workflow → Get a Workflow Run** — Retrieve results from a previously run workflow
+
+## Setup
+
+<Steps>
+  <Step title="Install the Skyvern node">
+    Create a new workflow or edit an existing one, click **+**, search for "Skyvern", and click *Install* → *Add to workflow*.
+
+    <Frame>
+      <video
+        autoPlay
+        muted
+        loop
+        playsInline
+        className="w-full aspect-video rounded-xl"
+        src="/images/n8n/n8n1.mp4"
+      ></video>
+    </Frame>
+  </Step>
+
+  <Step title="Connect your account">
+    Click *Select credential* → "Create new credential" and paste your API key from [Settings](https://app.skyvern.com/settings/api-keys).
+  </Step>
+
+  <Step title="Configure">
+    Fill in the fields for your chosen operation. See the field reference below.
+  </Step>
+
+  <Step title="Test">
+    Run the workflow and monitor progress in your [Skyvern dashboard](https://app.skyvern.com).
+  </Step>
+</Steps>
+
+## Field reference
+
+### Dispatch a Task
+
+<Frame>
+  <img src="/images/n8n/n8n2.png" alt="Configure Dispatch a Task fields in n8n" />
+</Frame>
+
+- **User Prompt** (required) — What Skyvern should do
+- **URL** — The starting page. If omitted, Skyvern navigates based on the prompt.
+- **Webhook Callback URL** — URL to notify when the task finishes
+
+Under **Task Options**:
+
+- **Engine** — Defaults to **Skyvern 2.0**.
+  - **Skyvern 1.0** — Simple, single-step tasks
+  - **Skyvern 2.0** — Complex, multi-step goals with dynamic planning
+  - **OpenAI CUA** / **Anthropic CUA** — Third-party computer-use agents
+
+### Dispatch a Workflow Run
+
+<Frame>
+  <img src="/images/n8n/n8n3.png" alt="Configure Dispatch a Workflow Run fields in n8n" />
+</Frame>
+
+First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
+
+- **Workflow Name or ID** (required) — Select from the dropdown or specify an ID with an expression
+- **Workflow Run Parameters** — Loaded dynamically from the selected workflow
+- **Webhook Callback URL** — URL to notify when the workflow finishes
+
+### Get a Task
+
+<Frame>
+  <img src="/images/n8n/n8n5.png" alt="Enter Task ID field in n8n" />
+</Frame>
+
+- **Task ID** (required) — The ID of the task run
+
+### Get a Workflow Run
+
+<Frame>
+  <img src="/images/n8n/n8n4.png" alt="Enter Workflow Run ID field in n8n" />
+</Frame>
+
+- **Workflow Name or ID** (required) — Select the workflow from the dropdown
+- **Workflow Run ID** (required) — Starts with `wr_`
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Build Workflows"
+    icon="diagram-project"
+    href="/cloud/manage-workflows"
+  >
+    Create reusable multi-step automations in Skyvern
+  </Card>
+  <Card
+    title="Use Webhooks"
+    icon="webhook"
+    href="/going-to-production/webhooks"
+  >
+    Get notified when tasks complete
+  </Card>
+</CardGroup>

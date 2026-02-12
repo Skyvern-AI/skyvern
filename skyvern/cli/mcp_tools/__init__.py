@@ -71,11 +71,12 @@ mcp = FastMCP(
 Split into separate blocks — one per logical step. Each block should have a prompt of 2-3 sentences.
 
 ## Critical Rules
-1. ALWAYS create a session (skyvern_session_create) before using browser tools.
-2. NEVER scrape by guessing API endpoints or writing HTTP requests — use skyvern_navigate + skyvern_extract.
-3. NEVER create single-block workflows with long prompts — split into multiple blocks.
-4. NEVER import from skyvern.cli.mcp_tools — use `from skyvern import Skyvern` for SDK scripts.
-5. After page-changing actions (skyvern_click, skyvern_act), use skyvern_screenshot to verify the result.
+1. ALWAYS use MCP tools directly — do NOT write Python scripts unless the user explicitly asks for a script. The tools ARE the interface.
+2. Create a session (skyvern_session_create) before using browser tools (navigate, click, extract, etc.). Workflow and block tools do NOT need a session.
+3. NEVER scrape by guessing API endpoints or writing HTTP requests — use skyvern_navigate + skyvern_extract.
+4. NEVER create single-block workflows with long prompts — split into multiple blocks.
+5. NEVER import from skyvern.cli.mcp_tools — use `from skyvern import Skyvern` for SDK scripts.
+6. After page-changing actions (skyvern_click, skyvern_act), use skyvern_screenshot to verify the result.
 
 ## Cross-Tool Dependencies
 - Workflow tools (list, create, run, status) do NOT need a browser session
@@ -110,7 +111,8 @@ support three modes. When unsure, use `intent`. For multiple actions in sequence
 | "Create a workflow that monitors prices" | skyvern_workflow_create |
 | "Run the login workflow" | skyvern_workflow_run |
 | "Is my workflow done?" | skyvern_workflow_status |
-| "Write a script to do this" | Skyvern SDK (see below) |
+| "Automate this process" | skyvern_workflow_create (always prefer MCP tools over scripts) |
+| "Write a Python script to do this" | Skyvern SDK (ONLY when user explicitly asks for a script) |
 
 ## Getting Started
 
@@ -120,7 +122,7 @@ support three modes. When unsure, use `intent`. For multiple actions in sequence
 3. Close with skyvern_session_close when done
 
 **Automating a multi-page form** (the most common use case):
-1. Create a workflow with skyvern_workflow_create — one task block per form page
+1. Create a workflow with skyvern_workflow_create — one navigation/extraction block per form page
 2. Each block gets a short, focused prompt (2-3 sentences max)
 3. All blocks in a run share the same browser automatically
 4. Run with skyvern_workflow_run
@@ -139,13 +141,15 @@ skyvern_workflow_list, skyvern_workflow_run, skyvern_workflow_status, etc.
 Before creating a workflow, call skyvern_block_schema() to discover available block types and their JSON schemas.
 Validate blocks with skyvern_block_validate() before submitting.
 
-ALWAYS split workflows into multiple blocks — one task block per logical step:
+ALWAYS split workflows into multiple blocks — one block per logical step.
+Use **navigation** blocks for actions (filling forms, clicking buttons) and **extraction** blocks for pulling data.
+Do NOT use the deprecated "task" block type — use "navigation" or "extraction" instead.
 
 GOOD (4 blocks, each with clear single responsibility):
-  Block 1: "Select Sole Proprietor and click Continue"
-  Block 2: "Fill in the business name and click Continue"
-  Block 3: "Enter owner info and SSN, click Continue"
-  Block 4: "Review and submit. Extract the confirmation number."
+  Block 1 (navigation): "Select Sole Proprietor and click Continue"
+  Block 2 (navigation): "Fill in the business name and click Continue"
+  Block 3 (navigation): "Enter owner info and SSN, click Continue"
+  Block 4 (extraction): "Extract the confirmation number from the results page"
 
 BAD (1 giant block trying to do everything):
   Block 1: "Go to the IRS site, select sole proprietor, fill in name, enter SSN, review, submit, and extract the EIN"
@@ -159,21 +163,23 @@ Use {{parameter_key}} to reference workflow input parameters in any block field.
 
 ## Block Types Reference
 Common block types for workflow definitions:
-- **task** — AI agent interacts with a page (the most common block type)
+- **navigation** — take actions on a page: fill forms, click buttons, navigate multi-step flows (most common)
+- **extraction** — extract structured data from the current page
+- **task_v2** — complex tasks via natural language prompt (handles both actions and extraction)
 - **for_loop** — iterate over a list of items
 - **conditional** — branch based on conditions
 - **code** — run Python code for data transformation
 - **text_prompt** — LLM text generation (no browser)
-- **extraction** — extract data from current page
-- **action** — single AI action on current page
-- **navigation** — navigate to a URL
+- **action** — single focused action on the current page
+- **goto_url** — navigate directly to a URL
 - **wait** — pause for a condition or time
 - **login** — log into a site using stored credentials
 - **validation** — assert a condition on the page
 - **http_request** — call an external API
 - **send_email** — send a notification email
 - **file_download** / **file_upload** — download or upload files
-- **goto_url** — navigate to a specific URL within a workflow
+
+IMPORTANT: Do NOT use "task" block type — it is deprecated. Use "navigation" for actions and "extraction" for data extraction.
 
 For full schemas and descriptions, call skyvern_block_schema().
 

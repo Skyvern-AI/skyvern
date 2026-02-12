@@ -83,15 +83,14 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
 # ---------------------------------------------------------------------------
 
 BLOCK_SUMMARIES: dict[str, str] = {
-    "task": "AI agent navigates a page, fills forms, clicks buttons (v1 engine)",
-    "task_v2": "AI agent with natural language prompt (v2 engine, recommended for complex tasks)",
+    "navigation": "Take actions on a page: fill forms, click buttons, navigate multi-step flows (most common)",
+    "extraction": "Extract structured data from the current page",
+    "task_v2": "Complex tasks via natural language prompt — handles both actions and extraction",
     "for_loop": "Iterate over a list, executing nested blocks for each item",
     "conditional": "Branch based on Jinja2 expressions or AI prompts",
     "code": "Run Python code for data transformation",
     "text_prompt": "LLM text generation without a browser",
-    "extraction": "Extract structured data from the current page",
     "action": "Perform a single focused action on the current page",
-    "navigation": "Navigate to a goal on the current page (Browser Task in UI)",
     "login": "Handle authentication flows including username/password and TOTP/2FA",
     "wait": "Pause workflow execution for a specified duration",
     "validation": "Validate page state with complete/terminate criteria",
@@ -113,13 +112,31 @@ BLOCK_SUMMARIES: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
-    "task": {
-        "block_type": "task",
-        "label": "fill_form",
-        "url": "https://example.com/form",
-        "navigation_goal": "Fill out the form with the provided data and click Submit",
-        "parameter_keys": ["form_data"],
+    "navigation": {
+        "block_type": "navigation",
+        "label": "search_and_open",
+        "url": "https://example.com/search",
+        "title": "Search and Open Result",
+        "navigation_goal": "Search for {{ query }} and click the first result",
+        "parameter_keys": ["query"],
         "max_retries": 2,
+    },
+    "extraction": {
+        "block_type": "extraction",
+        "label": "extract_products",
+        "title": "Extract Product List",
+        "data_extraction_goal": "Extract all products with name, price, and stock status",
+        "data_schema": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "price": {"type": "number"},
+                    "in_stock": {"type": "boolean"},
+                },
+            },
+        },
     },
     "task_v2": {
         "block_type": "task_v2",
@@ -153,30 +170,6 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
             },
             {"is_default": True, "next_block_label": "handle_inactive"},
         ],
-    },
-    "extraction": {
-        "block_type": "extraction",
-        "label": "extract_products",
-        "data_extraction_goal": "Extract all products with name, price, and stock status",
-        "data_schema": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "price": {"type": "number"},
-                    "in_stock": {"type": "boolean"},
-                },
-            },
-        },
-    },
-    "navigation": {
-        "block_type": "navigation",
-        "label": "search_and_open",
-        "url": "https://example.com/search",
-        "navigation_goal": "Search for {{ query }} and click the first result",
-        "parameter_keys": ["query"],
-        "max_retries": 2,
     },
     "login": {
         "block_type": "login",
@@ -304,7 +297,7 @@ async def skyvern_block_schema(
     block_type: Annotated[
         str | None,
         Field(
-            description="Block type to get schema for (e.g., 'task_v2', 'for_loop'). Omit to list all available types."
+            description="Block type to get schema for (e.g., 'navigation', 'extraction', 'task_v2'). Omit to list all available types."
         ),
     ] = None,
 ) -> dict[str, Any]:
@@ -324,11 +317,16 @@ async def skyvern_block_schema(
             data={
                 "block_types": BLOCK_SUMMARIES,
                 "count": len(BLOCK_SUMMARIES),
-                "hint": "Call skyvern_block_schema(block_type='task_v2') for the full schema of a specific type",
+                "hint": "Call skyvern_block_schema(block_type='navigation') for the full schema of a specific type",
             },
         )
 
     normalized = block_type.strip().lower()
+
+    task_redirect = normalized == "task"
+    if task_redirect:
+        normalized = "navigation"
+
     cls = BLOCK_TYPE_MAP.get(normalized)
     if cls is None:
         return make_result(
@@ -337,12 +335,20 @@ async def skyvern_block_schema(
             error=make_error(
                 ErrorCode.INVALID_INPUT,
                 f"Unknown block type: {block_type!r}",
-                f"Available types: {', '.join(sorted(BLOCK_TYPE_MAP.keys()))}",
+                f"Available types: {', '.join(sorted(BLOCK_SUMMARIES.keys()))}. Note: 'task' is also accepted (deprecated alias for 'navigation')",
             ),
         )
 
     kb = _parse_knowledge_base()
     kb_entry = kb.get(normalized, {})
+
+    warnings = (
+        [
+            "'task' is deprecated. Showing 'navigation' schema instead. Use 'navigation' for actions (requires navigation_goal) and 'extraction' for data extraction (requires data_extraction_goal + data_schema)."
+        ]
+        if task_redirect
+        else []
+    )
 
     return make_result(
         action,
@@ -354,6 +360,7 @@ async def skyvern_block_schema(
             "schema": cls.model_json_schema(),
             "example": BLOCK_EXAMPLES.get(normalized),
         },
+        warnings=warnings,
     )
 
 
@@ -418,6 +425,11 @@ async def skyvern_block_validate(
     adapter = _get_block_adapter()
     try:
         block = adapter.validate_python(raw)
+        warnings = []
+        if block.block_type == "task":
+            warnings.append(
+                "'task' block type is deprecated. Use 'navigation' for actions and 'extraction' for data extraction."
+            )
         return make_result(
             action,
             data={
@@ -426,6 +438,7 @@ async def skyvern_block_validate(
                 "label": block.label,
                 "field_count": len([f for f in block.model_fields_set if f != "block_type"]),
             },
+            warnings=warnings,
         )
     except ValidationError as exc:
         errors = []
@@ -439,6 +452,6 @@ async def skyvern_block_validate(
                 ErrorCode.INVALID_INPUT,
                 f"Block validation failed ({len(exc.errors())} error{'s' if len(exc.errors()) != 1 else ''}): "
                 + "; ".join(errors[:5]),
-                "Fix the fields listed above. Call skyvern_block_schema(block_type='...') to see the correct schema.",
+                "Fix the fields listed above. Call skyvern_block_schema(block_type='navigation') to see the correct schema. Use 'navigation' for actions and 'extraction' for data extraction — do NOT use the deprecated 'task' type.",
             ),
         )
