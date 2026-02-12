@@ -78,11 +78,12 @@ IMPORTANT RULES:
 * Always generate valid YAML that conforms to the Skyvern workflow schema
 * Preserve existing blocks unless the user explicitly asks to modify or remove them
 * Use appropriate block types based on the user's intent:
-   - Use "task_v2" blocks for complex, multi-step workflows (may be slightly slower)
-   - Use "task" blocks for combined navigation and extraction (faster, but less flexible)
-   - Use "goto_url" blocks for pure navigation without data extraction
-   - Use "extraction" blocks for data extraction from the current page
+   - Use "navigation" blocks for actions: filling forms, clicking buttons, navigating flows (most common)
+   - Use "extraction" blocks for extracting structured data from the current page
+   - Use "task_v2" blocks for complex tasks requiring deep thinking and natural language prompts
+   - Use "goto_url" blocks for navigating directly to a URL without additional instructions
    - Use "login" blocks for authentication flows
+   - Do NOT use "task" blocks — they are deprecated. Use "navigation" instead.
 * Include all required fields for each block type (label, next_block_label, block_type, etc.)
 * Use descriptive, unique labels for blocks (snake_case format)
 * Reference parameters using Jinja2 syntax: {% raw %}{{ parameters.param_key }}{% endraw %}
