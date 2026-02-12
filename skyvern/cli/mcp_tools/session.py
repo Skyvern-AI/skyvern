@@ -22,7 +22,7 @@ async def skyvern_session_create(
     local: Annotated[bool, Field(description="Launch local browser instead of cloud")] = False,
     headless: Annotated[bool, Field(description="Run local browser in headless mode")] = False,
 ) -> dict[str, Any]:
-    """Create a new browser session to start interacting with websites. Creates a cloud browser by default.
+    """Create a new browser session to start interacting with websites. Creates a cloud-hosted browser by default with geographic proxy support. This must be called before using any browser tools (navigate, click, extract, etc.).
 
     Use local=true for a local Chromium instance.
     The session persists across tool calls until explicitly closed.
