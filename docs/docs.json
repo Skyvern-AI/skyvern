@@ -110,6 +110,25 @@
         ]
       },
       {
+        "tab": "Python SDK",
+        "groups": [
+          {
+            "group": "Python SDK",
+            "pages": [
+              "sdk-reference/overview",
+              "sdk-reference/tasks",
+              "sdk-reference/workflows",
+              "sdk-reference/browser-sessions",
+              "sdk-reference/browser-profiles",
+              "sdk-reference/credentials",
+              "sdk-reference/helpers",
+              "sdk-reference/error-handling",
+              "sdk-reference/complete-reference"
+            ]
+          }
+        ]
+      },
+      {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
       }

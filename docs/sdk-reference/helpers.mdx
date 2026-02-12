@@ -1,0 +1,159 @@
+---
+title: Helper Methods
+subtitle: High-level methods for common automation patterns
+slug: sdk-reference/helpers
+---
+
+These methods wrap common multi-step patterns into single API calls. Under the hood, they create and run specialized workflows.
+
+---
+
+## `login`
+
+Automate logging into a website using stored credentials. This creates a login workflow, executes it, and optionally waits for completion.
+
+```python
+from skyvern.schemas.run_blocks import CredentialType
+
+result = await client.login(
+    credential_type=CredentialType.skyvern,
+    credential_id="cred_abc123",
+    url="https://app.example.com/login",
+    wait_for_completion=True,
+)
+print(result.status)
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `credential_type` | `CredentialType` | Yes | — | How credentials are stored. Options: `skyvern`, `bitwarden`, `onepassword`, `azure_vault`. |
+| `url` | `str` | No | `None` | The login page URL. |
+| `credential_id` | `str` | No | `None` | The Skyvern credential ID (when using `CredentialType.skyvern`). |
+| `prompt` | `str` | No | `None` | Additional instructions for the AI during login. |
+| `browser_session_id` | `str` | No | `None` | Run login inside an existing browser session. |
+| `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address. |
+| `proxy_location` | `ProxyLocation` | No | `None` | Route browser traffic through a geographic proxy. |
+| `webhook_url` | `str` | No | `None` | URL to receive a POST when the login finishes. |
+| `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
+| `totp_url` | `str` | No | `None` | URL to receive TOTP codes. |
+| `wait_for_completion` | `bool` | No | `False` | Block until the login finishes. |
+| `timeout` | `float` | No | `1800` | Max wait time in seconds. |
+| `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers. |
+| `max_screenshot_scrolling_times` | `int` | No | `None` | Number of screenshot scrolls. |
+
+**Bitwarden-specific parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `bitwarden_collection_id` | `str` | Bitwarden collection ID. |
+| `bitwarden_item_id` | `str` | Bitwarden item ID. |
+
+**1Password-specific parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `onepassword_vault_id` | `str` | 1Password vault ID. |
+| `onepassword_item_id` | `str` | 1Password item ID. |
+
+**Azure Key Vault-specific parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `azure_vault_name` | `str` | Azure Key Vault name. |
+| `azure_vault_username_key` | `str` | Secret name for the username. |
+| `azure_vault_password_key` | `str` | Secret name for the password. |
+| `azure_vault_totp_secret_key` | `str` | Secret name for the TOTP secret. |
+
+### Returns `WorkflowRunResponse`
+
+### Example: Login then extract data
+
+```python
+from skyvern.schemas.run_blocks import CredentialType
+
+session = await client.create_browser_session()
+
+# Login
+await client.login(
+    credential_type=CredentialType.skyvern,
+    credential_id="cred_abc123",
+    url="https://app.example.com/login",
+    browser_session_id=session.browser_session_id,
+    wait_for_completion=True,
+)
+
+# Now extract data from the authenticated session
+result = await client.run_task(
+    prompt="Go to the billing page and extract all invoices",
+    browser_session_id=session.browser_session_id,
+    wait_for_completion=True,
+)
+print(result.output)
+```
+
+---
+
+## `download_files`
+
+Navigate to a page and download files. Unlike `run_task` and `run_workflow`, this method does **not** support `wait_for_completion` — it returns immediately with a `run_id`. Poll with `get_run()` or use a webhook to know when the download finishes.
+
+```python
+result = await client.download_files(
+    navigation_goal="Download the latest monthly report PDF",
+    url="https://app.example.com/reports",
+)
+
+# Poll for completion
+import asyncio
+while True:
+    run = await client.get_run(result.run_id)
+    if run.status in ("completed", "failed", "terminated", "timed_out", "canceled"):
+        break
+    await asyncio.sleep(5)
+
+for f in run.downloaded_files:
+    print(f.name)
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `navigation_goal` | `str` | Yes | — | Natural language description of what to download. |
+| `url` | `str` | No | `None` | Starting page URL. |
+| `browser_session_id` | `str` | No | `None` | Run inside an existing browser session. |
+| `browser_profile_id` | `str` | No | `None` | Load a browser profile. |
+| `proxy_location` | `ProxyLocation` | No | `None` | Route through a geographic proxy. |
+| `webhook_url` | `str` | No | `None` | URL to receive a POST when the download finishes. |
+| `download_suffix` | `str` | No | `None` | Expected file extension to wait for (e.g., `".pdf"`). |
+| `download_timeout` | `float` | No | `None` | Max time to wait for the download in seconds. |
+| `max_steps_per_run` | `int` | No | `None` | Cap AI steps. |
+| `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers. |
+
+### Returns `WorkflowRunResponse`
+
+The `downloaded_files` field contains the list of files that were downloaded.
+
+---
+
+## `upload_file`
+
+Upload a file to Skyvern's storage. Returns a presigned URL and S3 URI you can reference in tasks and workflows.
+
+```python
+with open("data.csv", "rb") as f:
+    upload = await client.upload_file(file=f)
+    print(upload.s3uri)          # s3://skyvern-uploads/...
+    print(upload.presigned_url)  # https://...signed download URL
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file` | `File` | Yes | The file to upload. Accepts file objects, byte streams, or paths. |
+| `file_storage_type` | `FileStorageType` | No | Storage backend type. |
+
+### Returns `UploadFileResponse`

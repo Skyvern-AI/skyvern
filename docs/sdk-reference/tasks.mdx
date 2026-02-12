@@ -1,0 +1,297 @@
+---
+title: Tasks
+subtitle: Run single browser automations with natural language
+slug: sdk-reference/tasks
+---
+
+A task is a single browser automation. You describe what you want in natural language — Skyvern opens a browser, navigates to the URL, and executes the instructions with AI.
+
+For when to use tasks vs workflows, see [Run a Task](/running-automations/run-a-task).
+
+---
+
+## `run_task`
+
+Start a browser automation. Skyvern opens a cloud browser, navigates to the URL, and executes your prompt with AI.
+
+```python
+result = await client.run_task(
+    prompt="Get the title of the top post",
+    url="https://news.ycombinator.com",
+    wait_for_completion=True,
+)
+print(result.output)
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `prompt` | `str` | Yes | — | Natural language instructions for what the AI should do. |
+| `url` | `str` | No | `None` | Starting page URL. If omitted, the AI navigates from a blank page. |
+| `engine` | `RunEngine` | No | `skyvern_v2` | AI engine. Options: `skyvern_v2`, `skyvern_v1`, `openai_cua`, `anthropic_cua`, `ui_tars`. |
+| `wait_for_completion` | `bool` | No | `False` | Block until the run finishes. |
+| `timeout` | `float` | No | `1800` | Max wait time in seconds when `wait_for_completion=True`. |
+| `max_steps` | `int` | No | `None` | Cap the number of AI steps to limit cost. Run terminates with `timed_out` if hit. |
+| `data_extraction_schema` | `dict \| str` | No | `None` | JSON schema or Pydantic model name constraining the output shape. |
+| `proxy_location` | `ProxyLocation` | No | `None` | Route the browser through a geographic proxy. |
+| `browser_session_id` | `str` | No | `None` | Run inside an existing [browser session](/optimization/browser-sessions). |
+| `publish_workflow` | `bool` | No | `False` | Save the generated code as a reusable workflow. Only works with `skyvern_v2`. |
+| `webhook_url` | `str` | No | `None` | URL to receive a POST when the run finishes. |
+| `error_code_mapping` | `dict[str, str]` | No | `None` | Map custom error codes to failure reasons. |
+| `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
+| `totp_url` | `str` | No | `None` | URL to receive TOTP codes. |
+| `title` | `str` | No | `None` | Display name for this run in the dashboard. |
+| `model` | `dict` | No | `None` | Override the output model definition. |
+| `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. |
+| `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers injected into every browser request. |
+| `include_action_history_in_verification` | `bool` | No | `None` | Include action history when verifying task completion. |
+| `max_screenshot_scrolls` | `int` | No | `None` | Number of scrolls for post-action screenshots. Useful for lazy-loaded content. |
+| `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address instead of spinning up a new one. |
+
+### Returns `TaskRunResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | `str` | Unique identifier. Starts with `tsk_` for task runs. |
+| `status` | `str` | `created`, `queued`, `running`, `completed`, `failed`, `terminated`, `timed_out`, or `canceled`. |
+| `output` | `dict \| None` | Extracted data from the run. Shape depends on your prompt or `data_extraction_schema`. |
+| `downloaded_files` | `list[FileInfo] \| None` | Files downloaded during the run. |
+| `recording_url` | `str \| None` | URL to the session recording video. |
+| `screenshot_urls` | `list[str] \| None` | Final screenshots (most recent first). |
+| `failure_reason` | `str \| None` | Error description if the run failed. |
+| `app_url` | `str \| None` | Link to view this run in the Cloud UI. |
+| `step_count` | `int \| None` | Number of AI steps taken. |
+| `script_run` | `ScriptRunResponse \| None` | Code execution result if the run used generated code. |
+| `created_at` | `datetime` | When the run was created. |
+| `finished_at` | `datetime \| None` | When the run finished. |
+
+### Examples
+
+**Extract structured data:**
+
+```python
+result = await client.run_task(
+    prompt="Extract the name, price, and rating of the top 3 products",
+    url="https://example.com/products",
+    data_extraction_schema={
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "price": {"type": "string"},
+                "rating": {"type": "number"},
+            },
+        },
+    },
+    wait_for_completion=True,
+)
+print(result.output)
+# [{"name": "Widget A", "price": "$29.99", "rating": 4.5}, ...]
+```
+
+**Run inside an existing browser session:**
+
+```python
+session = await client.create_browser_session()
+
+result = await client.run_task(
+    prompt="Log in and download the latest invoice",
+    url="https://app.example.com/login",
+    browser_session_id=session.browser_session_id,
+    wait_for_completion=True,
+)
+```
+
+**Limit cost with max_steps:**
+
+```python
+result = await client.run_task(
+    prompt="Fill out the contact form",
+    url="https://example.com/contact",
+    max_steps=10,
+    wait_for_completion=True,
+)
+```
+
+**Use a lighter engine:**
+
+```python
+from skyvern.schemas.runs import RunEngine
+
+result = await client.run_task(
+    prompt="Get the page title",
+    url="https://example.com",
+    engine=RunEngine.skyvern_v1,
+    wait_for_completion=True,
+)
+```
+
+**Publish as a reusable workflow:**
+
+```python
+result = await client.run_task(
+    prompt="Fill out the contact form with the provided data",
+    url="https://example.com/contact",
+    publish_workflow=True,
+    wait_for_completion=True,
+)
+# The generated workflow is saved and can be re-triggered via run_workflow
+```
+
+---
+
+## `get_run`
+
+Get the current status and results of any run (task or workflow).
+
+```python
+run = await client.get_run("tsk_v2_486305187432193504")
+print(run.status, run.output)
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `run_id` | `str` | Yes | The run ID returned by `run_task` or `run_workflow`. |
+
+### Returns `GetRunResponse`
+
+A discriminated union based on `run_type`. All variants share the same core fields as `TaskRunResponse` above, plus a `run_type` field (`task_v1`, `task_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`, `workflow_run`).
+
+Workflow run responses additionally include `run_with` and `ai_fallback` fields.
+
+---
+
+## `cancel_run`
+
+Cancel a running or queued run.
+
+```python
+await client.cancel_run("tsk_v2_486305187432193504")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `run_id` | `str` | Yes | The run ID to cancel. |
+
+The run transitions to `canceled` status. If the run has already finished, this is a no-op.
+
+---
+
+## `get_run_timeline`
+
+Get the step-by-step timeline of a run. Each entry represents one AI action with screenshots and reasoning.
+
+```python
+timeline = await client.get_run_timeline("tsk_v2_486305187432193504")
+for step in timeline:
+    print(f"Step {step.order}: {step.type} — {step.status}")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `run_id` | `str` | Yes | The run ID. |
+
+### Returns `list[WorkflowRunTimeline]`
+
+Each timeline entry contains step details including type, status, order, and associated artifacts.
+
+---
+
+## `get_run_artifacts`
+
+Get all artifacts (screenshots, recordings, generated code, etc.) for a run.
+
+```python
+artifacts = await client.get_run_artifacts("tsk_v2_486305187432193504")
+for artifact in artifacts:
+    print(f"{artifact.artifact_type}: {artifact.uri}")
+```
+
+Filter by type to get specific artifacts:
+
+```python
+# Get only the generated Playwright scripts
+scripts = await client.get_run_artifacts(
+    "tsk_v2_486305187432193504",
+    artifact_type=["script_file"],
+)
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `run_id` | `str` | Yes | The run ID. |
+| `artifact_type` | `ArtifactType \| list[ArtifactType]` | No | Filter by artifact type. |
+
+### Returns `list[Artifact]`
+
+---
+
+## `get_artifact`
+
+Get a single artifact by ID.
+
+```python
+artifact = await client.get_artifact("art_486305187432193504")
+print(artifact.uri)
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `artifact_id` | `str` | Yes | The artifact ID. |
+
+### Returns `Artifact`
+
+---
+
+## `retry_run_webhook`
+
+Re-send the webhook notification for a completed run. Useful if your webhook endpoint was down when the run finished.
+
+```python
+await client.retry_run_webhook("tsk_v2_486305187432193504")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `run_id` | `str` | Yes | The run ID. |
+
+---
+
+## Polling pattern
+
+If you don't use `wait_for_completion`, poll `get_run` manually:
+
+```python
+import asyncio
+
+task = await client.run_task(
+    prompt="Extract product data",
+    url="https://example.com/products",
+)
+
+while True:
+    run = await client.get_run(task.run_id)
+    if run.status in ("completed", "failed", "terminated", "timed_out", "canceled"):
+        break
+    await asyncio.sleep(5)
+
+print(run.output)
+```
+
+<Tip>
+For production, prefer `wait_for_completion=True` or [webhooks](/going-to-production/webhooks) over manual polling.
+</Tip>
