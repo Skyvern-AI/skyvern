@@ -812,6 +812,23 @@ class BaseTaskBlock(Block):
                     if working_page.url == "about:blank" and self.url:
                         await browser_state.navigate_to_url(page=working_page, url=self.url)
 
+                    # When a browser profile is loaded, wait for the page to fully settle
+                    # so that cookie-based authentication can redirect or restore the session
+                    # BEFORE the agent starts interacting with the page.
+                    if workflow_run.browser_profile_id:
+                        LOG.info(
+                            "Browser profile loaded — waiting for page to settle before agent acts",
+                            browser_profile_id=workflow_run.browser_profile_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                        )
+                        try:
+                            await working_page.wait_for_load_state("networkidle", timeout=10000)
+                        except Exception:
+                            LOG.debug(
+                                "networkidle timeout after browser profile load (non-fatal)",
+                                workflow_run_id=workflow_run.workflow_run_id,
+                            )
+
                 except Exception as e:
                     LOG.exception(
                         "Failed to get browser state for first task",
@@ -3818,6 +3835,62 @@ class LoginBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.LOGIN] = BlockType.LOGIN  # type: ignore
+
+    # Prefix injected into the navigation_goal when the browser already has
+    # session state (e.g. a reused browser session or a loaded browser profile).
+    # This tells the LLM to inspect the page for signs of an existing
+    # authenticated session BEFORE filling in any credentials.
+    _SESSION_CHECK_PREFIX: ClassVar[str] = (
+        "IMPORTANT — BEFORE doing anything else, examine the current page to determine "
+        "whether you are ALREADY logged in.  Look for indicators of an authenticated "
+        "session such as a dashboard, welcome message, user menu, profile icon, logout "
+        "button, or any content that would not be visible to an unauthenticated user. "
+        "If the page shows that you are already logged in, immediately mark the task as "
+        "COMPLETE — do NOT interact with any form fields and do NOT attempt to log in "
+        "again.  Only proceed with the login steps below if the page clearly shows a "
+        "login form and you are definitely NOT logged in.\n\n"
+    )
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        # When the LoginBlock is running inside an existing browser session
+        # (e.g. the workflow-editor "Run" button) or with a loaded browser
+        # profile, the browser may already be logged in from a previous run.
+        # Augment the navigation_goal so the LLM checks for an existing
+        # session before filling in credentials.
+        workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        has_existing_session = bool(browser_session_id) or bool(
+            workflow_run and workflow_run.browser_profile_id
+        )
+        if has_existing_session and self.navigation_goal:
+            # Only prepend once — guard against retries re-augmenting.
+            if not self.navigation_goal.startswith("IMPORTANT — BEFORE"):
+                LOG.info(
+                    "LoginBlock: augmenting navigation_goal with session-check prefix",
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                    browser_profile_id=(
+                        workflow_run.browser_profile_id if workflow_run else None
+                    ),
+                )
+                self.navigation_goal = self._SESSION_CHECK_PREFIX + self.navigation_goal
+
+        return await super().execute(
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            **kwargs,
+        )
 
 
 class FileDownloadBlock(BaseTaskBlock):

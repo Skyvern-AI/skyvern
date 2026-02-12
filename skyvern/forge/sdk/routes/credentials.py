@@ -749,6 +749,22 @@ DEFAULT_LOGIN_PROMPT = (
     "Only attempt to log in once."
 )
 
+BROWSER_PROFILE_LOGIN_PROMPT = (
+    "A browser profile with saved session data has been loaded. "
+    "FIRST, check whether you are already logged in by examining the page content. "
+    "Look for signs of an authenticated session such as a dashboard, welcome message, "
+    "user menu, profile icon, or any content that indicates a logged-in state. "
+    "If you are already logged in, report success immediately — do NOT interact with "
+    "any form fields or attempt to log in again. "
+    "Only if the page clearly shows a login form and you are NOT logged in, "
+    "then log in with the provided credentials. Fill in the username and password fields "
+    "and submit the form. After submitting, verify whether the login was successful. "
+    "IMPORTANT: Do NOT retry or re-submit the login form if the first attempt fails. "
+    "If you see an error message such as 'invalid credentials', 'incorrect password', "
+    "or 'account locked', report the failure immediately and stop. "
+    "Only attempt to log in once."
+)
+
 
 @base_router.post(
     "/credentials/{credential_id}/test",
@@ -811,12 +827,36 @@ async def test_credential(
             detail="Only password credentials can be tested with login",
         )
 
+    # Check if the credential already has a browser profile — if so, the agent should
+    # first check whether the saved session is still valid before attempting to log in.
+    existing_browser_profile_id = credential.browser_profile_id
+    if existing_browser_profile_id:
+        # Verify the browser profile still exists in storage
+        profile = await app.DATABASE.get_browser_profile(
+            profile_id=existing_browser_profile_id,
+            organization_id=organization_id,
+        )
+        if not profile:
+            LOG.warning(
+                "Credential has browser_profile_id but profile not found, ignoring",
+                credential_id=credential_id,
+                browser_profile_id=existing_browser_profile_id,
+            )
+            existing_browser_profile_id = None
+
     LOG.info(
         "Testing credential",
         credential_id=credential_id,
         organization_id=organization_id,
         url=data.url,
         save_browser_profile=data.save_browser_profile,
+        existing_browser_profile_id=existing_browser_profile_id,
+    )
+
+    # Choose the appropriate prompt: if a browser profile exists, instruct the agent
+    # to check for an existing session before attempting login.
+    navigation_goal = (
+        BROWSER_PROFILE_LOGIN_PROMPT if existing_browser_profile_id else DEFAULT_LOGIN_PROMPT
     )
 
     # Build a login workflow
@@ -836,7 +876,7 @@ async def test_credential(
         label=label,
         title=label,
         url=data.url,
-        navigation_goal=DEFAULT_LOGIN_PROMPT,
+        navigation_goal=navigation_goal,
         max_steps_per_run=10,
         parameter_keys=[parameter_key],
         totp_verification_url=None,
@@ -862,10 +902,13 @@ async def test_credential(
         request=workflow_create_request,
     )
 
-    # Run the workflow
+    # Run the workflow — pass existing browser_profile_id so the browser launches
+    # with saved session data (cookies, storage) before the agent starts acting.
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody  # noqa: PLC0415
 
-    run_request = WorkflowRequestBody()
+    run_request = WorkflowRequestBody(
+        browser_profile_id=existing_browser_profile_id,
+    )
 
     workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
         request_id=None,
