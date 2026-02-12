@@ -1,0 +1,189 @@
+---
+title: Python SDK
+subtitle: Install, authenticate, and configure the Skyvern Python client
+slug: sdk-reference/overview
+---
+
+The `skyvern` package wraps the Skyvern REST API in a typed, async Python client.
+
+```bash
+pip install skyvern
+```
+
+<Note>
+Requires Python 3.11+. If you hit version errors, use `pipx install skyvern` to install in an isolated environment.
+</Note>
+
+---
+
+## Initialize the client
+
+The `Skyvern` class is async — all methods are coroutines. Wrap calls in an `async` function and use `asyncio.run()` as the entry point:
+
+```python
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key="YOUR_API_KEY")
+
+    result = await client.run_task(
+        prompt="Get the title of the top post on Hacker News",
+        url="https://news.ycombinator.com",
+        wait_for_completion=True,
+    )
+    print(result.output)
+
+asyncio.run(main())
+```
+
+If you're inside a framework that already runs an event loop (FastAPI, Django ASGI), `await` directly without `asyncio.run()`.
+
+### Constructor parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `api_key` | `str` | — | **Required.** Your Skyvern API key. Get one at [app.skyvern.com/settings](https://app.skyvern.com/settings/api-keys). |
+| `environment` | `SkyvernEnvironment` | `CLOUD` | Target environment. Options: `CLOUD`, `STAGING`, `LOCAL`. |
+| `base_url` | `str \| None` | `None` | Override the API base URL. Use this for self-hosted deployments. |
+| `timeout` | `float \| None` | `None` | HTTP request timeout in seconds. |
+| `follow_redirects` | `bool` | `True` | Whether to follow HTTP redirects. |
+| `httpx_client` | `AsyncClient \| None` | `None` | Provide your own httpx client for custom TLS, proxying, or connection pooling. |
+
+---
+
+## Environments
+
+The SDK ships with two built-in environment URLs:
+
+```python
+from skyvern.client import SkyvernEnvironment
+```
+
+| Environment | URL | When to use |
+|-------------|-----|-------------|
+| `SkyvernEnvironment.CLOUD` | `https://api.skyvern.com` | Skyvern Cloud (default) |
+| `SkyvernEnvironment.LOCAL` | `http://localhost:8000` | Local server started with `skyvern run server` |
+
+For a self-hosted instance at a custom URL, pass `base_url` instead:
+
+```python
+client = Skyvern(
+    api_key="YOUR_API_KEY",
+    base_url="https://skyvern.your-company.com",
+)
+```
+
+---
+
+## Local mode
+
+Run Skyvern entirely on your machine — no cloud, no network calls. `Skyvern.local()` reads your `.env` file, boots the engine in-process, and connects the client to it.
+
+**Prerequisite:** Run `skyvern quickstart` once to create the `.env` file with your database connection and LLM API keys.
+
+```python
+from skyvern import Skyvern
+
+client = Skyvern.local()
+
+result = await client.run_task(
+    prompt="Get the title of the top post",
+    url="https://news.ycombinator.com",
+    wait_for_completion=True,
+)
+```
+
+If you configured headful mode during `skyvern quickstart`, a Chromium window opens on your machine so you can watch the AI work.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `llm_config` | `LLMConfig \| LLMRouterConfig \| None` | `None` | Override the LLM. If omitted, uses `LLM_KEY` from `.env`. |
+| `settings` | `dict \| None` | `None` | Override `.env` settings at runtime. Example: `{"MAX_STEPS_PER_RUN": 100}` |
+
+---
+
+## `wait_for_completion`
+
+By default, `run_task` and `run_workflow` return immediately after the run is queued — you get a `run_id` and need to poll `get_run()` yourself. Pass `wait_for_completion=True` to have the SDK poll automatically until the run reaches a terminal state (`completed`, `failed`, `terminated`, `timed_out`, or `canceled`):
+
+```python
+# Returns only after the task finishes (up to 30 min by default)
+result = await client.run_task(
+    prompt="Fill out the contact form",
+    url="https://example.com/contact",
+    wait_for_completion=True,
+    timeout=600,  # give up after 10 minutes
+)
+
+# Without wait_for_completion — returns immediately
+task = await client.run_task(
+    prompt="Fill out the contact form",
+    url="https://example.com/contact",
+)
+print(task.run_id)  # poll with client.get_run(task.run_id)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `wait_for_completion` | `bool` | `False` | Poll until the run finishes. |
+| `timeout` | `float` | `1800` | Maximum wait time in seconds. Raises Python's `TimeoutError` if exceeded. |
+
+Supported on `run_task`, `run_workflow`, and `login`.
+
+---
+
+## Request options
+
+Every method accepts an optional `request_options` parameter for per-request overrides of timeout, retries, and headers:
+
+```python
+from skyvern.client.core import RequestOptions
+
+result = await client.run_task(
+    prompt="Extract data",
+    url="https://example.com",
+    request_options=RequestOptions(
+        timeout_in_seconds=120,
+        max_retries=3,
+        additional_headers={"x-custom-header": "value"},
+    ),
+)
+```
+
+These override the client-level defaults for that single call only.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Tasks"
+    icon="play"
+    href="/sdk-reference/tasks"
+  >
+    Run browser automations with `run_task`
+  </Card>
+  <Card
+    title="Workflows"
+    icon="diagram-project"
+    href="/sdk-reference/workflows"
+  >
+    Create and run multi-step automations
+  </Card>
+  <Card
+    title="Browser Sessions"
+    icon="browser"
+    href="/sdk-reference/browser-sessions"
+  >
+    Maintain live browser state between calls
+  </Card>
+  <Card
+    title="Error Handling"
+    icon="triangle-exclamation"
+    href="/sdk-reference/error-handling"
+  >
+    Handle errors and configure retries
+  </Card>
+</CardGroup>
