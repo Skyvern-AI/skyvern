@@ -20,6 +20,7 @@ from urllib.parse import quote, urlparse
 
 import aiofiles
 import aiohttp
+import docx
 import filetype
 import pandas as pd
 import pyotp
@@ -35,6 +36,7 @@ from skyvern.config import settings
 from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     GET_DOWNLOADED_FILES_TIMEOUT,
+    MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_UPLOAD_FILE_COUNT,
 )
 from skyvern.exceptions import (
@@ -76,6 +78,7 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, validate_pdf_file
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     CustomizedCodeException,
@@ -100,6 +103,7 @@ from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
+from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -3065,6 +3069,14 @@ class FileParserBlock(Block):
             return FileType.CSV  # TSV files are handled by the CSV parser
         elif suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"):
             return FileType.IMAGE
+        elif suffix == ".docx":
+            return FileType.DOCX
+        elif suffix == ".doc":
+            raise InvalidFileType(
+                file_url=file_url,
+                file_type=FileType.DOCX,
+                error="Legacy .doc format (Word 97-2003) is not supported. Please convert the file to .docx format.",
+            )
         else:
             return FileType.CSV  # Default to CSV for .csv and any other extensions
 
@@ -3119,6 +3131,14 @@ class FileParserBlock(Block):
             if kind is None or not kind.mime.startswith("image/"):
                 raise InvalidFileType(
                     file_url=file_url_used, file_type=self.file_type, error="File is not a valid image"
+                )
+        elif self.file_type == FileType.DOCX:
+            try:
+                # Try to open the file with python-docx to validate it's a valid DOCX file
+                docx.Document(file_path)
+            except Exception as e:
+                raise InvalidFileType(
+                    file_url=file_url_used, file_type=self.file_type, error=f"Invalid DOCX file format: {str(e)}"
                 )
 
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
@@ -3213,6 +3233,76 @@ class FileParserBlock(Block):
             LOG.exception("Failed to extract text from image via OCR", file_url=self.file_url)
             raise
 
+    async def _parse_docx_file(self, file_path: str, max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS) -> str:
+        """Parse DOCX file and return extracted text.
+
+        Extracts text from all paragraphs and tables in the document,
+        respecting the token limit.
+        """
+        try:
+            document = docx.Document(file_path)
+            text_parts = []
+            current_tokens = 0
+            truncated = False
+
+            # Extract text from paragraphs
+            for paragraph in document.paragraphs:
+                if paragraph.text.strip():
+                    para_tokens = count_tokens(paragraph.text)
+                    if max_tokens and current_tokens + para_tokens > max_tokens:
+                        LOG.warning(
+                            "DOCX text exceeds token limit, truncating",
+                            file_url=self.file_url,
+                            current_tokens=current_tokens,
+                            max_tokens=max_tokens,
+                        )
+                        truncated = True
+                        break
+                    text_parts.append(paragraph.text)
+                    current_tokens += para_tokens
+
+            # Extract text from tables (only if not already truncated)
+            if not truncated:
+                for table in document.tables:
+                    if truncated:
+                        break
+                    for row in table.rows:
+                        row_text = []
+                        for cell in row.cells:
+                            cell_text = cell.text.strip()
+                            if cell_text:
+                                row_text.append(cell_text)
+                        if row_text:
+                            row_str = " | ".join(row_text)
+                            row_tokens = count_tokens(row_str)
+                            if max_tokens and current_tokens + row_tokens > max_tokens:
+                                LOG.warning(
+                                    "DOCX text exceeds token limit, truncating at table",
+                                    file_url=self.file_url,
+                                    current_tokens=current_tokens,
+                                    max_tokens=max_tokens,
+                                )
+                                truncated = True
+                                break
+                            text_parts.append(row_str)
+                            current_tokens += row_tokens
+
+            extracted_text = "\n".join(text_parts)
+            extracted_text = sanitize_postgres_text(extracted_text)
+            LOG.info(
+                "Successfully parsed DOCX file",
+                file_url=self.file_url,
+                paragraph_count=len(document.paragraphs),
+                table_count=len(document.tables),
+                text_length=len(extracted_text),
+                truncated=truncated,
+            )
+            return extracted_text
+        except Exception as e:
+            raise InvalidFileType(
+                file_url=self.file_url, file_type=self.file_type, error=f"Failed to parse DOCX file: {str(e)}"
+            )
+
     async def _extract_with_ai(
         self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext
     ) -> dict[str, Any]:
@@ -3289,8 +3379,8 @@ class FileParserBlock(Block):
         else:
             file_path = await download_file(self.file_url)
 
-        # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF are explicit choices)
-        if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF):
+        # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
+        if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
             self.file_type = self._detect_file_type_from_url(self.file_url)
 
         # Validate the file type
@@ -3313,6 +3403,8 @@ class FileParserBlock(Block):
             parsed_data = await self._parse_pdf_file(file_path)
         elif self.file_type == FileType.IMAGE:
             parsed_data = await self._parse_image_file(file_path)
+        elif self.file_type == FileType.DOCX:
+            parsed_data = await self._parse_docx_file(file_path)
         else:
             return await self.build_block_result(
                 success=False,
