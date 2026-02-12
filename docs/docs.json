@@ -43,6 +43,14 @@
             ]
           },
           {
+            "group": "Optimization",
+            "pages": [
+              "optimization/browser-sessions",
+              "optimization/browser-profiles",
+              "optimization/cost-control"
+            ]
+          },
+          {
             "group": "Going to Production",
             "pages": [
               "going-to-production/webhooks",
