@@ -1120,6 +1120,74 @@ class LoopBlockExecutedResult(BaseModel):
         return self.block_outputs[-1].failure_reason if len(self.block_outputs) > 0 else "No block has been executed"
 
 
+def compute_conditional_scopes(
+    label_to_block: dict[str, Any],
+    default_next_map: dict[str, str | None],
+) -> dict[str, str]:
+    """Map each block label to the conditional block label whose scope it belongs to.
+
+    For each conditional block, trace each branch's chain of blocks via
+    ``default_next_map``.  Labels that appear in **all** branch chains are
+    considered merge-point blocks (i.e. they come *after* the conditional
+    reconverges) and are **not** scoped.  Labels that appear in fewer chains
+    than the total number of branches **are** inside the conditional.
+
+    Inner conditionals are themselves scoped to an outer conditional, but
+    their *own* branch targets are handled by a recursive application of
+    the same logic (inner wins via the ``if lbl not in scopes`` guard).
+    """
+    scopes: dict[str, str] = {}
+
+    conditional_labels = [lbl for lbl, blk in label_to_block.items() if blk.block_type == BlockType.CONDITIONAL]
+
+    for cond_label in conditional_labels:
+        cond_block = label_to_block[cond_label]
+        branch_targets: list[str | None] = [branch.next_block_label for branch in cond_block.ordered_branches]
+        # Deduplicate while preserving order – two branches may point to the same target
+        seen_targets: set[str | None] = set()
+        unique_targets: list[str | None] = []
+        for t in branch_targets:
+            if t not in seen_targets:
+                seen_targets.add(t)
+                unique_targets.append(t)
+
+        num_branches = len(unique_targets)
+        if num_branches == 0:
+            continue
+
+        # For each unique branch target, trace the chain via default_next_map.
+        # Stop at other conditional blocks (they handle their own branches).
+        chain_sets: list[list[str]] = []
+        for target in unique_targets:
+            chain: list[str] = []
+            cur = target
+            while cur and cur in label_to_block:
+                chain.append(cur)
+                # Stop tracing when we hit another conditional – it owns its own sub-tree
+                if label_to_block[cur].block_type == BlockType.CONDITIONAL:
+                    break
+                cur = default_next_map.get(cur)
+            chain_sets.append(chain)
+
+        # Count how many branch chains each label appears in
+        label_count: dict[str, int] = {}
+        for chain in chain_sets:
+            for lbl in chain:
+                label_count[lbl] = label_count.get(lbl, 0) + 1
+
+        # Labels appearing in ALL branches are merge points (after the conditional).
+        # Labels appearing in fewer branches are inside the conditional.
+        for chain in chain_sets:
+            for lbl in chain:
+                if label_count[lbl] >= num_branches:
+                    # This is a merge point – stop scoping further along this chain
+                    break
+                if lbl not in scopes:
+                    scopes[lbl] = cond_label
+
+    return scopes
+
+
 class ForLoopBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -1507,6 +1575,7 @@ class ForLoopBlock(Block):
         current_block: BlockTypeVar | None = None
 
         start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
+        conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             # Check max_iterations limit
@@ -1548,6 +1617,7 @@ class ForLoopBlock(Block):
 
             block_idx = 0
             current_label: str | None = start_label
+            conditional_wrb_ids: dict[str, str] = {}
             while current_label:
                 loop_block = label_to_block.get(current_label)
                 if not loop_block:
@@ -1584,12 +1654,26 @@ class ForLoopBlock(Block):
                 loop_block = loop_block.model_copy(deep=True)
                 current_block = loop_block
 
+                # Determine the parent for timeline nesting: if this block is
+                # inside a conditional's scope, parent it to that conditional's
+                # workflow_run_block rather than the loop's.
+                parent_wrb_id = workflow_run_block_id
+                if current_label in conditional_scopes:
+                    cond_label = conditional_scopes[current_label]
+                    if cond_label in conditional_wrb_ids:
+                        parent_wrb_id = conditional_wrb_ids[cond_label]
+
                 block_output = await loop_block.execute_safe(
                     workflow_run_id=workflow_run_id,
-                    parent_workflow_run_block_id=workflow_run_block_id,
+                    parent_workflow_run_block_id=parent_wrb_id,
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
                 )
+
+                # Track conditional workflow_run_block_ids so branch targets
+                # can be parented to them.
+                if loop_block.block_type == BlockType.CONDITIONAL and block_output.workflow_run_block_id:
+                    conditional_wrb_ids[current_label] = block_output.workflow_run_block_id
 
                 output_value = (
                     workflow_run_context.get_value(block_output.output_parameter.key)

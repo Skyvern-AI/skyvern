@@ -70,6 +70,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ExtractionBlock,
     NavigationBlock,
     TaskV2Block,
+    compute_conditional_scopes,
     get_all_blocks,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -1206,6 +1207,9 @@ class WorkflowService:
             )
             return workflow_run, blocks_to_update
 
+        conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
+        conditional_wrb_ids: dict[str, str] = {}
+
         visited_labels: set[str] = set()
         current_label = start_label
         block_idx = 0
@@ -1224,6 +1228,15 @@ class WorkflowService:
                     failure_reason=f"Unable to find block with label {current_label}",
                 )
                 break
+
+            # Determine the parent for timeline nesting: if this block is
+            # inside a conditional's scope, parent it to that conditional's
+            # workflow_run_block rather than the root.
+            parent_wrb_id: str | None = None
+            if current_label in conditional_scopes:
+                cond_label = conditional_scopes[current_label]
+                if cond_label in conditional_wrb_ids:
+                    parent_wrb_id = conditional_wrb_ids[cond_label]
 
             (
                 workflow_run,
@@ -1244,7 +1257,13 @@ class WorkflowService:
                 loaded_script_module=loaded_script_module,
                 is_script_run=is_script_run,
                 blocks_to_update=blocks_to_update,
+                parent_workflow_run_block_id=parent_wrb_id,
             )
+
+            # Track conditional workflow_run_block_ids so branch targets
+            # can be parented to them.
+            if block.block_type == BlockType.CONDITIONAL and block_result and block_result.workflow_run_block_id:
+                conditional_wrb_ids[block.label] = block_result.workflow_run_block_id
 
             visited_labels.add(current_label)
             if should_stop:
@@ -1298,6 +1317,7 @@ class WorkflowService:
         loaded_script_module: Any,
         is_script_run: bool,
         blocks_to_update: set[str],
+        parent_workflow_run_block_id: str | None = None,
     ) -> tuple[WorkflowRun, set[str], BlockResult | None, bool, dict[str, Any] | None]:
         organization_id = organization.organization_id
         workflow_run_block_result: BlockResult | None = None
@@ -1426,6 +1446,7 @@ class WorkflowService:
                 )
                 workflow_run_block_result = await block.execute_safe(
                     workflow_run_id=workflow_run_id,
+                    parent_workflow_run_block_id=parent_workflow_run_block_id,
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
                 )
