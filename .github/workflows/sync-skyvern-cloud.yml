@@ -1,5 +1,4 @@
 name: Sync to skyvern-cloud
-
 # Syncs merged OSS PRs (e.g. external contributions) to the cloud repo.
 # Skips sync PRs that originated from cloud to prevent infinite loops.
 on:
@@ -20,9 +19,8 @@ jobs:
     # 1. PR was merged (not just closed) OR manual dispatch
     # 2. PR is NOT a sync PR from cloud (prevents infinite sync loops)
     if: >
-      (github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch') &&
-      !contains(join(github.event.pull_request.labels.*.name, ','), 'sync') &&
-      !startsWith(github.event.pull_request.head.ref, 'repo-sync/')
+      (github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch') && !contains(join(github.event.pull_request.labels.*.name, ','), 'sync') && !startsWith(github.event.pull_request.head.ref, 'repo-sync/')
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -45,20 +43,10 @@ jobs:
               echo "GIT_EMAIL=suchintansingh@gmail.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=Suchintan Singh" >> $GITHUB_OUTPUT
               ;;
-            jomido)
-              echo "GH_PAT=${{ secrets.JON_GH_PAT }}" >> $GITHUB_OUTPUT
-              echo "GIT_EMAIL=jon@skyvern.com" >> $GITHUB_OUTPUT
-              echo "GIT_USERNAME=Jonathan Dobson" >> $GITHUB_OUTPUT
-              ;;
             pedrohsdb)
               echo "GH_PAT=${{ secrets.PEDROHSDB_GH_PAT }}" >> $GITHUB_OUTPUT
               echo "GIT_EMAIL=pedro@skyvern.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=pedrohsdb" >> $GITHUB_OUTPUT
-              ;;
-            stanislaw89)
-              echo "GH_PAT=${{ secrets.STAS_GH_PAT }}" >> $GITHUB_OUTPUT
-              echo "GIT_EMAIL=stas@skyvern.com" >> $GITHUB_OUTPUT
-              echo "GIT_USERNAME=stas" >> $GITHUB_OUTPUT
               ;;
             marcmuon)
               echo "GH_PAT=${{ secrets.MARC_GH_PAT }}" >> $GITHUB_OUTPUT
@@ -99,7 +87,6 @@ jobs:
           echo "PR_AUTHOR=$PR_AUTHOR" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Check for migration changes
         id: check-migrations
         run: |
@@ -119,7 +106,6 @@ jobs:
           echo "has_migrations=$HAS_MIGRATIONS" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Run GitHub File Sync
         id: file-sync
         uses: Skyvern-AI/repo-file-sync-action@main
@@ -133,12 +119,11 @@ jobs:
           BRANCH_NAME: repo-sync/${{ steps.pr_details.outputs.BRANCH_NAME }}
           PR_BODY: "PR: ${{ steps.pr_details.outputs.PR_URL }}\nAuthor: @${{ steps.pr_details.outputs.PR_AUTHOR }}\n\n${{ steps.pr_details.outputs.PR_BODY }}"
           PR_TITLE: ${{ steps.pr_details.outputs.PR_TITLE }}
-
       # Flag migration changes that need manual attention in the cloud repo
       - name: Comment migration warning on cloud sync PR
         if: >
-          steps.check-migrations.outputs.has_migrations == 'true' &&
-          steps.file-sync.outputs.pull_request_urls
+          steps.check-migrations.outputs.has_migrations == 'true' && steps.file-sync.outputs.pull_request_urls
+
         uses: actions/github-script@v6
         with:
           github-token: ${{ steps.git-creds.outputs.GH_PAT }}
