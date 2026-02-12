@@ -741,8 +741,12 @@ async def update_custom_credential_service_config(
 
 DEFAULT_LOGIN_PROMPT = (
     "Navigate to the login page if needed and log in with the provided credentials. "
-    "Fill in the username and password fields, submit the form, "
-    "and verify the login was successful by checking the page content."
+    "Fill in the username and password fields and submit the form. "
+    "After submitting, verify whether the login was successful by checking the page content. "
+    "IMPORTANT: Do NOT retry or re-submit the login form if the first attempt fails. "
+    "If you see an error message such as 'invalid credentials', 'incorrect password', "
+    "or 'account locked', report the failure immediately and stop. "
+    "Only attempt to log in once."
 )
 
 
@@ -833,7 +837,7 @@ async def test_credential(
         title=label,
         url=data.url,
         navigation_goal=DEFAULT_LOGIN_PROMPT,
-        max_steps_per_run=25,
+        max_steps_per_run=10,
         parameter_keys=[parameter_key],
         totp_verification_url=None,
         totp_identifier=credential.totp_identifier,
