@@ -951,6 +951,7 @@ async def get_test_credential_status(
     status = str(workflow_run.status)
     browser_profile_id = credential.browser_profile_id
     browser_profile_url = credential.browser_profile_url
+    browser_profile_failure_reason: str | None = None
 
     # If completed successfully and no browser profile yet, try to create one
     if status == "completed" and not browser_profile_id:
@@ -999,9 +1000,9 @@ async def get_test_credential_status(
                     # Extract URL from the workflow's login block
                     login_url = None
                     if workflow.workflow_definition:
-                        blocks = workflow.workflow_definition.get("blocks", [])
-                        if blocks and "url" in blocks[0]:
-                            login_url = blocks[0]["url"]
+                        blocks = workflow.workflow_definition.blocks
+                        if blocks:
+                            login_url = getattr(blocks[0], "url", None)
 
                     # Link browser profile to credential
                     await app.DATABASE.update_credential(
@@ -1020,6 +1021,11 @@ async def get_test_credential_status(
                         workflow_run_id=workflow_run_id,
                     )
                 else:
+                    browser_profile_failure_reason = (
+                        "The browser profile could not be saved. "
+                        "This usually means the login did not actually succeed — "
+                        "please verify your username and password are correct and try again."
+                    )
                     LOG.warning(
                         "No persisted session found after retries for credential test workflow",
                         credential_id=credential_id,
@@ -1028,19 +1034,37 @@ async def get_test_credential_status(
                         max_retries=max_retries,
                     )
             except Exception:
+                browser_profile_failure_reason = (
+                    "Login succeeded but the browser profile could not be saved. "
+                    "Please try testing the credential again."
+                )
                 LOG.exception(
                     "Failed to create browser profile from credential test",
                     credential_id=credential_id,
                     workflow_run_id=workflow_run_id,
                 )
 
+    # Build a detailed failure reason for login failures
+    failure_reason = workflow_run.failure_reason
+    if status == "failed" and not failure_reason:
+        failure_reason = "The login test failed. The credentials may be incorrect or the login page may have changed."
+    elif status == "timed_out":
+        failure_reason = failure_reason or (
+            "The login test timed out. The page may be slow to load or the login flow may require additional steps."
+        )
+    elif status == "terminated":
+        failure_reason = failure_reason or "The login test was terminated before it could complete."
+    elif status == "canceled":
+        failure_reason = failure_reason or "The login test was canceled."
+
     return TestCredentialStatusResponse(
         credential_id=credential_id,
         workflow_run_id=workflow_run_id,
         status=status,
-        failure_reason=workflow_run.failure_reason,
+        failure_reason=failure_reason,
         browser_profile_id=browser_profile_id,
         browser_profile_url=browser_profile_url,
+        browser_profile_failure_reason=browser_profile_failure_reason,
     )
 
 

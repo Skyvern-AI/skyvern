@@ -214,6 +214,10 @@ class TestCredentialStatusResponse(BaseModel):
         default=None,
         description="URL of the website the browser profile was created from.",
     )
+    browser_profile_failure_reason: str | None = Field(
+        default=None,
+        description="Reason the browser profile failed to save, if applicable. Present when login succeeded but browser profile creation failed.",
+    )
 
 
 class Credential(BaseModel):

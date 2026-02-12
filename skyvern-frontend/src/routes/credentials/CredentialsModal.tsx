@@ -125,7 +125,7 @@ function CredentialsModal({
   const [testAndSave, setTestAndSave] = useState(false);
   const [testUrl, setTestUrl] = useState("");
   const [testStatus, setTestStatus] = useState<
-    "idle" | "testing" | "completed" | "failed"
+    "idle" | "testing" | "completed" | "failed" | "profile_failed"
   >("idle");
   const [, setTestWorkflowRunId] = useState<string | null>(null);
   const [testFailureReason, setTestFailureReason] = useState<string | null>(
@@ -189,8 +189,21 @@ function CredentialsModal({
 
         if (data.status === "completed") {
           pollIntervalRef.current = null;
-          setTestStatus("completed");
           queryClient.invalidateQueries({ queryKey: ["credentials"] });
+
+          // Check if login succeeded but browser profile failed to save
+          if (data.browser_profile_failure_reason && !data.browser_profile_id) {
+            setTestStatus("profile_failed");
+            setTestFailureReason(data.browser_profile_failure_reason);
+            toast({
+              title: "Browser profile was not saved",
+              description: data.browser_profile_failure_reason,
+              variant: "destructive",
+            });
+            return;
+          }
+
+          setTestStatus("completed");
           const profileHost = data.browser_profile_url
             ? getHostname(data.browser_profile_url)
             : null;
@@ -471,7 +484,10 @@ function CredentialsModal({
   })();
 
   const isTestInProgress = testStatus === "testing";
-  const isTestComplete = testStatus === "completed" || testStatus === "failed";
+  const isTestComplete =
+    testStatus === "completed" ||
+    testStatus === "failed" ||
+    testStatus === "profile_failed";
 
   return (
     <Dialog
@@ -543,6 +559,19 @@ function CredentialsModal({
                 <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
                   <CheckCircledIcon className="size-4" />
                   <span>Login test passed — browser profile saved!</span>
+                </div>
+              )}
+              {testStatus === "profile_failed" && (
+                <div className="space-y-1 pl-7">
+                  <div className="flex items-center gap-2 text-sm text-destructive">
+                    <CrossCircledIcon className="size-4" />
+                    <span>Browser profile was not saved</span>
+                  </div>
+                  {testFailureReason && (
+                    <p className="text-xs text-destructive/70">
+                      {testFailureReason}
+                    </p>
+                  )}
                 </div>
               )}
               {testStatus === "failed" && (

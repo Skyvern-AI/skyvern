@@ -640,4 +640,5 @@ export type TestCredentialStatusResponse = {
   failure_reason?: string | null;
   browser_profile_id?: string | null;
   browser_profile_url?: string | null;
+  browser_profile_failure_reason?: string | null;
 };
