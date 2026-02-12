@@ -2210,6 +2210,25 @@ async def run_workflow_legacy(
     )
 
 
+@base_router.get(
+    "/workflows/runs",
+    response_model=list[WorkflowRun],
+    tags=["Workflows"],
+    description=(
+        "List workflow runs across all workflows for the current organization. "
+        "Results are paginated and can be filtered by status, search key, and error code. "
+        "All filters are combined with AND logic."
+    ),
+    summary="List workflow runs",
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_workflow_runs",
+    },
+)
+@base_router.get(
+    "/workflows/runs/",
+    response_model=list[WorkflowRun],
+    include_in_schema=False,
+)
 @legacy_base_router.get(
     "/workflows/runs",
     response_model=list[WorkflowRun],
@@ -2224,9 +2243,9 @@ async def run_workflow_legacy(
     include_in_schema=False,
 )
 async def get_workflow_runs(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
-    status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    page: int = Query(1, ge=1, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
     search_key: str | None = Query(
         None,
         max_length=500,
@@ -2243,10 +2262,10 @@ async def get_workflow_runs(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
-    Get all workflow runs for the current organization.
+    List workflow runs across all workflows for the current organization.
 
-    Supports filtering by status, parameter search, and error code. All filters
-    are combined with AND logic.
+    Results are paginated and can be filtered by status, search key, and error code.
+    All filters are combined with AND logic.
 
     **Examples:**
     - All failed runs: `?status=failed`
