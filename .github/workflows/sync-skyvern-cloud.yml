@@ -1,4 +1,6 @@
 name: Sync to skyvern-cloud
+# Syncs merged OSS PRs (e.g. external contributions) to the cloud repo.
+# Skips sync PRs that originated from cloud to prevent infinite loops.
 on:
   pull_request_target:
     types: [closed]
@@ -13,10 +15,15 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
+    # Only run when:
+    # 1. PR was merged (not just closed) OR manual dispatch
+    # 2. PR is NOT a sync PR from cloud (prevents infinite sync loops)
+    if: >
+      (github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch') && !contains(join(github.event.pull_request.labels.*.name, ','), 'sync') && !startsWith(github.event.pull_request.head.ref, 'repo-sync/')
+
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@master
+        uses: actions/checkout@v4
       - name: Determine Git credentials
         id: git-creds
         run: |
@@ -80,7 +87,27 @@ jobs:
           echo "PR_AUTHOR=$PR_AUTHOR" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check for migration changes
+        id: check-migrations
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            PR_NUMBER=${{ inputs.pr_number }}
+          else
+            PR_NUMBER=${{ github.event.pull_request.number }}
+          fi
+          CHANGED_FILES=$(gh pr diff $PR_NUMBER --name-only || true)
+          HAS_MIGRATIONS=false
+          for file in $CHANGED_FILES; do
+            if [[ "$file" == alembic/versions/* ]]; then
+              HAS_MIGRATIONS=true
+              break
+            fi
+          done
+          echo "has_migrations=$HAS_MIGRATIONS" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Run GitHub File Sync
+        id: file-sync
         uses: Skyvern-AI/repo-file-sync-action@main
         with:
           GH_PAT: ${{ steps.git-creds.outputs.GH_PAT }}
@@ -88,7 +115,44 @@ jobs:
           GIT_USERNAME: ${{ steps.git-creds.outputs.GIT_USERNAME }}
           PR_LABELS: |
             sync
-            ${{steps.pr_details.outputs.PR_AUTHOR }}
+            ${{ steps.pr_details.outputs.PR_AUTHOR }}
           BRANCH_NAME: repo-sync/${{ steps.pr_details.outputs.BRANCH_NAME }}
           PR_BODY: "PR: ${{ steps.pr_details.outputs.PR_URL }}\nAuthor: @${{ steps.pr_details.outputs.PR_AUTHOR }}\n\n${{ steps.pr_details.outputs.PR_BODY }}"
           PR_TITLE: ${{ steps.pr_details.outputs.PR_TITLE }}
+      # Flag migration changes that need manual attention in the cloud repo
+      - name: Comment migration warning on cloud sync PR
+        if: >
+          steps.check-migrations.outputs.has_migrations == 'true' && steps.file-sync.outputs.pull_request_urls
+
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.git-creds.outputs.GH_PAT }}
+          script: |
+            const urlsRaw = `${{ steps.file-sync.outputs.pull_request_urls }}`;
+            let urls;
+            try {
+              urls = JSON.parse(urlsRaw);
+            } catch {
+              urls = [urlsRaw].filter(Boolean);
+            }
+
+            for (const url of urls) {
+              const match = url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+              if (match) {
+                const [, owner, repo, prNumber] = match;
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: parseInt(prNumber),
+                  body: [
+                    '⚠️ **Migration Alert**',
+                    '',
+                    'The source OSS PR included database migration changes in `alembic/versions/` that are **NOT automatically synced**.',
+                    '',
+                    'Please check if corresponding migrations need to be created in the cloud repo.',
+                    '',
+                    `Source PR: ${{ steps.pr_details.outputs.PR_URL }}`
+                  ].join('\n')
+                });
+              }
+            }
