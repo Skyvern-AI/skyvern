@@ -1450,6 +1450,23 @@ class WorkflowService:
             ):
                 blocks_to_update.add(block.label)
 
+            # Invalidate cache for blocks with continue_on_failure=True that failed
+            # This ensures the block runs fresh with AI on the next cached run
+            if (
+                block.label
+                and block.continue_on_failure
+                and workflow_run_block_result.status != BlockStatus.completed
+                and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                and block.label in script_blocks_by_label
+            ):
+                blocks_to_update.add(block.label)
+                LOG.info(
+                    "Block with continue_on_failure failed during cached execution, marking for regeneration",
+                    block_label=block.label,
+                    block_status=workflow_run_block_result.status,
+                    workflow_run_id=workflow_run_id,
+                )
+
             workflow_run, should_stop = await self._handle_block_result_status(
                 block=block,
                 block_idx=block_idx,
