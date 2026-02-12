@@ -216,7 +216,7 @@ class Settings(BaseSettings):
     OPENAI_COMPATIBLE_ADD_ASSISTANT_PREFIX: bool = False
     OPENAI_COMPATIBLE_MODEL_KEY: str = "OPENAI_COMPATIBLE"
     OPENAI_COMPATIBLE_REASONING_EFFORT: str | None = None
-    GITHUB_COPILOT_DOMAIN: str = "githubcopilot.com"
+    OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN: str = "githubcopilot.com"
 
     # AZURE
     AZURE_DEPLOYMENT: str | None = None

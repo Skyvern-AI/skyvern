@@ -1792,55 +1792,41 @@ async def update_task_v2_status_to_workflow_run_status(
     return task_v2
 
 
+def _truncate_extracted_data(
+    entry: dict,
+    max_extracted_data_size: int = 1000,
+) -> dict:
+    """Truncate extracted_data field in a single entry to reduce payload size."""
+    entry_copy = entry.copy()
+    if "extracted_data" in entry_copy:
+        data_str = str(entry_copy["extracted_data"])
+        if len(data_str) > max_extracted_data_size:
+            entry_copy["extracted_data"] = data_str[:max_extracted_data_size] + "... [truncated]"
+    return entry_copy
+
+
 def _truncate_task_history_for_completion_check(
     task_history: list[dict],
     max_entries: int = 5,
     max_extracted_data_size: int = 1000,
 ) -> list[dict]:
-    """Truncate task history to reduce payload size for completion checks.
+    """Truncate task history to reduce payload size for completion checks."""
+    # Select entries to process
+    entries_to_process = task_history if len(task_history) <= max_entries else task_history[-max_entries:]
 
-    This function limits the number of task history entries and truncates large
-    extracted_data fields to prevent "Request Entity Too Large" errors when
-    sending to LLM APIs with strict payload limits.
+    # Process all entries uniformly
+    result = [_truncate_extracted_data(entry, max_extracted_data_size) for entry in entries_to_process]
 
-    Args:
-        task_history: Full task history from workflow execution
-        max_entries: Maximum number of recent entries to keep (default: 5)
-        max_extracted_data_size: Max characters for extracted_data fields (default: 1000)
+    # Log only when truncation occurred
+    if len(task_history) > max_entries:
+        LOG.info(
+            "Truncated task history for completion check",
+            original_length=len(task_history),
+            truncated_length=len(result),
+            max_entries=max_entries,
+        )
 
-    Returns:
-        Truncated task history with recent entries and condensed data
-    """
-    if len(task_history) <= max_entries:
-        # If history is small enough, just truncate extracted_data
-        result = []
-        for entry in task_history:
-            entry_copy = entry.copy()
-            if "extracted_data" in entry_copy:
-                data_str = str(entry_copy["extracted_data"])
-                if len(data_str) > max_extracted_data_size:
-                    entry_copy["extracted_data"] = data_str[:max_extracted_data_size] + "... [truncated]"
-            result.append(entry_copy)
-        return result
-
-    # Keep last max_entries tasks
-    truncated = []
-    for entry in task_history[-max_entries:]:
-        entry_copy = entry.copy()
-        if "extracted_data" in entry_copy:
-            data_str = str(entry_copy["extracted_data"])
-            if len(data_str) > max_extracted_data_size:
-                entry_copy["extracted_data"] = data_str[:max_extracted_data_size] + "... [truncated]"
-        truncated.append(entry_copy)
-
-    LOG.info(
-        "Truncated task history for completion check",
-        original_length=len(task_history),
-        truncated_length=len(truncated),
-        max_entries=max_entries,
-    )
-
-    return truncated
+    return result
 
 
 def _get_extracted_data_from_block_result(

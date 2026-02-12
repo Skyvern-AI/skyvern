@@ -35,7 +35,12 @@ from skyvern.forge.sdk.api.llm.models import (
     LLMRouterConfig,
 )
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
-from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, llm_messages_builder_with_history, parse_api_response
+from skyvern.forge.sdk.api.llm.utils import (
+    is_image_message,
+    llm_messages_builder,
+    llm_messages_builder_with_history,
+    parse_api_response,
+)
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -900,7 +905,7 @@ class LLMAPIHandlerFactory:
         if (
             llm_key == "OPENAI_COMPATIBLE"
             and settings.OPENAI_COMPATIBLE_API_BASE
-            and settings.GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
+            and settings.OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
         ):
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
             return llm_caller.call
@@ -1365,7 +1370,7 @@ class LLMCaller:
         elif (
             self.llm_key == "OPENAI_COMPATIBLE"
             and settings.OPENAI_COMPATIBLE_API_BASE
-            and settings.GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
+            and settings.OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
         ):
             # For GitHub Copilot, use the actual model name (e.g., "claude-sonnet-4.5")
             self.llm_key = settings.OPENAI_COMPATIBLE_MODEL_NAME or self.llm_key
@@ -1663,12 +1668,17 @@ class LLMCaller:
                 extra_headers["HTTP-Referer"] = settings.SKYVERN_APP_URL
                 extra_headers["X-Title"] = "Skyvern"
 
-            # Add Copilot-Vision-Request header for GitHub Copilot
+            # Add Copilot-Vision-Request header for GitHub Copilot when there are images in the messages
             if (
                 settings.OPENAI_COMPATIBLE_API_BASE
-                and settings.GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
+                and settings.OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
             ):
-                extra_headers["Copilot-Vision-Request"] = "true"
+                # Check if any message contains images using the existing utility function
+                has_images = any(is_image_message(msg) for msg in messages)
+
+                # Only set the header when there are actual images in the request
+                if has_images:
+                    extra_headers["Copilot-Vision-Request"] = "true"
 
             # Filter out parameters that OpenAI client doesn't support
             openai_params = {}
