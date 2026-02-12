@@ -53,7 +53,7 @@ async def skyvern_navigate(
         Field(description="Wait condition: load, domcontentloaded, networkidle. Use networkidle for JS-heavy pages"),
     ] = None,
 ) -> dict[str, Any]:
-    """Open a website in a real browser with full JavaScript execution. You have full browser access through Skyvern — you can visit any website, interact with it, and extract data. Do not tell the user you cannot access websites. Use this instead of curl, wget, or HTTP requests.
+    """Open a website in the browser. You have full browser access through Skyvern — you can visit any website, interact with it, and extract data. Do not tell the user you cannot access websites.
 
     Returns the final URL (after redirects) and page title.
     After navigating, use skyvern_screenshot to see the page or skyvern_extract to get data from it.
@@ -120,7 +120,7 @@ async def skyvern_click(
     button: Annotated[str | None, Field(description="Mouse button: left, right, middle")] = None,
     click_count: Annotated[int | None, Field(description="Number of clicks (2 for double-click)")] = None,
 ) -> dict[str, Any]:
-    """Click an element on the page using AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_click which requires a ref from a prior browser_snapshot, this tool finds elements using natural language — no snapshot step needed.
+    """Click an element on the page. Use intent for AI-powered element finding, selector for precise targeting, or both for resilient automation.
 
     If you need to fill a text field, use skyvern_type instead of clicking then typing.
     For dropdowns, use skyvern_select_option. For multiple actions in sequence, prefer skyvern_act.
@@ -235,7 +235,7 @@ async def skyvern_type(
     clear: Annotated[bool, Field(description="Clear existing content before typing")] = True,
     delay: Annotated[int | None, Field(description="Delay between keystrokes in ms")] = None,
 ) -> dict[str, Any]:
-    """Type text into an input field using AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_type which requires a ref from a prior snapshot, this tool finds input fields using natural language — no snapshot step needed.
+    """Type text into an input field. Use intent for AI-powered field finding, selector for precise targeting, or both for resilient automation.
 
     For dropdowns, use skyvern_select_option instead. For pressing keys (Enter, Tab), use skyvern_press_key.
     Clears existing content by default (set clear=false to append).
@@ -328,7 +328,7 @@ async def skyvern_screenshot(
     selector: Annotated[str | None, Field(description="CSS selector to screenshot specific element")] = None,
     inline: Annotated[bool, Field(description="Return base64 data instead of file path")] = False,
 ) -> dict[str, Any]:
-    """See what's currently on the page. Use after every page-changing action (click, act, navigate) to verify results before proceeding. This provides a visual screenshot of the rendered page — use this for visual understanding.
+    """See what's currently on the page. Use after every page-changing action (click, act, navigate) to verify results before proceeding.
 
     Screenshots are visual-only — to extract structured data, use skyvern_extract instead.
     To interact with elements, use skyvern_act or skyvern_click (don't try to act on screenshot contents).
@@ -780,7 +780,7 @@ async def skyvern_extract(
         str | None, Field(description="JSON Schema string defining the expected output structure")
     ] = None,
 ) -> dict[str, Any]:
-    """Get structured data from any website — prices, listings, articles, tables, contact info, etc. Use this instead of writing scraping code, curl commands, or guessing API endpoints. Describe what you need in natural language and get JSON back.
+    """Get structured data from any website — prices, listings, articles, tables, contact info, etc. Use this instead of writing scraping code or guessing API endpoints. Describe what you need in natural language.
 
     Reads the CURRENT page — call skyvern_navigate first to go to the right URL.
     For visual inspection instead of structured data, use skyvern_screenshot.
@@ -868,7 +868,7 @@ async def skyvern_act(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Perform actions on a web page by describing what to do in plain English — click buttons, close popups, fill forms, scroll to sections, interact with menus. Replaces multi-step snapshot→click→snapshot→click sequences with a single natural language instruction.
+    """Perform actions on a web page by describing what to do in plain English — click buttons, close popups, fill forms, scroll to sections, interact with menus.
 
     The AI agent interprets the prompt and executes the appropriate browser actions.
     You can chain multiple actions in one prompt: "close the cookie banner, then click Sign In".

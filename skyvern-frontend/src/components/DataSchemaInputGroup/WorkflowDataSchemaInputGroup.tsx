@@ -1,5 +1,14 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import {
   Cross2Icon,
@@ -12,7 +21,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { helpTooltips } from "@/routes/workflows/editor/helpContent";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { AutoResizingTextarea } from "../AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "../ui/button";
 import { AxiosError } from "axios";
@@ -36,6 +45,13 @@ function WorkflowDataSchemaInputGroup({
   const credentialGetter = useCredentialGetter();
   const [generateWithAIActive, setGenerateWithAIActive] = useState(false);
   const [generateWithAIPrompt, setGenerateWithAIPrompt] = useState("");
+  const [pendingSchema, setPendingSchema] = useState<string | null>(null);
+
+  const resetAIState = useCallback(() => {
+    setPendingSchema(null);
+    setGenerateWithAIActive(false);
+    setGenerateWithAIPrompt("");
+  }, []);
 
   const tsonResult = useMemo(() => {
     if (value === "null") return null;
@@ -54,7 +70,10 @@ function WorkflowDataSchemaInputGroup({
       );
     },
     onSuccess: (response) => {
-      onChange(JSON.stringify(response.data.output, null, 2));
+      if (value === "null") {
+        return;
+      }
+      setPendingSchema(JSON.stringify(response.data.output, null, 2));
     },
     onError: (error: AxiosError) => {
       toast({
@@ -77,6 +96,9 @@ function WorkflowDataSchemaInputGroup({
           <Checkbox
             checked={value !== "null"}
             onCheckedChange={(checked) => {
+              if (!checked) {
+                resetAIState();
+              }
               onChange(
                 checked ? JSON.stringify(exampleValue, null, 2) : "null",
               );
@@ -104,8 +126,8 @@ function WorkflowDataSchemaInputGroup({
               <Cross2Icon
                 className="size-4 cursor-pointer"
                 onClick={() => {
-                  setGenerateWithAIActive(false);
-                  setGenerateWithAIPrompt("");
+                  getDataSchemaSuggestionMutation.reset();
+                  resetAIState();
                 }}
               />
               <AutoResizingTextarea
@@ -120,8 +142,19 @@ function WorkflowDataSchemaInputGroup({
                 <ReloadIcon className="size-4 animate-spin" />
               ) : (
                 <PaperPlaneIcon
-                  className="size-4 cursor-pointer"
+                  className={cn(
+                    "size-4",
+                    pendingSchema !== null || !generateWithAIPrompt.trim()
+                      ? "cursor-not-allowed opacity-50"
+                      : "cursor-pointer",
+                  )}
                   onClick={() => {
+                    if (
+                      pendingSchema !== null ||
+                      !generateWithAIPrompt.trim()
+                    ) {
+                      return;
+                    }
                     getDataSchemaSuggestionMutation.mutate();
                   }}
                 />
@@ -148,6 +181,70 @@ function WorkflowDataSchemaInputGroup({
             <div className="text-xs text-red-400">{tsonResult.error}</div>
           )}
         </div>
+      )}
+      {value !== "null" && (
+        <Dialog
+          open={pendingSchema !== null}
+          onOpenChange={(open) => {
+            if (!open) {
+              getDataSchemaSuggestionMutation.reset();
+              resetAIState();
+            }
+          }}
+        >
+          <DialogContent className="max-w-4xl">
+            <DialogHeader>
+              <DialogTitle>Review AI-Generated Schema</DialogTitle>
+              <DialogDescription>
+                Review the AI-generated schema before applying it. This will
+                replace your current data schema.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label className="text-sm text-slate-400">Current Schema</Label>
+                <CodeEditor
+                  language="json"
+                  value={value}
+                  readOnly
+                  className="nopan"
+                  fontSize={10}
+                  minHeight="200px"
+                  maxHeight="400px"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label className="text-sm text-slate-400">
+                  Proposed Schema
+                </Label>
+                <CodeEditor
+                  language="json"
+                  value={pendingSchema ?? ""}
+                  readOnly
+                  className="nopan"
+                  fontSize={10}
+                  minHeight="200px"
+                  maxHeight="400px"
+                />
+              </div>
+            </div>
+            <DialogFooter>
+              <DialogClose asChild>
+                <Button variant="secondary">Cancel</Button>
+              </DialogClose>
+              <Button
+                onClick={() => {
+                  if (pendingSchema !== null) {
+                    onChange(pendingSchema);
+                  }
+                  resetAIState();
+                }}
+              >
+                Accept Changes
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
     </div>
   );
