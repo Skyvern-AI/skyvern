@@ -3577,6 +3577,7 @@ class ForgeAgent:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
                 task_id=task.task_id, browser_state=browser_state
             )
+            LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
                 await app.ARTIFACT_MANAGER.update_artifact_data(
                     artifact_id=video_artifact.video_artifact_id,
@@ -3585,6 +3586,7 @@ class ForgeAgent:
                 )
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
+            LOG.debug("Uploading har data", har_size=len(har_data))
             if har_data:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=last_step,
@@ -3595,6 +3597,7 @@ class ForgeAgent:
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
                 task_id=task.task_id, browser_state=browser_state
             )
+            LOG.debug("Uploading browser log", browser_log_size=len(browser_log))
             if browser_log:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=last_step,
