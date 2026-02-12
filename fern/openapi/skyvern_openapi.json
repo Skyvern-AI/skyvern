@@ -2361,6 +2361,98 @@
         ]
       }
     },
+    "/v1/credentials/{credential_id}/update": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Update credential",
+        "description": "Overwrites the stored credential data (e.g. username/password) while keeping the same credential_id.",
+        "operationId": "update_credential_v1_credentials__credential_id__update_post",
+        "parameters": [
+          {
+            "name": "credential_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the credential to update",
+              "examples": [
+                "cred_1234567890"
+              ],
+              "openapi_extra": {
+                "x-fern-sdk-parameter-name": "credential_id"
+              },
+              "title": "Credential Id"
+            },
+            "description": "The unique identifier of the credential to update"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCredentialRequest",
+                "description": "The new credential data to store",
+                "openapi_extra": {
+                  "x-fern-sdk-parameter-name": "data"
+                }
+              },
+              "example": {
+                "name": "My Credential",
+                "credential_type": "PASSWORD",
+                "credential": {
+                  "username": "user@example.com",
+                  "password": "newpassword123"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_credential"
+      }
+    },
     "/v1/credentials/{credential_id}/delete": {
       "post": {
         "tags": [
@@ -16434,6 +16526,13 @@
           "type": {
             "type": "string",
             "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
           }
         },
         "type": "object",
