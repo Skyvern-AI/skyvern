@@ -2391,6 +2391,66 @@ async def generate_workflow_script_python_code(
 
         append_block_code(block_code)
 
+    # --- preserve cached blocks from unexecuted branches ----------------
+    # When a workflow has conditional blocks, not all branches execute in a single run.
+    # transform_workflow_run_to_code_gen_input() only returns blocks that executed,
+    # so cached blocks from unexecuted branches would be lost during regeneration
+    # if we don't explicitly preserve them here.
+    processed_labels: set[str] = set()
+    for task in task_v1_blocks:
+        label = task.get("label") or task.get("title") or task.get("task_id")
+        if label:
+            processed_labels.add(label)
+    for task_v2 in task_v2_blocks:
+        label = task_v2.get("label") or f"task_v2_{task_v2.get('workflow_run_block_id')}"
+        processed_labels.add(label)
+    for flb in for_loop_blocks:
+        label = flb.get("label") or f"for_loop_{flb.get('workflow_run_block_id')}"
+        processed_labels.add(label)
+
+    preserved_count = 0
+    for cached_label, cached_source in cached_blocks.items():
+        if cached_label in processed_labels:
+            continue  # Already processed above
+        if not cached_source.code or not cached_source.run_signature:
+            continue  # Skip entries without usable code/metadata
+
+        if script_id and script_revision_id and organization_id:
+            try:
+                await create_or_update_script_block(
+                    block_code=cached_source.code,
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    block_label=cached_label,
+                    update=pending,
+                    run_signature=cached_source.run_signature,
+                    workflow_run_id=cached_source.workflow_run_id,
+                    workflow_run_block_id=cached_source.workflow_run_block_id,
+                    input_fields=cached_source.input_fields,
+                )
+            except Exception as e:
+                LOG.error(
+                    "Failed to preserve cached script block from unexecuted branch",
+                    error=str(e),
+                    block_label=cached_label,
+                    exc_info=True,
+                )
+
+        append_block_code(cached_source.code)
+        preserved_count += 1
+
+    if preserved_count > 0:
+        LOG.info(
+            "Preserved cached blocks from unexecuted branches during regeneration",
+            preserved_count=preserved_count,
+            preserved_labels=[
+                label
+                for label in cached_blocks
+                if label not in processed_labels and cached_blocks[label].code and cached_blocks[label].run_signature
+            ],
+        )
+
     # --- runner ---------------------------------------------------------
     run_fn = _build_run_fn(blocks, workflow_run_request)
 
