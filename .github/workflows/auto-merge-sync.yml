@@ -43,7 +43,7 @@ jobs:
               echo "GH_PAT=${{ secrets.CELAL_GH_PAT }}" >> $GITHUB_OUTPUT
               ;;
             *)
-              echo "GH_PAT=${{ secrets.SKYVERN_OSS_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
               echo "Author $PR_AUTHOR is not in the approved list"
               ;;
           esac
