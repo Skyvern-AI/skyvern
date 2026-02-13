@@ -7,7 +7,7 @@ log-ingestion.txt
 logs
 *.log
 current.json
-
+.cyrus*
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
