@@ -3099,11 +3099,6 @@ class WorkflowService:
             organization_id=workflow_run.organization_id,
             include_step_count=True,
         )
-        LOG.info(
-            "Built workflow run status response",
-            workflow_run_status_response=workflow_run_status_response,
-        )
-
         if not workflow_run.webhook_callback_url:
             LOG.warning(
                 "Workflow has no webhook callback url. Not sending workflow response",
