@@ -2571,7 +2571,11 @@ async def generate_workflow_script_python_code(
             except Exception as e:
                 LOG.error("Failed to create for_loop script block", error=str(e), exc_info=True)
 
-        append_block_code(block_code)
+        # NOTE: Do NOT call append_block_code() for for_loop blocks.
+        # Unlike task blocks (which produce function definitions valid at module level),
+        # for_loop blocks produce bare `async for` statements that cause SyntaxError
+        # at module level ("async for outside async function"). The for-loop code is
+        # already correctly inlined inside run_workflow() via _build_block_statement().
 
     # --- preserve cached blocks from unexecuted branches ----------------
     # When a workflow has conditional blocks, not all branches execute in a single run.
