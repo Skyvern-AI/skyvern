@@ -349,7 +349,7 @@ async def skyvern_workflow_create(
     Best practice: use one block per logical step with a short focused prompt (2-3 sentences).
     Use "navigation" blocks for actions (filling forms, clicking) and "extraction" blocks for pulling data.
     Do NOT use the deprecated "task" block type.
-    Common block types: navigation, extraction, task_v2, for_loop, conditional, code, text_prompt, action, wait, login.
+    Common block types: navigation, extraction, for_loop, conditional, code, text_prompt, action, wait, login.
     Call skyvern_block_schema() for the full list with schemas and examples.
 
     Example JSON definition (multi-block EIN application):
