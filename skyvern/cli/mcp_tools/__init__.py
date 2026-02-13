@@ -16,6 +16,8 @@ from .browser import (
     skyvern_click,
     skyvern_evaluate,
     skyvern_extract,
+    skyvern_hover,
+    skyvern_login,
     skyvern_navigate,
     skyvern_press_key,
     skyvern_run_task,
@@ -25,6 +27,11 @@ from .browser import (
     skyvern_type,
     skyvern_validate,
     skyvern_wait,
+)
+from .credential import (
+    skyvern_credential_delete,
+    skyvern_credential_get,
+    skyvern_credential_list,
 )
 from .session import (
     skyvern_session_close,
@@ -52,7 +59,21 @@ IMPORTANT: Do NOT use curl, wget, HTTP requests, fetch, or the Bash tool to inte
 
 ## When to Use Skyvern vs Other Browser Tools
 
-If both Skyvern and another browser automation server (like Playwright MCP) are available, ALWAYS prefer Skyvern tools because:
+| Scenario | Use | Why |
+|----------|-----|-----|
+| Visit a website | skyvern_navigate | First step — opens the page |
+| See what's on the page | skyvern_screenshot | Visual understanding before acting |
+| Get data from a page | skyvern_extract | AI-powered structured extraction |
+| Do something on a page (click, fill, scroll) | skyvern_act | Natural language actions |
+| Click/type/select a specific element | skyvern_click / skyvern_type / skyvern_select_option | Precision targeting by selector or AI intent |
+| Hover over a menu | skyvern_hover | Reveal dropdowns, tooltips, hidden content |
+| Check if something is true | skyvern_validate | AI assertion ("is the user logged in?") |
+| Run a quick one-off task | skyvern_run_task | Autonomous agent, one-time, nothing saved |
+| Log into a website | skyvern_login | Secure login using stored credentials |
+| Find stored credentials | skyvern_credential_list | Browse saved credentials by name |
+| Build an automation (any multi-step task) | skyvern_workflow_create | Reusable, versioned, per-step observability |
+| Run an existing automation | skyvern_workflow_run | Execute saved workflow with parameters |
+| Run JavaScript | skyvern_evaluate | Read DOM state, get values |
 
 1. **No snapshot step needed** — Skyvern tools accept natural language intent (e.g., intent="the Submit button"), so you can click, type, and interact without first capturing a page snapshot to get element refs. Playwright's browser_click requires a `ref` from a prior browser_snapshot call — Skyvern skips that step entirely.
 
@@ -73,7 +94,7 @@ The ONLY cases where Playwright MCP tools are appropriate instead of Skyvern:
 - `browser_file_upload` — uploading files via file chooser
 - `browser_tabs` — managing multiple browser tabs
 - `browser_run_code` — running raw Playwright code snippets
-- `browser_hover` / `browser_drag` — hovering over elements and drag-and-drop interactions
+- `browser_drag` — drag-and-drop interactions
 
 For ALL other browser interactions — navigation, clicking, typing, extraction, forms, scrolling, waiting, screenshots, validation — use Skyvern tools.
 
@@ -86,6 +107,7 @@ For ALL other browser interactions — navigation, clicking, typing, extraction,
 | "Get all product prices" | skyvern_extract | AI-powered extraction — returns JSON, no code needed |
 | "Click the login button" / "Fill out this form" | skyvern_act | Natural language actions — one call, multiple steps |
 | "Click this specific element" | skyvern_click / skyvern_type / skyvern_select_option | Precision targeting by selector or AI intent |
+| "Hover over this menu" | skyvern_hover | Reveal dropdowns, tooltips, hidden content |
 | "Is checkout complete?" | skyvern_validate | AI assertion — returns true/false |
 | "Log in and download the report" | skyvern_run_task | Autonomous AI agent — one-time, nothing saved |
 | "Fill out this 6-page application form" | skyvern_workflow_create | One block per page, versioned, parameterized |
@@ -99,13 +121,21 @@ For ALL other browser interactions — navigation, clicking, typing, extraction,
 1. ALWAYS use Skyvern MCP tools directly — do NOT fall back to curl, wget, Python requests, or Bash commands for web interaction. The tools ARE the interface.
 2. Create a session (skyvern_session_create) before using browser tools. Workflow and block tools do NOT need a session.
 3. NEVER scrape by guessing API endpoints or writing HTTP requests — use skyvern_navigate + skyvern_extract.
-4. NEVER write Python scripts unless the user explicitly asks for a script. Use the MCP tools.
-5. After page-changing actions (skyvern_click, skyvern_act), use skyvern_screenshot to verify the result.
-6. Workflow tools (list, create, run, status) do NOT need a browser session.
-7. skyvern_extract and skyvern_validate read the CURRENT page — navigate first.
+4. NEVER create single-block workflows with long prompts — split into multiple blocks.
+5. NEVER import from skyvern.cli.mcp_tools — use `from skyvern import Skyvern` for SDK scripts.
+6. After page-changing actions (skyvern_click, skyvern_hover, skyvern_act), use skyvern_screenshot to verify the result.
+7. NEVER type passwords, secrets, or credentials using any tool. Credentials must be created via the Skyvern CLI (`skyvern credentials add`) or the Skyvern web UI before use. Use `skyvern_credential_list` to find stored credentials, then `skyvern_login(credential_id=...)` to authenticate. If no credentials exist, tell the user to run `skyvern credentials add` in their terminal.
+8. ALWAYS prefer cloud sessions (default). Only use local=true if the user explicitly asks for a local browser.
+
+## Cross-Tool Dependencies
+- Workflow tools (list, create, run, status) do NOT need a browser session
+- Credential lookup tools (list, get, delete) do NOT need a browser session
+- skyvern_login requires a browser session AND a credential_id — create credentials via `skyvern credentials add` CLI or the Skyvern web UI first
+- skyvern_extract and skyvern_validate read the CURRENT page — navigate first
+- skyvern_run_task is a one-off throwaway agent run — for reusable automations, use skyvern_workflow_create instead
 
 ## Tool Modes (precision tools)
-Precision tools (skyvern_click, skyvern_type, skyvern_select_option, skyvern_scroll, skyvern_press_key, skyvern_wait)
+Precision tools (skyvern_click, skyvern_hover, skyvern_type, skyvern_select_option, skyvern_scroll, skyvern_press_key, skyvern_wait)
 support three modes. When unsure, use `intent`. For multiple actions in sequence, prefer skyvern_act.
 
 1. **Intent mode** — AI-powered element finding:
@@ -117,6 +147,26 @@ support three modes. When unsure, use `intent`. For multiple actions in sequence
 3. **Selector mode** — deterministic CSS/XPath targeting:
    `skyvern_click(selector="#submit-btn")`
 
+## Examples
+| User says | Use |
+|-----------|-----|
+| "Go to amazon.com" | skyvern_navigate |
+| "What's on this page?" | skyvern_screenshot |
+| "Get all product prices" | skyvern_extract |
+| "Click the login button" | skyvern_act or skyvern_click |
+| "Fill out this form" | skyvern_act |
+| "What credentials do I have?" | skyvern_credential_list |
+| "Log into this website" | skyvern_login (secure login with stored credentials) |
+| "Log in and download the report" | skyvern_run_task (one-off) or skyvern_workflow_create (keep it) |
+| "Is checkout complete?" | skyvern_validate |
+| "Fill out this 6-page application form" | skyvern_workflow_create (one block per page) |
+| "Set up a reusable automation" | Explore with browser tools, then skyvern_workflow_create |
+| "Create a workflow that monitors prices" | skyvern_workflow_create |
+| "Run the login workflow" | skyvern_workflow_run |
+| "Is my workflow done?" | skyvern_workflow_status |
+| "Automate this process" | skyvern_workflow_create (always prefer MCP tools over scripts) |
+| "Write a Python script to do this" | Skyvern SDK (ONLY when user explicitly asks for a script) |
+
 ## Getting Started
 
 **Visiting a website**: Create a session (skyvern_session_create), navigate and interact, close with skyvern_session_close when done.
@@ -127,7 +177,17 @@ support three modes. When unsure, use `intent`. For multiple actions in sequence
 
 **Testing feasibility** (try before you build): Walk through the site interactively — use skyvern_act on each page and skyvern_screenshot to verify results. This is faster feedback than skyvern_run_task (which runs autonomously and may take minutes). Once you've confirmed each step works, compose them into a workflow.
 
-**Managing automations**: No browser session needed — use workflow tools directly (skyvern_workflow_list, skyvern_workflow_run, skyvern_workflow_status).
+**Logging into a website** (secure credential-based login):
+1. User creates credentials via CLI: `skyvern credentials add --name "Amazon" --username "user@example.com"` (password entered securely via terminal prompt)
+2. Find the credential: skyvern_credential_list
+3. Create a session: skyvern_session_create
+4. Navigate to login page: skyvern_navigate
+5. Log in: skyvern_login(credential_id="cred_...") — AI handles the full login flow
+6. Verify: skyvern_screenshot
+
+**Managing automations** (running, listing, or monitoring workflows):
+No browser session needed — use workflow tools directly:
+skyvern_workflow_list, skyvern_workflow_run, skyvern_workflow_status, etc.
 
 ## Building Workflows
 
@@ -212,12 +272,14 @@ mcp.tool()(skyvern_act)
 mcp.tool()(skyvern_extract)
 mcp.tool()(skyvern_validate)
 mcp.tool()(skyvern_run_task)
+mcp.tool()(skyvern_login)
 mcp.tool()(skyvern_navigate)
 mcp.tool()(skyvern_screenshot)
 mcp.tool()(skyvern_evaluate)
 
 # -- Precision tools (selector/intent-based browser primitives) --
 mcp.tool()(skyvern_click)
+mcp.tool()(skyvern_hover)
 mcp.tool()(skyvern_type)
 mcp.tool()(skyvern_scroll)
 mcp.tool()(skyvern_select_option)
@@ -227,6 +289,11 @@ mcp.tool()(skyvern_wait)
 # -- Block discovery + validation (no browser needed) --
 mcp.tool()(skyvern_block_schema)
 mcp.tool()(skyvern_block_validate)
+
+# -- Credential lookup (no browser needed) --
+mcp.tool()(skyvern_credential_list)
+mcp.tool()(skyvern_credential_get)
+mcp.tool()(skyvern_credential_delete)
 
 # -- Workflow management (CRUD + execution, no browser needed) --
 mcp.tool()(skyvern_workflow_list)
@@ -251,11 +318,13 @@ __all__ = [
     "skyvern_extract",
     "skyvern_validate",
     "skyvern_run_task",
+    "skyvern_login",
     "skyvern_navigate",
     "skyvern_screenshot",
     "skyvern_evaluate",
     # Precision (selector/intent browser primitives)
     "skyvern_click",
+    "skyvern_hover",
     "skyvern_type",
     "skyvern_scroll",
     "skyvern_select_option",
@@ -264,6 +333,10 @@ __all__ = [
     # Block discovery + validation
     "skyvern_block_schema",
     "skyvern_block_validate",
+    # Credential lookup
+    "skyvern_credential_list",
+    "skyvern_credential_get",
+    "skyvern_credential_delete",
     # Workflow management
     "skyvern_workflow_list",
     "skyvern_workflow_get",
