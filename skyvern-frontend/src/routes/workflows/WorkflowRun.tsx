@@ -25,6 +25,7 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { runsApiBaseUrl } from "@/util/env";
 import {
+  ChatBubbleIcon,
   CodeIcon,
   FileIcon,
   Pencil2Icon,
@@ -51,6 +52,7 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
 import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowRunStatusAlert";
+import { DiagnosisChatPanel } from "./diagnosis";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -113,6 +115,7 @@ function WorkflowRun() {
 
   const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
   const [replayOpen, setReplayOpen] = useState(false);
+  const [showDiagnosis, setShowDiagnosis] = useState(false);
 
   const cancelWorkflowMutation = useMutation({
     mutationFn: async () => {
@@ -300,6 +303,12 @@ function WorkflowRun() {
 
   const isGeneratingCode = !isFinalized && !hasPublishedCode;
 
+  // Show diagnosis option for completed/failed/terminated runs
+  const canShowDiagnosis =
+    workflowRun?.status === Status.Completed ||
+    workflowRun?.status === Status.Failed ||
+    workflowRun?.status === Status.Terminated;
+
   const switchBarOptions: SwitchBarNavigationOption[] = [
     {
       label: "Overview",
@@ -445,6 +454,15 @@ function WorkflowRun() {
                 </Link>
               </Button>
             )}
+            {canShowDiagnosis && (
+              <Button
+                variant={showDiagnosis ? "default" : "secondary"}
+                onClick={() => setShowDiagnosis(!showDiagnosis)}
+              >
+                <ChatBubbleIcon className="mr-2 h-4 w-4" />
+                {showDiagnosis ? "Hide Diagnosis" : "Diagnose"}
+              </Button>
+            )}
           </div>
         </header>
       )}
@@ -517,10 +535,14 @@ function WorkflowRun() {
         </div>
       )}
       <div className="flex h-[42rem] gap-6">
-        <div className="w-2/3">
+        <div
+          className={cn("transition-all", showDiagnosis ? "w-1/2" : "w-2/3")}
+        >
           <Outlet />
         </div>
-        <div className="w-1/3">
+        <div
+          className={cn("transition-all", showDiagnosis ? "w-1/4" : "w-1/3")}
+        >
           <WorkflowRunTimeline
             activeItem={selection}
             onActionItemSelected={(item) => {
@@ -537,6 +559,14 @@ function WorkflowRun() {
             }}
           />
         </div>
+        {showDiagnosis && workflowRunId && (
+          <div className="w-1/4 overflow-hidden rounded-lg">
+            <DiagnosisChatPanel
+              workflowRunId={workflowRunId}
+              className="h-full"
+            />
+          </div>
+        )}
       </div>
     </div>
   );

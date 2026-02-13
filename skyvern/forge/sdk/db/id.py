@@ -71,6 +71,8 @@ WORKFLOW_TEMPLATE_PREFIX = "wt"
 ORGANIZATION_BILLING_PREFIX = "ob"
 WORKFLOW_COPILOT_CHAT_PREFIX = "wcc"
 WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX = "wccm"
+DIAGNOSIS_CONVERSATION_PREFIX = "dc"
+DIAGNOSIS_MESSAGE_PREFIX = "dm"
 
 
 def generate_workflow_id() -> str:
@@ -276,6 +278,16 @@ def generate_workflow_copilot_chat_id() -> str:
 def generate_workflow_copilot_chat_message_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX}_{int_id}"
+
+
+def generate_diagnosis_conversation_id() -> str:
+    int_id = generate_id()
+    return f"{DIAGNOSIS_CONVERSATION_PREFIX}_{int_id}"
+
+
+def generate_diagnosis_message_id() -> str:
+    int_id = generate_id()
+    return f"{DIAGNOSIS_MESSAGE_PREFIX}_{int_id}"
 
 
 ############# Helper functions below ##############
