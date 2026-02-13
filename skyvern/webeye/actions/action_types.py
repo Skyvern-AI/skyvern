@@ -53,4 +53,5 @@ POST_ACTION_EXECUTION_ACTION_TYPES = [
     ActionType.SOLVE_CAPTCHA,
     ActionType.EXTRACT,
     ActionType.KEYPRESS,
+    ActionType.SCROLL,
 ]

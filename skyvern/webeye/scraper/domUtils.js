@@ -2326,6 +2326,56 @@ function isWindowScrollable() {
   return true;
 }
 
+/**
+ * Find the nearest scrollable container relative to the given element and scroll it.
+ * Two strategies:
+ *   1) Walk up from element to find a scrollable ancestor (element is inside container)
+ *   2) Walk up the DOM checking siblings at each level (element is beside container)
+ * Returns true if a scrollable container was found and scrolled, false otherwise.
+ */
+function scrollNearestScrollableContainer(element, direction) {
+  function isContainerScrollable(node) {
+    if (!node || node === document.documentElement || node === document.body)
+      return false;
+    const style = window.getComputedStyle(node);
+    const oy = style.overflowY;
+    return (
+      (oy === "auto" || oy === "scroll") &&
+      node.scrollHeight > node.clientHeight
+    );
+  }
+
+  // Strategy 1: walk up from element to find a scrollable ancestor
+  let target = element;
+  while (target && target !== document.documentElement) {
+    if (isContainerScrollable(target)) break;
+    target = target.parentElement;
+  }
+
+  // Strategy 2: walk up the DOM checking siblings at each level
+  if (!target || target === document.documentElement) {
+    target = null;
+    let level = element.parentElement;
+    while (level && level !== document.documentElement && !target) {
+      for (const child of level.children) {
+        if (isContainerScrollable(child)) {
+          target = child;
+          break;
+        }
+      }
+      level = level.parentElement;
+    }
+  }
+
+  if (!target) return false;
+  if (direction === "down") {
+    target.scrollTop = target.scrollHeight;
+  } else {
+    target.scrollTop = 0;
+  }
+  return true;
+}
+
 function scrollToElementBottom(element, page_by_page = false) {
   const top = page_by_page
     ? element.clientHeight + element.scrollTop
