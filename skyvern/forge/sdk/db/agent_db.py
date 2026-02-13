@@ -2701,6 +2701,9 @@ class AgentDB(BaseAlchemyDB):
         ai_fallback: bool | None = None,
         depends_on_workflow_run_id: str | None = None,
         browser_session_id: str | None = None,
+        waiting_for_verification_code: bool | None = None,
+        verification_code_identifier: str | None = None,
+        verification_code_polling_started_at: datetime | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -2733,6 +2736,17 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
                 if browser_session_id:
                     workflow_run.browser_session_id = browser_session_id
+                # 2FA verification code waiting state updates
+                if waiting_for_verification_code is not None:
+                    workflow_run.waiting_for_verification_code = waiting_for_verification_code
+                    # Clear related fields when waiting is set to False
+                    if not waiting_for_verification_code:
+                        workflow_run.verification_code_identifier = None
+                        workflow_run.verification_code_polling_started_at = None
+                if verification_code_identifier is not None:
+                    workflow_run.verification_code_identifier = verification_code_identifier
+                if verification_code_polling_started_at is not None:
+                    workflow_run.verification_code_polling_started_at = verification_code_polling_started_at
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)
