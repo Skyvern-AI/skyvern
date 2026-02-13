@@ -870,6 +870,15 @@ class OutputParameterNotFound(SkyvernHTTPException):
         )
 
 
+class TemporalSubmissionFailed(SkyvernHTTPException):
+    def __init__(self, workflow_type: str, workflow_run_id: str | None = None) -> None:
+        workflow_run_str = f" for workflow_run_id={workflow_run_id}" if workflow_run_id else ""
+        super().__init__(
+            f"Failed to submit {workflow_type} to Temporal{workflow_run_str}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
 class AzureBaseError(SkyvernException):
     def __init__(self, message: str) -> None:
         super().__init__(f"Azure error: {message}")
