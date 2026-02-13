@@ -1,0 +1,228 @@
+---
+title: Error Handling
+subtitle: Handle API errors, timeouts, and configure retries
+slug: ts-sdk-reference/error-handling
+---
+
+The SDK raises typed exceptions for API errors. All errors extend `SkyvernError` and include the HTTP status code, response body, and raw response.
+
+---
+
+## Error types
+
+| Exception | Status Code | When it's raised |
+|-----------|-------------|------------------|
+| `BadRequestError` | 400 | Invalid request parameters. |
+| `ForbiddenError` | 403 | Invalid or missing API key. |
+| `NotFoundError` | 404 | Resource (run, workflow, session) not found. |
+| `ConflictError` | 409 | Resource conflict (e.g., duplicate creation). |
+| `UnprocessableEntityError` | 422 | Request validation failed. |
+| `SkyvernError` | Any | Base class for all API errors. Catch this as a fallback. |
+| `SkyvernTimeoutError` | — | HTTP request timed out. |
+
+Import errors from the package:
+
+```typescript
+import { SkyvernError, SkyvernTimeoutError, SkyvernApi } from "@skyvern/client";
+
+// Base errors are top-level exports:
+//   SkyvernError          — base class for all API errors
+//   SkyvernTimeoutError   — HTTP request timed out
+
+// HTTP status error subclasses are accessed via the SkyvernApi namespace:
+//   SkyvernApi.BadRequestError          — 400
+//   SkyvernApi.ForbiddenError           — 403
+//   SkyvernApi.NotFoundError            — 404
+//   SkyvernApi.ConflictError            — 409
+//   SkyvernApi.UnprocessableEntityError — 422
+```
+
+---
+
+## Catching errors
+
+```typescript
+import { Skyvern, SkyvernError, SkyvernApi } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+
+try {
+  const run = await skyvern.getRun("tsk_nonexistent");
+} catch (e) {
+  if (e instanceof SkyvernApi.NotFoundError) {
+    console.log(`Run not found: ${e.body}`);
+  } else if (e instanceof SkyvernError) {
+    console.log(`API error ${e.statusCode}: ${e.body}`);
+  }
+}
+```
+
+### Error properties
+
+Every error has these attributes:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `statusCode` | `number \| undefined` | HTTP status code. |
+| `body` | `unknown` | Response body (usually an object with error details). |
+| `rawResponse` | `RawResponse \| undefined` | The raw HTTP response. |
+| `message` | `string` | Human-readable error message. |
+
+---
+
+## Timeouts
+
+Two different timeouts apply:
+
+### HTTP request timeout
+
+Controls how long the SDK waits for the HTTP response from the Skyvern API. Set it in the constructor or per-request:
+
+```typescript
+// Global timeout (applies to all requests)
+const skyvern = new Skyvern({
+  apiKey: "YOUR_API_KEY",
+  timeoutInSeconds: 30,
+});
+
+// Per-request timeout
+const result = await skyvern.getRun("tsk_abc123", {
+  timeoutInSeconds: 10,
+});
+```
+
+When an HTTP request times out, a `SkyvernTimeoutError` is thrown.
+
+### Completion timeout
+
+Controls how long `waitForCompletion` polls before giving up. This is separate from the HTTP timeout:
+
+```typescript
+try {
+  const result = await skyvern.runTask({
+    body: {
+      prompt: "Extract data",
+      url: "https://example.com",
+    },
+    waitForCompletion: true,
+    timeout: 300, // Give up after 5 minutes
+  });
+} catch (e) {
+  if (e instanceof Error && e.message.includes("Timeout")) {
+    console.log("Task didn't complete in time");
+  }
+}
+```
+
+The completion timeout throws a standard JavaScript `Error` with a timeout message.
+
+---
+
+## Retries
+
+Configure automatic retries for transient failures. Set it in the constructor or per-request:
+
+```typescript
+// Global retries (default: 2)
+const skyvern = new Skyvern({
+  apiKey: "YOUR_API_KEY",
+  maxRetries: 3,
+});
+
+// Per-request retries
+const result = await skyvern.runTask(
+  {
+    body: {
+      prompt: "Extract product data",
+      url: "https://example.com/products",
+    },
+  },
+  { maxRetries: 5 },
+);
+```
+
+Retries apply to the HTTP request level (network errors, 5xx responses). They do not retry the entire task if it fails at the AI level — use `getRun` to check the status and re-run if needed.
+
+---
+
+## Abort requests
+
+Cancel in-flight requests using `AbortSignal`:
+
+```typescript
+const controller = new AbortController();
+
+// Cancel after 10 seconds
+setTimeout(() => controller.abort(), 10000);
+
+try {
+  const result = await skyvern.runTask(
+    {
+      body: {
+        prompt: "Extract data",
+        url: "https://example.com",
+      },
+    },
+    { abortSignal: controller.signal },
+  );
+} catch (e) {
+  if (e instanceof Error && e.name === "AbortError") {
+    console.log("Request was aborted");
+  }
+}
+```
+
+---
+
+## Run failure vs API errors
+
+There are two distinct failure modes:
+
+**API error** — The HTTP request itself failed. The SDK throws an exception.
+
+```typescript
+import { SkyvernError } from "@skyvern/client";
+
+try {
+  const result = await skyvern.runTask({
+    body: { prompt: "..." },
+  });
+} catch (e) {
+  if (e instanceof SkyvernError) {
+    console.log(`API call failed: ${e.statusCode}`);
+  }
+}
+```
+
+**Run failure** — The API call succeeded, but the task/workflow failed during execution. No exception is thrown. Check the `status` field:
+
+```typescript
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Fill out the form",
+    url: "https://example.com",
+  },
+  waitForCompletion: true,
+});
+
+if (result.status === "failed") {
+  console.log(`Task failed: ${result.failure_reason}`);
+} else if (result.status === "timed_out") {
+  console.log(`Task exceeded step limit after ${result.step_count} steps`);
+} else if (result.status === "completed") {
+  console.log(`Success: ${JSON.stringify(result.output)}`);
+}
+```
+
+### Run statuses
+
+| Status | Description |
+|--------|-------------|
+| `created` | Run initialized, not yet queued. |
+| `queued` | Waiting for an available browser. |
+| `running` | AI is executing. |
+| `completed` | Finished successfully. |
+| `failed` | Encountered an error during execution. |
+| `terminated` | Manually stopped. |
+| `timed_out` | Exceeded step limit (`max_steps`). |
+| `canceled` | Canceled before starting. |

@@ -1,0 +1,618 @@
+---
+title: Complete Reference (For LLMs)
+subtitle: Every method, parameter, and type in one page
+slug: ts-sdk-reference/complete-reference
+---
+
+## Install and initialize
+
+```bash
+npm install @skyvern/client
+```
+
+```typescript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Get the title of the top post on Hacker News",
+    url: "https://news.ycombinator.com",
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+```
+
+**Constructor:**
+
+```typescript
+new Skyvern({
+  apiKey: string,                              // Required
+  baseUrl?: string,                            // Override for self-hosted deployments
+  environment?: SkyvernEnvironment | string,   // Cloud (default), Staging, or Local
+  timeoutInSeconds?: number,                   // HTTP request timeout (default: 60)
+  maxRetries?: number,                         // Retry count (default: 2)
+  headers?: Record<string, string>,            // Additional headers
+})
+```
+
+**Environments:**
+
+```typescript
+import { SkyvernEnvironment } from "@skyvern/client";
+// SkyvernEnvironment.Cloud  → "https://api.skyvern.com"
+// SkyvernEnvironment.Staging → "https://api-staging.skyvern.com"
+// SkyvernEnvironment.Local  → "http://localhost:8000"
+```
+
+All methods return promises. Requires Node.js 18+.
+
+---
+
+## Imports
+
+```typescript
+import {
+  Skyvern,                   // Main client class
+  SkyvernEnvironment,        // Cloud, Staging, Local
+  SkyvernError,              // Base error class
+  SkyvernTimeoutError,       // HTTP timeout error
+  SkyvernApi,                // Namespace for API types and error subclasses
+} from "@skyvern/client";
+
+// HTTP error subclasses via SkyvernApi namespace:
+// SkyvernApi.BadRequestError          — 400
+// SkyvernApi.ForbiddenError           — 403
+// SkyvernApi.NotFoundError            — 404
+// SkyvernApi.ConflictError            — 409
+// SkyvernApi.UnprocessableEntityError — 422
+```
+
+**Important:** `SkyvernError` and `SkyvernTimeoutError` are top-level exports. The HTTP-specific errors (`BadRequestError`, etc.) extend `SkyvernError` and are accessed via the `SkyvernApi` namespace.
+
+---
+
+## Tasks
+
+### `runTask`
+
+```typescript
+const result = await skyvern.runTask({
+  body: {
+    prompt: string,                                  // Required. Natural language instructions.
+    url?: string,                                    // Starting page URL.
+    engine?: RunEngine,                              // "skyvern_v2" (default), "skyvern_v1", "openai_cua", "anthropic_cua", "ui_tars"
+    max_steps?: number,                              // Cap AI steps to limit cost.
+    data_extraction_schema?: Record<string, unknown> | string,  // JSON Schema for output.
+    browser_session_id?: string,                     // Run in existing session.
+    publish_workflow?: boolean,                       // Save generated code as reusable workflow.
+    proxy_location?: ProxyLocation,
+    webhook_url?: string,
+    error_code_mapping?: Record<string, string>,
+    totp_identifier?: string,
+    totp_url?: string,
+    title?: string,
+    model?: Record<string, unknown>,
+    user_agent?: string,
+    extra_http_headers?: Record<string, string>,
+    browser_address?: string,
+  },
+  waitForCompletion?: boolean,                       // Poll until finished. Default: false.
+  timeout?: number,                                  // Max wait (seconds). Default: 1800.
+}): Promise<TaskRunResponse>
+```
+
+**`TaskRunResponse` fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | `string` | Unique ID (`tsk_...`). |
+| `status` | `string` | `created` \| `queued` \| `running` \| `completed` \| `failed` \| `terminated` \| `timed_out` \| `canceled` |
+| `output` | `Record<string, unknown> \| null` | Extracted data. `null` until completed. |
+| `failure_reason` | `string \| undefined` | Error description if failed. |
+| `downloaded_files` | `FileInfo[] \| undefined` | Files downloaded during the run. |
+| `recording_url` | `string \| undefined` | Session recording video URL. |
+| `screenshot_urls` | `string[] \| undefined` | Final screenshots. |
+| `app_url` | `string \| undefined` | Link to run in Skyvern UI. |
+| `step_count` | `number \| undefined` | Number of AI steps taken. |
+| `created_at` | `string` | When the run was created. |
+| `finished_at` | `string \| undefined` | When the run finished. |
+
+### `getRun`
+
+```typescript
+const run = await skyvern.getRun(runId: string): Promise<GetRunResponse>
+```
+
+Returns status and results for any run (task or workflow).
+
+### `cancelRun`
+
+```typescript
+await skyvern.cancelRun(runId: string): Promise<void>
+```
+
+### `getRunTimeline`
+
+```typescript
+const timeline = await skyvern.getRunTimeline(runId: string): Promise<WorkflowRunTimeline[]>
+```
+
+### `getRunArtifacts`
+
+```typescript
+const artifacts = await skyvern.getRunArtifacts(
+  runId: string,
+  request?: { artifact_type?: ArtifactType | ArtifactType[] },
+): Promise<Artifact[]>
+```
+
+### `getArtifact`
+
+```typescript
+const artifact = await skyvern.getArtifact(artifactId: string): Promise<Artifact>
+```
+
+### `retryRunWebhook`
+
+```typescript
+await skyvern.retryRunWebhook(runId: string): Promise<void>
+```
+
+---
+
+## Workflows
+
+### `runWorkflow`
+
+```typescript
+const result = await skyvern.runWorkflow({
+  body: {
+    workflow_id: string,                       // Required. Permanent ID (wpid_...).
+    parameters?: Record<string, unknown>,      // Input params matching workflow definition.
+    browser_session_id?: string,
+    browser_profile_id?: string,               // Load saved browser state.
+    proxy_location?: ProxyLocation,
+    webhook_url?: string,
+    title?: string,
+    totp_identifier?: string,
+    totp_url?: string,
+    user_agent?: string,
+    extra_http_headers?: Record<string, string>,
+    browser_address?: string,
+  },
+  template?: boolean,
+  waitForCompletion?: boolean,                 // Default: false.
+  timeout?: number,                            // Default: 1800.
+}): Promise<WorkflowRunResponse>
+```
+
+**`WorkflowRunResponse` fields:** Same as `TaskRunResponse` plus `run_with`, `ai_fallback`, `script_run`.
+
+### `createWorkflow`
+
+```typescript
+const workflow = await skyvern.createWorkflow({
+  body: { json_definition?: object, yaml_definition?: string },
+  folder_id?: string,
+}): Promise<Workflow>
+```
+
+**`Workflow` fields:** `workflow_id`, `workflow_permanent_id`, `version`, `title`, `workflow_definition`, `status`, `created_at`
+
+### `getWorkflows`
+
+```typescript
+const workflows = await skyvern.getWorkflows({
+  page?: number,
+  page_size?: number,
+  only_saved_tasks?: boolean,
+  only_workflows?: boolean,
+  title?: string,
+  search_key?: string,
+  folder_id?: string,
+  status?: WorkflowStatus | WorkflowStatus[],
+}): Promise<Workflow[]>
+```
+
+### `getWorkflow`
+
+```typescript
+const workflow = await skyvern.getWorkflow(
+  workflowPermanentId: string,
+  request?: { version?: number; template?: boolean },
+): Promise<Workflow>
+```
+
+### `getWorkflowVersions`
+
+```typescript
+const versions = await skyvern.getWorkflowVersions(
+  workflowPermanentId: string,
+  request?: { template?: boolean },
+): Promise<Workflow[]>
+```
+
+### `updateWorkflow`
+
+```typescript
+const updated = await skyvern.updateWorkflow(
+  workflowId: string,              // The version ID (not permanent ID).
+  request?: { json_definition?: object; yaml_definition?: string },
+): Promise<Workflow>
+```
+
+### `deleteWorkflow`
+
+```typescript
+await skyvern.deleteWorkflow(workflowId: string): Promise<void>
+```
+
+---
+
+## Browser sessions
+
+A persistent browser instance that stays alive between API calls. Use to chain tasks without losing cookies or login state.
+
+### `createBrowserSession`
+
+```typescript
+const session = await skyvern.createBrowserSession({
+  timeout?: number,                            // Minutes (5-1440). Default: 60.
+  proxy_location?: ProxyLocation,
+  extensions?: Extensions[],                   // "ad-blocker", "captcha-solver"
+  browser_type?: PersistentBrowserType,        // "chrome", "msedge"
+}): Promise<BrowserSessionResponse>
+```
+
+**`BrowserSessionResponse` fields:** `browser_session_id`, `status`, `browser_address`, `app_url`, `timeout`, `started_at`, `created_at`
+
+### `getBrowserSession`
+
+```typescript
+const session = await skyvern.getBrowserSession(browserSessionId: string): Promise<BrowserSessionResponse>
+```
+
+### `getBrowserSessions`
+
+```typescript
+const sessions = await skyvern.getBrowserSessions(): Promise<BrowserSessionResponse[]>
+```
+
+### `closeBrowserSession`
+
+```typescript
+await skyvern.closeBrowserSession(browserSessionId: string): Promise<void>
+```
+
+### Session chaining example
+
+```typescript
+const session = await skyvern.createBrowserSession({});
+
+// Step 1: Log in
+await skyvern.runTask({
+  body: {
+    prompt: "Log in with username demo@example.com",
+    url: "https://app.example.com/login",
+    browser_session_id: session.browser_session_id,
+  },
+  waitForCompletion: true,
+});
+
+// Step 2: Extract data (same browser, already logged in)
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Go to the invoices page and extract all invoice numbers",
+    browser_session_id: session.browser_session_id,
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+
+// Clean up
+await skyvern.closeBrowserSession(session.browser_session_id);
+```
+
+---
+
+## Browser profiles
+
+A saved snapshot of browser state (cookies, local storage). Create from a completed workflow run, then reuse to skip login.
+
+### `createBrowserProfile`
+
+```typescript
+const profile = await skyvern.createBrowserProfile({
+  name: string,
+  description?: string,
+  workflow_run_id?: string,        // Run must have used persist_browser_session: true.
+  browser_session_id?: string,
+}): Promise<BrowserProfile>
+```
+
+**`BrowserProfile` fields:** `browser_profile_id`, `name`, `description`, `created_at`
+
+### `listBrowserProfiles`
+
+```typescript
+const profiles = await skyvern.listBrowserProfiles({
+  include_deleted?: boolean,
+}): Promise<BrowserProfile[]>
+```
+
+### `getBrowserProfile`
+
+```typescript
+const profile = await skyvern.getBrowserProfile(profileId: string): Promise<BrowserProfile>
+```
+
+### `deleteBrowserProfile`
+
+```typescript
+await skyvern.deleteBrowserProfile(profileId: string): Promise<void>
+```
+
+---
+
+## Credentials
+
+Store login information securely. Reference by ID instead of passing secrets in code.
+
+### `createCredential`
+
+```typescript
+const credential = await skyvern.createCredential({
+  name: string,
+  credential_type: CredentialType,       // e.g. "password"
+  credential: object,                    // Password: { username: "...", password: "..." }
+}): Promise<CredentialResponse>
+```
+
+### `getCredentials`
+
+```typescript
+const creds = await skyvern.getCredentials({
+  page?: number,
+  page_size?: number,
+}): Promise<CredentialResponse[]>
+```
+
+### `getCredential`
+
+```typescript
+const cred = await skyvern.getCredential(credentialId: string): Promise<CredentialResponse>
+```
+
+### `deleteCredential`
+
+```typescript
+await skyvern.deleteCredential(credentialId: string): Promise<void>
+```
+
+### `sendTotpCode`
+
+Send a TOTP code to Skyvern during a run that requires 2FA.
+
+```typescript
+await skyvern.sendTotpCode({
+  totp_identifier: string,
+  content: string,                       // The TOTP code value.
+  task_id?: string,
+  workflow_id?: string,
+  workflow_run_id?: string,
+  source?: string,
+  expired_at?: string,
+}): Promise<TotpCode>
+```
+
+---
+
+## Helper methods
+
+### `login`
+
+Automate logging into a website using stored credentials.
+
+```typescript
+const result = await skyvern.login({
+  credential_type: CredentialType,         // Required. "skyvern", "bitwarden", "1password", "azure_vault".
+  url?: string,
+  credential_id?: string,                  // When using "skyvern" type.
+  prompt?: string,
+  browser_session_id?: string,
+  browser_address?: string,
+  proxy_location?: ProxyLocation,
+  webhook_url?: string,
+  totp_identifier?: string,
+  totp_url?: string,
+  extra_http_headers?: Record<string, string>,
+  waitForCompletion?: boolean,             // Default: false.
+  timeout?: number,                        // Default: 1800.
+  // Bitwarden: bitwarden_collection_id, bitwarden_item_id
+  // 1Password: onepassword_vault_id, onepassword_item_id
+  // Azure: azure_vault_name, azure_vault_username_key, azure_vault_password_key, azure_vault_totp_secret_key
+}): Promise<WorkflowRunResponse>
+```
+
+### `downloadFiles`
+
+```typescript
+const result = await skyvern.downloadFiles({
+  navigation_goal: string,                 // Required. What to download.
+  url?: string,
+  browser_session_id?: string,
+  browser_profile_id?: string,
+  download_suffix?: string,                // Expected extension, e.g. ".pdf"
+  download_timeout?: number,
+  max_steps_per_run?: number,
+  extra_http_headers?: Record<string, string>,
+  waitForCompletion?: boolean,             // Default: false.
+  timeout?: number,                        // Default: 1800.
+}): Promise<WorkflowRunResponse>
+```
+
+### `uploadFile`
+
+```typescript
+const upload = await skyvern.uploadFile({ file }): Promise<UploadFileResponse>
+// Returns: { s3_uri: string, presigned_url: string }
+```
+
+---
+
+## Browser automation (Playwright + AI)
+
+The TypeScript SDK extends Playwright with AI capabilities via cloud browsers.
+
+### Launch browsers
+
+```typescript
+// Launch new cloud browser
+const browser = await skyvern.launchCloudBrowser({ timeout?: number, proxyLocation?: ProxyLocation });
+
+// Reuse existing or create new
+const browser = await skyvern.useCloudBrowser({ timeout?: number, proxyLocation?: ProxyLocation });
+
+// Connect to existing cloud session
+const browser = await skyvern.connectToCloudBrowserSession(browserSessionId: string);
+
+// Connect via CDP
+const browser = await skyvern.connectToBrowserOverCdp(cdpUrl: string);
+```
+
+### Get pages
+
+```typescript
+const page = await browser.getWorkingPage();  // Get or create page
+const page = await browser.newPage();          // Always create new page
+await browser.close();                         // Close browser and session
+```
+
+### AI-enhanced page methods
+
+```typescript
+// Click with AI fallback
+await page.click("#selector");                                    // Standard Playwright
+await page.click({ prompt: "Click the submit button" });          // AI-powered
+await page.click("#selector", { prompt: "Click submit" });        // Selector + AI fallback
+
+// Fill with AI fallback
+await page.fill("#email", "user@example.com");                    // Standard Playwright
+await page.fill({ prompt: "Fill email with user@example.com" });  // AI-powered
+await page.fill("#email", "user@example.com", { prompt: "..." }); // Selector + AI fallback
+
+// Select with AI fallback
+await page.selectOption("#country", "us");                                     // Standard Playwright
+await page.selectOption({ prompt: "Select United States from country" });      // AI-powered
+
+// Single AI actions
+await page.act("Click the login button");                         // Perform an action
+const data = await page.extract({ prompt: "Extract products" });  // Extract data
+const ok = await page.validate("User is logged in");              // Validate state (boolean)
+const resp = await page.prompt("What is the heading?", schema);   // LLM prompt
+```
+
+### Full task execution via `page.agent`
+
+```typescript
+await page.agent.runTask("Fill out the form", { timeout: 300 });
+await page.agent.login("skyvern", { credentialId: "cred_123" });
+await page.agent.downloadFiles("Download the PDF", { downloadSuffix: ".pdf" });
+await page.agent.runWorkflow("wpid_abc", { parameters: { key: "value" } });
+```
+
+---
+
+## Error handling
+
+```typescript
+import { SkyvernError, SkyvernTimeoutError, SkyvernApi } from "@skyvern/client";
+
+try {
+  const run = await skyvern.getRun("tsk_nonexistent");
+} catch (e) {
+  if (e instanceof SkyvernApi.NotFoundError) {
+    console.log(e.statusCode, e.body);    // 404
+  } else if (e instanceof SkyvernTimeoutError) {
+    console.log("Request timed out");
+  } else if (e instanceof SkyvernError) {
+    console.log(e.statusCode, e.body);    // Any other HTTP error
+  }
+}
+```
+
+**Error types:** `SkyvernApi.BadRequestError` (400), `SkyvernApi.ForbiddenError` (403), `SkyvernApi.NotFoundError` (404), `SkyvernApi.ConflictError` (409), `SkyvernApi.UnprocessableEntityError` (422). All inherit from `SkyvernError`.
+
+**Completion timeout** throws a standard `Error`:
+
+```typescript
+try {
+  const result = await skyvern.runTask({
+    body: { prompt: "...", url: "..." },
+    waitForCompletion: true,
+    timeout: 300,
+  });
+} catch (e) {
+  if (e instanceof Error && e.message.includes("Timeout")) {
+    console.log("Task didn't complete in time");
+  }
+}
+```
+
+**Run failure** is not an exception — check `result.status`:
+
+```typescript
+if (result.status === "failed") console.log(result.failure_reason);
+if (result.status === "completed") console.log(result.output);
+```
+
+---
+
+## Request options
+
+Override timeout, retries, or headers per-request (second parameter on all methods):
+
+```typescript
+const result = await skyvern.runTask(
+  { body: { prompt: "...", url: "..." } },
+  {
+    timeoutInSeconds: 120,
+    maxRetries: 3,
+    headers: { "x-custom-header": "value" },
+    abortSignal: controller.signal,
+  },
+);
+```
+
+---
+
+## Polling pattern
+
+When not using `waitForCompletion`:
+
+```typescript
+const task = await skyvern.runTask({ body: { prompt: "...", url: "..." } });
+
+const terminal = ["completed", "failed", "terminated", "timed_out", "canceled"];
+let run;
+while (true) {
+  run = await skyvern.getRun(task.run_id);
+  if (terminal.includes(run.status)) break;
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+console.log(run.output);
+```
+
+---
+
+## Key constraints
+
+- `browser_profile_id` works with `runWorkflow` only — silently ignored by `runTask`.
+- Only workflow runs with `persist_browser_session: true` produce archives for profile creation.
+- Session archiving is async — profile creation may need a short retry delay after a run completes.
+- `engine` accepts string values: `"skyvern_v1"`, `"skyvern_v2"`, `"openai_cua"`, `"anthropic_cua"`, `"ui_tars"`.
+- Cloud browser methods (`launchCloudBrowser`, `useCloudBrowser`, `connectToCloudBrowserSession`) only work with `Cloud` or `Staging` environments.
+- The SDK depends on `playwright` for browser automation features.

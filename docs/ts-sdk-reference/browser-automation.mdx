@@ -1,0 +1,403 @@
+---
+title: Browser Automation
+subtitle: Control cloud browsers with Playwright + AI
+slug: ts-sdk-reference/browser-automation
+---
+
+The TypeScript SDK extends Playwright with AI-powered browser automation. Launch a cloud browser, get a page that works like a normal Playwright `Page`, then use `.agent` for full-task AI execution or AI-enhanced versions of `click`, `fill`, and `selectOption` that fall back to natural language when selectors fail.
+
+---
+
+## Launch a cloud browser
+
+### `launchCloudBrowser`
+
+Create a new cloud-hosted browser session and connect to it.
+
+```typescript
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+
+// Use Playwright methods
+await page.goto("https://example.com");
+
+// Or use AI
+await page.agent.runTask("Fill out the contact form and submit it");
+
+await browser.close();
+```
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `timeout` | `number` | No | `60` | Session timeout in minutes (5–1440). |
+| `proxyLocation` | `ProxyLocation` | No | `undefined` | Geographic proxy location for browser traffic. |
+
+#### Returns `SkyvernBrowser`
+
+<Note>
+Cloud browser sessions are only available with `SkyvernEnvironment.Cloud` or `SkyvernEnvironment.Staging`.
+</Note>
+
+---
+
+### `useCloudBrowser`
+
+Get or create a cloud browser session. Reuses the most recent available session if one exists, otherwise creates a new one.
+
+```typescript
+const browser = await skyvern.useCloudBrowser();
+const page = await browser.getWorkingPage();
+```
+
+#### Parameters
+
+Same as `launchCloudBrowser`. Options are only used when creating a new session.
+
+#### Returns `SkyvernBrowser`
+
+---
+
+### `connectToCloudBrowserSession`
+
+Connect to an existing cloud browser session by ID.
+
+```typescript
+const browser = await skyvern.connectToCloudBrowserSession("pbs_abc123");
+const page = await browser.getWorkingPage();
+```
+
+#### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `browserSessionId` | `string` | Yes | The ID of the cloud browser session. |
+
+#### Returns `SkyvernBrowser`
+
+---
+
+### `connectToBrowserOverCdp`
+
+Connect to any browser running with Chrome DevTools Protocol (CDP) enabled, whether local or remote.
+
+```typescript
+const browser = await skyvern.connectToBrowserOverCdp("http://localhost:9222");
+const page = await browser.getWorkingPage();
+```
+
+#### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `cdpUrl` | `string` | Yes | The CDP WebSocket URL (e.g., `"http://localhost:9222"`). |
+
+#### Returns `SkyvernBrowser`
+
+---
+
+## SkyvernBrowser
+
+A browser context wrapper that provides Skyvern-enabled pages.
+
+### `getWorkingPage()`
+
+Get the most recent page or create a new one if none exists.
+
+```typescript
+const page = await browser.getWorkingPage();
+```
+
+### `newPage()`
+
+Create a new page (tab) in the browser context.
+
+```typescript
+const page = await browser.newPage();
+```
+
+### `close()`
+
+Close the browser and release resources. If connected to a cloud session, also closes the session.
+
+```typescript
+await browser.close();
+```
+
+---
+
+## SkyvernBrowserPage
+
+A `SkyvernBrowserPage` extends Playwright's `Page` with AI capabilities. Every standard Playwright method (`goto`, `click`, `fill`, `waitForSelector`, etc.) works as-is. Additionally, it provides:
+
+- **`page.agent`** — AI-powered task execution (full automations)
+- **AI-enhanced `click`, `fill`, `selectOption`** — try selectors first, fall back to AI
+- **`page.act`, `page.extract`, `page.validate`, `page.prompt`** — single AI actions
+
+---
+
+### AI-enhanced Playwright methods
+
+These methods extend the standard Playwright API with AI fallback. Pass a CSS selector and it works like normal Playwright. Add a `prompt` option and if the selector fails, AI takes over.
+
+#### `click`
+
+```typescript
+// Standard Playwright click
+await page.click("#submit-button");
+
+// AI-powered click (no selector needed)
+await page.click({ prompt: "Click the 'Submit' button" });
+
+// Selector with AI fallback
+await page.click("#submit-button", { prompt: "Click the 'Submit' button" });
+```
+
+#### `fill`
+
+```typescript
+// Standard Playwright fill
+await page.fill("#email", "user@example.com");
+
+// AI-powered fill
+await page.fill({ prompt: "Fill 'user@example.com' in the email field" });
+
+// Selector with AI fallback
+await page.fill("#email", "user@example.com", {
+  prompt: "Fill the email address field",
+});
+```
+
+#### `selectOption`
+
+```typescript
+// Standard Playwright select
+await page.selectOption("#country", "us");
+
+// AI-powered select
+await page.selectOption({ prompt: "Select 'United States' from the country dropdown" });
+
+// Selector with AI fallback
+await page.selectOption("#country", "us", {
+  prompt: "Select United States from country",
+});
+```
+
+---
+
+### `page.agent` — Full task execution
+
+The `agent` property provides methods for running complete AI-powered automations within the browser page context. These always wait for completion.
+
+#### `agent.runTask`
+
+Run a complete AI task in the context of the current page.
+
+```typescript
+const result = await page.agent.runTask("Fill out the contact form and submit it", {
+  dataExtractionSchema: {
+    type: "object",
+    properties: {
+      confirmation_number: { type: "string" },
+    },
+  },
+});
+console.log(result.output);
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `string` | Yes | Natural language task description. |
+| `options.engine` | `RunEngine` | No | AI engine to use. |
+| `options.url` | `string` | No | URL to navigate to. Defaults to current page URL. |
+| `options.dataExtractionSchema` | `Record<string, unknown> \| string` | No | JSON schema for output. |
+| `options.maxSteps` | `number` | No | Maximum AI steps. |
+| `options.timeout` | `number` | No | Max wait time in seconds. Default: `1800`. |
+| `options.webhookUrl` | `string` | No | Webhook URL for notifications. |
+| `options.totpIdentifier` | `string` | No | TOTP identifier. |
+| `options.totpUrl` | `string` | No | TOTP URL. |
+| `options.title` | `string` | No | Run display name. |
+| `options.errorCodeMapping` | `Record<string, string>` | No | Custom error code mapping. |
+| `options.model` | `Record<string, unknown>` | No | LLM model configuration. |
+
+Returns `TaskRunResponse`.
+
+#### `agent.login`
+
+Run a login workflow in the context of the current page. Supports multiple credential providers via overloaded signatures.
+
+```typescript
+// Skyvern credentials
+await page.agent.login("skyvern", {
+  credentialId: "cred_123",
+});
+
+// Bitwarden
+await page.agent.login("bitwarden", {
+  bitwardenItemId: "item_id",
+  bitwardenCollectionId: "collection_id",
+});
+
+// 1Password
+await page.agent.login("1password", {
+  onepasswordVaultId: "vault_id",
+  onepasswordItemId: "item_id",
+});
+
+// Azure Vault
+await page.agent.login("azure_vault", {
+  azureVaultName: "vault_name",
+  azureVaultUsernameKey: "username_key",
+  azureVaultPasswordKey: "password_key",
+});
+```
+
+Returns `WorkflowRunResponse`.
+
+#### `agent.downloadFiles`
+
+Download files in the context of the current page.
+
+```typescript
+const result = await page.agent.downloadFiles("Download the latest invoice PDF", {
+  downloadSuffix: ".pdf",
+  downloadTimeout: 30,
+});
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `string` | Yes | What to download. |
+| `options.url` | `string` | No | URL to navigate to. Defaults to current page URL. |
+| `options.downloadSuffix` | `string` | No | Expected file extension. |
+| `options.downloadTimeout` | `number` | No | Download timeout in seconds. |
+| `options.maxStepsPerRun` | `number` | No | Max AI steps. |
+| `options.timeout` | `number` | No | Max wait time in seconds. Default: `1800`. |
+
+Returns `WorkflowRunResponse`.
+
+#### `agent.runWorkflow`
+
+Run a pre-defined workflow in the context of the current page.
+
+```typescript
+const result = await page.agent.runWorkflow("wpid_abc123", {
+  parameters: { company_name: "Acme Corp" },
+});
+console.log(result.output);
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflowId` | `string` | Yes | The workflow permanent ID. |
+| `options.parameters` | `Record<string, unknown>` | No | Workflow input parameters. |
+| `options.template` | `boolean` | No | Whether it's a template. |
+| `options.title` | `string` | No | Run display name. |
+| `options.timeout` | `number` | No | Max wait time in seconds. Default: `1800`. |
+
+Returns `WorkflowRunResponse`.
+
+---
+
+### Single AI actions
+
+#### `act`
+
+Perform a single AI action on the page.
+
+```typescript
+await page.act("Scroll down and click the 'Load More' button");
+```
+
+#### `extract`
+
+Extract structured data from the current page.
+
+```typescript
+const data = await page.extract({
+  prompt: "Extract all product names and prices",
+  schema: {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        price: { type: "string" },
+      },
+    },
+  },
+});
+console.log(data);
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `string` | Yes | What to extract. |
+| `schema` | `Record<string, unknown> \| unknown[] \| string` | No | JSON schema for output. |
+| `errorCodeMapping` | `Record<string, string>` | No | Custom error codes. |
+
+Returns `Record<string, unknown> | unknown[] | string | null`.
+
+#### `validate`
+
+Validate the current page state with AI.
+
+```typescript
+const isLoggedIn = await page.validate("Check if the user is logged in");
+console.log(isLoggedIn); // true or false
+```
+
+Returns `boolean`.
+
+#### `prompt`
+
+Send a prompt to the LLM and get a structured response.
+
+```typescript
+const result = await page.prompt(
+  "What is the main heading on this page?",
+  { heading: { type: "string" } },
+);
+console.log(result);
+```
+
+Returns `Record<string, unknown> | unknown[] | string | null`.
+
+---
+
+## Complete example
+
+```typescript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+
+// Navigate with Playwright
+await page.goto("https://app.example.com");
+
+// Login with AI
+await page.agent.login("skyvern", { credentialId: "cred_abc123" });
+
+// Extract data with AI
+const data = await page.extract({
+  prompt: "Extract all invoice numbers and amounts from the billing page",
+  schema: {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        invoice_number: { type: "string" },
+        amount: { type: "string" },
+      },
+    },
+  },
+});
+console.log(data);
+
+// Clean up
+await browser.close();
+await skyvern.close();
+```
