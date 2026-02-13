@@ -2718,6 +2718,7 @@ async def choose_auto_completion_dropdown(
                 value=text,
             )
             await skyvern_element.press_key("Enter")
+            clear_input = False
             return result
 
         if not element_id:
