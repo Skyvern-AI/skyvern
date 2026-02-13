@@ -25,7 +25,7 @@ jobs:
         run: |
           case "${{ github.event.pull_request.user.login }}" in
             wintonzheng)
-              echo "GH_PAT=${{ secrets.SKYVERN_OSS_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
               ;;
             LawyZheng)
               echo "GH_PAT=${{ secrets.LAWY_GH_PAT }}" >> $GITHUB_OUTPUT
@@ -43,7 +43,8 @@ jobs:
               echo "GH_PAT=${{ secrets.CELAL_GH_PAT }}" >> $GITHUB_OUTPUT
               ;;
             *)
-              echo "GH_PAT=${{ secrets.SKYVERN_OSS_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "Author $PR_AUTHOR is not in the approved list"
               ;;
           esac
       - name: Auto-merge PR
