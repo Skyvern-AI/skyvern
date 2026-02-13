@@ -33,6 +33,7 @@ from .credential import (
     skyvern_credential_get,
     skyvern_credential_list,
 )
+from .prompts import build_workflow, debug_automation, extract_data
 from .session import (
     skyvern_session_close,
     skyvern_session_connect,
@@ -213,7 +214,6 @@ Use `{{parameter_key}}` to reference workflow input parameters in any block fiel
 Common block types for workflow definitions:
 - **navigation** — take actions on a page: fill forms, click buttons, navigate multi-step flows (most common)
 - **extraction** — extract structured data from the current page
-- **task_v2** — complex tasks via natural language prompt (handles both actions and extraction)
 - **for_loop** — iterate over a list of items
 - **conditional** — branch based on conditions
 - **code** — run Python code for data transformation
@@ -305,6 +305,11 @@ mcp.tool()(skyvern_workflow_run)
 mcp.tool()(skyvern_workflow_status)
 mcp.tool()(skyvern_workflow_cancel)
 
+# -- Prompts (methodology guides injected into LLM conversations) --
+mcp.prompt()(build_workflow)
+mcp.prompt()(debug_automation)
+mcp.prompt()(extract_data)
+
 __all__ = [
     "mcp",
     # Session
@@ -346,4 +351,8 @@ __all__ = [
     "skyvern_workflow_run",
     "skyvern_workflow_status",
     "skyvern_workflow_cancel",
+    # Prompts
+    "build_workflow",
+    "debug_automation",
+    "extract_data",
 ]

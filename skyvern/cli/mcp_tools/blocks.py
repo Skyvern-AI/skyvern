@@ -85,7 +85,6 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
 BLOCK_SUMMARIES: dict[str, str] = {
     "navigation": "Take actions on a page: fill forms, click buttons, navigate multi-step flows (most common)",
     "extraction": "Extract structured data from the current page",
-    "task_v2": "Complex tasks via natural language prompt — handles both actions and extraction",
     "for_loop": "Iterate over a list, executing nested blocks for each item",
     "conditional": "Branch based on Jinja2 expressions or AI prompts",
     "code": "Run Python code for data transformation",
@@ -137,12 +136,6 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
                 },
             },
         },
-    },
-    "task_v2": {
-        "block_type": "task_v2",
-        "label": "book_flight",
-        "url": "https://booking.example.com",
-        "prompt": "Book a flight from {{ origin }} to {{ destination }} on {{ date }}",
     },
     "for_loop": {
         "block_type": "for_loop",
@@ -297,7 +290,7 @@ async def skyvern_block_schema(
     block_type: Annotated[
         str | None,
         Field(
-            description="Block type to get schema for (e.g., 'navigation', 'extraction', 'task_v2'). Omit to list all available types."
+            description="Block type to get schema for (e.g., 'navigation', 'extraction', 'for_loop'). Omit to list all available types."
         ),
     ] = None,
 ) -> dict[str, Any]:
@@ -323,7 +316,7 @@ async def skyvern_block_schema(
 
     normalized = block_type.strip().lower()
 
-    task_redirect = normalized == "task"
+    task_redirect = normalized in ("task", "task_v2")
     if task_redirect:
         normalized = "navigation"
 
@@ -344,7 +337,7 @@ async def skyvern_block_schema(
 
     warnings = (
         [
-            "'task' is deprecated. Showing 'navigation' schema instead. Use 'navigation' for actions (requires navigation_goal) and 'extraction' for data extraction (requires data_extraction_goal + data_schema)."
+            f"'{block_type}' is deprecated. Showing 'navigation' schema instead. Use 'navigation' for actions (requires navigation_goal) and 'extraction' for data extraction (requires data_extraction_goal + data_schema)."
         ]
         if task_redirect
         else []
@@ -426,9 +419,9 @@ async def skyvern_block_validate(
     try:
         block = adapter.validate_python(raw)
         warnings = []
-        if block.block_type == "task":
+        if block.block_type in ("task", "task_v2"):
             warnings.append(
-                "'task' block type is deprecated. Use 'navigation' for actions and 'extraction' for data extraction."
+                f"'{block.block_type}' block type is deprecated. Use 'navigation' for actions and 'extraction' for data extraction."
             )
         return make_result(
             action,
