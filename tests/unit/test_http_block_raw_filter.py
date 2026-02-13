@@ -1,12 +1,20 @@
 import json
+from datetime import datetime, timezone
+from enum import StrEnum
+from unittest.mock import MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
 from skyvern.forge.sdk.workflow.models.block import (
     _JSON_TYPE_MARKER,
+    HttpRequestBlock,
     _json_type_filter,
     jinja_sandbox_env,
 )
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 
 
 class TestJsonTypeFilter:
@@ -50,8 +58,6 @@ class TestJsonTypeFilter:
         assert parsed == value
 
     def test_filter_handles_datetime(self) -> None:
-        from datetime import datetime
-
         now = datetime(2024, 1, 15, 12, 30, 45)
         result = _json_type_filter(now)
         json_part = result[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
@@ -59,8 +65,6 @@ class TestJsonTypeFilter:
         assert parsed == "2024-01-15 12:30:45"
 
     def test_filter_handles_enum(self) -> None:
-        from enum import StrEnum
-
         class Status(StrEnum):
             completed = "completed"
             failed = "failed"
@@ -71,8 +75,6 @@ class TestJsonTypeFilter:
         assert parsed == "completed"
 
     def test_filter_handles_nested_datetime_in_dict(self) -> None:
-        from datetime import datetime
-
         data = {
             "status": "completed",
             "downloaded_files": [
@@ -264,13 +266,6 @@ class TestEmbeddedMarkerErrorHandling:
 
     def test_embedded_marker_raises_error(self) -> None:
         """Using | json with prefix/suffix text should raise FailedToFormatJinjaStyleParameter."""
-        from datetime import datetime, timezone
-        from unittest.mock import MagicMock
-
-        from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
-        from skyvern.forge.sdk.workflow.models.block import HttpRequestBlock
-        from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-
         now = datetime.now(timezone.utc)
         output_param = OutputParameter(
             parameter_type=ParameterType.OUTPUT,
@@ -304,12 +299,6 @@ class TestEmbeddedMarkerErrorHandling:
 
     def test_valid_json_filter_does_not_raise(self) -> None:
         """Using | json for complete value replacement should work without error."""
-        from datetime import datetime, timezone
-        from unittest.mock import MagicMock
-
-        from skyvern.forge.sdk.workflow.models.block import HttpRequestBlock
-        from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-
         now = datetime.now(timezone.utc)
         output_param = OutputParameter(
             parameter_type=ParameterType.OUTPUT,
@@ -348,14 +337,9 @@ class TestWorkflowRunSummary:
 
     def test_build_workflow_run_summary_empty_outputs(self) -> None:
         """Test summary with no block outputs."""
-        from unittest.mock import MagicMock
-
         context = MagicMock()
         context.workflow_run_id = "wr_123"
         context.workflow_run_outputs = {}
-
-        # Import and call the method
-        from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 
         # Create a real context to test the method
         summary = WorkflowRunContext.build_workflow_run_summary(context)
@@ -369,10 +353,6 @@ class TestWorkflowRunSummary:
 
     def test_build_workflow_run_summary_merges_extracted_information(self) -> None:
         """Test that output.extracted_information is merged from all blocks."""
-        from unittest.mock import MagicMock
-
-        from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-
         context = MagicMock()
         context.workflow_run_id = "wr_456"
         context.workflow_run_outputs = {
@@ -400,10 +380,6 @@ class TestWorkflowRunSummary:
 
     def test_build_workflow_run_summary_aggregates_downloaded_files(self) -> None:
         """Test that downloaded_files are aggregated from all blocks."""
-        from unittest.mock import MagicMock
-
-        from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-
         context = MagicMock()
         context.workflow_run_id = "wr_789"
         context.workflow_run_outputs = {
@@ -428,10 +404,6 @@ class TestWorkflowRunSummary:
 
     def test_build_workflow_run_summary_aggregates_errors(self) -> None:
         """Test that errors are aggregated from all blocks."""
-        from unittest.mock import MagicMock
-
-        from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-
         context = MagicMock()
         context.workflow_run_id = "wr_errors"
         context.workflow_run_outputs = {
@@ -455,10 +427,6 @@ class TestWorkflowRunSummary:
 
     def test_build_workflow_run_summary_uses_last_status(self) -> None:
         """Test that the last block's status is used."""
-        from unittest.mock import MagicMock
-
-        from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-
         context = MagicMock()
         context.workflow_run_id = "wr_status"
         context.workflow_run_outputs = {
@@ -473,11 +441,6 @@ class TestWorkflowRunSummary:
 
     def test_status_converted_to_string_in_summary(self) -> None:
         """Test that TaskStatus enum is converted to string in summary."""
-        from unittest.mock import MagicMock
-
-        from skyvern.forge.sdk.schemas.tasks import TaskStatus
-        from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-
         context = MagicMock()
         context.workflow_run_id = "wr_enum"
         context.workflow_run_outputs = {

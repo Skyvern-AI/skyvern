@@ -5,11 +5,14 @@ This test file exists to prevent regressions like the AttributeError bug where
 self._page was used instead of self.page (see PR #8425, SKY-7676).
 """
 
+import inspect
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from skyvern.config import settings
+from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 
 
 def create_mock_page():
@@ -52,8 +55,6 @@ async def test_wait_for_page_ready_before_action_calls_skyvern_frame(mock_scrape
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
     ):
-        from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-
         # Create ScriptSkyvernPage instance
         script_page = ScriptSkyvernPage(
             scraped_page=mock_scraped_page,
@@ -100,8 +101,6 @@ async def test_wait_for_page_ready_before_action_handles_no_page(mock_scraped_pa
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
     ):
-        from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-
         # Create a mock page first, then set page to None after construction
         mock_page = create_mock_page()
         script_page = ScriptSkyvernPage(
@@ -138,8 +137,6 @@ async def test_wait_for_page_ready_before_action_catches_exceptions(mock_scraped
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
     ):
-        from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-
         script_page = ScriptSkyvernPage(
             scraped_page=mock_scraped_page,
             page=mock_page,
@@ -167,8 +164,6 @@ async def test_wait_for_page_ready_before_action_catches_wait_for_page_ready_exc
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
     ):
-        from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-
         script_page = ScriptSkyvernPage(
             scraped_page=mock_scraped_page,
             page=mock_page,
@@ -198,10 +193,6 @@ async def test_wait_for_page_ready_attribute_access_regression():
 
     This test directly inspects the source code to ensure self._page is not used.
     """
-    import inspect
-
-    from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-
     source = inspect.getsource(ScriptSkyvernPage._wait_for_page_ready_before_action)
 
     # The fixed code should use self.page
@@ -209,8 +200,6 @@ async def test_wait_for_page_ready_attribute_access_regression():
 
     # The fixed code should NOT use self._page (except in comments)
     # Remove comments and docstrings first
-    import re
-
     # Remove docstrings
     source_no_docstrings = re.sub(r'""".*?"""', "", source, flags=re.DOTALL)
     source_no_docstrings = re.sub(r"'''.*?'''", "", source_no_docstrings, flags=re.DOTALL)

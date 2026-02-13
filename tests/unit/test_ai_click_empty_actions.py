@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
+
 
 @pytest.fixture
 def mock_page():
@@ -66,8 +68,6 @@ class TestAiClickEmptyActions:
         When the LLM returns no actions (element doesn't exist on page) and
         there's no selector to fall back to, ai_click should raise an exception.
         """
-        from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
-
         real_skyvern_page_ai = RealSkyvernPageAi(mock_scraped_page, mock_page)
 
         mock_app.SINGLE_CLICK_AGENT_LLM_API_HANDLER = AsyncMock(return_value={"actions": []})
@@ -101,8 +101,6 @@ class TestAiClickEmptyActions:
         When AI fails (exception) and there's no selector to fall back to,
         ai_click should raise an exception.
         """
-        from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
-
         real_skyvern_page_ai = RealSkyvernPageAi(mock_scraped_page, mock_page)
 
         mock_app.SINGLE_CLICK_AGENT_LLM_API_HANDLER = AsyncMock(side_effect=Exception("LLM error"))
@@ -135,8 +133,6 @@ class TestAiClickEmptyActions:
         When AI returns empty actions but there IS a selector to fall back to,
         ai_click should use the selector and succeed.
         """
-        from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
-
         # Set up the locator mock properly with AsyncMock for click
         mock_locator = MagicMock()
         mock_locator.click = AsyncMock()

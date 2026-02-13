@@ -12,12 +12,16 @@ from typing import Any
 
 import pytest
 
+from skyvern.core.script_generations import generate_workflow_parameters as gwp
 from skyvern.core.script_generations.generate_workflow_parameters import (
     CUSTOM_FIELD_ACTIONS,
     GeneratedFieldMapping,
     generate_workflow_parameters_schema,
     hydrate_input_text_actions_with_field_names,
 )
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.workflow.service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
 from skyvern.webeye.actions.actions import ActionType
 
 
@@ -244,7 +248,6 @@ async def test_generate_workflow_parameters_schema_with_actions(monkeypatch: pyt
     This confirms that when script generation runs AFTER actions are saved,
     it properly generates field mappings.
     """
-    from skyvern.core.script_generations import generate_workflow_parameters as gwp
 
     # Mock the LLM call to return a mapping
     async def mock_generate_field_names_with_llm(custom_field_actions):
@@ -337,8 +340,6 @@ class TestFinalizeParameter:
         This simulates the logic in generate_script_if_needed when finalize=True
         and the context has script_gen_had_incomplete_actions=True.
         """
-        from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-        from skyvern.forge.sdk.workflow.service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
 
         # Simulate workflow definition blocks
         class MockBlock:
@@ -377,8 +378,6 @@ class TestFinalizeParameter:
         This is the optimization - when script generation had complete data,
         we don't waste resources regenerating.
         """
-        from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-
         blocks_to_update: set[str] = set()
         finalize = True
         context = SkyvernContext(script_gen_had_incomplete_actions=False)
@@ -527,8 +526,6 @@ class TestSkipActionsWithoutData:
 
     def test_input_text_without_text_is_skipped(self) -> None:
         """Test that INPUT_TEXT actions without text are skipped during field mapping."""
-        from skyvern.core.script_generations.generate_workflow_parameters import CUSTOM_FIELD_ACTIONS
-
         task_id = "task-123"
 
         # INPUT_TEXT action without text - simulates race condition
@@ -562,8 +559,6 @@ class TestSkipActionsWithoutData:
 
     def test_input_text_with_text_is_included(self) -> None:
         """Test that INPUT_TEXT actions with text are included in field mapping."""
-        from skyvern.core.script_generations.generate_workflow_parameters import CUSTOM_FIELD_ACTIONS
-
         task_id = "task-123"
 
         # INPUT_TEXT action with text - properly saved
@@ -597,8 +592,6 @@ class TestSkipActionsWithoutData:
 
     def test_select_option_without_option_is_skipped(self) -> None:
         """Test that SELECT_OPTION actions without option are skipped."""
-        from skyvern.core.script_generations.generate_workflow_parameters import CUSTOM_FIELD_ACTIONS
-
         task_id = "task-123"
 
         action_without_option = {
@@ -627,8 +620,6 @@ class TestSkipActionsWithoutData:
 
     def test_upload_file_without_file_url_is_skipped(self) -> None:
         """Test that UPLOAD_FILE actions without file_url are skipped."""
-        from skyvern.core.script_generations.generate_workflow_parameters import CUSTOM_FIELD_ACTIONS
-
         task_id = "task-123"
 
         action_without_file = {
@@ -667,10 +658,6 @@ async def test_generate_workflow_parameters_schema_skips_empty_actions_and_sets_
     1. Incomplete actions are skipped mid-run (prevents bad field mappings)
     2. Context flag is set (triggers finalize regeneration only when needed)
     """
-    from skyvern.core.script_generations import generate_workflow_parameters as gwp
-    from skyvern.forge.sdk.core import skyvern_context
-    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-
     # Set up context to track the flag
     context = SkyvernContext()
     skyvern_context.set(context)
@@ -729,10 +716,6 @@ async def test_generate_workflow_parameters_schema_with_complete_actions_no_flag
     When script generation has complete data, the flag should NOT be set,
     which means finalize won't regenerate (saving costs).
     """
-    from skyvern.core.script_generations import generate_workflow_parameters as gwp
-    from skyvern.forge.sdk.core import skyvern_context
-    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-
     # Set up context to track the flag
     context = SkyvernContext()
     skyvern_context.set(context)

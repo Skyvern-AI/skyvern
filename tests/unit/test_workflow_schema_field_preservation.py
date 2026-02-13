@@ -21,6 +21,7 @@ from skyvern.core.script_generations.generate_script import (
 from skyvern.core.script_generations.generate_workflow_parameters import (
     generate_workflow_parameters_schema,
 )
+from skyvern.forge.forge_app_initializer import start_forge_app
 from tests.unit.force_stub_app import start_forge_stub_app
 
 # Load environment variables for real LLM tests
@@ -493,8 +494,6 @@ class TestRealLLMFieldPreservation:
     @pytest.fixture(scope="class", autouse=True)
     def setup_real_app(self):
         """Set up the real Forge app for LLM calls."""
-        from skyvern.forge.forge_app_initializer import start_forge_app
-
         start_forge_app()
         yield
 

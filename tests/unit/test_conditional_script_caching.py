@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from skyvern.core.script_generations.generate_script import ScriptBlockSource
+from skyvern.core.script_generations.generate_script import ScriptBlockSource, generate_workflow_script_python_code
 from skyvern.forge.sdk.workflow.service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
 from skyvern.schemas.workflows import BlockType
 from skyvern.services.workflow_script_service import workflow_has_conditionals
@@ -254,8 +254,6 @@ class TestCachedBlockPreservationDuringRegeneration:
         Core test: when only branch B's blocks are in the transform output,
         branch A's cached blocks should still appear in the generated script.
         """
-        from skyvern.core.script_generations.generate_script import generate_workflow_script_python_code
-
         # Branch A's cached block (from a previous run)
         branch_a_code = (
             "async def branch_a_extract(page: SkyvernPage, context: RunContext) -> None:\n"
@@ -361,8 +359,6 @@ class TestCachedBlockPreservationDuringRegeneration:
     @pytest.mark.asyncio
     async def test_cached_blocks_without_run_signature_are_not_preserved(self) -> None:
         """Cached blocks without a run_signature should NOT be preserved."""
-        from skyvern.core.script_generations.generate_script import generate_workflow_script_python_code
-
         cached_blocks = {
             "incomplete_block": ScriptBlockSource(
                 label="incomplete_block",
@@ -420,8 +416,6 @@ class TestCachedBlockPreservationDuringRegeneration:
     @pytest.mark.asyncio
     async def test_cached_blocks_without_code_are_not_preserved(self) -> None:
         """Cached blocks without code should NOT be preserved."""
-        from skyvern.core.script_generations.generate_script import generate_workflow_script_python_code
-
         cached_blocks = {
             "empty_block": ScriptBlockSource(
                 label="empty_block",
@@ -473,8 +467,6 @@ class TestCachedBlockPreservationDuringRegeneration:
         Blocks that appear in both the transform output AND cached_blocks
         should NOT be duplicated. The transform output processing handles them.
         """
-        from skyvern.core.script_generations.generate_script import generate_workflow_script_python_code
-
         block_code = (
             "async def shared_block(page: SkyvernPage, context: RunContext) -> None:\n"
             '    await skyvern.click(page, "//button")\n'
@@ -560,7 +552,6 @@ class TestCachedBlockPreservationDuringRegeneration:
         When a workflow has 3 conditional branches and only 1 executes,
         cached blocks from the other 2 branches should ALL be preserved.
         """
-        from skyvern.core.script_generations.generate_script import generate_workflow_script_python_code
 
         def _make_cached_block(label: str) -> ScriptBlockSource:
             return ScriptBlockSource(
@@ -652,8 +643,6 @@ class TestCachedBlockPreservationDuringRegeneration:
         When script_id/script_revision_id/organization_id are not provided,
         cached blocks should still be added to the script output (just no DB calls).
         """
-        from skyvern.core.script_generations.generate_script import generate_workflow_script_python_code
-
         branch_a_code = "async def branch_a(page: SkyvernPage, context: RunContext) -> None:\n    pass\n"
         cached_blocks = {
             "branch_a": ScriptBlockSource(

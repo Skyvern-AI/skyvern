@@ -1,3 +1,5 @@
+import os
+import tempfile
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -616,9 +618,6 @@ async def test_aiohttp_request_proxy_passed_correctly() -> None:
 @pytest.mark.asyncio
 async def test_aiohttp_request_with_files_uses_multipart() -> None:
     """Test that files parameter sends data as multipart/form-data"""
-    import os
-    import tempfile
-
     captured_args: list[Any] = []
     captured_request_kwargs: dict[str, Any] = {}
 
@@ -670,9 +669,6 @@ async def test_aiohttp_request_with_files_uses_multipart() -> None:
 @pytest.mark.asyncio
 async def test_aiohttp_request_with_files_and_data_combines_in_multipart() -> None:
     """Test that files and data can be combined in multipart/form-data"""
-    import os
-    import tempfile
-
     captured_args: list[Any] = []
     captured_request_kwargs: dict[str, Any] = {}
 
@@ -748,9 +744,6 @@ async def test_aiohttp_request_with_files_raises_file_not_found() -> None:
 @pytest.mark.asyncio
 async def test_aiohttp_request_with_multiple_files() -> None:
     """Test that multiple files can be uploaded in a single request"""
-    import os
-    import tempfile
-
     captured_args: list[Any] = []
     captured_request_kwargs: dict[str, Any] = {}
 
@@ -803,9 +796,6 @@ async def test_aiohttp_request_with_multiple_files() -> None:
 @pytest.mark.asyncio
 async def test_aiohttp_request_files_priority_over_data() -> None:
     """Test that files parameter takes priority and uses multipart even if data is provided"""
-    import os
-    import tempfile
-
     captured_args: list[Any] = []
     captured_request_kwargs: dict[str, Any] = {}
 

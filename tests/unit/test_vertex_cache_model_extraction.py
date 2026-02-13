@@ -5,6 +5,7 @@ This tests the fix for the issue where GEMINI_3_0_FLASH_WITH_FALLBACK was
 incorrectly using 'gemini-3.0-flash' instead of 'gemini-3-flash-preview'.
 """
 
+import re
 from dataclasses import dataclass
 
 
@@ -44,8 +45,6 @@ class TestVertexCacheModelExtraction:
         """
         Mimics the model name extraction logic from _create_vertex_cache_for_task.
         """
-        import re
-
         model_name = "gemini-2.5-flash"  # Default
         extracted_name = None
 

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
 from skyvern.webeye.actions.actions import ClickAction, ExtractAction, InputTextAction
 
 
@@ -42,8 +43,6 @@ async def test_batch_actions_preserve_per_task_ordering() -> None:
     get_tasks_actions returns DESC order (for timeline UI). The transform
     layer reverses to ASC. This test mocks DESC input and verifies ASC output.
     """
-    from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
-
     mock_workflow_run_resp = MagicMock()
     mock_workflow_run_resp.run_request = MagicMock()
     mock_workflow_run_resp.run_request.workflow_id = "wpid_test"
@@ -143,8 +142,6 @@ async def test_batch_actions_without_reverse_would_be_wrong() -> None:
 
     If someone removes the reverse(), this test catches it.
     """
-    from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
-
     mock_workflow_run_resp = MagicMock()
     mock_workflow_run_resp.run_request = MagicMock()
     mock_workflow_run_resp.run_request.workflow_id = "wpid_test"
@@ -213,8 +210,6 @@ async def test_batch_actions_preserve_none_element_id() -> None:
     Previously get_tasks_actions used hydrate_action(action, empty_element_id=True)
     which silently converted None element_ids to empty strings.
     """
-    from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
-
     mock_workflow_run_resp = MagicMock()
     mock_workflow_run_resp.run_request = MagicMock()
     mock_workflow_run_resp.run_request.workflow_id = "wpid_test"

@@ -9,9 +9,15 @@ These tests verify that ForLoop blocks are properly handled during:
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import libcst as cst
 import pytest
 
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
+from skyvern.core.script_generations.generate_script import _build_for_loop_statement
+from skyvern.core.script_generations.transform_workflow_run import (
+    CodeGenInput,
+    transform_workflow_run_to_code_gen_input,
+)
 from skyvern.forge.sdk.workflow.service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
 from skyvern.schemas.workflows import BlockType
 
@@ -108,8 +114,6 @@ class TestForLoopScriptGeneration:
 
     def test_build_for_loop_statement_signature(self) -> None:
         """Test that _build_for_loop_statement is called with correct parameters."""
-        from skyvern.core.script_generations.generate_script import _build_for_loop_statement
-
         forloop_block = {
             "block_type": "for_loop",
             "label": "process_items",
@@ -200,8 +204,6 @@ async def test_transform_forloop_block_integration() -> None:
     This test mocks the database calls and verifies that the transformation
     correctly processes ForLoop blocks and their child blocks.
     """
-    from skyvern.core.script_generations.transform_workflow_run import CodeGenInput
-
     # Create a mock CodeGenInput with ForLoop block
     mock_input = CodeGenInput(
         file_name="test_workflow.py",
@@ -254,11 +256,6 @@ async def test_transform_forloop_block_with_mocked_db() -> None:
     This test verifies the actual transformation logic in transform_workflow_run.py
     correctly processes ForLoop blocks and their child blocks.
     """
-    from unittest.mock import MagicMock
-
-    from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
-    from skyvern.schemas.workflows import BlockType
-
     # Mock workflow run response
     mock_workflow_run_resp = MagicMock()
     mock_workflow_run_resp.run_request = MagicMock()
@@ -381,10 +378,6 @@ class TestForLoopScriptExecution:
 
     def test_forloop_generates_async_for_statement(self) -> None:
         """Verify that ForLoop generates an async for statement."""
-        import libcst as cst
-
-        from skyvern.core.script_generations.generate_script import _build_for_loop_statement
-
         forloop_block = {
             "block_type": "for_loop",
             "label": "iterate_items",
@@ -401,10 +394,6 @@ class TestForLoopScriptExecution:
 
     def test_forloop_generates_skyvern_loop_call(self) -> None:
         """Verify that ForLoop generates a skyvern.loop() call."""
-        import libcst as cst
-
-        from skyvern.core.script_generations.generate_script import _build_for_loop_statement
-
         forloop_block = {
             "block_type": "for_loop",
             "label": "iterate_items",

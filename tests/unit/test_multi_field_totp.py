@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.core.script_generations.generate_script import _annotate_multi_field_totp_sequence
+from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.webeye.actions.action_types import ActionType
 
 
@@ -211,8 +212,6 @@ class TestGetTotpDigitBasic:
         mock_skyvern_context: MagicMock,
     ) -> None:
         """get_totp_digit should return a single digit string."""
-        from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-
         # Empty credentials - will fall back to get_actual_value
         mock_workflow_context = MagicMock()
         mock_workflow_context.values = {}
@@ -246,8 +245,6 @@ class TestGetTotpDigitBasic:
         mock_skyvern_context: MagicMock,
     ) -> None:
         """get_totp_digit should return the correct digit for the given index."""
-        from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-
         mock_workflow_context = MagicMock()
         mock_workflow_context.values = {}
 
