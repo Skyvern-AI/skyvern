@@ -32,7 +32,7 @@ For example, an Extraction block labeled `scrape_listings` produces output that 
 | **Control Flow** | Branch, loop, validate, or pause | Loop, Conditional, AI Validation, Wait |
 | **Communication** | Send data to external services | Send Email, HTTP Request |
 
-See [Block Reference](/cloud/configure-blocks) for every block type and its configuration fields.
+See [Block Reference](/cloud/building-workflows/configure-blocks) for every block type and its configuration fields.
 
 <Tip>
 If your block needs a browser, pick a browser automation block. If it just needs to process data, use Text Prompt or Code. If you need to repeat or branch, use control flow.
@@ -192,7 +192,7 @@ This uses 5 blocks across 3 categories: browser automation, data processing, and
 
     Click **Save**, then click **Run** in the top right. A parameters page opens where you can review and confirm the workflow's settings. Click **Run Workflow** to start execution.
 
-    The [live execution view](/cloud/monitor-a-run) opens. Watch as Skyvern navigates Hacker News, extracts listings, summarizes each one, and sends your email.
+    The [live execution view](/cloud/getting-started/monitor-a-run) opens. Watch as Skyvern navigates Hacker News, extracts listings, summarizes each one, and sends your email.
 
   </Step>
 </Steps>
@@ -235,7 +235,7 @@ When you create a blank workflow, hover over the **+** on the start edge to add 
 
 Click any block on the canvas to open its configuration panel on the right. Each block has a **Label** field (which determines its output variable name) and block-specific settings. Browser-based blocks share additional fields like URL, Engine, and Max Retries.
 
-See [Block Reference](/cloud/configure-blocks) for the full list of fields on each block type.
+See [Block Reference](/cloud/building-workflows/configure-blocks) for the full list of fields on each block type.
 
 ### Connecting and reordering blocks
 
@@ -266,8 +266,8 @@ The **Run** button also saves before starting execution.
 | **Save** (disk icon) | Save the current workflow definition |
 | **Template** (bookmark icon) | Toggle whether this workflow is saved as an organization template |
 | **History** (clock icon) | View past runs of this workflow |
-| **Parameters** | Open the parameters panel (see [Workflow Parameters](/cloud/add-parameters)) |
-| **Run** (play icon) | Save and start a new execution (see [Running Workflows](/cloud/run-a-workflow)) |
+| **Parameters** | Open the parameters panel (see [Workflow Parameters](/cloud/building-workflows/add-parameters)) |
+| **Run** (play icon) | Save and start a new execution (see [Running Workflows](/cloud/building-workflows/run-a-workflow)) |
 
 ---
 
@@ -277,21 +277,21 @@ The **Run** button also saves before starting execution.
   <Card
     title="Block Reference"
     icon="cube"
-    href="/cloud/configure-blocks"
+    href="/cloud/building-workflows/configure-blocks"
   >
     Configuration fields for every block type
   </Card>
   <Card
     title="Add Parameters"
     icon="sliders"
-    href="/cloud/add-parameters"
+    href="/cloud/building-workflows/add-parameters"
   >
     Pass dynamic values into your workflows
   </Card>
   <Card
     title="Run Your Workflow"
     icon="play"
-    href="/cloud/run-a-workflow"
+    href="/cloud/building-workflows/run-a-workflow"
   >
     Execute workflows and track results
   </Card>

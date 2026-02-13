@@ -1,0 +1,40 @@
+---
+title: Organization Settings
+subtitle: Manage your organization name and team access
+slug: cloud/account-settings/organization-settings
+---
+
+Everything in Skyvern — workflows, credentials, runs, API keys — belongs to an **organization**. One is created automatically when you sign up.
+
+## Organization details
+
+Open **Settings** in the sidebar. The **Settings** card at the top shows your current environment and organization. The organization name appears throughout the UI and in API responses.
+
+## Team members
+
+Plans that support multiple users show a **Members** section where you can invite teammates by email and manage who has access to the organization's resources.
+
+<Warning>
+When removing a team member, also review your [API keys](/cloud/account-settings/api-keys) — they may have copied keys that remain active.
+</Warning>
+
+<Note>
+Role-based access control (restricting what individual members can do) is available on **Enterprise** plans. On other plans, all members have full access to the organization's resources.
+</Note>
+
+<CardGroup cols={2}>
+  <Card
+    title="Profile Settings"
+    icon="user"
+    href="/cloud/account-settings/profile-settings"
+  >
+    Manage your personal account settings
+  </Card>
+  <Card
+    title="API Keys"
+    icon="key"
+    href="/cloud/account-settings/api-keys"
+  >
+    View and manage API keys for your organization
+  </Card>
+</CardGroup>

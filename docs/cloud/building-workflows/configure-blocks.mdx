@@ -4,7 +4,7 @@ subtitle: Reference for every block available in the workflow editor
 slug: cloud/configure-blocks
 ---
 
-Workflows are built from blocks. Each block performs one specific operation: navigating a page, extracting data, making an API call, or branching logic. This page covers every block type available in the [editor](/cloud/build-a-workflow), grouped by category.
+Workflows are built from blocks. Each block performs one specific operation: navigating a page, extracting data, making an API call, or branching logic. This page covers every block type available in the [editor](/cloud/building-workflows/build-a-workflow), grouped by category.
 
 
 ## Quick reference
@@ -136,7 +136,7 @@ Navigate the browser directly to a specific URL without AI interaction.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **URL** | text | **(Required)** The URL to navigate to. Supports [parameter references](/cloud/add-parameters#referencing-parameters-in-blocks). |
+| **URL** | text | **(Required)** The URL to navigate to. Supports [parameter references](/cloud/building-workflows/add-parameters#referencing-parameters-in-blocks). |
 
 ### Print Page
 
@@ -192,7 +192,7 @@ Repeat a sequence of blocks for each item in a list. Child blocks are placed ins
 | **Loop Value** | text | The list to iterate over. Use a parameter reference (e.g., `{{ my_list }}`) or a natural language description (e.g., "Extract links of the top 5 posts") which triggers automatic extraction. |
 | **Continue if Empty** | boolean | Mark the loop as complete if the list is empty |
 
-Inside loop blocks, use these [reserved variables](/cloud/add-parameters#reserved-variables):
+Inside loop blocks, use these [reserved variables](/cloud/building-workflows/add-parameters#reserved-variables):
 - `{{ current_value }}`: the current item
 - `{{ current_index }}`: the iteration number (0-based)
 
@@ -311,7 +311,7 @@ Send an email notification, optionally with file attachments from previous block
 |-------|------|-------------|
 | **Recipients** | text | Comma-separated email addresses |
 | **Subject** | text | Email subject line |
-| **Body** | text | Email body. Supports [parameter references](/cloud/add-parameters#referencing-parameters-in-blocks). |
+| **Body** | text | Email body. Supports [parameter references](/cloud/building-workflows/add-parameters#referencing-parameters-in-blocks). |
 | **File Attachments** | text | Path to files to attach |
 
 ### HTTP Request
