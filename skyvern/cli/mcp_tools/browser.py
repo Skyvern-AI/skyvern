@@ -211,6 +211,96 @@ async def skyvern_click(
     )
 
 
+async def skyvern_hover(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    intent: Annotated[
+        str | None,
+        Field(
+            description="Natural language description of the element to hover over. Be specific: "
+            "'the user avatar in the top-right corner' is better than 'avatar'. "
+            "Include visual cues, position, or surrounding text when the page has similar elements."
+        ),
+    ] = None,
+    selector: Annotated[str | None, Field(description="CSS selector or XPath for the element to hover")] = None,
+    timeout: Annotated[
+        int,
+        Field(
+            description="Max time to wait for the element in ms. Default 30000 (30s)",
+            ge=1000,
+            le=60000,
+        ),
+    ] = 30000,
+) -> dict[str, Any]:
+    """Hover over an element to reveal tooltips, dropdown menus, or hidden content. Uses AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_hover which requires a ref from a prior snapshot, this finds elements using natural language."""
+    ai_mode, err = _resolve_ai_mode(selector, intent)
+    if err:
+        return make_result(
+            "skyvern_hover",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Must provide intent, selector, or both",
+                "Use intent='describe what to hover' for AI-powered hovering, or selector='#css-selector' for precise targeting",
+            ),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_hover", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            if ai_mode is not None:
+                loc = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
+            else:
+                assert selector is not None
+                loc = page.locator(selector)
+            await loc.hover(timeout=timeout)
+            timer.mark("sdk")
+        except PlaywrightTimeoutError as e:
+            return make_result(
+                "skyvern_hover",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.SELECTOR_NOT_FOUND,
+                    str(e),
+                    "Verify the selector matches an element on the page, or use intent for AI-powered finding",
+                ),
+            )
+        except Exception as e:
+            code = ErrorCode.AI_FALLBACK_FAILED if ai_mode else ErrorCode.ACTION_FAILED
+            return make_result(
+                "skyvern_hover",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    code,
+                    str(e),
+                    "The element may be hidden or not interactable",
+                ),
+            )
+
+    data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode}
+    if selector and intent:
+        data["sdk_equivalent"] = f'await page.locator("{selector}", prompt="{intent}").hover()'
+    elif ai_mode:
+        data["sdk_equivalent"] = f'await page.locator(prompt="{intent}").hover()'
+    elif selector:
+        data["sdk_equivalent"] = f'await page.locator("{selector}").hover()'
+
+    return make_result(
+        "skyvern_hover",
+        browser_context=ctx,
+        data=data,
+        timing_ms=timer.timing_ms,
+    )
+
+
 async def skyvern_type(
     text: Annotated[str, "Text to type into the element"],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,

@@ -16,6 +16,7 @@ from .browser import (
     skyvern_click,
     skyvern_evaluate,
     skyvern_extract,
+    skyvern_hover,
     skyvern_navigate,
     skyvern_press_key,
     skyvern_run_task,
@@ -73,7 +74,7 @@ The ONLY cases where Playwright MCP tools are appropriate instead of Skyvern:
 - `browser_file_upload` — uploading files via file chooser
 - `browser_tabs` — managing multiple browser tabs
 - `browser_run_code` — running raw Playwright code snippets
-- `browser_hover` / `browser_drag` — hovering over elements and drag-and-drop interactions
+- `browser_drag` — drag-and-drop interactions
 
 For ALL other browser interactions — navigation, clicking, typing, extraction, forms, scrolling, waiting, screenshots, validation — use Skyvern tools.
 
@@ -86,6 +87,7 @@ For ALL other browser interactions — navigation, clicking, typing, extraction,
 | "Get all product prices" | skyvern_extract | AI-powered extraction — returns JSON, no code needed |
 | "Click the login button" / "Fill out this form" | skyvern_act | Natural language actions — one call, multiple steps |
 | "Click this specific element" | skyvern_click / skyvern_type / skyvern_select_option | Precision targeting by selector or AI intent |
+| "Hover over this menu" | skyvern_hover | Reveal dropdowns, tooltips, hidden content |
 | "Is checkout complete?" | skyvern_validate | AI assertion — returns true/false |
 | "Log in and download the report" | skyvern_run_task | Autonomous AI agent — one-time, nothing saved |
 | "Fill out this 6-page application form" | skyvern_workflow_create | One block per page, versioned, parameterized |
@@ -100,12 +102,12 @@ For ALL other browser interactions — navigation, clicking, typing, extraction,
 2. Create a session (skyvern_session_create) before using browser tools. Workflow and block tools do NOT need a session.
 3. NEVER scrape by guessing API endpoints or writing HTTP requests — use skyvern_navigate + skyvern_extract.
 4. NEVER write Python scripts unless the user explicitly asks for a script. Use the MCP tools.
-5. After page-changing actions (skyvern_click, skyvern_act), use skyvern_screenshot to verify the result.
+5. After page-changing actions (skyvern_click, skyvern_hover, skyvern_act), use skyvern_screenshot to verify the result.
 6. Workflow tools (list, create, run, status) do NOT need a browser session.
 7. skyvern_extract and skyvern_validate read the CURRENT page — navigate first.
 
 ## Tool Modes (precision tools)
-Precision tools (skyvern_click, skyvern_type, skyvern_select_option, skyvern_scroll, skyvern_press_key, skyvern_wait)
+Precision tools (skyvern_click, skyvern_hover, skyvern_type, skyvern_select_option, skyvern_scroll, skyvern_press_key, skyvern_wait)
 support three modes. When unsure, use `intent`. For multiple actions in sequence, prefer skyvern_act.
 
 1. **Intent mode** — AI-powered element finding:
@@ -218,6 +220,7 @@ mcp.tool()(skyvern_evaluate)
 
 # -- Precision tools (selector/intent-based browser primitives) --
 mcp.tool()(skyvern_click)
+mcp.tool()(skyvern_hover)
 mcp.tool()(skyvern_type)
 mcp.tool()(skyvern_scroll)
 mcp.tool()(skyvern_select_option)
@@ -256,6 +259,7 @@ __all__ = [
     "skyvern_evaluate",
     # Precision (selector/intent browser primitives)
     "skyvern_click",
+    "skyvern_hover",
     "skyvern_type",
     "skyvern_scroll",
     "skyvern_select_option",
