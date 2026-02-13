@@ -289,7 +289,7 @@ class LLMAPIHandlerFactory:
             else:
                 # Other reasoning-capable models (Deepseek, etc.) - use "low" for all budget values
                 parameters["reasoning_effort"] = "low"
-                LOG.info(
+                LOG.debug(
                     "Applied thinking budget optimization (reasoning_effort)",
                     prompt_name=prompt_name,
                     budget=new_budget,
@@ -320,7 +320,7 @@ class LLMAPIHandlerFactory:
             if model_label is None and isinstance(llm_config, LLMRouterConfig):
                 model_label = getattr(llm_config, "main_model_group", "router")
 
-            LOG.info(
+            LOG.debug(
                 "Applied thinking budget optimization (reasoning_effort)",
                 prompt_name=prompt_name,
                 budget=new_budget,
@@ -338,7 +338,7 @@ class LLMAPIHandlerFactory:
             if model_label is None and isinstance(llm_config, LLMRouterConfig):
                 model_label = getattr(llm_config, "main_model_group", "router")
 
-            LOG.info(
+            LOG.debug(
                 "Applied thinking budget optimization (thinking)",
                 prompt_name=prompt_name,
                 budget=new_budget,
@@ -366,7 +366,7 @@ class LLMAPIHandlerFactory:
                 thinking_payload["type"] = "enabled"
             parameters["thinking"] = thinking_payload
 
-        LOG.info(
+        LOG.debug(
             "Applied thinking budget optimization (budget_tokens)",
             prompt_name=prompt_name,
             budget=new_budget,
