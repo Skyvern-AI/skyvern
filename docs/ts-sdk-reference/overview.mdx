@@ -1,0 +1,173 @@
+---
+title: TypeScript SDK
+subtitle: Install, authenticate, and configure the Skyvern TypeScript client
+slug: ts-sdk-reference/overview
+---
+
+The `@skyvern/client` package wraps the Skyvern REST API in a typed TypeScript client with built-in browser automation via Playwright.
+
+```bash
+npm install @skyvern/client
+```
+
+<Note>
+Requires Node.js 18+. Also compatible with Bun, Deno, and Cloudflare Workers.
+</Note>
+
+---
+
+## Initialize the client
+
+The `Skyvern` class provides both API methods and browser automation. All API methods return promises:
+
+```typescript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Get the title of the top post on Hacker News",
+    url: "https://news.ycombinator.com",
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+```
+
+### Constructor parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `apiKey` | `string` | — | **Required.** Your Skyvern API key. Get one at [app.skyvern.com/settings](https://app.skyvern.com/settings/api-keys). |
+| `environment` | `SkyvernEnvironment \| string` | `Cloud` | Target environment. Options: `Cloud`, `Staging`, `Local`. |
+| `baseUrl` | `string` | `undefined` | Override the API base URL. Use this for self-hosted deployments. |
+| `timeoutInSeconds` | `number` | `60` | HTTP request timeout in seconds. |
+| `maxRetries` | `number` | `2` | Number of times to retry failed requests. |
+| `headers` | `Record<string, string>` | `undefined` | Additional headers included with every request. |
+
+---
+
+## Environments
+
+The SDK ships with three built-in environment URLs:
+
+```typescript
+import { SkyvernEnvironment } from "@skyvern/client";
+```
+
+| Environment | URL | When to use |
+|-------------|-----|-------------|
+| `SkyvernEnvironment.Cloud` | `https://api.skyvern.com` | Skyvern Cloud (default) |
+| `SkyvernEnvironment.Staging` | `https://api-staging.skyvern.com` | Staging environment |
+| `SkyvernEnvironment.Local` | `http://localhost:8000` | Local server started with `skyvern run server` |
+
+For a self-hosted instance at a custom URL, pass `baseUrl` instead:
+
+```typescript
+const skyvern = new Skyvern({
+  apiKey: "YOUR_API_KEY",
+  baseUrl: "https://skyvern.your-company.com",
+});
+```
+
+---
+
+## `waitForCompletion`
+
+By default, `runTask` and `runWorkflow` return immediately after the run is queued — you get a `run_id` and need to poll `getRun()` yourself. Pass `waitForCompletion: true` to have the SDK poll automatically until the run reaches a terminal state (`completed`, `failed`, `terminated`, `timed_out`, or `canceled`):
+
+```typescript
+// Returns only after the task finishes (up to 30 min by default)
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Fill out the contact form",
+    url: "https://example.com/contact",
+  },
+  waitForCompletion: true,
+  timeout: 600, // give up after 10 minutes
+});
+
+// Without waitForCompletion — returns immediately
+const task = await skyvern.runTask({
+  body: {
+    prompt: "Fill out the contact form",
+    url: "https://example.com/contact",
+  },
+});
+console.log(task.run_id); // poll with skyvern.getRun(task.run_id)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `waitForCompletion` | `boolean` | `false` | Poll until the run finishes. |
+| `timeout` | `number` | `1800` | Maximum wait time in seconds. Throws `Error` if exceeded. |
+
+Supported on `runTask`, `runWorkflow`, `login`, and `downloadFiles`.
+
+---
+
+## Request options
+
+Every method accepts an optional second parameter for per-request overrides of timeout, retries, headers, and abort signal:
+
+```typescript
+const result = await skyvern.runTask(
+  {
+    body: {
+      prompt: "Extract data",
+      url: "https://example.com",
+    },
+  },
+  {
+    timeoutInSeconds: 120,
+    maxRetries: 3,
+    headers: { "x-custom-header": "value" },
+  },
+);
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `timeoutInSeconds` | `number` | HTTP timeout for this request. |
+| `maxRetries` | `number` | Retry count for this request. |
+| `abortSignal` | `AbortSignal` | Signal to abort the request. |
+| `apiKey` | `string` | Override the API key for this request. |
+| `headers` | `Record<string, string>` | Additional headers for this request. |
+
+These override the client-level defaults for that single call only.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Tasks"
+    icon="play"
+    href="/ts-sdk-reference/tasks"
+  >
+    Run browser automations with `runTask`
+  </Card>
+  <Card
+    title="Workflows"
+    icon="diagram-project"
+    href="/ts-sdk-reference/workflows"
+  >
+    Create and run multi-step automations
+  </Card>
+  <Card
+    title="Browser Automation"
+    icon="robot"
+    href="/ts-sdk-reference/browser-automation"
+  >
+    Control cloud browsers with Playwright + AI
+  </Card>
+  <Card
+    title="Error Handling"
+    icon="triangle-exclamation"
+    href="/ts-sdk-reference/error-handling"
+  >
+    Handle errors and configure retries
+  </Card>
+</CardGroup>

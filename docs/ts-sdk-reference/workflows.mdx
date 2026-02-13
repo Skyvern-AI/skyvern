@@ -1,0 +1,273 @@
+---
+title: Workflows
+subtitle: Create and run multi-step browser automations
+slug: ts-sdk-reference/workflows
+---
+
+A workflow chains multiple steps (blocks) into a single automation. Workflows support loops, conditionals, data passing between steps, and code-based re-execution.
+
+For conceptual background, see [Build a Workflow](/multi-step-automations/build-a-workflow).
+
+---
+
+## `runWorkflow`
+
+Execute a workflow by its permanent ID. Skyvern opens a cloud browser and runs each block in sequence.
+
+```typescript
+const result = await skyvern.runWorkflow({
+  body: {
+    workflow_id: "wpid_abc123",
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `body.workflow_id` | `string` | Yes | — | The workflow's permanent ID (`wpid_...`). |
+| `body.parameters` | `Record<string, unknown>` | No | `undefined` | Input parameters defined in the workflow. Keys must match parameter names. |
+| `body.browser_session_id` | `string` | No | `undefined` | Run inside an existing [browser session](/optimization/browser-sessions). |
+| `body.browser_profile_id` | `string` | No | `undefined` | Load a [browser profile](/optimization/browser-profiles) (cookies, storage) into the session. |
+| `body.proxy_location` | `ProxyLocation` | No | `undefined` | Route the browser through a geographic proxy. |
+| `body.webhook_url` | `string` | No | `undefined` | URL to receive a POST when the run finishes. |
+| `body.title` | `string` | No | `undefined` | Display name for this run in the dashboard. |
+| `body.totp_identifier` | `string` | No | `undefined` | Identifier for TOTP verification. |
+| `body.totp_url` | `string` | No | `undefined` | URL to receive TOTP codes. |
+| `body.user_agent` | `string` | No | `undefined` | Custom User-Agent header for the browser. |
+| `body.extra_http_headers` | `Record<string, string>` | No | `undefined` | Additional HTTP headers injected into every browser request. |
+| `body.browser_address` | `string` | No | `undefined` | Connect to a browser at this CDP address. |
+| `template` | `boolean` | No | `undefined` | Run a template workflow. |
+| `waitForCompletion` | `boolean` | No | `false` | Block until the workflow finishes. |
+| `timeout` | `number` | No | `1800` | Max wait time in seconds when `waitForCompletion` is `true`. |
+
+### Returns `WorkflowRunResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | `string` | Unique identifier. Starts with `wr_` for workflow runs. |
+| `status` | `string` | `"created"`, `"queued"`, `"running"`, `"completed"`, `"failed"`, `"terminated"`, `"timed_out"`, or `"canceled"`. |
+| `output` | `Record<string, unknown> \| null` | Extracted data from the workflow's output block. |
+| `downloaded_files` | `FileInfo[] \| undefined` | Files downloaded during the run. |
+| `recording_url` | `string \| undefined` | URL to the session recording. |
+| `failure_reason` | `string \| undefined` | Error description if the run failed. |
+| `app_url` | `string \| undefined` | Link to view this run in the Cloud UI. |
+| `step_count` | `number \| undefined` | Total AI steps taken across all blocks. |
+| `run_with` | `string \| undefined` | Whether the run used `"code"` or `"agent"`. |
+| `ai_fallback` | `boolean \| undefined` | Whether AI fallback was configured. |
+| `script_run` | `ScriptRunResponse \| undefined` | Code execution result. Contains `ai_fallback_triggered` if code was used. |
+
+### Examples
+
+**Pass parameters to a workflow:**
+
+```typescript
+const result = await skyvern.runWorkflow({
+  body: {
+    workflow_id: "wpid_invoice_extraction",
+    parameters: {
+      company_name: "Acme Corp",
+      date_range: "2025-01-01 to 2025-12-31",
+    },
+  },
+  waitForCompletion: true,
+});
+```
+
+**Run with a browser profile (skip login):**
+
+```typescript
+const result = await skyvern.runWorkflow({
+  body: {
+    workflow_id: "wpid_daily_report",
+    browser_profile_id: "bpf_abc123",
+  },
+  waitForCompletion: true,
+});
+```
+
+---
+
+## `createWorkflow`
+
+Create a new workflow from a JSON or YAML definition.
+
+```typescript
+const workflow = await skyvern.createWorkflow({
+  body: {
+    json_definition: {
+      title: "Extract Products",
+      workflow_definition: {
+        parameters: [
+          {
+            key: "target_url",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+            description: "URL to scrape",
+          },
+        ],
+        blocks: [
+          {
+            block_type: "task",
+            label: "extract",
+            prompt: "Extract the top 3 products with name and price",
+            url: "{{ target_url }}",
+          },
+        ],
+      },
+    },
+  },
+});
+console.log(workflow.workflow_permanent_id);
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `body.json_definition` | `object` | No | Workflow definition as a JSON object. |
+| `body.yaml_definition` | `string` | No | Workflow definition as a YAML string. |
+| `folder_id` | `string` | No | Folder to organize the workflow in. |
+
+You must provide either `body.json_definition` or `body.yaml_definition`.
+
+### Returns `Workflow`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `workflow_id` | `string` | Unique ID for this version. |
+| `workflow_permanent_id` | `string` | Stable ID across all versions. Use this to run workflows. |
+| `version` | `number` | Version number. |
+| `title` | `string` | Workflow title. |
+| `workflow_definition` | `WorkflowDefinition` | The full definition including blocks and parameters. |
+| `status` | `string \| undefined` | Workflow status. |
+| `created_at` | `string` | When the workflow was created. |
+
+---
+
+## `getWorkflows`
+
+List all workflows. Supports filtering and pagination.
+
+```typescript
+const workflows = await skyvern.getWorkflows({});
+for (const wf of workflows) {
+  console.log(`${wf.title} (${wf.workflow_permanent_id})`);
+}
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `page` | `number` | No | `undefined` | Page number for pagination. |
+| `page_size` | `number` | No | `undefined` | Number of results per page. |
+| `only_saved_tasks` | `boolean` | No | `undefined` | Only return saved tasks. |
+| `only_workflows` | `boolean` | No | `undefined` | Only return workflows (not saved tasks). |
+| `only_templates` | `boolean` | No | `undefined` | Only return templates. |
+| `title` | `string` | No | `undefined` | Filter by exact title. |
+| `search_key` | `string` | No | `undefined` | Search by title. |
+| `folder_id` | `string` | No | `undefined` | Filter by folder. |
+| `status` | `WorkflowStatus \| WorkflowStatus[]` | No | `undefined` | Filter by status. |
+
+### Returns `Workflow[]`
+
+---
+
+## `getWorkflow`
+
+Get a specific workflow by its permanent ID.
+
+```typescript
+const workflow = await skyvern.getWorkflow("wpid_abc123");
+console.log(workflow.title, `v${workflow.version}`);
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflowPermanentId` | `string` | Yes | The workflow's permanent ID. |
+| `version` | `number` | No | Specific version to retrieve. Defaults to latest. |
+| `template` | `boolean` | No | Whether to fetch a template workflow. |
+
+### Returns `Workflow`
+
+---
+
+## `getWorkflowVersions`
+
+List all versions of a workflow.
+
+```typescript
+const versions = await skyvern.getWorkflowVersions("wpid_abc123");
+for (const v of versions) {
+  console.log(`v${v.version} — ${v.modified_at}`);
+}
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflowPermanentId` | `string` | Yes | The workflow's permanent ID. |
+| `template` | `boolean` | No | Whether to fetch template versions. |
+
+### Returns `Workflow[]`
+
+---
+
+## `updateWorkflow`
+
+Update an existing workflow's definition.
+
+```typescript
+const updated = await skyvern.updateWorkflow("wpid_abc123", {
+  json_definition: {
+    title: "Extract Products Updated",
+    workflow_definition: {
+      blocks: [
+        {
+          block_type: "task",
+          label: "extract_data",
+          prompt: "Extract the top 5 products",
+          url: "https://example.com/products",
+        },
+      ],
+      parameters: [],
+    },
+  },
+});
+console.log(`Updated to v${updated.version}`);
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflowId` | `string` | Yes | The workflow's permanent ID (`wpid_...`). |
+| `json_definition` | `object` | No | Updated workflow definition as JSON. |
+| `yaml_definition` | `string` | No | Updated workflow definition as YAML. |
+
+### Returns `Workflow`
+
+Creates a new version of the workflow.
+
+---
+
+## `deleteWorkflow`
+
+Delete a workflow.
+
+```typescript
+await skyvern.deleteWorkflow("wf_abc123");
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflowId` | `string` | Yes | The workflow version ID to delete. |

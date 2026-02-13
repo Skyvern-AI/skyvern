@@ -1,0 +1,124 @@
+---
+title: Browser Sessions
+subtitle: Maintain live browser state between API calls
+slug: ts-sdk-reference/browser-sessions
+---
+
+A browser session is a persistent browser instance that stays alive between API calls. Use sessions to chain multiple tasks in the same browser without losing cookies, local storage, or login state.
+
+For conceptual background, see [Browser Sessions](/optimization/browser-sessions).
+
+---
+
+## `createBrowserSession`
+
+Spin up a new cloud browser session.
+
+```typescript
+const session = await skyvern.createBrowserSession({ timeout: 60 });
+console.log(session.browser_session_id); // pbs_abc123
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `timeout` | `number` | No | `60` | Session timeout in minutes (5–1440). Timer starts after the session is ready. |
+| `proxy_location` | `ProxyLocation` | No | `undefined` | Route browser traffic through a geographic proxy. |
+| `extensions` | `Extensions[]` | No | `undefined` | Browser extensions to install. Options: `"ad-blocker"`, `"captcha-solver"`. |
+| `browser_type` | `PersistentBrowserType` | No | `undefined` | Browser type. Options: `"chrome"`, `"msedge"`. |
+
+### Returns `BrowserSessionResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `browser_session_id` | `string` | Unique ID. Starts with `pbs_`. |
+| `status` | `string \| undefined` | Current session status. |
+| `browser_address` | `string \| undefined` | CDP address for connecting to the browser. |
+| `app_url` | `string \| undefined` | Link to the live browser view in the Cloud UI. |
+| `timeout` | `number \| undefined` | Configured timeout in minutes. |
+| `started_at` | `string \| undefined` | When the session became ready. |
+| `created_at` | `string` | When the session was requested. |
+
+### Example: Chain multiple tasks in one session
+
+```typescript
+const session = await skyvern.createBrowserSession({});
+
+// Step 1: Log in
+await skyvern.runTask({
+  body: {
+    prompt: "Log in with username demo@example.com",
+    url: "https://app.example.com/login",
+    browser_session_id: session.browser_session_id,
+  },
+  waitForCompletion: true,
+});
+
+// Step 2: Extract data (same browser, already logged in)
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Go to the invoices page and extract all invoice numbers",
+    browser_session_id: session.browser_session_id,
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+
+// Clean up
+await skyvern.closeBrowserSession(session.browser_session_id);
+```
+
+---
+
+## `getBrowserSession`
+
+Get the status and details of a session.
+
+```typescript
+const session = await skyvern.getBrowserSession("pbs_abc123");
+console.log(session.status, session.browser_address);
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `browserSessionId` | `string` | Yes | The session ID. |
+
+### Returns `BrowserSessionResponse`
+
+---
+
+## `getBrowserSessions`
+
+List all active browser sessions.
+
+```typescript
+const sessions = await skyvern.getBrowserSessions();
+for (const s of sessions) {
+  console.log(`${s.browser_session_id} — ${s.status}`);
+}
+```
+
+### Returns `BrowserSessionResponse[]`
+
+---
+
+## `closeBrowserSession`
+
+Close a browser session and release its resources.
+
+```typescript
+await skyvern.closeBrowserSession("pbs_abc123");
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `browserSessionId` | `string` | Yes | The session ID to close. |
+
+<Warning>
+Closing a session is irreversible. Any unsaved state (cookies, local storage) is lost unless you created a [browser profile](/ts-sdk-reference/browser-profiles) from it.
+</Warning>

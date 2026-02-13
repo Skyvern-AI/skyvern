@@ -118,7 +118,7 @@
         ]
       },
       {
-        "tab": "Python SDK",
+        "tab": "SDKs",
         "groups": [
           {
             "group": "Python SDK",
@@ -132,6 +132,21 @@
               "sdk-reference/helpers",
               "sdk-reference/error-handling",
               "sdk-reference/complete-reference"
+            ]
+          },
+        {
+            "group": "TypeScript SDK",
+            "pages": [
+              "ts-sdk-reference/overview",
+              "ts-sdk-reference/tasks",
+              "ts-sdk-reference/workflows",
+              "ts-sdk-reference/browser-sessions",
+              "ts-sdk-reference/browser-profiles",
+              "ts-sdk-reference/credentials",
+              "ts-sdk-reference/helpers",
+              "ts-sdk-reference/browser-automation",
+              "ts-sdk-reference/error-handling",
+              "ts-sdk-reference/complete-reference"
             ]
           }
         ]
