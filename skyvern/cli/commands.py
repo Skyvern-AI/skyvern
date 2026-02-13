@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 
 from skyvern.utils.env_paths import resolve_backend_env_path
 
+from .credentials import credentials_app
 from .docs import docs_app
 from .init_command import init_browser, init_env
 from .quickstart import quickstart_app
@@ -24,6 +25,7 @@ cli_app.add_typer(
 )
 cli_app.add_typer(workflow_app, name="workflow", help="Workflow management commands.")
 cli_app.add_typer(tasks_app, name="tasks", help="Task management commands.")
+cli_app.add_typer(credentials_app, name="credentials", help="Manage stored credentials for secure login.")
 cli_app.add_typer(docs_app, name="docs", help="Open Skyvern documentation.")
 cli_app.add_typer(status_app, name="status", help="Check if Skyvern services are running.")
 cli_app.add_typer(stop_app, name="stop", help="Stop Skyvern services.")
