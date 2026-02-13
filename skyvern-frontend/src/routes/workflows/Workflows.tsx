@@ -293,11 +293,13 @@ function Workflows() {
     expandedRows,
     toggleExpanded: toggleParametersExpanded,
     setAutoExpandedRows,
+    setManuallyExpandedRows,
   } = useParameterExpansion();
 
   useEffect(() => {
     if (!isSearchActive) {
       setAutoExpandedRows([]);
+      setManuallyExpandedRows(new Set());
       return;
     }
 
@@ -316,7 +318,13 @@ function Workflows() {
     setAutoExpandedRows(
       matchingWorkflows.map((workflow) => workflow.workflow_permanent_id),
     );
-  }, [isSearchActive, workflows, matchesParameter, setAutoExpandedRows]);
+  }, [
+    isSearchActive,
+    workflows,
+    matchesParameter,
+    setAutoExpandedRows,
+    setManuallyExpandedRows,
+  ]);
 
   function handleRowClick(
     event: React.MouseEvent<HTMLTableCellElement>,
