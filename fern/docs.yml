@@ -177,14 +177,19 @@ navigation:
               - GET /v1/runs/{run_id}/timeline
           - section: Workflows
             contents:
+              - GET /v1/workflows
+              - POST /v1/workflows
+              - GET /v1/workflows/{workflow_permanent_id}
+              - GET /v1/workflows/{workflow_permanent_id}/versions
+              - POST /v1/workflows/{workflow_id}
+              - POST /v1/workflows/{workflow_id}/delete
+          - section: Workflow Runs
+            contents:
               - POST /v1/run/workflows
+              - GET /v1/workflows/runs
               - GET /v1/runs/{run_id}
               - POST /v1/runs/{run_id}/cancel
               - POST /v1/runs/{run_id}/retry_webhook
-              - GET /v1/workflows
-              - POST /v1/workflows
-              - POST /v1/workflows/{workflow_id}
-              - POST /v1/workflows/{workflow_id}/delete
               - GET /v1/runs/{run_id}/timeline
           - section: Browser Sessions
             contents:
@@ -202,6 +207,7 @@ navigation:
             contents:
               - POST /v1/credentials
               - GET /v1/credentials/{credential_id}
+              - POST /v1/credentials/{credential_id}/update
               - POST /v1/credentials/{credential_id}/delete
               - GET /v1/credentials
               - POST /v1/credentials/totp
