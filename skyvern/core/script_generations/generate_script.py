@@ -229,6 +229,16 @@ def _build_value_to_param_lookup(
     return dict(sorted(raw.items(), key=lambda kv: len(kv[0]), reverse=True))
 
 
+def _escape_for_fstring_text(text: str) -> str:
+    """Escape ``{`` and ``}`` so they survive inside a ``FormattedStringText`` node.
+
+    Jinja2 templates (e.g. ``{{param}}``) would otherwise be interpreted as
+    f-string expressions.  Doubling the braces turns them into literal braces
+    in the rendered f-string.
+    """
+    return text.replace("{", "{{").replace("}", "}}")
+
+
 def _build_parameterized_prompt_cst(
     intention: str,
     value_to_param: dict[str, str],
@@ -268,7 +278,7 @@ def _build_parameterized_prompt_cst(
     for start, end, field_name in matches:
         # Text segment before this match.
         if start > cursor:
-            parts.append(cst.FormattedStringText(intention[cursor:start]))
+            parts.append(cst.FormattedStringText(_escape_for_fstring_text(intention[cursor:start])))
         # The {context.parameters['field_name']} expression.
         parts.append(
             cst.FormattedStringExpression(
@@ -289,9 +299,17 @@ def _build_parameterized_prompt_cst(
 
     # Trailing text after last match.
     if cursor < len(intention):
-        parts.append(cst.FormattedStringText(intention[cursor:]))
+        parts.append(cst.FormattedStringText(_escape_for_fstring_text(intention[cursor:])))
 
-    return cst.FormattedString(parts=parts)
+    # Use triple-quote f-string when the content contains newlines or quotes
+    # (run_task prompts always have newlines from the appended navigation_payload).
+    raw_text = intention
+    if "\n" in raw_text or '"' in raw_text or "'" in raw_text:
+        quote = '"""'
+    else:
+        quote = '"'
+
+    return cst.FormattedString(parts=parts, start=f"f{quote}", end=quote)
 
 
 def _requires_mini_agent(act: dict[str, Any]) -> bool:
@@ -1085,10 +1103,13 @@ def _build_generated_model_from_schema(schema_code: str) -> cst.ClassDef | None:
 
 
 def _build_run_task_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    value_to_param: dict[str, str] | None = None,
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.run_task statement."""
-    args = __build_base_task_statement(block_title, block, data_variable_name)
+    args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("run_task")),
         args=args,
@@ -1102,10 +1123,13 @@ def _build_run_task_statement(
 
 
 def _build_download_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    value_to_param: dict[str, str] | None = None,
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.download statement."""
-    args = __build_base_task_statement(block_title, block, data_variable_name)
+    args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("download")),
         args=args,
@@ -1168,10 +1192,13 @@ def _build_action_statement(
 
 
 def _build_login_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    value_to_param: dict[str, str] | None = None,
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.login statement."""
-    args = __build_base_task_statement(block_title, block, data_variable_name)
+    args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("login")),
         args=args,
@@ -1256,10 +1283,13 @@ def _build_extract_statement(
 
 
 def _build_navigate_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    value_to_param: dict[str, str] | None = None,
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.navigate statement."""
-    args = __build_base_task_statement(block_title, block, data_variable_name)
+    args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("run_task")),
         args=args,
@@ -1995,7 +2025,10 @@ def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
 
 
 def __build_base_task_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    value_to_param: dict[str, str] | None = None,
 ) -> list[cst.Arg]:
     block_type = block.get("block_type")
     prompt = block.get("prompt") if block_type == "task_v2" else block.get("navigation_goal")
@@ -2011,10 +2044,17 @@ def __build_base_task_statement(
         prompt = prompt or ""
         prompt = f"{prompt}\n{navigation_payload}"
 
+    # Try to parameterize PII in the prompt with f-string context.parameters refs.
+    prompt_value: cst.BaseExpression | None = None
+    if value_to_param and prompt:
+        prompt_value = _build_parameterized_prompt_cst(prompt, value_to_param)
+    if prompt_value is None:
+        prompt_value = _value(prompt)
+
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(prompt),
+            value=prompt_value,
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -2132,7 +2172,10 @@ def __build_base_task_statement(
 
 
 def _build_block_statement(
-    block: dict[str, Any], data_variable_name: str | None = None, assign_output: bool = False
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    assign_output: bool = False,
+    value_to_param: dict[str, str] | None = None,
 ) -> cst.SimpleStatementLine:
     """Build a block statement."""
     block_type = block.get("block_type")
@@ -2141,23 +2184,23 @@ def _build_block_statement(
     if block_type in SCRIPT_TASK_BLOCKS:
         # For task blocks, call the custom function with cache_key
         if block_type == "task":
-            stmt = _build_run_task_statement(block_title, block, data_variable_name)
+            stmt = _build_run_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
         elif block_type == "file_download":
-            stmt = _build_download_statement(block_title, block, data_variable_name)
+            stmt = _build_download_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
         elif block_type == "action":
             stmt = _build_action_statement(block_title, block, data_variable_name)
         elif block_type == "login":
-            stmt = _build_login_statement(block_title, block, data_variable_name)
+            stmt = _build_login_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
         elif block_type == "extraction":
             stmt = _build_extract_statement(block_title, block, data_variable_name, assign_output)
         elif block_type == "navigation":
-            stmt = _build_navigate_statement(block_title, block, data_variable_name)
+            stmt = _build_navigate_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     elif block_type == "validation":
         stmt = _build_validate_statement(block_title, block, data_variable_name)
     elif block_type == "human_interaction":
         stmt = _build_human_interaction_statement(block)
     elif block_type == "task_v2":
-        stmt = _build_run_task_statement(block_title, block, data_variable_name)
+        stmt = _build_run_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     elif block_type == "send_email":
         stmt = _build_send_email_statement(block)
     elif block_type == "text_prompt":
@@ -2398,7 +2441,7 @@ async def generate_workflow_script_python_code(
             temp_module = cst.Module(body=[block_fn_def])
             block_code = temp_module.code
 
-            block_stmt = _build_block_statement(task)
+            block_stmt = _build_block_statement(task, value_to_param=value_to_param)
             run_signature_module = cst.Module(body=[block_stmt])
             run_signature = run_signature_module.code.strip()
 
@@ -2464,7 +2507,7 @@ async def generate_workflow_script_python_code(
             temp_module = cst.Module(body=task_v2_block_body)
             block_code = temp_module.code
 
-            task_v2_stmt = _build_block_statement(task_v2)
+            task_v2_stmt = _build_block_statement(task_v2, value_to_param=value_to_param)
             run_signature = cst.Module(body=[task_v2_stmt]).code.strip()
 
         if script_id and script_revision_id and organization_id:
