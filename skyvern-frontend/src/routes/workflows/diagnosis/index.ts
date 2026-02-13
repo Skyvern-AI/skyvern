@@ -1,0 +1,1 @@
+export { DiagnosisChatPanel } from "./DiagnosisChatPanel";
