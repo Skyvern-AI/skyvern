@@ -1375,7 +1375,9 @@ class LLMCaller:
             # For GitHub Copilot, use the actual model name from OPENAI_COMPATIBLE_MODEL_NAME
             self.llm_key = settings.OPENAI_COMPATIBLE_MODEL_NAME or self.llm_key
             self.openai_client = AsyncOpenAI(
-                api_key=settings.OPENAI_COMPATIBLE_API_KEY, base_url=settings.OPENAI_COMPATIBLE_API_BASE
+                api_key=settings.OPENAI_COMPATIBLE_API_KEY,
+                base_url=settings.OPENAI_COMPATIBLE_API_BASE,
+                http_client=ForgeAsyncHttpxClientWrapper(),
             )
 
     def add_tool_result(self, tool_result: dict[str, Any]) -> None:
@@ -1668,11 +1670,12 @@ class LLMCaller:
                 extra_headers["HTTP-Referer"] = settings.SKYVERN_APP_URL
                 extra_headers["X-Title"] = "Skyvern"
 
-            # Add Copilot-Vision-Request header for GitHub Copilot when there are images in the messages
+            # Add required headers for GitHub Copilot API
             if LLMAPIHandlerFactory.is_github_copilot_endpoint():
-                # Check if any message contains images using the existing utility function
-                has_images = any(is_image_message(msg) for msg in messages)
+                extra_headers["Copilot-Integration-Id"] = "copilot-chat"
 
+                # Add vision header when there are images in the request
+                has_images = any(is_image_message(msg) for msg in messages)
                 # Only set the header when there are actual images in the request
                 if has_images:
                     extra_headers["Copilot-Vision-Request"] = "true"
