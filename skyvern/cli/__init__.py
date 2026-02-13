@@ -2,6 +2,7 @@
 
 __all__ = [
     "cli_app",
+    "credentials_app",
     "quickstart_app",
     "run_app",
     "workflow_app",
@@ -12,6 +13,7 @@ __all__ = [
 ]
 
 from .commands import cli_app, init_app  # init_app is defined in commands.py
+from .credentials import credentials_app
 from .docs import docs_app
 from .quickstart import quickstart_app
 from .run_commands import run_app
