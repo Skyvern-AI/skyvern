@@ -117,6 +117,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     ExtractAction,
     GotoUrlAction,
+    KeypressAction,
     ReloadPageAction,
     TerminateAction,
     WebAction,
@@ -1284,6 +1285,16 @@ class ForgeAgent:
                         "totp_secret": totp_secret,
                         "is_retry": step.retry_index > 0,
                     }
+
+                # Tell the handler to skip the auto-completion Tab hack when the
+                # next batched action would be broken by a focus change — e.g. a
+                # KEYPRESS Enter or another action on the same element.
+                if action.action_type == ActionType.INPUT_TEXT and action_idx + 1 < len(action_linked_list):
+                    next_action = action_linked_list[action_idx + 1].action
+                    if isinstance(next_action, KeypressAction) or (
+                        isinstance(next_action, WebAction) and next_action.element_id == action.element_id
+                    ):
+                        action.skip_auto_complete_tab = True
 
                 results = await ActionHandler.handle_action(
                     scraped_page=scraped_page,
@@ -3577,6 +3588,7 @@ class ForgeAgent:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
                 task_id=task.task_id, browser_state=browser_state
             )
+            LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
                 await app.ARTIFACT_MANAGER.update_artifact_data(
                     artifact_id=video_artifact.video_artifact_id,
@@ -3585,6 +3597,7 @@ class ForgeAgent:
                 )
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
+            LOG.debug("Uploading har data", har_size=len(har_data))
             if har_data:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=last_step,
@@ -3595,6 +3608,7 @@ class ForgeAgent:
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
                 task_id=task.task_id, browser_state=browser_state
             )
+            LOG.debug("Uploading browser log", browser_log_size=len(browser_log))
             if browser_log:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=last_step,

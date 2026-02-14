@@ -185,6 +185,132 @@ ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT = ["extract"]
 INDENT = " " * 4
 DOUBLE_INDENT = " " * 8
 
+# Minimum length for a parameter value to be eligible for substitution in click prompts.
+# Short values (e.g. "1", "No", "CA") cause too many false-positive replacements.
+MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 4
+
+
+def _build_value_to_param_lookup(
+    actions_by_task: dict[str, list[dict[str, Any]]],
+) -> dict[str, str]:
+    """Build a mapping from literal action values to their parameter field names.
+
+    After ``hydrate_input_text_actions_with_field_names`` runs, custom-field actions
+    carry both the original literal value (``text``, ``option``, or ``file_url``) and
+    the ``field_name`` assigned by the LLM.  This function collects those pairs so
+    that click-prompt generation can replace matching literals with
+    ``context.parameters['field_name']`` f-string references.
+
+    The returned dict is sorted by *descending value length* so that callers who
+    iterate in order will replace longer matches first, avoiding partial collisions.
+    """
+    raw: dict[str, str] = {}
+    for _task_id, actions in actions_by_task.items():
+        for action in actions:
+            field_name = action.get("field_name")
+            if not field_name:
+                continue
+            action_type = action.get("action_type", "")
+            if action_type == ActionType.INPUT_TEXT:
+                value = action.get("text", "")
+            elif action_type == ActionType.UPLOAD_FILE:
+                value = action.get("file_url", "")
+            elif action_type == ActionType.SELECT_OPTION:
+                value = action.get("option", "")
+            else:
+                continue
+            if value and len(value) >= MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB:
+                # First writer wins — the field-level name is more specific than a
+                # workflow-level parameter that may happen to share the same value.
+                if value not in raw:
+                    raw[value] = field_name
+
+    # Sort by descending value length so longer matches are attempted first.
+    return dict(sorted(raw.items(), key=lambda kv: len(kv[0]), reverse=True))
+
+
+def _escape_for_fstring_text(text: str) -> str:
+    """Escape ``{`` and ``}`` so they survive inside a ``FormattedStringText`` node.
+
+    Jinja2 templates (e.g. ``{{param}}``) would otherwise be interpreted as
+    f-string expressions.  Doubling the braces turns them into literal braces
+    in the rendered f-string.
+    """
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+def _build_parameterized_prompt_cst(
+    intention: str,
+    value_to_param: dict[str, str],
+) -> cst.BaseExpression | None:
+    """If *intention* contains any literal parameter values, return a ``FormattedString``
+    CST node (an f-string) with those values replaced by
+    ``context.parameters['field_name']`` expressions.
+
+    Returns ``None`` when no substitution is needed (the caller should fall back to
+    emitting a plain string literal).
+    """
+    # Identify all non-overlapping matches, preferring longer values (dict is
+    # already sorted by descending length).
+    # Each match is (start, end, field_name).
+    matches: list[tuple[int, int, str]] = []
+    for value, field_name in value_to_param.items():
+        start = 0
+        while True:
+            idx = intention.find(value, start)
+            if idx == -1:
+                break
+            end = idx + len(value)
+            # Check overlap with already-accepted matches.
+            overlaps = any(not (end <= ms or idx >= me) for ms, me, _ in matches)
+            if not overlaps:
+                matches.append((idx, end, field_name))
+            start = end
+
+    if not matches:
+        return None
+
+    # Sort matches by position so we can build the f-string left-to-right.
+    matches.sort(key=lambda m: m[0])
+
+    parts: list[cst.BaseFormattedStringContent] = []
+    cursor = 0
+    for start, end, field_name in matches:
+        # Text segment before this match.
+        if start > cursor:
+            parts.append(cst.FormattedStringText(_escape_for_fstring_text(intention[cursor:start])))
+        # The {context.parameters['field_name']} expression.
+        parts.append(
+            cst.FormattedStringExpression(
+                expression=cst.Subscript(
+                    value=cst.Attribute(
+                        value=cst.Name("context"),
+                        attr=cst.Name("parameters"),
+                    ),
+                    slice=[
+                        cst.SubscriptElement(
+                            slice=cst.Index(value=_value(field_name)),
+                        )
+                    ],
+                )
+            )
+        )
+        cursor = end
+
+    # Trailing text after last match.
+    if cursor < len(intention):
+        parts.append(cst.FormattedStringText(_escape_for_fstring_text(intention[cursor:])))
+
+    # Use triple-quote f-string when the content contains newlines or quotes
+    # (run_task prompts always have newlines from the appended navigation_payload).
+    raw_text = intention
+    if "\n" in raw_text or '"' in raw_text or "'" in raw_text:
+        quote = '"""'
+    else:
+        quote = '"'
+
+    return cst.FormattedString(parts=parts, start=f"f{quote}", end=quote)
+
 
 def _requires_mini_agent(act: dict[str, Any]) -> bool:
     """
@@ -431,7 +557,12 @@ def _make_decorator(block_label: str, block: dict[str, Any]) -> cst.Decorator:
     )
 
 
-def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output: bool = False) -> cst.BaseStatement:
+def _action_to_stmt(
+    act: dict[str, Any],
+    task: dict[str, Any],
+    assign_to_output: bool = False,
+    value_to_param: dict[str, str] | None = None,
+) -> cst.BaseStatement:
     """
     Turn one Action dict into:
 
@@ -440,6 +571,10 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
     Or if assign_to_output is True for extract actions:
 
         output = await page.extract(...)
+
+    When *value_to_param* is provided, click prompt strings that contain literal
+    parameter values will be emitted as f-strings referencing
+    ``context.parameters['field_name']`` instead of hardcoded text.
     """
     method = ACTION_MAP[act["action_type"]]
 
@@ -740,11 +875,19 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
 
     intention = act.get("intention") or act.get("reasoning") or ""
     if intention and method not in ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT:
+        # Try to parameterize the prompt for click actions so cached scripts
+        # don't embed recording-specific values (e.g. a patient ID).
+        prompt_value: cst.BaseExpression | None = None
+        if value_to_param:
+            prompt_value = _build_parameterized_prompt_cst(intention, value_to_param)
+        if prompt_value is None:
+            prompt_value = _value(intention)
+
         args.extend(
             [
                 cst.Arg(
                     keyword=cst.Name("prompt"),
-                    value=_value(intention),
+                    value=prompt_value,
                     whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
                     comma=cst.Comma(),
                 ),
@@ -811,7 +954,11 @@ def _collect_block_input_fields(
     return all_fields
 
 
-def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> FunctionDef:
+def _build_block_fn(
+    block: dict[str, Any],
+    actions: list[dict[str, Any]],
+    value_to_param: dict[str, str] | None = None,
+) -> FunctionDef:
     name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
     body_stmts: list[cst.BaseStatement] = []
@@ -832,7 +979,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
 
         # For extraction blocks, assign extract action results to output variable
         assign_to_output = act["action_type"] == "extract"
-        body_stmts.append(_action_to_stmt(act, block, assign_to_output=assign_to_output))
+        body_stmts.append(_action_to_stmt(act, block, assign_to_output=assign_to_output, value_to_param=value_to_param))
 
     # add complete action
     block_type = block.get("block_type")
@@ -956,10 +1103,13 @@ def _build_generated_model_from_schema(schema_code: str) -> cst.ClassDef | None:
 
 
 def _build_run_task_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    value_to_param: dict[str, str] | None = None,
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.run_task statement."""
-    args = __build_base_task_statement(block_title, block, data_variable_name)
+    args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("run_task")),
         args=args,
@@ -973,10 +1123,13 @@ def _build_run_task_statement(
 
 
 def _build_download_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    value_to_param: dict[str, str] | None = None,
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.download statement."""
-    args = __build_base_task_statement(block_title, block, data_variable_name)
+    args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("download")),
         args=args,
@@ -1039,10 +1192,13 @@ def _build_action_statement(
 
 
 def _build_login_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    value_to_param: dict[str, str] | None = None,
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.login statement."""
-    args = __build_base_task_statement(block_title, block, data_variable_name)
+    args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("login")),
         args=args,
@@ -1127,10 +1283,13 @@ def _build_extract_statement(
 
 
 def _build_navigate_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    value_to_param: dict[str, str] | None = None,
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.navigate statement."""
-    args = __build_base_task_statement(block_title, block, data_variable_name)
+    args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("run_task")),
         args=args,
@@ -1866,7 +2025,10 @@ def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
 
 
 def __build_base_task_statement(
-    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+    block_title: str,
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    value_to_param: dict[str, str] | None = None,
 ) -> list[cst.Arg]:
     block_type = block.get("block_type")
     prompt = block.get("prompt") if block_type == "task_v2" else block.get("navigation_goal")
@@ -1882,10 +2044,17 @@ def __build_base_task_statement(
         prompt = prompt or ""
         prompt = f"{prompt}\n{navigation_payload}"
 
+    # Try to parameterize PII in the prompt with f-string context.parameters refs.
+    prompt_value: cst.BaseExpression | None = None
+    if value_to_param and prompt:
+        prompt_value = _build_parameterized_prompt_cst(prompt, value_to_param)
+    if prompt_value is None:
+        prompt_value = _value(prompt)
+
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(prompt),
+            value=prompt_value,
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -2003,7 +2172,10 @@ def __build_base_task_statement(
 
 
 def _build_block_statement(
-    block: dict[str, Any], data_variable_name: str | None = None, assign_output: bool = False
+    block: dict[str, Any],
+    data_variable_name: str | None = None,
+    assign_output: bool = False,
+    value_to_param: dict[str, str] | None = None,
 ) -> cst.SimpleStatementLine:
     """Build a block statement."""
     block_type = block.get("block_type")
@@ -2012,23 +2184,23 @@ def _build_block_statement(
     if block_type in SCRIPT_TASK_BLOCKS:
         # For task blocks, call the custom function with cache_key
         if block_type == "task":
-            stmt = _build_run_task_statement(block_title, block, data_variable_name)
+            stmt = _build_run_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
         elif block_type == "file_download":
-            stmt = _build_download_statement(block_title, block, data_variable_name)
+            stmt = _build_download_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
         elif block_type == "action":
             stmt = _build_action_statement(block_title, block, data_variable_name)
         elif block_type == "login":
-            stmt = _build_login_statement(block_title, block, data_variable_name)
+            stmt = _build_login_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
         elif block_type == "extraction":
             stmt = _build_extract_statement(block_title, block, data_variable_name, assign_output)
         elif block_type == "navigation":
-            stmt = _build_navigate_statement(block_title, block, data_variable_name)
+            stmt = _build_navigate_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     elif block_type == "validation":
         stmt = _build_validate_statement(block_title, block, data_variable_name)
     elif block_type == "human_interaction":
         stmt = _build_human_interaction_statement(block)
     elif block_type == "task_v2":
-        stmt = _build_run_task_statement(block_title, block, data_variable_name)
+        stmt = _build_run_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     elif block_type == "send_email":
         stmt = _build_send_email_statement(block)
     elif block_type == "text_prompt":
@@ -2223,6 +2395,10 @@ async def generate_workflow_script_python_code(
     )
     actions_by_task = hydrate_input_text_actions_with_field_names(actions_by_task, field_mappings)
 
+    # Build a lookup from literal parameter values to field names so that click
+    # prompt strings can be parameterized (e.g. patient ID → context.parameters[...]).
+    value_to_param = _build_value_to_param_lookup(actions_by_task)
+
     # --- class + cached params -----------------------------------------
     model_cls = _build_model(workflow)
     generated_model_cls = _build_generated_model_from_schema(generated_schema)
@@ -2259,11 +2435,13 @@ async def generate_workflow_script_python_code(
             block_workflow_run_id = cached_source.workflow_run_id
             block_workflow_run_block_id = cached_source.workflow_run_block_id
         else:
-            block_fn_def = _build_block_fn(task, actions_by_task.get(task.get("task_id", ""), []))
+            block_fn_def = _build_block_fn(
+                task, actions_by_task.get(task.get("task_id", ""), []), value_to_param=value_to_param
+            )
             temp_module = cst.Module(body=[block_fn_def])
             block_code = temp_module.code
 
-            block_stmt = _build_block_statement(task)
+            block_stmt = _build_block_statement(task, value_to_param=value_to_param)
             run_signature_module = cst.Module(body=[block_stmt])
             run_signature = run_signature_module.code.strip()
 
@@ -2317,7 +2495,11 @@ async def generate_workflow_script_python_code(
 
             for child_block in child_blocks:
                 if child_block.get("block_type") in SCRIPT_TASK_BLOCKS and child_block.get("block_type") != "task_v2":
-                    child_fn_def = _build_block_fn(child_block, actions_by_task.get(child_block.get("task_id", ""), []))
+                    child_fn_def = _build_block_fn(
+                        child_block,
+                        actions_by_task.get(child_block.get("task_id", ""), []),
+                        value_to_param=value_to_param,
+                    )
                     task_v2_block_body.append(cst.EmptyLine())
                     task_v2_block_body.append(cst.EmptyLine())
                     task_v2_block_body.append(child_fn_def)
@@ -2325,7 +2507,7 @@ async def generate_workflow_script_python_code(
             temp_module = cst.Module(body=task_v2_block_body)
             block_code = temp_module.code
 
-            task_v2_stmt = _build_block_statement(task_v2)
+            task_v2_stmt = _build_block_statement(task_v2, value_to_param=value_to_param)
             run_signature = cst.Module(body=[task_v2_stmt]).code.strip()
 
         if script_id and script_revision_id and organization_id:
@@ -2390,6 +2572,66 @@ async def generate_workflow_script_python_code(
                 LOG.error("Failed to create for_loop script block", error=str(e), exc_info=True)
 
         append_block_code(block_code)
+
+    # --- preserve cached blocks from unexecuted branches ----------------
+    # When a workflow has conditional blocks, not all branches execute in a single run.
+    # transform_workflow_run_to_code_gen_input() only returns blocks that executed,
+    # so cached blocks from unexecuted branches would be lost during regeneration
+    # if we don't explicitly preserve them here.
+    processed_labels: set[str] = set()
+    for task in task_v1_blocks:
+        label = task.get("label") or task.get("title") or task.get("task_id")
+        if label:
+            processed_labels.add(label)
+    for task_v2 in task_v2_blocks:
+        label = task_v2.get("label") or f"task_v2_{task_v2.get('workflow_run_block_id')}"
+        processed_labels.add(label)
+    for flb in for_loop_blocks:
+        label = flb.get("label") or f"for_loop_{flb.get('workflow_run_block_id')}"
+        processed_labels.add(label)
+
+    preserved_count = 0
+    for cached_label, cached_source in cached_blocks.items():
+        if cached_label in processed_labels:
+            continue  # Already processed above
+        if not cached_source.code or not cached_source.run_signature:
+            continue  # Skip entries without usable code/metadata
+
+        if script_id and script_revision_id and organization_id:
+            try:
+                await create_or_update_script_block(
+                    block_code=cached_source.code,
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    block_label=cached_label,
+                    update=pending,
+                    run_signature=cached_source.run_signature,
+                    workflow_run_id=cached_source.workflow_run_id,
+                    workflow_run_block_id=cached_source.workflow_run_block_id,
+                    input_fields=cached_source.input_fields,
+                )
+            except Exception as e:
+                LOG.error(
+                    "Failed to preserve cached script block from unexecuted branch",
+                    error=str(e),
+                    block_label=cached_label,
+                    exc_info=True,
+                )
+
+        append_block_code(cached_source.code)
+        preserved_count += 1
+
+    if preserved_count > 0:
+        LOG.info(
+            "Preserved cached blocks from unexecuted branches during regeneration",
+            preserved_count=preserved_count,
+            preserved_labels=[
+                label
+                for label in cached_blocks
+                if label not in processed_labels and cached_blocks[label].code and cached_blocks[label].run_signature
+            ],
+        )
 
     # --- runner ---------------------------------------------------------
     run_fn = _build_run_fn(blocks, workflow_run_request)

@@ -1,0 +1,288 @@
+---
+title: Tasks
+subtitle: Run single browser automations with natural language
+slug: ts-sdk-reference/tasks
+---
+
+A task is a single browser automation. You describe what you want in natural language — Skyvern opens a browser, navigates to the URL, and executes the instructions with AI.
+
+For when to use tasks vs workflows, see [Run a Task](/running-automations/run-a-task).
+
+---
+
+## `runTask`
+
+Start a browser automation. Skyvern opens a cloud browser, navigates to the URL, and executes your prompt with AI.
+
+```typescript
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Get the title of the top post",
+    url: "https://news.ycombinator.com",
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+```
+
+### Parameters
+
+The `runTask` method accepts a single request object with the following shape:
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `body.prompt` | `string` | Yes | — | Natural language instructions for what the AI should do. |
+| `body.url` | `string` | No | `undefined` | Starting page URL. If omitted, the AI navigates from a blank page. |
+| `body.engine` | `RunEngine` | No | `"skyvern_v2"` | AI engine. Options: `"skyvern_v2"`, `"skyvern_v1"`, `"openai_cua"`, `"anthropic_cua"`, `"ui_tars"`. |
+| `body.max_steps` | `number` | No | `undefined` | Cap the number of AI steps to limit cost. Run terminates with `timed_out` if hit. |
+| `body.data_extraction_schema` | `Record<string, unknown> \| string` | No | `undefined` | JSON schema constraining the output shape. |
+| `body.proxy_location` | `ProxyLocation` | No | `undefined` | Route the browser through a geographic proxy. |
+| `body.browser_session_id` | `string` | No | `undefined` | Run inside an existing [browser session](/optimization/browser-sessions). |
+| `body.publish_workflow` | `boolean` | No | `false` | Save the generated code as a reusable workflow. Only works with `skyvern_v2`. |
+| `body.webhook_url` | `string` | No | `undefined` | URL to receive a POST when the run finishes. |
+| `body.error_code_mapping` | `Record<string, string>` | No | `undefined` | Map custom error codes to failure reasons. |
+| `body.totp_identifier` | `string` | No | `undefined` | Identifier for TOTP verification. |
+| `body.totp_url` | `string` | No | `undefined` | URL to receive TOTP codes. |
+| `body.title` | `string` | No | `undefined` | Display name for this run in the dashboard. |
+| `body.model` | `Record<string, unknown>` | No | `undefined` | Override the output model definition. |
+| `body.user_agent` | `string` | No | `undefined` | Custom User-Agent header for the browser. |
+| `body.extra_http_headers` | `Record<string, string>` | No | `undefined` | Additional HTTP headers injected into every browser request. |
+| `body.browser_address` | `string` | No | `undefined` | Connect to a browser at this CDP address instead of spinning up a new one. |
+| `waitForCompletion` | `boolean` | No | `false` | Block until the run finishes. |
+| `timeout` | `number` | No | `1800` | Max wait time in seconds when `waitForCompletion` is `true`. |
+
+### Returns `TaskRunResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | `string` | Unique identifier. Starts with `tsk_` for task runs. |
+| `status` | `string` | `"created"`, `"queued"`, `"running"`, `"completed"`, `"failed"`, `"terminated"`, `"timed_out"`, or `"canceled"`. |
+| `output` | `Record<string, unknown> \| null` | Extracted data from the run. Shape depends on your prompt or `data_extraction_schema`. |
+| `downloaded_files` | `FileInfo[] \| undefined` | Files downloaded during the run. |
+| `recording_url` | `string \| undefined` | URL to the session recording video. |
+| `screenshot_urls` | `string[] \| undefined` | Final screenshots (most recent first). |
+| `failure_reason` | `string \| undefined` | Error description if the run failed. |
+| `app_url` | `string \| undefined` | Link to view this run in the Cloud UI. |
+| `step_count` | `number \| undefined` | Number of AI steps taken. |
+| `script_run` | `ScriptRunResponse \| undefined` | Code execution result if the run used generated code. |
+| `created_at` | `string` | When the run was created. |
+| `finished_at` | `string \| undefined` | When the run finished. |
+
+### Examples
+
+**Extract structured data:**
+
+```typescript
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Extract the name, price, and rating of the top 3 products",
+    url: "https://example.com/products",
+    data_extraction_schema: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          price: { type: "string" },
+          rating: { type: "number" },
+        },
+      },
+    },
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+// [{ name: "Widget A", price: "$29.99", rating: 4.5 }, ...]
+```
+
+**Run inside an existing browser session:**
+
+```typescript
+const session = await skyvern.createBrowserSession({});
+
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Log in and download the latest invoice",
+    url: "https://app.example.com/login",
+    browser_session_id: session.browser_session_id,
+  },
+  waitForCompletion: true,
+});
+```
+
+**Limit cost with max_steps:**
+
+```typescript
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Fill out the contact form",
+    url: "https://example.com/contact",
+    max_steps: 10,
+  },
+  waitForCompletion: true,
+});
+```
+
+**Publish as a reusable workflow:**
+
+```typescript
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Fill out the contact form with the provided data",
+    url: "https://example.com/contact",
+    publish_workflow: true,
+  },
+  waitForCompletion: true,
+});
+// The generated workflow is saved and can be re-triggered via runWorkflow
+```
+
+---
+
+## `getRun`
+
+Get the current status and results of any run (task or workflow).
+
+```typescript
+const run = await skyvern.getRun("tsk_v2_486305187432193504");
+console.log(run.status, run.output);
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `runId` | `string` | Yes | The run ID returned by `runTask` or `runWorkflow`. |
+
+### Returns `GetRunResponse`
+
+A discriminated union based on `run_type`. All variants share the same core fields as `TaskRunResponse` above, plus a `run_type` field (`task_v1`, `task_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`, `workflow_run`).
+
+Workflow run responses additionally include `run_with` and `ai_fallback` fields.
+
+---
+
+## `cancelRun`
+
+Cancel a running or queued run.
+
+```typescript
+await skyvern.cancelRun("tsk_v2_486305187432193504");
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `runId` | `string` | Yes | The run ID to cancel. |
+
+The run transitions to `canceled` status. If the run has already finished, this is a no-op.
+
+---
+
+## `getRunTimeline`
+
+Get the step-by-step timeline of a run. Each entry represents one AI action with screenshots and reasoning.
+
+```typescript
+const timeline = await skyvern.getRunTimeline("tsk_v2_486305187432193504");
+for (const step of timeline) {
+  console.log(`Step ${step.order}: ${step.type} — ${step.status}`);
+}
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `runId` | `string` | Yes | The run ID. |
+
+### Returns `WorkflowRunTimeline[]`
+
+Each timeline entry contains step details including type, status, order, and associated artifacts.
+
+---
+
+## `getRunArtifacts`
+
+Get all artifacts (screenshots, recordings, generated code, etc.) for a run.
+
+```typescript
+const artifacts = await skyvern.getRunArtifacts("tsk_v2_486305187432193504");
+for (const artifact of artifacts) {
+  console.log(`${artifact.artifact_type}: ${artifact.uri}`);
+}
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `runId` | `string` | Yes | The run ID. |
+| `artifactType` | `ArtifactType \| ArtifactType[]` | No | Filter by artifact type. |
+
+### Returns `Artifact[]`
+
+---
+
+## `getArtifact`
+
+Get a single artifact by ID.
+
+```typescript
+const artifact = await skyvern.getArtifact("art_486305187432193504");
+console.log(artifact.uri);
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `artifactId` | `string` | Yes | The artifact ID. |
+
+### Returns `Artifact`
+
+---
+
+## `retryRunWebhook`
+
+Re-send the webhook notification for a completed run. Useful if your webhook endpoint was down when the run finished.
+
+```typescript
+await skyvern.retryRunWebhook("tsk_v2_486305187432193504");
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `runId` | `string` | Yes | The run ID. |
+
+---
+
+## Polling pattern
+
+If you don't use `waitForCompletion`, poll `getRun` manually:
+
+```typescript
+const task = await skyvern.runTask({
+  body: {
+    prompt: "Extract product data",
+    url: "https://example.com/products",
+  },
+});
+
+const terminalStatuses = ["completed", "failed", "terminated", "timed_out", "canceled"];
+let run;
+while (true) {
+  run = await skyvern.getRun(task.run_id);
+  if (terminalStatuses.includes(run.status)) break;
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+
+console.log(run.output);
+```
+
+<Tip>
+For production, prefer `waitForCompletion: true` or [webhooks](/going-to-production/webhooks) over manual polling.
+</Tip>

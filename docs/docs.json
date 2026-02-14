@@ -43,6 +43,14 @@
             ]
           },
           {
+            "group": "Optimization",
+            "pages": [
+              "optimization/browser-sessions",
+              "optimization/browser-profiles",
+              "optimization/cost-control"
+            ]
+          },
+          {
             "group": "Going to Production",
             "pages": [
               "going-to-production/webhooks",
@@ -105,6 +113,40 @@
               "integrations/make",
               "integrations/n8n",
               "integrations/workato"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "SDKs",
+        "groups": [
+          {
+            "group": "Python SDK",
+            "pages": [
+              "sdk-reference/overview",
+              "sdk-reference/tasks",
+              "sdk-reference/workflows",
+              "sdk-reference/browser-sessions",
+              "sdk-reference/browser-profiles",
+              "sdk-reference/credentials",
+              "sdk-reference/helpers",
+              "sdk-reference/error-handling",
+              "sdk-reference/complete-reference"
+            ]
+          },
+        {
+            "group": "TypeScript SDK",
+            "pages": [
+              "ts-sdk-reference/overview",
+              "ts-sdk-reference/tasks",
+              "ts-sdk-reference/workflows",
+              "ts-sdk-reference/browser-sessions",
+              "ts-sdk-reference/browser-profiles",
+              "ts-sdk-reference/credentials",
+              "ts-sdk-reference/helpers",
+              "ts-sdk-reference/browser-automation",
+              "ts-sdk-reference/error-handling",
+              "ts-sdk-reference/complete-reference"
             ]
           }
         ]

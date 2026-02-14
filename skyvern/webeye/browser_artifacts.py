@@ -4,7 +4,10 @@ import asyncio
 import os
 
 import aiofiles
+import structlog
 from pydantic import BaseModel, PrivateAttr
+
+LOG = structlog.get_logger()
 
 
 class VideoArtifact(BaseModel):
@@ -29,13 +32,26 @@ class BrowserArtifacts(BaseModel):
             async with aiofiles.open(self.browser_console_log_path, "a") as f:
                 return await f.write(msg)
 
-    async def read_browser_console_log(self) -> bytes:
+    async def _read_console_log_file(self) -> bytes:
         if self.browser_console_log_path is None:
             return b""
 
-        async with self._browser_console_log_lock:
-            if not os.path.exists(self.browser_console_log_path):
-                return b""
+        if not os.path.exists(self.browser_console_log_path):
+            return b""
+        async with aiofiles.open(self.browser_console_log_path, "rb") as f:
+            return await f.read()
 
-            async with aiofiles.open(self.browser_console_log_path, "rb") as f:
-                return await f.read()
+    async def read_browser_console_log(self, timeout: float = 5) -> bytes:
+        if self.browser_console_log_path is None:
+            return b""
+
+        try:
+            async with asyncio.timeout(timeout):
+                async with self._browser_console_log_lock:
+                    return await self._read_console_log_file()
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Failed to acquire browser console log lock, reading file without lock (may be incomplete)",
+                timeout=timeout,
+            )
+            return await self._read_console_log_file()

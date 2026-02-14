@@ -1,0 +1,119 @@
+---
+title: Browser Sessions
+subtitle: Maintain live browser state between API calls
+slug: sdk-reference/browser-sessions
+---
+
+A browser session is a persistent browser instance that stays alive between API calls. Use sessions to chain multiple tasks in the same browser without losing cookies, local storage, or login state.
+
+For conceptual background, see [Browser Sessions](/optimization/browser-sessions).
+
+---
+
+## `create_browser_session`
+
+Spin up a new cloud browser session.
+
+```python
+session = await client.create_browser_session(timeout=60)
+print(session.browser_session_id)  # pbs_abc123
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `timeout` | `int` | No | `60` | Session timeout in minutes (5–1440). Timer starts after the session is ready. |
+| `proxy_location` | `ProxyLocation` | No | `None` | Route browser traffic through a geographic proxy. |
+| `extensions` | `list[Extensions]` | No | `None` | Browser extensions to install. Options: `"ad-blocker"`, `"captcha-solver"`. |
+| `browser_type` | `PersistentBrowserType` | No | `None` | Browser type. Options: `"chrome"`, `"msedge"`. |
+
+### Returns `BrowserSessionResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `browser_session_id` | `str` | Unique ID. Starts with `pbs_`. |
+| `status` | `str \| None` | Current session status. |
+| `browser_address` | `str \| None` | CDP address for connecting to the browser. |
+| `app_url` | `str \| None` | Link to the live browser view in the Cloud UI. |
+| `timeout` | `int \| None` | Configured timeout in minutes. |
+| `started_at` | `datetime \| None` | When the session became ready. |
+| `created_at` | `datetime` | When the session was requested. |
+
+### Example: Chain multiple tasks in one session
+
+```python
+session = await client.create_browser_session()
+
+# Step 1: Log in
+await client.run_task(
+    prompt="Log in with username demo@example.com",
+    url="https://app.example.com/login",
+    browser_session_id=session.browser_session_id,
+    wait_for_completion=True,
+)
+
+# Step 2: Extract data (same browser, already logged in)
+result = await client.run_task(
+    prompt="Go to the invoices page and extract all invoice numbers",
+    browser_session_id=session.browser_session_id,
+    wait_for_completion=True,
+)
+print(result.output)
+
+# Clean up
+await client.close_browser_session(session.browser_session_id)
+```
+
+---
+
+## `get_browser_session`
+
+Get the status and details of a session.
+
+```python
+session = await client.get_browser_session("pbs_abc123")
+print(session.status, session.browser_address)
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `browser_session_id` | `str` | Yes | The session ID. |
+
+### Returns `BrowserSessionResponse`
+
+---
+
+## `get_browser_sessions`
+
+List all active browser sessions.
+
+```python
+sessions = await client.get_browser_sessions()
+for s in sessions:
+    print(f"{s.browser_session_id} — {s.status}")
+```
+
+### Returns `list[BrowserSessionResponse]`
+
+---
+
+## `close_browser_session`
+
+Close a browser session and release its resources.
+
+```python
+await client.close_browser_session("pbs_abc123")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `browser_session_id` | `str` | Yes | The session ID to close. |
+
+<Warning>
+Closing a session is irreversible. Any unsaved state (cookies, local storage) is lost unless you created a [browser profile](/sdk-reference/browser-profiles) from it.
+</Warning>

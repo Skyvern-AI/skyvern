@@ -561,7 +561,7 @@ Recommended `LLM_KEY`: `BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE`, `BE
 | `ENABLE_GEMINI` | Register Gemini models| Boolean | `true`, `false` |
 | `GEMINI_API_KEY` | Gemini API Key| String | `your_google_gemini_api_key`|
 
-Recommended `LLM_KEY`: `GEMINI_2.5_PRO`, `GEMINI_2.5_FLASH`, `GEMINI_2.5_PRO_PREVIEW`, `GEMINI_2.5_FLASH_PREVIEW`
+Recommended `LLM_KEY`: `GEMINI_3.0_FLASH`, `GEMINI_2.5_PRO`, `GEMINI_2.5_FLASH`, `GEMINI_2.5_PRO_PREVIEW`, `GEMINI_2.5_FLASH_PREVIEW`
 
 ##### Ollama
 | Variable | Description| Type | Sample Value|

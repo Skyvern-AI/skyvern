@@ -594,6 +594,7 @@ function convertToNode(
       };
     }
     case "navigation": {
+      const isV2Engine = block.engine === RunEngine.SkyvernV2;
       return {
         ...identifiers,
         ...common,
@@ -616,8 +617,11 @@ function convertToNode(
           engine: block.engine ?? RunEngine.SkyvernV1,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
-          prompt: "",
-          maxSteps: MAX_STEPS_DEFAULT,
+          // When engine is SkyvernV2, use navigation_goal as the prompt
+          prompt: isV2Engine ? block.navigation_goal ?? "" : "",
+          maxSteps: isV2Engine
+            ? block.max_steps_per_run ?? MAX_STEPS_DEFAULT
+            : MAX_STEPS_DEFAULT,
         },
       };
     }

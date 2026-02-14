@@ -25,9 +25,18 @@ function useParameterExpansion() {
   }, []);
 
   const expandedRows = useMemo(() => {
-    const combined = new Set(autoExpandedRows);
+    const combined = new Set<string>();
+    // Symmetric difference (XOR): a row is expanded if it's in one set but not both.
+    // This lets manual toggles override auto-expansion (and vice versa).
+    for (const id of autoExpandedRows) {
+      if (!manuallyExpandedRows.has(id)) {
+        combined.add(id);
+      }
+    }
     for (const id of manuallyExpandedRows) {
-      combined.add(id);
+      if (!autoExpandedRows.has(id)) {
+        combined.add(id);
+      }
     }
     return combined;
   }, [autoExpandedRows, manuallyExpandedRows]);

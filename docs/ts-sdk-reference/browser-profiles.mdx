@@ -1,0 +1,133 @@
+---
+title: Browser Profiles
+subtitle: Save and reuse browser state across runs
+slug: ts-sdk-reference/browser-profiles
+---
+
+A browser profile is a snapshot of browser state — cookies, local storage, session data. Create a profile from a completed run, then load it into future workflow runs to skip login and setup steps.
+
+For conceptual background, see [Browser Profiles](/optimization/browser-profiles).
+
+---
+
+## `createBrowserProfile`
+
+Create a profile from a completed workflow run.
+
+```typescript
+const profile = await skyvern.createBrowserProfile({
+  name: "production-login",
+  workflow_run_id: "wr_abc123",
+});
+console.log(profile.browser_profile_id); // bpf_abc123
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | `string` | Yes | Display name for the profile. |
+| `description` | `string` | No | Optional description. |
+| `workflow_run_id` | `string` | No | The workflow run ID to snapshot. The run must have used `persist_browser_session: true`. |
+| `browser_session_id` | `string` | No | The browser session ID to snapshot. |
+
+### Returns `BrowserProfile`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `browser_profile_id` | `string` | Unique ID. Starts with `bpf_`. |
+| `name` | `string` | Profile name. |
+| `description` | `string \| undefined` | Profile description. |
+| `created_at` | `string` | When the profile was created. |
+
+### Example: Create a profile from a login workflow
+
+```typescript
+// Step 1: Run a workflow with persist_browser_session
+const run = await skyvern.runWorkflow({
+  body: {
+    workflow_id: "wpid_login_flow",
+    parameters: { username: "demo@example.com" },
+  },
+  waitForCompletion: true,
+});
+
+// Step 2: Create a profile from the run
+const profile = await skyvern.createBrowserProfile({
+  name: "demo-account-login",
+  workflow_run_id: run.run_id,
+});
+
+// Step 3: Use the profile in future runs (skip login)
+const result = await skyvern.runWorkflow({
+  body: {
+    workflow_id: "wpid_extract_invoices",
+    browser_profile_id: profile.browser_profile_id,
+  },
+  waitForCompletion: true,
+});
+```
+
+<Info>
+Session archiving is asynchronous. If `createBrowserProfile` fails immediately after a workflow completes, wait a few seconds and retry.
+</Info>
+
+---
+
+## `listBrowserProfiles`
+
+List all browser profiles.
+
+```typescript
+const profiles = await skyvern.listBrowserProfiles({});
+for (const p of profiles) {
+  console.log(`${p.name} (${p.browser_profile_id})`);
+}
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `include_deleted` | `boolean` | No | `undefined` | Include soft-deleted profiles in the results. |
+
+### Returns `BrowserProfile[]`
+
+---
+
+## `getBrowserProfile`
+
+Get a single profile by ID.
+
+```typescript
+const profile = await skyvern.getBrowserProfile("bpf_abc123");
+console.log(profile.name);
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profileId` | `string` | Yes | The browser profile ID. |
+
+### Returns `BrowserProfile`
+
+---
+
+## `deleteBrowserProfile`
+
+Delete a browser profile.
+
+```typescript
+await skyvern.deleteBrowserProfile("bpf_abc123");
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profileId` | `string` | Yes | The browser profile ID to delete. |
+
+<Warning>
+`browser_profile_id` only works with `runWorkflow`, not `runTask`. If you pass it to `runTask`, it will be silently ignored.
+</Warning>

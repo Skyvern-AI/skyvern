@@ -346,8 +346,10 @@ async def skyvern_workflow_create(
     """Create a new Skyvern workflow from a YAML or JSON definition. Use when you need to save
     a new automation workflow that can be run repeatedly with different parameters.
 
-    Best practice: use one task block per logical step with a short focused prompt (2-3 sentences).
-    Common block types: task, for_loop, conditional, code, text_prompt, extraction, action, navigation, wait, login.
+    Best practice: use one block per logical step with a short focused prompt (2-3 sentences).
+    Use "navigation" blocks for actions (filling forms, clicking) and "extraction" blocks for pulling data.
+    Do NOT use the deprecated "task" block type.
+    Common block types: navigation, extraction, for_loop, conditional, code, text_prompt, action, wait, login.
     Call skyvern_block_schema() for the full list with schemas and examples.
 
     Example JSON definition (multi-block EIN application):
@@ -361,17 +363,21 @@ async def skyvern_workflow_create(
               {"parameter_type": "workflow", "key": "owner_ssn", "workflow_parameter_type": "string"}
             ],
             "blocks": [
-              {"block_type": "task", "label": "select_entity_type",
+              {"block_type": "navigation", "label": "select_entity_type",
                "url": "https://sa.www4.irs.gov/modiein/individual/index.jsp",
-               "engine": "skyvern-2.0",
+               "title": "Select Entity Type",
                "navigation_goal": "Select 'Sole Proprietor' as the entity type and click Continue."},
-              {"block_type": "task", "label": "enter_business_info", "engine": "skyvern-2.0",
-               "navigation_goal": "Fill in the business name as '{{business_name}}' and click Continue."},
-              {"block_type": "task", "label": "enter_owner_info", "engine": "skyvern-2.0",
-               "navigation_goal": "Enter the responsible party name '{{owner_name}}' and SSN '{{owner_ssn}}'. Click Continue."},
-              {"block_type": "task", "label": "confirm_and_submit", "engine": "skyvern-2.0",
-               "navigation_goal": "Review the information on the confirmation page and click Submit.",
-               "data_extraction_goal": "Extract the assigned EIN number",
+              {"block_type": "navigation", "label": "enter_business_info",
+               "title": "Enter Business Info",
+               "navigation_goal": "Fill in the business name as '{{business_name}}' and click Continue.",
+               "parameter_keys": ["business_name"]},
+              {"block_type": "navigation", "label": "enter_owner_info",
+               "title": "Enter Owner Info",
+               "navigation_goal": "Enter the responsible party name '{{owner_name}}' and SSN '{{owner_ssn}}'. Click Continue.",
+               "parameter_keys": ["owner_name", "owner_ssn"]},
+              {"block_type": "extraction", "label": "extract_ein",
+               "title": "Extract EIN",
+               "data_extraction_goal": "Extract the assigned EIN number from the confirmation page",
                "data_schema": {"type": "object", "properties": {"ein": {"type": "string"}}}}
             ]
           }
