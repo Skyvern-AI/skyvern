@@ -37,6 +37,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.services.browser_recording.service import BrowserSessionRecordingService
 from skyvern.services.streaming.service import StreamingService
+from skyvern.utils import detect_os
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
@@ -44,6 +45,7 @@ from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
 
 LOG = structlog.get_logger()
+STREAMING_SUPPORTED_OS = {"linux", "wsl"}
 
 
 class ForgeApp:
@@ -80,7 +82,7 @@ class ForgeApp:
     AGENT_FUNCTION: AgentFunction
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
     BROWSER_SESSION_RECORDING_SERVICE: BrowserSessionRecordingService
-    STREAMING_SERVICE: StreamingService
+    STREAMING_SERVICE: StreamingService | None
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
     CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
@@ -203,7 +205,13 @@ def create_forge_app() -> ForgeApp:
     app.AGENT_FUNCTION = AgentFunction()
     app.PERSISTENT_SESSIONS_MANAGER = DefaultPersistentSessionsManager(database=app.DATABASE)
     app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
-    app.STREAMING_SERVICE = StreamingService()
+    operating_system = detect_os()
+    if operating_system in STREAMING_SUPPORTED_OS:
+        LOG.info("Streaming service enabled for detected linux OS", os=operating_system)
+        app.STREAMING_SERVICE = StreamingService()
+    else:
+        LOG.info("Streaming service disabled on unsupported OS", os=operating_system)
+        app.STREAMING_SERVICE = None
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
     app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = BitwardenCredentialVaultService()
@@ -256,16 +264,18 @@ def create_forge_app() -> ForgeApp:
     app.api_app_shutdown_event = None
 
     # Set up startup/shutdown events to manage streaming service monitoring
-    async def _startup_event(fastapi_app: FastAPI) -> None:
-        structlog.get_logger(__name__).info("Starting streaming service monitoring loop")
-        app.STREAMING_SERVICE.start_monitoring()
+    if app.STREAMING_SERVICE:
 
-    async def _shutdown_event() -> None:
-        structlog.get_logger(__name__).info("Stopping streaming service monitoring loop")
-        await app.STREAMING_SERVICE.stop_monitoring()
+        async def _startup_event(fastapi_app: FastAPI) -> None:
+            structlog.get_logger(__name__).info("Starting streaming service monitoring loop")
+            app.STREAMING_SERVICE.start_monitoring()
 
-    app.api_app_startup_event = _startup_event
-    app.api_app_shutdown_event = _shutdown_event
+        async def _shutdown_event() -> None:
+            structlog.get_logger(__name__).info("Stopping streaming service monitoring loop")
+            await app.STREAMING_SERVICE.stop_monitoring()
+
+        app.api_app_startup_event = _startup_event
+        app.api_app_shutdown_event = _shutdown_event
 
     app.agent = ForgeAgent()
 
