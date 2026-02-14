@@ -1092,6 +1092,9 @@ async def skyvern_run_task(
 ) -> dict[str, Any]:
     """Run a quick, one-off web task via an autonomous AI agent. Nothing is saved — use for throwaway tests and exploration only. Best for tasks describable in 2-3 sentences.
 
+    Always uses engine 2.0 (planning agent) — the engine cannot be changed. For simple single-goal
+    tasks, a workflow with engine 1.0 blocks is cheaper and more reliable.
+
     For anything reusable, multi-step, or worth keeping, use skyvern_workflow_create instead — it produces a versioned, rerunnable workflow with per-step observability.
     For simple single-step actions on the current page, use skyvern_act instead.
     """
