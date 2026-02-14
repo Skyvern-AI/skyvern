@@ -4166,8 +4166,10 @@ class ForgeAgent:
             # Check for LLM provider errors in the failed steps
             for step_cnt, cur_step in enumerate(steps[-max_retries:]):
                 if cur_step.status == StepStatus.failed:
-                    # If step failed with no actions, it might be an LLM error during action extraction
-                    if not cur_step.output or not cur_step.output.actions_and_results:
+                    # Only count steps where the LLM call itself failed (no output at all).
+                    # Steps with output but empty actions mean the LLM worked fine but found
+                    # nothing to interact with — those fall through to normal summarization.
+                    if not cur_step.output:
                         steps_without_actions += 1
 
                 if cur_step.output and cur_step.output.actions_and_results:

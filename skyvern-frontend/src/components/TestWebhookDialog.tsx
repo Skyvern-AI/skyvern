@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ReloadIcon, CopyIcon, CheckIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import {
@@ -40,6 +40,7 @@ type TestWebhookDialogProps = {
   runId?: string | null;
   initialWebhookUrl?: string;
   trigger?: React.ReactNode;
+  autoRunOnOpen?: boolean;
 };
 
 function TestWebhookDialog({
@@ -47,6 +48,7 @@ function TestWebhookDialog({
   runId,
   initialWebhookUrl,
   trigger,
+  autoRunOnOpen = true,
 }: TestWebhookDialogProps) {
   const [open, setOpen] = useState(false);
   const [targetUrl, setTargetUrl] = useState(initialWebhookUrl || "");
@@ -123,14 +125,19 @@ function TestWebhookDialog({
     }
   };
 
+  // Only sync URL and optionally auto-run on the closed→open transition,
+  // not when initialWebhookUrl changes while the dialog is already open
+  const prevOpen = useRef(false);
   useEffect(() => {
-    if (!open) {
-      return;
+    if (open && !prevOpen.current) {
+      const nextUrl = initialWebhookUrl || "";
+      setTargetUrl(nextUrl);
+      setResult(null);
+      if (autoRunOnOpen) {
+        void runTest(nextUrl);
+      }
     }
-
-    const nextUrl = initialWebhookUrl || "";
-    setTargetUrl(nextUrl);
-    void runTest(nextUrl);
+    prevOpen.current = open;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initialWebhookUrl]);
 
@@ -182,16 +189,28 @@ function TestWebhookDialog({
             <Input
               id="test-webhook-url"
               value={targetUrl}
-              onChange={(event) => setTargetUrl(event.target.value)}
+              onChange={(event) => {
+                setTargetUrl(event.target.value);
+                setResult(null);
+              }}
               placeholder="https://your-endpoint.com/webhook"
             />
           </div>
 
-          {loading && !result ? (
+          {loading ? (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <ReloadIcon className="h-4 w-4 animate-spin" />
               Sending test webhook…
             </div>
+          ) : !result ? (
+            <Button
+              type="button"
+              onClick={() => void runTest(targetUrl)}
+              disabled={!targetUrl.trim()}
+              variant="secondary"
+            >
+              Send Test Request
+            </Button>
           ) : null}
 
           {result && (

@@ -68,9 +68,9 @@ workflow_definition:
   version: 2
   blocks:
     - label: block_1
-      block_type: task_v2
-      prompt: Give me top {{topics_count}} news items
+      block_type: navigation
       url: https://news.ycombinator.com/
+      navigation_goal: "Give me top {{topics_count}} news items"
       next_block_label: null
   parameters:
     - key: topics_count
@@ -200,38 +200,11 @@ blocks:
     navigation_goal: "Check the terms checkbox"
     max_retries: 1
 
-** TASK V2 BLOCK (task_v2) **
+** TASK V2 BLOCK (task_v2) — DEPRECATED **
 
-Purpose: Achieve complex tasks with deep thinking using a single natural language prompt. Can handle more complex scenarios than navigation blocks but may be slightly slower.
-
-Structure:
-block_type: task_v2
-label: <unique_label>
-prompt: <natural_language_instruction>  # Required: What to do
-url: <starting_url>                     # Optional: URL to navigate to; omit to continue on current page
-disable_cache: false                    # Optional: Disable caching
-
-Use Cases:
-- Complex, multi-step workflows that can be described in natural language
-- Scenarios requiring multiple actions and decision-making
-- General-purpose automation with flexible requirements
-- When you need to handle more complex scenarios and are okay with potentially slower execution
-
-Differences from Navigation Block:
-- Uses single "prompt" field instead of "navigation_goal"
-- Can handle more complex scenarios and longer sequences of actions
-- May be slightly slower than navigation blocks
-- No data_schema (extraction format described in prompt)
-- More flexible configuration
-
-Example:
-blocks:
-  - block_type: task_v2
-    label: simple_booking
-    next_block_label: null
-    url: "https://booking.example.com"
-    prompt: "Book a flight from {{ origin }} to {{ destination }} on {{ date }}. Return the booking confirmation number."
-    max_iterations: 10
+DO NOT USE task_v2. Use "navigation" blocks instead (with navigation_goal).
+Use "extraction" blocks for data extraction (with data_extraction_goal + data_schema).
+The task_v2 block type exists only for backward compatibility with existing workflows.
 
 ** FOR LOOP BLOCK (for_loop) **
 
@@ -708,10 +681,10 @@ workflow_definition:
   version: 2
   parameters: []
   blocks:
-    - block_type: task_v2
+    - block_type: navigation
       label: get_data
       next_block_label: send_webhook
-      prompt: "Get top 3 hacker news items"
+      navigation_goal: "Get top 3 hacker news items"
       url: "https://news.ycombinator.com"
     - block_type: http_request
       label: send_webhook
@@ -752,9 +725,9 @@ Examples - Block Outputs (no parameter_keys needed):
 
 * Send previous block output to webhook:
 blocks:
-  - block_type: task_v2
+  - block_type: navigation
     label: get_data
-    prompt: "Get top 3 hacker news items"
+    navigation_goal: "Get top 3 hacker news items"
     ...
   - block_type: http_request
     label: send_webhook
@@ -769,9 +742,9 @@ blocks:
   - block_type: extraction
     label: extract_items
     ...
-  - block_type: task_v2
+  - block_type: navigation
     label: process_items
-    prompt: "Process these items: {{ extract_items.output }}"
+    navigation_goal: "Process these items: {{ extract_items.output }}"
 
 * In schemas (as descriptions):
 data_schema:
@@ -815,10 +788,10 @@ blocks:
   - block_type: extraction
     label: step2
     next_block_label: step3
-  - block_type: task_v2
+  - block_type: navigation
     label: step3
     next_block_label: null
-    prompt: "Complete the final step on the page"
+    navigation_goal: "Complete the final step on the page"
 # Executes: step1 → step2 → step3
 
 Explicit Flow Control (Skip blocks):
@@ -827,10 +800,10 @@ blocks:
     label: login
     next_block_label: extract_data
     url: "https://app.example.com/login"
-  - block_type: task_v2
+  - block_type: navigation
     label: handle_error
     next_block_label: null
-    prompt: "Handle the error state if it appears"
+    navigation_goal: "Handle the error state if it appears"
   - block_type: extraction
     label: extract_data
     next_block_label: null
@@ -838,11 +811,11 @@ blocks:
 
 Error Recovery Flow:
 blocks:
-  - block_type: task_v2
+  - block_type: navigation
     label: primary_task
     next_block_label: verify_result
     continue_on_failure: true
-    prompt: "Attempt the primary task on the page"
+    navigation_goal: "Attempt the primary task on the page"
   - block_type: validation
     label: verify_result
     next_block_label: null
@@ -877,7 +850,7 @@ blocks:
 * Performance:
    - Use disable_cache: true for dynamic content
    - Set max_steps_per_run to prevent infinite loops
-   - Use task_v2 when a single prompt should include both actions and extraction requirements
+   - Use navigation blocks for actions and extraction blocks for data extraction
 
 * Security:
    - Never hardcode credentials in workflows
@@ -918,11 +891,11 @@ Pattern 2: Search with Dynamic Input
 workflow_definition:
   version: 2
   blocks:
-    - block_type: task_v2
+    - block_type: navigation
       label: search_and_extract
       next_block_label: null
       url: "https://example.com"
-      prompt: "Search for '{{ search_query }}' and extract the first 10 results with titles and URLs"
+      navigation_goal: "Search for '{{ search_query }}' and extract the first 10 results with titles and URLs"
   parameters:
     - parameter_type: workflow
       key: search_query
@@ -1048,11 +1021,11 @@ workflow_definition:
           rating: {type: number}
           available: {type: boolean}
 
-    - block_type: task_v2
+    - block_type: navigation
       label: add_to_cart
       next_block_label: null
-      prompt: "Click on the first available product and add it to cart"
-      max_iterations: 5
+      navigation_goal: "Click on the first available product and add it to cart"
+      max_retries: 3
   parameters:
     - parameter_type: workflow
       key: product_name
