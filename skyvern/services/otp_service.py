@@ -80,38 +80,70 @@ async def poll_otp_value(
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
     )
-    while True:
-        await asyncio.sleep(10)
-        # check timeout
-        if datetime.utcnow() > timeout_datetime:
-            LOG.warning("Polling otp value timed out")
-            raise NoTOTPVerificationCodeFound(
-                task_id=task_id,
+
+    # Set the waiting state in the database when polling starts
+    if workflow_run_id:
+        try:
+            # Determine the identifier to show in the UI
+            identifier_for_ui = totp_identifier
+            await app.DATABASE.update_workflow_run(
                 workflow_run_id=workflow_run_id,
-                workflow_id=workflow_permanent_id,
-                totp_verification_url=totp_verification_url,
-                totp_identifier=totp_identifier,
+                waiting_for_verification_code=True,
+                verification_code_identifier=identifier_for_ui,
+                verification_code_polling_started_at=start_datetime,
             )
-        otp_value: OTPValue | None = None
-        if totp_verification_url:
-            otp_value = await _get_otp_value_from_url(
-                organization_id,
-                totp_verification_url,
-                org_token.token,
-                task_id=task_id,
+            LOG.info(
+                "Set 2FA waiting state for workflow run",
                 workflow_run_id=workflow_run_id,
+                verification_code_identifier=identifier_for_ui,
             )
-        elif totp_identifier:
-            otp_value = await _get_otp_value_from_db(
-                organization_id,
-                totp_identifier,
-                task_id=task_id,
-                workflow_id=workflow_permanent_id,
-                workflow_run_id=workflow_run_id,
-            )
-        if otp_value:
-            LOG.info("Got otp value", otp_value=otp_value)
-            return otp_value
+        except Exception:
+            LOG.warning("Failed to set 2FA waiting state", exc_info=True)
+
+    try:
+        while True:
+            await asyncio.sleep(10)
+            # check timeout
+            if datetime.utcnow() > timeout_datetime:
+                LOG.warning("Polling otp value timed out")
+                raise NoTOTPVerificationCodeFound(
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_id=workflow_permanent_id,
+                    totp_verification_url=totp_verification_url,
+                    totp_identifier=totp_identifier,
+                )
+            otp_value: OTPValue | None = None
+            if totp_verification_url:
+                otp_value = await _get_otp_value_from_url(
+                    organization_id,
+                    totp_verification_url,
+                    org_token.token,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                )
+            elif totp_identifier:
+                otp_value = await _get_otp_value_from_db(
+                    organization_id,
+                    totp_identifier,
+                    task_id=task_id,
+                    workflow_id=workflow_permanent_id,
+                    workflow_run_id=workflow_run_id,
+                )
+            if otp_value:
+                LOG.info("Got otp value", otp_value=otp_value)
+                return otp_value
+    finally:
+        # Clear the waiting state when polling completes (success, timeout, or error)
+        if workflow_run_id:
+            try:
+                await app.DATABASE.update_workflow_run(
+                    workflow_run_id=workflow_run_id,
+                    waiting_for_verification_code=False,
+                )
+                LOG.info("Cleared 2FA waiting state for workflow run", workflow_run_id=workflow_run_id)
+            except Exception:
+                LOG.warning("Failed to clear 2FA waiting state", exc_info=True)
 
 
 async def _get_otp_value_from_url(

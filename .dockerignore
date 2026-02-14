@@ -13,7 +13,7 @@
 !/.env
 # Streamlit ignores
 **/secrets*.toml
-
+.cyrus*
 # Skyvern
 docs
 images

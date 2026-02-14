@@ -51,6 +51,7 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
 import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowRunStatusAlert";
+import { WorkflowRunVerificationCodeForm } from "@/routes/workflows/workflowRun/WorkflowRunVerificationCodeForm";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -503,6 +504,8 @@ function WorkflowRun() {
           {webhookFailureReason}
         </div>
       )}
+      {/* 2FA Verification Code Form - shown when workflow is waiting for a code */}
+      <WorkflowRunVerificationCodeForm />
       {workflowFailureReason}
       {!isEmbedded && (
         <div className="flex items-center justify-between">

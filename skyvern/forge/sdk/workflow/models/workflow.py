@@ -172,6 +172,10 @@ class WorkflowRun(BaseModel):
     sequential_key: str | None = None
     ai_fallback: bool | None = None
     code_gen: bool | None = None
+    # 2FA verification code waiting state fields
+    waiting_for_verification_code: bool = False
+    verification_code_identifier: str | None = None
+    verification_code_polling_started_at: datetime | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
@@ -226,6 +230,10 @@ class WorkflowRunResponseBase(BaseModel):
     browser_address: str | None = None
     script_run: ScriptRunResponse | None = None
     errors: list[dict[str, Any]] | None = None
+    # 2FA verification code waiting state fields
+    waiting_for_verification_code: bool = False
+    verification_code_identifier: str | None = None
+    verification_code_polling_started_at: datetime | None = None
 
 
 class WorkflowRunWithWorkflowResponse(WorkflowRunResponseBase):
