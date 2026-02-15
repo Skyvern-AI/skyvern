@@ -154,6 +154,13 @@
       {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
+      },
+      {
+        "tab": "Cookbooks",
+        "pages": [
+           "cookbooks/overview",
+          "cookbooks/bulk-invoice-downloader"
+        ]
       }
     ]
   },
