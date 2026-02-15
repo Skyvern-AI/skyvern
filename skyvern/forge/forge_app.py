@@ -265,14 +265,16 @@ def create_forge_app() -> ForgeApp:
 
     # Set up startup/shutdown events to manage streaming service monitoring
     if app.STREAMING_SERVICE:
+        # Capture the streaming service in a local variable for the closures
+        streaming_service = app.STREAMING_SERVICE
 
         async def _startup_event(fastapi_app: FastAPI) -> None:
             structlog.get_logger(__name__).info("Starting streaming service monitoring loop")
-            app.STREAMING_SERVICE.start_monitoring()
+            streaming_service.start_monitoring()
 
         async def _shutdown_event() -> None:
             structlog.get_logger(__name__).info("Stopping streaming service monitoring loop")
-            await app.STREAMING_SERVICE.stop_monitoring()
+            await streaming_service.stop_monitoring()
 
         app.api_app_startup_event = _startup_event
         app.api_app_shutdown_event = _shutdown_event
