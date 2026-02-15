@@ -61,10 +61,34 @@ BAD navigation_goal — describes HOW to do it (Skyvern already knows):
    (prices, tables, lists).  Requires data_extraction_goal and data_schema.
 3. **for_loop** — iterate over a list.  Use when you need to repeat blocks for each item
    in a parameter list (e.g., process each URL, each product).
-4. **goto_url** — simple navigation without any actions.  Use to jump to a known URL.
-5. **login** — authenticate with stored credentials.  Use for sites that require login.
-6. **code** — run Python for data transformation between blocks.
-7. **action** — single focused action on the current page (e.g., click one button).
+4. **conditional** — branch based on conditions.  Use when workflow logic should diverge
+   based on data from a previous block or a Jinja2 expression.
+5. **goto_url** — simple navigation without any actions.  Use to jump to a known URL.
+6. **login** — authenticate with stored credentials.  Use for sites that require login.
+7. **code** — run Python for data transformation between blocks.
+8. **action** — single focused action on the current page (e.g., click one button).
+
+Use skyvern_block_schema() to see full schemas and examples for any block type.
+
+### Engine selection for workflow blocks
+
+Task-based blocks (navigation, extraction, action, login, file_download) default to engine 1.0 (`skyvern-1.0`).
+Omit the `engine` field unless you need 2.0.  Non-task blocks (for_loop, conditional, code, wait, etc.)
+do not have an engine field — do not set one.
+
+Use engine 2.0 (`"engine": "skyvern-2.0"`) on a **navigation** block when:
+- The block's goal requires dynamic planning — discovering what to do at runtime, conditional
+  branching, or looping over unknown items on the page.
+- Example: "Navigate through a multi-step insurance quote wizard, handling dynamic questions
+  based on previous answers, then extract the final quote."
+
+Keep engine 1.0 (default, omit field) when:
+- The path is known upfront — all fields, values, and actions are specified in the prompt.
+- A long prompt with many form fields is still 1.0.  Complexity means dynamic planning, not field count.
+- Example: "Fill in SSN, first name, last name, select 'Sole Proprietor', click Continue."
+
+When in doubt, split into multiple 1.0 blocks rather than using one 2.0 block — it's cheaper and
+gives you per-block observability.  Only navigation blocks support engine 2.0.
 
 ### One block per logical step
 
@@ -244,7 +268,7 @@ Skyvern failures fall into predictable categories. Match the error to a pattern 
 - Cause: label mismatch (the button says "Continue" but the prompt says "Next"), or element loads asynchronously.
 - Fix: update the prompt to use the exact label visible on the page. If the element loads after a delay, add
   "wait for the page to fully load before acting" to the prompt.
-- If you know the exact label: switch that block to a navigation block with precise element references.
+- If you know the exact label: switch to an action block for a single precise interaction.
 
 ### Wrong Page (block started on an unexpected page)
 - Cause: the previous block did not complete its page transition. The current block assumed it would land on page B

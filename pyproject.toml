@@ -114,7 +114,7 @@ dev = [
     "twine>=6.1.0,<7",
     "build>=1.2.2.post1,<2",
     "pre-commit>=4.2.0,<5",
-    "ruff>=0.11.12,<0.12",
+    "ruff>=0.14.1,<0.15",
     "aiosqlite>=0.21.0,<0.22",
     "moto[s3, server]>=5.1.5,<6",
     "curlify>=3.0.0",
@@ -191,12 +191,13 @@ exclude = [
     "site-packages",
     "venv",
     "alembic/env.py",
+    "cloud/extensions",
+    "skyvern-frontend",
 ]
 line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-extend-select = ["PLC0415"]
 
 [tool.isort]
 profile = "black"

@@ -6,6 +6,7 @@ These tests verify that ForLoop blocks are properly handled during:
 2. Script generation (generate_script.py)
 """
 
+import ast
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -410,3 +411,75 @@ class TestForLoopScriptExecution:
         func = result.iter.func
         assert isinstance(func, cst.Attribute)
         assert func.attr.value == "loop"
+
+
+class TestForLoopScriptCompilation:
+    """Test that generated scripts with ForLoop blocks compile without SyntaxError.
+
+    This catches the bug where `async for` statements were placed at module level
+    (outside an async function), causing 'async for outside async function' SyntaxError.
+    """
+
+    @pytest.mark.asyncio
+    async def test_forloop_script_compiles_without_syntax_error(self) -> None:
+        """Verify that a generated script with a for_loop block is valid Python.
+
+        Regression test: previously, _build_for_loop_statement() output was added
+        to module-level block_fns via append_block_code(), placing a bare `async for`
+        at module level. This caused SyntaxError when Python tried to compile the script.
+        """
+        from skyvern.core.script_generations.generate_script import generate_workflow_script_python_code
+
+        blocks = [
+            {
+                "block_type": "for_loop",
+                "label": "scrape_each_page",
+                "loop_variable_reference": "{{ urls }}",
+                "loop_blocks": [
+                    {
+                        "block_type": "extraction",
+                        "label": "extract_data",
+                        "data_extraction_goal": "Get page content",
+                    },
+                ],
+            },
+        ]
+
+        workflow = {
+            "workflow_id": "wf_test",
+            "title": "Test ForLoop Workflow",
+            "workflow_definition": {"parameters": []},
+        }
+
+        with (
+            patch(
+                "skyvern.core.script_generations.generate_script.generate_workflow_parameters_schema",
+                new_callable=AsyncMock,
+                return_value=("", {}),
+            ),
+            patch(
+                "skyvern.core.script_generations.generate_script.create_or_update_script_block",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await generate_workflow_script_python_code(
+                file_name="test_forloop.py",
+                workflow_run_request={"workflow_id": "wpid_test"},
+                workflow=workflow,
+                blocks=blocks,
+                actions_by_task={},
+                script_id="script_123",
+                script_revision_id="rev_123",
+                organization_id="org_123",
+            )
+
+            # The generated code must compile without SyntaxError
+            # This was the actual bug: 'async for' at module level
+            try:
+                ast.parse(result)
+            except SyntaxError as e:
+                pytest.fail(f"Generated script has SyntaxError: {e}\n\nGenerated code:\n{result}")
+
+            # Verify the for-loop is present inside run_workflow (not at module level)
+            assert "async for current_value in skyvern.loop" in result
+            assert "def run_workflow" in result
