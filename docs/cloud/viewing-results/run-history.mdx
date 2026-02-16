@@ -1,0 +1,55 @@
+---
+title: Run History
+subtitle: Find, filter, and inspect past task and workflow executions
+slug: cloud/viewing-results/run-history
+---
+
+The **Runs** page shows every task and workflow execution, sorted newest-first. Use it to check on past runs, find failures, or verify that a scheduled workflow completed.
+
+<img src="/images/cloud/run-history-overview.png" alt="Run History page overview" />
+
+## Finding a specific run
+
+**Search** narrows the list by run ID or workflow parameter value. Type part of an ID (e.g., `wr_49338`) or a parameter you passed (like a URL), and matching results appear as you type.
+
+<img src="/images/cloud/run-history-search.png" alt="Searching for a run by ID" />
+
+**Filter by Status** opens a multi-select dropdown. Check one or more statuses to narrow results — `failed` and `timed_out` together show everything that went wrong. Filters and search can be combined: search for a parameter value while filtering to only failed runs.
+
+Available statuses: **Created**, **Queued**, **Running**, **Completed**, **Failed**, **Terminated**, **Canceled**, **Timed Out**.
+
+## Reading the table
+
+Each row is one run. The columns:
+
+| Column | What it shows |
+|--------|--------------|
+| **Run ID** | Workflow run (`wr_...`) or task (`tsk_...`) identifier. Hover for the full ID. |
+| **Detail** | Workflow title or task description. A lightning bolt icon means code generation was used. |
+| **Status** | Color-coded badge — green (completed), yellow (running/queued/created), red (failed/timed_out), orange (terminated/canceled). |
+| **Created At** | Start time in your local timezone. Hover for UTC. |
+
+Workflow runs have a **settings icon** in the last column. Click it to expand the row and see the parameters passed to that run. If your search matches something inside the parameters, the row auto-expands so you can see the match in context.
+
+## Opening a run
+
+Click any row to jump to its [detail page](/cloud/viewing-results/run-details). Hold **Ctrl** (or **Cmd** on Mac) to open in a new tab.
+
+Pagination controls at the bottom let you adjust the page size (5, 10, 20, or 50 items) and navigate between pages. Settings are stored in the URL, so you can bookmark a filtered view or share it with a teammate.
+
+<CardGroup cols={2}>
+  <Card
+    title="Run Details"
+    icon="magnifying-glass"
+    href="/cloud/viewing-results/run-details"
+  >
+    Inspect actions, outputs, recordings, and parameters for any run
+  </Card>
+  <Card
+    title="Downloading Artifacts"
+    icon="download"
+    href="/cloud/viewing-results/downloading-artifacts"
+  >
+    Save recordings, screenshots, and output files
+  </Card>
+</CardGroup>
