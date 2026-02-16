@@ -365,6 +365,7 @@ class BlockStatus(StrEnum):
     terminated = "terminated"
     canceled = "canceled"
     timed_out = "timed_out"
+    skipped = "skipped"
 
 
 @dataclass(frozen=True)

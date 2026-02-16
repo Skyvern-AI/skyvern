@@ -2671,6 +2671,7 @@ class AgentDB(BaseAlchemyDB):
         ai_fallback: bool | None = None,
         depends_on_workflow_run_id: str | None = None,
         browser_session_id: str | None = None,
+        browser_profile_id: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -2703,6 +2704,8 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
                 if browser_session_id:
                     workflow_run.browser_session_id = browser_session_id
+                if browser_profile_id:
+                    workflow_run.browser_profile_id = browser_profile_id
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)

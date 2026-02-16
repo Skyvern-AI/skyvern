@@ -84,8 +84,17 @@ function WorkflowRunTimelineBlockItem({
   }, []);
 
   const showStatusIndicator = block.status !== null;
+  // Special: login block skipped due to browser profile
+  const isLoginSkippedWithProfile =
+    block.block_type === "login" && block.status === Status.Skipped &&
+    block.output && typeof block.output === "object" &&
+    "browser_profile_id" in block.output &&
+    block.output.browser_profile_id;
+
   const showSuccessIndicator =
-    showStatusIndicator && block.status === Status.Completed;
+    showStatusIndicator &&
+    block.status === Status.Completed &&
+    !(block.block_type === "login" && isLoginSkippedWithProfile);
   const showFailureIndicator =
     showStatusIndicator &&
     (block.status === Status.Failed ||
@@ -177,7 +186,9 @@ function WorkflowRunTimelineBlockItem({
             </div>
           </div>
         </div>
-        {block.description ? (
+        {isLoginSkippedWithProfile ? (
+          <div className="text-xs text-amber-400 font-semibold">skipped due to using saved browser credentials</div>
+        ) : block.description ? (
           <div className="text-xs text-slate-400">{block.description}</div>
         ) : null}
         {block.block_type === "conditional" && block.executed_branch_id && (
