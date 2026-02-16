@@ -239,7 +239,7 @@ const versions = await skyvern.getWorkflowVersions(
 
 ```typescript
 const updated = await skyvern.updateWorkflow(
-  workflowId: string,              // The version ID (not permanent ID).
+  workflowId: string,              // The permanent ID (wpid_...).
   request?: { json_definition?: object; yaml_definition?: string },
 ): Promise<Workflow>
 ```
@@ -329,7 +329,7 @@ const profile = await skyvern.createBrowserProfile({
   name: string,
   description?: string,
   workflow_run_id?: string,        // Run must have used persist_browser_session: true.
-  browser_session_id?: string,
+  browser_session_id?: string,     // One of workflow_run_id or browser_session_id is required.
 }): Promise<BrowserProfile>
 ```
 
