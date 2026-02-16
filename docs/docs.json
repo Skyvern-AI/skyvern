@@ -160,7 +160,7 @@
               "sdk-reference/complete-reference"
             ]
           },
-        {
+          {
             "group": "TypeScript SDK",
             "pages": [
               "ts-sdk-reference/overview",
@@ -175,6 +175,15 @@
               "ts-sdk-reference/complete-reference"
             ]
           }
+        ]
+      },
+      {
+        "tab": "Cookbooks",
+        "pages": [
+          "cookbooks/overview",
+          "cookbooks/bulk-invoice-downloader",
+          "cookbooks/job-application-filler",
+          "cookbooks/healthcare-portal-data"
         ]
       },
       {
