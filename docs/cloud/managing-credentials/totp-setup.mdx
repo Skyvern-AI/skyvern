@@ -53,11 +53,13 @@ curl -X POST "https://api.skyvern.com/v1/credentials/totp" \
   }'
 ```
 
-This turns email-based 2FA into something nearly as automated as authenticator app — the only difference is a few seconds of latency while the email arrives and gets forwarded.
+The `source` field is a free-text label for your own tracking (e.g., `"email_forwarder"`, `"twilio_webhook"`).
+
+This turns email-based 2FA into something nearly as automated as authenticator app — the main difference is latency while the email arrives and gets forwarded.
 
 ## Viewing past codes
 
-The table below the push form shows all 2FA codes your organization has received: identifier, extracted code, source type, associated workflow run, and timestamps. Filter by identifier, OTP type (numeric code vs. magic link), and result count.
+The table below the push form shows all 2FA codes your organization has received: identifier, extracted code, source type, associated workflow run, and timestamps. Filter by identifier, OTP type (numeric code vs. magic link), and number of results per page.
 
 Use this for auditing and debugging — confirming that a code was received and delivered to the right run.
 

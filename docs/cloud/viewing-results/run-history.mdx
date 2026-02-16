@@ -14,7 +14,7 @@ The **Runs** page shows every task and workflow execution, sorted newest-first. 
 
 <img src="/images/cloud/run-history-search.png" alt="Searching for a run by ID" />
 
-**Filter by Status** opens a multi-select dropdown. Check one or more statuses to narrow results — `failed` and `timed_out` together show everything that went wrong. Filters and search compose: search for a parameter value while filtering to only failed runs.
+**Filter by Status** opens a multi-select dropdown. Check one or more statuses to narrow results — `failed` and `timed_out` together show everything that went wrong. Filters and search can be combined: search for a parameter value while filtering to only failed runs.
 
 Available statuses: **Created**, **Queued**, **Running**, **Completed**, **Failed**, **Terminated**, **Canceled**, **Timed Out**.
 
@@ -25,8 +25,8 @@ Each row is one run. The columns:
 | Column | What it shows |
 |--------|--------------|
 | **Run ID** | Workflow run (`wr_...`) or task (`tsk_...`) identifier. Hover for the full ID. |
-| **Detail** | Workflow title. A lightning bolt icon means code generation was used. |
-| **Status** | Color-coded badge — green (completed), yellow (running/queued), red (failed), orange (terminated). |
+| **Detail** | Workflow title or task description. A lightning bolt icon means code generation was used. |
+| **Status** | Color-coded badge — green (completed), yellow (running/queued/created), red (failed/timed_out), orange (terminated/canceled). |
 | **Created At** | Start time in your local timezone. Hover for UTC. |
 
 Workflow runs have a **settings icon** in the last column. Click it to expand the row and see the parameters passed to that run. If your search matches something inside the parameters, the row auto-expands so you can see the match in context.

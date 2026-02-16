@@ -135,6 +135,26 @@ Click any template to launch it with pre-filled configuration, or use it as a st
 
 ---
 
+## Tips for better results
+
+**Write specific prompts.** Include the exact goal, target fields, and what "done" looks like.
+
+| Instead of | Write |
+|-----------|-------|
+| "Get some data from this site" | "Extract the product name, price, and availability from the first 5 results on amazon.com/s?k=wireless+mouse" |
+| "Fill out the form" | "Fill the contact form at example.com/contact with name 'Jane Doe', email 'jane@example.com', and message 'Demo request'" |
+
+**Control cost with Max Steps.** Set **Max Steps Override** to a reasonable limit (e.g., 10–20 for simple tasks) during development. Each step consumes one credit. Remove the cap once you've confirmed the task works.
+
+**Debug failures in order.** If a task fails or produces wrong results:
+
+1. Check the **Failure Reason** at the top of the run detail page
+2. Read the **Thought cards** in the Overview timeline to find where the AI went off track
+3. Watch the **Recording** to see what actually happened on screen
+4. Review **Parameters** to confirm the inputs were correct
+
+---
+
 ## What happens next
 
 1. Your prompt is sent to Skyvern
@@ -142,3 +162,24 @@ Click any template to launch it with pre-filled configuration, or use it as a st
 3. The AI analyzes the page, plans actions, and executes them step by step
 4. You're taken to the [live execution view](/cloud/getting-started/monitor-a-run) where you can watch it happen in real time
 5. When complete, results appear on the run detail page under **Runs**
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Watching Live Execution"
+    icon="eye"
+    href="/cloud/getting-started/monitor-a-run"
+  >
+    Monitor runs, take control of the browser, and review results
+  </Card>
+  <Card
+    title="Build a Workflow"
+    icon="diagram-project"
+    href="/cloud/building-workflows/build-a-workflow"
+  >
+    Turn a successful task into a reusable multi-step workflow
+  </Card>
+</CardGroup>

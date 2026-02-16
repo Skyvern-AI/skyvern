@@ -21,16 +21,17 @@ A workflow is a sequence of **blocks** that run one after another. Each block do
 
 Every block produces an output. Downstream blocks reference it using the pattern `{{ block_label_output }}`.
 
-For example, an Extraction block labeled `scrape_listings` produces output that later blocks access as `{{ scrape_listings_output }}`. This is how you chain steps together. One block's output becomes the next block's input.
+For example, an Extraction block labeled `scrape_listings` produces output that later blocks access as `{{ scrape_listings_output }}`. The label is lowercased with spaces replaced by underscores, then `_output` is appended. This is how you chain steps together. One block's output becomes the next block's input.
 
 ### Block categories
 
 | Category | What it does | Examples |
 |----------|-------------|----------|
-| **Browser Automation** | Interact with web pages using AI | Browser Task, Extraction, Browser Action, Login, File Download |
-| **Data Processing** | Transform data without a browser | Text Prompt, File Parser, Code |
-| **Control Flow** | Branch, loop, validate, or pause | Loop, Conditional, AI Validation, Wait |
-| **Communication** | Send data to external services | Send Email, HTTP Request |
+| **Browser Automation** | Interact with web pages using AI | Browser Task, Browser Action, Extraction, Login, Go to URL, Print Page |
+| **Data and Extraction** | Transform data without a browser | Text Prompt, File Parser |
+| **Control Flow** | Branch, loop, validate, or pause | Loop, Conditional, AI Validation, Code, Wait |
+| **Files** | Download and upload files | File Download, Cloud Storage Upload |
+| **Communication** | Send data to external services or humans | Send Email, HTTP Request, Human Interaction |
 
 See [Block Reference](/cloud/building-workflows/configure-blocks) for every block type and its configuration fields.
 
@@ -44,7 +45,7 @@ If your block needs a browser, pick a browser automation block. If it just needs
 
 Let's build a real workflow. You'll create an automation that finds the top 5 job listings from Hacker News's monthly "Who is Hiring" thread, summarizes each one, and emails you a digest.
 
-This uses 5 blocks across 3 categories: browser automation, data processing, and communication.
+This uses 5 blocks across 3 categories: browser automation, data and extraction, and communication.
 
 <Steps>
   <Step title="Create a new workflow">
