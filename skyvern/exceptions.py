@@ -426,6 +426,14 @@ class CredentialParameterNotFoundError(SkyvernException):
         super().__init__(f"Could not find credential parameter: {credential_parameter_id}")
 
 
+class CredentialVaultNotConfiguredError(SkyvernException):
+    def __init__(self, vault_type: str, credential_id: str) -> None:
+        super().__init__(
+            f"Credential vault service '{vault_type}' is not configured. "
+            f"Credential {credential_id} was found in DB but cannot be resolved."
+        )
+
+
 class UnknownElementTreeFormat(SkyvernException):
     def __init__(self, fmt: str) -> None:
         super().__init__(f"Unknown element tree format {fmt}")
