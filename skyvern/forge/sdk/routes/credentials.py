@@ -792,6 +792,7 @@ BROWSER_PROFILE_LOGIN_PROMPT = (
     include_in_schema=False,
 )
 async def test_credential(
+    background_tasks: BackgroundTasks,
     credential_id: str = Path(
         ...,
         description="The credential ID to test",
@@ -905,7 +906,7 @@ async def test_credential(
     # Execute the workflow via the async executor (cloud version enqueues to a worker)
     await AsyncExecutorFactory.get_executor().execute_workflow(
         request=None,
-        background_tasks=None,
+        background_tasks=background_tasks,
         organization=current_org,
         workflow_id=workflow_run.workflow_id,
         workflow_run_id=workflow_run.workflow_run_id,
