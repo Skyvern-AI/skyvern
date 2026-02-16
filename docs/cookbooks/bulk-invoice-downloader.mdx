@@ -1,0 +1,1057 @@
+---
+title: Bulk Invoice Downloader
+subtitle: Download invoices from a customer portal, parse PDFs, and email a summary
+slug: cookbooks/bulk-invoice-downloader
+---
+
+Automate invoice collection from any vendor portal. 
+
+This cookbook creates a workflow that takes in a vendor portal URL, logs in using saved credentials, finds order history, filters by date and finally downloads and emails the invoices as PDFs.
+
+---
+
+## What you'll build
+
+A workflow that:
+
+1. Logs into a customer account portal
+2. Navigates to order history and filters by date
+3. Extracts order metadata from the page
+4. Downloads invoice PDFs for each order
+5. Parses invoice data from each PDF
+6. Emails a summary with PDFs attached
+
+---
+
+## Prerequisites
+
+- **Skyvern Cloud API key** — Get one at [app.skyvern.com/settings](https://app.skyvern.com/settings) → API Keys
+
+Install the SDK:
+
+<CodeGroup>
+```bash Python
+pip install skyvern
+```
+
+```bash TypeScript
+npm install @skyvern/client
+```
+</CodeGroup>
+
+Set your API key:
+
+```bash
+export SKYVERN_API_KEY="your-api-key"
+```
+
+---
+
+## Sample Vendor Portal
+
+We'll use *Ember Roasters*, a fake coffee retailer website created for agent automation testing. 
+Change `portal_url` to use your vendor's portal URL.
+
+| Field          | Value                        |
+| -------------- | ---------------------------- |
+| URL            | https://ember-roasters.vercel.app/ |
+| Login email    | demo@manicule.dev            |
+| Login password | helloworld              |
+
+
+---
+
+## Step 1: Store credentials
+
+Before defining the workflow, store the login email and password Skyvern will use. This keeps secrets out of your workflow definition and away from LLMs.
+
+<CodeGroup>
+```python Python
+import os
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+    credential = await client.create_credential(
+        name="Vendor Portal",
+        credential_type="password",
+        credential={
+            "username": "demo@manicule.dev",
+            "password": "helloworld"
+        }
+    )
+
+    print(f"Credential ID: {credential.credential_id}")
+    # Save this ID for your workflow: cred_xxx
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+
+const client = new SkyvernClient({
+  apiKey: process.env.SKYVERN_API_KEY,
+});
+
+const credential = await client.createCredential({
+  name: "Vendor Portal",
+  credential_type: "password",
+  credential: {
+    username: "demo@manicule.dev",
+    password: "helloworld",
+  },
+});
+
+console.log(`Credential ID: ${credential.credential_id}`);
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/credentials" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Vendor Portal",
+    "credential_type": "password",
+    "credential": {
+      "username": "demo@manicule.dev",
+      "password": "helloworld"
+    }
+  }'
+```
+</CodeGroup>
+
+---
+
+## Step 2: Define workflow parameters
+
+Parameters are the inputs your workflow accepts. Defining them upfront lets you run the same workflow against different portals, date ranges, or recipients.
+
+This workflow uses the following parameters:
+
+- **`portal_url`** — The vendor portal's login URL.
+- **`start_date` / `end_date`** — Date range for filtering invoices.
+- **`recipient_email`** — Where to send the summary email.
+- **`credentials`** — The ID of the stored credential to use for login.
+
+**`smtp_host`, `smtp_port`, `smtp_username`, `smtp_password`** are SMTP configuration that Skyvern fills on its own. The `send_email` block requires these four parameters to connect to your mail server.
+
+<CodeGroup>
+```json JSON
+{
+  "parameters": [
+    {
+      "key": "portal_url",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "string"
+    },
+    {
+      "key": "start_date",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "string"
+    },
+    {
+      "key": "end_date",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "string"
+    },
+    {
+      "key": "recipient_email",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "string"
+    },
+    {
+      "key": "credentials",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "credential_id",
+      "default_value": "your-credential-id"
+    },
+    {
+      "key": "smtp_host",
+      "parameter_type": "aws_secret",
+      "aws_key": "SKYVERN_SMTP_HOST_AWS_SES"
+    },
+    {
+      "key": "smtp_port",
+      "parameter_type": "aws_secret",
+      "aws_key": "SKYVERN_SMTP_PORT_AWS_SES"
+    },
+    {
+      "key": "smtp_username",
+      "parameter_type": "aws_secret",
+      "aws_key": "SKYVERN_SMTP_USERNAME_SES"
+    },
+    {
+      "key": "smtp_password",
+      "parameter_type": "aws_secret",
+      "aws_key": "SKYVERN_SMTP_PASSWORD_SES"
+    }
+  ]
+}
+```
+
+```yaml YAML
+parameters:
+  - key: portal_url                      # <-- parameter name
+    parameter_type: workflow             # <-- always set to "workflow"
+    workflow_parameter_type: string      # <-- can be string, file_url, credential_id, etc
+  - key: start_date
+    parameter_type: workflow
+    workflow_parameter_type: string
+  - key: end_date
+    parameter_type: workflow
+    workflow_parameter_type: string
+  - key: recipient_email
+    parameter_type: workflow
+    workflow_parameter_type: string
+  - key: credentials
+    parameter_type: workflow
+    workflow_parameter_type: credential_id
+    default_value: your-credential-id # <-- replace this
+  - key: smtp_host
+    parameter_type: aws_secret
+    aws_key: SKYVERN_SMTP_HOST_AWS_SES
+  - key: smtp_port
+    parameter_type: aws_secret
+    aws_key: SKYVERN_SMTP_PORT_AWS_SES
+  - key: smtp_username
+    parameter_type: aws_secret
+    aws_key: SKYVERN_SMTP_USERNAME_SES
+  - key: smtp_password
+    parameter_type: aws_secret
+    aws_key: SKYVERN_SMTP_PASSWORD_SES
+```
+</CodeGroup>
+
+---
+
+## Step 3: Create the workflow definition
+
+The workflow chains together several blocks to automate the full invoice collection process:
+
+1. **Login block** — Authenticates to the vendor portal using stored credentials
+2. **Navigation block** — Navigates to order history and applies date filters
+3. **Extraction block** — Extracts order metadata from the filtered results
+4. **For loop + File download** — Iterates over each order and downloads its invoice PDF
+5. **For loop + File parser** — Parses each downloaded PDF to extract structured data
+6. **Send email** — Sends a summary with PDFs attached to the recipient
+
+We will add these blocks one by one in the **workflow definition**, a YAML/JSON file that contains the complete description of your workflow logic
+
+### Workflow Definition format
+
+<CodeGroup>
+```json JSON
+{
+  "title": "Bulk Invoice Downloader",
+  "description": "Download invoices from vendor portals, parse PDFs to extract amounts, and email a summary with attachments.",
+  "proxy_location": "RESIDENTIAL",
+  "workflow_definition": {
+    "version": 1,
+    "parameters": [],
+    "blocks": []
+  }
+}
+```
+
+```yaml YAML
+title: Bulk Invoice Downloader
+description: "Download invoices from vendor portals, parse PDFs to extract amounts, and email a summary with attachments."
+proxy_location: RESIDENTIAL       # <-- defaults to RESIDENTIAL
+workflow_definition:
+  version: 1                      # <-- auto-increments when you make changes
+  parameters:
+    ...                           # <-- defined in Step 2
+
+  blocks:
+    ...                           # <-- defined one by one in the next steps
+```
+</CodeGroup>
+
+### Login block
+
+The `login` block authenticates using stored credentials. Skyvern injects the username/password directly into form fields without exposing them to the LLM.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "login",
+  "label": "login_block",
+  "url": "{{portal_url}}",
+  "title": "login_block",
+  "parameter_keys": ["credentials"],
+  "navigation_goal": "Log in using the provided credentials.\nHandle any cookie consent popups.\nCOMPLETE when on the account dashboard or orders page.",
+  "error_code_mapping": {
+    "INVALID_CREDENTIALS": "Login failed - incorrect email or password",
+    "ACCOUNT_LOCKED": "Account has been locked or suspended"
+  },
+  "max_retries": 0,
+  "engine": "skyvern-1.0"
+}
+```
+
+```yaml YAML
+- block_type: login
+  label: login_block
+  url: "{{portal_url}}"
+  title: login_block
+  parameter_keys:
+    - credentials
+  navigation_goal: |
+    Log in using the provided credentials.
+    Handle any cookie consent popups.
+    COMPLETE when on the account dashboard or orders page.
+  error_code_mapping:
+    INVALID_CREDENTIALS: Login failed - incorrect email or password
+    ACCOUNT_LOCKED: Account has been locked or suspended
+  max_retries: 0
+  engine: skyvern-1.0
+```
+</CodeGroup>
+
+**Why `error_code_mapping`?** It surfaces specific failures in your workflow output, so you can handle "wrong password" differently from "account locked."
+
+### Navigation block
+
+Navigate to the orders page and apply the date filter.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "navigation",
+  "label": "nav_block",
+  "url": "",
+  "title": "nav_block",
+  "engine": "skyvern-1.0",
+  "parameter_keys": ["start_date", "end_date"],
+  "navigation_goal": "Navigate to Order History or My Orders.\nFilter orders between {{ start_date }} and {{ end_date }}.\nClick the Filter button.\nCOMPLETE when filtered results are visible.",
+  "max_retries": 0
+}
+```
+
+```yaml YAML
+- block_type: navigation
+  label: nav_block
+  url: ""
+  title: nav_block
+  engine: skyvern-1.0
+  parameter_keys:
+    - start_date
+    - end_date
+  navigation_goal: |
+    Navigate to Order History or My Orders.
+    Filter orders between {{ start_date }} and {{ end_date }}.
+    Click the Filter button.
+    COMPLETE when filtered results are visible.
+  max_retries: 0
+```
+</CodeGroup>
+
+### Extraction block
+
+Extract order metadata from the filtered results. The `data_schema` tells Skyvern exactly what structure to return.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "extraction",
+  "label": "data_extraction_block",
+  "url": "",
+  "title": "data_extraction_block",
+  "data_extraction_goal": "Extract all visible orders: order ID, date, total amount, and status.",
+  "data_schema": {
+    "orders": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "description": "Unique identifier for the order"
+          },
+          "date": {
+            "type": "string",
+            "description": "Date when the order was placed"
+          },
+          "total": {
+            "type": "number",
+            "description": "Total amount for the order"
+          },
+          "status": {
+            "type": "string",
+            "description": "Current status of the order"
+          }
+        },
+        "required": ["order_id", "date", "total", "status"]
+      }
+    }
+  },
+  "max_retries": 0,
+  "engine": "skyvern-1.0"
+}
+```
+
+```yaml YAML
+- block_type: extraction
+  label: data_extraction_block
+  url: ""
+  title: data_extraction_block
+  data_extraction_goal: "Extract all visible orders: order ID, date, total amount, and status."
+  data_schema:
+    orders:
+      type: array
+      items:
+        type: object
+        properties:
+          order_id:
+            type: string
+            description: Unique identifier for the order
+          date:
+            type: string
+            description: Date when the order was placed
+          total:
+            type: number
+            description: Total amount for the order
+          status:
+            type: string
+            description: Current status of the order
+        required:
+          - order_id
+          - date
+          - total
+          - status
+  max_retries: 0
+  engine: skyvern-1.0
+```
+</CodeGroup>
+
+The output is accessible as `{{ data_extraction_block_output.orders }}` in subsequent blocks.
+
+### Download invoices block
+
+Iterate over each order and click its "Download Invoice" button. `continue_on_failure: true` ensures one failed download doesn't stop the entire workflow.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "for_loop",
+  "label": "for_1_block",
+  "loop_variable_reference": "{{data_extraction_block_output.orders}}",
+  "continue_on_failure": true,
+  "next_loop_on_failure": true,
+  "complete_if_empty": true,
+  "loop_blocks": [
+    {
+      "block_type": "file_download",
+      "label": "inv_download_block",
+      "url": "",
+      "title": "inv_download_block",
+      "navigation_goal": "Find order {{ current_value.order_id }}.\nClick Download Invoice.\nCOMPLETE when the PDF download starts.",
+      "download_suffix": "invoice_{{ current_value.order_id }}.pdf",
+      "max_retries": 0,
+      "engine": "skyvern-1.0"
+    }
+  ]
+}
+```
+
+```yaml YAML
+- block_type: for_loop
+  label: for_1_block
+  loop_variable_reference: "{{data_extraction_block_output.orders}}"
+  continue_on_failure: true
+  next_loop_on_failure: true
+  complete_if_empty: true
+  loop_blocks:
+    - block_type: file_download
+      label: inv_download_block
+      url: ""
+      title: inv_download_block
+      navigation_goal: |
+        Find order {{ current_value.order_id }}.
+        Click Download Invoice.
+        COMPLETE when the PDF download starts.
+      download_suffix: invoice_{{ current_value.order_id }}.pdf
+      max_retries: 0
+      engine: skyvern-1.0
+```
+</CodeGroup>
+
+**Key pattern:** Inside a loop, `{{ current_value }}` gives you the current item being iterated over.
+
+### Parse invoices block
+
+Use `file_url_parser` to extract structured data from each downloaded PDF.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "for_loop",
+  "label": "for_2_block",
+  "loop_variable_reference": "{{data_extraction_block_output.orders}}",
+  "continue_on_failure": true,
+  "next_loop_on_failure": true,
+  "complete_if_empty": true,
+  "loop_blocks": [
+    {
+      "block_type": "file_url_parser",
+      "label": "parse_block",
+      "file_url": "SKYVERN_DOWNLOAD_DIRECTORY/invoice_{{ current_value.order_id }}.pdf",
+      "file_type": "pdf",
+      "json_schema": {
+        "type": "object",
+        "properties": {
+          "invoice_id": {
+            "type": "string",
+            "description": "Unique identifier for the invoice"
+          },
+          "amount": {
+            "type": "number",
+            "description": "Total amount of the invoice"
+          },
+          "date": {
+            "type": "string",
+            "description": "Date of the invoice, typically in YYYY-MM-DD format"
+          }
+        },
+        "required": ["invoice_id", "amount", "date"]
+      }
+    }
+  ]
+}
+```
+
+```yaml YAML
+- block_type: for_loop
+  label: for_2_block
+  loop_variable_reference: "{{data_extraction_block_output.orders}}"
+  continue_on_failure: true
+  next_loop_on_failure: true
+  complete_if_empty: true
+  loop_blocks:
+    - block_type: file_url_parser
+      label: parse_block
+      file_url: SKYVERN_DOWNLOAD_DIRECTORY/invoice_{{ current_value.order_id }}.pdf
+      file_type: pdf
+      json_schema:
+        type: object
+        properties:
+          invoice_id:
+            type: string
+            description: Unique identifier for the invoice
+          amount:
+            type: number
+            description: Total amount of the invoice
+          date:
+            type: string
+            description: Date of the invoice, typically in YYYY-MM-DD format
+        required:
+          - invoice_id
+          - amount
+          - date
+```
+</CodeGroup>
+
+The output is accessible as `{{ for_2_block_output }}` in subsequent blocks.
+
+### Email block
+
+Send a summary email with PDFs attached.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "send_email",
+  "label": "email_block",
+  "smtp_host_secret_parameter_key": "smtp_host",
+  "smtp_port_secret_parameter_key": "smtp_port",
+  "smtp_username_secret_parameter_key": "smtp_username",
+  "smtp_password_secret_parameter_key": "smtp_password",
+  "sender": "hello@skyvern.com",
+  "recipients": ["{{recipient_email}}"],
+  "subject": "Ember Roasters Invoices from {{start_date}} to {{end_date}}",
+  "body": "{{for_2_block_output}}",
+  "file_attachments": ["SKYVERN_DOWNLOAD_DIRECTORY"]
+}
+```
+
+```yaml YAML
+- block_type: send_email
+  label: email_block
+  smtp_host_secret_parameter_key: smtp_host
+  smtp_port_secret_parameter_key: smtp_port
+  smtp_username_secret_parameter_key: smtp_username
+  smtp_password_secret_parameter_key: smtp_password
+  sender: hello@skyvern.com
+  recipients:
+    - "{{recipient_email}}"
+  subject: "Ember Roasters Invoices from {{start_date}} to {{end_date}}"
+  body: "{{for_2_block_output}}"
+  file_attachments:
+    - SKYVERN_DOWNLOAD_DIRECTORY
+```
+</CodeGroup>
+
+### Complete workflow definition
+
+Save this complete definition to `invoice-workflow.yaml` (or `.json`) before running.
+
+
+<Accordion title="Complete workflow definition">
+<CodeGroup>
+```json JSON
+{
+  "title": "Bulk Invoice Downloader",
+  "description": "Download invoices from vendor portals, parse PDFs to extract amounts, and email a summary with attachments.",
+  "proxy_location": "RESIDENTIAL",
+  "webhook_callback_url": "",
+  "persist_browser_session": false,
+  "workflow_definition": {
+    "version": 1,
+    "parameters": [
+      { "key": "portal_url", "parameter_type": "workflow", "workflow_parameter_type": "string" },
+      { "key": "start_date", "parameter_type": "workflow", "workflow_parameter_type": "string" },
+      { "key": "end_date", "parameter_type": "workflow", "workflow_parameter_type": "string" },
+      { "key": "recipient_email", "parameter_type": "workflow", "workflow_parameter_type": "string" },
+      { "key": "credentials", "parameter_type": "workflow", "workflow_parameter_type": "credential_id", "default_value": "your-credential-id" },
+      { "key": "smtp_host", "parameter_type": "aws_secret", "aws_key": "SKYVERN_SMTP_HOST_AWS_SES" },
+      { "key": "smtp_port", "parameter_type": "aws_secret", "aws_key": "SKYVERN_SMTP_PORT_AWS_SES" },
+      { "key": "smtp_username", "parameter_type": "aws_secret", "aws_key": "SKYVERN_SMTP_USERNAME_SES" },
+      { "key": "smtp_password", "parameter_type": "aws_secret", "aws_key": "SKYVERN_SMTP_PASSWORD_SES" }
+    ],
+    "blocks": [
+      {
+        "block_type": "login",
+        "label": "login_block",
+        "url": "{{portal_url}}",
+        "title": "login_block",
+        "parameter_keys": ["credentials"],
+        "navigation_goal": "Log in using the provided credentials.\nHandle any cookie consent popups.\nCOMPLETE when on the account dashboard or orders page.",
+        "error_code_mapping": {
+          "INVALID_CREDENTIALS": "Login failed - incorrect email or password",
+          "ACCOUNT_LOCKED": "Account has been locked or suspended"
+        },
+        "max_retries": 0,
+        "engine": "skyvern-1.0"
+      },
+      {
+        "block_type": "navigation",
+        "label": "nav_block",
+        "url": "",
+        "title": "nav_block",
+        "engine": "skyvern-1.0",
+        "parameter_keys": ["start_date", "end_date"],
+        "navigation_goal": "Navigate to Order History or My Orders.\nFilter orders between {{ start_date }} and {{ end_date }}.\nClick the Filter button.\nCOMPLETE when filtered results are visible.",
+        "max_retries": 0
+      },
+      {
+        "block_type": "extraction",
+        "label": "data_extraction_block",
+        "url": "",
+        "title": "data_extraction_block",
+        "data_extraction_goal": "Extract all visible orders: order ID, date, total amount, and status.",
+        "data_schema": {
+          "orders": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "order_id": { "type": "string", "description": "Unique identifier for the order" },
+                "date": { "type": "string", "description": "Date when the order was placed" },
+                "total": { "type": "number", "description": "Total amount for the order" },
+                "status": { "type": "string", "description": "Current status of the order" }
+              },
+              "required": ["order_id", "date", "total", "status"]
+            }
+          }
+        },
+        "max_retries": 0,
+        "engine": "skyvern-1.0"
+      },
+      {
+        "block_type": "for_loop",
+        "label": "for_1_block",
+        "loop_variable_reference": "{{data_extraction_block_output.orders}}",
+        "continue_on_failure": true,
+        "next_loop_on_failure": true,
+        "complete_if_empty": true,
+        "loop_blocks": [
+          {
+            "block_type": "file_download",
+            "label": "inv_download_block",
+            "url": "",
+            "title": "inv_download_block",
+            "navigation_goal": "Find order {{ current_value.order_id }}.\nClick Download Invoice.\nCOMPLETE when the PDF download starts.",
+            "download_suffix": "invoice_{{ current_value.order_id }}.pdf",
+            "max_retries": 0,
+            "engine": "skyvern-1.0"
+          }
+        ]
+      },
+      {
+        "block_type": "for_loop",
+        "label": "for_2_block",
+        "loop_variable_reference": "{{data_extraction_block_output.orders}}",
+        "continue_on_failure": true,
+        "next_loop_on_failure": true,
+        "complete_if_empty": true,
+        "loop_blocks": [
+          {
+            "block_type": "file_url_parser",
+            "label": "parse_block",
+            "file_url": "SKYVERN_DOWNLOAD_DIRECTORY/invoice_{{ current_value.order_id }}.pdf",
+            "file_type": "pdf",
+            "json_schema": {
+              "type": "object",
+              "properties": {
+                "invoice_id": { "type": "string", "description": "Unique identifier for the invoice" },
+                "amount": { "type": "number", "description": "Total amount of the invoice" },
+                "date": { "type": "string", "description": "Date of the invoice, typically in YYYY-MM-DD format" }
+              },
+              "required": ["invoice_id", "amount", "date"]
+            }
+          }
+        ]
+      },
+      {
+        "block_type": "send_email",
+        "label": "email_block",
+        "smtp_host_secret_parameter_key": "smtp_host",
+        "smtp_port_secret_parameter_key": "smtp_port",
+        "smtp_username_secret_parameter_key": "smtp_username",
+        "smtp_password_secret_parameter_key": "smtp_password",
+        "sender": "hello@skyvern.com",
+        "recipients": ["{{recipient_email}}"],
+        "subject": "Ember Roasters Invoices from {{start_date}} to {{end_date}}",
+        "body": "{{for_2_block_output}}",
+        "file_attachments": ["SKYVERN_DOWNLOAD_DIRECTORY"]
+      }
+    ]
+  }
+}
+```
+```yaml YAML
+title: Bulk Invoice Downloader
+description: "Download invoices from vendor portals, parse PDFs to extract amounts, and email a summary with attachments."
+proxy_location: RESIDENTIAL
+webhook_callback_url: ""
+persist_browser_session: false
+workflow_definition:
+  version: 1
+  parameters:
+    - key: portal_url
+      parameter_type: workflow
+      workflow_parameter_type: string
+    - key: start_date
+      parameter_type: workflow
+      workflow_parameter_type: string
+    - key: end_date
+      parameter_type: workflow
+      workflow_parameter_type: string
+    - key: recipient_email
+      parameter_type: workflow
+      workflow_parameter_type: string
+    - key: credentials
+      parameter_type: workflow
+      workflow_parameter_type: credential_id
+      default_value: your-credential-id # <-- replace this
+    - key: smtp_host
+      parameter_type: aws_secret
+      aws_key: SKYVERN_SMTP_HOST_AWS_SES
+    - key: smtp_port
+      parameter_type: aws_secret
+      aws_key: SKYVERN_SMTP_PORT_AWS_SES
+    - key: smtp_username
+      parameter_type: aws_secret
+      aws_key: SKYVERN_SMTP_USERNAME_SES
+    - key: smtp_password
+      parameter_type: aws_secret
+      aws_key: SKYVERN_SMTP_PASSWORD_SES
+
+  blocks:
+    - block_type: login
+      label: login_block
+      url: "{{portal_url}}"
+      title: login_block
+      parameter_keys:
+        - credentials
+      navigation_goal: |
+        Log in using the provided credentials.
+        Handle any cookie consent popups.
+        COMPLETE when on the account dashboard or orders page.
+      error_code_mapping:
+        INVALID_CREDENTIALS: Login failed - incorrect email or password
+        ACCOUNT_LOCKED: Account has been locked or suspended
+      max_retries: 0
+      engine: skyvern-1.0
+
+    - block_type: navigation
+      label: nav_block
+      url: ""
+      title: nav_block
+      engine: skyvern-1.0
+      parameter_keys:
+        - start_date
+        - end_date
+      navigation_goal: |
+        Navigate to Order History or My Orders.
+        Filter orders between {{ start_date }} and {{ end_date }}.
+        Click the Filter button.
+        COMPLETE when filtered results are visible.
+      max_retries: 0
+
+    - block_type: extraction
+      label: data_extraction_block
+      url: ""
+      title: data_extraction_block
+      data_extraction_goal: "Extract all visible orders: order ID, date, total amount, and status."
+      data_schema:
+        orders:
+          type: array
+          items:
+            type: object
+            properties:
+              order_id:
+                type: string
+                description: Unique identifier for the order
+              date:
+                type: string
+                description: Date when the order was placed
+              total:
+                type: number
+                description: Total amount for the order
+              status:
+                type: string
+                description: Current status of the order
+            required:
+              - order_id
+              - date
+              - total
+              - status
+      max_retries: 0
+      engine: skyvern-1.0
+
+    - block_type: for_loop
+      label: for_1_block
+      loop_variable_reference: "{{data_extraction_block_output.orders}}"
+      continue_on_failure: true
+      next_loop_on_failure: true
+      complete_if_empty: true
+      loop_blocks:
+        - block_type: file_download
+          label: inv_download_block
+          url: ""
+          title: inv_download_block
+          navigation_goal: |
+            Find order {{ current_value.order_id }}.
+            Click Download Invoice.
+            COMPLETE when the PDF download starts.
+          download_suffix: invoice_{{ current_value.order_id }}.pdf
+          max_retries: 0
+          engine: skyvern-1.0
+
+    - block_type: for_loop
+      label: for_2_block
+      loop_variable_reference: "{{data_extraction_block_output.orders}}"
+      continue_on_failure: true
+      next_loop_on_failure: true
+      complete_if_empty: true
+      loop_blocks:
+        - block_type: file_url_parser
+          label: parse_block
+          file_url: SKYVERN_DOWNLOAD_DIRECTORY/invoice_{{ current_value.order_id }}.pdf
+          file_type: pdf
+          json_schema:
+            type: object
+            properties:
+              invoice_id:
+                type: string
+                description: Unique identifier for the invoice
+              amount:
+                type: number
+                description: Total amount of the invoice
+              date:
+                type: string
+                description: Date of the invoice, typically in YYYY-MM-DD format
+            required:
+              - invoice_id
+              - amount
+              - date
+
+    - block_type: send_email
+      label: email_block
+      smtp_host_secret_parameter_key: smtp_host
+      smtp_port_secret_parameter_key: smtp_port
+      smtp_username_secret_parameter_key: smtp_username
+      smtp_password_secret_parameter_key: smtp_password
+      sender: hello@skyvern.com
+      recipients:
+        - "{{recipient_email}}"
+      subject: "Ember Roasters Invoices from {{start_date}} to {{end_date}}"
+      body: "{{for_2_block_output}}"
+      file_attachments:
+        - SKYVERN_DOWNLOAD_DIRECTORY
+```
+</CodeGroup>
+</Accordion>
+
+---
+
+## Step 4: Run the workflow
+
+Create the workflow from your definition file and execute it using the SDK.
+
+<CodeGroup>
+```python Python
+import os
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+    # Create workflow from YAML file
+    workflow = await client.create_workflow(
+        yaml_definition=open("invoice-workflow.yaml").read()
+    )
+    print(f"Created workflow: {workflow.workflow_permanent_id}")
+
+    # Run the workflow
+    run = await client.run_workflow(
+        workflow_id=workflow.workflow_permanent_id,
+        parameters={
+            "portal_url": "https://ember-roasters.vercel.app",
+            "start_date": "2025-01-01",
+            "end_date": "2025-01-31",
+            "recipient_email": "your-email@company.com"  # <-- replace this
+        }
+    )
+    print(f"Started run: {run.run_id}")
+
+    # Poll for completion
+    while True:
+        result = await client.get_run(run.run_id)
+        if result.status in ["completed", "failed", "terminated"]:
+            break
+        print(f"Status: {result.status}")
+        await asyncio.sleep(10)
+
+    print(f"Final status: {result.status}")
+    if result.status == "completed":
+        print("Invoices downloaded and email sent successfully")
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+import * as fs from "fs";
+
+async function main() {
+  const client = new SkyvernClient({
+    apiKey: process.env.SKYVERN_API_KEY,
+  });
+
+  // Create workflow from YAML file
+  const workflow = await client.createWorkflow({
+    body: {
+      yaml_definition: fs.readFileSync("invoice-workflow.yaml", "utf-8"),
+    },
+  });
+  console.log(`Created workflow: ${workflow.workflow_permanent_id}`);
+
+  // Run the workflow
+  const run = await client.runWorkflow({
+    body: {
+      workflow_id: workflow.workflow_permanent_id,
+      parameters: {
+        portal_url: "https://ember-roasters.vercel.app",
+        start_date: "2025-01-01",
+        end_date: "2025-01-31",
+        recipient_email: "your-email@company.com", // <-- replace this
+      },
+    },
+  });
+  console.log(`Started run: ${run.run_id}`);
+
+  // Poll for completion
+  while (true) {
+    const result = await client.getRun(run.run_id);
+    if (["completed", "failed", "terminated"].includes(result.status)) {
+      console.log(`Final status: ${result.status}`);
+      if (result.status === "completed") {
+        console.log("Invoices downloaded and email sent successfully");
+      }
+      break;
+    }
+    console.log(`Status: ${result.status}`);
+    await new Promise((r) => setTimeout(r, 10000));
+  }
+}
+
+main();
+```
+
+```bash cURL
+# Create workflow
+WORKFLOW=$(curl -s -X POST "https://api.skyvern.com/v1/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"yaml_definition\": $(cat invoice-workflow.yaml | jq -Rs .)}")
+
+WORKFLOW_ID=$(echo "$WORKFLOW" | jq -r '.workflow_permanent_id')
+echo "Created workflow: $WORKFLOW_ID"
+
+# Run workflow (replace parameter values below)
+RUN=$(curl -s -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"workflow_id\": \"$WORKFLOW_ID\",
+    \"parameters\": {
+      \"portal_url\": \"https://ember-roasters.vercel.app\",
+      \"start_date\": \"2025-01-01\",
+      \"end_date\": \"2025-01-31\",
+      \"recipient_email\": \"your-email@company.com\"
+    }
+  }")
+
+RUN_ID=$(echo "$RUN" | jq -r '.run_id')
+echo "Started run: $RUN_ID"
+
+# Poll for completion
+while true; do
+  RESULT=$(curl -s "https://api.skyvern.com/v1/runs/$RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY")
+  STATUS=$(echo "$RESULT" | jq -r '.status')
+  echo "Status: $STATUS"
+
+  if [[ "$STATUS" == "completed" || "$STATUS" == "failed" || "$STATUS" == "terminated" ]]; then
+    echo "Workflow finished with status: $STATUS"
+    break
+  fi
+  sleep 10
+done
+```
+</CodeGroup>
+
+---
+
+## Resources
+
+<CardGroup cols={2}>
+  <Card title="Workflow Blocks Reference" icon="cube" href="/multi-step-automations/workflow-blocks-reference">
+    Complete parameter reference for all block types
+  </Card>
+  <Card title="Credential Management" icon="key" href="/sdk-reference/credentials">
+    Securely store and use login credentials
+  </Card>
+  <Card title="File Operations" icon="file" href="/multi-step-automations/file-operations">
+    Download, parse, and upload files in workflows
+  </Card>
+  <Card title="Error Handling" icon="triangle-exclamation" href="/going-to-production/error-handling">
+    Handle failures and retries in production
+  </Card>
+</CardGroup>

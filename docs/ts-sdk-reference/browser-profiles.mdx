@@ -28,8 +28,10 @@ console.log(profile.browser_profile_id); // bpf_abc123
 |-----------|------|----------|-------------|
 | `name` | `string` | Yes | Display name for the profile. |
 | `description` | `string` | No | Optional description. |
-| `workflow_run_id` | `string` | No | The workflow run ID to snapshot. The run must have used `persist_browser_session: true`. |
-| `browser_session_id` | `string` | No | The browser session ID to snapshot. |
+| `workflow_run_id` | `string` | Conditional | The workflow run ID to snapshot. The run must have used `persist_browser_session: true`. Required if `browser_session_id` is not provided. |
+| `browser_session_id` | `string` | Conditional | The browser session ID to snapshot. Required if `workflow_run_id` is not provided. |
+
+You must provide either `workflow_run_id` or `browser_session_id`.
 
 ### Returns `BrowserProfile`
 

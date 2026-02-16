@@ -28,8 +28,10 @@ print(profile.browser_profile_id)  # bpf_abc123
 |-----------|------|----------|-------------|
 | `name` | `str` | Yes | Display name for the profile. |
 | `description` | `str` | No | Optional description. |
-| `workflow_run_id` | `str` | No | The workflow run ID to snapshot. The run must have used `persist_browser_session=True`. |
-| `browser_session_id` | `str` | No | The browser session ID to snapshot. |
+| `workflow_run_id` | `str` | Conditional | The workflow run ID to snapshot. The run must have used `persist_browser_session=True`. Required if `browser_session_id` is not provided. |
+| `browser_session_id` | `str` | Conditional | The browser session ID to snapshot. Required if `workflow_run_id` is not provided. |
+
+You must provide either `workflow_run_id` or `browser_session_id`.
 
 ### Returns `BrowserProfile`
 
