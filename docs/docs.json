@@ -179,13 +179,11 @@
       },
       {
         "tab": "Cookbooks",
-        "groups": [
-          {
-            "group": "Cookbooks",
-            "pages": [
-              "cookbooks/healthcare-portal-data"
-            ]
-          }
+        "pages": [
+          "cookbooks/overview",
+          "cookbooks/bulk-invoice-downloader",
+          "cookbooks/job-application-filler",
+          "cookbooks/healthcare-portal-data"
         ]
       },
       {

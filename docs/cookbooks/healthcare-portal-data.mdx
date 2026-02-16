@@ -308,7 +308,7 @@ Navigate to **Patient/Client > Finder** and extract the results table.
             ),
             data_extraction_schema=PATIENT_SCHEMA,
             proxy_location="RESIDENTIAL",
-            browser_profile_id="YOUR_PROFILE_ID",
+            browser_session_id="YOUR_SESSION_ID",
         )
 
         while run.status not in ["completed", "failed", "terminated", "timed_out", "canceled"]:
@@ -353,7 +353,7 @@ Navigate to **Patient/Client > Finder** and extract the results table.
             "Click Search to display all patients.",
           data_extraction_schema: PATIENT_SCHEMA,
           proxy_location: "RESIDENTIAL",
-          browser_profile_id: "YOUR_PROFILE_ID",
+          browser_session_id: "YOUR_SESSION_ID",
         },
       });
 
@@ -385,6 +385,10 @@ Navigate to **Patient/Client > Finder** and extract the results table.
 
 <Note>
 The demo resets daily and community users add test patients, so exact records may differ.
+</Note>
+
+<Note>
+Browser profiles cannot be used directly with standalone tasks. Create a [browser session](/optimization/browser-sessions) from the profile first, then pass the session ID. See [Pagination with browser sessions](#pagination-with-browser-sessions) below for the full pattern.
 </Note>
 
 ---
@@ -434,7 +438,7 @@ Navigate to **Reports > Visits > Superbill**, set a date range, and extract the 
         ),
         data_extraction_schema=ENCOUNTER_SCHEMA,
         proxy_location="RESIDENTIAL",
-        browser_profile_id="YOUR_PROFILE_ID",
+        browser_session_id="YOUR_SESSION_ID",
     )
     ```
 
@@ -468,7 +472,7 @@ Navigate to **Reports > Visits > Superbill**, set a date range, and extract the 
           "Set the From date to 2020-01-01 and the To date to today. Click Submit.",
         data_extraction_schema: ENCOUNTER_SCHEMA,
         proxy_location: "RESIDENTIAL",
-        browser_profile_id: "YOUR_PROFILE_ID",
+        browser_session_id: "YOUR_SESSION_ID",
       },
     });
     ```
@@ -708,7 +712,7 @@ OpenEMR can timeout or show session-expired pages. Use `error_code_mapping` on w
         muted
         playsInline
         className="w-full aspect-video rounded-xl"
-        src="/images/navigation-error-messags.mp4"
+        src="/images/navigation-error-messages.mp4"
       ></video>
     </Frame>
 
@@ -1054,7 +1058,7 @@ The OpenEMR demo resets daily at 8:00 AM UTC, so profiles expire every day. In p
 
 ---
 
-## Next steps
+## Resources
 
 <CardGroup cols={2}>
   <Card
@@ -1070,6 +1074,13 @@ The OpenEMR demo resets daily at 8:00 AM UTC, so profiles expire every day. In p
     href="/going-to-production/proxy-geolocation"
   >
     All proxy locations and country-specific routing options
+  </Card>
+  <Card
+    title="Credential Management"
+    icon="key"
+    href="/sdk-reference/credentials"
+  >
+    Securely store and use login credentials
   </Card>
   <Card
     title="Error Handling"
