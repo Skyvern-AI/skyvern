@@ -160,7 +160,7 @@
               "sdk-reference/complete-reference"
             ]
           },
-        {
+          {
             "group": "TypeScript SDK",
             "pages": [
               "ts-sdk-reference/overview",
@@ -173,6 +173,17 @@
               "ts-sdk-reference/browser-automation",
               "ts-sdk-reference/error-handling",
               "ts-sdk-reference/complete-reference"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Cookbooks",
+        "groups": [
+          {
+            "group": "Cookbooks",
+            "pages": [
+              "cookbooks/healthcare-portal-data"
             ]
           }
         ]

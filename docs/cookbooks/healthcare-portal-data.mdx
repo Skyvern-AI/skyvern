@@ -1,0 +1,1088 @@
+---
+title: Healthcare Portal Data Extraction
+subtitle: Extract patient demographics and billing data from OpenEMR
+slug: cookbooks/healthcare-portal-data
+---
+
+This cookbook extracts two datasets from [OpenEMR](https://www.open-emr.org/), an open-source EHR, using the public demo at `https://demo.openemr.io/openemr/index.php`:
+
+1. **Patient demographics** from Patient/Client > Finder
+2. **Encounter billing data** from Reports > Visits > Superbill
+
+**Demo credentials:** `admin` / `pass` (resets daily at 8:00 AM UTC)
+
+---
+
+## Prerequisites
+
+- A [Skyvern Cloud](https://app.skyvern.com) account or [self-hosted](/self-hosted/overview) deployment
+- The Skyvern SDK (for API usage)
+
+<CodeGroup>
+```bash Python
+pip install skyvern
+```
+
+```bash TypeScript
+npm install @skyvern/client
+```
+</CodeGroup>
+
+---
+
+## Why a single task isn't enough
+
+A basic task pointed at OpenEMR with a vague prompt will partially work, but hits four problems in production:
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    url="https://demo.openemr.io/openemr/index.php",
+    prompt="Log in and extract the patient list",
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    url: "https://demo.openemr.io/openemr/index.php",
+    prompt: "Log in and extract the patient list",
+  },
+});
+```
+</CodeGroup>
+
+| Problem | Impact |
+|---------|--------|
+| No proxy | Production EHR portals sit behind WAFs that block datacenter IPs |
+| Login every run | Wastes steps, fragile with session complexity |
+| Vague navigation | OpenEMR uses iframes and dynamic menus — needs explicit goals |
+| No pagination | Only gets page 1 of multi-page results |
+
+The sections below solve each one.
+
+---
+
+## Residential proxies
+
+Route the browser through a residential IP to bypass WAF/bot detection. The demo works without one, but production portals require it.
+
+<Tabs>
+  <Tab title="Cloud UI">
+    In the run panel, expand **Advanced Settings** and set **Proxy Location** to a country (e.g., **United States**).
+  </Tab>
+  <Tab title="API / SDK">
+    <CodeGroup>
+    ```python Python
+    result = await client.run_task(
+        url="https://demo.openemr.io/openemr/index.php",
+        prompt="Log in with username 'admin' and password 'pass', confirm the Calendar page loads",
+        proxy_location="RESIDENTIAL",
+    )
+    ```
+
+    ```typescript TypeScript
+    const result = await client.runTask({
+      body: {
+        url: "https://demo.openemr.io/openemr/index.php",
+        prompt: "Log in with username 'admin' and password 'pass', confirm the Calendar page loads",
+        proxy_location: "RESIDENTIAL",
+      },
+    });
+    ```
+    </CodeGroup>
+  </Tab>
+</Tabs>
+
+See [Proxy & Geolocation](/going-to-production/proxy-geolocation) for all available locations.
+
+---
+
+## Browser profiles
+
+Log in once, save the browser state as a profile, and skip login on future runs.
+
+<Tabs>
+  <Tab title="Cloud UI">
+    <Steps>
+      <Step title="Create a login workflow">
+        Go to **Workflows** in the sidebar and create a new workflow. Add a **Navigation** block with URL `https://demo.openemr.io/openemr/index.php` and goal: "Log in with username 'admin' and password 'pass'. Confirm the Calendar page loads."
+
+        On the **Start** node, expand the settings and enable **Save & Reuse Session**. Set **Proxy Location** to a country (e.g., **United States**).
+
+        <Frame>
+          <video
+            controls
+            muted
+            playsInline
+            className="w-full aspect-video rounded-xl"
+            src="/images/workflow-start.mp4"
+          ></video>
+        </Frame>
+      </Step>
+      <Step title="Run the workflow">
+        Run the workflow and wait for it to complete.
+      </Step>
+      <Step title="Create a profile via API">
+        Browser profile creation is done via the API. Use the `create_browser_profile` call from the API/SDK tab with the completed workflow run ID. Name it `openemr-demo-admin`.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="API / SDK">
+    <CodeGroup>
+    ```python Python
+    import asyncio
+    from skyvern import Skyvern
+
+    async def main():
+        client = Skyvern(api_key="YOUR_API_KEY")
+
+        # 1. Create workflow that saves browser state
+        workflow = await client.create_workflow(
+            json_definition={
+                "title": "OpenEMR Login",
+                "persist_browser_session": True,
+                "workflow_definition": {
+                    "parameters": [],
+                    "blocks": [
+                        {
+                            "block_type": "navigation",
+                            "label": "login",
+                            "url": "https://demo.openemr.io/openemr/index.php",
+                            "navigation_goal": (
+                                "Log in with username 'admin' and password 'pass'. "
+                                "Confirm the Calendar page or main dashboard loads."
+                            ),
+                        }
+                    ],
+                },
+            }
+        )
+
+        # 2. Run with residential proxy
+        run = await client.run_workflow(
+            workflow_id=workflow.workflow_permanent_id,
+            proxy_location="RESIDENTIAL",
+            wait_for_completion=True,
+        )
+        print(f"Login: {run.status}")  # completed
+
+        # 3. Save profile (retry while session archives)
+        profile = None
+        for attempt in range(10):
+            try:
+                profile = await client.create_browser_profile(
+                    name="openemr-demo-admin",
+                    workflow_run_id=run.run_id,
+                )
+                break
+            except Exception as e:
+                if "persisted" in str(e).lower() and attempt < 9:
+                    await asyncio.sleep(2)
+                    continue
+                raise
+
+        print(f"Profile: {profile.browser_profile_id}")
+
+    asyncio.run(main())
+    ```
+
+    ```typescript TypeScript
+    import { Skyvern } from "@skyvern/client";
+
+    async function main() {
+      const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+      // 1. Create workflow that saves browser state
+      const workflow = await client.createWorkflow({
+        body: {
+          json_definition: {
+            title: "OpenEMR Login",
+            persist_browser_session: true,
+            workflow_definition: {
+              parameters: [],
+              blocks: [
+                {
+                  block_type: "navigation",
+                  label: "login",
+                  url: "https://demo.openemr.io/openemr/index.php",
+                  navigation_goal:
+                    "Log in with username 'admin' and password 'pass'. " +
+                    "Confirm the Calendar page or main dashboard loads.",
+                },
+              ],
+            },
+          },
+        },
+      });
+
+      // 2. Run with residential proxy
+      const run = await client.runWorkflow({
+        body: {
+          workflow_id: workflow.workflow_permanent_id,
+          proxy_location: "RESIDENTIAL",
+        },
+        waitForCompletion: true,
+      });
+      console.log(`Login: ${run.status}`);
+
+      // 3. Save profile (retry while session archives)
+      let profile;
+      for (let attempt = 0; attempt < 10; attempt++) {
+        try {
+          profile = await client.createBrowserProfile({
+            name: "openemr-demo-admin",
+            workflow_run_id: run.run_id,
+          });
+          break;
+        } catch (e) {
+          if (String(e).toLowerCase().includes("persisted") && attempt < 9) {
+            await new Promise((r) => setTimeout(r, 2000));
+            continue;
+          }
+          throw e;
+        }
+      }
+
+      console.log(`Profile: ${profile.browser_profile_id}`);
+    }
+
+    main();
+    ```
+    </CodeGroup>
+  </Tab>
+</Tabs>
+
+<Note>
+`persist_browser_session` is a workflow definition property — set it when creating the workflow, not when running it. See [Browser Profiles](/optimization/browser-profiles) for the full lifecycle.
+</Note>
+
+---
+
+## Extract patient demographics
+
+Navigate to **Patient/Client > Finder** and extract the results table.
+
+<Tabs>
+  <Tab title="Cloud UI">
+    Create a workflow with two blocks:
+
+    1. **Navigation** block — URL: `https://demo.openemr.io/openemr/index.php`. Goal: "Click Patient/Client in the top menu, then click Finder. Click Search to display all patients."
+    2. **Extraction** block — Goal: "Extract all patient rows from the Patient Finder results table." Paste the patient schema into **Data Schema**.
+
+    On the **Start** node, set **Proxy Location** to a country (e.g., **United States**). Run the workflow.
+  </Tab>
+  <Tab title="API / SDK">
+    <CodeGroup>
+    ```python Python
+    import asyncio
+    from skyvern import Skyvern
+
+    PATIENT_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "patients": {
+                "type": "array",
+                "description": "Patient rows from the Patient Finder results table",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Patient full name (Last, First)"},
+                        "pid": {"type": "string", "description": "Patient ID number"},
+                        "dob": {"type": "string", "description": "Date of birth (YYYY-MM-DD)"},
+                        "phone_home": {"type": "string", "description": "Home phone number"},
+                    },
+                },
+            },
+        },
+    }
+
+    async def main():
+        client = Skyvern(api_key="YOUR_API_KEY")
+
+        run = await client.run_task(
+            url="https://demo.openemr.io/openemr/index.php",
+            prompt=(
+                "Click Patient/Client in the top menu, then click Finder. "
+                "Click Search to display all patients."
+            ),
+            data_extraction_schema=PATIENT_SCHEMA,
+            proxy_location="RESIDENTIAL",
+            browser_profile_id="YOUR_PROFILE_ID",
+        )
+
+        while run.status not in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+            await asyncio.sleep(5)
+            run = await client.get_run(run.run_id)
+
+        print(run.output)
+
+    asyncio.run(main())
+    ```
+
+    ```typescript TypeScript
+    import { Skyvern } from "@skyvern/client";
+
+    const PATIENT_SCHEMA = {
+      type: "object",
+      properties: {
+        patients: {
+          type: "array",
+          description: "Patient rows from the Patient Finder results table",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "Patient full name (Last, First)" },
+              pid: { type: "string", description: "Patient ID number" },
+              dob: { type: "string", description: "Date of birth (YYYY-MM-DD)" },
+              phone_home: { type: "string", description: "Home phone number" },
+            },
+          },
+        },
+      },
+    } as const;
+
+    async function main() {
+      const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+      let run = await client.runTask({
+        body: {
+          url: "https://demo.openemr.io/openemr/index.php",
+          prompt:
+            "Click Patient/Client in the top menu, then click Finder. " +
+            "Click Search to display all patients.",
+          data_extraction_schema: PATIENT_SCHEMA,
+          proxy_location: "RESIDENTIAL",
+          browser_profile_id: "YOUR_PROFILE_ID",
+        },
+      });
+
+      while (!["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
+        await new Promise((r) => setTimeout(r, 5000));
+        run = await client.getRun(run.run_id);
+      }
+
+      console.log(JSON.stringify(run.output, null, 2));
+    }
+
+    main();
+    ```
+    </CodeGroup>
+  </Tab>
+</Tabs>
+
+**Example output:**
+
+```json
+{
+  "patients": [
+    { "name": "Belford, Phil", "pid": "1", "dob": "1972-02-09", "phone_home": "333-444-2222" },
+    { "name": "Underwood, Susan Ardmore", "pid": "2", "dob": "1967-02-08", "phone_home": "4443332222" },
+    { "name": "Moore, Wanda", "pid": "3", "dob": "2007-02-18", "phone_home": null }
+  ]
+}
+```
+
+<Note>
+The demo resets daily and community users add test patients, so exact records may differ.
+</Note>
+
+---
+
+## Extract encounter billing data
+
+Navigate to **Reports > Visits > Superbill**, set a date range, and extract the report.
+
+<Tabs>
+  <Tab title="Cloud UI">
+    Create a workflow with two blocks:
+
+    1. **Navigation** block — Goal: "Click Reports in the top menu, then Visits, then Superbill. Set the From date to 2020-01-01 and the To date to today. Click Submit."
+    2. **Extraction** block — Goal: "Extract all encounter rows from the Superbill report." Paste the encounter schema into **Data Schema**.
+
+    On the **Start** node, set **Proxy Location** to a country (e.g., **United States**). Run the workflow.
+  </Tab>
+  <Tab title="API / SDK">
+    <CodeGroup>
+    ```python Python
+    ENCOUNTER_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "encounters": {
+                "type": "array",
+                "description": "Encounter rows from the Superbill report",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "patient_name": {"type": "string", "description": "Patient name"},
+                        "encounter_date": {"type": "string", "description": "Date of encounter (YYYY-MM-DD)"},
+                        "provider": {"type": "string", "description": "Provider name"},
+                        "billing_code": {"type": "string", "description": "CPT or billing code"},
+                        "code_description": {"type": "string", "description": "Description of the billing code"},
+                        "charge": {"type": "number", "description": "Fee amount in USD"},
+                    },
+                },
+            },
+        },
+    }
+
+    run = await client.run_task(
+        url="https://demo.openemr.io/openemr/index.php",
+        prompt=(
+            "Click Reports in the top menu, then Visits, then Superbill. "
+            "Set the From date to 2020-01-01 and the To date to today. Click Submit."
+        ),
+        data_extraction_schema=ENCOUNTER_SCHEMA,
+        proxy_location="RESIDENTIAL",
+        browser_profile_id="YOUR_PROFILE_ID",
+    )
+    ```
+
+    ```typescript TypeScript
+    const ENCOUNTER_SCHEMA = {
+      type: "object",
+      properties: {
+        encounters: {
+          type: "array",
+          description: "Encounter rows from the Superbill report",
+          items: {
+            type: "object",
+            properties: {
+              patient_name: { type: "string", description: "Patient name" },
+              encounter_date: { type: "string", description: "Date of encounter (YYYY-MM-DD)" },
+              provider: { type: "string", description: "Provider name" },
+              billing_code: { type: "string", description: "CPT or billing code" },
+              code_description: { type: "string", description: "Description of the billing code" },
+              charge: { type: "number", description: "Fee amount in USD" },
+            },
+          },
+        },
+      },
+    } as const;
+
+    let run = await client.runTask({
+      body: {
+        url: "https://demo.openemr.io/openemr/index.php",
+        prompt:
+          "Click Reports in the top menu, then Visits, then Superbill. " +
+          "Set the From date to 2020-01-01 and the To date to today. Click Submit.",
+        data_extraction_schema: ENCOUNTER_SCHEMA,
+        proxy_location: "RESIDENTIAL",
+        browser_profile_id: "YOUR_PROFILE_ID",
+      },
+    });
+    ```
+    </CodeGroup>
+  </Tab>
+</Tabs>
+
+**Example output:**
+
+```json
+{
+  "encounters": [
+    {
+      "patient_name": "Phil Lopez",
+      "encounter_date": "2024-06-01",
+      "provider": "Administrator Administrator",
+      "billing_code": "99213",
+      "code_description": "Office/outpatient visit, est patient, low complexity",
+      "charge": 50.00
+    }
+  ]
+}
+```
+
+---
+
+## Pagination with browser sessions
+
+A [Browser Profile](/optimization/browser-profiles) is a saved snapshot. A [Browser Session](/optimization/browser-sessions) is a live browser instance that persists between tasks. Use sessions to paginate: extract page 1, click Next, extract page 2.
+
+<Tabs>
+  <Tab title="Cloud UI">
+    <Steps>
+      <Step title="Create a session">
+        Go to **Browsers** in the sidebar. Click **Create Session**. Set **Proxy Location** to a country (e.g., **United States**) and configure the timeout.
+
+        <Frame>
+          <video
+            controls
+            muted
+            playsInline
+            className="w-full aspect-video rounded-xl"
+            src="/images/browser-session-create.mp4"
+          ></video>
+        </Frame>
+      </Step>
+      <Step title="Navigate and extract page 1">
+        Run a task against the session: "Click Patient/Client > Finder. Click Search. Extract all patient rows."
+      </Step>
+      <Step title="Extract subsequent pages">
+        Run another task against the same session: "Click Next to go to the next page. Extract all patient rows." Repeat until no more results.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="API / SDK">
+    <CodeGroup>
+    ```python Python
+    import asyncio
+    from skyvern import Skyvern
+
+    PATIENT_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "patients": {
+                "type": "array",
+                "description": "Patient rows from the current page",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Patient full name (Last, First)"},
+                        "pid": {"type": "string", "description": "Patient ID number"},
+                        "dob": {"type": "string", "description": "Date of birth (YYYY-MM-DD)"},
+                        "phone_home": {"type": "string", "description": "Home phone number"},
+                    },
+                },
+            },
+        },
+    }
+
+    async def extract_page(client, session_id, page_num):
+        prompt = (
+            "Click Patient/Client in the top menu, then click Finder. "
+            "Click Search to display all patients. "
+            "Extract all patient rows from the results table."
+        ) if page_num == 1 else (
+            "Click Next to go to the next page of results. "
+            "Extract all patient rows from the table."
+        )
+
+        run = await client.run_task(
+            url="https://demo.openemr.io/openemr/index.php",
+            prompt=prompt,
+            browser_session_id=session_id,
+            data_extraction_schema=PATIENT_SCHEMA,
+        )
+
+        while run.status not in ["completed", "failed", "terminated", "timed_out", "canceled"]:
+            await asyncio.sleep(5)
+            run = await client.get_run(run.run_id)
+
+        return run
+
+    async def main():
+        client = Skyvern(api_key="YOUR_API_KEY")
+
+        session = await client.create_browser_session(
+            browser_profile_id="YOUR_PROFILE_ID",
+            proxy_location="RESIDENTIAL",
+        )
+
+        all_patients = []
+        for page in range(1, 11):
+            run = await extract_page(client, session.browser_session_id, page)
+
+            if run.status != "completed":
+                break
+
+            patients = run.output.get("patients", [])
+            if not patients:
+                break
+
+            all_patients.extend(patients)
+            print(f"Page {page}: {len(patients)} patients ({len(all_patients)} total)")
+
+        print(f"Done: {len(all_patients)} patients")
+
+    asyncio.run(main())
+    ```
+
+    ```typescript TypeScript
+    import { Skyvern } from "@skyvern/client";
+
+    const PATIENT_SCHEMA = {
+      type: "object",
+      properties: {
+        patients: {
+          type: "array",
+          description: "Patient rows from the current page",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "Patient full name (Last, First)" },
+              pid: { type: "string", description: "Patient ID number" },
+              dob: { type: "string", description: "Date of birth (YYYY-MM-DD)" },
+              phone_home: { type: "string", description: "Home phone number" },
+            },
+          },
+        },
+      },
+    } as const;
+
+    async function extractPage(client: Skyvern, sessionId: string, pageNum: number) {
+      const prompt =
+        pageNum === 1
+          ? "Click Patient/Client in the top menu, then click Finder. " +
+            "Click Search to display all patients. " +
+            "Extract all patient rows from the results table."
+          : "Click Next to go to the next page of results. " +
+            "Extract all patient rows from the table.";
+
+      let run = await client.runTask({
+        body: {
+          url: "https://demo.openemr.io/openemr/index.php",
+          prompt,
+          browser_session_id: sessionId,
+          data_extraction_schema: PATIENT_SCHEMA,
+        },
+      });
+
+      while (!["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
+        await new Promise((r) => setTimeout(r, 5000));
+        run = await client.getRun(run.run_id);
+      }
+
+      return run;
+    }
+
+    async function main() {
+      const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+      const session = await client.createBrowserSession({
+        browser_profile_id: "YOUR_PROFILE_ID",
+        proxy_location: "RESIDENTIAL",
+      });
+
+      const allPatients: any[] = [];
+      for (let page = 1; page <= 10; page++) {
+        const run = await extractPage(client, session.browser_session_id, page);
+
+        if (run.status !== "completed") break;
+
+        const patients = run.output?.patients ?? [];
+        if (patients.length === 0) break;
+
+        allPatients.push(...patients);
+        console.log(`Page ${page}: ${patients.length} patients (${allPatients.length} total)`);
+      }
+
+      console.log(`Done: ${allPatients.length} patients`);
+    }
+
+    main();
+    ```
+    </CodeGroup>
+
+    **Expected output:**
+
+    ```
+    Page 1: 25 patients (25 total)
+    Page 2: 18 patients (43 total)
+    Done: 43 patients
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+You cannot use `browser_profile_id` and `browser_session_id` in the same request. Use the profile to create the session, then pass only the session ID to tasks.
+</Warning>
+
+---
+
+## Error handling
+
+OpenEMR can timeout or show session-expired pages. Use `error_code_mapping` on workflow blocks to classify failures, and `max_retries` to retry automatically.
+
+<Tabs>
+  <Tab title="Cloud UI">
+    On each Navigation and Extraction block, expand **Advanced Settings** and enable **Error Messages**. Add this JSON:
+
+    ```json
+    { "session_expired": "Session expired, login required, or access denied page" }
+    ```
+
+    <Frame>
+      <video
+        controls
+        muted
+        playsInline
+        className="w-full aspect-video rounded-xl"
+        src="/images/navigation-error-messags.mp4"
+      ></video>
+    </Frame>
+
+    <Note>
+    `max_retries` is only available via the API. In the Cloud UI, Skyvern uses its default retry behavior. For fine-grained retry control, use the API/SDK approach.
+    </Note>
+  </Tab>
+  <Tab title="API / SDK">
+    Set `error_code_mapping` and `max_retries` directly on workflow blocks:
+
+    ```json
+    {
+      "block_type": "extraction",
+      "label": "extract_patients",
+      "data_extraction_goal": "Extract all patient rows from the table",
+      "error_code_mapping": {
+        "session_expired": "Session expired, login required, or access denied page"
+      },
+      "max_retries": 3
+    }
+    ```
+
+    For standalone tasks, handle retries in your calling code:
+
+    <CodeGroup>
+    ```python Python
+    async def run_with_retry(client, session_id, page_num, max_retries=3):
+        for attempt in range(max_retries + 1):
+            run = await extract_page(client, session_id, page_num)
+            if run.status == "completed":
+                return run
+
+            is_session_error = "session" in (run.failure_reason or "").lower()
+            if is_session_error and attempt < max_retries:
+                await asyncio.sleep(2 ** attempt * 5)
+                continue
+
+            return run
+        return run
+    ```
+
+    ```typescript TypeScript
+    async function runWithRetry(
+      client: Skyvern, sessionId: string, pageNum: number, maxRetries = 3
+    ) {
+      let run;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        run = await extractPage(client, sessionId, pageNum);
+        if (run.status === "completed") return run;
+
+        const isSessionError = (run.failure_reason ?? "").toLowerCase().includes("session");
+        if (isSessionError && attempt < maxRetries) {
+          await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 5000));
+          continue;
+        }
+        return run;
+      }
+      return run!;
+    }
+    ```
+    </CodeGroup>
+  </Tab>
+</Tabs>
+
+See [Error Handling](/going-to-production/error-handling) and [CAPTCHA & Bot Detection](/going-to-production/captcha-bot-detection) for more.
+
+---
+
+## Complete workflow
+
+This workflow combines everything: navigate to the Patient Finder, extract demographics, navigate to Superbill, and extract billing data — with error recovery and residential proxy.
+
+<Tabs>
+  <Tab title="Cloud UI">
+    <Steps>
+      <Step title="Create the workflow">
+        Go to **Workflows** and create a new workflow named "OpenEMR Daily Extract." On the **Start** node, enable **Save & Reuse Session** and set **Proxy Location** to a country (e.g., **United States**).
+      </Step>
+      <Step title="Block 1: Navigation — open Patient Finder">
+        Add a **Navigation** block. Set URL to `https://demo.openemr.io/openemr/index.php` and goal: "Click Patient/Client > Finder. Click Search to display all patients. If a login page appears, log in with 'admin'/'pass'." In **Advanced Settings**, enable **Error Messages** and add `{"session_expired": "Session expired, login required, or access denied page"}`.
+      </Step>
+      <Step title="Block 2: Extraction — patient demographics">
+        Add an **Extraction** block. Set goal: "Extract all patient rows from the Patient Finder results table." Paste the patient schema into **Data Schema**.
+      </Step>
+      <Step title="Block 3: Navigation — open Superbill">
+        Add another **Navigation** block. Set goal: "Click Reports > Visits > Superbill. Set From to 2020-01-01, To to today. Click Submit." Add the same error messages mapping.
+      </Step>
+      <Step title="Block 4: Extraction — encounter billing">
+        Add another **Extraction** block. Set goal: "Extract all encounter rows from the Superbill report." Paste the encounter schema into **Data Schema**.
+      </Step>
+      <Step title="Run">
+        Click **Run**. The workflow navigates to the Patient Finder, extracts demographics, then navigates to Superbill and extracts billing data.
+      </Step>
+    </Steps>
+
+    For multi-page results, combine with the [pagination pattern](#pagination-with-browser-sessions) above.
+  </Tab>
+  <Tab title="API / SDK">
+    <CodeGroup>
+    ```python Python
+    import asyncio
+    from skyvern import Skyvern
+
+    PATIENT_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "patients": {
+                "type": "array",
+                "description": "Patient rows from the Patient Finder results table",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Patient full name (Last, First)"},
+                        "pid": {"type": "string", "description": "Patient ID number"},
+                        "dob": {"type": "string", "description": "Date of birth (YYYY-MM-DD)"},
+                        "phone_home": {"type": "string", "description": "Home phone number"},
+                    },
+                },
+            },
+        },
+    }
+
+    ENCOUNTER_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "encounters": {
+                "type": "array",
+                "description": "Encounter rows from the Superbill report",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "patient_name": {"type": "string", "description": "Patient name"},
+                        "encounter_date": {"type": "string", "description": "Date of encounter (YYYY-MM-DD)"},
+                        "provider": {"type": "string", "description": "Provider name"},
+                        "billing_code": {"type": "string", "description": "CPT or billing code"},
+                        "code_description": {"type": "string", "description": "Description of the billing code"},
+                        "charge": {"type": "number", "description": "Fee amount in USD"},
+                    },
+                },
+            },
+        },
+    }
+
+    SESSION_ERROR = "Session expired, login required, or access denied page"
+
+    async def main():
+        client = Skyvern(api_key="YOUR_API_KEY")
+
+        workflow = await client.create_workflow(
+            json_definition={
+                "title": "OpenEMR Daily Extract",
+                "persist_browser_session": True,
+                "workflow_definition": {
+                    "parameters": [],
+                    "blocks": [
+                        {
+                            "block_type": "navigation",
+                            "label": "open_patient_finder",
+                            "url": "https://demo.openemr.io/openemr/index.php",
+                            "navigation_goal": (
+                                "Click Patient/Client in the top menu, then click Finder. "
+                                "Click Search to display all patients. "
+                                "If a login page appears, log in with username 'admin' and password 'pass'."
+                            ),
+                            "error_code_mapping": {"session_expired": SESSION_ERROR},
+                            "max_retries": 3,
+                        },
+                        {
+                            "block_type": "extraction",
+                            "label": "extract_patients",
+                            "data_extraction_goal": "Extract all patient rows from the Patient Finder results table",
+                            "data_schema": PATIENT_SCHEMA,
+                            "error_code_mapping": {"session_expired": SESSION_ERROR},
+                            "max_retries": 2,
+                        },
+                        {
+                            "block_type": "navigation",
+                            "label": "open_superbill",
+                            "navigation_goal": (
+                                "Click Reports in the top menu, then Visits, then Superbill. "
+                                "Set the From date to 2020-01-01 and the To date to today. Click Submit."
+                            ),
+                            "error_code_mapping": {"session_expired": SESSION_ERROR},
+                            "max_retries": 3,
+                        },
+                        {
+                            "block_type": "extraction",
+                            "label": "extract_encounters",
+                            "data_extraction_goal": "Extract all encounter rows from the Superbill report",
+                            "data_schema": ENCOUNTER_SCHEMA,
+                            "error_code_mapping": {"session_expired": SESSION_ERROR},
+                            "max_retries": 2,
+                        },
+                    ],
+                },
+            }
+        )
+        print(f"Workflow: {workflow.workflow_permanent_id}")
+
+        run = await client.run_workflow(
+            workflow_id=workflow.workflow_permanent_id,
+            browser_profile_id="YOUR_PROFILE_ID",
+            proxy_location="RESIDENTIAL",
+            wait_for_completion=True,
+        )
+
+        print(f"Status: {run.status}")
+        print(f"Output: {run.output}")
+
+    asyncio.run(main())
+    ```
+
+    ```typescript TypeScript
+    import { Skyvern } from "@skyvern/client";
+
+    const PATIENT_SCHEMA = {
+      type: "object",
+      properties: {
+        patients: {
+          type: "array",
+          description: "Patient rows from the Patient Finder results table",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "Patient full name (Last, First)" },
+              pid: { type: "string", description: "Patient ID number" },
+              dob: { type: "string", description: "Date of birth (YYYY-MM-DD)" },
+              phone_home: { type: "string", description: "Home phone number" },
+            },
+          },
+        },
+      },
+    } as const;
+
+    const ENCOUNTER_SCHEMA = {
+      type: "object",
+      properties: {
+        encounters: {
+          type: "array",
+          description: "Encounter rows from the Superbill report",
+          items: {
+            type: "object",
+            properties: {
+              patient_name: { type: "string", description: "Patient name" },
+              encounter_date: { type: "string", description: "Date of encounter (YYYY-MM-DD)" },
+              provider: { type: "string", description: "Provider name" },
+              billing_code: { type: "string", description: "CPT or billing code" },
+              code_description: { type: "string", description: "Description of the billing code" },
+              charge: { type: "number", description: "Fee amount in USD" },
+            },
+          },
+        },
+      },
+    } as const;
+
+    const SESSION_ERROR = "Session expired, login required, or access denied page";
+
+    async function main() {
+      const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+      const workflow = await client.createWorkflow({
+        body: {
+          json_definition: {
+            title: "OpenEMR Daily Extract",
+            persist_browser_session: true,
+            workflow_definition: {
+              parameters: [],
+              blocks: [
+                {
+                  block_type: "navigation",
+                  label: "open_patient_finder",
+                  url: "https://demo.openemr.io/openemr/index.php",
+                  navigation_goal:
+                    "Click Patient/Client in the top menu, then click Finder. " +
+                    "Click Search to display all patients. " +
+                    "If a login page appears, log in with username 'admin' and password 'pass'.",
+                  error_code_mapping: { session_expired: SESSION_ERROR },
+                  max_retries: 3,
+                },
+                {
+                  block_type: "extraction",
+                  label: "extract_patients",
+                  data_extraction_goal: "Extract all patient rows from the Patient Finder results table",
+                  data_schema: PATIENT_SCHEMA,
+                  error_code_mapping: { session_expired: SESSION_ERROR },
+                  max_retries: 2,
+                },
+                {
+                  block_type: "navigation",
+                  label: "open_superbill",
+                  navigation_goal:
+                    "Click Reports in the top menu, then Visits, then Superbill. " +
+                    "Set the From date to 2020-01-01 and the To date to today. Click Submit.",
+                  error_code_mapping: { session_expired: SESSION_ERROR },
+                  max_retries: 3,
+                },
+                {
+                  block_type: "extraction",
+                  label: "extract_encounters",
+                  data_extraction_goal: "Extract all encounter rows from the Superbill report",
+                  data_schema: ENCOUNTER_SCHEMA,
+                  error_code_mapping: { session_expired: SESSION_ERROR },
+                  max_retries: 2,
+                },
+              ],
+            },
+          },
+        },
+      });
+      console.log(`Workflow: ${workflow.workflow_permanent_id}`);
+
+      const run = await client.runWorkflow({
+        body: {
+          workflow_id: workflow.workflow_permanent_id,
+          browser_profile_id: "YOUR_PROFILE_ID",
+          proxy_location: "RESIDENTIAL",
+        },
+        waitForCompletion: true,
+      });
+
+      console.log(`Status: ${run.status}`);
+      console.log(`Output: ${JSON.stringify(run.output, null, 2)}`);
+    }
+
+    main();
+    ```
+    </CodeGroup>
+  </Tab>
+</Tabs>
+
+| Technique | Purpose |
+|-----------|---------|
+| Residential proxy | Bypass WAF/bot detection |
+| Browser profile | Skip login on every run |
+| Navigation goals | Explicit menu clicks for iframe-based UI |
+| JSON schemas | Consistent, structured output |
+| Session reuse | Paginate multi-page results |
+| Error mapping + retries | Recover from session timeouts |
+
+<Tip>
+The OpenEMR demo resets daily at 8:00 AM UTC, so profiles expire every day. In production, re-run your login workflow weekly or whenever extractions fail with auth errors. See [Browser Profiles](/optimization/browser-profiles) for the refresh pattern.
+</Tip>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Browser Profiles"
+    icon="user"
+    href="/optimization/browser-profiles"
+  >
+    Full lifecycle: create, refresh, and delete saved browser state
+  </Card>
+  <Card
+    title="Proxy & Geolocation"
+    icon="globe"
+    href="/going-to-production/proxy-geolocation"
+  >
+    All proxy locations and country-specific routing options
+  </Card>
+  <Card
+    title="Error Handling"
+    icon="triangle-exclamation"
+    href="/going-to-production/error-handling"
+  >
+    Error code mapping, failure classification, and retry strategies
+  </Card>
+  <Card
+    title="Extract Structured Data"
+    icon="table"
+    href="/running-automations/extract-structured-data"
+  >
+    JSON schema design and the interactive schema builder
+  </Card>
+</CardGroup>
