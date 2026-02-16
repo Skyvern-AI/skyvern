@@ -47,6 +47,20 @@ export SKYVERN_API_KEY="your-api-key"
 
 ---
 
+## Sample Vendor Portal
+
+We'll use *Ember Roasters*, a fake coffee retailer website created for agent automation testing. 
+Change `portal_url` to use your vendor's portal URL.
+
+| Field          | Value                        |
+| -------------- | ---------------------------- |
+| URL            | https://ember-roasters.vercel.app/ |
+| Login email    | demo@manicule.dev            |
+| Login password | helloworld              |
+
+
+---
+
 ## Step 1: Store credentials
 
 Before defining the workflow, store the login email and password Skyvern will use. This keeps secrets out of your workflow definition and away from LLMs.
@@ -64,8 +78,8 @@ async def main():
         name="Vendor Portal",
         credential_type="password",
         credential={
-            "username": "your-username",  # <-- replace this
-            "password": "your-password"   # <-- replace this
+            "username": "demo@manicule.dev",
+            "password": "helloworld"
         }
     )
 
@@ -87,8 +101,8 @@ const credential = await client.createCredential({
     name: "Vendor Portal",
     credential_type: "password",
     credential: {
-      username: "your-username", // <-- replace this
-      password: "your-password", // <-- replace this
+      username: "demo@manicule.dev",
+      password: "helloworld",
     },
   },
 });
@@ -97,7 +111,6 @@ console.log(`Credential ID: ${credential.credential_id}`);
 ```
 
 ```bash cURL
-# Replace your-username and your-password with your actual credentials
 curl -X POST "https://api.skyvern.com/v1/credentials" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
@@ -105,8 +118,8 @@ curl -X POST "https://api.skyvern.com/v1/credentials" \
     "name": "Vendor Portal",
     "credential_type": "password",
     "credential": {
-      "username": "your-username",
-      "password": "your-password"
+      "username": "demo@manicule.dev",
+      "password": "helloworld"
     }
   }'
 ```
@@ -911,9 +924,9 @@ async def main():
     run = await client.run_workflow(
         workflow_id=workflow.workflow_permanent_id,
         parameters={
-            "portal_url": "https://your-vendor-portal.com/login",  # <-- replace this
-            "start_date": "2025-01-01",  # <-- replace this
-            "end_date": "2025-01-31",  # <-- replace this
+            "portal_url": "https://ember--roasters.vercel.app",
+            "start_date": "2025-01-01",
+            "end_date": "2025-01-31",
             "recipient_email": "your-email@company.com"  # <-- replace this
         }
     )
@@ -956,9 +969,9 @@ async function main() {
     body: {
       workflow_id: workflow.workflow_permanent_id,
       parameters: {
-        portal_url: "https://your-vendor-portal.com/login", // <-- replace this
-        start_date: "2025-01-01", // <-- replace this
-        end_date: "2025-01-31", // <-- replace this
+        portal_url: "https://ember--roasters.vercel.app",
+        start_date: "2025-01-01",
+        end_date: "2025-01-31",
         recipient_email: "your-email@company.com", // <-- replace this
       },
     },
@@ -1000,7 +1013,7 @@ RUN=$(curl -s -X POST "https://api.skyvern.com/v1/run/workflows" \
   -d "{
     \"workflow_id\": \"$WORKFLOW_ID\",
     \"parameters\": {
-      \"portal_url\": \"https://your-vendor-portal.com/login\",
+      \"portal_url\": \"https://ember--roasters.vercel.app\",
       \"start_date\": \"2025-01-01\",
       \"end_date\": \"2025-01-31\",
       \"recipient_email\": \"your-email@company.com\"

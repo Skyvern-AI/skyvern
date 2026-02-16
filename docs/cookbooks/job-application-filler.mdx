@@ -46,9 +46,23 @@ export SKYVERN_API_KEY="your-api-key"
 
 ---
 
+## Sample Job Portal
+
+We'll use *Job Stash*, a fake job board website created for agent automation testing.
+Change `job_portal_url` to use your job portal's URL.
+
+| Field          | Value                        |
+| -------------- | ---------------------------- |
+| URL            | https://job-stash.vercel.app |
+| Login email    | demo@manicule.dev            |
+| Login password | helloworld                   |
+
+
+---
+
 ## Step 1: Store credentials
 
-Before defining the workflow, store the login email and password Skyvern will use. 
+Before defining the workflow, store the login email and password Skyvern will use.
 
 This makes sure your passwords are never stored in the shareable workflow definition and never sent to LLMs.
 
@@ -65,8 +79,8 @@ async def main():
         name="Job Portal",
         credential_type="password",
         credential={
-            "username": "your-username",  # <-- replace this
-            "password": "your-password"   # <-- replace this
+            "username": "demo@manicule.dev",
+            "password": "helloworld"
         }
     )
 
@@ -88,8 +102,8 @@ const credential = await client.createCredential({
     name: "Job Portal",
     credential_type: "password",
     credential: {
-      username: "your-username", // <-- replace this
-      password: "your-password", // <-- replace this
+      username: "demo@manicule.dev",
+      password: "helloworld",
     },
   },
 });
@@ -98,7 +112,6 @@ console.log(`Credential ID: ${credential.credential_id}`);
 ```
 
 ```bash cURL
-# Replace your-username and your-password with your actual credentials
 curl -X POST "https://api.skyvern.com/v1/credentials" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
@@ -106,8 +119,8 @@ curl -X POST "https://api.skyvern.com/v1/credentials" \
     "name": "Job Portal",
     "credential_type": "password",
     "credential": {
-      "username": "your-username",
-      "password": "your-password"
+      "username": "demo@manicule.dev",
+      "password": "helloworld"
     }
   }'
 ```
@@ -836,7 +849,7 @@ async def main():
         workflow_id=workflow.workflow_permanent_id,
         parameters={
             "resume": "https://your-resume-url.com/resume.pdf",  # <-- replace this
-            "job_portal_url": "https://jobs.example.com/login"   # <-- replace this
+            "job_portal_url": "https://job-stash.vercel.app"
         }
     )
     print(f"Started run: {run.run_id}")
@@ -879,7 +892,7 @@ async function main() {
       workflow_id: workflow.workflow_permanent_id,
       parameters: {
         resume: "https://your-resume-url.com/resume.pdf", // <-- replace this
-        job_portal_url: "https://jobs.example.com/login", // <-- replace this
+        job_portal_url: "https://job-stash.vercel.app",
       },
     },
   });
@@ -913,7 +926,7 @@ WORKFLOW=$(curl -s -X POST "https://api.skyvern.com/v1/workflows" \
 WORKFLOW_ID=$(echo "$WORKFLOW" | jq -r '.workflow_permanent_id')
 echo "Created workflow: $WORKFLOW_ID"
 
-# Run workflow (replace parameter values below)
+# Run workflow (replace resume URL with your own)
 RUN=$(curl -s -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
@@ -921,7 +934,7 @@ RUN=$(curl -s -X POST "https://api.skyvern.com/v1/run/workflows" \
     \"workflow_id\": \"$WORKFLOW_ID\",
     \"parameters\": {
       \"resume\": \"https://your-resume-url.com/resume.pdf\",
-      \"job_portal_url\": \"https://jobs.example.com/login\"
+      \"job_portal_url\": \"https://job-stash.vercel.app\"
     }
   }")
 
