@@ -1,0 +1,975 @@
+---
+title: Job Applications Pipeline
+subtitle: Search for jobs and automatically apply using your resume
+slug: cookbooks/job-application-filler
+---
+
+Automate job applications across multiple postings on any job portal.
+
+This cookbook creates a workflow that logs into a job portal, searches for relevant positions based on your resume, extracts job listings, and applies to each one with AI-generated responses tailored to the role.
+
+---
+
+## What you'll build
+
+A workflow that:
+
+1. Parses your resume PDF to extract structured information
+2. Logs into a job portal using saved credentials
+3. Searches for relevant jobs based on your resume
+4. Extracts a list of matching job postings
+5. For each job: extracts details, generates tailored answers, and submits the application
+
+---
+
+## Prerequisites
+
+- **Skyvern Cloud API key** — Get one at [app.skyvern.com/settings](https://app.skyvern.com/settings) → API Keys
+
+Install the SDK:
+
+<CodeGroup>
+```bash Python
+pip install skyvern
+```
+
+```bash TypeScript
+npm install @skyvern/client
+```
+</CodeGroup>
+
+Set your API key:
+
+```bash
+export SKYVERN_API_KEY="your-api-key"
+```
+
+---
+
+## Sample Job Portal
+
+We'll use *Job Stash*, a fake job board website created for agent automation testing.
+Change `job_portal_url` to use your job portal's URL.
+
+| Field          | Value                        |
+| -------------- | ---------------------------- |
+| URL            | https://job-stash.vercel.app |
+| Login email    | demo@manicule.dev            |
+| Login password | helloworld                   |
+
+
+---
+
+## Step 1: Store credentials
+
+Before defining the workflow, store the login email and password Skyvern will use.
+
+This makes sure your passwords are never stored in the shareable workflow definition and never sent to LLMs.
+
+<CodeGroup>
+```python Python
+import os
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+    credential = await client.create_credential(
+        name="Job Portal",
+        credential_type="password",
+        credential={
+            "username": "demo@manicule.dev",
+            "password": "helloworld"
+        }
+    )
+
+    print(f"Credential ID: {credential.credential_id}")
+    # Save this ID for your workflow: cred_xxx
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+
+const client = new SkyvernClient({
+  apiKey: process.env.SKYVERN_API_KEY,
+});
+
+const credential = await client.createCredential({
+  name: "Job Portal",
+  credential_type: "password",
+  credential: {
+    username: "demo@manicule.dev",
+    password: "helloworld",
+  },
+});
+
+console.log(`Credential ID: ${credential.credential_id}`);
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/credentials" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Job Portal",
+    "credential_type": "password",
+    "credential": {
+      "username": "demo@manicule.dev",
+      "password": "helloworld"
+    }
+  }'
+```
+</CodeGroup>
+
+---
+
+## Step 2: Define workflow parameters
+
+Parameters are the inputs your workflow accepts. Defining them upfront lets you run the same workflow against different job portals.
+
+This workflow uses the following parameters:
+
+- **`resume`** — URL to your resume PDF.
+- **`credentials`** — The ID of the stored credential to use for login.
+- **`job_portal_url`** — The job portal's login URL.
+
+<CodeGroup>
+```json JSON
+{
+  "parameters": [
+    {
+      "key": "resume",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "file_url"
+    },
+    {
+      "key": "credentials",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "credential_id",
+      "default_value": "your-credential-id"
+    },
+    {
+      "key": "job_portal_url",
+      "description": "URL of the job portal",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "string"
+    }
+  ]
+}
+```
+
+```yaml YAML
+parameters:
+  - key: resume
+    parameter_type: workflow
+    workflow_parameter_type: file_url
+  - key: credentials
+    parameter_type: workflow
+    workflow_parameter_type: credential_id
+    default_value: your-credential-id # <-- replace this
+  - key: job_portal_url
+    description: URL of the job portal
+    parameter_type: workflow
+    workflow_parameter_type: string
+```
+</CodeGroup>
+
+---
+
+## Step 3: Create the workflow definition
+
+The workflow chains together several blocks to automate the full job application process:
+
+1. **PDF Parser block** — Extracts structured data from your resume
+2. **Login block** — Authenticates to the job portal using stored credentials
+3. **Navigation block** — Searches for relevant jobs based on your resume
+4. **Extraction block** — Extracts a list of job postings from search results
+5. **For loop** (Go to URL + Extraction + Action + Extraction + Text Prompt + Navigation) — Iterates over each job to extract details, generates tailored answers using an LLM, and submits the application.
+
+We will add these blocks one by one in the **workflow definition**, a YAML/JSON file that contains the complete description of your workflow logic
+
+### Workflow Definition format
+
+<CodeGroup>
+```json JSON
+{
+  "title": "Search and Apply for Jobs Workflow",
+  "description": "Search for jobs on any portal, extract listings, generate tailored answers with AI, and submit applications automatically.",
+  "proxy_location": "RESIDENTIAL",
+  "workflow_definition": {
+    "version": 1,
+    "parameters": [],
+    "blocks": []
+  }
+}
+```
+
+```yaml YAML
+title: Search and Apply for Jobs Workflow
+description: "Search for jobs on any portal, extract listings, generate tailored answers with AI, and submit applications automatically."
+proxy_location: RESIDENTIAL       # <-- defaults to RESIDENTIAL
+workflow_definition:
+  version: 1                      # <-- auto-increments when you make changes
+  parameters:
+    ...                           # <-- defined in Step 2
+
+  blocks:
+    ...                           # <-- defined one by one in the next steps
+```
+</CodeGroup>
+
+### PDF Parser block
+
+The `pdf_parser` block extracts structured information from your resume PDF. Skyvern uses AI to identify your name, contact info, work experience, education, and skills.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "pdf_parser",
+  "label": "parsed_resume",
+  "file_url": "{{ resume }}"
+}
+```
+
+```yaml YAML
+- block_type: pdf_parser
+  label: parsed_resume
+  file_url: "{{ resume }}"
+```
+</CodeGroup>
+
+The parsed data is accessible as `{{ parsed_resume_output }}` in subsequent blocks.
+
+### Login block
+
+The `login` block authenticates using stored credentials. Skyvern injects the username/password directly into form fields without exposing them to the LLM.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "login",
+  "label": "login_to_portal",
+  "url": "{{ job_portal_url }}",
+  "title": "login_to_portal",
+  "parameter_keys": ["credentials"],
+  "navigation_goal": "Log in using the provided credentials.\nHandle any cookie consent popups.\nCOMPLETE when on the account dashboard or orders page.",
+  "max_retries": 0,
+  "engine": "skyvern-1.0"
+}
+```
+
+```yaml YAML
+- block_type: login
+  label: login_to_portal
+  url: "{{ job_portal_url }}"
+  title: login_to_portal
+  parameter_keys:
+    - credentials
+  navigation_goal: |
+    Log in using the provided credentials.
+    Handle any cookie consent popups.
+    COMPLETE when on the account dashboard or orders page.
+  max_retries: 0
+  engine: skyvern-1.0
+```
+</CodeGroup>
+
+### Search for jobs block
+
+Navigate to the job search and find relevant positions based on the parsed resume.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "navigation",
+  "label": "search_for_job",
+  "url": "",
+  "title": "search_for_job",
+  "engine": "skyvern-1.0",
+  "navigation_goal": "Search for a relevant job based on the parsed resume: {{parsed_resume_output}}",
+  "max_retries": 0
+}
+```
+
+```yaml YAML
+- block_type: navigation
+  label: search_for_job
+  url: ""
+  title: search_for_job
+  engine: skyvern-1.0
+  navigation_goal: "Search for a relevant job based on the parsed resume: {{parsed_resume_output}}"
+  max_retries: 0
+```
+</CodeGroup>
+
+### Extract jobs list block
+
+Extract job postings from the search results. The `data_schema` tells Skyvern exactly what structure to return.
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "extraction",
+  "label": "jobs_list_extraction",
+  "url": "",
+  "title": "jobs_list_extraction",
+  "data_extraction_goal": "Extract all visible job profiles: job page url, title, employer, location, and type (full time, part time, etc)",
+  "data_schema": {
+    "jobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "job_page_url": {
+            "type": "string",
+            "description": "Link to the apply page for the job"
+          },
+          "title": {
+            "type": "string",
+            "description": "Title of the role offered"
+          },
+          "employer": {
+            "type": "string",
+            "description": "Name of the company posting the job profile"
+          },
+          "location": {
+            "type": "string",
+            "description": "Where is the job role based. City and country,"
+          },
+          "type": {
+            "type": "string",
+            "description": "Type for employment: full-time. part-time, contractual, internship etc."
+          }
+        },
+        "required": ["job_page_url", "title", "employer", "location"]
+      }
+    }
+  },
+  "max_retries": 0,
+  "engine": "skyvern-1.0"
+}
+```
+
+```yaml YAML
+- block_type: extraction
+  label: jobs_list_extraction
+  url: ""
+  title: jobs_list_extraction
+  data_extraction_goal: "Extract all visible job profiles: job page url, title, employer, location, and type (full time, part time, etc)"
+  data_schema:
+    jobs:
+      type: array
+      items:
+        type: object
+        properties:
+          job_page_url:
+            type: string
+            description: Link to the apply page for the job
+          title:
+            type: string
+            description: Title of the role offered
+          employer:
+            type: string
+            description: Name of the company posting the job profile
+          location:
+            type: string
+            description: Where is the job role based. City and country,
+          type:
+            type: string
+            description: "Type for employment: full-time. part-time, contractual, internship etc."
+        required:
+          - job_page_url
+          - title
+          - employer
+          - location
+  max_retries: 0
+  engine: skyvern-1.0
+```
+</CodeGroup>
+
+The output is accessible as `{{ jobs_list_extraction_output.jobs }}` in subsequent blocks.
+
+### Apply to jobs loop
+
+Iterate over each job posting and complete the application. This loop contains multiple blocks that work together:
+
+1. **goto_url** — Navigate to the job page
+2. **extraction** — Extract detailed job information
+3. **action** — Click the Apply button
+4. **extraction** — Extract application form questions
+5. **text_prompt** — Generate tailored answers using AI
+6. **navigation** — Fill out and submit the application
+
+<CodeGroup>
+```json JSON
+{
+  "block_type": "for_loop",
+  "label": "for_each_job",
+  "loop_variable_reference": "{{jobs_list_extraction_output.jobs}}",
+  "continue_on_failure": true,
+  "next_loop_on_failure": true,
+  "complete_if_empty": true,
+  "loop_blocks": [
+    {
+      "block_type": "goto_url",
+      "label": "go_to_each_job",
+      "url": "{{ current_value.job_page_url }}"
+    },
+    {
+      "block_type": "extraction",
+      "label": "extract_job_detail",
+      "url": "",
+      "title": "extract_job_detail",
+      "data_extraction_goal": "Extract every detail about the job role present on the page",
+      "max_retries": 0,
+      "engine": "skyvern-1.0"
+    },
+    {
+      "block_type": "action",
+      "label": "click_apply",
+      "url": "",
+      "title": "click_apply",
+      "navigation_goal": "Find Apply button and click it.\n\nCOMPLETE when the job application is visible on the screen",
+      "max_retries": 0,
+      "engine": "skyvern-1.0"
+    },
+    {
+      "block_type": "extraction",
+      "label": "extract_questions",
+      "url": "",
+      "title": "extract_questions",
+      "data_extraction_goal": "Extract every question in the job application form as a list",
+      "max_retries": 0,
+      "engine": "skyvern-1.0"
+    },
+    {
+      "block_type": "text_prompt",
+      "label": "answer_form_questions",
+      "prompt": "Given:\nresume: {{resume}}\nparsed resume: {{parsed_resume_output}}\ninformation about the job profile: {{extract_job_detail_output}}\napplication form questions: {{extract_questions_output}}\n\nYou are applying for {{ current_value.title }} at {{ current_value.employer }}.\n\nWrite thoughtful and impressive answers to each question using the information from resume and parsed resume output."
+    },
+    {
+      "block_type": "navigation",
+      "label": "apply_to_job",
+      "url": "",
+      "title": "apply_to_job",
+      "engine": "skyvern-1.0",
+      "navigation_goal": "Given:\n{{answer_form_questions_output}}\n\nFill out all of the form fields, including the optional fields.\n\nIf you dont know the answer to an optional question, leave it blank. If you dont know the answer to a required question such as referral name put N/A or something equivalent.\n\nCOMPLETE when the application form has been successfully submitted.\n\nMore context:\nresume: {{resume}}\nperson_information: {{parsed_resume_output}}",
+      "max_retries": 0
+    }
+  ]
+}
+```
+
+```yaml YAML
+- block_type: for_loop
+  label: for_each_job
+  loop_variable_reference: "{{jobs_list_extraction_output.jobs}}"
+  continue_on_failure: true
+  next_loop_on_failure: true
+  complete_if_empty: true
+  loop_blocks:
+    - block_type: goto_url
+      label: go_to_each_job
+      url: "{{ current_value.job_page_url }}"
+
+    - block_type: extraction
+      label: extract_job_detail
+      url: ""
+      title: extract_job_detail
+      data_extraction_goal: Extract every detail about the job role present on the page
+      max_retries: 0
+      engine: skyvern-1.0
+
+    - block_type: action
+      label: click_apply
+      url: ""
+      title: click_apply
+      navigation_goal: |
+        Find Apply button and click it.
+
+        COMPLETE when the job application is visible on the screen
+      max_retries: 0
+      engine: skyvern-1.0
+
+    - block_type: extraction
+      label: extract_questions
+      url: ""
+      title: extract_questions
+      data_extraction_goal: Extract every question in the job application form as a list
+      max_retries: 0
+      engine: skyvern-1.0
+
+    - block_type: text_prompt
+      label: answer_form_questions
+      prompt: |
+        Given:
+        resume: {{resume}}
+        parsed resume: {{parsed_resume_output}}
+        information about the job profile: {{extract_job_detail_output}}
+        application form questions: {{extract_questions_output}}
+
+        You are applying for {{ current_value.title }} at {{ current_value.employer }}.
+
+        Write thoughtful and impressive answers to each question using the information from resume and parsed resume output.
+
+    - block_type: navigation
+      label: apply_to_job
+      url: ""
+      title: apply_to_job
+      engine: skyvern-1.0
+      navigation_goal: |
+        Given:
+        {{answer_form_questions_output}}
+
+        Fill out all of the form fields, including the optional fields.
+
+        If you dont know the answer to an optional question, leave it blank. If you dont know the answer to a required question such as referral name put N/A or something equivalent.
+
+        COMPLETE when the application form has been successfully submitted.
+
+        More context:
+        resume: {{resume}}
+        person_information: {{parsed_resume_output}}
+      max_retries: 0
+```
+</CodeGroup>
+
+**Key pattern:** `continue_on_failure: true` ensures that if one application fails, the workflow continues to the next job. Inside the loop, `{{ current_value }}` gives you the current job being processed.
+
+### Complete workflow definition
+
+Save this complete definition as `job-application-workflow.yaml` (or `.json`) before running.
+
+<Accordion title="Complete workflow definition">
+<CodeGroup>
+```json JSON
+{
+  "title": "Search and Apply for Jobs Workflow",
+  "description": "Search for jobs on any portal, extract listings, generate tailored answers with AI, and submit applications automatically.",
+  "proxy_location": "RESIDENTIAL",
+  "workflow_definition": {
+    "version": 1,
+    "parameters": [
+      { "key": "resume", "parameter_type": "workflow", "workflow_parameter_type": "file_url" },
+      { "key": "credentials", "parameter_type": "workflow", "workflow_parameter_type": "credential_id", "default_value": "your-credential-id" },
+      { "key": "job_portal_url", "description": "URL of the job portal", "parameter_type": "workflow", "workflow_parameter_type": "string" }
+    ],
+    "blocks": [
+      {
+        "block_type": "pdf_parser",
+        "label": "parsed_resume",
+        "file_url": "{{ resume }}"
+      },
+      {
+        "block_type": "login",
+        "label": "login_to_portal",
+        "url": "{{ job_portal_url }}",
+        "title": "login_to_portal",
+        "parameter_keys": ["credentials"],
+        "navigation_goal": "Log in using the provided credentials.\nHandle any cookie consent popups.\nCOMPLETE when on the account dashboard or orders page.",
+        "max_retries": 0,
+        "engine": "skyvern-1.0"
+      },
+      {
+        "block_type": "navigation",
+        "label": "search_for_job",
+        "url": "",
+        "title": "search_for_job",
+        "engine": "skyvern-1.0",
+        "navigation_goal": "Search for a relevant job based on the parsed resume: {{parsed_resume_output}}",
+        "max_retries": 0
+      },
+      {
+        "block_type": "extraction",
+        "label": "jobs_list_extraction",
+        "url": "",
+        "title": "jobs_list_extraction",
+        "data_extraction_goal": "Extract all visible job profiles: job page url, title, employer, location, and type (full time, part time, etc)",
+        "data_schema": {
+          "jobs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "job_page_url": { "type": "string", "description": "Link to the apply page for the job" },
+                "title": { "type": "string", "description": "Title of the role offered" },
+                "employer": { "type": "string", "description": "Name of the company posting the job profile" },
+                "location": { "type": "string", "description": "Where is the job role based. City and country," },
+                "type": { "type": "string", "description": "Type for employment: full-time. part-time, contractual, internship etc." }
+              },
+              "required": ["job_page_url", "title", "employer", "location"]
+            }
+          }
+        },
+        "max_retries": 0,
+        "engine": "skyvern-1.0"
+      },
+      {
+        "block_type": "for_loop",
+        "label": "for_each_job",
+        "loop_variable_reference": "{{jobs_list_extraction_output.jobs}}",
+        "continue_on_failure": true,
+        "next_loop_on_failure": true,
+        "complete_if_empty": true,
+        "loop_blocks": [
+          {
+            "block_type": "goto_url",
+            "label": "go_to_each_job",
+            "url": "{{ current_value.job_page_url }}"
+          },
+          {
+            "block_type": "extraction",
+            "label": "extract_job_detail",
+            "url": "",
+            "title": "extract_job_detail",
+            "data_extraction_goal": "Extract every detail about the job role present on the page",
+            "max_retries": 0,
+            "engine": "skyvern-1.0"
+          },
+          {
+            "block_type": "action",
+            "label": "click_apply",
+            "url": "",
+            "title": "click_apply",
+            "navigation_goal": "Find Apply button and click it.\n\nCOMPLETE when the job application is visible on the screen",
+            "max_retries": 0,
+            "engine": "skyvern-1.0"
+          },
+          {
+            "block_type": "extraction",
+            "label": "extract_questions",
+            "url": "",
+            "title": "extract_questions",
+            "data_extraction_goal": "Extract every question in the job application form as a list",
+            "max_retries": 0,
+            "engine": "skyvern-1.0"
+          },
+          {
+            "block_type": "text_prompt",
+            "label": "answer_form_questions",
+            "prompt": "Given:\nresume: {{resume}}\nparsed resume: {{parsed_resume_output}}\ninformation about the job profile: {{extract_job_detail_output}}\napplication form questions: {{extract_questions_output}}\n\nYou are applying for {{ current_value.title }} at {{ current_value.employer }}.\n\nWrite thoughtful and impressive answers to each question using the information from resume and parsed resume output."
+          },
+          {
+            "block_type": "navigation",
+            "label": "apply_to_job",
+            "url": "",
+            "title": "apply_to_job",
+            "engine": "skyvern-1.0",
+            "navigation_goal": "Given:\n{{answer_form_questions_output}}\n\nFill out all of the form fields, including the optional fields.\n\nIf you dont know the answer to an optional question, leave it blank. If you dont know the answer to a required question such as referral name put N/A or something equivalent.\n\nCOMPLETE when the application form has been successfully submitted.\n\nMore context:\nresume: {{resume}}\nperson_information: {{parsed_resume_output}}",
+            "max_retries": 0
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+```yaml YAML
+title: Search and Apply for Jobs Workflow
+description: "Search for jobs on any portal, extract listings, generate tailored answers with AI, and submit applications automatically."
+proxy_location: RESIDENTIAL
+workflow_definition:
+  version: 1
+  parameters:
+    - key: resume
+      parameter_type: workflow
+      workflow_parameter_type: file_url
+    - key: credentials
+      parameter_type: workflow
+      workflow_parameter_type: credential_id
+      default_value: your-credential-id # <-- replace this
+    - key: job_portal_url
+      description: URL of the job portal
+      parameter_type: workflow
+      workflow_parameter_type: string
+
+  blocks:
+    - block_type: pdf_parser
+      label: parsed_resume
+      file_url: "{{ resume }}"
+
+    - block_type: login
+      label: login_to_portal
+      url: "{{ job_portal_url }}"
+      title: login_to_portal
+      parameter_keys:
+        - credentials
+      navigation_goal: |
+        Log in using the provided credentials.
+        Handle any cookie consent popups.
+        COMPLETE when on the account dashboard or orders page.
+      max_retries: 0
+      engine: skyvern-1.0
+
+    - block_type: navigation
+      label: search_for_job
+      url: ""
+      title: search_for_job
+      engine: skyvern-1.0
+      navigation_goal: "Search for a relevant job based on the parsed resume: {{parsed_resume_output}}"
+      max_retries: 0
+
+    - block_type: extraction
+      label: jobs_list_extraction
+      url: ""
+      title: jobs_list_extraction
+      data_extraction_goal: "Extract all visible job profiles: job page url, title, employer, location, and type (full time, part time, etc)"
+      data_schema:
+        jobs:
+          type: array
+          items:
+            type: object
+            properties:
+              job_page_url:
+                type: string
+                description: Link to the apply page for the job
+              title:
+                type: string
+                description: Title of the role offered
+              employer:
+                type: string
+                description: Name of the company posting the job profile
+              location:
+                type: string
+                description: Where is the job role based. City and country,
+              type:
+                type: string
+                description: "Type for employment: full-time. part-time, contractual, internship etc."
+            required:
+              - job_page_url
+              - title
+              - employer
+              - location
+      max_retries: 0
+      engine: skyvern-1.0
+
+    - block_type: for_loop
+      label: for_each_job
+      loop_variable_reference: "{{jobs_list_extraction_output.jobs}}"
+      continue_on_failure: true
+      next_loop_on_failure: true
+      complete_if_empty: true
+      loop_blocks:
+        - block_type: goto_url
+          label: go_to_each_job
+          url: "{{ current_value.job_page_url }}"
+
+        - block_type: extraction
+          label: extract_job_detail
+          url: ""
+          title: extract_job_detail
+          data_extraction_goal: Extract every detail about the job role present on the page
+          max_retries: 0
+          engine: skyvern-1.0
+
+        - block_type: action
+          label: click_apply
+          url: ""
+          title: click_apply
+          navigation_goal: |
+            Find Apply button and click it.
+
+            COMPLETE when the job application is visible on the screen
+          max_retries: 0
+          engine: skyvern-1.0
+
+        - block_type: extraction
+          label: extract_questions
+          url: ""
+          title: extract_questions
+          data_extraction_goal: Extract every question in the job application form as a list
+          max_retries: 0
+          engine: skyvern-1.0
+
+        - block_type: text_prompt
+          label: answer_form_questions
+          prompt: |
+            Given:
+            resume: {{resume}}
+            parsed resume: {{parsed_resume_output}}
+            information about the job profile: {{extract_job_detail_output}}
+            application form questions: {{extract_questions_output}}
+
+            You are applying for {{ current_value.title }} at {{ current_value.employer }}.
+
+            Write thoughtful and impressive answers to each question using the information from resume and parsed resume output.
+
+        - block_type: navigation
+          label: apply_to_job
+          url: ""
+          title: apply_to_job
+          engine: skyvern-1.0
+          navigation_goal: |
+            Given:
+            {{answer_form_questions_output}}
+
+            Fill out all of the form fields, including the optional fields.
+
+            If you dont know the answer to an optional question, leave it blank. If you dont know the answer to a required question such as referral name put N/A or something equivalent.
+
+            COMPLETE when the application form has been successfully submitted.
+
+            More context:
+            resume: {{resume}}
+            person_information: {{parsed_resume_output}}
+          max_retries: 0
+```
+</CodeGroup>
+</Accordion>
+
+---
+
+## Step 4: Run the workflow
+
+Create the workflow from your definition file and execute it using the SDK.
+
+<CodeGroup>
+```python Python
+import os
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+    # Create workflow from YAML file
+    workflow = await client.create_workflow(
+        yaml_definition=open("job-application-workflow.yaml").read()
+    )
+    print(f"Created workflow: {workflow.workflow_permanent_id}")
+
+    # Run the workflow
+    run = await client.run_workflow(
+        workflow_id=workflow.workflow_permanent_id,
+        parameters={
+            "resume": "https://your-resume-url.com/resume.pdf",  # <-- replace this
+            "job_portal_url": "https://job-stash.vercel.app"
+        }
+    )
+    print(f"Started run: {run.run_id}")
+
+    # Poll for completion
+    while True:
+        result = await client.get_run(run.run_id)
+        if result.status in ["completed", "failed", "terminated"]:
+            break
+        print(f"Status: {result.status}")
+        await asyncio.sleep(10)
+
+    print(f"Final status: {result.status}")
+    if result.status == "completed":
+        print("Job applications submitted successfully")
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+import * as fs from "fs";
+
+async function main() {
+  const client = new SkyvernClient({
+    apiKey: process.env.SKYVERN_API_KEY,
+  });
+
+  // Create workflow from YAML file
+  const workflow = await client.createWorkflow({
+    body: {
+      yaml_definition: fs.readFileSync("job-application-workflow.yaml", "utf-8"),
+    },
+  });
+  console.log(`Created workflow: ${workflow.workflow_permanent_id}`);
+
+  // Run the workflow
+  const run = await client.runWorkflow({
+    body: {
+      workflow_id: workflow.workflow_permanent_id,
+      parameters: {
+        resume: "https://your-resume-url.com/resume.pdf", // <-- replace this
+        job_portal_url: "https://job-stash.vercel.app",
+      },
+    },
+  });
+  console.log(`Started run: ${run.run_id}`);
+
+  // Poll for completion
+  while (true) {
+    const result = await client.getRun(run.run_id);
+    if (["completed", "failed", "terminated"].includes(result.status)) {
+      console.log(`Final status: ${result.status}`);
+      if (result.status === "completed") {
+        console.log("Job applications submitted successfully");
+      }
+      break;
+    }
+    console.log(`Status: ${result.status}`);
+    await new Promise((r) => setTimeout(r, 10000));
+  }
+}
+
+main();
+```
+
+```bash cURL
+# Create workflow
+WORKFLOW=$(curl -s -X POST "https://api.skyvern.com/v1/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"yaml_definition\": $(cat job-application-workflow.yaml | jq -Rs .)}")
+
+WORKFLOW_ID=$(echo "$WORKFLOW" | jq -r '.workflow_permanent_id')
+echo "Created workflow: $WORKFLOW_ID"
+
+# Run workflow (replace resume URL with your own)
+RUN=$(curl -s -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"workflow_id\": \"$WORKFLOW_ID\",
+    \"parameters\": {
+      \"resume\": \"https://your-resume-url.com/resume.pdf\",
+      \"job_portal_url\": \"https://job-stash.vercel.app\"
+    }
+  }")
+
+RUN_ID=$(echo "$RUN" | jq -r '.run_id')
+echo "Started run: $RUN_ID"
+
+# Poll for completion
+while true; do
+  RESULT=$(curl -s "https://api.skyvern.com/v1/runs/$RUN_ID" \
+    -H "x-api-key: $SKYVERN_API_KEY")
+  STATUS=$(echo "$RESULT" | jq -r '.status')
+  echo "Status: $STATUS"
+
+  if [[ "$STATUS" == "completed" || "$STATUS" == "failed" || "$STATUS" == "terminated" ]]; then
+    echo "Workflow finished with status: $STATUS"
+    break
+  fi
+  sleep 10
+done
+```
+</CodeGroup>
+
+---
+
+## Resources
+
+<CardGroup cols={2}>
+  <Card title="Workflow Blocks Reference" icon="cube" href="/multi-step-automations/workflow-blocks-reference">
+    Complete parameter reference for all block types
+  </Card>
+  <Card title="Credential Management" icon="key" href="/sdk-reference/credentials">
+    Securely store and use login credentials
+  </Card>
+  <Card title="File Operations" icon="file" href="/multi-step-automations/file-operations">
+    Upload and parse files in workflows
+  </Card>
+  <Card title="Error Handling" icon="triangle-exclamation" href="/going-to-production/error-handling">
+    Handle failures and retries in production
+  </Card>
+</CardGroup>

@@ -34,9 +34,9 @@ Next to your prompt, you'll see an engine selector. Click it to switch engines:
 |--------|---------------|
 | **Skyvern 1.0** | Tasks with a simple, single goal: filling a form, searching for information on Google, reading content from a page |
 | **Skyvern 2.0** | Complex, multi-step tasks. Scores state-of-the-art 85.85% on the WebVoyager benchmark |
-| **Skyvern 2.0 with code** | The default engine. Same capabilities as Skyvern 2.0, plus auto-generates reusable code and a workflow from the run |
+| **Skyvern 2.0 with Code** | The default engine. Same capabilities as Skyvern 2.0, plus auto-generates reusable code and a workflow from the run |
 
-For this example, keep the default **Skyvern 2.0 with code** selected.
+For this example, keep the default **Skyvern 2.0 with Code** selected.
 
 Click the **send button** (arrow icon to the right of the input). Skyvern generates a workflow from your prompt and opens it in the workflow editor. Click **Run** in the top right, confirm the parameters, then click **Run workflow** to start execution.
 
@@ -48,7 +48,7 @@ Click the **gear icon** next to send to configure additional options before runn
 | **Webhook Callback URL** | Endpoint to receive the extracted data when the run completes |
 | **Proxy Location** | Route Skyvern through one of the available proxies |
 | **Browser Session ID** | Reuse a persistent browser session to keep login state |
-| **Browser Address** | Connect to a specific browser server for the task run |
+| **CDP Address** | Connect to your own browser via Chrome DevTools Protocol |
 | **2FA Identifier** | Identifier for a 2FA code to handle two-factor auth automatically |
 | **Extra HTTP Headers** | Custom HTTP request headers (dict format) |
 | **Generate Script** | Auto-generate reusable scripts from a successful run |
@@ -88,17 +88,19 @@ The **Extracted Information** block shows your results as structured JSON:
 ]
 ```
 
+Your result will differ — the #1 post changes constantly. The structure is what matters.
+
 The agent log on the right confirms what happened. You'll see a final Thought summarizing the result.
 
 ### Tabs
 
 Below the extracted data, five tabs give you different views of the run:
 
-- **Overview**: The default view. Shows extracted data and the agent log with every Thought and Decision.
-- **Output**: The raw JSON output from the run.
+- **Overview**: The AI's reasoning timeline alongside browser screenshots. Each Thought, Block, and Action card shows what the agent saw and why it acted.
+- **Output**: The complete JSON output and any downloaded files.
 - **Parameters**: The exact configuration that was submitted (URL, prompt, engine, schema). Useful for reproducing or tweaking the run.
 - **Recording**: Full video replay of the browser session, start to finish.
-- **Code**: Auto-generated code snippets to reproduce this task via the API or SDK.
+- **Code**: Auto-generated Python code to reproduce this task via the API or SDK.
 
 ## Try something bigger
 
@@ -106,7 +108,7 @@ Now that you've seen the basic flow, here are a few ideas to try next:
 
 - **Fill a form**: Point Skyvern at a contact form and tell it what to enter in each field
 - **Compare prices**: Extract product names and prices from an e-commerce page using a data schema
-- **Navigate a flow**: Use the Advanced engine to walk through a multi-page checkout or signup process
+- **Navigate a flow**: Use Skyvern 2.0 to walk through a multi-page checkout or signup process
 - **Use an Agent template**: Check the **Agents** section in the sidebar for pre-built automations you can run instantly
 
 ---
