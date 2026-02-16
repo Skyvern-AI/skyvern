@@ -97,13 +97,11 @@ const client = new SkyvernClient({
 });
 
 const credential = await client.createCredential({
-  body: {
-    name: "Vendor Portal",
-    credential_type: "password",
-    credential: {
-      username: "demo@manicule.dev",
-      password: "helloworld",
-    },
+  name: "Vendor Portal",
+  credential_type: "password",
+  credential: {
+    username: "demo@manicule.dev",
+    password: "helloworld",
   },
 });
 
@@ -145,9 +143,9 @@ This workflow uses the following parameters:
 {
   "parameters": [
     {
-      "key": "portal_url",                  // <-- parameter name
-      "parameter_type": "workflow",         // <-- always set to "workflow"
-      "workflow_parameter_type": "string"   // <-- can be string, file_url, credential_id, etc
+      "key": "portal_url",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "string"
     },
     {
       "key": "start_date",
@@ -249,11 +247,11 @@ We will add these blocks one by one in the **workflow definition**, a YAML/JSON 
 {
   "title": "Bulk Invoice Downloader",
   "description": "Download invoices from vendor portals, parse PDFs to extract amounts, and email a summary with attachments.",
-  "proxy_location": "RESIDENTIAL",        // <-- defaults to RESIDENTIAL
+  "proxy_location": "RESIDENTIAL",
   "workflow_definition": {
-    "version": 1,                         // <-- auto-increments when you make changes
-    "parameters": [],                     // <-- defined in Step 2
-    "blocks": []                          // <-- defined one by one in the next steps
+    "version": 1,
+    "parameters": [],
+    "blocks": []
   }
 }
 ```
@@ -501,7 +499,7 @@ Use `file_url_parser` to extract structured data from each downloaded PDF.
       "block_type": "file_url_parser",
       "label": "parse_block",
       "file_url": "SKYVERN_DOWNLOAD_DIRECTORY/invoice_{{ current_value.order_id }}.pdf",
-      "file_type": "csv",
+      "file_type": "pdf",
       "json_schema": {
         "type": "object",
         "properties": {
@@ -536,7 +534,7 @@ Use `file_url_parser` to extract structured data from each downloaded PDF.
     - block_type: file_url_parser
       label: parse_block
       file_url: SKYVERN_DOWNLOAD_DIRECTORY/invoice_{{ current_value.order_id }}.pdf
-      file_type: csv
+      file_type: pdf
       json_schema:
         type: object
         properties:
@@ -704,7 +702,7 @@ Save this complete definition to `invoice-workflow.yaml` (or `.json`) before run
             "block_type": "file_url_parser",
             "label": "parse_block",
             "file_url": "SKYVERN_DOWNLOAD_DIRECTORY/invoice_{{ current_value.order_id }}.pdf",
-            "file_type": "csv",
+            "file_type": "pdf",
             "json_schema": {
               "type": "object",
               "properties": {
@@ -864,7 +862,7 @@ workflow_definition:
         - block_type: file_url_parser
           label: parse_block
           file_url: SKYVERN_DOWNLOAD_DIRECTORY/invoice_{{ current_value.order_id }}.pdf
-          file_type: csv
+          file_type: pdf
           json_schema:
             type: object
             properties:
@@ -924,7 +922,7 @@ async def main():
     run = await client.run_workflow(
         workflow_id=workflow.workflow_permanent_id,
         parameters={
-            "portal_url": "https://ember--roasters.vercel.app",
+            "portal_url": "https://ember-roasters.vercel.app",
             "start_date": "2025-01-01",
             "end_date": "2025-01-31",
             "recipient_email": "your-email@company.com"  # <-- replace this
@@ -969,7 +967,7 @@ async function main() {
     body: {
       workflow_id: workflow.workflow_permanent_id,
       parameters: {
-        portal_url: "https://ember--roasters.vercel.app",
+        portal_url: "https://ember-roasters.vercel.app",
         start_date: "2025-01-01",
         end_date: "2025-01-31",
         recipient_email: "your-email@company.com", // <-- replace this
@@ -1013,7 +1011,7 @@ RUN=$(curl -s -X POST "https://api.skyvern.com/v1/run/workflows" \
   -d "{
     \"workflow_id\": \"$WORKFLOW_ID\",
     \"parameters\": {
-      \"portal_url\": \"https://ember--roasters.vercel.app\",
+      \"portal_url\": \"https://ember-roasters.vercel.app\",
       \"start_date\": \"2025-01-01\",
       \"end_date\": \"2025-01-31\",
       \"recipient_email\": \"your-email@company.com\"
@@ -1047,7 +1045,7 @@ done
   <Card title="Workflow Blocks Reference" icon="cube" href="/multi-step-automations/workflow-blocks-reference">
     Complete parameter reference for all block types
   </Card>
-  <Card title="Credential Management" icon="key" href="/credentials/introduction">
+  <Card title="Credential Management" icon="key" href="/sdk-reference/credentials">
     Securely store and use login credentials
   </Card>
   <Card title="File Operations" icon="file" href="/multi-step-automations/file-operations">

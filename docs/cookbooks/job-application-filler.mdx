@@ -98,13 +98,11 @@ const client = new SkyvernClient({
 });
 
 const credential = await client.createCredential({
-  body: {
-    name: "Job Portal",
-    credential_type: "password",
-    credential: {
-      username: "demo@manicule.dev",
-      password: "helloworld",
-    },
+  name: "Job Portal",
+  credential_type: "password",
+  credential: {
+    username: "demo@manicule.dev",
+    password: "helloworld",
   },
 });
 
@@ -143,9 +141,9 @@ This workflow uses the following parameters:
 {
   "parameters": [
     {
-      "key": "resume",                      // <-- parameter name
-      "parameter_type": "workflow",         // <-- always set to "workflow"
-      "workflow_parameter_type": "file_url" // <-- can be string, file_url, credential_id, etc
+      "key": "resume",
+      "parameter_type": "workflow",
+      "workflow_parameter_type": "file_url"
     },
     {
       "key": "credentials",
@@ -189,7 +187,7 @@ The workflow chains together several blocks to automate the full job application
 2. **Login block** — Authenticates to the job portal using stored credentials
 3. **Navigation block** — Searches for relevant jobs based on your resume
 4. **Extraction block** — Extracts a list of job postings from search results
-5. **For loop + Extraction + Text Prompt + Task** — Iterates over each job to extract details, generates relevant answers using an LLM, and submits the form.
+5. **For loop** (Go to URL + Extraction + Action + Extraction + Text Prompt + Navigation) — Iterates over each job to extract details, generates tailored answers using an LLM, and submits the application.
 
 We will add these blocks one by one in the **workflow definition**, a YAML/JSON file that contains the complete description of your workflow logic
 
@@ -198,13 +196,13 @@ We will add these blocks one by one in the **workflow definition**, a YAML/JSON 
 <CodeGroup>
 ```json JSON
 {
-  "title": "Job Applications Pipeline",
+  "title": "Search and Apply for Jobs Workflow",
   "description": "Search for jobs on any portal, extract listings, generate tailored answers with AI, and submit applications automatically.",
-  "proxy_location": "RESIDENTIAL",        // <-- defaults to RESIDENTIAL
+  "proxy_location": "RESIDENTIAL",
   "workflow_definition": {
-    "version": 1,                         // <-- auto-increments when you make changes
-    "parameters": [],                     // <-- defined in Step 2
-    "blocks": []                          // <-- defined one by one in the next steps
+    "version": 1,
+    "parameters": [],
+    "blocks": []
   }
 }
 ```
@@ -965,7 +963,7 @@ done
   <Card title="Workflow Blocks Reference" icon="cube" href="/multi-step-automations/workflow-blocks-reference">
     Complete parameter reference for all block types
   </Card>
-  <Card title="Credential Management" icon="key" href="/credentials/introduction">
+  <Card title="Credential Management" icon="key" href="/sdk-reference/credentials">
     Securely store and use login credentials
   </Card>
   <Card title="File Operations" icon="file" href="/multi-step-automations/file-operations">
