@@ -34,14 +34,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-
-function getHostname(url: string): string {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return url;
-  }
-}
+import { getHostname } from "@/util/getHostname";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -127,7 +120,6 @@ function CredentialsModal({
   const [testStatus, setTestStatus] = useState<
     "idle" | "testing" | "completed" | "failed" | "profile_failed"
   >("idle");
-  const [, setTestWorkflowRunId] = useState<string | null>(null);
   const [testFailureReason, setTestFailureReason] = useState<string | null>(
     null,
   );
@@ -170,7 +162,6 @@ function CredentialsModal({
     setTestAndSave(false);
     setTestUrl("");
     setTestStatus("idle");
-    setTestWorkflowRunId(null);
     setTestFailureReason(null);
     if (pollIntervalRef.current) {
       clearTimeout(pollIntervalRef.current);
@@ -204,8 +195,8 @@ function CredentialsModal({
           }
 
           setTestStatus("completed");
-          const profileHost = data.browser_profile_url
-            ? getHostname(data.browser_profile_url)
+          const profileHost = data.tested_url
+            ? getHostname(data.tested_url)
             : null;
           toast({
             title: "Credential test passed",
@@ -260,7 +251,6 @@ function CredentialsModal({
           },
         );
         const data = response.data;
-        setTestWorkflowRunId(data.workflow_run_id);
         setTestStatus("testing");
 
         // Start first poll after 3 seconds (subsequent polls scheduled by pollTestStatus)
@@ -362,6 +352,19 @@ function CredentialsModal({
         toast({
           title: "Error",
           description: "Login URL is required when testing credentials",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      if (
+        testAndSave &&
+        !testUrl.trim().startsWith("http://") &&
+        !testUrl.trim().startsWith("https://")
+      ) {
+        toast({
+          title: "Error",
+          description: "Login URL must start with http:// or https://",
           variant: "destructive",
         });
         return;

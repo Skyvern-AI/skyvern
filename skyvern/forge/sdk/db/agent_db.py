@@ -5140,7 +5140,7 @@ class AgentDB(BaseAlchemyDB):
         organization_id: str,
         name: str | None = None,
         browser_profile_id: str | None = None,
-        browser_profile_url: str | None = None,
+        tested_url: str | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -5156,8 +5156,8 @@ class AgentDB(BaseAlchemyDB):
                 credential.name = name
             if browser_profile_id is not None:
                 credential.browser_profile_id = browser_profile_id
-            if browser_profile_url is not None:
-                credential.browser_profile_url = browser_profile_url
+            if tested_url is not None:
+                credential.tested_url = tested_url
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)

@@ -162,7 +162,7 @@ class CredentialResponse(BaseModel):
     credential_type: CredentialType = Field(..., description="Type of the credential")
     name: str = Field(..., description="Name of the credential", examples=["Amazon Login"])
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
-    browser_profile_url: str | None = Field(default=None, description="URL of the website the browser profile was created from")
+    tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
 
 
 class TestCredentialRequest(BaseModel):
@@ -210,9 +210,9 @@ class TestCredentialStatusResponse(BaseModel):
         default=None,
         description="Browser profile ID created from successful test. Only present when status=completed and save_browser_profile was true.",
     )
-    browser_profile_url: str | None = Field(
+    tested_url: str | None = Field(
         default=None,
-        description="URL of the website the browser profile was created from.",
+        description="Login page URL used during the credential test.",
     )
     browser_profile_failure_reason: str | None = Field(
         default=None,
@@ -248,7 +248,7 @@ class Credential(BaseModel):
     card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")
     secret_label: str | None = Field(default=None, description="For secret credentials: optional label")
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
-    browser_profile_url: str | None = Field(default=None, description="URL of the website the browser profile was created from")
+    tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")

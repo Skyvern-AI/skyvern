@@ -118,7 +118,7 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
     value: credential.credential_id,
     type: "credential" as const,
     hasBrowserProfile: !!credential.browser_profile_id,
-    browserProfileUrl: credential.browser_profile_url ?? null,
+    browserProfileUrl: credential.tested_url ?? null,
   }));
 
   // Only show non-Skyvern credential parameters (Bitwarden, 1Password, Azure Vault)

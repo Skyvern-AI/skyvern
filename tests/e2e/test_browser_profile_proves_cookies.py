@@ -139,10 +139,10 @@ async def main() -> None:
 
         cred_id = cred_with_profile["credential_id"]
         profile_id = cred_with_profile["browser_profile_id"]
-        profile_url = cred_with_profile.get("browser_profile_url", "")
+        profile_url = cred_with_profile.get("tested_url", "")
         print(f"   ✅ Found credential: {cred_id}")
         print(f"   ✅ Browser profile:  {profile_id}")
-        print(f"   ✅ Profile URL:      {profile_url}")
+        print(f"   ✅ Tested URL:       {profile_url}")
 
         # Verify the profile directory exists on disk
         result = subprocess.run(

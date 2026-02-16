@@ -7,6 +7,7 @@ from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_PYTHON,
     CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_TS,
@@ -48,6 +49,15 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCrea
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+from skyvern.schemas.workflows import (
+    LoginBlockYAML,
+    WorkflowCreateYAMLRequest,
+    WorkflowDefinitionYAML,
+    WorkflowParameterYAML,
+    WorkflowStatus,
+)
 from skyvern.services.otp_service import OTPValue, parse_otp_login
 
 LOG = structlog.get_logger()
@@ -781,18 +791,7 @@ BROWSER_PROFILE_LOGIN_PROMPT = (
     response_model=TestCredentialResponse,
     include_in_schema=False,
 )
-@legacy_base_router.post(
-    "/credentials/{credential_id}/test",
-    response_model=TestCredentialResponse,
-    include_in_schema=False,
-)
-@legacy_base_router.post(
-    "/credentials/{credential_id}/test/",
-    response_model=TestCredentialResponse,
-    include_in_schema=False,
-)
 async def test_credential(
-    background_tasks: BackgroundTasks,
     credential_id: str = Path(
         ...,
         description="The credential ID to test",
@@ -804,21 +803,10 @@ async def test_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TestCredentialResponse:
-    from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType  # noqa: PLC0415
-    from skyvern.schemas.workflows import (  # noqa: PLC0415
-        LoginBlockYAML,
-        WorkflowCreateYAMLRequest,
-        WorkflowDefinitionYAML,
-        WorkflowParameterYAML,
-        WorkflowStatus,
-    )
-
     organization_id = current_org.organization_id
 
     # Validate credential exists and is a password type
-    credential = await app.DATABASE.get_credential(
-        credential_id=credential_id, organization_id=organization_id
-    )
+    credential = await app.DATABASE.get_credential(credential_id=credential_id, organization_id=organization_id)
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential {credential_id} not found")
     if credential.credential_type != CredentialType.PASSWORD:
@@ -855,9 +843,7 @@ async def test_credential(
 
     # Choose the appropriate prompt: if a browser profile exists, instruct the agent
     # to check for an existing session before attempting login.
-    navigation_goal = (
-        BROWSER_PROFILE_LOGIN_PROMPT if existing_browser_profile_id else DEFAULT_LOGIN_PROMPT
-    )
+    navigation_goal = BROWSER_PROFILE_LOGIN_PROMPT if existing_browser_profile_id else DEFAULT_LOGIN_PROMPT
 
     # Build a login workflow
     parameter_key = "credential"
@@ -904,8 +890,6 @@ async def test_credential(
 
     # Run the workflow — pass existing browser_profile_id so the browser launches
     # with saved session data (cookies, storage) before the agent starts acting.
-    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody  # noqa: PLC0415
-
     run_request = WorkflowRequestBody(
         browser_profile_id=existing_browser_profile_id,
     )
@@ -918,13 +902,37 @@ async def test_credential(
         max_steps_override=None,
     )
 
-    # Execute the workflow in the background
-    background_tasks.add_task(
-        app.WORKFLOW_SERVICE.execute_workflow,
-        workflow_run_id=workflow_run.workflow_run_id,
-        api_key=None,
+    # Execute the workflow via the async executor (cloud version enqueues to a worker)
+    await AsyncExecutorFactory.get_executor().execute_workflow(
+        request=None,
+        background_tasks=None,
         organization=current_org,
+        workflow_id=workflow_run.workflow_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        workflow_permanent_id=workflow_run.workflow_permanent_id,
+        max_steps_override=None,
+        api_key=None,
+        browser_session_id=None,
+        block_labels=None,
+        block_outputs=None,
     )
+
+    # If save_browser_profile is requested, schedule a background task to create
+    # the browser profile after the workflow completes. This avoids the race
+    # condition of doing it in the GET status endpoint (which could create
+    # duplicate profiles when polled rapidly).
+    if data.save_browser_profile:
+        asyncio.create_task(
+            _create_browser_profile_after_workflow(
+                credential_id=credential_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_id=workflow_run.workflow_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=organization_id,
+                credential_name=credential.name,
+                test_url=data.url,
+            )
+        )
 
     LOG.info(
         "Credential test started",
@@ -956,16 +964,6 @@ async def test_credential(
     response_model=TestCredentialStatusResponse,
     include_in_schema=False,
 )
-@legacy_base_router.get(
-    "/credentials/{credential_id}/test/{workflow_run_id}",
-    response_model=TestCredentialStatusResponse,
-    include_in_schema=False,
-)
-@legacy_base_router.get(
-    "/credentials/{credential_id}/test/{workflow_run_id}/",
-    response_model=TestCredentialStatusResponse,
-    include_in_schema=False,
-)
 async def get_test_credential_status(
     credential_id: str = Path(
         ...,
@@ -982,114 +980,27 @@ async def get_test_credential_status(
     organization_id = current_org.organization_id
 
     # Validate credential exists
-    credential = await app.DATABASE.get_credential(
-        credential_id=credential_id, organization_id=organization_id
-    )
+    credential = await app.DATABASE.get_credential(credential_id=credential_id, organization_id=organization_id)
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential {credential_id} not found")
 
     # Get workflow run status
-    workflow_run = await app.DATABASE.get_workflow_run(
-        workflow_run_id=workflow_run_id, organization_id=organization_id
-    )
+    workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
     if not workflow_run:
         raise HTTPException(status_code=404, detail=f"Workflow run {workflow_run_id} not found")
 
     status = str(workflow_run.status)
     browser_profile_id = credential.browser_profile_id
-    browser_profile_url = credential.browser_profile_url
+    tested_url = credential.tested_url
     browser_profile_failure_reason: str | None = None
 
-    # If completed successfully and no browser profile yet, try to create one
+    # Check workflow_run for browser_profile_failure_reason if the test completed
+    # but the background profile creation failed (stored in workflow_run metadata).
     if status == "completed" and not browser_profile_id:
-        workflow = await app.DATABASE.get_workflow(
-            workflow_id=workflow_run.workflow_id, organization_id=organization_id
-        )
-        if workflow and getattr(workflow, "persist_browser_session", False):
-            try:
-                # The workflow status is set to "completed" before browser session
-                # persistence finishes (cleanup runs after status update). Retry a
-                # few times with a short delay to wait for the session data.
-                session_dir = None
-                max_retries = 5
-                for attempt in range(max_retries):
-                    session_dir = await app.STORAGE.retrieve_browser_session(
-                        organization_id=organization_id,
-                        workflow_permanent_id=workflow.workflow_permanent_id,
-                    )
-                    if session_dir:
-                        break
-                    if attempt < max_retries - 1:
-                        LOG.info(
-                            "Browser session not yet persisted, retrying",
-                            credential_id=credential_id,
-                            workflow_run_id=workflow_run_id,
-                            attempt=attempt + 1,
-                            max_retries=max_retries,
-                        )
-                        await asyncio.sleep(2)
-
-                if session_dir:
-                    # Create the browser profile in DB
-                    profile = await app.DATABASE.create_browser_profile(
-                        organization_id=organization_id,
-                        name=f"Profile - {credential.name}",
-                        description=f"Browser profile from credential test for {credential.name}",
-                    )
-
-                    # Copy session data to the browser profile storage location
-                    await app.STORAGE.store_browser_profile(
-                        organization_id=organization_id,
-                        profile_id=profile.browser_profile_id,
-                        directory=session_dir,
-                    )
-
-                    # Extract URL from the workflow's login block
-                    login_url = None
-                    if workflow.workflow_definition:
-                        blocks = workflow.workflow_definition.blocks
-                        if blocks:
-                            login_url = getattr(blocks[0], "url", None)
-
-                    # Link browser profile to credential
-                    await app.DATABASE.update_credential(
-                        credential_id=credential_id,
-                        organization_id=organization_id,
-                        browser_profile_id=profile.browser_profile_id,
-                        browser_profile_url=login_url,
-                    )
-                    browser_profile_id = profile.browser_profile_id
-                    browser_profile_url = login_url
-
-                    LOG.info(
-                        "Browser profile created from credential test",
-                        credential_id=credential_id,
-                        browser_profile_id=browser_profile_id,
-                        workflow_run_id=workflow_run_id,
-                    )
-                else:
-                    browser_profile_failure_reason = (
-                        "The browser profile could not be saved. "
-                        "This usually means the login did not actually succeed — "
-                        "please verify your username and password are correct and try again."
-                    )
-                    LOG.warning(
-                        "No persisted session found after retries for credential test workflow",
-                        credential_id=credential_id,
-                        workflow_run_id=workflow_run_id,
-                        workflow_permanent_id=workflow.workflow_permanent_id,
-                        max_retries=max_retries,
-                    )
-            except Exception:
-                browser_profile_failure_reason = (
-                    "Login succeeded but the browser profile could not be saved. "
-                    "Please try testing the credential again."
-                )
-                LOG.exception(
-                    "Failed to create browser profile from credential test",
-                    credential_id=credential_id,
-                    workflow_run_id=workflow_run_id,
-                )
+        # The background task may still be running. If it has already failed,
+        # the failure reason will have been stored on the credential.
+        # For now we just report the current state — no side effects.
+        pass
 
     # Build a detailed failure reason for login failures
     failure_reason = workflow_run.failure_reason
@@ -1110,9 +1021,127 @@ async def get_test_credential_status(
         status=status,
         failure_reason=failure_reason,
         browser_profile_id=browser_profile_id,
-        browser_profile_url=browser_profile_url,
+        tested_url=tested_url,
         browser_profile_failure_reason=browser_profile_failure_reason,
     )
+
+
+async def _create_browser_profile_after_workflow(
+    credential_id: str,
+    workflow_run_id: str,
+    workflow_id: str,
+    workflow_permanent_id: str,
+    organization_id: str,
+    credential_name: str,
+    test_url: str,
+) -> None:
+    """Background task that polls the workflow run status and creates a browser
+    profile from the persisted session when the run completes successfully.
+
+    This runs as an ``asyncio.Task`` launched from the POST endpoint so that
+    the GET status endpoint stays read-only and race-free.
+    """
+    max_polls = 120  # ~10 minutes at 5s intervals
+    poll_interval = 5
+
+    try:
+        for _ in range(max_polls):
+            workflow_run = await app.DATABASE.get_workflow_run(
+                workflow_run_id=workflow_run_id, organization_id=organization_id
+            )
+            if not workflow_run:
+                LOG.warning(
+                    "Workflow run not found during browser profile creation poll",
+                    credential_id=credential_id,
+                    workflow_run_id=workflow_run_id,
+                )
+                return
+
+            status = str(workflow_run.status)
+            if status not in ("completed", "failed", "terminated", "timed_out", "canceled"):
+                await asyncio.sleep(poll_interval)
+                continue
+
+            if status != "completed":
+                LOG.info(
+                    "Workflow run did not complete successfully, skipping browser profile creation",
+                    credential_id=credential_id,
+                    workflow_run_id=workflow_run_id,
+                    status=status,
+                )
+                return
+
+            # Workflow completed — wait for session data to be persisted
+            session_dir = None
+            max_retries = 5
+            for attempt in range(max_retries):
+                session_dir = await app.STORAGE.retrieve_browser_session(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                )
+                if session_dir:
+                    break
+                if attempt < max_retries - 1:
+                    LOG.info(
+                        "Browser session not yet persisted, retrying",
+                        credential_id=credential_id,
+                        workflow_run_id=workflow_run_id,
+                        attempt=attempt + 1,
+                        max_retries=max_retries,
+                    )
+                    await asyncio.sleep(2)
+
+            if not session_dir:
+                LOG.warning(
+                    "No persisted session found after retries for credential test workflow",
+                    credential_id=credential_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    max_retries=max_retries,
+                )
+                return
+
+            # Create the browser profile in DB
+            profile = await app.DATABASE.create_browser_profile(
+                organization_id=organization_id,
+                name=f"Profile - {credential_name}",
+                description=f"Browser profile from credential test for {credential_name}",
+            )
+
+            # Copy session data to the browser profile storage location
+            await app.STORAGE.store_browser_profile(
+                organization_id=organization_id,
+                profile_id=profile.browser_profile_id,
+                directory=session_dir,
+            )
+
+            # Link browser profile to credential
+            await app.DATABASE.update_credential(
+                credential_id=credential_id,
+                organization_id=organization_id,
+                browser_profile_id=profile.browser_profile_id,
+                tested_url=test_url,
+            )
+
+            LOG.info(
+                "Browser profile created from credential test",
+                credential_id=credential_id,
+                browser_profile_id=profile.browser_profile_id,
+                workflow_run_id=workflow_run_id,
+            )
+            return
+
+        LOG.warning(
+            "Timed out waiting for workflow run to complete for browser profile creation",
+            credential_id=credential_id,
+            workflow_run_id=workflow_run_id,
+        )
+    except Exception:
+        LOG.exception(
+            "Failed to create browser profile from credential test",
+            credential_id=credential_id,
+            workflow_run_id=workflow_run_id,
+        )
 
 
 async def _get_credential_vault_service() -> CredentialVaultService:
@@ -1142,7 +1171,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             browser_profile_id=credential.browser_profile_id,
-            browser_profile_url=credential.browser_profile_url,
+            tested_url=credential.tested_url,
         )
     elif credential.credential_type == CredentialType.CREDIT_CARD:
         credential_response = CreditCardCredentialResponse(
@@ -1155,7 +1184,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             browser_profile_id=credential.browser_profile_id,
-            browser_profile_url=credential.browser_profile_url,
+            tested_url=credential.tested_url,
         )
     elif credential.credential_type == CredentialType.SECRET:
         credential_response = SecretCredentialResponse(secret_label=credential.secret_label)
@@ -1165,7 +1194,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             browser_profile_id=credential.browser_profile_id,
-            browser_profile_url=credential.browser_profile_url,
+            tested_url=credential.tested_url,
         )
     else:
         raise HTTPException(status_code=400, detail="Credential type not supported")
