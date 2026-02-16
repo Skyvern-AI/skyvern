@@ -11,6 +11,7 @@ from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
     CredentialParameterNotFoundError,
+    CredentialVaultNotConfiguredError,
     ImaginarySecretValue,
     SkyvernException,
     WorkflowRunContextNotInitialized,
@@ -396,7 +397,7 @@ class WorkflowRunContext:
         vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
         credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
         if credential_service is None:
-            raise CredentialParameterNotFoundError(credential_id)
+            raise CredentialVaultNotConfiguredError(vault_type=vault_type.value, credential_id=credential_id)
 
         credential_item = await credential_service.get_credential_item(db_credential)
         credential = credential_item.credential
