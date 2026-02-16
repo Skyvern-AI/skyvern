@@ -90,20 +90,46 @@
           {
             "group": "Getting Started",
             "pages": [
-              "cloud/overview",
-              "cloud/run-your-first-task",
-              "cloud/run-a-task",
-              "cloud/monitor-a-run"
+              "cloud/getting-started/overview",
+              "cloud/getting-started/run-your-first-task",
+              "cloud/getting-started/run-a-task",
+              "cloud/getting-started/monitor-a-run"
             ]
           },
           {
             "group": "Building Workflows",
             "pages": [
-              "cloud/build-a-workflow",
-              "cloud/manage-workflows",
-              "cloud/add-parameters",
-              "cloud/configure-blocks",
-              "cloud/run-a-workflow"
+              "cloud/building-workflows/build-a-workflow",
+              "cloud/building-workflows/manage-workflows",
+              "cloud/building-workflows/add-parameters",
+              "cloud/building-workflows/configure-blocks",
+              "cloud/building-workflows/run-a-workflow"
+            ]
+          },
+          {
+            "group": "Viewing Results",
+            "pages": [
+              "cloud/viewing-results/run-history",
+              "cloud/viewing-results/run-details",
+              "cloud/viewing-results/downloading-artifacts"
+            ]
+          },
+          {
+            "group": "Managing Credentials",
+            "pages": [
+              "cloud/managing-credentials/credentials-overview",
+              "cloud/managing-credentials/password-credentials",
+              "cloud/managing-credentials/credit-card-credentials",
+              "cloud/managing-credentials/totp-setup"
+            ]
+          },
+          {
+            "group": "Account & Settings",
+            "pages": [
+              "cloud/account-settings/api-keys",
+              "cloud/account-settings/billing-usage",
+              "cloud/account-settings/organization-settings",
+              "cloud/account-settings/profile-settings"
             ]
           },
           {
@@ -134,7 +160,7 @@
               "sdk-reference/complete-reference"
             ]
           },
-        {
+          {
             "group": "TypeScript SDK",
             "pages": [
               "ts-sdk-reference/overview",
@@ -152,8 +178,25 @@
         ]
       },
       {
+        "tab": "Cookbooks",
+        "pages": [
+          "cookbooks/overview",
+          "cookbooks/bulk-invoice-downloader",
+          "cookbooks/job-application-filler",
+          "cookbooks/healthcare-portal-data"
+        ]
+      },
+      {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
+      },
+      {
+        "tab": "Cookbooks",
+        "pages": [
+          "cookbooks/overview",
+          "cookbooks/bulk-invoice-downloader",
+          "cookbooks/job-application-filler"
+        ]
       }
     ]
   },
