@@ -694,9 +694,6 @@ async def run_task_v2_helper(
             return workflow, workflow_run, task_v2
 
         LOG.info(f"Task v2 iteration i={i}", workflow_run_id=workflow_run_id, url=url)
-        task_type = ""
-        plan = ""
-        block: BlockTypeVar | None = None
         task_history_record: dict[str, Any] = {}
         context = skyvern_context.ensure_context()
 

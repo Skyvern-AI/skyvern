@@ -3,7 +3,24 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
+from sqlalchemy import (
+    Text,
+    and_,
+    asc,
+    case,
+    cast,
+    delete,
+    distinct,
+    exists,
+    func,
+    literal,
+    or_,
+    pool,
+    select,
+    tuple_,
+    update,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import (
     SQLAlchemyError,
 )
@@ -112,6 +129,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -227,6 +245,18 @@ class AgentDB(BaseAlchemyDB):
         download_timeout: float | None = None,
     ) -> Task:
         try:
+            # Sanitize text fields to remove NUL bytes and control characters
+            # that PostgreSQL cannot store in text columns
+            def _sanitize(v: str | None) -> str | None:
+                return sanitize_postgres_text(v) if isinstance(v, str) else v
+
+            navigation_goal = _sanitize(navigation_goal)
+            data_extraction_goal = _sanitize(data_extraction_goal)
+            title = _sanitize(title)
+            url = sanitize_postgres_text(url)
+            complete_criterion = _sanitize(complete_criterion)
+            terminate_criterion = _sanitize(terminate_criterion)
+
             async with self.Session() as session:
                 new_task = TaskModel(
                     status=status,
@@ -2793,8 +2823,8 @@ class AgentDB(BaseAlchemyDB):
                     key_like = f"%{search_key}%"
                     # Match workflow_run_id directly
                     id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
-                    # Match parameter key, description, or value
-                    param_exists = exists(
+                    # Match parameter key or description (only for non-deleted parameter definitions)
+                    param_key_desc_exists = exists(
                         select(1)
                         .select_from(WorkflowRunParameterModel)
                         .join(
@@ -2808,11 +2838,24 @@ class AgentDB(BaseAlchemyDB):
                             or_(
                                 WorkflowParameterModel.key.ilike(key_like),
                                 WorkflowParameterModel.description.ilike(key_like),
-                                WorkflowRunParameterModel.value.ilike(key_like),
                             )
                         )
                     )
-                    workflow_run_query = workflow_run_query.where(or_(id_matches, param_exists))
+                    # Match run parameter value directly (searches all values regardless of parameter definition status)
+                    param_value_exists = exists(
+                        select(1)
+                        .select_from(WorkflowRunParameterModel)
+                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                        .where(WorkflowRunParameterModel.value.ilike(key_like))
+                    )
+                    # Match extra HTTP headers (cast JSON to text for search, skip NULLs)
+                    extra_headers_match = and_(
+                        WorkflowRunModel.extra_http_headers.isnot(None),
+                        func.cast(WorkflowRunModel.extra_http_headers, Text()).ilike(key_like),
+                    )
+                    workflow_run_query = workflow_run_query.where(
+                        or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match)
+                    )
 
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
@@ -2988,6 +3031,57 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    @staticmethod
+    def _apply_search_key_filter(query, search_key: str | None):  # type: ignore[no-untyped-def]
+        if not search_key:
+            return query
+        key_like = f"%{search_key}%"
+        # Match workflow_run_id directly
+        id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
+        # Match parameter key or description (only for non-deleted parameter definitions)
+        # Use EXISTS to avoid duplicate rows and to keep pagination correct
+        param_key_desc_exists = exists(
+            select(1)
+            .select_from(WorkflowRunParameterModel)
+            .join(
+                WorkflowParameterModel,
+                WorkflowParameterModel.workflow_parameter_id == WorkflowRunParameterModel.workflow_parameter_id,
+            )
+            .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+            .where(WorkflowParameterModel.deleted_at.is_(None))
+            .where(
+                or_(
+                    WorkflowParameterModel.key.ilike(key_like),
+                    WorkflowParameterModel.description.ilike(key_like),
+                )
+            )
+        )
+        # Match run parameter value directly (searches all values regardless of parameter definition status)
+        param_value_exists = exists(
+            select(1)
+            .select_from(WorkflowRunParameterModel)
+            .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+            .where(WorkflowRunParameterModel.value.ilike(key_like))
+        )
+        # Match extra HTTP headers (cast JSON to text for search, skip NULLs)
+        extra_headers_match = and_(
+            WorkflowRunModel.extra_http_headers.isnot(None),
+            func.cast(WorkflowRunModel.extra_http_headers, Text()).ilike(key_like),
+        )
+        return query.where(or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match))
+
+    @staticmethod
+    def _apply_error_code_filter(query, error_code: str | None):  # type: ignore[no-untyped-def]
+        if not error_code:
+            return query
+        error_code_exists = exists(
+            select(1)
+            .select_from(TaskModel)
+            .where(TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+            .where(cast(TaskModel.errors, JSONB).contains(literal([{"error_code": error_code}], type_=JSONB)))
+        )
+        return query.where(error_code_exists)
+
     async def get_workflow_runs(
         self,
         organization_id: str,
@@ -2995,6 +3089,8 @@ class AgentDB(BaseAlchemyDB):
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
         ordering: tuple[str, str] | None = None,
+        search_key: str | None = None,
+        error_code: str | None = None,
     ) -> list[WorkflowRun]:
         try:
             async with self.Session() as session:
@@ -3006,6 +3102,9 @@ class AgentDB(BaseAlchemyDB):
                     .filter(WorkflowRunModel.organization_id == organization_id)
                     .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 )
+
+                query = self._apply_search_key_filter(query, search_key)
+                query = self._apply_error_code_filter(query, error_code)
 
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
@@ -3069,9 +3168,11 @@ class AgentDB(BaseAlchemyDB):
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
         search_key: str | None = None,
+        error_code: str | None = None,
     ) -> list[WorkflowRun]:
         """
-        Get runs for a workflow, with optional `search_key` on parameter key/description/value.
+        Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
+        or extra HTTP headers.
         """
         try:
             async with self.Session() as session:
@@ -3082,29 +3183,8 @@ class AgentDB(BaseAlchemyDB):
                     .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
                     .filter(WorkflowRunModel.organization_id == organization_id)
                 )
-                if search_key:
-                    key_like = f"%{search_key}%"
-                    # Filter runs where any run parameter matches by key/description/value
-                    # Use EXISTS to avoid duplicate rows and to keep pagination correct
-                    param_exists = exists(
-                        select(1)
-                        .select_from(WorkflowRunParameterModel)
-                        .join(
-                            WorkflowParameterModel,
-                            WorkflowParameterModel.workflow_parameter_id
-                            == WorkflowRunParameterModel.workflow_parameter_id,
-                        )
-                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
-                        .where(WorkflowParameterModel.deleted_at.is_(None))
-                        .where(
-                            or_(
-                                WorkflowParameterModel.key.ilike(key_like),
-                                WorkflowParameterModel.description.ilike(key_like),
-                                WorkflowRunParameterModel.value.ilike(key_like),
-                            )
-                        )
-                    )
-                    query = query.where(param_exists)
+                query = self._apply_search_key_filter(query, search_key)
+                query = self._apply_error_code_filter(query, error_code)
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
                 query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
@@ -5158,6 +5238,45 @@ class AgentDB(BaseAlchemyDB):
                 credential.browser_profile_id = browser_profile_id
             if tested_url is not None:
                 credential.tested_url = tested_url
+            await session.commit()
+            await session.refresh(credential)
+            return Credential.model_validate(credential)
+
+    async def update_credential_vault_data(
+        self,
+        credential_id: str,
+        organization_id: str,
+        item_id: str,
+        name: str,
+        credential_type: CredentialType,
+        username: str | None = None,
+        totp_type: str = "none",
+        totp_identifier: str | None = None,
+        card_last4: str | None = None,
+        card_brand: str | None = None,
+        secret_label: str | None = None,
+    ) -> Credential:
+        async with self.Session() as session:
+            credential = (
+                await session.scalars(
+                    select(CredentialModel)
+                    .filter_by(credential_id=credential_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(CredentialModel.deleted_at.is_(None))
+                    .with_for_update()
+                )
+            ).first()
+            if not credential:
+                raise NotFoundError(f"Credential {credential_id} not found")
+            credential.item_id = item_id
+            credential.name = name
+            credential.credential_type = credential_type
+            credential.username = username
+            credential.totp_type = totp_type
+            credential.totp_identifier = totp_identifier
+            credential.card_last4 = card_last4
+            credential.card_brand = card_brand
+            credential.secret_label = secret_label
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)

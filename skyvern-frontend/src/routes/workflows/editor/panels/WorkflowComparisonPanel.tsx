@@ -38,7 +38,7 @@ type Props = {
 // Mapping from WorkflowBlock.block_type to ReactFlow node.type
 const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   task: "task",
-  task_v2: "taskv2",
+  task_v2: "navigation", // task_v2 blocks are displayed as navigation nodes with V2 engine
   validation: "validation",
   action: "action",
   navigation: "navigation",

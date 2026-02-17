@@ -9,6 +9,7 @@ import {
   useCredentialModalState,
   CredentialModalTypes,
 } from "./useCredentialModalState";
+import type { CredentialModalType } from "./useCredentialModalState";
 import { PasswordCredentialContent } from "./PasswordCredentialContent";
 import { SecretCredentialContent } from "./SecretCredentialContent";
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -17,6 +18,10 @@ import { CreditCardCredentialContent } from "./CreditCardCredentialContent";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   CreateCredentialRequest,
+  CredentialApiResponse,
+  isPasswordCredential,
+  isCreditCardCredential,
+  isSecretCredential,
   TestCredentialStatusResponse,
   TestLoginResponse,
 } from "@/api/types";
@@ -27,8 +32,10 @@ import { AxiosError } from "axios";
 import {
   CheckCircledIcon,
   CrossCircledIcon,
+  InfoCircledIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -83,24 +90,33 @@ type Props = {
   /** Optional controlled mode: pass isOpen and onOpenChange to control modal state locally */
   isOpen?: boolean;
   onOpenChange?: (open: boolean) => void;
+  /** When provided, the modal opens in edit mode and pre-fills available fields */
+  editingCredential?: CredentialApiResponse;
+  /** Override the modal type (used in edit mode to set the correct form) */
+  overrideType?: CredentialModalType;
 };
 
 function CredentialsModal({
   onCredentialCreated,
   isOpen: controlledIsOpen,
   onOpenChange: controlledOnOpenChange,
+  editingCredential,
+  overrideType,
 }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const {
     isOpen: urlIsOpen,
-    type,
+    type: urlType,
     setIsOpen: setUrlIsOpen,
   } = useCredentialModalState();
+
+  const isEditMode = !!editingCredential;
 
   // Use controlled props if provided, otherwise fall back to URL-based state
   const isOpen = controlledIsOpen ?? urlIsOpen;
   const setIsOpen = controlledOnOpenChange ?? setUrlIsOpen;
+  const type = overrideType ?? urlType;
   const { data: credentials } = useCredentialsQuery({
     page_size: 100,
   });
@@ -138,11 +154,47 @@ function CredentialsModal({
 
   const nameInitializedRef = useRef(false);
 
-  // Set default name only when modal first opens (not on every credentials refetch)
+  // Set default name when modal opens, or pre-populate fields in edit mode
   useEffect(() => {
-    if (isOpen && credentials && !nameInitializedRef.current) {
+    if (!isOpen) {
+      nameInitializedRef.current = false;
+      return;
+    }
+
+    if (isEditMode) {
+      reset();
+      const cred = editingCredential.credential;
+      if (isPasswordCredential(cred)) {
+        setPasswordCredentialValues({
+          name: editingCredential.name,
+          username: cred.username,
+          password: "",
+          totp: "",
+          totp_type: cred.totp_type,
+          totp_identifier: cred.totp_identifier ?? "",
+        });
+      } else if (isCreditCardCredential(cred)) {
+        setCreditCardCredentialValues({
+          name: editingCredential.name,
+          cardNumber: "",
+          cardExpirationDate: "",
+          cardCode: "",
+          cardBrand: cred.brand,
+          cardHolderName: "",
+        });
+      } else if (isSecretCredential(cred)) {
+        setSecretCredentialValues({
+          name: editingCredential.name,
+          secretLabel: cred.secret_label ?? "",
+          secretValue: "",
+        });
+      }
+      return;
+    }
+
+    if (credentials && !nameInitializedRef.current) {
       nameInitializedRef.current = true;
-      const existingNames = credentials.map((cred) => cred.name);
+      const existingNames = credentials.map((c) => c.name);
       const defaultName = generateDefaultCredentialName(existingNames);
 
       setPasswordCredentialValues((prev) => ({
@@ -158,10 +210,7 @@ function CredentialsModal({
         name: defaultName,
       }));
     }
-    if (!isOpen) {
-      nameInitializedRef.current = false;
-    }
-  }, [isOpen, credentials]);
+  }, [isOpen, credentials, isEditMode, editingCredential]);
 
   function reset() {
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
@@ -353,6 +402,41 @@ function CredentialsModal({
     },
   });
 
+  const updateCredentialMutation = useMutation({
+    mutationFn: async (request: CreateCredentialRequest) => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const response = await client.post(
+        `/credentials/${editingCredential?.credential_id}/update`,
+        request,
+      );
+      return response.data;
+    },
+    onSuccess: () => {
+      reset();
+      setIsOpen(false);
+      queryClient.invalidateQueries({
+        queryKey: ["credentials"],
+      });
+      toast({
+        title: "Credential updated",
+        description: "Your credential has been updated successfully",
+        variant: "success",
+      });
+    },
+    onError: (error: AxiosError) => {
+      const detail = (error.response?.data as { detail?: string })?.detail;
+      toast({
+        title: "Error",
+        description: detail ? detail : error.message,
+        variant: "destructive",
+      });
+    },
+  });
+
+  const activeMutation = isEditMode
+    ? updateCredentialMutation
+    : createCredentialMutation;
+
   const handleSave = () => {
     const name =
       type === CredentialModalTypes.PASSWORD
@@ -390,7 +474,7 @@ function CredentialsModal({
         return;
       }
 
-      createCredentialMutation.mutate({
+      activeMutation.mutate({
         name,
         credential_type: "password",
         credential: {
@@ -445,7 +529,7 @@ function CredentialsModal({
       }
       // remove all spaces from the card number
       const number = creditCardCredentialValues.cardNumber.replace(/\s/g, "");
-      createCredentialMutation.mutate({
+      activeMutation.mutate({
         name,
         credential_type: "credit_card",
         credential: {
@@ -470,7 +554,7 @@ function CredentialsModal({
         return;
       }
 
-      createCredentialMutation.mutate({
+      activeMutation.mutate({
         name,
         credential_type: "secret",
         credential: {
@@ -581,8 +665,19 @@ function CredentialsModal({
     >
       <DialogContent className="w-[700px] max-w-[700px]">
         <DialogHeader>
-          <DialogTitle className="font-bold">Add Credential</DialogTitle>
+          <DialogTitle className="font-bold">
+            {isEditMode ? "Edit Credential" : "Add Credential"}
+          </DialogTitle>
         </DialogHeader>
+        {isEditMode && (
+          <Alert>
+            <InfoCircledIcon className="size-4" />
+            <AlertDescription>
+              For security, saved passwords and secrets are never retrieved.
+              Please re-enter all fields to update this credential.
+            </AlertDescription>
+          </Alert>
+        )}
         {credentialContent}
 
         {/* Test & Save Browser Profile section — only for password credentials */}
@@ -698,13 +793,13 @@ function CredentialsModal({
             <Button
               onClick={handleSave}
               disabled={
-                createCredentialMutation.isPending || renameCredentialMutation.isPending || isTestInProgress
+                activeMutation.isPending || renameCredentialMutation.isPending || isTestInProgress
               }
             >
-              {createCredentialMutation.isPending || renameCredentialMutation.isPending ? (
+              {activeMutation.isPending || renameCredentialMutation.isPending ? (
                 <ReloadIcon className="mr-2 size-4 animate-spin" />
               ) : null}
-              Save
+              {isEditMode ? "Update" : "Save"}
             </Button>
           </div>
         </DialogFooter>

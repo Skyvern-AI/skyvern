@@ -57,6 +57,6 @@ class LLMProviderErrorRetryableTask(LLMProviderError):
 class NoProviderEnabledError(BaseLLMError):
     def __init__(self) -> None:
         super().__init__(
-            "At least one LLM provider must be enabled. Run setup.sh and follow through the LLM provider setup, or "
-            "update the .env file (check out .env.example to see the required environment variables)."
+            "At least one LLM provider must be enabled. Run `skyvern init` and follow through the LLM provider setup, "
+            "or update the .env file (check out .env.example to see the required environment variables)."
         )

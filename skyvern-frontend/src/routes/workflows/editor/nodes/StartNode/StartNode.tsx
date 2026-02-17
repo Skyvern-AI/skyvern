@@ -22,7 +22,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ProxyLocation } from "@/api/types";
 import { Label } from "@/components/ui/label";
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -75,6 +75,31 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   const rerender = useRerender({ prefix: "accordion" });
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const isRecording = recordingStore.isRecording;
+
+  // Local state for webhook URL to fix race condition where data.webhookCallbackUrl
+  // isn't updated yet when user clicks "Test Webhook" after typing
+  const webhookCallbackUrl = data.withWorkflowSettings
+    ? data.webhookCallbackUrl
+    : "";
+  const [localWebhookUrl, setLocalWebhookUrl] = useState(webhookCallbackUrl);
+  const prevWebhookUrl = useRef(webhookCallbackUrl);
+
+  // Sync from parent only on external changes (e.g., undo/redo), not our own updates
+  useEffect(() => {
+    if (!data.withWorkflowSettings) {
+      setLocalWebhookUrl("");
+      return;
+    }
+
+    const parentChanged = webhookCallbackUrl !== prevWebhookUrl.current;
+    const isExternalChange =
+      parentChanged && localWebhookUrl === prevWebhookUrl.current;
+
+    if (isExternalChange) {
+      setLocalWebhookUrl(webhookCallbackUrl);
+    }
+    prevWebhookUrl.current = webhookCallbackUrl;
+  }, [data.withWorkflowSettings, webhookCallbackUrl, localWebhookUrl]);
 
   const parentNode = parentId ? reactFlowInstance.getNode(parentId) : null;
   const isInsideConditional = parentNode?.type === "conditional";
@@ -222,9 +247,10 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                         <div className="flex flex-col gap-2">
                           <Input
                             className="w-full"
-                            value={data.webhookCallbackUrl}
+                            value={localWebhookUrl}
                             placeholder="https://"
                             onChange={(event) => {
+                              setLocalWebhookUrl(event.target.value);
                               update({
                                 webhookCallbackUrl: event.target.value,
                               });
@@ -233,15 +259,14 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                           <TestWebhookDialog
                             runType="workflow_run"
                             runId={null}
-                            initialWebhookUrl={
-                              data.webhookCallbackUrl || undefined
-                            }
+                            initialWebhookUrl={localWebhookUrl || undefined}
+                            autoRunOnOpen={false}
                             trigger={
                               <Button
                                 type="button"
                                 variant="secondary"
                                 className="self-start"
-                                disabled={!data.webhookCallbackUrl}
+                                disabled={!localWebhookUrl}
                               >
                                 Test Webhook
                               </Button>

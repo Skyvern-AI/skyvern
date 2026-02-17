@@ -1,4 +1,5 @@
 import asyncio
+import json
 from enum import Enum
 from typing import Annotated, Any
 
@@ -25,7 +26,6 @@ from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
 from skyvern.exceptions import (
-    CannotUpdateWorkflowDueToCodeCache,
     MissingBrowserAddressError,
     SkyvernHTTPException,
 )
@@ -334,7 +334,7 @@ async def run_task(
 
 @base_router.post(
     "/run/workflows",
-    tags=["Workflows"],
+    tags=["Workflow Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
@@ -439,7 +439,7 @@ async def run_workflow(
 
 @base_router.get(
     "/runs/{run_id}",
-    tags=["Agent", "Workflows"],
+    tags=["Agent", "Workflow Runs"],
     response_model=RunResponse,
     description="Get run information (task run, workflow run)",
     summary="Get a run by id",
@@ -481,7 +481,7 @@ async def get_run(
 
 @base_router.post(
     "/runs/{run_id}/cancel",
-    tags=["Agent", "Workflows"],
+    tags=["Agent", "Workflow Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "cancel_run",
         "x-fern-examples": [
@@ -922,7 +922,6 @@ async def update_workflow_legacy(
         ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    delete_code_cache_is_ok: bool = Query(False),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
     # validate the workflow
@@ -938,13 +937,7 @@ async def update_workflow_legacy(
             organization=current_org,
             request=workflow_create_request,
             workflow_permanent_id=workflow_id,
-            delete_code_cache_is_ok=delete_code_cache_is_ok,
         )
-    except CannotUpdateWorkflowDueToCodeCache as e:
-        raise HTTPException(
-            status_code=422,
-            detail=str(e),
-        ) from e
     except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
@@ -1452,7 +1445,7 @@ async def get_run_artifacts(
 
 @base_router.post(
     "/runs/{run_id}/retry_webhook",
-    tags=["Agent"],
+    tags=["Agent", "Workflow Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "retry_run_webhook",
         "x-fern-examples": [
@@ -1485,7 +1478,7 @@ async def retry_run_webhook(
 
 @base_router.get(
     "/runs/{run_id}/timeline",
-    tags=["Agent", "Workflows"],
+    tags=["Agent", "Workflow Runs"],
     response_model=list[WorkflowRunTimeline],
     openapi_extra={
         "x-fern-sdk-method-name": "get_run_timeline",
@@ -1580,34 +1573,44 @@ async def run_block(
     # LOG.critical("REMOVING BROWSER SESSION ID")
     # block_run_request.browser_session_id = None
 
-    await block_service.validate_block_labels(
-        workflow_permanent_id=block_run_request.workflow_id,
-        organization_id=organization.organization_id,
-        block_labels=block_run_request.block_labels,
-    )
+    try:
+        await block_service.validate_block_labels(
+            workflow_permanent_id=block_run_request.workflow_id,
+            organization_id=organization.organization_id,
+            block_labels=block_run_request.block_labels,
+        )
 
-    workflow_run = await block_service.ensure_workflow_run(
-        organization=organization,
-        template=template,
-        workflow_permanent_id=block_run_request.workflow_id,
-        block_run_request=block_run_request,
-    )
+        workflow_run = await block_service.ensure_workflow_run(
+            organization=organization,
+            template=template,
+            workflow_permanent_id=block_run_request.workflow_id,
+            block_run_request=block_run_request,
+        )
 
-    browser_session_id = block_run_request.browser_session_id
+        browser_session_id = block_run_request.browser_session_id
 
-    await block_service.execute_blocks(
-        request=request,
-        background_tasks=background_tasks,
-        api_key=x_api_key or "",
-        block_labels=block_run_request.block_labels,
-        workflow_id=block_run_request.workflow_id,
-        workflow_run_id=workflow_run.workflow_run_id,
-        workflow_permanent_id=workflow_run.workflow_permanent_id,
-        organization=organization,
-        user_id=user_id,
-        browser_session_id=browser_session_id,
-        block_outputs=block_run_request.block_outputs,
-    )
+        await block_service.execute_blocks(
+            request=request,
+            background_tasks=background_tasks,
+            api_key=x_api_key or "",
+            block_labels=block_run_request.block_labels,
+            workflow_id=block_run_request.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id,
+            organization=organization,
+            user_id=user_id,
+            browser_session_id=browser_session_id,
+            block_outputs=block_run_request.block_outputs,
+        )
+    except SkyvernHTTPException:
+        raise
+    except Exception:
+        LOG.exception(
+            "Unexpected error running blocks",
+            workflow_id=block_run_request.workflow_id,
+            organization_id=organization.organization_id,
+        )
+        raise
 
     return BlockRunResponse(
         block_labels=block_run_request.block_labels,
@@ -1990,7 +1993,13 @@ async def get_runs(
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     search_key: str | None = Query(
         None,
-        description="Search runs by parameter key, parameter description, or run parameter value.",
+        description=(
+            "Case-insensitive substring search across: workflow run ID, "
+            "parameter key, parameter description, run parameter value, "
+            "and extra HTTP headers. A run is returned if any of these fields match. "
+            "Soft-deleted parameter definitions are excluded from key/description matching."
+        ),
+        examples=["login_url", "credential_value", "wr_abc123"],
     ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-get")
@@ -2200,6 +2209,46 @@ async def run_workflow_legacy(
     )
 
 
+@base_router.get(
+    "/workflows/runs",
+    response_model=list[WorkflowRun],
+    tags=["Workflow Runs"],
+    description=(
+        "List workflow runs across all workflows for the current organization.\n\n"
+        "Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. "
+        "All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n"
+        "### search_key\n\n"
+        "A case-insensitive substring search that matches against **any** of the following fields:\n\n"
+        "| Searched field | Description |\n"
+        "|---|---|\n"
+        "| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n"
+        "| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n"
+        "| Parameter **description** | The `description` of any workflow parameter definition |\n"
+        "| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n"
+        "| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n\n"
+        "Soft-deleted parameter definitions are excluded from key/description matching. "
+        "A run is returned if **any** of the fields above contain the search term.\n\n"
+        "### error_code\n\n"
+        "An **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. "
+        "A run matches if **any** of its tasks contains an error object with a matching `error_code` value. "
+        "Error codes are user-defined strings set during workflow execution "
+        "(e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n"
+        "### Combining filters\n\n"
+        "All query parameters use AND logic:\n"
+        "- `?status=failed` — only failed runs\n"
+        "- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n"
+        "- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match"
+    ),
+    summary="List workflow runs",
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_workflow_runs",
+    },
+)
+@base_router.get(
+    "/workflows/runs/",
+    response_model=list[WorkflowRun],
+    include_in_schema=False,
+)
 @legacy_base_router.get(
     "/workflows/runs",
     response_model=list[WorkflowRun],
@@ -2214,17 +2263,61 @@ async def run_workflow_legacy(
     include_in_schema=False,
 )
 async def get_workflow_runs(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
-    status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    page: int = Query(1, ge=1, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
+    search_key: str | None = Query(
+        None,
+        max_length=500,
+        description=(
+            "Case-insensitive substring search across: workflow run ID, "
+            "parameter key, parameter description, run parameter value, "
+            "and extra HTTP headers. A run is returned if any of these fields match. "
+            "Soft-deleted parameter definitions are excluded from key/description matching."
+        ),
+        examples=["login_url", "credential_value", "wr_abc123"],
+    ),
+    error_code: str | None = Query(
+        None,
+        max_length=500,
+        description=(
+            "Exact-match filter on the error_code field inside each task's errors JSON array. "
+            "A run matches if any of its tasks contains an error with a matching error_code. "
+            "Error codes are user-defined strings set during workflow execution."
+        ),
+        examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
+    """
+    List workflow runs across all workflows for the current organization.
+
+    All filters (**status**, **search_key**, **error_code**) are combined with AND logic.
+
+    **search_key** performs a case-insensitive substring match across:
+    - `workflow_run_id` — the unique run identifier
+    - Parameter **key** and **description** from workflow parameter definitions (soft-deleted parameters excluded)
+    - Run parameter **value** — the actual value supplied when the run was created
+    - `extra_http_headers` — searched as raw JSON text
+
+    **error_code** performs an exact match against the `error_code` field in the `errors`
+    JSON array on each task. A run matches if *any* of its tasks has a matching error code.
+
+    **Examples:**
+    - All failed runs: `?status=failed`
+    - Failed runs with a specific error: `?status=failed&error_code=INVALID_CREDENTIALS`
+    - Runs matching a parameter value: `?search_key=https://example.com`
+    - Runs matching a run ID: `?search_key=wr_abc123`
+    - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
+    """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs(
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
         status=status,
+        search_key=search_key,
+        error_code=error_code,
     )
 
 
@@ -2232,6 +2325,19 @@ async def get_workflow_runs(
     "/workflows/{workflow_id}/runs",
     response_model=list[WorkflowRun],
     tags=["agent"],
+    description=(
+        "List runs for a specific workflow.\n\n"
+        "Supports filtering by **status**, **search_key**, and **error_code**. "
+        "All filters are combined with **AND** logic.\n\n"
+        "### search_key\n\n"
+        "Case-insensitive substring search across: workflow run ID, "
+        "parameter key, parameter description, run parameter value, "
+        "and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n"
+        "### error_code\n\n"
+        "Exact-match filter on the `error_code` field inside each task's `errors` JSON array. "
+        "A run matches if any of its tasks contains an error with a matching `error_code`."
+    ),
+    summary="List runs for a workflow",
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow_runs_by_id",
     },
@@ -2243,17 +2349,52 @@ async def get_workflow_runs(
 )
 async def get_workflow_runs_by_id(
     workflow_id: str,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
-    status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    page: int = Query(1, ge=1, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
     search_key: str | None = Query(
         None,
-        description="Search runs by parameter key, parameter description, or run parameter value.",
+        max_length=500,
+        description=(
+            "Case-insensitive substring search across: workflow run ID, "
+            "parameter key, parameter description, run parameter value, "
+            "and extra HTTP headers. A run is returned if any of these fields match. "
+            "Soft-deleted parameter definitions are excluded from key/description matching."
+        ),
+        examples=["login_url", "credential_value", "wr_abc123"],
+    ),
+    error_code: str | None = Query(
+        None,
+        max_length=500,
+        description=(
+            "Exact-match filter on the error_code field inside each task's errors JSON array. "
+            "A run matches if any of its tasks contains an error with a matching error_code. "
+            "Error codes are user-defined strings set during workflow execution."
+        ),
+        examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
-    Get workflow runs for a specific workflow permanent id.
+    List runs for a specific workflow permanent id.
+
+    All filters (**status**, **search_key**, **error_code**) are combined with AND logic.
+
+    **search_key** performs a case-insensitive substring match across:
+    - `workflow_run_id` — the unique run identifier
+    - Parameter **key** and **description** from workflow parameter definitions (soft-deleted parameters excluded)
+    - Run parameter **value** — the actual value supplied when the run was created
+    - `extra_http_headers` — searched as raw JSON text
+
+    **error_code** performs an exact match against the `error_code` field in the `errors`
+    JSON array on each task. A run matches if *any* of its tasks has a matching error code.
+
+    **Examples:**
+    - All failed runs: `?status=failed`
+    - Failed runs with a specific error: `?status=failed&error_code=INVALID_CREDENTIALS`
+    - Runs matching a parameter value: `?search_key=https://example.com`
+    - Runs matching a run ID: `?search_key=wr_abc123`
+    - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
     """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
@@ -2263,6 +2404,7 @@ async def get_workflow_runs_by_id(
         page_size=page_size,
         status=status,
         search_key=search_key,
+        error_code=error_code,
     )
 
 
@@ -2421,9 +2563,20 @@ async def get_workflows(
     only_templates: bool = Query(False),
     search_key: str | None = Query(
         None,
-        description="Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).",
+        description=(
+            "Case-insensitive substring search across: workflow title, folder name, "
+            "and parameter metadata (key, description, default_value). "
+            "A workflow is returned if any of these fields match. "
+            "Soft-deleted parameter definitions are excluded. "
+            "Takes precedence over the deprecated `title` parameter."
+        ),
+        examples=["my_workflow", "login_url", "production"],
     ),
-    title: str = Query("", deprecated=True, description="Deprecated: use search_key instead."),
+    title: str = Query(
+        "",
+        deprecated=True,
+        description="Deprecated: use search_key instead. Falls back to title-only search if search_key is not provided.",
+    ),
     folder_id: str | None = Query(None, description="Filter workflows by folder ID"),
     status: Annotated[list[WorkflowStatus] | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -2615,7 +2768,33 @@ async def suggest(
     llm_prompt = ""
 
     if ai_suggestion_type == AISuggestionType.DATA_SCHEMA:
-        llm_prompt = prompt_engine.load_prompt("suggest-data-schema", input=data.input, additional_context=data.context)
+        existing_schema = None
+        additional_context = data.context
+        if data.context:
+            raw_schema = data.context.get("current_schema")
+            if raw_schema:
+                if isinstance(raw_schema, dict):
+                    existing_schema = json.dumps(raw_schema, indent=2)
+                elif isinstance(raw_schema, str) and raw_schema not in ("null", ""):
+                    try:
+                        existing_schema = json.dumps(json.loads(raw_schema), indent=2)
+                    except (json.JSONDecodeError, TypeError):
+                        LOG.warning("Invalid JSON in current_schema context, ignoring", raw_schema=raw_schema)
+            additional_context = {k: v for k, v in data.context.items() if k != "current_schema"}
+            if not additional_context:
+                additional_context = None
+        if existing_schema:
+            LOG.info(
+                "Using existing schema for data schema suggestion",
+                schema_length=len(existing_schema),
+                has_additional_context=bool(additional_context),
+            )
+        llm_prompt = prompt_engine.load_prompt(
+            "suggest-data-schema",
+            input=data.input,
+            additional_context=additional_context,
+            existing_schema=existing_schema,
+        )
 
     try:
         new_ai_suggestion = await app.DATABASE.create_ai_suggestion(

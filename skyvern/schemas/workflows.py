@@ -383,6 +383,7 @@ class FileType(StrEnum):
     EXCEL = "excel"
     PDF = "pdf"
     IMAGE = "image"
+    DOCX = "docx"
 
 
 class PDFFormat(StrEnum):

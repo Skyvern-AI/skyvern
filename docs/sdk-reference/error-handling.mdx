@@ -1,0 +1,168 @@
+---
+title: Error Handling
+subtitle: Handle API errors, timeouts, and configure retries
+slug: sdk-reference/error-handling
+---
+
+The SDK raises typed exceptions for API errors. All errors extend `ApiError` and include the HTTP status code, response headers, and body.
+
+---
+
+## Error types
+
+| Exception | Status Code | When it's raised |
+|-----------|-------------|------------------|
+| `BadRequestError` | 400 | Invalid request parameters. |
+| `ForbiddenError` | 403 | Invalid or missing API key. |
+| `NotFoundError` | 404 | Resource (run, workflow, session) not found. |
+| `ConflictError` | 409 | Resource conflict (e.g., duplicate creation). |
+| `UnprocessableEntityError` | 422 | Request validation failed. |
+| `ApiError` | Any | Base class for all API errors. Catch this as a fallback. |
+
+The specific error classes live in `skyvern.client.errors`. The base `ApiError` class lives in `skyvern.client.core`:
+
+```python
+from skyvern.client.core import ApiError
+from skyvern.client.errors import (
+    BadRequestError,
+    ForbiddenError,
+    NotFoundError,
+    ConflictError,
+    UnprocessableEntityError,
+)
+```
+
+---
+
+## Catching errors
+
+```python
+from skyvern import Skyvern
+from skyvern.client.core import ApiError
+from skyvern.client.errors import NotFoundError
+
+client = Skyvern(api_key="YOUR_API_KEY")
+
+try:
+    run = await client.get_run("tsk_nonexistent")
+except NotFoundError as e:
+    print(f"Run not found: {e.body}")
+except ApiError as e:
+    print(f"API error {e.status_code}: {e.body}")
+```
+
+### Error properties
+
+Every error has these attributes:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `status_code` | `int \| None` | HTTP status code. |
+| `body` | `Any` | Response body (usually a dict with error details). |
+| `headers` | `dict[str, str] \| None` | Response headers. |
+
+---
+
+## Timeouts
+
+Two different timeouts apply:
+
+### HTTP request timeout
+
+Controls how long the SDK waits for the HTTP response from the Skyvern API. Set it in the constructor or per-request:
+
+```python
+# Global timeout (applies to all requests)
+client = Skyvern(api_key="YOUR_API_KEY", timeout=30.0)
+
+# Per-request timeout
+from skyvern.client.core import RequestOptions
+
+result = await client.get_run(
+    "tsk_abc123",
+    request_options=RequestOptions(timeout_in_seconds=10),
+)
+```
+
+### Completion timeout
+
+Controls how long `wait_for_completion` polls before giving up. This is separate from the HTTP timeout:
+
+```python
+try:
+    result = await client.run_task(
+        prompt="Extract data",
+        url="https://example.com",
+        wait_for_completion=True,
+        timeout=300,  # Give up after 5 minutes
+    )
+except TimeoutError:
+    print("Task didn't complete in time")
+```
+
+The completion timeout raises Python's built-in `TimeoutError` (via `asyncio.timeout`), not `ApiError`.
+
+---
+
+## Retries
+
+Configure automatic retries for transient failures using `RequestOptions`:
+
+```python
+from skyvern.client.core import RequestOptions
+
+result = await client.run_task(
+    prompt="Extract product data",
+    url="https://example.com/products",
+    request_options=RequestOptions(max_retries=3),
+)
+```
+
+Retries apply to the HTTP request level (network errors, 5xx responses). They do not retry the entire task if it fails at the AI level — use `get_run` to check the status and re-run if needed.
+
+---
+
+## Run failure vs API errors
+
+There are two distinct failure modes:
+
+**API error** — The HTTP request itself failed. The SDK raises an exception.
+
+```python
+from skyvern.client.core import ApiError
+
+try:
+    result = await client.run_task(prompt="...")
+except ApiError as e:
+    print(f"API call failed: {e.status_code}")
+```
+
+**Run failure** — The API call succeeded, but the task/workflow failed during execution. No exception is raised. Check the `status` field:
+
+```python
+result = await client.run_task(
+    prompt="Fill out the form",
+    url="https://example.com",
+    wait_for_completion=True,
+)
+
+if result.status == "failed":
+    print(f"Task failed: {result.failure_reason}")
+elif result.status == "timed_out":
+    print(f"Task exceeded step limit after {result.step_count} steps")
+elif result.status == "completed":
+    print(f"Success: {result.output}")
+```
+
+### Run statuses
+
+| Status | Description |
+|--------|-------------|
+| `created` | Run initialized, not yet queued. |
+| `queued` | Waiting for an available browser. |
+| `running` | AI is executing. |
+| `completed` | Finished successfully. |
+| `failed` | Encountered an error during execution. |
+| `terminated` | Manually stopped. |
+| `timed_out` | Exceeded step limit (`max_steps`). |
+| `canceled` | Canceled before starting. |

@@ -1,0 +1,287 @@
+---
+title: Workflows
+subtitle: Create and run multi-step browser automations
+slug: sdk-reference/workflows
+---
+
+A workflow chains multiple steps (blocks) into a single automation. Workflows support loops, conditionals, data passing between steps, and code-based re-execution.
+
+For conceptual background, see [Build a Workflow](/multi-step-automations/build-a-workflow).
+
+---
+
+## `run_workflow`
+
+Execute a workflow by its permanent ID. Skyvern opens a cloud browser and runs each block in sequence.
+
+```python
+result = await client.run_workflow(
+    workflow_id="wpid_abc123",
+    wait_for_completion=True,
+)
+print(result.output)
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `workflow_id` | `str` | Yes | — | The workflow's permanent ID (`wpid_...`). |
+| `parameters` | `dict` | No | `None` | Input parameters defined in the workflow. Keys must match parameter names. |
+| `wait_for_completion` | `bool` | No | `False` | Block until the workflow finishes. |
+| `timeout` | `float` | No | `1800` | Max wait time in seconds when `wait_for_completion=True`. |
+| `run_with` | `str` | No | `None` | Force execution mode: `"code"` (use cached Playwright code) or `"agent"` (use AI). |
+| `ai_fallback` | `bool` | No | `None` | Fall back to AI if the cached code fails. |
+| `browser_session_id` | `str` | No | `None` | Run inside an existing [browser session](/optimization/browser-sessions). |
+| `browser_profile_id` | `str` | No | `None` | Load a [browser profile](/optimization/browser-profiles) (cookies, storage) into the session. |
+| `proxy_location` | `ProxyLocation` | No | `None` | Route the browser through a geographic proxy. |
+| `max_steps_override` | `int` | No | `None` | Cap total AI steps across all blocks. |
+| `webhook_url` | `str` | No | `None` | URL to receive a POST when the run finishes. |
+| `title` | `str` | No | `None` | Display name for this run in the dashboard. |
+| `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
+| `totp_url` | `str` | No | `None` | URL to receive TOTP codes. |
+| `template` | `bool` | No | `None` | Run a template workflow. |
+| `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. |
+| `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers injected into every browser request. |
+| `max_screenshot_scrolls` | `int` | No | `None` | Number of scrolls for post-action screenshots. |
+| `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address. |
+
+### Returns `WorkflowRunResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | `str` | Unique identifier. Starts with `wr_` for workflow runs. |
+| `status` | `str` | `created`, `queued`, `running`, `completed`, `failed`, `terminated`, `timed_out`, or `canceled`. |
+| `output` | `dict \| None` | Extracted data from the workflow's output block. |
+| `downloaded_files` | `list[FileInfo] \| None` | Files downloaded during the run. |
+| `recording_url` | `str \| None` | URL to the session recording. |
+| `failure_reason` | `str \| None` | Error description if the run failed. |
+| `app_url` | `str \| None` | Link to view this run in the Cloud UI. |
+| `step_count` | `int \| None` | Total AI steps taken across all blocks. |
+| `run_with` | `str \| None` | Whether the run used `"code"` or `"agent"`. |
+| `ai_fallback` | `bool \| None` | Whether AI fallback was configured. |
+| `script_run` | `ScriptRunResponse \| None` | Code execution result. Contains `ai_fallback_triggered` if code was used. |
+
+### Examples
+
+**Pass parameters to a workflow:**
+
+```python
+result = await client.run_workflow(
+    workflow_id="wpid_invoice_extraction",
+    parameters={
+        "company_name": "Acme Corp",
+        "date_range": "2025-01-01 to 2025-12-31",
+    },
+    wait_for_completion=True,
+)
+```
+
+**Run with cached code (skip AI, use generated Playwright scripts):**
+
+```python
+result = await client.run_workflow(
+    workflow_id="wpid_daily_report",
+    run_with="code",
+    ai_fallback=True,  # Fall back to AI if code fails
+    wait_for_completion=True,
+)
+```
+
+**Run with a browser profile (skip login):**
+
+```python
+result = await client.run_workflow(
+    workflow_id="wpid_daily_report",
+    browser_profile_id="bpf_abc123",
+    wait_for_completion=True,
+)
+```
+
+---
+
+## `create_workflow`
+
+Create a new workflow from a JSON or YAML definition.
+
+```python
+workflow = await client.create_workflow(
+    json_definition={
+        "title": "Extract Products",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "key": "target_url",
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "string",
+                    "description": "URL to scrape",
+                }
+            ],
+            "blocks": [
+                {
+                    "block_type": "task",
+                    "label": "extract_data",
+                    "prompt": "Extract the top 3 products",
+                    "url": "{{ target_url }}",
+                }
+            ],
+        },
+    },
+)
+print(workflow.workflow_permanent_id)
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `json_definition` | `WorkflowCreateYamlRequest` | No | Workflow definition as a JSON object. |
+| `yaml_definition` | `str` | No | Workflow definition as a YAML string. |
+| `folder_id` | `str` | No | Folder to organize the workflow in. |
+
+You must provide either `json_definition` or `yaml_definition`.
+
+### Returns `Workflow`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `workflow_id` | `str` | Unique ID for this version. |
+| `workflow_permanent_id` | `str` | Stable ID across all versions. Use this to run workflows. |
+| `version` | `int` | Version number. |
+| `title` | `str` | Workflow title. |
+| `workflow_definition` | `WorkflowDefinition` | The full definition including blocks and parameters. |
+| `status` | `str \| None` | Workflow status. |
+| `created_at` | `datetime` | When the workflow was created. |
+
+---
+
+## `get_workflows`
+
+List all workflows. Supports filtering and pagination.
+
+```python
+workflows = await client.get_workflows()
+for wf in workflows:
+    print(f"{wf.title} ({wf.workflow_permanent_id})")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `page` | `int` | No | `None` | Page number for pagination. |
+| `page_size` | `int` | No | `None` | Number of results per page. |
+| `only_saved_tasks` | `bool` | No | `None` | Only return saved tasks. |
+| `only_workflows` | `bool` | No | `None` | Only return workflows (not saved tasks). |
+| `only_templates` | `bool` | No | `None` | Only return templates. |
+| `title` | `str` | No | `None` | Filter by exact title. |
+| `search_key` | `str` | No | `None` | Search by title. |
+| `folder_id` | `str` | No | `None` | Filter by folder. |
+| `status` | `WorkflowStatus \| list[WorkflowStatus]` | No | `None` | Filter by status. |
+
+### Returns `list[Workflow]`
+
+---
+
+## `get_workflow`
+
+<Info>
+Requires `skyvern` version 1.1.0 or later. Run `pip install --upgrade skyvern` to update.
+</Info>
+
+Get a specific workflow by its permanent ID.
+
+```python
+workflow = await client.get_workflow("wpid_abc123")
+print(workflow.title, f"v{workflow.version}")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflow_permanent_id` | `str` | Yes | The workflow's permanent ID. |
+| `version` | `int` | No | Specific version to retrieve. Defaults to latest. |
+| `template` | `bool` | No | Whether to fetch a template workflow. |
+
+### Returns `Workflow`
+
+---
+
+## `get_workflow_versions`
+
+<Info>
+Requires `skyvern` version 1.1.0 or later. Run `pip install --upgrade skyvern` to update.
+</Info>
+
+List all versions of a workflow.
+
+```python
+versions = await client.get_workflow_versions("wpid_abc123")
+for v in versions:
+    print(f"v{v.version} — {v.modified_at}")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflow_permanent_id` | `str` | Yes | The workflow's permanent ID. |
+| `template` | `bool` | No | Whether to fetch template versions. |
+
+### Returns `list[Workflow]`
+
+---
+
+## `update_workflow`
+
+Update an existing workflow's definition.
+
+```python
+updated = await client.update_workflow(
+    "wpid_abc123",
+    json_definition={
+        "title": "Extract Products",
+        "workflow_definition": {
+            "blocks": [
+                {
+                    "block_type": "task",
+                    "label": "extract_data",
+                    "prompt": "Extract the top 5 products",
+                    "url": "https://example.com/products",
+                }
+            ],
+            "parameters": [],
+        },
+    },
+)
+print(f"Updated to v{updated.version}")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflow_id` | `str` | Yes | The workflow's permanent ID (`wpid_...`). |
+| `json_definition` | `WorkflowCreateYamlRequest` | No | Updated workflow definition as JSON. |
+| `yaml_definition` | `str` | No | Updated workflow definition as YAML. |
+
+### Returns `Workflow`
+
+Creates a new version of the workflow.
+
+---
+
+## `delete_workflow`
+
+Delete a workflow.
+
+```python
+await client.delete_workflow("wf_abc123")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `workflow_id` | `str` | Yes | The workflow version ID to delete. |

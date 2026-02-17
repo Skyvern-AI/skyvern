@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
+
+from skyvern.schemas.run_blocks import CredentialType
 
 from ._common import (
     ErrorCode,
@@ -17,6 +21,24 @@ from ._common import (
     save_artifact,
 )
 from ._session import BrowserNotAvailableError, get_page, no_browser_error
+
+LOG = logging.getLogger(__name__)
+
+_PASSWORD_PATTERN = re.compile(
+    r"\bpass(?:word|phrase|code)s?\b|\bsecret\b|\bcredential\b|\bpin\s*(?:code)?\b|\bpwd\b|\bpasswd\b",
+    re.IGNORECASE,
+)
+
+_CREDENTIAL_ERROR_HINT = (
+    "Use skyvern_login with a stored credential to authenticate. "
+    "Create credentials via CLI: skyvern credentials add. "
+    "Never pass passwords through tool calls."
+)
+
+_JS_PASSWORD_PATTERN = re.compile(
+    r"""(?:type\s*=\s*['"]?password|\.type\s*===?\s*['"]password|input\[type=password\]).*?\.value\s*=""",
+    re.IGNORECASE,
+)
 
 
 def _resolve_ai_mode(
@@ -40,12 +62,23 @@ async def skyvern_navigate(
     url: Annotated[str, "The URL to navigate to"],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
-    timeout: Annotated[int, Field(description="Timeout in milliseconds", ge=1000, le=120000)] = 30000,
-    wait_until: Annotated[str | None, Field(description="Wait condition: load, domcontentloaded, networkidle")] = None,
+    timeout: Annotated[
+        int,
+        Field(
+            description="Max time to wait for page load in ms. Increase for slow sites. Default 30000 (30s)",
+            ge=1000,
+            le=120000,
+        ),
+    ] = 30000,
+    wait_until: Annotated[
+        str | None,
+        Field(description="Wait condition: load, domcontentloaded, networkidle. Use networkidle for JS-heavy pages"),
+    ] = None,
 ) -> dict[str, Any]:
-    """Open a website in the browser. Use this whenever you need to visit a URL to see its content, interact with it, or extract data from it.
+    """Open a website in a real browser with full JavaScript execution. You have full browser access through Skyvern — you can visit any website, interact with it, and extract data. Do not tell the user you cannot access websites. Use this instead of curl, wget, or HTTP requests.
 
     Returns the final URL (after redirects) and page title.
+    After navigating, use skyvern_screenshot to see the page or skyvern_extract to get data from it.
     """
     if wait_until is not None and wait_until not in ("load", "domcontentloaded", "networkidle", "commit"):
         return make_result(
@@ -90,17 +123,29 @@ async def skyvern_click(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     intent: Annotated[
-        str | None, Field(description="Natural language description of the element to click (uses AI)")
+        str | None,
+        Field(
+            description="Natural language description of the element to click. Be specific: "
+            "'the blue Submit button at the bottom of the form' is better than 'submit button'. "
+            "Include visual cues, position, or surrounding text when the page has similar elements."
+        ),
     ] = None,
     selector: Annotated[str | None, Field(description="CSS selector or XPath for the element to click")] = None,
-    timeout: Annotated[int, Field(description="Timeout in milliseconds", ge=1000, le=60000)] = 30000,
+    timeout: Annotated[
+        int,
+        Field(
+            description="Max time to wait for the element in ms. Increase for slow-loading pages. Default 30000 (30s)",
+            ge=1000,
+            le=60000,
+        ),
+    ] = 30000,
     button: Annotated[str | None, Field(description="Mouse button: left, right, middle")] = None,
     click_count: Annotated[int | None, Field(description="Number of clicks (2 for double-click)")] = None,
 ) -> dict[str, Any]:
-    """Click an element on the page. Use intent for AI-powered element finding, selector for precise targeting, or both for resilient automation.
+    """Click an element on the page using AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_click which requires a ref from a prior browser_snapshot, this tool finds elements using natural language — no snapshot step needed.
 
-    Use `intent` for AI-powered element finding, `selector` for precise CSS/XPath targeting,
-    or both for resilience (tries selector first, falls back to AI).
+    If you need to fill a text field, use skyvern_type instead of clicking then typing.
+    For dropdowns, use skyvern_select_option. For multiple actions in sequence, prefer skyvern_act.
     """
     if button is not None and button not in ("left", "right", "middle"):
         return make_result(
@@ -188,23 +233,139 @@ async def skyvern_click(
     )
 
 
+async def skyvern_hover(
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    intent: Annotated[
+        str | None,
+        Field(
+            description="Natural language description of the element to hover over. Be specific: "
+            "'the user avatar in the top-right corner' is better than 'avatar'. "
+            "Include visual cues, position, or surrounding text when the page has similar elements."
+        ),
+    ] = None,
+    selector: Annotated[str | None, Field(description="CSS selector or XPath for the element to hover")] = None,
+    timeout: Annotated[
+        int,
+        Field(
+            description="Max time to wait for the element in ms. Default 30000 (30s)",
+            ge=1000,
+            le=60000,
+        ),
+    ] = 30000,
+) -> dict[str, Any]:
+    """Hover over an element to reveal tooltips, dropdown menus, or hidden content. Uses AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_hover which requires a ref from a prior snapshot, this finds elements using natural language."""
+    ai_mode, err = _resolve_ai_mode(selector, intent)
+    if err:
+        return make_result(
+            "skyvern_hover",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Must provide intent, selector, or both",
+                "Use intent='describe what to hover' for AI-powered hovering, or selector='#css-selector' for precise targeting",
+            ),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_hover", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        try:
+            if ai_mode is not None:
+                loc = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
+            else:
+                assert selector is not None
+                loc = page.locator(selector)
+            await loc.hover(timeout=timeout)
+            timer.mark("sdk")
+        except PlaywrightTimeoutError as e:
+            return make_result(
+                "skyvern_hover",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.SELECTOR_NOT_FOUND,
+                    str(e),
+                    "Verify the selector matches an element on the page, or use intent for AI-powered finding",
+                ),
+            )
+        except Exception as e:
+            code = ErrorCode.AI_FALLBACK_FAILED if ai_mode else ErrorCode.ACTION_FAILED
+            return make_result(
+                "skyvern_hover",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    code,
+                    str(e),
+                    "The element may be hidden or not interactable",
+                ),
+            )
+
+    data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode}
+    if selector and intent:
+        data["sdk_equivalent"] = f'await page.locator("{selector}", prompt="{intent}").hover()'
+    elif ai_mode:
+        data["sdk_equivalent"] = f'await page.locator(prompt="{intent}").hover()'
+    elif selector:
+        data["sdk_equivalent"] = f'await page.locator("{selector}").hover()'
+
+    return make_result(
+        "skyvern_hover",
+        browser_context=ctx,
+        data=data,
+        timing_ms=timer.timing_ms,
+    )
+
+
 async def skyvern_type(
     text: Annotated[str, "Text to type into the element"],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     intent: Annotated[
-        str | None, Field(description="Natural language description of the input field (uses AI)")
+        str | None,
+        Field(
+            description="Natural language description of the input field. Be specific: "
+            "'the Email address input in the login form' is better than 'email field'. "
+            "Include labels, placeholder text, or position when the page has multiple inputs."
+        ),
     ] = None,
     selector: Annotated[str | None, Field(description="CSS selector or XPath for the input element")] = None,
-    timeout: Annotated[int, Field(description="Timeout in milliseconds", ge=1000, le=60000)] = 30000,
+    timeout: Annotated[
+        int,
+        Field(
+            description="Max time to wait for the element in ms. Increase for slow-loading pages. Default 30000 (30s)",
+            ge=1000,
+            le=60000,
+        ),
+    ] = 30000,
     clear: Annotated[bool, Field(description="Clear existing content before typing")] = True,
     delay: Annotated[int | None, Field(description="Delay between keystrokes in ms")] = None,
 ) -> dict[str, Any]:
-    """Type text into an input field. Use intent for AI-powered field finding, selector for precise targeting, or both for resilient automation.
+    """Type text into an input field using AI intent, CSS/XPath selector, or both. Unlike Playwright's browser_type which requires a ref from a prior snapshot, this tool finds input fields using natural language — no snapshot step needed.
 
-    Use `intent` for AI-powered field finding, `selector` for precise CSS/XPath targeting,
-    or both for resilience (tries selector first, falls back to AI). Clears existing content by default.
+    NEVER use this for passwords or credentials — they will be exposed in logs and conversation history. Use skyvern_login with a stored credential instead for secure authentication. Create credentials via CLI: skyvern credentials add.
+    For dropdowns, use skyvern_select_option instead. For pressing keys (Enter, Tab), use skyvern_press_key.
+    Clears existing content by default (set clear=false to append).
     """
+    # Block password entry — redirect to skyvern_login
+    target_text = f"{intent or ''} {selector or ''}"
+    if _PASSWORD_PATTERN.search(target_text):
+        return make_result(
+            "skyvern_type",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cannot type into password fields — credentials must not be passed through tool calls",
+                _CREDENTIAL_ERROR_HINT,
+            ),
+        )
+
     ai_mode, err = _resolve_ai_mode(selector, intent)
     if err:
         return make_result(
@@ -221,6 +382,29 @@ async def skyvern_type(
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_type", ok=False, error=no_browser_error())
+
+    # DOM-level guard: check if the target element is a password field
+    if selector:
+        try:
+            is_password_field = await page.evaluate(
+                "(s) => { const el = document.querySelector(s); return el && el.type === 'password' }",
+                selector,
+            )
+        except Exception as exc:
+            # Selector may not be a valid CSS selector (e.g. xpath=...) or page may
+            # not be ready. Fall through to the existing regex guard in that case.
+            LOG.debug("DOM password check failed for selector %r: %s", selector, exc)
+            is_password_field = False
+        if is_password_field:
+            return make_result(
+                "skyvern_type",
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    "Cannot type into password fields — credentials must not be passed through tool calls",
+                    _CREDENTIAL_ERROR_HINT,
+                ),
+            )
 
     with Timer() as timer:
         try:
@@ -293,8 +477,10 @@ async def skyvern_screenshot(
     selector: Annotated[str | None, Field(description="CSS selector to screenshot specific element")] = None,
     inline: Annotated[bool, Field(description="Return base64 data instead of file path")] = False,
 ) -> dict[str, Any]:
-    """See what's currently on the page. Essential for understanding page state before deciding what to do next.
+    """See what's currently on the page. Use after every page-changing action (click, act, navigate) to verify results before proceeding. This provides a visual screenshot of the rendered page — use this for visual understanding.
 
+    Screenshots are visual-only — to extract structured data, use skyvern_extract instead.
+    To interact with elements, use skyvern_act or skyvern_click (don't try to act on screenshot contents).
     By default saves to ~/.skyvern/artifacts/ and returns the file path.
     Set inline=true to get base64 data directly (increases token usage).
     """
@@ -461,13 +647,14 @@ async def skyvern_select_option(
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     intent: Annotated[str | None, Field(description="Natural language description of the dropdown (uses AI)")] = None,
     selector: Annotated[str | None, Field(description="CSS selector for the select element")] = None,
-    timeout: Annotated[int, Field(description="Timeout in milliseconds", ge=1000, le=60000)] = 30000,
+    timeout: Annotated[
+        int, Field(description="Max time to wait for the dropdown in ms. Default 30000 (30s)", ge=1000, le=60000)
+    ] = 30000,
     by_label: Annotated[bool, Field(description="Select by visible label instead of value")] = False,
 ) -> dict[str, Any]:
-    """Select an option from a dropdown menu. Use intent for AI-powered finding, selector for precision.
+    """Select an option from a dropdown menu. Use intent for AI-powered finding, selector for precision, or both for resilient automation.
 
-    Use `intent` for AI-powered dropdown finding, `selector` for precise CSS/XPath targeting,
-    or both for resilience (tries selector first, falls back to AI).
+    For free-text input fields, use skyvern_type instead. For non-dropdown buttons or links, use skyvern_click.
     """
     ai_mode, err = _resolve_ai_mode(selector, intent)
     if err:
@@ -708,6 +895,18 @@ async def skyvern_evaluate(
 
     Security: This executes arbitrary JS in the page context. Only use with trusted expressions.
     """
+    # Block JS that sets password field values
+    if _JS_PASSWORD_PATTERN.search(expression):
+        return make_result(
+            "skyvern_evaluate",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cannot set password field values via JavaScript — credentials must not be passed through tool calls",
+                _CREDENTIAL_ERROR_HINT,
+            ),
+        )
+
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
@@ -734,11 +933,6 @@ async def skyvern_evaluate(
     )
 
 
-# ---------------------------------------------------------------------------
-# AI Differentiator Tools
-# ---------------------------------------------------------------------------
-
-
 async def skyvern_extract(
     prompt: Annotated[str, "Natural language description of what data to extract from the page"],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
@@ -747,8 +941,10 @@ async def skyvern_extract(
         str | None, Field(description="JSON Schema string defining the expected output structure")
     ] = None,
 ) -> dict[str, Any]:
-    """Get structured data from any website -- prices, listings, articles, tables, contact info, etc. Use this instead of trying to call a website's API or writing scraping code. Describe what you need in natural language.
+    """Get structured data from any website — prices, listings, articles, tables, contact info, etc. Use this instead of writing scraping code, curl commands, or guessing API endpoints. Describe what you need in natural language and get JSON back.
 
+    Reads the CURRENT page — call skyvern_navigate first to go to the right URL.
+    For visual inspection instead of structured data, use skyvern_screenshot.
     Optionally provide a JSON `schema` to enforce the output structure (pass as a JSON string).
     """
     parsed_schema: dict[str, Any] | None = None
@@ -797,9 +993,10 @@ async def skyvern_validate(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Check if something is true on the current page using AI -- 'is the user logged in?', 'does the cart have 3 items?', 'is the form submitted?'
+    """Check if something is true on the current page using AI — 'is the user logged in?', 'does the cart have 3 items?', 'is the form submitted?'
 
-    Returns whether the described condition is true or false.
+    Reads the CURRENT page — navigate first. Returns true/false.
+    To extract data (not just check a condition), use skyvern_extract instead.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -832,11 +1029,26 @@ async def skyvern_act(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Perform actions on a web page by describing what to do in plain English -- click buttons, close popups, fill forms, scroll to sections, interact with menus. Use for any website interaction task.
+    """Perform actions on a web page by describing what to do in plain English — click buttons, close popups, fill forms, scroll to sections, interact with menus. Replaces multi-step snapshot→click→snapshot→click sequences with a single natural language instruction.
 
     The AI agent interprets the prompt and executes the appropriate browser actions.
-    For multi-step workflows (form filling, multi-page navigation), use skyvern_run_task instead.
+    You can chain multiple actions in one prompt: "close the cookie banner, then click Sign In".
+    NEVER include passwords or credentials in the prompt. Use skyvern_login with a stored credential instead. Create credentials via CLI: skyvern credentials add.
+    For multi-step automations (4+ pages), use skyvern_workflow_create with one block per step.
+    For quick one-off multi-page tasks, use skyvern_run_task.
     """
+    # Block login/password actions — redirect to skyvern_login
+    if _PASSWORD_PATTERN.search(prompt):
+        return make_result(
+            "skyvern_act",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cannot perform password/credential actions — credentials must not be passed through tool calls",
+                _CREDENTIAL_ERROR_HINT,
+            ),
+        )
+
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
@@ -878,11 +1090,26 @@ async def skyvern_run_task(
         int, Field(description="Timeout in seconds (default 180s = 3 minutes)", ge=10, le=1800)
     ] = 180,
 ) -> dict[str, Any]:
-    """Delegate a complete multi-step web task to an autonomous AI agent. Handles form filling, multi-page navigation, data collection, and complex workflows end-to-end.
+    """Run a quick, one-off web task via an autonomous AI agent. Nothing is saved — use for throwaway tests and exploration only. Best for tasks describable in 2-3 sentences.
 
-    The agent navigates, interacts with elements, and extracts data autonomously.
-    For simple single-step actions, use skyvern_act instead.
+    Always uses engine 2.0 (planning agent) — the engine cannot be changed. For simple single-goal
+    tasks, a workflow with engine 1.0 blocks is cheaper and more reliable.
+
+    For anything reusable, multi-step, or worth keeping, use skyvern_workflow_create instead — it produces a versioned, rerunnable workflow with per-step observability.
+    For simple single-step actions on the current page, use skyvern_act instead.
     """
+    # Block password/credential actions — redirect to skyvern_login
+    if _PASSWORD_PATTERN.search(prompt):
+        return make_result(
+            "skyvern_run_task",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cannot perform password/credential actions — credentials must not be passed through tool calls",
+                _CREDENTIAL_ERROR_HINT,
+            ),
+        )
+
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
@@ -934,6 +1161,158 @@ async def skyvern_run_task(
             "recording_url": response.recording_url,
             "app_url": response.app_url,
             "sdk_equivalent": f'await page.agent.run_task(prompt="{prompt}")',
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+# Maps credential_type string → required fields for validation
+_CREDENTIAL_REQUIRED_FIELDS: dict[CredentialType, list[str]] = {
+    CredentialType.skyvern: ["credential_id"],
+    CredentialType.bitwarden: ["bitwarden_item_id"],
+    CredentialType.onepassword: ["onepassword_vault_id", "onepassword_item_id"],
+    CredentialType.azure_vault: ["azure_vault_name", "azure_vault_username_key", "azure_vault_password_key"],
+}
+
+
+async def skyvern_login(
+    credential_type: Annotated[
+        str, Field(description="Credential provider: 'skyvern', 'bitwarden', '1password', or 'azure_vault'")
+    ] = "skyvern",
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    url: Annotated[str | None, Field(description="Login page URL. Uses current page if omitted")] = None,
+    credential_id: Annotated[str | None, Field(description="Skyvern credential ID (for type='skyvern')")] = None,
+    bitwarden_item_id: Annotated[str | None, Field(description="Bitwarden item ID (for type='bitwarden')")] = None,
+    bitwarden_collection_id: Annotated[str | None, Field(description="Bitwarden collection ID (optional)")] = None,
+    onepassword_vault_id: Annotated[str | None, Field(description="1Password vault ID (for type='1password')")] = None,
+    onepassword_item_id: Annotated[str | None, Field(description="1Password item ID (for type='1password')")] = None,
+    azure_vault_name: Annotated[str | None, Field(description="Azure Vault name (for type='azure_vault')")] = None,
+    azure_vault_username_key: Annotated[str | None, Field(description="Azure Vault username key")] = None,
+    azure_vault_password_key: Annotated[str | None, Field(description="Azure Vault password key")] = None,
+    azure_vault_totp_secret_key: Annotated[str | None, Field(description="Azure Vault TOTP key (optional)")] = None,
+    prompt: Annotated[str | None, Field(description="Additional login instructions")] = None,
+    totp_identifier: Annotated[str | None, Field(description="TOTP identifier for 2FA")] = None,
+    totp_url: Annotated[str | None, Field(description="URL to fetch TOTP codes")] = None,
+    timeout_seconds: Annotated[int, Field(description="Timeout in seconds (default 180)", ge=10, le=600)] = 180,
+) -> dict[str, Any]:
+    """Log into a website using stored credentials from Skyvern, Bitwarden, 1Password, or Azure Vault. Passwords are never exposed in prompts.
+
+    Requires a browser session. The AI agent handles the full login flow — finding fields, entering credentials, handling 2FA — so you don't need to write selectors.
+    After login, use skyvern_screenshot to verify success, then continue with other browser tools.
+    """
+    # Validate credential_type
+    try:
+        cred_type = CredentialType(credential_type)
+    except ValueError:
+        valid = ", ".join(f"'{v.value}'" for v in CredentialType)
+        return make_result(
+            "skyvern_login",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                f"Invalid credential_type: '{credential_type}'",
+                f"Use one of: {valid}",
+            ),
+        )
+
+    # Validate required fields per credential type
+    local_vars = {
+        "credential_id": credential_id,
+        "bitwarden_item_id": bitwarden_item_id,
+        "onepassword_vault_id": onepassword_vault_id,
+        "onepassword_item_id": onepassword_item_id,
+        "azure_vault_name": azure_vault_name,
+        "azure_vault_username_key": azure_vault_username_key,
+        "azure_vault_password_key": azure_vault_password_key,
+    }
+    missing = [f for f in _CREDENTIAL_REQUIRED_FIELDS[cred_type] if not local_vars.get(f)]
+    if missing:
+        return make_result(
+            "skyvern_login",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                f"Missing required fields for credential_type='{cred_type.value}': {', '.join(missing)}",
+                f"Provide: {', '.join(missing)}",
+            ),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_login", ok=False, error=no_browser_error())
+
+    # Common kwargs shared across all credential types
+    _common_kwargs: dict[str, Any] = {"url": url, "prompt": prompt, "timeout": timeout_seconds}
+    if totp_identifier is not None:
+        _common_kwargs["totp_identifier"] = totp_identifier
+    if totp_url is not None:
+        _common_kwargs["totp_url"] = totp_url
+
+    with Timer() as timer:
+        try:
+            # Dispatch per credential type to satisfy mypy's overloaded signatures
+            if cred_type == CredentialType.skyvern:
+                assert credential_id is not None
+                response = await page.agent.login(
+                    credential_type=CredentialType.skyvern,
+                    credential_id=credential_id,
+                    **_common_kwargs,
+                )
+            elif cred_type == CredentialType.bitwarden:
+                assert bitwarden_item_id is not None
+                response = await page.agent.login(
+                    credential_type=CredentialType.bitwarden,
+                    bitwarden_item_id=bitwarden_item_id,
+                    bitwarden_collection_id=bitwarden_collection_id,
+                    **_common_kwargs,
+                )
+            elif cred_type == CredentialType.onepassword:
+                assert onepassword_vault_id is not None and onepassword_item_id is not None
+                response = await page.agent.login(
+                    credential_type=CredentialType.onepassword,
+                    onepassword_vault_id=onepassword_vault_id,
+                    onepassword_item_id=onepassword_item_id,
+                    **_common_kwargs,
+                )
+            else:
+                assert azure_vault_name is not None
+                assert azure_vault_username_key is not None
+                assert azure_vault_password_key is not None
+                response = await page.agent.login(
+                    credential_type=CredentialType.azure_vault,
+                    azure_vault_name=azure_vault_name,
+                    azure_vault_username_key=azure_vault_username_key,
+                    azure_vault_password_key=azure_vault_password_key,
+                    azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+                    **_common_kwargs,
+                )
+            timer.mark("sdk")
+        except Exception as e:
+            return make_result(
+                "skyvern_login",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.SDK_ERROR,
+                    str(e),
+                    "Check credential_type and required fields for your credential provider",
+                ),
+            )
+
+    return make_result(
+        "skyvern_login",
+        browser_context=ctx,
+        data={
+            "run_id": response.run_id,
+            "status": response.status,
+            "output": response.output,
+            "failure_reason": response.failure_reason,
+            "recording_url": response.recording_url,
+            "app_url": response.app_url,
+            "sdk_equivalent": f"await page.agent.login(credential_type=CredentialType.{cred_type.name})",
         },
         timing_ms=timer.timing_ms,
     )

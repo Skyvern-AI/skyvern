@@ -26,3 +26,15 @@ Skyvern-AI/skyvern-cloud:
   - source: docs/
     dest: docs/
     deleteOrphaned: true
+  - source: tests/__init__.py
+    dest: tests/__init__.py
+  - source: tests/conftest.py
+    dest: tests/conftest.py
+  - source: tests/test_agent.py
+    dest: tests/test_agent.py
+  - source: tests/unit/
+    dest: tests/unit/
+    deleteOrphaned: true
+  - source: tests/smoke_tests/
+    dest: tests/smoke_tests/
+    deleteOrphaned: true

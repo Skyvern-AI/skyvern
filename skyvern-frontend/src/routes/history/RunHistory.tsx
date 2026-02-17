@@ -429,7 +429,12 @@ function WorkflowRunParametersInline({
     );
   }
 
-  if (!run || !run.parameters || Object.keys(run.parameters).length === 0) {
+  const hasParameters =
+    run?.parameters && Object.keys(run.parameters).length > 0;
+  const hasExtraHeaders =
+    run?.extra_http_headers && Object.keys(run.extra_http_headers).length > 0;
+
+  if (!hasParameters && !hasExtraHeaders) {
     return (
       <div className="ml-8 py-4 text-sm text-slate-400">
         No parameters for this run
@@ -437,19 +442,44 @@ function WorkflowRunParametersInline({
     );
   }
 
-  const parameterItems = Object.entries(run.parameters).map(([key, value]) => ({
-    key,
-    value,
-    description: null,
-  }));
+  const parameterItems = hasParameters
+    ? Object.entries(run.parameters).map(([key, value]) => ({
+        key,
+        value,
+        description: null,
+      }))
+    : [];
+
+  const headerItems =
+    hasExtraHeaders && run.extra_http_headers
+      ? Object.entries(run.extra_http_headers).map(([key, value]) => ({
+          key,
+          value,
+          description: null,
+        }))
+      : [];
 
   return (
-    <ParameterDisplayInline
-      parameters={parameterItems}
-      searchQuery={searchQuery}
-      keywordMatchesParameter={keywordMatchesParameter}
-      showDescription={false}
-    />
+    <div className="space-y-4">
+      {hasParameters && (
+        <ParameterDisplayInline
+          title="Run Parameters"
+          parameters={parameterItems}
+          searchQuery={searchQuery}
+          keywordMatchesParameter={keywordMatchesParameter}
+          showDescription={false}
+        />
+      )}
+      {hasExtraHeaders && (
+        <ParameterDisplayInline
+          title="Extra HTTP Headers"
+          parameters={headerItems}
+          searchQuery={searchQuery}
+          keywordMatchesParameter={keywordMatchesParameter}
+          showDescription={false}
+        />
+      )}
+    </div>
   );
 }
 

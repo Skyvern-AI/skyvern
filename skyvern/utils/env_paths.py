@@ -10,10 +10,7 @@ def resolve_backend_env_path(
     basename: str = BACKEND_ENV_DEFAULT,
 ) -> Path:
     """Return the backend env file path inside the current working directory."""
-
-    env_path = Path.cwd() / basename
-
-    return env_path
+    return Path.cwd() / basename
 
 
 def resolve_frontend_env_path() -> Optional[Path]:

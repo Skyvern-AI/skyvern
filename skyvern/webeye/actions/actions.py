@@ -152,6 +152,11 @@ class Action(BaseModel):
     # flag indicating whether the action requires mini-agent mode
     has_mini_agent: bool | None = None
 
+    # When True, the auto-completion Tab hack is skipped because a follow-up
+    # action in the same batch targets the same element or presses a key (e.g. Enter).
+    # Pressing Tab would move focus away and break that next action.
+    skip_auto_complete_tab: bool = False
+
     created_at: datetime | None = None
     modified_at: datetime | None = None
     created_by: str | None = None

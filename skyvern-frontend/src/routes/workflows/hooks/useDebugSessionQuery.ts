@@ -23,6 +23,19 @@ function useDebugSessionQuery({ workflowPermanentId, enabled }: Opts) {
       enabled !== undefined
         ? enabled && !!workflowPermanentId
         : !!workflowPermanentId,
+    // Reduce polling frequency on errors
+    retry: 3,
+    retryDelay: 10000,
+    refetchOnWindowFocus: false,
+    // Don't keep retrying if in error state
+    refetchInterval: (query) => {
+      // If query is in error state, poll much less frequently (30s)
+      // Otherwise don't auto-refetch
+      if (query.state.status === "error") {
+        return 30000;
+      }
+      return false;
+    },
   });
 }
 

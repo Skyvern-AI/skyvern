@@ -1,0 +1,6 @@
+#!/Users/jseres/Projects/Skyvern/skyvern/.venv-test/bin/python3.11
+import sys
+from httpx import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())
