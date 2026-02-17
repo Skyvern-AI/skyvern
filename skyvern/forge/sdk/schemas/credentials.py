@@ -179,10 +179,63 @@ class TestCredentialRequest(BaseModel):
     )
 
 
+class TestLoginRequest(BaseModel):
+    """Request model for testing a login with inline credentials (no saved credential required)."""
+
+    url: str = Field(
+        ...,
+        description="The login page URL to test against",
+        examples=["https://example.com/login"],
+    )
+    username: str = Field(
+        ...,
+        min_length=1,
+        description="The username to test",
+        examples=["user@example.com"],
+    )
+    password: str = Field(
+        ...,
+        min_length=1,
+        description="The password to test",
+        examples=["securepassword123"],
+    )
+    totp: str | None = Field(
+        default=None,
+        description="Optional TOTP secret for 2FA",
+    )
+    totp_type: TotpType = Field(
+        default=TotpType.NONE,
+        description="Type of 2FA method",
+    )
+    totp_identifier: str | None = Field(
+        default=None,
+        description="Identifier (email or phone) for TOTP",
+    )
+
+
 class TestCredentialResponse(BaseModel):
     """Response model for a credential test initiation."""
 
     credential_id: str = Field(..., description="The credential being tested")
+    workflow_run_id: str = Field(
+        ...,
+        description="The workflow run ID to poll for test status",
+        examples=["wr_1234567890"],
+    )
+    status: str = Field(
+        ...,
+        description="Current status of the test",
+        examples=["running"],
+    )
+
+
+class TestLoginResponse(BaseModel):
+    """Response model for an inline login test (no saved credential)."""
+
+    credential_id: str = Field(
+        ...,
+        description="The temporary credential ID created for this test",
+    )
     workflow_run_id: str = Field(
         ...,
         description="The workflow run ID to poll for test status",
@@ -253,3 +306,13 @@ class Credential(BaseModel):
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
     deleted_at: datetime | None = Field(None, description="Timestamp when the credential was deleted, if applicable")
+
+
+class UpdateCredentialRequest(BaseModel):
+    """Request model for updating a credential."""
+
+    name: str | None = Field(
+        default=None,
+        description="New name for the credential",
+        examples=["My Updated Credential"],
+    )

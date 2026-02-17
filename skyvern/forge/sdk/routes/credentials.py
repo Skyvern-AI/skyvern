@@ -35,6 +35,9 @@ from skyvern.forge.sdk.schemas.credentials import (
     TestCredentialRequest,
     TestCredentialResponse,
     TestCredentialStatusResponse,
+    TestLoginRequest,
+    TestLoginResponse,
+    UpdateCredentialRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredentialResponse,
@@ -292,6 +295,47 @@ async def create_credential(
         )
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported credential type: {data.credential_type}")
+
+
+@base_router.patch(
+    "/credentials/{credential_id}",
+    response_model=CredentialResponse,
+    summary="Update credential",
+    description="Updates a credential's metadata (e.g. name)",
+    tags=["Credentials"],
+)
+@base_router.patch(
+    "/credentials/{credential_id}/",
+    response_model=CredentialResponse,
+    include_in_schema=False,
+)
+async def update_credential(
+    credential_id: str = Path(
+        ...,
+        description="The unique identifier of the credential to update",
+        examples=["cred_1234567890"],
+    ),
+    data: UpdateCredentialRequest = Body(
+        ...,
+        description="The credential fields to update",
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialResponse:
+    credential = await app.DATABASE.get_credential(
+        credential_id=credential_id, organization_id=current_org.organization_id
+    )
+    if not credential:
+        raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
+
+    updated = await app.DATABASE.update_credential(
+        credential_id=credential_id,
+        organization_id=current_org.organization_id,
+        name=data.name,
+    )
+    if not updated:
+        raise HTTPException(status_code=500, detail="Failed to update credential")
+
+    return _convert_to_response(updated)
 
 
 @legacy_base_router.delete("/credentials/{credential_id}")
@@ -777,6 +821,158 @@ BROWSER_PROFILE_LOGIN_PROMPT = (
 
 
 @base_router.post(
+    "/credentials/test-login",
+    response_model=TestLoginResponse,
+    summary="Test login with inline credentials",
+    description=(
+        "Test a login by providing credentials inline (no saved credential required). "
+        "Creates a temporary credential, runs a login test, and returns a workflow run ID to poll."
+    ),
+    tags=["Credentials"],
+)
+@base_router.post(
+    "/credentials/test-login/",
+    response_model=TestLoginResponse,
+    include_in_schema=False,
+)
+async def test_login(
+    background_tasks: BackgroundTasks,
+    data: TestLoginRequest = Body(
+        ...,
+        description="The login credentials and URL to test",
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> TestLoginResponse:
+    """Test a login with inline credentials without requiring a saved credential."""
+    organization_id = current_org.organization_id
+
+    # Create a temporary credential
+    from skyvern.forge.sdk.schemas.credentials import NonEmptyPasswordCredential
+
+    create_request = CreateCredentialRequest(
+        name=f"_test_login_{data.username}",
+        credential_type=CredentialType.PASSWORD,
+        credential=NonEmptyPasswordCredential(
+            username=data.username,
+            password=data.password,
+            totp=data.totp,
+            totp_type=data.totp_type,
+            totp_identifier=data.totp_identifier,
+        ),
+    )
+
+    credential_service = await _get_credential_vault_service()
+    credential = await credential_service.create_credential(
+        organization_id=organization_id,
+        data=create_request,
+    )
+
+    if credential.vault_type == CredentialVaultType.BITWARDEN:
+        background_tasks.add_task(fetch_credential_item_background, credential.item_id)
+
+    credential_id = credential.credential_id
+
+    LOG.info(
+        "Testing login with inline credentials",
+        credential_id=credential_id,
+        organization_id=organization_id,
+        url=data.url,
+    )
+
+    # Build a login workflow (no browser profile saving for test-only)
+    parameter_key = "credential"
+    label = "login"
+
+    yaml_parameters = [
+        WorkflowParameterYAML(
+            key=parameter_key,
+            workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+            description="The credential to test",
+            default_value=credential_id,
+        )
+    ]
+
+    login_block_yaml = LoginBlockYAML(
+        label=label,
+        title=label,
+        url=data.url,
+        navigation_goal=DEFAULT_LOGIN_PROMPT,
+        max_steps_per_run=10,
+        parameter_keys=[parameter_key],
+        totp_verification_url=None,
+        totp_identifier=data.totp_identifier,
+    )
+
+    workflow_definition_yaml = WorkflowDefinitionYAML(
+        parameters=yaml_parameters,
+        blocks=[login_block_yaml],
+    )
+
+    workflow_create_request = WorkflowCreateYAMLRequest(
+        title=f"Login Test - {data.username}",
+        description="Auto-generated workflow to test login credentials",
+        persist_browser_session=True,
+        workflow_definition=workflow_definition_yaml,
+        status=WorkflowStatus.auto_generated,
+    )
+
+    workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        organization=current_org,
+        request=workflow_create_request,
+    )
+
+    run_request = WorkflowRequestBody()
+
+    workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
+        request_id=None,
+        workflow_request=run_request,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        organization=current_org,
+        max_steps_override=None,
+    )
+
+    await AsyncExecutorFactory.get_executor().execute_workflow(
+        request=None,
+        background_tasks=background_tasks,
+        organization=current_org,
+        workflow_id=workflow_run.workflow_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        workflow_permanent_id=workflow_run.workflow_permanent_id,
+        max_steps_override=None,
+        api_key=None,
+        browser_session_id=None,
+        block_labels=None,
+        block_outputs=None,
+    )
+
+    # Schedule background task to create browser profile after the workflow completes
+    asyncio.create_task(
+        _create_browser_profile_after_workflow(
+            credential_id=credential_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_id=workflow_run.workflow_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            organization_id=organization_id,
+            credential_name=f"_test_login_{data.username}",
+            test_url=data.url,
+        )
+    )
+
+    LOG.info(
+        "Login test started",
+        credential_id=credential_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=organization_id,
+    )
+
+    return TestLoginResponse(
+        credential_id=credential_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        status="running",
+    )
+
+
+@base_router.post(
     "/credentials/{credential_id}/test",
     response_model=TestCredentialResponse,
     summary="Test a credential",
@@ -1103,9 +1299,10 @@ async def _create_browser_profile_after_workflow(
                 return
 
             # Create the browser profile in DB
+            profile_name = f"Profile - {credential_name} ({credential_id})"
             profile = await app.DATABASE.create_browser_profile(
                 organization_id=organization_id,
-                name=f"Profile - {credential_name}",
+                name=profile_name,
                 description=f"Browser profile from credential test for {credential_name}",
             )
 
