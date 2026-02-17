@@ -1,0 +1,441 @@
+---
+title: Kubernetes Deployment
+subtitle: Deploy Skyvern at scale with Kubernetes manifests
+slug: self-hosted/kubernetes
+---
+
+This guide walks through deploying Skyvern on Kubernetes for production environments. Use this when you need horizontal scaling, high availability, or integration with existing Kubernetes infrastructure.
+
+<Warning>
+Do not expose this deployment to the public internet without adding authentication at the ingress layer.
+</Warning>
+
+## Prerequisites
+
+- A running Kubernetes cluster (1.19+)
+- `kubectl` configured to access your cluster
+- An ingress controller (the manifests use Traefik, but any controller works)
+- An LLM API key (OpenAI, Anthropic, Azure, etc.)
+
+## Architecture overview
+
+The Kubernetes deployment creates three services:
+
+```mermaid
+flowchart LR
+    subgraph Kubernetes Cluster
+        Ingress[Ingress] --> FE[Frontend<br/>:8080]
+        Ingress --> BE[Backend<br/>:8000]
+        Ingress --> Art[Artifacts<br/>:9090]
+        BE --> DB[(PostgreSQL<br/>:5432)]
+        BE --> Browser[Browser<br/>embedded]
+        FE --> Art
+    end
+
+    BE --> LLM[LLM Provider]
+```
+
+| Component | Service | Purpose |
+|-----------|---------|---------|
+| Backend | `skyvern-backend` | API server + embedded browser |
+| Frontend | `skyvern-frontend` | Web UI + artifact server |
+| PostgreSQL | `postgres` | Database for tasks, workflows, credentials |
+
+---
+
+## Quick start
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/Skyvern-AI/skyvern.git
+cd skyvern/kubernetes-deployment
+```
+
+### 2. Configure backend secrets
+
+Edit `backend/backend-secrets.yaml` with your LLM provider credentials:
+
+```yaml backend/backend-secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: skyvern-backend-env
+  namespace: skyvern
+type: Opaque
+stringData:
+  ENV: local
+
+  # LLM Configuration - set your provider
+  ENABLE_OPENAI: "true"
+  OPENAI_API_KEY: "sk-your-api-key-here"
+  LLM_KEY: "OPENAI_GPT4O"
+
+  # Database - points to the PostgreSQL service
+  DATABASE_STRING: "postgresql+psycopg://skyvern:skyvern@postgres/skyvern"
+
+  # Browser settings
+  BROWSER_TYPE: "chromium-headless"
+  BROWSER_ACTION_TIMEOUT_MS: "5000"
+  MAX_STEPS_PER_RUN: "50"
+
+  # Server
+  PORT: "8000"
+  LOG_LEVEL: "INFO"
+```
+
+For other LLM providers, see [LLM Configuration](/self-hosted/llm-configuration).
+
+### 3. Configure frontend secrets
+
+Edit `frontend/frontend-secrets.yaml`:
+
+```yaml frontend/frontend-secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: skyvern-frontend-env
+  namespace: skyvern
+type: Opaque
+stringData:
+  VITE_API_BASE_URL: "http://skyvern.example.com/api/v1"
+  VITE_WSS_BASE_URL: "ws://skyvern.example.com/api/v1"
+  VITE_ARTIFACT_API_BASE_URL: "http://skyvern.example.com/artifacts"
+  VITE_SKYVERN_API_KEY: ""  # Leave empty for initial deploy
+```
+
+Replace `skyvern.example.com` with your actual domain.
+
+### 4. Configure ingress
+
+Edit `ingress.yaml` with your domain and TLS settings:
+
+```yaml ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: skyvern-ingress
+  namespace: skyvern
+  annotations:
+    # Adjust for your ingress controller
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik  # Change to nginx, kong, etc.
+  rules:
+    - host: skyvern.example.com  # Your domain
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: skyvern-backend
+                port:
+                  number: 8000
+          - path: /artifacts
+            pathType: Prefix
+            backend:
+              service:
+                name: skyvern-frontend
+                port:
+                  number: 9090
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: skyvern-frontend
+                port:
+                  number: 8080
+```
+
+### 5. Deploy
+
+Run the deployment script:
+
+```bash
+chmod +x k8s-deploy.sh
+./k8s-deploy.sh
+```
+
+This applies manifests in order:
+1. Namespace
+2. PostgreSQL (secrets, storage, deployment, service)
+3. Backend (secrets, deployment, service)
+4. Frontend (secrets, deployment, service)
+5. Ingress
+
+### 6. Verify deployment
+
+Check that all pods are running:
+
+```bash
+kubectl get pods -n skyvern
+```
+
+Expected output:
+
+```
+NAME                                READY   STATUS    RESTARTS   AGE
+postgres-xxx                        1/1     Running   0          2m
+skyvern-backend-xxx                 1/1     Running   0          1m
+skyvern-frontend-xxx                1/1     Running   0          30s
+```
+
+The backend pod takes 1-2 minutes to become ready as it runs database migrations.
+
+### 7. Get your API key
+
+Wait for the backend pod to show `1/1` in the `READY` column of `kubectl get pods -n skyvern` before running this command. The API key file is generated during startup and won't exist until the pod is ready.
+
+```bash
+kubectl exec -n skyvern deployment/skyvern-backend -- cat /app/.streamlit/secrets.toml
+```
+
+Copy the `cred` value and update `frontend/frontend-secrets.yaml`:
+
+```yaml
+VITE_SKYVERN_API_KEY: "eyJhbGciOiJIUzI1..."
+```
+
+Reapply the frontend secrets and restart:
+
+```bash
+kubectl apply -f frontend/frontend-secrets.yaml -n skyvern
+kubectl rollout restart deployment/skyvern-frontend -n skyvern
+```
+
+### 8. Access the UI
+
+Navigate to your configured domain (e.g., `https://skyvern.example.com`). You should see the Skyvern dashboard.
+
+---
+
+## Manifest structure
+
+```
+kubernetes-deployment/
+├── namespace.yaml           # Creates 'skyvern' namespace
+├── k8s-deploy.sh           # Deployment script
+├── ingress.yaml            # Ingress configuration
+├── backend/
+│   ├── backend-secrets.yaml     # Environment variables
+│   ├── backend-deployment.yaml  # Pod spec
+│   └── backend-service.yaml     # ClusterIP service
+├── frontend/
+│   ├── frontend-secrets.yaml    # Environment variables
+│   ├── frontend-deployment.yaml # Pod spec
+│   └── frontend-service.yaml    # ClusterIP service
+└── postgres/
+    ├── postgres-secrets.yaml    # Database credentials
+    ├── postgres-storage.yaml    # PersistentVolumeClaim
+    ├── postgres-deployment.yaml # Pod spec
+    └── postgres-service.yaml    # ClusterIP service
+```
+
+---
+
+## Storage configuration
+
+By default, the manifests use `hostPath` volumes. This works for single-node clusters but isn't suitable for multi-node production deployments.
+
+### Using PersistentVolumeClaims
+
+For production, replace `hostPath` with PVCs. Edit `backend/backend-deployment.yaml`:
+
+```yaml
+volumes:
+  - name: artifacts
+    persistentVolumeClaim:
+      claimName: skyvern-artifacts-pvc
+  - name: videos
+    persistentVolumeClaim:
+      claimName: skyvern-videos-pvc
+```
+
+Create the PVCs:
+
+```yaml skyvern-storage.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: skyvern-artifacts-pvc
+  namespace: skyvern
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: skyvern-videos-pvc
+  namespace: skyvern
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+```
+
+### Using S3 or Azure Blob
+
+For cloud storage, configure the backend environment variables instead of mounting volumes. See [Storage Configuration](/self-hosted/storage).
+
+---
+
+## Scaling
+
+### Horizontal scaling
+
+To run multiple backend instances, increase the replica count:
+
+```yaml backend/backend-deployment.yaml
+spec:
+  replicas: 3  # Run 3 backend pods
+```
+
+Each pod runs its own browser instance. Tasks are distributed across pods.
+
+<Note>
+When scaling horizontally, ensure your storage backend supports concurrent access (S3, Azure Blob, or ReadWriteMany PVCs). Local storage with ReadWriteOnce PVCs won't work across multiple pods.
+</Note>
+
+### Resource limits
+
+Add resource limits to prevent pods from consuming excessive resources:
+
+```yaml
+containers:
+  - name: skyvern-backend
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "500m"
+      limits:
+        memory: "4Gi"
+        cpu: "2000m"
+```
+
+Browser instances need significant memory. Start with 2GB minimum per pod.
+
+---
+
+## TLS configuration
+
+To enable HTTPS, uncomment the TLS section in `ingress.yaml`:
+
+```yaml
+spec:
+  tls:
+    - hosts:
+        - skyvern.example.com
+      secretName: skyvern-tls-secret
+```
+
+Create the TLS secret:
+
+```bash
+kubectl create secret tls skyvern-tls-secret \
+  --cert=path/to/tls.crt \
+  --key=path/to/tls.key \
+  -n skyvern
+```
+
+Or use cert-manager for automatic certificate management.
+
+Update frontend secrets to use `https` and `wss`:
+
+```yaml
+VITE_API_BASE_URL: "https://skyvern.example.com/api/v1"
+VITE_WSS_BASE_URL: "wss://skyvern.example.com/api/v1"
+```
+
+---
+
+## Using an external database
+
+For production, consider using a managed PostgreSQL service (RDS, Cloud SQL, Azure Database).
+
+1. Remove the `postgres/` manifests from the deployment
+2. Update `backend/backend-secrets.yaml`:
+
+```yaml
+DATABASE_STRING: "postgresql+psycopg://user:password@your-db-host:5432/skyvern"
+```
+
+---
+
+## Troubleshooting
+
+### Pods stuck in Pending
+
+Check for resource constraints:
+
+```bash
+kubectl describe pod -n skyvern <pod-name>
+```
+
+Common causes:
+- Insufficient node resources
+- PersistentVolume not available
+- Image pull errors
+
+### Backend crashes on startup
+
+Check the logs:
+
+```bash
+kubectl logs -n skyvern deployment/skyvern-backend
+```
+
+Common causes:
+- Invalid LLM API key
+- Database connection failed
+- Missing environment variables
+
+### Frontend shows "Unauthorized"
+
+The API key in frontend secrets doesn't match the generated key. Re-copy it from the backend pod.
+
+### Ingress not routing correctly
+
+Verify your ingress controller is running and the ingress resource is configured:
+
+```bash
+kubectl get ingress -n skyvern
+kubectl describe ingress skyvern-ingress -n skyvern
+```
+
+---
+
+## Cleanup
+
+To remove the entire deployment:
+
+```bash
+kubectl delete namespace skyvern
+```
+
+This removes all resources in the `skyvern` namespace.
+
+To clean up host storage (if using hostPath):
+
+```bash
+rm -rf /data/artifacts /data/videos /data/har /data/log /app/.streamlit
+```
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Storage Configuration" icon="hard-drive" href="/self-hosted/storage">
+    Configure S3 or Azure Blob for artifact storage
+  </Card>
+  <Card title="LLM Configuration" icon="microchip" href="/self-hosted/llm-configuration">
+    Configure additional LLM providers
+  </Card>
+</CardGroup>

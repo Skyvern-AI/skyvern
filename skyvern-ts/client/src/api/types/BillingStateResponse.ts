@@ -17,6 +17,7 @@ export interface BillingStateResponse {
     topup_credits_used: number;
     topup_credits_remaining: number;
     credits_remaining: number;
+    cancel_at_period_end?: boolean;
     created_at: string;
     modified_at: string;
 }

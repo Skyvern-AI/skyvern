@@ -43,27 +43,160 @@
             ]
           },
           {
+            "group": "Optimization",
+            "pages": [
+              "optimization/browser-sessions",
+              "optimization/browser-profiles",
+              "optimization/cost-control"
+            ]
+          },
+          {
             "group": "Going to Production",
             "pages": [
               "going-to-production/webhooks",
               "going-to-production/proxy-geolocation",
               "going-to-production/error-handling",
               "going-to-production/reliability-tips",
-              "going-to-production/captcha-bot-detection"
+              "going-to-production/captcha-bot-detection",
+              "integrations/mcp"
+            ]
+          },
+          {
+            "group": "Debugging",
+            "pages": [
+              "debugging/using-artifacts",
+              "debugging/troubleshooting-guide",
+              "debugging/faq"
+            ]
+          },
+          {
+            "group": "Self-Hosted Deployment",
+            "pages": [
+              "self-hosted/overview",
+              "self-hosted/docker",
+              "self-hosted/llm-configuration",
+              "self-hosted/browser",
+              "self-hosted/proxy",
+              "self-hosted/kubernetes",
+              "self-hosted/storage",
+              "integrations/local-llms"
             ]
           }
         ]
       },
       {
         "tab": "Cloud UI",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "cloud/getting-started/overview",
+              "cloud/getting-started/run-your-first-task",
+              "cloud/getting-started/run-a-task",
+              "cloud/getting-started/monitor-a-run"
+            ]
+          },
+          {
+            "group": "Building Workflows",
+            "pages": [
+              "cloud/building-workflows/build-a-workflow",
+              "cloud/building-workflows/manage-workflows",
+              "cloud/building-workflows/add-parameters",
+              "cloud/building-workflows/configure-blocks",
+              "cloud/building-workflows/run-a-workflow"
+            ]
+          },
+          {
+            "group": "Viewing Results",
+            "pages": [
+              "cloud/viewing-results/run-history",
+              "cloud/viewing-results/run-details",
+              "cloud/viewing-results/downloading-artifacts"
+            ]
+          },
+          {
+            "group": "Managing Credentials",
+            "pages": [
+              "cloud/managing-credentials/credentials-overview",
+              "cloud/managing-credentials/password-credentials",
+              "cloud/managing-credentials/credit-card-credentials",
+              "cloud/managing-credentials/totp-setup"
+            ]
+          },
+          {
+            "group": "Account & Settings",
+            "pages": [
+              "cloud/account-settings/api-keys",
+              "cloud/account-settings/billing-usage",
+              "cloud/account-settings/organization-settings",
+              "cloud/account-settings/profile-settings"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/zapier",
+              "integrations/make",
+              "integrations/n8n",
+              "integrations/workato"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "SDKs",
+        "groups": [
+          {
+            "group": "Python SDK",
+            "pages": [
+              "sdk-reference/overview",
+              "sdk-reference/tasks",
+              "sdk-reference/workflows",
+              "sdk-reference/browser-sessions",
+              "sdk-reference/browser-profiles",
+              "sdk-reference/credentials",
+              "sdk-reference/helpers",
+              "sdk-reference/error-handling",
+              "sdk-reference/complete-reference"
+            ]
+          },
+          {
+            "group": "TypeScript SDK",
+            "pages": [
+              "ts-sdk-reference/overview",
+              "ts-sdk-reference/tasks",
+              "ts-sdk-reference/workflows",
+              "ts-sdk-reference/browser-sessions",
+              "ts-sdk-reference/browser-profiles",
+              "ts-sdk-reference/credentials",
+              "ts-sdk-reference/helpers",
+              "ts-sdk-reference/browser-automation",
+              "ts-sdk-reference/error-handling",
+              "ts-sdk-reference/complete-reference"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Cookbooks",
         "pages": [
-          "cloud/getting-started",
-          "cloud/running-tasks"
+          "cookbooks/overview",
+          "cookbooks/bulk-invoice-downloader",
+          "cookbooks/job-application-filler",
+          "cookbooks/healthcare-portal-data"
         ]
       },
       {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
+      },
+      {
+        "tab": "Cookbooks",
+        "pages": [
+          "cookbooks/overview",
+          "cookbooks/bulk-invoice-downloader",
+          "cookbooks/job-application-filler"
+        ]
       }
     ]
   },

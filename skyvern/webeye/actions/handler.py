@@ -1512,7 +1512,12 @@ async def handle_input_text_action(
         raise e
     finally:
         # HACK: force to finish missing auto completion input
-        if auto_complete_hacky_flag and await skyvern_element.is_visible() and not await skyvern_element.is_raw_input():
+        if (
+            auto_complete_hacky_flag
+            and await skyvern_element.is_visible()
+            and not await skyvern_element.is_raw_input()
+            and not action.skip_auto_complete_tab
+        ):
             LOG.debug(
                 "Trigger input-selection hack, pressing Tab to choose one",
                 action=action,
@@ -2180,9 +2185,40 @@ async def handle_scroll_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    if action.x and action.y:
+    if action.element_id:
+        # Element-based scrolling from extract-action prompt. Uses
+        # scrollNearestScrollableContainer() from domUtils.js which walks the DOM to find
+        # the nearest scrollable ancestor or sibling container relative to the element.
+        scroll_direction = "down" if action.scroll_y >= 0 else "up"
+        scrolled = False
+        dom = DomUtil(scraped_page=scraped_page, page=page)
+        skyvern_element = await dom.safe_get_skyvern_element_by_id(action.element_id)
+        if skyvern_element:
+            try:
+                scrolled = await skyvern_element.locator.evaluate(
+                    "(el, direction) => scrollNearestScrollableContainer(el, direction)",
+                    scroll_direction,
+                )
+            except Exception:
+                LOG.warning(
+                    "JavaScript scroll evaluation failed, falling back to mouse wheel",
+                    element_id=action.element_id,
+                    exc_info=True,
+                )
+        else:
+            LOG.warning("Could not resolve element for scroll action", element_id=action.element_id)
+        if not scrolled:
+            LOG.warning(
+                "Could not find scrollable container near element, falling back to mouse wheel",
+                element_id=action.element_id,
+            )
+            await page.mouse.wheel(action.scroll_x, action.scroll_y)
+    elif action.x and action.y:
+        # Coordinate-based scrolling from CUA/UI-TARS agents
         await page.mouse.move(action.x, action.y)
-    await page.mouse.wheel(action.scroll_x, action.scroll_y)
+        await page.mouse.wheel(action.scroll_x, action.scroll_y)
+    else:
+        await page.mouse.wheel(action.scroll_x, action.scroll_y)
     return [ActionSuccess()]
 
 
@@ -2682,6 +2718,7 @@ async def choose_auto_completion_dropdown(
                 value=text,
             )
             await skyvern_element.press_key("Enter")
+            clear_input = False
             return result
 
         if not element_id:

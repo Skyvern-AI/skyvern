@@ -20,6 +20,7 @@ from urllib.parse import quote, urlparse
 
 import aiofiles
 import aiohttp
+import docx
 import filetype
 import pandas as pd
 import pyotp
@@ -35,6 +36,7 @@ from skyvern.config import settings
 from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     GET_DOWNLOADED_FILES_TIMEOUT,
+    MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_UPLOAD_FILE_COUNT,
 )
 from skyvern.exceptions import (
@@ -76,6 +78,7 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, validate_pdf_file
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     CustomizedCodeException,
@@ -100,6 +103,7 @@ from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
+from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -1116,6 +1120,74 @@ class LoopBlockExecutedResult(BaseModel):
         return self.block_outputs[-1].failure_reason if len(self.block_outputs) > 0 else "No block has been executed"
 
 
+def compute_conditional_scopes(
+    label_to_block: dict[str, Any],
+    default_next_map: dict[str, str | None],
+) -> dict[str, str]:
+    """Map each block label to the conditional block label whose scope it belongs to.
+
+    For each conditional block, trace each branch's chain of blocks via
+    ``default_next_map``.  Labels that appear in **all** branch chains are
+    considered merge-point blocks (i.e. they come *after* the conditional
+    reconverges) and are **not** scoped.  Labels that appear in fewer chains
+    than the total number of branches **are** inside the conditional.
+
+    Inner conditionals are themselves scoped to an outer conditional, but
+    their *own* branch targets are handled by a recursive application of
+    the same logic (inner wins via the ``if lbl not in scopes`` guard).
+    """
+    scopes: dict[str, str] = {}
+
+    conditional_labels = [lbl for lbl, blk in label_to_block.items() if blk.block_type == BlockType.CONDITIONAL]
+
+    for cond_label in conditional_labels:
+        cond_block = label_to_block[cond_label]
+        branch_targets: list[str | None] = [branch.next_block_label for branch in cond_block.ordered_branches]
+        # Deduplicate while preserving order – two branches may point to the same target
+        seen_targets: set[str | None] = set()
+        unique_targets: list[str | None] = []
+        for t in branch_targets:
+            if t not in seen_targets:
+                seen_targets.add(t)
+                unique_targets.append(t)
+
+        num_branches = len(unique_targets)
+        if num_branches == 0:
+            continue
+
+        # For each unique branch target, trace the chain via default_next_map.
+        # Stop at other conditional blocks (they handle their own branches).
+        chain_sets: list[list[str]] = []
+        for target in unique_targets:
+            chain: list[str] = []
+            cur = target
+            while cur and cur in label_to_block:
+                chain.append(cur)
+                # Stop tracing when we hit another conditional – it owns its own sub-tree
+                if label_to_block[cur].block_type == BlockType.CONDITIONAL:
+                    break
+                cur = default_next_map.get(cur)
+            chain_sets.append(chain)
+
+        # Count how many branch chains each label appears in
+        label_count: dict[str, int] = {}
+        for chain in chain_sets:
+            for lbl in chain:
+                label_count[lbl] = label_count.get(lbl, 0) + 1
+
+        # Labels appearing in ALL branches are merge points (after the conditional).
+        # Labels appearing in fewer branches are inside the conditional.
+        for chain in chain_sets:
+            for lbl in chain:
+                if label_count[lbl] >= num_branches:
+                    # This is a merge point – stop scoping further along this chain
+                    break
+                if lbl not in scopes:
+                    scopes[lbl] = cond_label
+
+    return scopes
+
+
 class ForLoopBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -1503,6 +1575,7 @@ class ForLoopBlock(Block):
         current_block: BlockTypeVar | None = None
 
         start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
+        conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             # Check max_iterations limit
@@ -1544,6 +1617,7 @@ class ForLoopBlock(Block):
 
             block_idx = 0
             current_label: str | None = start_label
+            conditional_wrb_ids: dict[str, str] = {}
             while current_label:
                 loop_block = label_to_block.get(current_label)
                 if not loop_block:
@@ -1580,12 +1654,26 @@ class ForLoopBlock(Block):
                 loop_block = loop_block.model_copy(deep=True)
                 current_block = loop_block
 
+                # Determine the parent for timeline nesting: if this block is
+                # inside a conditional's scope, parent it to that conditional's
+                # workflow_run_block rather than the loop's.
+                parent_wrb_id = workflow_run_block_id
+                if current_label in conditional_scopes:
+                    cond_label = conditional_scopes[current_label]
+                    if cond_label in conditional_wrb_ids:
+                        parent_wrb_id = conditional_wrb_ids[cond_label]
+
                 block_output = await loop_block.execute_safe(
                     workflow_run_id=workflow_run_id,
-                    parent_workflow_run_block_id=workflow_run_block_id,
+                    parent_workflow_run_block_id=parent_wrb_id,
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
                 )
+
+                # Track conditional workflow_run_block_ids so branch targets
+                # can be parented to them.
+                if loop_block.block_type == BlockType.CONDITIONAL and block_output.workflow_run_block_id:
+                    conditional_wrb_ids[current_label] = block_output.workflow_run_block_id
 
                 output_value = (
                     workflow_run_context.get_value(block_output.output_parameter.key)
@@ -3065,6 +3153,14 @@ class FileParserBlock(Block):
             return FileType.CSV  # TSV files are handled by the CSV parser
         elif suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"):
             return FileType.IMAGE
+        elif suffix == ".docx":
+            return FileType.DOCX
+        elif suffix == ".doc":
+            raise InvalidFileType(
+                file_url=file_url,
+                file_type=FileType.DOCX,
+                error="Legacy .doc format (Word 97-2003) is not supported. Please convert the file to .docx format.",
+            )
         else:
             return FileType.CSV  # Default to CSV for .csv and any other extensions
 
@@ -3119,6 +3215,14 @@ class FileParserBlock(Block):
             if kind is None or not kind.mime.startswith("image/"):
                 raise InvalidFileType(
                     file_url=file_url_used, file_type=self.file_type, error="File is not a valid image"
+                )
+        elif self.file_type == FileType.DOCX:
+            try:
+                # Try to open the file with python-docx to validate it's a valid DOCX file
+                docx.Document(file_path)
+            except Exception as e:
+                raise InvalidFileType(
+                    file_url=file_url_used, file_type=self.file_type, error=f"Invalid DOCX file format: {str(e)}"
                 )
 
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
@@ -3213,6 +3317,76 @@ class FileParserBlock(Block):
             LOG.exception("Failed to extract text from image via OCR", file_url=self.file_url)
             raise
 
+    async def _parse_docx_file(self, file_path: str, max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS) -> str:
+        """Parse DOCX file and return extracted text.
+
+        Extracts text from all paragraphs and tables in the document,
+        respecting the token limit.
+        """
+        try:
+            document = docx.Document(file_path)
+            text_parts = []
+            current_tokens = 0
+            truncated = False
+
+            # Extract text from paragraphs
+            for paragraph in document.paragraphs:
+                if paragraph.text.strip():
+                    para_tokens = count_tokens(paragraph.text)
+                    if max_tokens and current_tokens + para_tokens > max_tokens:
+                        LOG.warning(
+                            "DOCX text exceeds token limit, truncating",
+                            file_url=self.file_url,
+                            current_tokens=current_tokens,
+                            max_tokens=max_tokens,
+                        )
+                        truncated = True
+                        break
+                    text_parts.append(paragraph.text)
+                    current_tokens += para_tokens
+
+            # Extract text from tables (only if not already truncated)
+            if not truncated:
+                for table in document.tables:
+                    if truncated:
+                        break
+                    for row in table.rows:
+                        row_text = []
+                        for cell in row.cells:
+                            cell_text = cell.text.strip()
+                            if cell_text:
+                                row_text.append(cell_text)
+                        if row_text:
+                            row_str = " | ".join(row_text)
+                            row_tokens = count_tokens(row_str)
+                            if max_tokens and current_tokens + row_tokens > max_tokens:
+                                LOG.warning(
+                                    "DOCX text exceeds token limit, truncating at table",
+                                    file_url=self.file_url,
+                                    current_tokens=current_tokens,
+                                    max_tokens=max_tokens,
+                                )
+                                truncated = True
+                                break
+                            text_parts.append(row_str)
+                            current_tokens += row_tokens
+
+            extracted_text = "\n".join(text_parts)
+            extracted_text = sanitize_postgres_text(extracted_text)
+            LOG.info(
+                "Successfully parsed DOCX file",
+                file_url=self.file_url,
+                paragraph_count=len(document.paragraphs),
+                table_count=len(document.tables),
+                text_length=len(extracted_text),
+                truncated=truncated,
+            )
+            return extracted_text
+        except Exception as e:
+            raise InvalidFileType(
+                file_url=self.file_url, file_type=self.file_type, error=f"Failed to parse DOCX file: {str(e)}"
+            )
+
     async def _extract_with_ai(
         self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext
     ) -> dict[str, Any]:
@@ -3289,8 +3463,8 @@ class FileParserBlock(Block):
         else:
             file_path = await download_file(self.file_url)
 
-        # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF are explicit choices)
-        if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF):
+        # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
+        if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
             self.file_type = self._detect_file_type_from_url(self.file_url)
 
         # Validate the file type
@@ -3313,6 +3487,8 @@ class FileParserBlock(Block):
             parsed_data = await self._parse_pdf_file(file_path)
         elif self.file_type == FileType.IMAGE:
             parsed_data = await self._parse_image_file(file_path)
+        elif self.file_type == FileType.DOCX:
+            parsed_data = await self._parse_docx_file(file_path)
         else:
             return await self.build_block_result(
                 success=False,
@@ -4957,6 +5133,59 @@ def _is_pure_jinja_expression(expression: str) -> bool:
     return True
 
 
+def _resolve_nested_path(value: Any, path: str) -> Any:
+    """
+    Resolve a dotted/bracket access path on a nested value.
+
+    Examples:
+        _resolve_nested_path({"a": {"b": 1}}, ".a.b") -> 1
+        _resolve_nested_path([{"x": 2}], "[0].x") -> 2
+
+    Args:
+        value: The root value to traverse
+        path: The access path (e.g., ".field1.field2[0].field3")
+
+    Returns:
+        The resolved leaf value
+
+    Raises:
+        LookupError: If the path cannot be resolved
+    """
+    segments = re.findall(r"\.([a-zA-Z_]\w*)|\[(\d+)\]", path)
+    current = value
+    for dot_key, bracket_idx in segments:
+        if dot_key:
+            if isinstance(current, dict):
+                if dot_key not in current:
+                    raise LookupError(f"Key {dot_key!r} not found")
+                current = current[dot_key]
+            else:
+                raise LookupError(f"Cannot access .{dot_key} on {type(current).__name__}")
+        elif bracket_idx:
+            idx = int(bracket_idx)
+            if isinstance(current, (list, tuple)):
+                if idx >= len(current):
+                    raise LookupError(f"Index [{idx}] out of range")
+                current = current[idx]
+            else:
+                raise LookupError(f"Cannot index [{idx}] on {type(current).__name__}")
+    return current
+
+
+_JINJA_DISPLAY_FILTERS: dict[str, Callable[[Any], Any]] = {
+    "lower": lambda v: str(v).lower(),
+    "upper": lambda v: str(v).upper(),
+    "trim": lambda v: str(v).strip(),
+    "title": lambda v: str(v).title(),
+    "capitalize": lambda v: str(v).capitalize(),
+    "int": lambda v: int(v),
+    "float": lambda v: float(v),
+    "string": lambda v: str(v),
+    "length": lambda v: len(v),
+    "abs": lambda v: abs(v),
+}
+
+
 def _render_jinja_expression_for_display(
     expression: str,
     context_values: dict[str, Any],
@@ -4969,6 +5198,13 @@ def _render_jinja_expression_for_display(
     without actually evaluating the expression. For example:
     - Input: "{{ base_date == date_1 }}" with context {"base_date": "01-25-2026", "date_1": "01-25-2026"}
     - Output: '"01-25-2026" == "01-25-2026"'
+    - Input: "{{ output.extracted_information.field != None }}" with nested dict context
+    - Output: '"some_value" != None'
+    - Input: "{{ output.status|lower == 'active' }}" with context {"output": {"status": "Active"}}
+    - Output: '"active" == \'active\''
+
+    Known Jinja filters (lower, upper, trim, etc.) are applied to the resolved value.
+    Unknown filters are left as-is in the output.
 
     Returns the original expression if it's not a pure Jinja expression or if rendering fails.
     """
@@ -4980,15 +5216,48 @@ def _render_jinja_expression_for_display(
         inner_expr = expression.strip()[2:-2].strip()
         display_expr = inner_expr
 
-        # Substitute variable names with their values using word boundary regex
-        # This ensures we only match whole variable names, not substrings
-        # e.g., "date" won't match inside "validate_date" or "date_1"
+        # Substitute variable references (including dotted/bracket access paths and filters)
+        # with their values.
+        # Match var_name optionally followed by .field or [index] segments,
+        # then optionally followed by a |filter_name.
+        # Sort by key length (longest first) to avoid partial matches.
         for var_name in sorted(context_values.keys(), key=len, reverse=True):
-            pattern = r"\b" + re.escape(var_name) + r"\b"
-            var_value = context_values[var_name]
-            # Quote string values for clarity
-            replacement = f'"{var_value}"' if isinstance(var_value, str) else str(var_value)
-            display_expr = re.sub(pattern, replacement, display_expr)
+            pattern = r"\b" + re.escape(var_name) + r"((?:\.[a-zA-Z_]\w*|\[\d+\])*)(\|[a-zA-Z_]\w*)?"
+
+            def _replacer(match: re.Match, _var_name: str = var_name) -> str:
+                access_path = match.group(1)  # the dotted/bracket part after var_name
+                filter_expr = match.group(2)  # e.g., "|lower" or None
+                var_value = context_values[_var_name]
+
+                if access_path:
+                    try:
+                        var_value = _resolve_nested_path(var_value, access_path)
+                    except LookupError:
+                        # Path couldn't be resolved — return original text unchanged
+                        return match.group(0)
+
+                if filter_expr:
+                    filter_name = filter_expr[1:]  # strip the leading |
+                    filter_fn = _JINJA_DISPLAY_FILTERS.get(filter_name)
+                    if filter_fn is not None:
+                        try:
+                            var_value = filter_fn(var_value)
+                        except Exception:
+                            # Filter application failed — show value with filter text
+                            if isinstance(var_value, str):
+                                return f'"{var_value}"{filter_expr}'
+                            return f"{var_value}{filter_expr}"
+                    else:
+                        # Unknown filter — show value with filter text preserved
+                        if isinstance(var_value, str):
+                            return f'"{var_value}"{filter_expr}'
+                        return f"{var_value}{filter_expr}"
+
+                if isinstance(var_value, str):
+                    return f'"{var_value}"'
+                return str(var_value)
+
+            display_expr = re.sub(pattern, _replacer, display_expr)
 
         return display_expr
     except Exception as exc:

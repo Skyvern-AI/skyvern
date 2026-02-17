@@ -125,7 +125,6 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       ) : null}
                     </div>
                     <WorkflowBlockInputTextarea
-                      canWriteTitle={true}
                       nodeId={id}
                       onChange={(value) => {
                         update({ url: value });
@@ -179,7 +178,18 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       />
                     </div>
                     <WorkflowBlockInputTextarea
-                      aiImprove={AI_IMPROVE_CONFIGS.task.dataExtractionGoal}
+                      aiImprove={{
+                        useCase:
+                          AI_IMPROVE_CONFIGS.task.dataExtractionGoal.useCase,
+                        context: {
+                          ...AI_IMPROVE_CONFIGS.task.dataExtractionGoal.context,
+                          data_schema:
+                            data.dataSchema && data.dataSchema !== "null"
+                              ? data.dataSchema
+                              : undefined,
+                          navigation_goal: data.navigationGoal || undefined,
+                        },
+                      }}
                       nodeId={id}
                       onChange={(value) => {
                         update({ dataExtractionGoal: value });

@@ -245,18 +245,11 @@ function Workspace({
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
-  const [toDeleteCacheKeyValue, setToDeleteCacheKeyValue] = useState<
-    string | null
-  >(null);
   const [isCopilotOpen, setIsCopilotOpen] = useState(
     () => !initialNodes.some(isWorkflowBlockNode),
   );
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
-  const [
-    openConfirmCacheKeyValueDeleteDialogue,
-    setOpenConfirmCacheKeyValueDeleteDialogue,
-  ] = useState(false);
   const [activeDebugSession, setActiveDebugSession] =
     useState<DebugSessionApiResponse | null>(null);
   const [showPowerButton, setShowPowerButton] = useState(true);
@@ -355,6 +348,8 @@ function Workspace({
     }
 
     await saveWorkflow.mutateAsync();
+
+    workflowChangesStore.setSaidOkToCodeCacheDeletion(false);
 
     queryClient.invalidateQueries({
       queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
@@ -632,8 +627,6 @@ function Workspace({
       queryClient.invalidateQueries({
         queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
       });
-      setToDeleteCacheKeyValue(null);
-      setOpenConfirmCacheKeyValueDeleteDialogue(false);
     },
     onError: (error: AxiosError) => {
       toast({
@@ -641,8 +634,6 @@ function Workspace({
         title: "Failed to delete code key value",
         description: error.message,
       });
-      setToDeleteCacheKeyValue(null);
-      setOpenConfirmCacheKeyValueDeleteDialogue(false);
     },
   });
 
@@ -706,11 +697,11 @@ function Workspace({
 
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
-      const layoutedElements = layout(nodes, edges);
+      const layoutedElements = layout(nodes, edges, blockLabel);
       setNodes(layoutedElements.nodes);
       setEdges(layoutedElements.edges);
     },
-    [setNodes, setEdges],
+    [setNodes, setEdges, blockLabel],
   );
 
   // Listen for conditional branch changes to trigger re-layout
@@ -722,7 +713,7 @@ function Workspace({
         const currentNodes = getNodes() as Array<AppNode>;
         const currentEdges = getEdges();
 
-        const layoutedElements = layout(currentNodes, currentEdges);
+        const layoutedElements = layout(currentNodes, currentEdges, blockLabel);
         setNodes(layoutedElements.nodes);
         setEdges(layoutedElements.edges);
       }, 10); // Small delay to ensure visibility updates complete
@@ -735,7 +726,7 @@ function Workspace({
         handleBranchChange,
       );
     };
-  }, [getNodes, getEdges, setNodes, setEdges]);
+  }, [getNodes, getEdges, setNodes, setEdges, blockLabel]);
 
   function addNode({
     nodeType,
@@ -1111,60 +1102,35 @@ function Workspace({
         </DialogContent>
       </Dialog>
 
-      {/* cache key value delete dialog */}
+      {/* confirm code cache deletion dialog */}
       <Dialog
-        open={openConfirmCacheKeyValueDeleteDialogue}
+        open={workflowChangesStore.showConfirmCodeCacheDeletion}
         onOpenChange={(open) => {
-          if (!open && deleteCacheKeyValue.isPending) {
-            return;
-          }
-          setOpenConfirmCacheKeyValueDeleteDialogue(open);
+          !open && workflowChangesStore.setShowConfirmCodeCacheDeletion(false);
+          !open && workflowChangesStore.setSaidOkToCodeCacheDeletion(false);
         }}
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete Generated Code</DialogTitle>
+            <DialogTitle>Are you sure?</DialogTitle>
             <DialogDescription>
-              <div className="w-full pb-2 pt-4 text-sm text-slate-400">
-                {deleteCacheKeyValue.isPending ? (
-                  "Deleting generated code..."
-                ) : (
-                  <div className="flex w-full flex-col gap-2">
-                    <div className="w-full">
-                      Are you sure you want to delete the generated code for
-                      this code key value?
-                    </div>
-                    <div
-                      className="max-w-[29rem] overflow-hidden text-ellipsis whitespace-nowrap text-sm font-bold text-slate-400"
-                      title={toDeleteCacheKeyValue ?? undefined}
-                    >
-                      {toDeleteCacheKeyValue}
-                    </div>
-                  </div>
-                )}
-              </div>
+              Saving will delete cached code, and Skyvern will re-generate it in
+              the next run. Proceed?
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            {!deleteCacheKeyValue.isPending && (
-              <DialogClose asChild>
-                <Button variant="secondary">Cancel</Button>
-              </DialogClose>
-            )}
+            <DialogClose asChild>
+              <Button variant="secondary">Cancel</Button>
+            </DialogClose>
             <Button
               variant="default"
-              onClick={() => {
-                deleteCacheKeyValue.mutate({
-                  workflowPermanentId: workflowPermanentId!,
-                  cacheKeyValue: toDeleteCacheKeyValue!,
-                });
+              onClick={async () => {
+                workflowChangesStore.setSaidOkToCodeCacheDeletion(true);
+                await handleOnSave();
+                workflowChangesStore.setShowConfirmCodeCacheDeletion(false);
               }}
-              disabled={deleteCacheKeyValue.isPending}
             >
-              Yes, Continue{" "}
-              {deleteCacheKeyValue.isPending && (
-                <ReloadIcon className="ml-2 size-4 animate-spin" />
-              )}
+              Yes
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1277,8 +1243,10 @@ function Workspace({
                   pending={cacheKeyValuesLoading}
                   scriptKey={workflow.cache_key ?? "default"}
                   onDelete={(cacheKeyValue) => {
-                    setToDeleteCacheKeyValue(cacheKeyValue);
-                    setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                    deleteCacheKeyValue.mutate({
+                      workflowPermanentId: workflowPermanentId!,
+                      cacheKeyValue,
+                    });
                   }}
                   onPaginate={(page) => {
                     setPage(page);
@@ -1350,8 +1318,10 @@ function Workspace({
                       pending={cacheKeyValuesLoading}
                       scriptKey={workflow.cache_key ?? "default"}
                       onDelete={(cacheKeyValue) => {
-                        setToDeleteCacheKeyValue(cacheKeyValue);
-                        setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                        deleteCacheKeyValue.mutate({
+                          workflowPermanentId: workflowPermanentId!,
+                          cacheKeyValue,
+                        });
                       }}
                       onPaginate={(page) => {
                         setPage(page);
@@ -1404,8 +1374,10 @@ function Workspace({
                 pending={cacheKeyValuesLoading}
                 scriptKey={workflow.cache_key ?? "default"}
                 onDelete={(cacheKeyValue) => {
-                  setToDeleteCacheKeyValue(cacheKeyValue);
-                  setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                  deleteCacheKeyValue.mutate({
+                    workflowPermanentId: workflowPermanentId!,
+                    cacheKeyValue,
+                  });
                 }}
                 onPaginate={(page) => {
                   setPage(page);

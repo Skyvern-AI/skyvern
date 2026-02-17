@@ -106,6 +106,7 @@ import { actionNodeDefaultData, isActionNode } from "./nodes/ActionNode/types";
 import {
   isNavigationNode,
   navigationNodeDefaultData,
+  MAX_STEPS_DEFAULT,
 } from "./nodes/NavigationNode/types";
 import {
   extractionNodeDefaultData,
@@ -119,7 +120,6 @@ import {
   isPdfParserNode,
   pdfParserNodeDefaultData,
 } from "./nodes/PDFParserNode/types";
-import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
 import {
@@ -262,9 +262,13 @@ function getNestingLevel(node: AppNode, nodes: Array<AppNode>): number {
   return level;
 }
 
+// Extra margin to add when a block is being debugged and shows the status row
+const TARGETTED_BLOCK_EXTRA_MARGIN = 48;
+
 function layout(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
+  targettedBlockLabel?: string,
 ): { nodes: Array<AppNode>; edges: Array<Edge> } {
   const loopNodes = nodes.filter(
     (node) => node.type === "loop" && !node.hidden,
@@ -288,12 +292,18 @@ function layout(
       ...n,
       position: { x: 0, y: 0 },
     }));
+    // Check if this loop node is the targetted block (being debugged)
+    // If so, add extra margin to account for the status row that appears
+    const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
+    const isTargetted =
+      targettedBlockLabel && nodeLabel === targettedBlockLabel;
+    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
       {
         marginx: (loopNodeWidth - maxChildWidth) / 2,
-        marginy: 225,
+        marginy,
       },
       nodes,
     );
@@ -337,12 +347,18 @@ function layout(
       position: { x: 0, y: 0 },
     }));
 
+    // Check if this conditional node is the targetted block (being debugged)
+    // If so, add extra margin to account for the status row that appears
+    const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
+    const isTargetted =
+      targettedBlockLabel && nodeLabel === targettedBlockLabel;
+    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
       {
         marginx: (conditionalNodeWidth - maxChildWidth) / 2,
-        marginy: 225,
+        marginy,
       },
       nodes,
     );
@@ -511,19 +527,33 @@ function convertToNode(
       };
     }
     case "task_v2": {
+      // Convert task_v2 blocks to navigation nodes with engine=SkyvernV2
       return {
         ...identifiers,
         ...common,
-        type: "taskv2",
+        type: "navigation",
         data: {
           ...commonData,
+          // V2-specific fields
           prompt: block.prompt,
           url: block.url ?? "",
-          maxSteps: block.max_steps,
+          maxSteps: block.max_steps ?? MAX_STEPS_DEFAULT,
           disableCache: block.disable_cache ?? false,
           totpIdentifier: block.totp_identifier,
           totpVerificationUrl: block.totp_verification_url,
-          maxScreenshotScrolls: null,
+          // Set engine to SkyvernV2 to indicate V2 mode
+          engine: RunEngine.SkyvernV2,
+          // Default V1 fields (not used in V2 mode but needed for type compatibility)
+          navigationGoal: "",
+          errorCodeMapping: "null",
+          completeCriterion: "",
+          terminateCriterion: "",
+          maxRetries: null,
+          maxStepsOverride: null,
+          allowDownloads: false,
+          downloadSuffix: null,
+          parameterKeys: [],
+          includeActionHistoryInVerification: false,
         },
       };
     }
@@ -564,6 +594,7 @@ function convertToNode(
       };
     }
     case "navigation": {
+      const isV2Engine = block.engine === RunEngine.SkyvernV2;
       return {
         ...identifiers,
         ...common,
@@ -586,6 +617,11 @@ function convertToNode(
           engine: block.engine ?? RunEngine.SkyvernV1,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
+          // When engine is SkyvernV2, use navigation_goal as the prompt
+          prompt: isV2Engine ? block.navigation_goal ?? "" : "",
+          maxSteps: isV2Engine
+            ? block.max_steps_per_run ?? MAX_STEPS_DEFAULT
+            : MAX_STEPS_DEFAULT,
         },
       };
     }
@@ -1683,13 +1719,15 @@ function createNode(
       };
     }
     case "taskv2": {
+      // Redirect taskv2 creation to navigation with SkyvernV2 engine
       return {
         ...identifiers,
         ...common,
-        type: "taskv2",
+        type: "navigation",
         data: {
-          ...taskv2NodeDefaultData,
+          ...navigationNodeDefaultData,
           label,
+          engine: RunEngine.SkyvernV2,
         },
       };
     }
@@ -2148,6 +2186,20 @@ function getWorkflowBlock(
       };
     }
     case "navigation": {
+      // If engine is SkyvernV2, convert to task_v2 block
+      if (node.data.engine === RunEngine.SkyvernV2) {
+        return {
+          ...base,
+          block_type: "task_v2",
+          prompt: node.data.prompt,
+          max_steps: node.data.maxSteps,
+          totp_identifier: node.data.totpIdentifier,
+          totp_verification_url: node.data.totpVerificationUrl,
+          url: node.data.url,
+          disable_cache: node.data.disableCache ?? false,
+        };
+      }
+      // Otherwise, create a navigation block
       return {
         ...base,
         block_type: "navigation",
@@ -3915,8 +3967,15 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
   const navigationNodes = nodes.filter(isNavigationNode);
   navigationNodes.forEach((node) => {
-    if (node.data.navigationGoal.length === 0) {
-      errors.push(`${node.data.label}: Navigation goal is required.`);
+    // V2 mode uses prompt, V1 mode uses navigationGoal
+    if (node.data.engine === RunEngine.SkyvernV2) {
+      if (!node.data.prompt || node.data.prompt.length === 0) {
+        errors.push(`${node.data.label}: Prompt is required.`);
+      }
+    } else {
+      if (!node.data.navigationGoal || node.data.navigationGoal.length === 0) {
+        errors.push(`${node.data.label}: Prompt is required.`);
+      }
     }
   });
 

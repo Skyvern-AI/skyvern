@@ -1,0 +1,164 @@
+---
+title: Helper Methods
+subtitle: High-level methods for common automation patterns
+slug: ts-sdk-reference/helpers
+---
+
+These methods wrap common multi-step patterns into single API calls. Under the hood, they create and run specialized workflows.
+
+---
+
+## `login`
+
+Automate logging into a website using stored credentials. This creates a login workflow, executes it, and optionally waits for completion.
+
+```typescript
+const result = await skyvern.login({
+  credential_type: "skyvern",
+  credential_id: "cred_abc123",
+  url: "https://app.example.com/login",
+  waitForCompletion: true,
+});
+console.log(result.status);
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `credential_type` | `CredentialType` | Yes | — | How credentials are stored. Options: `"skyvern"`, `"bitwarden"`, `"1password"`, `"azure_vault"`. |
+| `url` | `string` | No | `undefined` | The login page URL. |
+| `credential_id` | `string` | No | `undefined` | The Skyvern credential ID (when using `"skyvern"` type). |
+| `prompt` | `string` | No | `undefined` | Additional instructions for the AI during login. |
+| `browser_session_id` | `string` | No | `undefined` | Run login inside an existing browser session. |
+| `browser_address` | `string` | No | `undefined` | Connect to a browser at this CDP address. |
+| `proxy_location` | `ProxyLocation` | No | `undefined` | Route browser traffic through a geographic proxy. |
+| `webhook_url` | `string` | No | `undefined` | URL to receive a POST when the login finishes. |
+| `totp_identifier` | `string` | No | `undefined` | Identifier for TOTP verification. |
+| `totp_url` | `string` | No | `undefined` | URL to receive TOTP codes. |
+| `extra_http_headers` | `Record<string, string>` | No | `undefined` | Additional HTTP headers. |
+| `max_screenshot_scrolling_times` | `number` | No | `undefined` | Number of screenshot scrolls. |
+| `waitForCompletion` | `boolean` | No | `false` | Block until the login finishes. |
+| `timeout` | `number` | No | `1800` | Max wait time in seconds. |
+
+**Bitwarden-specific parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `bitwarden_collection_id` | `string` | Bitwarden collection ID. |
+| `bitwarden_item_id` | `string` | Bitwarden item ID. |
+
+**1Password-specific parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `onepassword_vault_id` | `string` | 1Password vault ID. |
+| `onepassword_item_id` | `string` | 1Password item ID. |
+
+**Azure Key Vault-specific parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `azure_vault_name` | `string` | Azure Key Vault name. |
+| `azure_vault_username_key` | `string` | Secret name for the username. |
+| `azure_vault_password_key` | `string` | Secret name for the password. |
+| `azure_vault_totp_secret_key` | `string` | Secret name for the TOTP secret. |
+
+### Returns `WorkflowRunResponse`
+
+### Example: Login then extract data
+
+```typescript
+const session = await skyvern.createBrowserSession({});
+
+// Login
+await skyvern.login({
+  credential_type: "skyvern",
+  credential_id: "cred_abc123",
+  url: "https://app.example.com/login",
+  browser_session_id: session.browser_session_id,
+  waitForCompletion: true,
+});
+
+// Now extract data from the authenticated session
+const result = await skyvern.runTask({
+  body: {
+    prompt: "Go to the billing page and extract all invoices",
+    browser_session_id: session.browser_session_id,
+  },
+  waitForCompletion: true,
+});
+console.log(result.output);
+```
+
+---
+
+## `downloadFiles`
+
+Navigate to a page and download files.
+
+```typescript
+const result = await skyvern.downloadFiles({
+  navigation_goal: "Download the latest monthly report PDF",
+  url: "https://app.example.com/reports",
+  waitForCompletion: true,
+});
+
+for (const f of result.downloaded_files ?? []) {
+  console.log(f.name);
+}
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `navigation_goal` | `string` | Yes | — | Natural language description of what to download. |
+| `url` | `string` | No | `undefined` | Starting page URL. |
+| `browser_session_id` | `string` | No | `undefined` | Run inside an existing browser session. |
+| `browser_profile_id` | `string` | No | `undefined` | Load a browser profile. |
+| `proxy_location` | `ProxyLocation` | No | `undefined` | Route through a geographic proxy. |
+| `webhook_url` | `string` | No | `undefined` | URL to receive a POST when the download finishes. |
+| `download_suffix` | `string` | No | `undefined` | Expected file extension to wait for (e.g., `".pdf"`). |
+| `download_timeout` | `number` | No | `undefined` | Max time to wait for the download in seconds. |
+| `max_steps_per_run` | `number` | No | `undefined` | Cap AI steps. |
+| `extra_http_headers` | `Record<string, string>` | No | `undefined` | Additional HTTP headers. |
+| `waitForCompletion` | `boolean` | No | `false` | Block until the download finishes. |
+| `timeout` | `number` | No | `1800` | Max wait time in seconds. |
+
+### Returns `WorkflowRunResponse`
+
+The `downloaded_files` field contains the list of files that were downloaded.
+
+<Note>
+Unlike the Python SDK where `download_files` does not support `wait_for_completion`, the TypeScript SDK supports `waitForCompletion` on all methods including `downloadFiles`.
+</Note>
+
+---
+
+## `uploadFile`
+
+Upload a file to Skyvern's storage. Returns a presigned URL and S3 URI you can reference in tasks and workflows.
+
+```typescript
+import fs from "fs";
+
+const upload = await skyvern.uploadFile({
+  file: fs.createReadStream("data.csv"),
+});
+console.log(upload.s3_uri);        // s3://skyvern-uploads/...
+console.log(upload.presigned_url); // https://...signed download URL
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file` | `File \| ReadStream \| Blob` | Yes | The file to upload. |
+
+### Returns `UploadFileResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `s3_uri` | `string` | S3 URI for the uploaded file. |
+| `presigned_url` | `string` | Pre-signed download URL. |

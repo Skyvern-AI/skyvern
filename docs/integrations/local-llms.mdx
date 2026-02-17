@@ -1,0 +1,140 @@
+---
+title: Local LLMs
+subtitle: Run Skyvern with Ollama or any OpenAI-compatible endpoint
+slug: integrations/local-llms
+---
+
+Skyvern supports local LLMs for self-hosted deployments. Use Ollama directly or route through LiteLLM to connect any model provider.
+
+---
+
+## What you'll need
+
+- A self-hosted Skyvern deployment
+- Ollama installed locally, or an OpenAI-compatible endpoint
+
+---
+
+## Option A: Ollama
+
+Use Ollama to run open-source models locally.
+
+### Step 1: Start Ollama
+
+```bash
+ollama pull llama3.1
+ollama serve
+```
+
+The API runs at `http://localhost:11434`.
+
+### Step 2: Configure Skyvern
+
+Add to your `.env` file:
+
+```bash
+ENABLE_OLLAMA=true
+OLLAMA_SERVER_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.1
+
+# Enable for vision models (qwen2-vl, llava, etc.)
+OLLAMA_SUPPORTS_VISION=false
+```
+
+| Variable | Description |
+|----------|-------------|
+| `ENABLE_OLLAMA` | Enable Ollama integration. |
+| `OLLAMA_SERVER_URL` | Ollama server URL. Defaults to `http://localhost:11434`. |
+| `OLLAMA_MODEL` | Model name. Check available models with `ollama list`. |
+| `OLLAMA_SUPPORTS_VISION` | Enable vision support for multimodal models like `qwen2-vl` or `llava`. |
+
+### Step 3: Verify the connection
+
+```bash
+curl -s http://localhost:11434/api/tags | jq .
+```
+
+---
+
+## Option B: LiteLLM
+
+Use LiteLLM as an OpenAI-compatible proxy to connect any model provider.
+
+### Step 1: Start LiteLLM
+
+```bash
+litellm --model ollama/llama3.1 --host 0.0.0.0 --port 4000
+```
+
+### Step 2: Configure Skyvern
+
+Add to your `.env` file:
+
+```bash
+ENABLE_OPENAI_COMPATIBLE=true
+OPENAI_COMPATIBLE_MODEL_NAME=llama3.1
+OPENAI_COMPATIBLE_API_KEY=sk-test
+OPENAI_COMPATIBLE_API_BASE=http://localhost:4000/v1
+```
+
+| Variable | Description |
+|----------|-------------|
+| `ENABLE_OPENAI_COMPATIBLE` | Enable OpenAI-compatible provider. |
+| `OPENAI_COMPATIBLE_MODEL_NAME` | Model identifier. |
+| `OPENAI_COMPATIBLE_API_KEY` | API key for the proxy. |
+| `OPENAI_COMPATIBLE_API_BASE` | Base URL. Must end with `/v1`. |
+| `OPENAI_COMPATIBLE_SUPPORTS_VISION` | Enable vision support for multimodal models. |
+| `OPENAI_COMPATIBLE_REASONING_EFFORT` | Set to `low`, `medium`, or `high`. |
+
+### Step 3: Verify the connection
+
+```bash
+curl -s http://localhost:4000/v1/models \
+  -H "Authorization: Bearer sk-test" | jq .
+```
+
+---
+
+## Step 4: Start Skyvern
+
+After configuring your `.env`, start the server:
+
+```bash
+# With Docker
+docker compose up -d
+
+# Or locally
+skyvern run server
+```
+
+---
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Model not responding | Ensure `ollama serve` is running and the model exists (`ollama list`). |
+| LiteLLM 401 error | Set `OPENAI_COMPATIBLE_API_KEY` to a value the proxy accepts. |
+| Model not visible | Set `ENABLE_OLLAMA=true` or `ENABLE_OPENAI_COMPATIBLE=true` and restart. |
+| Wrong base URL | Confirm `OPENAI_COMPATIBLE_API_BASE` ends with `/v1`. |
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="API Quickstart"
+    icon="rocket"
+    href="/getting-started/quickstart"
+  >
+    Get started with Skyvern
+  </Card>
+  <Card
+    title="Run a Task"
+    icon="play"
+    href="/running-automations/run-a-task"
+  >
+    Learn the task API
+  </Card>
+</CardGroup>

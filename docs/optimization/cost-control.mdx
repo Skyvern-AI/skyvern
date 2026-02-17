@@ -1,0 +1,292 @@
+---
+title: Cost Control
+subtitle: Limit steps and optimize prompts to manage costs
+slug: optimization/cost-control
+---
+
+Skyvern Cloud uses a **credit-based billing model**. Each plan includes a monthly credit allowance that determines how many actions you can run.
+
+| Plan | Price | Actions Included |
+|------|-------|------------------|
+| Free | $0 | ~170 |
+| Hobby | $29 | ~1,200 |
+| Pro | $149 | ~6,200 |
+| Enterprise | Custom | Unlimited |
+
+Use `max_steps` to limit steps per run and prevent runaway costs.
+
+---
+
+## Limit steps with max_steps
+
+Set `max_steps` to cap the worst-case cost of any run. If a task gets stuck in a loop or hits repeated failures, `max_steps` stops it before it burns through your budget. The run terminates with `status: "timed_out"` when it hits the limit.
+
+### For tasks
+
+Pass `max_steps` in the request body.
+
+<CodeGroup>
+```python Python
+from skyvern import Skyvern
+
+client = Skyvern(api_key="YOUR_API_KEY")
+
+result = await client.run_task(
+    prompt="Extract the top 3 products",
+    url="https://example.com/products",
+    max_steps=15,
+    wait_for_completion=True,
+)
+print(f"Steps taken: {result.step_count}")
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+const result = await client.runTask({
+  body: {
+    prompt: "Extract the top 3 products",
+    url: "https://example.com/products",
+    max_steps: 15,
+  },
+  waitForCompletion: true,
+});
+console.log(`Steps taken: ${result.step_count}`);
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Extract the top 3 products",
+    "url": "https://example.com/products",
+    "max_steps": 15
+  }'
+```
+</CodeGroup>
+
+### For workflows
+
+Pass `max_steps_override` as a parameter (Python) or `x-max-steps-override` header (TypeScript/cURL). This limits total steps across all blocks.
+
+<CodeGroup>
+```python Python
+from skyvern import Skyvern
+
+client = Skyvern(api_key="YOUR_API_KEY")
+
+result = await client.run_workflow(
+    workflow_id="wf_data_extraction",
+    max_steps_override=30,
+    wait_for_completion=True,
+)
+print(f"Steps taken: {result.step_count}")
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+const result = await client.runWorkflow({
+  "x-max-steps-override": 30,
+  body: { workflow_id: "wf_data_extraction" },
+  waitForCompletion: true,
+});
+console.log(`Steps taken: ${result.step_count}`);
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/workflows" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "x-max-steps-override: 30" \
+  -H "Content-Type: application/json" \
+  -d '{"workflow_id": "wf_data_extraction"}'
+```
+</CodeGroup>
+
+<Info>
+If runs consistently time out, increase `max_steps` or simplify the task. If `step_count` is much lower than `max_steps`, reduce the limit.
+</Info>
+
+---
+
+## Use code generation for repeatable tasks
+
+On Skyvern Cloud, the default **Skyvern 2.0 with Code** engine records the actions the AI takes and generates reusable code from them. Subsequent runs execute the generated code instead of the AI agent — skipping LLM inference and screenshot analysis entirely. This makes them faster, deterministic, and significantly cheaper.
+
+1. Run your task with the default engine. Skyvern generates code from the recorded actions.
+2. Subsequent runs execute the cached code directly, no AI reasoning required.
+3. If the code doesn't handle an edge case, adjust your prompt and re-run to regenerate. Skyvern also falls back to the AI agent automatically if the cached code fails.
+
+You can control this with the `run_with` parameter. Set it to `"code"` to use cached code, or `"agent"` to force AI reasoning.
+
+<CodeGroup>
+```python Python
+from skyvern import Skyvern
+
+client = Skyvern(api_key="YOUR_API_KEY")
+
+# First run: AI agent executes and generates code
+result = await client.run_task(
+    prompt="Extract the top 3 products",
+    url="https://example.com/products",
+    wait_for_completion=True,
+)
+
+# Subsequent runs: execute cached code instead of AI
+result = await client.run_task(
+    prompt="Extract the top 3 products",
+    url="https://example.com/products",
+    run_with="code",
+    wait_for_completion=True,
+)
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+// First run: AI agent executes and generates code
+const result = await client.runTask({
+  body: {
+    prompt: "Extract the top 3 products",
+    url: "https://example.com/products",
+  },
+  waitForCompletion: true,
+});
+
+// Subsequent runs: execute cached code instead of AI
+const codeResult = await client.runTask({
+  body: {
+    prompt: "Extract the top 3 products",
+    url: "https://example.com/products",
+    run_with: "code",
+  },
+  waitForCompletion: true,
+});
+```
+
+```bash cURL
+# First run: AI agent executes and generates code
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Extract the top 3 products",
+    "url": "https://example.com/products"
+  }'
+
+# Subsequent runs: execute cached code instead of AI
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Extract the top 3 products",
+    "url": "https://example.com/products",
+    "run_with": "code"
+  }'
+```
+</CodeGroup>
+
+<Tip>
+Set `publish_workflow: true` to save the generated workflow so you can re-trigger it later or schedule it on a cron.
+</Tip>
+
+---
+
+## Choose a cheaper engine
+
+Not every task needs the most powerful engine. Use a lighter engine for simple, single-objective work.
+
+| Engine | Cost | Best for |
+|--------|------|----------|
+| `skyvern-2.0` | Highest | Complex, multi-step tasks that require flexibility |
+| `skyvern-1.0` | Lower | Single-objective tasks like form fills or single-page extraction |
+
+<CodeGroup>
+```python Python
+from skyvern import Skyvern
+
+client = Skyvern(api_key="YOUR_API_KEY")
+
+result = await client.run_task(
+    prompt="Fill out the contact form",
+    url="https://example.com/contact",
+    engine="skyvern-1.0",
+    wait_for_completion=True,
+)
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+const result = await client.runTask({
+  body: {
+    prompt: "Fill out the contact form",
+    url: "https://example.com/contact",
+    engine: "skyvern-1.0",
+  },
+  waitForCompletion: true,
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Fill out the contact form",
+    "url": "https://example.com/contact",
+    "engine": "skyvern-1.0"
+  }'
+```
+</CodeGroup>
+
+For self-hosted deployments, you can also swap the underlying LLM to a cheaper model (e.g., Gemini 2.5 Flash instead of a pro-tier model) via the `LLM_KEY` environment variable. See [LLM configuration](/self-hosted/llm-configuration) for details.
+
+---
+
+## Write better prompts
+
+Small prompt changes can cut step count significantly.
+
+- **Be specific about the goal and completion criteria.** "Extract the price, title, and rating of the first 3 products" finishes faster than "look at the products page."
+- **Avoid open-ended exploration.** Prompts like "find interesting data" or "look around" cause the agent to wander.
+- **Use `data_extraction_schema`** to constrain what fields the AI extracts. This prevents it from spending steps parsing irrelevant content.
+- **Provide `url`** to start on the correct page instead of making the agent search for it.
+- **Use [browser profiles](/optimization/browser-profiles)** to skip login steps on repeated runs.
+
+---
+
+## Monitor usage
+
+- Check `step_count` in run responses to understand actual consumption per task.
+- Use `get_run_timeline()` to inspect individual steps and identify waste (loops, unnecessary navigation, retries).
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Browser Sessions"
+    icon="browser"
+    href="/optimization/browser-sessions"
+  >
+    Maintain live browser state between calls
+  </Card>
+  <Card
+    title="Browser Profiles"
+    icon="floppy-disk"
+    href="/optimization/browser-profiles"
+  >
+    Save authenticated state for reuse across days
+  </Card>
+</CardGroup>

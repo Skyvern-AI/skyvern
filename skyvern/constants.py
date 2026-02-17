@@ -38,6 +38,7 @@ DEFAULT_MAX_TOKENS = 100000
 MAX_FILE_PARSE_INPUT_TOKENS = 256_000
 MAX_IMAGE_MESSAGES = 10
 SCROLL_AMOUNT_MULTIPLIER = 100
+EXTRACT_ACTION_SCROLL_AMOUNT = 500  # pixels per scroll action from extract-action prompt
 
 # Text input constants
 TEXT_INPUT_DELAY = 10  # 10ms between each character input

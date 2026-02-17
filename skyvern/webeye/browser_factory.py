@@ -236,6 +236,7 @@ class BrowserContextFactory:
             browser_args.extend([f"--disable-extensions-except={joined_paths}", f"--load-extension={joined_paths}"])
             LOG.info("Extensions added to browser args", extensions=joined_paths)
 
+        browser_args.extend(settings.BROWSER_ADDITIONAL_ARGS)
         args = {
             "color_scheme": "no-preference",
             "args": browser_args,

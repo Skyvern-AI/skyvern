@@ -1,0 +1,81 @@
+---
+title: Overview
+subtitle: End-to-end workflow examples for common automation scenarios
+slug: cookbooks/overview
+---
+
+Cookbooks are complete, production-ready workflow examples that demonstrate how to use Skyvern Browser Automation agent in real-world use-cases. 
+
+Each cookbook walks through the workflow step-by-step, explaining design decisions and showing you how to adapt it for your use case.
+
+---
+
+## Available cookbooks
+
+<CardGroup cols={1}>
+  <Card
+    title="Bulk Invoice Downloader"
+    icon="file-invoice-dollar"
+    href="/cookbooks/bulk-invoice-downloader"
+  >
+    Download invoices from vendor portals, parse PDFs to extract amounts, and email a summary with attachments.
+  </Card>
+  <Card
+    title="Job Applications Pipeline"
+    icon="briefcase"
+    href="/cookbooks/job-application-filler"
+  >
+    Search for jobs on any portal, extract listings, generate tailored answers with AI, and submit applications automatically.
+  </Card>
+</CardGroup>
+
+---
+
+## Getting your API key
+
+All cookbooks require a Skyvern API key. Here's how to get one:
+
+<Steps>
+  <Step title="Create an account">
+  Sign up at [app.skyvern.com](https://app.skyvern.com) or log in to your existing account.
+  </Step>
+  <Step title="Go to Settings">
+  Click **Settings** in the left sidebar, then copy your **API Keys**.
+  <Frame>
+    <img src="/images/get-api-key.png" alt="API Keys settings page" />
+  </Frame>
+  </Step>
+  <Step title="Set your environment variable">
+  Set the `SKYVERN_API_KEY` environment variable in your shell or `.env` file.
+  ```bash
+  export SKYVERN_API_KEY="your-api-key"
+  ```
+  Or add it to your `.env` file:
+  ```bash
+  SKYVERN_API_KEY=your-api-key
+  ```
+  </Step>
+</Steps>
+
+---
+
+## Other Resources
+
+If you're new to Skyvern workflows, start with these foundational guides:
+
+<CardGroup cols={2}>
+  <Card
+    title="Build a Workflow"
+    icon="hammer"
+    href="/multi-step-automations/build-a-workflow"
+  >
+    Learn workflow basics: parameters, blocks, and data passing
+  </Card>
+  <Card
+    title="Workflow Blocks Reference"
+    icon="cube"
+    href="/multi-step-automations/workflow-blocks-reference"
+  >
+    Complete reference for all block types
+  </Card>
+</CardGroup>

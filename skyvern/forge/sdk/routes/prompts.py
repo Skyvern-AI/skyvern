@@ -10,17 +10,27 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.prompts import ImprovePromptRequest, ImprovePromptResponse
+from skyvern.forge.sdk.schemas.prompts import (
+    GenerateWorkflowTitleRequest,
+    GenerateWorkflowTitleResponse,
+    ImprovePromptRequest,
+    ImprovePromptResponse,
+)
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.service import generate_title_from_blocks_info
 
 LOG = structlog.get_logger()
 
 
 class Constants:
     DEFAULT_TEMPLATE_NAME = "improve-prompt-for-ai-browser-agent"
+    EXTRACTION_TEMPLATE_NAME = "improve-prompt-for-data-extraction"
     IMPROVE_PROMPT_USE_CASE_TO_TEMPLATE_MAP = {
         "new_workflow": DEFAULT_TEMPLATE_NAME,
         "task_v2_prompt": DEFAULT_TEMPLATE_NAME,
+        "workflow_editor.extraction.data_extraction_goal": EXTRACTION_TEMPLATE_NAME,
+        "workflow_editor.extraction.data_schema": EXTRACTION_TEMPLATE_NAME,
+        "workflow_editor.task.data_extraction_goal": EXTRACTION_TEMPLATE_NAME,
     }
 
 
@@ -123,4 +133,43 @@ async def improve_prompt(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to improve prompt: {str(e)}",
+        )
+
+
+@base_router.post(
+    "/prompts/generate-workflow-title",
+    tags=["Prompts"],
+    description="Generate a meaningful workflow title from block content",
+    summary="Generate workflow title",
+    include_in_schema=False,
+)
+async def generate_workflow_title(
+    request: GenerateWorkflowTitleRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> GenerateWorkflowTitleResponse:
+    """Generate a meaningful workflow title based on block content using LLM."""
+    LOG.info(
+        "Generating workflow title",
+        organization_id=current_org.organization_id,
+        num_blocks=len(request.blocks),
+    )
+
+    try:
+        blocks_info = [block.model_dump(exclude_none=True) for block in request.blocks]
+        title = await generate_title_from_blocks_info(
+            organization_id=current_org.organization_id,
+            blocks_info=blocks_info,
+        )
+        return GenerateWorkflowTitleResponse(title=title)
+    except LLMProviderError:
+        LOG.error("Failed to generate workflow title", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to generate title. Please try again later.",
+        )
+    except Exception as e:
+        LOG.error("Unexpected error generating workflow title", error=str(e), exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to generate title: {str(e)}",
         )

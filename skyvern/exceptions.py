@@ -426,6 +426,14 @@ class CredentialParameterNotFoundError(SkyvernException):
         super().__init__(f"Could not find credential parameter: {credential_parameter_id}")
 
 
+class CredentialVaultNotConfiguredError(SkyvernException):
+    def __init__(self, vault_type: str, credential_id: str) -> None:
+        super().__init__(
+            f"Credential vault service '{vault_type}' is not configured. "
+            f"Credential {credential_id} was found in DB but cannot be resolved."
+        )
+
+
 class UnknownElementTreeFormat(SkyvernException):
     def __init__(self, fmt: str) -> None:
         super().__init__(f"Unknown element tree format {fmt}")
@@ -867,6 +875,15 @@ class OutputParameterNotFound(SkyvernHTTPException):
         super().__init__(
             f"Output parameter for {block_label} not found in workflow {workflow_permanent_id}",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class TemporalSubmissionFailed(SkyvernHTTPException):
+    def __init__(self, workflow_type: str, workflow_run_id: str | None = None) -> None:
+        workflow_run_str = f" for workflow_run_id={workflow_run_id}" if workflow_run_id else ""
+        super().__init__(
+            f"Failed to submit {workflow_type} to Temporal{workflow_run_str}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
 

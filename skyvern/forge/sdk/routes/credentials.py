@@ -1,3 +1,30 @@
+"""Credential management API endpoints.
+
+SECURITY INVARIANT — NO RAW CREDENTIAL RETRIEVAL
+=================================================
+Credential endpoints must NEVER return sensitive credential data (passwords,
+TOTP secrets, full card numbers, CVVs, expiration dates, card holder names,
+or secret values) in any API response. The only fields that may be returned
+are non-sensitive metadata:
+
+  - Password credentials: ``username``, ``totp_type``, ``totp_identifier``
+  - Credit card credentials: ``last_four``, ``brand``
+  - Secret credentials: ``secret_label``
+
+This is enforced by the ``*CredentialResponse`` Pydantic models and the
+``_convert_to_response()`` helper. When adding new credential types or
+modifying existing ones, ensure that:
+
+  1. The response model never includes the raw secret material.
+  2. The ``_convert_to_response()`` function only maps non-sensitive fields.
+  3. No endpoint (including ``get_credential`` and ``get_credentials``) ever
+     fetches and returns the decrypted secret from the vault.
+
+Violating this invariant would allow any caller with a valid API key to
+exfiltrate stored passwords, card numbers, and secrets — which is the
+exact threat the vault architecture is designed to prevent.
+"""
+
 import json
 
 import structlog
@@ -280,6 +307,75 @@ async def create_credential(
         raise HTTPException(status_code=400, detail=f"Unsupported credential type: {data.credential_type}")
 
 
+@legacy_base_router.put("/credentials/{credential_id}")
+@legacy_base_router.put("/credentials/{credential_id}/", include_in_schema=False)
+@base_router.post(
+    "/credentials/{credential_id}/update",
+    response_model=CredentialResponse,
+    summary="Update credential",
+    description="Overwrites the stored credential data (e.g. username/password) while keeping the same credential_id.",
+    tags=["Credentials"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "update_credential",
+    },
+)
+@base_router.post(
+    "/credentials/{credential_id}/update/",
+    response_model=CredentialResponse,
+    include_in_schema=False,
+)
+async def update_credential(
+    background_tasks: BackgroundTasks,
+    credential_id: str = Path(
+        ...,
+        description="The unique identifier of the credential to update",
+        examples=["cred_1234567890"],
+        openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
+    ),
+    data: CreateCredentialRequest = Body(
+        ...,
+        description="The new credential data to store",
+        example={
+            "name": "My Credential",
+            "credential_type": "PASSWORD",
+            "credential": {"username": "user@example.com", "password": "newpassword123"},
+        },
+        openapi_extra={"x-fern-sdk-parameter-name": "data"},
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialResponse:
+    existing_credential = await app.DATABASE.get_credential(
+        credential_id=credential_id, organization_id=current_org.organization_id
+    )
+    if not existing_credential:
+        raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
+
+    vault_type = existing_credential.vault_type or CredentialVaultType.BITWARDEN
+    credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+    if not credential_service:
+        raise HTTPException(status_code=400, detail="Unsupported credential storage type")
+
+    old_item_id = existing_credential.item_id
+
+    updated_credential = await credential_service.update_credential(
+        credential=existing_credential,
+        data=data,
+    )
+
+    # Schedule background cleanup of old vault item if the item_id changed
+    if old_item_id != updated_credential.item_id:
+        background_tasks.add_task(
+            credential_service.post_delete_credential_item,
+            old_item_id,
+            existing_credential.organization_id,
+        )
+
+    if updated_credential.vault_type == CredentialVaultType.BITWARDEN:
+        background_tasks.add_task(fetch_credential_item_background, updated_credential.item_id)
+
+    return _convert_to_response(updated_credential)
+
+
 @legacy_base_router.delete("/credentials/{credential_id}")
 @legacy_base_router.delete("/credentials/{credential_id}/", include_in_schema=False)
 @base_router.post(
@@ -329,7 +425,12 @@ async def delete_credential(
     await credential_service.delete_credential(credential)
 
     # Schedule background cleanup if the service implements it
-    background_tasks.add_task(credential_service.post_delete_credential_item, credential.item_id)
+    if vault_type != CredentialVaultType.CUSTOM:
+        background_tasks.add_task(
+            credential_service.post_delete_credential_item,
+            credential.item_id,
+            credential.organization_id,
+        )
 
     return None
 
@@ -368,6 +469,13 @@ async def get_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
+    """Return non-sensitive metadata for a single credential.
+
+    SECURITY: This endpoint intentionally does NOT return the raw secret
+    material (password, card number, CVV, secret value, etc.). Only
+    non-sensitive fields are included in the response. See the module
+    docstring for the full security invariant.
+    """
     credential = await app.DATABASE.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
     )
@@ -419,6 +527,11 @@ async def get_credentials(
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
     ),
 ) -> list[CredentialResponse]:
+    """Return non-sensitive metadata for all credentials (paginated).
+
+    SECURITY: Like ``get_credential``, this endpoint never returns raw secret
+    material. See the module docstring for the full security invariant.
+    """
     credentials = await app.DATABASE.get_credentials(current_org.organization_id, page=page, page_size=page_size)
     return [_convert_to_response(credential) for credential in credentials]
 
@@ -751,6 +864,13 @@ async def _get_credential_vault_service() -> CredentialVaultService:
 
 
 def _convert_to_response(credential: Credential) -> CredentialResponse:
+    """Convert an internal ``Credential`` to a safe API response.
+
+    SECURITY: This function must ONLY copy non-sensitive metadata into the
+    response. Never include passwords, TOTP secrets, full card numbers, CVVs,
+    expiration dates, card holder names, or secret values. See the module
+    docstring for the full security invariant.
+    """
     if credential.credential_type == CredentialType.PASSWORD:
         credential_response = PasswordCredentialResponse(
             username=credential.username or credential.credential_id,

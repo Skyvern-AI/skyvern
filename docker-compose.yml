@@ -57,7 +57,7 @@ services:
     # - LLM_KEY=GEMINI
     # - ENABLE_GEMINI=true
     # - GEMINI_API_KEY=YOUR_GEMINI_KEY
-    # - LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
+    # - LLM_KEY=GEMINI_3.0_FLASH
     # If you want to use other LLM provider, like azure and anthropic:
     # - ENABLE_ANTHROPIC=true
     # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET

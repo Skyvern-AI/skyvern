@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.12"
+version = "1.0.13"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -12,10 +12,10 @@ dependencies = [
     "openai>=1.68.2",
     "sqlalchemy[mypy]>=2.0.29,<3",
     "aiohttp>=3.8.5,<4",
-    "python-multipart>=0.0.18,<0.0.19",
+    "python-multipart>=0.0.22,<1",
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.2,<4",
-    "uvicorn[standard]>=0.24.0.post1,<0.25",
+    "uvicorn[standard]>=0.35.0",
     "litellm>=1.80.10",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
@@ -25,7 +25,7 @@ dependencies = [
     "starlette-context>=0.3.6,<0.4",
     "pydantic>=2.5.2,<3",
     "pydantic-settings>=2.1.0,<3",
-    "fastapi>=0.115.4,<0.116",
+    "fastapi>=0.121.0,<0.129",
     "psycopg[binary, pool]==3.1.18 ; python_version >= '3.11' and python_version < '3.13'",
     "psycopg[binary, pool]>=3.2.2,<3.3.0 ; python_version >= '3.13' and python_version < '3.14'",
     "alembic>=1.12.1,<2",
@@ -50,7 +50,7 @@ dependencies = [
     "pyotp>=2.9.0,<3",
     "asyncpg>=0.30.0,<0.31",
     "json-repair>=0.34.0,<0.35",
-    "pypdf>=5.1.0,<6",
+    "pypdf>=5.1.0,<7",
     "pdfplumber>=0.11.0,<0.12",
     "fastmcp>=2.10.1,<3",
     "psutil>=7.0.0",
@@ -67,6 +67,7 @@ dependencies = [
     "azure-keyvault-secrets>=4.2.0,<5",
     "jsonschema>=4.25.1",
     "python-calamine>=0.6.1",
+    "python-docx>=1.1.0",
     "urllib3>=2.6.0",
     "zstandard>=0.25.0",
     "sse-starlette>=3.0.3,<4",
@@ -113,7 +114,7 @@ dev = [
     "twine>=6.1.0,<7",
     "build>=1.2.2.post1,<2",
     "pre-commit>=4.2.0,<5",
-    "ruff>=0.11.12,<0.12",
+    "ruff>=0.14.1,<0.15",
     "aiosqlite>=0.21.0,<0.22",
     "moto[s3, server]>=5.1.5,<6",
     "curlify>=3.0.0",
@@ -190,12 +191,13 @@ exclude = [
     "site-packages",
     "venv",
     "alembic/env.py",
+    "cloud/extensions",
+    "skyvern-frontend",
 ]
 line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-extend-select = ["PLC0415"]
 
 [tool.isort]
 profile = "black"

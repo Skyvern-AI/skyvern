@@ -227,7 +227,7 @@ Credentials provide secure storage for authentication data. Skyvern encrypts cre
 - **1Password** — Sync from your 1Password vault
 - **Azure Key Vault** — Enterprise secret management
 
-See [Credentials](/credentials/introduction) for setup instructions.
+See [Credentials](/sdk-reference/credentials) for setup instructions.
 
 ---
 
@@ -290,7 +290,7 @@ A saved snapshot of browser state. Unlike sessions, profiles persist indefinitel
 
 ```python
 # Create a profile from a completed run
-profile = await skyvern.browser_profiles.create_browser_profile(
+profile = await skyvern.create_browser_profile(
     name="my-authenticated-profile",
     workflow_run_id=run.run_id
 )
@@ -350,10 +350,12 @@ Skyvern supports multiple AI engines for task execution:
 Specify the engine when running a task:
 
 ```python
+from skyvern.schemas.runs import RunEngine
+
 result = await skyvern.run_task(
     prompt="Extract pricing data",
     url="https://example.com",
-    engine="skyvern-2.0"
+    engine=RunEngine.skyvern_v2
 )
 ```
 

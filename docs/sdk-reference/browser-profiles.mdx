@@ -1,0 +1,130 @@
+---
+title: Browser Profiles
+subtitle: Save and reuse browser state across runs
+slug: sdk-reference/browser-profiles
+---
+
+A browser profile is a snapshot of browser state — cookies, local storage, session data. Create a profile from a completed run, then load it into future workflow runs to skip login and setup steps.
+
+For conceptual background, see [Browser Profiles](/optimization/browser-profiles).
+
+---
+
+## `create_browser_profile`
+
+Create a profile from a completed workflow run.
+
+```python
+profile = await client.create_browser_profile(
+    name="production-login",
+    workflow_run_id="wr_abc123",
+)
+print(profile.browser_profile_id)  # bpf_abc123
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | `str` | Yes | Display name for the profile. |
+| `description` | `str` | No | Optional description. |
+| `workflow_run_id` | `str` | Conditional | The workflow run ID to snapshot. The run must have used `persist_browser_session=True`. Required if `browser_session_id` is not provided. |
+| `browser_session_id` | `str` | Conditional | The browser session ID to snapshot. Required if `workflow_run_id` is not provided. |
+
+You must provide either `workflow_run_id` or `browser_session_id`.
+
+### Returns `BrowserProfile`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `browser_profile_id` | `str` | Unique ID. Starts with `bpf_`. |
+| `name` | `str` | Profile name. |
+| `description` | `str \| None` | Profile description. |
+| `created_at` | `datetime` | When the profile was created. |
+
+### Example: Create a profile from a login workflow
+
+```python
+# Step 1: Run a workflow with persist_browser_session
+run = await client.run_workflow(
+    workflow_id="wpid_login_flow",
+    parameters={"username": "demo@example.com"},
+    wait_for_completion=True,
+)
+
+# Step 2: Create a profile from the run
+profile = await client.create_browser_profile(
+    name="demo-account-login",
+    workflow_run_id=run.run_id,
+)
+
+# Step 3: Use the profile in future runs (skip login)
+result = await client.run_workflow(
+    workflow_id="wpid_extract_invoices",
+    browser_profile_id=profile.browser_profile_id,
+    wait_for_completion=True,
+)
+```
+
+<Info>
+Session archiving is asynchronous. If `create_browser_profile` fails immediately after a workflow completes, wait a few seconds and retry.
+</Info>
+
+---
+
+## `list_browser_profiles`
+
+List all browser profiles.
+
+```python
+profiles = await client.list_browser_profiles()
+for p in profiles:
+    print(f"{p.name} ({p.browser_profile_id})")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `include_deleted` | `bool` | No | `None` | Include soft-deleted profiles in the results. |
+
+### Returns `list[BrowserProfile]`
+
+---
+
+## `get_browser_profile`
+
+Get a single profile by ID.
+
+```python
+profile = await client.get_browser_profile("bpf_abc123")
+print(profile.name)
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profile_id` | `str` | Yes | The browser profile ID. |
+
+### Returns `BrowserProfile`
+
+---
+
+## `delete_browser_profile`
+
+Delete a browser profile.
+
+```python
+await client.delete_browser_profile("bpf_abc123")
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profile_id` | `str` | Yes | The browser profile ID to delete. |
+
+<Warning>
+`browser_profile_id` only works with `run_workflow`, not `run_task`. If you pass it to `run_task`, it will be silently ignored.
+</Warning>

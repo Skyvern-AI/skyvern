@@ -1,0 +1,81 @@
+---
+title: UI Overview
+slug: cloud/overview
+subtitle: Navigate the Skyvern Cloud dashboard
+---
+
+Skyvern Cloud ([app.skyvern.com](https://app.skyvern.com)) lets you automate any website from your browser. Describe what you want in plain English, watch an AI-powered browser do it live, and get structured results back. No code required.
+
+<Note>
+Looking to integrate Skyvern into your own app? See the [API Quickstart](/getting-started/quickstart) instead.
+</Note>
+
+## The dashboard
+
+Sign in and you'll land on the **Discover** page, the starting point for running automations.
+
+<img src="/images/cloud/skyvern-cloud-discover.png" alt="Skyvern Cloud dashboard showing the Discover page" />
+
+The left sidebar is your navigation hub. Here's what each section does:
+
+### Build
+
+Where you create and monitor automations.
+
+| Page | Purpose |
+|------|---------|
+| **Discover** | Run one-off tasks. Type your instructions and target URL into a single prompt, pick an engine, and hit send. |
+| **Workflows** | Build multi-step automations with the visual workflow editor. Add loops, conditionals, and data passing between steps. |
+| **Runs** | Execution history for every task and workflow. Filter by status, drill into any run to see actions, recordings, and extracted data. |
+| **Browsers** | Active browser sessions. Useful for persistent sessions that keep login state across tasks. |
+
+### Agents
+
+Ready-made automation templates. Each agent is preconfigured with a prompt, target URL, and settings. Pick one to see it work or use it as a starting point for your own task.
+
+### General
+
+| Page | Purpose |
+|------|---------|
+| **Billing** | Usage, remaining credits, and plan management. |
+| **Credentials** | Store website logins securely. Skyvern uses these to authenticate automatically when it encounters a login page. |
+| **Settings** | API key, account preferences, and organization management. |
+
+## How it works
+
+Every automation in Skyvern Cloud follows the same pattern:
+
+<Steps>
+  <Step title="Describe your task">
+    Type what you want into the prompt bar. Include the target URL and your instructions in one go. Something like "Get the top post from https://news.ycombinator.com" or "Fill out the contact form at https://example.com/contact with my details."
+  </Step>
+  <Step title="Watch it happen">
+    A cloud browser opens and you see it navigate in real time. Pages load, elements highlight, actions fire. An agent log streams the AI's reasoning — what it sees on the page, what it plans to do, and why — so you can follow along. If the AI gets stuck, hit **Take Control** to jump in and help.
+  </Step>
+  <Step title="Get your results">
+    Extracted data appears as structured JSON on the run detail page. Every run also includes an output view, full recording, the parameters you submitted, and auto-generated code to reproduce the task via API.
+  </Step>
+</Steps>
+
+That's it. The next guide walks you through this flow with a real example.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Run Your First Task"
+    icon="play"
+    href="/cloud/getting-started/run-your-first-task"
+  >
+    Follow along with a real example to see Skyvern Cloud in action
+  </Card>
+  <Card
+    title="Core Concepts"
+    icon="book"
+    href="/getting-started/core-concepts"
+  >
+    Understand tasks, workflows, and other foundational concepts
+  </Card>
+</CardGroup>

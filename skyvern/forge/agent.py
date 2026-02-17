@@ -117,6 +117,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     ExtractAction,
     GotoUrlAction,
+    KeypressAction,
     ReloadPageAction,
     TerminateAction,
     WebAction,
@@ -1285,6 +1286,16 @@ class ForgeAgent:
                         "is_retry": step.retry_index > 0,
                     }
 
+                # Tell the handler to skip the auto-completion Tab hack when the
+                # next batched action would be broken by a focus change — e.g. a
+                # KEYPRESS Enter or another action on the same element.
+                if action.action_type == ActionType.INPUT_TEXT and action_idx + 1 < len(action_linked_list):
+                    next_action = action_linked_list[action_idx + 1].action
+                    if isinstance(next_action, KeypressAction) or (
+                        isinstance(next_action, WebAction) and next_action.element_id == action.element_id
+                    ):
+                        action.skip_auto_complete_tab = True
+
                 results = await ActionHandler.handle_action(
                     scraped_page=scraped_page,
                     task=task,
@@ -1795,6 +1806,7 @@ class ForgeAgent:
 
     async def _speculate_next_step_plan(
         self,
+        organization: Organization,
         task: Task,
         current_step: Step,
         next_step: Step,
@@ -1811,6 +1823,9 @@ class ForgeAgent:
 
         try:
             next_step.is_speculative = True
+
+            if page := await browser_state.get_working_page():
+                await self.register_async_operations(organization, task, page)
 
             scraped_page, extract_action_prompt, use_caching, prompt_name = await self.build_and_record_step_prompt(
                 task,
@@ -1829,6 +1844,8 @@ class ForgeAgent:
                 task.llm_key,
                 default=app.LLM_API_HANDLER,
             )
+
+            self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
 
             llm_json_response = await llm_api_handler(
                 prompt=extract_action_prompt,
@@ -3391,7 +3408,7 @@ class ForgeAgent:
                 "Sending task response to webhook callback url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
-                payload=signed_data.signed_payload,
+                payload=signed_data.payload_for_log,
                 headers=signed_data.headers,
             )
 
@@ -3571,6 +3588,7 @@ class ForgeAgent:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
                 task_id=task.task_id, browser_state=browser_state
             )
+            LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
                 await app.ARTIFACT_MANAGER.update_artifact_data(
                     artifact_id=video_artifact.video_artifact_id,
@@ -3579,6 +3597,7 @@ class ForgeAgent:
                 )
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
+            LOG.debug("Uploading har data", har_size=len(har_data))
             if har_data:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=last_step,
@@ -3589,6 +3608,7 @@ class ForgeAgent:
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
                 task_id=task.task_id, browser_state=browser_state
             )
+            LOG.debug("Uploading browser log", browser_log_size=len(browser_log))
             if browser_log:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=last_step,
@@ -3766,6 +3786,7 @@ class ForgeAgent:
 
         speculative_task = asyncio.create_task(
             self._speculate_next_step_plan(
+                organization=organization,
                 task=task,
                 current_step=step,
                 next_step=next_step,
@@ -4145,8 +4166,10 @@ class ForgeAgent:
             # Check for LLM provider errors in the failed steps
             for step_cnt, cur_step in enumerate(steps[-max_retries:]):
                 if cur_step.status == StepStatus.failed:
-                    # If step failed with no actions, it might be an LLM error during action extraction
-                    if not cur_step.output or not cur_step.output.actions_and_results:
+                    # Only count steps where the LLM call itself failed (no output at all).
+                    # Steps with output but empty actions mean the LLM worked fine but found
+                    # nothing to interact with — those fall through to normal summarization.
+                    if not cur_step.output:
                         steps_without_actions += 1
 
                 if cur_step.output and cur_step.output.actions_and_results:

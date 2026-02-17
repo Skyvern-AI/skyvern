@@ -22,11 +22,13 @@ export const baseHelpTooltipContent = {
   totpIdentifier:
     "If you are running multiple workflows at once, you will need to give the block an identifier to know that this TOTP goes with this block.",
   continueOnFailure:
-    "Allow the workflow to continue if it encounters a failure.",
+    "If this block fails, skip the failure and continue to the next block in the current iteration. The remaining blocks in the same iteration will still run.",
   nextLoopOnFailure:
-    "When inside a for loop, continue to the next iteration if this block fails.",
+    "If this block fails, skip the remaining blocks in the current iteration and jump to the next loop iteration.",
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
+  engine:
+    "Skyvern 1.0: Fast, single-goal tasks. Skyvern 2.0: Complex, multi-goal tasks (slower).",
 } as const;
 
 export const basePlaceholderContent = {
@@ -75,7 +77,7 @@ export const helpTooltips = {
     loopValue:
       "Define the values to iterate over. Use a parameter reference or natural language (e.g., 'Extract links of the top 2 posts'). Natural language automatically creates an extraction block that generates a list of string values. Use {{ current_value }} in the loop to get the current iteration value.",
     nextLoopOnFailure:
-      "When enabled, if any block inside the loop fails, the loop will immediately jump to the next iteration instead of stopping.",
+      "If any block inside the loop fails, skip the remaining blocks in the current iteration and jump to the next loop iteration instead of stopping the entire loop.",
   },
   sendEmail: {
     ...baseHelpTooltipContent,

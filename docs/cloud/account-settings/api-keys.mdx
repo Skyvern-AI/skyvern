@@ -1,0 +1,57 @@
+---
+title: API Key
+subtitle: Authenticate programmatic access to Skyvern
+slug: cloud/account-settings/api-keys
+---
+
+Every API call to Skyvern requires an API key. The key identifies your organization and determines billing.
+
+## Finding your API key
+
+Open **Settings** in the sidebar. Your API key is shown in a masked field. Click the **eye icon** to reveal the full value, or the **copy icon** to copy it to your clipboard.
+
+<img src="/images/cloud/settings-api-key.png" alt="API key display with reveal and copy buttons" />
+
+<Warning>
+Treat your API key like a password. Anyone with this key can create runs, read results, and manage workflows on behalf of your organization.
+</Warning>
+
+## Using your key
+
+Every Skyvern API request requires the `x-api-key` header:
+
+```bash
+curl -X POST "https://api.skyvern.com/v1/runs" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "url": "https://example.com", "goal": "Extract the pricing table" }'
+```
+
+With the Python SDK:
+
+```python
+from skyvern import Skyvern
+
+client = Skyvern(api_key="YOUR_API_KEY")
+```
+
+<Tip>
+Store the key in an environment variable (`SKYVERN_API_KEY`) rather than hardcoding it. In production, use your platform's secrets management (AWS Secrets Manager, Vault, etc.).
+</Tip>
+
+<CardGroup cols={2}>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="/api-reference"
+  >
+    Full endpoint documentation with interactive playground
+  </Card>
+  <Card
+    title="Billing & Usage"
+    icon="receipt"
+    href="/cloud/account-settings/billing-usage"
+  >
+    Understand how runs are metered and billed
+  </Card>
+</CardGroup>
