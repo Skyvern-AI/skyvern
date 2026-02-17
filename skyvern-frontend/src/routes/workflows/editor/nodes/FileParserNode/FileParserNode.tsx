@@ -95,7 +95,7 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
             onChange={(value) => {
               update({ jsonSchema: value });
             }}
-            suggestionContext={{}}
+            suggestionContext={{ current_schema: data.jsonSchema }}
           />
           <ModelSelector
             className="nopan w-52 text-xs"
