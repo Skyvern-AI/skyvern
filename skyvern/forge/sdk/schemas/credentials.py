@@ -28,7 +28,10 @@ class TotpType(StrEnum):
 
 
 class PasswordCredentialResponse(BaseModel):
-    """Response model for password credentials, containing only the username."""
+    """Response model for password credentials — non-sensitive fields only.
+
+    SECURITY: Must NEVER include password, TOTP secret, or TOTP identifier.
+    """
 
     username: str = Field(..., description="The username associated with the credential", examples=["user@example.com"])
     totp_type: TotpType = Field(
@@ -44,14 +47,20 @@ class PasswordCredentialResponse(BaseModel):
 
 
 class CreditCardCredentialResponse(BaseModel):
-    """Response model for credit card credentials, containing only the last four digits and brand."""
+    """Response model for credit card credentials — non-sensitive fields only.
+
+    SECURITY: Must NEVER include full card number, CVV, expiration date, or card holder name.
+    """
 
     last_four: str = Field(..., description="Last four digits of the credit card number", examples=["1234"])
     brand: str = Field(..., description="Brand of the credit card", examples=["visa"])
 
 
 class SecretCredentialResponse(BaseModel):
-    """Response model for secret credentials."""
+    """Response model for secret credentials — non-sensitive fields only.
+
+    SECURITY: Must NEVER include the secret_value.
+    """
 
     secret_label: str | None = Field(default=None, description="Optional label for the stored secret")
 

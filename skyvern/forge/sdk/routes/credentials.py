@@ -1,3 +1,30 @@
+"""Credential management API endpoints.
+
+SECURITY INVARIANT — NO RAW CREDENTIAL RETRIEVAL
+=================================================
+Credential endpoints must NEVER return sensitive credential data (passwords,
+TOTP secrets, full card numbers, CVVs, expiration dates, card holder names,
+or secret values) in any API response. The only fields that may be returned
+are non-sensitive metadata:
+
+  - Password credentials: ``username``, ``totp_type``, ``totp_identifier``
+  - Credit card credentials: ``last_four``, ``brand``
+  - Secret credentials: ``secret_label``
+
+This is enforced by the ``*CredentialResponse`` Pydantic models and the
+``_convert_to_response()`` helper. When adding new credential types or
+modifying existing ones, ensure that:
+
+  1. The response model never includes the raw secret material.
+  2. The ``_convert_to_response()`` function only maps non-sensitive fields.
+  3. No endpoint (including ``get_credential`` and ``get_credentials``) ever
+     fetches and returns the decrypted secret from the vault.
+
+Violating this invariant would allow any caller with a valid API key to
+exfiltrate stored passwords, card numbers, and secrets — which is the
+exact threat the vault architecture is designed to prevent.
+"""
+
 import json
 
 import structlog
@@ -442,6 +469,13 @@ async def get_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
+    """Return non-sensitive metadata for a single credential.
+
+    SECURITY: This endpoint intentionally does NOT return the raw secret
+    material (password, card number, CVV, secret value, etc.). Only
+    non-sensitive fields are included in the response. See the module
+    docstring for the full security invariant.
+    """
     credential = await app.DATABASE.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
     )
@@ -493,6 +527,11 @@ async def get_credentials(
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
     ),
 ) -> list[CredentialResponse]:
+    """Return non-sensitive metadata for all credentials (paginated).
+
+    SECURITY: Like ``get_credential``, this endpoint never returns raw secret
+    material. See the module docstring for the full security invariant.
+    """
     credentials = await app.DATABASE.get_credentials(current_org.organization_id, page=page, page_size=page_size)
     return [_convert_to_response(credential) for credential in credentials]
 
@@ -825,6 +864,13 @@ async def _get_credential_vault_service() -> CredentialVaultService:
 
 
 def _convert_to_response(credential: Credential) -> CredentialResponse:
+    """Convert an internal ``Credential`` to a safe API response.
+
+    SECURITY: This function must ONLY copy non-sensitive metadata into the
+    response. Never include passwords, TOTP secrets, full card numbers, CVVs,
+    expiration dates, card holder names, or secret values. See the module
+    docstring for the full security invariant.
+    """
     if credential.credential_type == CredentialType.PASSWORD:
         credential_response = PasswordCredentialResponse(
             username=credential.username or credential.credential_id,
