@@ -1,4 +1,5 @@
 import asyncio
+import json
 from enum import Enum
 from typing import Annotated, Any
 
@@ -2767,7 +2768,33 @@ async def suggest(
     llm_prompt = ""
 
     if ai_suggestion_type == AISuggestionType.DATA_SCHEMA:
-        llm_prompt = prompt_engine.load_prompt("suggest-data-schema", input=data.input, additional_context=data.context)
+        existing_schema = None
+        additional_context = data.context
+        if data.context:
+            raw_schema = data.context.get("current_schema")
+            if raw_schema:
+                if isinstance(raw_schema, dict):
+                    existing_schema = json.dumps(raw_schema, indent=2)
+                elif isinstance(raw_schema, str) and raw_schema not in ("null", ""):
+                    try:
+                        existing_schema = json.dumps(json.loads(raw_schema), indent=2)
+                    except (json.JSONDecodeError, TypeError):
+                        LOG.warning("Invalid JSON in current_schema context, ignoring", raw_schema=raw_schema)
+            additional_context = {k: v for k, v in data.context.items() if k != "current_schema"}
+            if not additional_context:
+                additional_context = None
+        if existing_schema:
+            LOG.info(
+                "Using existing schema for data schema suggestion",
+                schema_length=len(existing_schema),
+                has_additional_context=bool(additional_context),
+            )
+        llm_prompt = prompt_engine.load_prompt(
+            "suggest-data-schema",
+            input=data.input,
+            additional_context=additional_context,
+            existing_schema=existing_schema,
+        )
 
     try:
         new_ai_suggestion = await app.DATABASE.create_ai_suggestion(
