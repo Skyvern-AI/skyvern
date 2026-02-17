@@ -633,6 +633,12 @@ export type TestCredentialResponse = {
   status: string;
 };
 
+export type TestLoginResponse = {
+  credential_id: string;
+  workflow_run_id: string;
+  status: string;
+};
+
 export type TestCredentialStatusResponse = {
   credential_id: string;
   workflow_run_id: string;
