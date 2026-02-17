@@ -57,4 +57,25 @@ function useCredentialModalState(): ReturnType {
   };
 }
 
+/**
+ * Convert a backend credential_type ("password" | "credit_card" | "secret")
+ * to the modal type used by CredentialsModal ("password" | "credit-card" | "secret").
+ */
+export function credentialTypeToModalType(
+  credentialType: "password" | "credit_card" | "secret",
+): CredentialModalType {
+  switch (credentialType) {
+    case "password":
+      return CredentialModalTypes.PASSWORD;
+    case "credit_card":
+      return CredentialModalTypes.CREDIT_CARD;
+    case "secret":
+      return CredentialModalTypes.SECRET;
+    default: {
+      const _exhaustive: never = credentialType;
+      throw new Error(`Unhandled credential type: ${_exhaustive}`);
+    }
+  }
+}
+
 export { useCredentialModalState };
