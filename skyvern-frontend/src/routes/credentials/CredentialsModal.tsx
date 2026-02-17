@@ -202,8 +202,8 @@ function CredentialsModal({
             title: "Credential test passed",
             description: data.browser_profile_id
               ? profileHost
-                ? `Login successful! Browser profile saved for ${profileHost}`
-                : "Login successful! Browser profile saved."
+                ? `Login successful! Login-free credentials enabled for ${profileHost}`
+                : "Login successful! Login-free credentials enabled."
               : "Login successful!",
             variant: "success",
           });
@@ -526,7 +526,7 @@ function CredentialsModal({
                   htmlFor="test-and-save"
                   className="cursor-pointer text-sm font-medium"
                 >
-                  Test credential & save browser profile
+                  Enable login-free workflows when using this credential
                 </Label>
               </div>
               {testAndSave && (

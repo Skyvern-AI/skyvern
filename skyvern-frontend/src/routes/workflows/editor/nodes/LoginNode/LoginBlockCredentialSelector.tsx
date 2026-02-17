@@ -252,7 +252,7 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
               <div className="flex items-center gap-2">
                 <span>{option.label}</span>
                 {"hasBrowserProfile" in option && option.hasBrowserProfile && (
-                  <span title={option.browserProfileUrl ? `Browser profile saved for ${option.browserProfileUrl}` : "Browser profile saved"}>
+                  <span title={option.browserProfileUrl ? `Login-free credentials enabled for ${option.browserProfileUrl}` : "Login-free credentials enabled"}>
                     <CheckCircledIcon className="size-3 text-green-400" />
                   </span>
                 )}

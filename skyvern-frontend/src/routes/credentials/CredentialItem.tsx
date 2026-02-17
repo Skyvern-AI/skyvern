@@ -103,8 +103,8 @@ function CredentialItem({ credential }: Props) {
             <CheckCircledIcon className="size-3" />
             <span>
               {credential.tested_url
-                ? `Browser profile saved for ${getHostname(credential.tested_url) ?? credential.tested_url}`
-                : "Browser profile saved"}
+                ? `Login-free credentials enabled for ${getHostname(credential.tested_url) ?? credential.tested_url}`
+                : "Login-free credentials enabled"}
             </span>
           </div>
         )}
