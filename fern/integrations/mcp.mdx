@@ -16,17 +16,33 @@ You can use MCP with:
 1. **Skyvern Cloud** (`SKYVERN_BASE_URL=https://api.skyvern.com` + your API key)
 2. **Local Skyvern Server** (`SKYVERN_BASE_URL=http://localhost:8000`)
 
+## Cloud-only setup (no OSS clone required)
+
+You do **not** need to clone the Skyvern OSS repo to use Skyvern Cloud MCP.
+You only need Python and the `skyvern` package installed locally.
+
 ## Quickstart
 <Tip title="Supported Python Versions" icon="fa-brands fa-python">
 Python 3.11, 3.12 and 3.13
 </Tip>
 
-1. **Install Skyvern**
+1. **Install Python 3.11+ and verify**
 ```bash
-pip install skyvern
+python3 --version
+```
+If this is not 3.11+ (or you have multiple Python versions), use `python3.11`, `python3.12`, or `python3.13` explicitly in the next steps.
+
+2. **Install Skyvern into that Python**
+```bash
+python3.11 -m pip install --upgrade pip skyvern
 ```
 
-2. **Run the setup wizard**
+3. **Confirm install**
+```bash
+python3.11 -m skyvern --help
+```
+
+4. **Run the setup wizard**
 ```bash
 skyvern init
 ```
@@ -35,12 +51,12 @@ The wizard will:
 - collect/set `SKYVERN_BASE_URL` and `SKYVERN_API_KEY`
 - auto-configure MCP for Claude Desktop, Cursor, and Windsurf
 
-3. **Only for local mode: start the API server**
+5. **Only for local mode: start the API server**
 ```bash
 skyvern run server
 ```
 
-4. **Restart your MCP client app** and ask it to use Skyvern tools.
+6. **Restart your MCP client app** and ask it to use Skyvern tools.
 
 ## Config file locations
 
@@ -72,7 +88,7 @@ Use this if you are setting up a custom MCP client, or Claude Code.
 }
 ```
 
-Set `command` to the exact output of `which python3.11` (or `which python3.12` / `which python3.13`) on the same machine where your MCP client runs.
+Set `command` to the exact output of `python3.11 -c "import sys; print(sys.executable)"` (or `python3.12` / `python3.13`) on the same machine where your MCP client runs.
 
 For local mode:
 - set `SKYVERN_BASE_URL` to `http://localhost:8000`

@@ -15,6 +15,11 @@ Skyvern MCP currently runs as a local stdio process (`skyvern run mcp`) on your 
 Remote-hosted MCP is planned, but is not the default setup today.
 </Note>
 
+<Note title="Cloud users">
+You do not need to clone the Skyvern OSS repo to use Skyvern Cloud MCP.
+Install `skyvern` locally, configure with your Cloud API key, and run MCP from your local machine.
+</Note>
+
 ## What you can do
 
 The MCP server exposes 31 tools across 5 categories:
@@ -34,7 +39,8 @@ Your AI assistant decides which tools to call based on your instructions. For ex
 ### Option A: Setup wizard (recommended)
 
 ```bash
-pip install skyvern
+python3.11 -m pip install --upgrade pip skyvern
+python3.11 -m skyvern --help
 skyvern init
 ```
 
@@ -71,7 +77,7 @@ Add this to your MCP client's configuration file (including Claude Code manual s
 }
 ```
 
-Replace the `command` value with the exact output of `which python3.11` (or `which python3.12` / `which python3.13`) on your machine. For local mode, set `SKYVERN_BASE_URL` to `http://localhost:8000` and find your API key in the `.env` file after running `skyvern init`.
+Replace the `command` value with the exact output of `python3.11 -c "import sys; print(sys.executable)"` (or `python3.12` / `python3.13`) on your machine. For local mode, set `SKYVERN_BASE_URL` to `http://localhost:8000` and find your API key in the `.env` file after running `skyvern init`.
 
 <Accordion title="Config file locations by client">
 
