@@ -65,17 +65,20 @@ Use this if you are setting up a custom MCP client, or Claude Code.
         "SKYVERN_BASE_URL": "https://api.skyvern.com",
         "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
       },
-      "command": "/absolute/path/to/python3",
+      "command": "/Users/you/.pyenv/versions/3.11.11/bin/python3.11",
       "args": ["-m", "skyvern", "run", "mcp"]
     }
   }
 }
 ```
 
+Set `command` to the exact output of `which python3.11` (or `which python3.12` / `which python3.13`) on the same machine where your MCP client runs.
+
 For local mode:
 - set `SKYVERN_BASE_URL` to `http://localhost:8000`
 - use your local `.env` API key from `skyvern init`
 - run `skyvern run server` before using MCP
+- if you get `No module named skyvern`, install with `<that_python_path> -m pip install skyvern`
 
 ## Claude Code setup
 
@@ -91,7 +94,7 @@ For Claude Code project scope, create `<project>/.mcp.json`:
         "SKYVERN_BASE_URL": "https://api.skyvern.com",
         "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
       },
-      "command": "/absolute/path/to/python3",
+      "command": "/Users/you/.pyenv/versions/3.11.11/bin/python3.11",
       "args": ["-m", "skyvern", "run", "mcp"]
     }
   }

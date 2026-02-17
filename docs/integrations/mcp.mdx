@@ -64,14 +64,14 @@ Add this to your MCP client's configuration file (including Claude Code manual s
         "SKYVERN_BASE_URL": "https://api.skyvern.com",
         "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
       },
-      "command": "/usr/bin/python3",
+      "command": "/Users/you/.pyenv/versions/3.11.11/bin/python3.11",
       "args": ["-m", "skyvern", "run", "mcp"]
     }
   }
 }
 ```
 
-Replace `/usr/bin/python3` with the output of `which python3` on your machine. For local mode, set `SKYVERN_BASE_URL` to `http://localhost:8000` and find your API key in the `.env` file after running `skyvern init`.
+Replace the `command` value with the exact output of `which python3.11` (or `which python3.12` / `which python3.13`) on your machine. For local mode, set `SKYVERN_BASE_URL` to `http://localhost:8000` and find your API key in the `.env` file after running `skyvern init`.
 
 <Accordion title="Config file locations by client">
 
