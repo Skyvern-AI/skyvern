@@ -57,6 +57,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialType,
     CredentialVaultType,
     CreditCardCredentialResponse,
+    NonEmptyPasswordCredential,
     PasswordCredentialResponse,
     SecretCredentialResponse,
     TestCredentialRequest,
@@ -961,8 +962,6 @@ async def test_login(
     organization_id = current_org.organization_id
 
     # Create a temporary credential
-    from skyvern.forge.sdk.schemas.credentials import NonEmptyPasswordCredential
-
     create_request = CreateCredentialRequest(
         name=f"_test_login_{data.username}",
         credential_type=CredentialType.PASSWORD,

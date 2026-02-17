@@ -117,10 +117,12 @@ celerybeat.pid
 .direnv/
 .env
 .venv
+.venv-*/
 env/
 venv*/
 ENV/
 env.bak/
+browser_sessions/
 
 # Spyder project settings
 .spyderproject

@@ -1,6 +1,0 @@
-#!/Users/jseres/Projects/Skyvern/skyvern/.venv-test/bin/python3.11
-import sys
-from docutils.core import rst2odt
-if __name__ == '__main__':
-    sys.argv[0] = sys.argv[0].removesuffix('.exe')
-    sys.exit(rst2odt())
