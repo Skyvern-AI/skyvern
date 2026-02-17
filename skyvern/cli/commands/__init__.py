@@ -1,23 +1,51 @@
+import logging
+
 import typer
 from dotenv import load_dotenv
 
+from skyvern.forge.sdk.forge_log import setup_logger as _setup_logger
 from skyvern.utils.env_paths import resolve_backend_env_path
 
-from .credentials import credentials_app
-from .docs import docs_app
-from .init_command import init_browser, init_env
-from .quickstart import quickstart_app
-from .run_commands import run_app
-from .status import status_app
-from .stop_commands import stop_app
-from .tasks import tasks_app
-from .workflow import workflow_app
+from ..credentials import credentials_app
+from ..docs import docs_app
+from ..init_command import init_browser, init_env
+from ..quickstart import quickstart_app
+from ..run_commands import run_app
+from ..status import status_app
+from ..stop_commands import stop_app
+from ..tasks import tasks_app
+from ..workflow import workflow_app
+from .browser import browser_app
+
+_cli_logging_configured = False
+
+
+def configure_cli_logging() -> None:
+    """Configure CLI log levels once at runtime (not at import time)."""
+    global _cli_logging_configured
+    if _cli_logging_configured:
+        return
+    _cli_logging_configured = True
+
+    # Suppress noisy SDK/third-party logs for CLI execution only.
+    for logger_name in ("skyvern", "httpx", "litellm", "playwright", "httpcore"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    _setup_logger()
+
 
 cli_app = typer.Typer(
     help=("""[bold]Skyvern CLI[/bold]\nManage and run your local Skyvern environment."""),
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
+
+
+@cli_app.callback()
+def cli_callback() -> None:
+    """Configure CLI logging before command execution."""
+    configure_cli_logging()
+
+
 cli_app.add_typer(
     run_app,
     name="run",
@@ -39,6 +67,9 @@ cli_app.add_typer(init_app, name="init")
 cli_app.add_typer(
     quickstart_app, name="quickstart", help="One-command setup and start for Skyvern (combines init and run)."
 )
+
+# Browser automation commands
+cli_app.add_typer(browser_app, name="browser", help="Browser automation commands.")
 
 
 @init_app.callback()
