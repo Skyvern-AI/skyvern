@@ -825,6 +825,7 @@ blocks:
 * Naming Conventions:
    - Use descriptive labels: "login_to_portal" not "step1"
    - Use snake_case for labels and parameter keys
+   - Use snake_case for data schema field names (e.g., product_name, total_price)
    - Make labels unique and meaningful
 
 * Goal Writing:

@@ -2,23 +2,25 @@ We are developing an interface for AI agent tasks that use JSON schemas to descr
 
 You are given an input prompt from a user, and some additional context. Your goal is to generate a JSON schema given the user prompt and the context.
 
+IMPORTANT: All field names in the schema MUST use snake_case naming convention (e.g., "first_name", "total_price", "order_date"). Do not use camelCase, PascalCase, or spaces in field names.
+
 If additional context is given, try to use the it for further clues about the data that needs to be extracted. For example, the user might provide some detail about
 product information to be extracted in a "data_extraction_goal" inside the context, but maybe not necessarily pass it in the input prompt. In these cases, you should use the
 context.
 
 Here is an example:
 
-User prompt: Generate a data schema that extracts the title and link for the posts as a list
-Additional context: 
+User prompt: Generate a data schema that extracts the title, link, and author name for the posts as a list
+Additional context:
 ```json
 {
   "url": "https://news.ycombinator.com",
-  "data_extraction_goal": "Extract the title and link of the top 5 posts",
+  "data_extraction_goal": "Extract the title, link, and author name of the top 5 posts",
   "existing_schema": "null"
 }
 ```
 
-Suggested Data Schema: 
+Suggested Data Schema:
 ```json
 {
   "posts" : {
@@ -33,11 +35,16 @@ Suggested Data Schema:
         "link": {
           "type": "string",
           "description": "Link to the post"
+        },
+        "author_name": {
+          "type": "string",
+          "description": "Name of the post author"
         }
       },
       "required": [
         "title",
-        "link"
+        "link",
+        "author_name"
       ]
     }
   }

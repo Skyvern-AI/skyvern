@@ -27,7 +27,7 @@ export const errorMappingExampleValue = {
 export const dataSchemaExampleValue = {
   type: "object",
   properties: {
-    sample: { type: "string" },
+    sample_field: { type: "string" },
   },
 } as const;
 
