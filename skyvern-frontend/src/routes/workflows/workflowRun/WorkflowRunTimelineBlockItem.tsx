@@ -187,7 +187,7 @@ function WorkflowRunTimelineBlockItem({
           </div>
         </div>
         {isLoginSkippedWithProfile ? (
-          <div className="text-xs text-amber-400 font-semibold">skipped due to using saved browser credentials</div>
+          <div className="text-xs text-amber-400 font-semibold">SKIPPED: used login-free credentials</div>
         ) : block.description ? (
           <div className="text-xs text-slate-400">{block.description}</div>
         ) : null}
