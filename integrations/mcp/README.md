@@ -9,32 +9,96 @@
 
 # Model Context Protocol (MCP)
 
-Skyvern's MCP server implementation helps connect your AI Applications to the browser. This allows your AI applications to do things like: Fill out forms, download files, research information on the web, and more.
+Skyvern MCP lets your MCP client control browser automation tools (navigation, extraction, workflows, screenshots, and more).
 
-You can connect your MCP-enabled applications to Skyvern in two ways:
-1. **Local Skyvern Server**
-   - Use your favourite LLM to power Skyvern
-2. **Skyvern Cloud**
-   - Create an account at [app.skyvern.com](https://app.skyvern.com)
-   - Get the API key from the settings page which will be used for setup
+> Current availability: Skyvern MCP currently runs as a local stdio process (`skyvern run mcp`) on your machine.
+> Remote-hosted MCP is planned, but is not the default setup today.
+
+You can use MCP with:
+1. **Skyvern Cloud** (`SKYVERN_BASE_URL=https://api.skyvern.com` + your API key)
+2. **Local Skyvern Server** (`SKYVERN_BASE_URL=http://localhost:8000`)
 
 ## Quickstart
-> ⚠️ **REQUIREMENT**: Skyvern only runs in Python 3.11 environment today ⚠️
+> Supported Python versions: 3.11, 3.12, 3.13
 
 1. **Install Skyvern**
-	```bash
-	pip install skyvern
-	```
+```bash
+pip install skyvern
+```
 
-2. **Configure Skyvern** Run the setup wizard which will guide you through the configuration process. You can connect to either [Skyvern Cloud](https://app.skyvern.com) or a local version of Skyvern. 
-	```bash
-	skyvern init
-	```
+2. **Run the setup wizard**
+```bash
+skyvern init
+```
+The wizard will:
+- ask whether to use Cloud or local mode
+- collect/set `SKYVERN_BASE_URL` and `SKYVERN_API_KEY`
+- auto-configure MCP for Claude Desktop, Cursor, and Windsurf
 
-3. **(Optional) Launch the Skyvern Server. Only required in local mode** 
-	```bash
-	skyvern run server
-	```
+3. **Only for local mode: start the API server**
+```bash
+skyvern run server
+```
+
+4. **Restart your MCP client app** and ask it to use Skyvern tools.
+
+## Config file locations
+
+| Client | Auto-configured by `skyvern init` | Config location |
+|---|---|---|
+| Claude Desktop (macOS) | Yes | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Claude Desktop (Linux) | Yes | `~/.config/Claude/claude_desktop_config.json` (or `~/.local/share/Claude/claude_desktop_config.json`) |
+| Cursor | Yes | `~/.cursor/mcp.json` |
+| Windsurf | Yes | `~/.codeium/windsurf/mcp_config.json` |
+| Claude Code (project scope) | No | `<project>/.mcp.json` |
+| Claude Code (user/local scopes) | No | `~/.claude.json` |
+
+## Manual configuration (any MCP client)
+
+Use this if you are setting up a custom MCP client, or Claude Code.
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "env": {
+        "SKYVERN_BASE_URL": "https://api.skyvern.com",
+        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
+      },
+      "command": "/absolute/path/to/python3",
+      "args": ["-m", "skyvern", "run", "mcp"]
+    }
+  }
+}
+```
+
+For local mode:
+- set `SKYVERN_BASE_URL` to `http://localhost:8000`
+- use your local `.env` API key from `skyvern init`
+- run `skyvern run server` before using MCP
+
+## Claude Code setup
+
+`skyvern init` does not currently write Claude Code config automatically.
+
+For Claude Code project scope, create `<project>/.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "env": {
+        "SKYVERN_BASE_URL": "https://api.skyvern.com",
+        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
+      },
+      "command": "/absolute/path/to/python3",
+      "args": ["-m", "skyvern", "run", "mcp"]
+    }
+  }
+}
+```
+
+For Claude Code user/local scopes, place the same `mcpServers.Skyvern` object in `~/.claude.json`.
 
 ## Examples
 ### Skyvern allows Claude to look up the top Hackernews posts today
@@ -48,31 +112,3 @@ https://github.com/user-attachments/assets/084c89c9-6229-4bac-adc9-6ad69b41327d
 ### Ask Windsurf to do a form 5500 search and download some files 
 
 https://github.com/user-attachments/assets/70cfe310-24dc-431a-adde-e72691f198a7
-
-## Supported Applications
-`skyvern init` helps configure the following applications for you:
-- Cursor
-- Windsurf
-- Claude Desktop
-- Your custom MCP App?
-
-Use the following config if you want to set up Skyvern for any other MCP-enabled application
-```json
-{
-  "mcpServers": {
-    "Skyvern": {
-      "env": {
-        "SKYVERN_BASE_URL": "https://api.skyvern.com", # "http://localhost:8000" if running locally
-        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY" # find the local SKYVERN_API_KEY in the .env file after running `skyvern init` or in your Skyvern Cloud console
-      },
-      "command": "PATH_TO_PYTHON",
-      "args": [
-        "-m",
-        "skyvern",
-        "run",
-        "mcp"
-      ]
-    }
-  }
-}
-```

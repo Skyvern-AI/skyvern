@@ -10,6 +10,11 @@ The Skyvern MCP server lets AI assistants like Claude Desktop, Cursor, and Winds
 Requires Python 3.11, 3.12, or 3.13.
 </Note>
 
+<Note title="Current availability">
+Skyvern MCP currently runs as a local stdio process (`skyvern run mcp`) on your machine.
+Remote-hosted MCP is planned, but is not the default setup today.
+</Note>
+
 ## What you can do
 
 The MCP server exposes 31 tools across 5 categories:
@@ -37,7 +42,7 @@ The wizard will:
 1. Ask whether to use Skyvern Cloud or a local server
 2. Configure your LLM provider (if local)
 3. Detect your MCP clients (Claude Desktop, Cursor, Windsurf)
-4. Write the MCP configuration file for each client automatically
+4. Write the MCP configuration file for each detected desktop client automatically
 
 <Tip>
 If you chose local mode, start the server before using MCP:
@@ -49,7 +54,7 @@ skyvern run server
 
 ### Option B: Manual configuration
 
-Add this to your MCP client's configuration file:
+Add this to your MCP client's configuration file (including Claude Code manual setup):
 
 ```json
 {
@@ -73,11 +78,20 @@ Replace `/usr/bin/python3` with the output of `which python3` on your machine. F
 | Client | Path |
 |--------|------|
 | **Claude Desktop** (macOS) | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| **Claude Desktop** (Linux) | `~/.config/Claude/claude_desktop_config.json` |
+| **Claude Desktop** (Linux) | `~/.config/Claude/claude_desktop_config.json` (or `~/.local/share/Claude/claude_desktop_config.json`) |
 | **Cursor** | `~/.cursor/mcp.json` |
 | **Windsurf** | `~/.codeium/windsurf/mcp_config.json` |
+| **Claude Code** (project scope) | `<project>/.mcp.json` |
+| **Claude Code** (user/local scopes) | `~/.claude.json` |
 
 </Accordion>
+
+## Claude Code setup
+
+`skyvern init` does not currently write Claude Code config automatically.
+
+1. For project-scoped setup, add the `mcpServers.Skyvern` config to `<project>/.mcp.json`.
+2. For user/local scopes, add the same `mcpServers.Skyvern` config to `~/.claude.json`.
 
 ## See it in action
 
