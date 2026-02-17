@@ -4,7 +4,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
 
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
 from ._session import (
@@ -30,24 +30,20 @@ async def skyvern_session_create(
     with Timer() as timer:
         try:
             skyvern = get_skyvern()
-
-            if local:
-                browser = await skyvern.launch_local_browser(headless=headless)
-                ctx = BrowserContext(mode="local")
-                set_current_session(SessionState(browser=browser, context=ctx))
-                timer.mark("sdk")
-                return make_result(
-                    "skyvern_session_create",
-                    browser_context=ctx,
-                    data={"local": True, "headless": headless},
-                    timing_ms=timer.timing_ms,
-                )
-
-            proxy = ProxyLocation(proxy_location) if proxy_location else None
-            browser = await skyvern.launch_cloud_browser(timeout=timeout, proxy_location=proxy)
-            ctx = BrowserContext(mode="cloud_session", session_id=browser.browser_session_id)
-            set_current_session(SessionState(browser=browser, context=ctx))
+            browser, result = await do_session_create(
+                skyvern,
+                timeout=timeout or 60,
+                proxy_location=proxy_location,
+                local=local,
+                headless=headless,
+            )
             timer.mark("sdk")
+
+            if result.local:
+                ctx = BrowserContext(mode="local")
+            else:
+                ctx = BrowserContext(mode="cloud_session", session_id=result.session_id)
+            set_current_session(SessionState(browser=browser, context=ctx))
 
         except ValueError as e:
             return make_result(
@@ -68,12 +64,20 @@ async def skyvern_session_create(
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Failed to create browser session"),
             )
 
+    if result.local:
+        return make_result(
+            "skyvern_session_create",
+            browser_context=ctx,
+            data={"local": True, "headless": result.headless},
+            timing_ms=timer.timing_ms,
+        )
+
     return make_result(
         "skyvern_session_create",
         browser_context=ctx,
         data={
-            "session_id": browser.browser_session_id,
-            "timeout_minutes": timeout,
+            "session_id": result.session_id,
+            "timeout_minutes": result.timeout_minutes,
         },
         timing_ms=timer.timing_ms,
     )
@@ -92,13 +96,13 @@ async def skyvern_session_close(
         try:
             if session_id:
                 skyvern = get_skyvern()
-                await skyvern.close_browser_session(session_id)
+                result = await do_session_close(skyvern, session_id)
                 if current.context and current.context.session_id == session_id:
                     set_current_session(SessionState())
                 timer.mark("sdk")
                 return make_result(
                     "skyvern_session_close",
-                    data={"session_id": session_id, "closed": True},
+                    data={"session_id": result.session_id, "closed": result.closed},
                     timing_ms=timer.timing_ms,
                 )
 
@@ -138,17 +142,17 @@ async def skyvern_session_list() -> dict[str, Any]:
     with Timer() as timer:
         try:
             skyvern = get_skyvern()
-            sessions = await skyvern.get_browser_sessions()
+            sessions = await do_session_list(skyvern)
             timer.mark("sdk")
 
             session_data = [
                 {
-                    "session_id": s.browser_session_id,
+                    "session_id": s.session_id,
                     "status": s.status,
-                    "started_at": s.started_at.isoformat() if s.started_at else None,
+                    "started_at": s.started_at,
                     "timeout": s.timeout,
                     "runnable_id": s.runnable_id,
-                    "available": s.runnable_id is None and s.browser_address is not None,
+                    "available": s.available,
                 }
                 for s in sessions
             ]
