@@ -2832,14 +2832,14 @@ class AgentDB(BaseAlchemyDB):
                 # 2FA verification code waiting state updates
                 if waiting_for_verification_code is not None:
                     workflow_run.waiting_for_verification_code = waiting_for_verification_code
-                    # Clear related fields when waiting is set to False
-                    if not waiting_for_verification_code:
-                        workflow_run.verification_code_identifier = None
-                        workflow_run.verification_code_polling_started_at = None
                 if verification_code_identifier is not None:
                     workflow_run.verification_code_identifier = verification_code_identifier
                 if verification_code_polling_started_at is not None:
                     workflow_run.verification_code_polling_started_at = verification_code_polling_started_at
+                if waiting_for_verification_code is not None and not waiting_for_verification_code:
+                    # Clear related fields when waiting is set to False
+                    workflow_run.verification_code_identifier = None
+                    workflow_run.verification_code_polling_started_at = None
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)

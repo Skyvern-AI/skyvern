@@ -6,10 +6,12 @@ import structlog
 from fastapi import WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
 from skyvern.forge.sdk.routes.routers import legacy_base_router
-from skyvern.forge.sdk.services.org_auth_service import get_current_org
+from skyvern.forge.sdk.routes.streaming.auth import _auth as local_auth
+from skyvern.forge.sdk.routes.streaming.auth import auth as real_auth
 
 LOG = structlog.get_logger()
 HEARTBEAT_INTERVAL = 60
@@ -21,24 +23,10 @@ async def notification_stream(
     apikey: str | None = None,
     token: str | None = None,
 ) -> None:
-    try:
-        await websocket.accept()
-        if not token and not apikey:
-            await websocket.send_text("No valid credential provided")
-            return
-    except ConnectionClosedOK:
-        LOG.info("Notifications: ConnectionClosedOK error. Streaming won't start")
-        return
-
-    try:
-        organization = await get_current_org(x_api_key=apikey, authorization=token)
-        organization_id = organization.organization_id
-    except Exception:
-        LOG.exception("Notifications: Error while getting organization")
-        try:
-            await websocket.send_text("Invalid credential provided")
-        except ConnectionClosedOK:
-            LOG.info("Notifications: ConnectionClosedOK error while sending invalid credential message")
+    auth = local_auth if settings.ENV == "local" else real_auth
+    organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
+    if not organization_id:
+        LOG.info("Notifications: Authentication failed")
         return
 
     LOG.info("Notifications: Started streaming", organization_id=organization_id)
