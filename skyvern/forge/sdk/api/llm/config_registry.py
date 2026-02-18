@@ -385,6 +385,7 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -395,6 +396,7 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,  # Claude 4.6 only supports temperature=1
         ),
     )
 
@@ -522,6 +524,7 @@ if settings.ENABLE_BEDROCK:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -532,6 +535,7 @@ if settings.ENABLE_BEDROCK:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -542,6 +546,7 @@ if settings.ENABLE_BEDROCK:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,  # Claude 4.6 only supports temperature=1
         ),
     )
 
