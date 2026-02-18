@@ -23,6 +23,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes import internal_auth
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
+from skyvern.services.cleanup_service import start_cleanup_scheduler, stop_cleanup_scheduler
 
 try:
     from cloud.observability.otel_setup import OTELSetup
@@ -68,7 +69,17 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
             await forge_app.api_app_startup_event(fastapi_app)
         except Exception:
             LOG.exception("Failed to execute api app startup event")
+
+    # Start cleanup scheduler if enabled
+    cleanup_task = start_cleanup_scheduler()
+    if cleanup_task:
+        LOG.info("Cleanup scheduler started")
+
     yield
+
+    # Stop cleanup scheduler
+    await stop_cleanup_scheduler()
+
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
         try:

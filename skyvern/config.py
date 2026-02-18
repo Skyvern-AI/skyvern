@@ -427,6 +427,14 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
 
+    # Cleanup Cron Settings
+    ENABLE_CLEANUP_CRON: bool = False
+    """Enable periodic cleanup of temporary data (temp files and stale processes)."""
+    CLEANUP_CRON_INTERVAL_MINUTES: int = 10
+    """Interval in minutes for the cleanup cron job."""
+    CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
+    """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
+
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "skyvern"
