@@ -35,24 +35,51 @@ STALE_PROCESS_NAMES = frozenset(
 )
 
 
-async def has_running_tasks_or_workflows() -> bool:
+async def check_running_tasks_or_workflows() -> tuple[bool, int, int]:
     """
-    Check if there are any running tasks or workflow runs.
+    Check if there are any actively running tasks or workflow runs.
+
+    Tasks/workflows that haven't been updated for longer than the configured
+    stale threshold are considered stuck (not actively running), and a warning
+    will be logged for them.
 
     Returns:
-        True if there are running tasks or workflows, False otherwise.
+        Tuple of (has_active_tasks_or_workflows, stale_task_count, stale_workflow_count).
     """
     try:
-        has_running_tasks = await app.DATABASE.has_running_tasks_globally()
-        if has_running_tasks:
-            return True
+        stale_threshold = settings.CLEANUP_STALE_TASK_THRESHOLD_HOURS
 
-        has_running_workflows = await app.DATABASE.has_running_workflow_runs_globally()
-        return has_running_workflows
+        # Check tasks
+        active_tasks, stale_tasks = await app.DATABASE.get_running_tasks_info_globally(
+            stale_threshold_hours=stale_threshold
+        )
+
+        # Check workflow runs
+        active_workflows, stale_workflows = await app.DATABASE.get_running_workflow_runs_info_globally(
+            stale_threshold_hours=stale_threshold
+        )
+
+        # Log warnings for stale tasks/workflows
+        if stale_tasks > 0:
+            LOG.warning(
+                "Found stale tasks that haven't been updated",
+                stale_task_count=stale_tasks,
+                threshold_hours=stale_threshold,
+            )
+
+        if stale_workflows > 0:
+            LOG.warning(
+                "Found stale workflow runs that haven't been updated",
+                stale_workflow_count=stale_workflows,
+                threshold_hours=stale_threshold,
+            )
+
+        has_active = active_tasks > 0 or active_workflows > 0
+        return (has_active, stale_tasks, stale_workflows)
     except Exception:
         LOG.exception("Error checking for running tasks/workflows")
         # If we can't check, assume there are running tasks to be safe
-        return True
+        return (True, 0, 0)
 
 
 def cleanup_temp_directory() -> int:
@@ -158,15 +185,27 @@ async def run_cleanup() -> None:
     """
     Run the cleanup process.
 
-    This function checks if there are running tasks/workflows before cleaning up.
-    If there are, it skips the cleanup and logs a message.
+    This function checks if there are actively running tasks/workflows before cleaning up.
+    If there are active (recently updated) tasks/workflows, it skips the cleanup.
+    Tasks/workflows that haven't been updated for longer than the stale threshold
+    are considered stuck and will not block cleanup (but a warning will be logged).
     """
     LOG.debug("Starting cleanup process")
 
     # Check if there are running tasks or workflows
-    if await has_running_tasks_or_workflows():
+    has_active, stale_tasks, stale_workflows = await check_running_tasks_or_workflows()
+
+    if has_active:
         LOG.info("Skipping cleanup: tasks or workflows are currently running")
         return
+
+    # Log summary if there are stale tasks/workflows (they won't block cleanup)
+    if stale_tasks > 0 or stale_workflows > 0:
+        LOG.info(
+            "Proceeding with cleanup despite stale tasks/workflows",
+            stale_tasks=stale_tasks,
+            stale_workflows=stale_workflows,
+        )
 
     # Clean up temp directory
     temp_files_removed = cleanup_temp_directory()
