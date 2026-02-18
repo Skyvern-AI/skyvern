@@ -1061,6 +1061,99 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_running_tasks_info_globally(
+        self,
+        stale_threshold_hours: int = 24,
+    ) -> tuple[int, int]:
+        """
+        Get information about running tasks across all organizations.
+        Used by cleanup service to determine if cleanup should be skipped.
+
+        Args:
+            stale_threshold_hours: Tasks not updated for this many hours are considered stale.
+
+        Returns:
+            Tuple of (active_task_count, stale_task_count).
+            Active tasks are those updated within the threshold.
+            Stale tasks are those not updated within the threshold but still in running status.
+        """
+        try:
+            async with self.Session() as session:
+                running_statuses = [TaskStatus.created, TaskStatus.queued, TaskStatus.running]
+                stale_cutoff = datetime.utcnow() - timedelta(hours=stale_threshold_hours)
+
+                # Count active tasks (recently updated)
+                active_query = (
+                    select(func.count())
+                    .select_from(TaskModel)
+                    .filter(TaskModel.status.in_(running_statuses))
+                    .filter(TaskModel.modified_at >= stale_cutoff)
+                )
+                active_count = (await session.execute(active_query)).scalar_one()
+
+                # Count stale tasks (not updated for a long time)
+                stale_query = (
+                    select(func.count())
+                    .select_from(TaskModel)
+                    .filter(TaskModel.status.in_(running_statuses))
+                    .filter(TaskModel.modified_at < stale_cutoff)
+                )
+                stale_count = (await session.execute(stale_query)).scalar_one()
+
+                return (active_count, stale_count)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_running_tasks_info_globally", exc_info=True)
+            raise
+
+    async def get_running_workflow_runs_info_globally(
+        self,
+        stale_threshold_hours: int = 24,
+    ) -> tuple[int, int]:
+        """
+        Get information about running workflow runs across all organizations.
+        Used by cleanup service to determine if cleanup should be skipped.
+
+        Args:
+            stale_threshold_hours: Workflow runs not updated for this many hours are considered stale.
+
+        Returns:
+            Tuple of (active_workflow_count, stale_workflow_count).
+            Active workflows are those updated within the threshold.
+            Stale workflows are those not updated within the threshold but still in running status.
+        """
+        try:
+            async with self.Session() as session:
+                running_statuses = [
+                    WorkflowRunStatus.created,
+                    WorkflowRunStatus.queued,
+                    WorkflowRunStatus.running,
+                    WorkflowRunStatus.paused,
+                ]
+                stale_cutoff = datetime.utcnow() - timedelta(hours=stale_threshold_hours)
+
+                # Count active workflow runs (recently updated)
+                active_query = (
+                    select(func.count())
+                    .select_from(WorkflowRunModel)
+                    .filter(WorkflowRunModel.status.in_(running_statuses))
+                    .filter(WorkflowRunModel.modified_at >= stale_cutoff)
+                )
+                active_count = (await session.execute(active_query)).scalar_one()
+
+                # Count stale workflow runs (not updated for a long time)
+                stale_query = (
+                    select(func.count())
+                    .select_from(WorkflowRunModel)
+                    .filter(WorkflowRunModel.status.in_(running_statuses))
+                    .filter(WorkflowRunModel.modified_at < stale_cutoff)
+                )
+                stale_count = (await session.execute(stale_query)).scalar_one()
+
+                return (active_count, stale_count)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_running_workflow_runs_info_globally", exc_info=True)
+            raise
+
     async def get_all_organizations(self) -> list[Organization]:
         try:
             async with self.Session() as session:
@@ -4576,11 +4669,15 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run_block.task_id = task_id
                 if failure_reason:
                     workflow_run_block.failure_reason = failure_reason
-                if loop_values:
+                # Use `is not None` instead of truthiness checks so that falsy
+                # values like current_index=0, empty loop_values=[], or
+                # current_value="" are correctly persisted. Without this,
+                # the first loop iteration (index 0) loses its metadata.
+                if loop_values is not None:
                     workflow_run_block.loop_values = loop_values
-                if current_value:
+                if current_value is not None:
                     workflow_run_block.current_value = current_value
-                if current_index:
+                if current_index is not None:
                     workflow_run_block.current_index = current_index
                 if recipients:
                     workflow_run_block.recipients = recipients
