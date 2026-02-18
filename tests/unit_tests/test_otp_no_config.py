@@ -7,6 +7,7 @@ import pytest
 from skyvern.constants import SPECIAL_FIELD_VERIFICATION_CODE
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.notification.local import LocalNotificationRegistry
 from skyvern.forge.sdk.routes.credentials import send_totp_code
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCodeCreate
 from skyvern.schemas.runs import RunEngine
@@ -454,3 +455,90 @@ def test_build_navigation_payload_no_code_no_injection():
     assert isinstance(result, dict)
     assert SPECIAL_FIELD_VERIFICATION_CODE not in result
     assert result["field"] == "value"
+
+
+# === Task: poll_otp_value publishes 2FA events to notification registry ===
+
+
+@pytest.mark.asyncio
+async def test_poll_otp_value_publishes_required_event_for_task():
+    """poll_otp_value should publish verification_code_required when task waiting state is set."""
+    mock_code = MagicMock()
+    mock_code.code = "123456"
+    mock_code.otp_type = "totp"
+
+    mock_db = AsyncMock()
+    mock_db.get_valid_org_auth_token.return_value = MagicMock(token="tok")
+    mock_db.get_otp_codes_by_run.return_value = [mock_code]
+    mock_db.update_task_2fa_state = AsyncMock()
+
+    mock_app = MagicMock()
+    mock_app.DATABASE = mock_db
+
+    registry = LocalNotificationRegistry()
+    queue = registry.subscribe("org_1")
+
+    with (
+        patch("skyvern.services.otp_service.app", new=mock_app),
+        patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "skyvern.forge.sdk.notification.factory.NotificationRegistryFactory._NotificationRegistryFactory__registry",
+            new=registry,
+        ),
+    ):
+        await poll_otp_value(organization_id="org_1", task_id="tsk_1")
+
+    # Should have received required + resolved messages
+    messages = []
+    while not queue.empty():
+        messages.append(queue.get_nowait())
+
+    types = [m["type"] for m in messages]
+    assert "verification_code_required" in types
+    assert "verification_code_resolved" in types
+
+    required = next(m for m in messages if m["type"] == "verification_code_required")
+    assert required["task_id"] == "tsk_1"
+
+    resolved = next(m for m in messages if m["type"] == "verification_code_resolved")
+    assert resolved["task_id"] == "tsk_1"
+
+
+@pytest.mark.asyncio
+async def test_poll_otp_value_publishes_required_event_for_workflow_run():
+    """poll_otp_value should publish verification_code_required when workflow run waiting state is set."""
+    mock_code = MagicMock()
+    mock_code.code = "654321"
+    mock_code.otp_type = "totp"
+
+    mock_db = AsyncMock()
+    mock_db.get_valid_org_auth_token.return_value = MagicMock(token="tok")
+    mock_db.update_workflow_run = AsyncMock()
+    mock_db.get_otp_codes_by_run.return_value = [mock_code]
+
+    mock_app = MagicMock()
+    mock_app.DATABASE = mock_db
+
+    registry = LocalNotificationRegistry()
+    queue = registry.subscribe("org_1")
+
+    with (
+        patch("skyvern.services.otp_service.app", new=mock_app),
+        patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "skyvern.forge.sdk.notification.factory.NotificationRegistryFactory._NotificationRegistryFactory__registry",
+            new=registry,
+        ),
+    ):
+        await poll_otp_value(organization_id="org_1", workflow_run_id="wr_1")
+
+    messages = []
+    while not queue.empty():
+        messages.append(queue.get_nowait())
+
+    types = [m["type"] for m in messages]
+    assert "verification_code_required" in types
+    assert "verification_code_resolved" in types
+
+    required = next(m for m in messages if m["type"] == "verification_code_required")
+    assert required["workflow_run_id"] == "wr_1"
