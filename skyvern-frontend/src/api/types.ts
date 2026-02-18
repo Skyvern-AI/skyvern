@@ -151,6 +151,10 @@ export type TaskApiResponse = {
   task_v2: TaskV2 | null;
   workflow_run_id: string | null;
   browser_session_id: string | null;
+  // 2FA verification code waiting state fields
+  waiting_for_verification_code?: boolean;
+  verification_code_identifier?: string | null;
+  verification_code_polling_started_at?: string | null;
 };
 
 export type CreateTaskRequest = {
@@ -416,6 +420,10 @@ export type WorkflowRunStatusApiResponse = {
   workflow_title: string | null;
   browser_session_id: string | null;
   max_screenshot_scrolls: number | null;
+  // 2FA verification code waiting state fields
+  waiting_for_verification_code?: boolean;
+  verification_code_identifier?: string | null;
+  verification_code_polling_started_at?: string | null;
 };
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
@@ -442,6 +450,10 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   browser_session_id: string | null;
   max_screenshot_scrolls: number | null;
   workflow: WorkflowApiResponse;
+  // 2FA verification code waiting state fields
+  waiting_for_verification_code?: boolean;
+  verification_code_identifier?: string | null;
+  verification_code_polling_started_at?: string | null;
 };
 
 export type TaskGenerationApiResponse = {
