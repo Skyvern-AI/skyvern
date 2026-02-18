@@ -68,6 +68,30 @@ Add this to your MCP client's configuration file:
 
 Replace `/usr/bin/python3` with the output of `which python3` on your machine. For local mode, set `SKYVERN_BASE_URL` to `http://localhost:8000` and find your API key in the `.env` file after running `skyvern init`.
 
+### Option C: Remote MCP over HTTPS (streamable HTTP)
+
+Use this when your team provides a hosted MCP endpoint (for example: `https://mcp.skyvern.com/mcp`).
+
+In remote HTTP mode:
+- Clients must send `x-api-key` on every request.
+- Use `skyvern_session_create` first, then pass `session_id` explicitly on subsequent browser tool calls.
+
+If your MCP client supports native remote HTTP transport, configure it directly:
+
+```json
+{
+  "mcpServers": {
+    "SkyvernRemote": {
+      "type": "streamable-http",
+      "url": "https://mcp.skyvern.com/mcp",
+      "headers": {
+        "x-api-key": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
 <Accordion title="Config file locations by client">
 
 | Client | Path |
