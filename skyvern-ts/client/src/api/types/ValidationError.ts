@@ -4,6 +4,8 @@ export interface ValidationError {
     loc: ValidationError.Loc.Item[];
     msg: string;
     type: string;
+    input?: unknown;
+    ctx?: Record<string, unknown>;
 }
 
 export namespace ValidationError {

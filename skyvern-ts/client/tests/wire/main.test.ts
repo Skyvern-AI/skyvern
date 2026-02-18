@@ -1452,6 +1452,106 @@ describe("SkyvernClient", () => {
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
+    test("get_workflow_runs (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = [
+            {
+                workflow_run_id: "workflow_run_id",
+                workflow_id: "workflow_id",
+                workflow_permanent_id: "workflow_permanent_id",
+                organization_id: "organization_id",
+                browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
+                debug_session_id: "debug_session_id",
+                status: "created",
+                extra_http_headers: { key: "value" },
+                proxy_location: "RESIDENTIAL",
+                webhook_callback_url: "webhook_callback_url",
+                webhook_failure_reason: "webhook_failure_reason",
+                totp_verification_url: "totp_verification_url",
+                totp_identifier: "totp_identifier",
+                failure_reason: "failure_reason",
+                parent_workflow_run_id: "parent_workflow_run_id",
+                workflow_title: "workflow_title",
+                max_screenshot_scrolls: 1,
+                browser_address: "browser_address",
+                run_with: "run_with",
+                script_run: { ai_fallback_triggered: true },
+                job_id: "job_id",
+                depends_on_workflow_run_id: "depends_on_workflow_run_id",
+                sequential_key: "sequential_key",
+                ai_fallback: true,
+                code_gen: true,
+                queued_at: "2024-01-15T09:30:00Z",
+                started_at: "2024-01-15T09:30:00Z",
+                finished_at: "2024-01-15T09:30:00Z",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+            },
+        ];
+        server.mockEndpoint().get("/v1/workflows/runs").respondWith().statusCode(200).jsonBody(rawResponseBody).build();
+
+        const response = await client.getWorkflowRuns({
+            page: 1,
+            page_size: 1,
+            search_key: "search_key",
+            error_code: "error_code",
+        });
+        expect(response).toEqual([
+            {
+                workflow_run_id: "workflow_run_id",
+                workflow_id: "workflow_id",
+                workflow_permanent_id: "workflow_permanent_id",
+                organization_id: "organization_id",
+                browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
+                debug_session_id: "debug_session_id",
+                status: "created",
+                extra_http_headers: {
+                    key: "value",
+                },
+                proxy_location: "RESIDENTIAL",
+                webhook_callback_url: "webhook_callback_url",
+                webhook_failure_reason: "webhook_failure_reason",
+                totp_verification_url: "totp_verification_url",
+                totp_identifier: "totp_identifier",
+                failure_reason: "failure_reason",
+                parent_workflow_run_id: "parent_workflow_run_id",
+                workflow_title: "workflow_title",
+                max_screenshot_scrolls: 1,
+                browser_address: "browser_address",
+                run_with: "run_with",
+                script_run: {
+                    ai_fallback_triggered: true,
+                },
+                job_id: "job_id",
+                depends_on_workflow_run_id: "depends_on_workflow_run_id",
+                sequential_key: "sequential_key",
+                ai_fallback: true,
+                code_gen: true,
+                queued_at: "2024-01-15T09:30:00Z",
+                started_at: "2024-01-15T09:30:00Z",
+                finished_at: "2024-01-15T09:30:00Z",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+            },
+        ]);
+    });
+
+    test("get_workflow_runs (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server.mockEndpoint().get("/v1/workflows/runs").respondWith().statusCode(422).jsonBody(rawResponseBody).build();
+
+        await expect(async () => {
+            return await client.getWorkflowRuns();
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
     test("get_workflow (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
@@ -2629,6 +2729,83 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.createCredential({
+                name: "name",
+                credential_type: "password",
+                credential: {
+                    password: "x",
+                    username: "x",
+                },
+            });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("update_credential (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = {
+            name: "My Credential",
+            credential_type: "password",
+            credential: { password: "newpassword123", username: "user@example.com" },
+        };
+        const rawResponseBody = {
+            credential_id: "cred_1234567890",
+            credential: {
+                username: "user@example.com",
+                totp_type: "authenticator",
+                totp_identifier: "totp_identifier",
+            },
+            credential_type: "password",
+            name: "Amazon Login",
+        };
+        server
+            .mockEndpoint()
+            .post("/v1/credentials/cred_1234567890/update")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.updateCredential("cred_1234567890", {
+            name: "My Credential",
+            credential_type: "password",
+            credential: {
+                password: "newpassword123",
+                username: "user@example.com",
+            },
+        });
+        expect(response).toEqual({
+            credential_id: "cred_1234567890",
+            credential: {
+                username: "user@example.com",
+                totp_type: "authenticator",
+                totp_identifier: "totp_identifier",
+            },
+            credential_type: "password",
+            name: "Amazon Login",
+        });
+    });
+
+    test("update_credential (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = {
+            name: "name",
+            credential_type: "password",
+            credential: { password: "x", username: "x" },
+        };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/credentials/credential_id/update")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.updateCredential("credential_id", {
                 name: "name",
                 credential_type: "password",
                 credential: {
