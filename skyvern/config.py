@@ -98,13 +98,6 @@ class Settings(BaseSettings):
     # Supported storage types: local, s3cloud, azureblob
     SKYVERN_STORAGE_TYPE: str = "local"
 
-    # Shared Redis URL (used by any service that needs Redis)
-    REDIS_URL: str = "redis://localhost:6379/0"
-
-    # Notification registry settings ("local" or "redis")
-    NOTIFICATION_REGISTRY_TYPE: str = "local"
-    NOTIFICATION_REDIS_URL: str | None = None  # Deprecated: falls back to REDIS_URL
-
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
