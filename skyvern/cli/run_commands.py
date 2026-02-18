@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import json
 import logging
 import os
@@ -14,6 +15,8 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 
 from skyvern.cli.console import console
+from skyvern.cli.core.client import close_skyvern
+from skyvern.cli.core.session_manager import close_current_session
 from skyvern.cli.mcp_tools import mcp  # Uses standalone fastmcp (v2.x)
 from skyvern.cli.utils import start_services
 from skyvern.client import SkyvernEnvironment
@@ -26,6 +29,42 @@ from skyvern.utils import detect_os
 from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
+_mcp_cleanup_done = False
+
+
+async def _cleanup_mcp_resources() -> None:
+    try:
+        await close_current_session()
+    finally:
+        await close_skyvern()
+
+
+def _cleanup_mcp_resources_blocking() -> None:
+    global _mcp_cleanup_done
+    if _mcp_cleanup_done:
+        return
+
+    try:
+        asyncio.run(_cleanup_mcp_resources())
+        _mcp_cleanup_done = True
+    except Exception:
+        logging.getLogger(__name__).warning("MCP cleanup failed", exc_info=True)
+
+
+def _cleanup_mcp_resources_sync() -> None:
+    """Atexit callback for MCP cleanup. Skips if an event loop is still running
+    because asyncio.run() cannot be called inside a running loop. This means
+    cleanup is best-effort for signal-based exits (e.g. SIGTERM) that fire atexit
+    while the MCP server's loop is still alive -- the finally block in run_mcp()
+    handles normal shutdown instead."""
+    logger = logging.getLogger(__name__)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        _cleanup_mcp_resources_blocking()
+        return
+
+    logger.debug("Skipping MCP cleanup because event loop is still running")
 
 
 @mcp.tool()
@@ -260,7 +299,14 @@ def run_mcp() -> None:
     """Run the MCP server."""
     # This breaks the MCP processing because it expects json output only
     # console.print(Panel("[bold green]Starting MCP Server...[/bold green]", border_style="green"))
-    mcp.run(transport="stdio")
+    # atexit covers signal-based exits (SIGTERM); finally covers normal
+    # mcp.run() completion or unhandled exceptions. Both are needed because
+    # atexit doesn't fire on normal return and finally doesn't fire on signals.
+    atexit.register(_cleanup_mcp_resources_sync)
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        _cleanup_mcp_resources_blocking()
 
 
 @run_app.command(

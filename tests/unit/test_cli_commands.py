@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import typer
@@ -147,3 +150,149 @@ class TestResolveConnection:
         monkeypatch.setattr("skyvern.cli.commands._state.STATE_FILE", tmp_path / "nonexistent.json")
         with pytest.raises(typer.BadParameter, match="No active browser connection"):
             _resolve_connection(None, None)
+
+
+# ---------------------------------------------------------------------------
+# Browser command helpers and command behavior
+# ---------------------------------------------------------------------------
+
+
+class TestBrowserCommandGuards:
+    def test_resolve_ai_target_requires_selector_or_intent(self) -> None:
+        from skyvern.cli.commands.browser import _resolve_ai_target
+        from skyvern.cli.core.guards import GuardError
+
+        with pytest.raises(GuardError, match="Must provide intent, selector, or both"):
+            _resolve_ai_target(None, None, operation="click")
+
+    def test_validate_wait_state_rejects_invalid(self) -> None:
+        from skyvern.cli.commands.browser import _validate_wait_state
+        from skyvern.cli.core.guards import GuardError
+
+        with pytest.raises(GuardError, match="Invalid state"):
+            _validate_wait_state("bad-state")
+
+
+class TestBrowserCommands:
+    def test_session_get_outputs_session_details(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli.commands import browser as browser_cmd
+
+        session_obj = SimpleNamespace(
+            browser_session_id="pbs_123",
+            status="active",
+            started_at=datetime(2026, 2, 17, 12, 0, tzinfo=timezone.utc),
+            completed_at=None,
+            timeout=60,
+            runnable_id=None,
+        )
+        skyvern = SimpleNamespace(get_browser_session=AsyncMock(return_value=session_obj))
+        monkeypatch.setattr(browser_cmd, "get_skyvern", lambda: skyvern)
+        monkeypatch.setattr(browser_cmd, "load_state", lambda: CLIState(session_id="pbs_123", mode="cloud"))
+
+        browser_cmd.session_get(session="pbs_123", json_output=True)
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is True
+        assert parsed["action"] == "session_get"
+        assert parsed["data"]["session_id"] == "pbs_123"
+        assert parsed["data"]["is_current"] is True
+
+    def test_evaluate_blocks_password_js_before_connection(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli.commands import browser as browser_cmd
+
+        monkeypatch.setattr(
+            browser_cmd,
+            "_resolve_connection",
+            lambda _session, _cdp: (_ for _ in ()).throw(AssertionError("should not resolve connection")),
+        )
+
+        with pytest.raises(SystemExit, match="1"):
+            browser_cmd.evaluate(
+                expression='document.querySelector("input[type=password]").value = ""', json_output=True
+            )
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is False
+        assert "Cannot set password field values" in parsed["error"]["message"]
+
+    def test_click_requires_target_before_connection(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli.commands import browser as browser_cmd
+
+        monkeypatch.setattr(
+            browser_cmd,
+            "_resolve_connection",
+            lambda _session, _cdp: (_ for _ in ()).throw(AssertionError("should not resolve connection")),
+        )
+
+        with pytest.raises(SystemExit, match="1"):
+            browser_cmd.click(
+                intent=None,
+                selector=None,
+                session=None,
+                cdp=None,
+                timeout=30000,
+                button=None,
+                click_count=None,
+                json_output=True,
+            )
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is False
+        assert "Must provide intent, selector, or both" in parsed["error"]["message"]
+
+    def test_click_with_intent_uses_proactive_ai_mode(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli.commands import browser as browser_cmd
+
+        page = MagicMock()
+        page.click = AsyncMock(return_value="xpath=//button[@id='submit']")
+        browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+
+        monkeypatch.setattr(
+            browser_cmd,
+            "_resolve_connection",
+            lambda _session, _cdp: browser_cmd.ConnectionTarget(mode="cloud", session_id="pbs_123"),
+        )
+        monkeypatch.setattr(browser_cmd, "_connect_browser", AsyncMock(return_value=browser))
+
+        browser_cmd.click(
+            intent="the Submit button",
+            selector=None,
+            session="pbs_123",
+            cdp=None,
+            timeout=30000,
+            button=None,
+            click_count=None,
+            json_output=True,
+        )
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is True
+        assert parsed["action"] == "click"
+        assert parsed["data"]["ai_mode"] == "proactive"
+        assert parsed["data"]["resolved_selector"] == "xpath=//button[@id='submit']"
+
+    def test_wait_rejects_invalid_state_before_connection(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli.commands import browser as browser_cmd
+
+        monkeypatch.setattr(
+            browser_cmd,
+            "_resolve_connection",
+            lambda _session, _cdp: (_ for _ in ()).throw(AssertionError("should not resolve connection")),
+        )
+
+        with pytest.raises(SystemExit, match="1"):
+            browser_cmd.wait(state="bad-state", time_ms=1000, json_output=True)
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is False
+        assert "Invalid state" in parsed["error"]["message"]
