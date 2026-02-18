@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -8,6 +7,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 
 import structlog
 
+from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern
 from .result import BrowserContext, ErrorCode, make_error
 
@@ -73,7 +73,7 @@ def is_stateless_http_mode() -> bool:
 def _api_key_hash(api_key: str | None) -> str | None:
     if not api_key:
         return None
-    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    return hash_api_key_for_cache(api_key)
 
 
 def _matches_current(
