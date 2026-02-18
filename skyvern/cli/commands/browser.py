@@ -13,7 +13,17 @@ from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_
 from skyvern.cli.core.artifacts import save_artifact
 from skyvern.cli.core.browser_ops import do_act, do_extract, do_navigate, do_screenshot
 from skyvern.cli.core.client import get_skyvern
-from skyvern.cli.core.guards import GuardError, check_password_prompt, validate_wait_until
+from skyvern.cli.core.guards import (
+    CREDENTIAL_HINT,
+    PASSWORD_PATTERN,
+    VALID_ELEMENT_STATES,
+    GuardError,
+    check_js_password,
+    check_password_prompt,
+    resolve_ai_mode,
+    validate_button,
+    validate_wait_until,
+)
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
 
 browser_app = typer.Typer(help="Browser automation commands.", no_args_is_help=True)
@@ -62,6 +72,24 @@ async def _connect_browser(connection: ConnectionTarget) -> Any:
     if not connection.cdp_url:
         raise typer.BadParameter("CDP mode requires --cdp or an active CDP URL in state.")
     return await skyvern.connect_to_browser_over_cdp(connection.cdp_url)
+
+
+def _resolve_ai_target(selector: str | None, intent: str | None, *, operation: str) -> str | None:
+    ai_mode, err = resolve_ai_mode(selector, intent)
+    if err:
+        raise GuardError(
+            "Must provide intent, selector, or both",
+            (
+                f"Use intent='describe what to {operation}' for AI-powered targeting, "
+                "or selector='#css-selector' for precise targeting"
+            ),
+        )
+    return ai_mode
+
+
+def _validate_wait_state(state: str) -> None:
+    if state not in VALID_ELEMENT_STATES:
+        raise GuardError(f"Invalid state: {state}", "Use visible, hidden, attached, or detached")
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +218,35 @@ def session_list(
         output_error(str(e), hint="Check your API key and network connection.", json_mode=json_output)
 
 
+@session_app.command("get")
+def session_get(
+    session: str = typer.Option(..., "--session", "--id", help="Browser session ID."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Get details for a browser session."""
+
+    async def _run() -> dict:
+        skyvern = get_skyvern()
+        resolved = await skyvern.get_browser_session(session)
+        state = load_state()
+        is_current = bool(state and state.mode == "cloud" and state.session_id == session)
+        return {
+            "session_id": resolved.browser_session_id,
+            "status": resolved.status,
+            "started_at": resolved.started_at.isoformat() if resolved.started_at else None,
+            "completed_at": resolved.completed_at.isoformat() if resolved.completed_at else None,
+            "timeout": resolved.timeout,
+            "runnable_id": resolved.runnable_id,
+            "is_current": is_current,
+        }
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="session_get", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), hint="Verify the session ID exists and is accessible.", json_mode=json_output)
+
+
 # ---------------------------------------------------------------------------
 # Browser commands
 # ---------------------------------------------------------------------------
@@ -269,6 +326,392 @@ def screenshot(
         output_error(str(e), hint="Ensure the session is active and the page has loaded.", json_mode=json_output)
 
 
+@browser_app.command("evaluate")
+def evaluate(
+    expression: str = typer.Option(..., help="JavaScript expression to evaluate."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Run JavaScript on the current page."""
+
+    async def _run() -> dict:
+        check_js_password(expression)
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        result = await page.evaluate(expression)
+        return {"result": result}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="evaluate", json_mode=json_output)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint="Check JavaScript syntax and page state.", json_mode=json_output)
+
+
+@browser_app.command("click")
+def click(
+    intent: str | None = typer.Option(None, help="Natural language description of the element to click."),
+    selector: str | None = typer.Option(None, help="CSS selector or XPath for the element to click."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    timeout: int = typer.Option(30000, help="Max wait time in milliseconds."),
+    button: str | None = typer.Option(None, help="Mouse button: left, right, or middle."),
+    click_count: int | None = typer.Option(None, "--click-count", help="Number of clicks (2 for double-click)."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Click an element using selector, intent, or both."""
+
+    async def _run() -> dict:
+        validate_button(button)
+        ai_mode = _resolve_ai_target(selector, intent, operation="click")
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+
+        kwargs: dict[str, Any] = {"timeout": timeout}
+        if button:
+            kwargs["button"] = button
+        if click_count is not None:
+            kwargs["click_count"] = click_count
+
+        if ai_mode is not None:
+            resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
+        else:
+            assert selector is not None
+            resolved = await page.click(selector=selector, **kwargs)
+
+        data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode}
+        if resolved and resolved != selector:
+            data["resolved_selector"] = resolved
+        return data
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="click", json_mode=json_output)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint="Element may be hidden, disabled, or not yet available.", json_mode=json_output)
+
+
+@browser_app.command("hover")
+def hover(
+    intent: str | None = typer.Option(None, help="Natural language description of the element to hover."),
+    selector: str | None = typer.Option(None, help="CSS selector or XPath for the element to hover."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    timeout: int = typer.Option(30000, help="Max wait time in milliseconds."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Hover over an element using selector, intent, or both."""
+
+    async def _run() -> dict:
+        ai_mode = _resolve_ai_target(selector, intent, operation="hover")
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+
+        if ai_mode is not None:
+            locator = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
+        else:
+            assert selector is not None
+            locator = page.locator(selector)
+        await locator.hover(timeout=timeout)
+        return {"selector": selector, "intent": intent, "ai_mode": ai_mode}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="hover", json_mode=json_output)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint="Element may be hidden or not interactable.", json_mode=json_output)
+
+
+@browser_app.command("type")
+def type_text(
+    text: str = typer.Option(..., help="Text to type into the input."),
+    intent: str | None = typer.Option(None, help="Natural language description of the input field."),
+    selector: str | None = typer.Option(None, help="CSS selector or XPath for the input field."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    timeout: int = typer.Option(30000, help="Max wait time in milliseconds."),
+    clear: bool = typer.Option(True, "--clear/--no-clear", help="Clear existing content before typing."),
+    delay: int | None = typer.Option(None, help="Delay between keystrokes in milliseconds."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Type into an input field using selector, intent, or both."""
+
+    async def _run() -> dict:
+        target_text = f"{intent or ''} {selector or ''}"
+        if PASSWORD_PATTERN.search(target_text):
+            raise GuardError(
+                "Cannot type into password fields — credentials must not be passed through tool calls",
+                CREDENTIAL_HINT,
+            )
+
+        ai_mode = _resolve_ai_target(selector, intent, operation="type")
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+
+        if selector:
+            try:
+                is_password = await page.evaluate(
+                    "(s) => { const el = document.querySelector(s); return !!(el && el.type === 'password'); }",
+                    selector,
+                )
+            except Exception:
+                is_password = False
+            if is_password:
+                raise GuardError(
+                    "Cannot type into password fields — credentials must not be passed through tool calls",
+                    CREDENTIAL_HINT,
+                )
+
+        if clear:
+            if ai_mode is not None:
+                await page.fill(selector=selector, value=text, prompt=intent, ai=ai_mode, timeout=timeout)  # type: ignore[arg-type]
+            else:
+                assert selector is not None
+                await page.fill(selector, text, timeout=timeout)
+        else:
+            kwargs: dict[str, Any] = {"timeout": timeout}
+            if delay is not None:
+                kwargs["delay"] = delay
+            if ai_mode is not None:
+                locator = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
+                await locator.type(text, **kwargs)
+            else:
+                assert selector is not None
+                await page.type(selector, text, **kwargs)
+
+        return {"selector": selector, "intent": intent, "ai_mode": ai_mode, "text_length": len(text)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="type", json_mode=json_output)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint="Element may not be editable or may be obscured.", json_mode=json_output)
+
+
+@browser_app.command("scroll")
+def scroll(
+    direction: str = typer.Option(..., help="Direction: up, down, left, right."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    amount: int | None = typer.Option(None, help="Pixels to scroll (default 500)."),
+    intent: str | None = typer.Option(None, help="Natural language element to scroll into view."),
+    selector: str | None = typer.Option(None, help="CSS selector of scrollable element."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Scroll the page or scroll a targeted element into view."""
+
+    async def _run() -> dict:
+        valid_directions = ("up", "down", "left", "right")
+        if not intent and direction not in valid_directions:
+            raise GuardError(f"Invalid direction: {direction}", "Use up, down, left, or right")
+
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+
+        if intent:
+            ai_mode = "fallback" if selector else "proactive"
+            locator = page.locator(selector=selector, prompt=intent, ai=ai_mode)
+            await locator.scroll_into_view_if_needed()
+            return {"direction": "into_view", "intent": intent, "selector": selector, "ai_mode": ai_mode}
+
+        pixels = amount or 500
+        direction_map = {"up": (0, -pixels), "down": (0, pixels), "left": (-pixels, 0), "right": (pixels, 0)}
+        dx, dy = direction_map[direction]
+
+        if selector:
+            await page.locator(selector).evaluate(f"el => el.scrollBy({dx}, {dy})")
+        else:
+            await page.evaluate(f"window.scrollBy({dx}, {dy})")
+
+        return {"direction": direction, "pixels": pixels, "selector": selector}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="scroll", json_mode=json_output)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint="Scroll failed; check selector and page readiness.", json_mode=json_output)
+
+
+@browser_app.command("select")
+def select(
+    value: str = typer.Option(..., help="Option value to select."),
+    intent: str | None = typer.Option(None, help="Natural language description of the dropdown."),
+    selector: str | None = typer.Option(None, help="CSS selector for the dropdown."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    timeout: int = typer.Option(30000, help="Max wait time in milliseconds."),
+    by_label: bool = typer.Option(False, "--by-label", help="Select by visible label instead of value."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Select an option from a dropdown."""
+
+    async def _run() -> dict:
+        ai_mode = _resolve_ai_target(selector, intent, operation="select")
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+
+        if ai_mode is not None:
+            await page.select_option(selector=selector, value=value, prompt=intent, ai=ai_mode, timeout=timeout)  # type: ignore[arg-type]
+        else:
+            assert selector is not None
+            if by_label:
+                await page.page.locator(selector).select_option(label=value, timeout=timeout)
+            else:
+                await page.select_option(selector, value=value, timeout=timeout)
+
+        return {"selector": selector, "intent": intent, "ai_mode": ai_mode, "value": value, "by_label": by_label}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="select", json_mode=json_output)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint="Check dropdown selector and available options.", json_mode=json_output)
+
+
+@browser_app.command("press-key")
+def press_key(
+    key: str = typer.Option(..., help="Key to press (e.g., Enter, Tab, Escape)."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    intent: str | None = typer.Option(None, help="Natural language description of element to focus first."),
+    selector: str | None = typer.Option(None, help="CSS selector to focus first."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Press a keyboard key."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+
+        if intent or selector:
+            ai_mode, err = resolve_ai_mode(selector, intent)
+            if err:
+                raise GuardError(
+                    "Must provide intent, selector, or both",
+                    "Use intent='describe where to press' or selector='#css-selector'",
+                )
+            if ai_mode is not None:
+                locator = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
+            else:
+                assert selector is not None
+                locator = page.locator(selector)
+            await locator.press(key)
+        else:
+            await page.keyboard.press(key)
+
+        return {"key": key, "selector": selector, "intent": intent}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="press_key", json_mode=json_output)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint="Check key name and focused target.", json_mode=json_output)
+
+
+@browser_app.command("wait")
+def wait(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    time_ms: int | None = typer.Option(None, "--time", help="Milliseconds to wait."),
+    intent: str | None = typer.Option(None, help="Natural language condition to wait for."),
+    selector: str | None = typer.Option(None, help="CSS selector to wait for."),
+    state: str = typer.Option("visible", help="Element state: visible, hidden, attached, detached."),
+    timeout: int = typer.Option(30000, help="Max wait time in milliseconds."),
+    poll_interval: int = typer.Option(5000, "--poll-interval", help="Polling interval for intent waits in ms."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Wait for time, selector state, or AI condition."""
+
+    async def _run() -> dict:
+        _validate_wait_state(state)
+        if time_ms is None and not selector and not intent:
+            raise GuardError(
+                "Must provide intent, selector, or time_ms",
+                "Use --time, --selector, or --intent to specify what to wait for",
+            )
+
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+
+        waited_for = ""
+        if time_ms is not None:
+            await page.wait_for_timeout(time_ms)
+            waited_for = "time"
+        elif intent:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout / 1000
+            last_error: Exception | None = None
+            while True:
+                try:
+                    ready = await page.validate(intent)
+                    last_error = None
+                except Exception as poll_error:
+                    ready = False
+                    last_error = poll_error
+
+                if ready:
+                    waited_for = "intent"
+                    break
+                if loop.time() >= deadline:
+                    if last_error:
+                        raise RuntimeError(str(last_error))
+                    raise TimeoutError(f"Condition not met within {timeout}ms: {intent}")
+                await page.wait_for_timeout(poll_interval)
+        else:
+            assert selector is not None
+            await page.wait_for_selector(selector, state=state, timeout=timeout)
+            waited_for = "selector"
+
+        return {"waited_for": waited_for, "state": state, "selector": selector, "intent": intent}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="wait", json_mode=json_output)
+    except GuardError as e:
+        output_error(str(e), hint=e.hint, json_mode=json_output)
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint="Condition was not met within timeout.", json_mode=json_output)
+
+
 @browser_app.command("act")
 def act(
     prompt: str = typer.Option(..., help="Natural language action to perform."),
@@ -323,3 +766,28 @@ def extract(
         raise
     except Exception as e:
         output_error(str(e), hint="Simplify the prompt or provide a JSON schema.", json_mode=json_output)
+
+
+@browser_app.command("validate")
+def validate(
+    prompt: str = typer.Option(..., help="Validation condition to check."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Check whether a natural language condition is true on the current page."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        valid = await page.validate(prompt)
+        return {"prompt": prompt, "valid": valid}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="validate", json_mode=json_output)
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint="Check the page state and validation prompt.", json_mode=json_output)
