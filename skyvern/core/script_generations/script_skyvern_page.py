@@ -240,6 +240,7 @@ class ScriptSkyvernPage(SkyvernPage):
             # Wait for page to be ready before executing action
             # This helps prevent issues where cached actions execute before the page is fully loaded
             await self._wait_for_page_ready_before_action()
+            await self._ensure_element_ids_on_page()
 
             call.result = await fn(self, *args, **kwargs)
 
@@ -560,6 +561,39 @@ class ScriptSkyvernPage(SkyvernPage):
         except Exception:
             # Don't block action execution if page readiness check fails
             LOG.debug("Page readiness check failed, proceeding with action", exc_info=True)
+
+    async def _ensure_element_ids_on_page(self) -> None:
+        """
+        Ensure unique_id attributes exist on DOM elements for cached selectors.
+
+        After page navigation, the new DOM has no unique_id attributes because
+        they are only set during scraping (domUtils.js buildTreeFromBody). Cached
+        actions use [unique_id='XXX'] selectors, so we need to build the element
+        tree before executing cached actions on a new page.
+        """
+        try:
+            if not self.page:
+                return
+
+            # Quick check: do unique_id attributes already exist?
+            has_unique_ids = await self.page.evaluate("() => document.querySelector('[unique_id]') !== null")
+            if has_unique_ids:
+                return
+
+            # Inject domUtils.js and build the element tree to set unique_id attrs.
+            # Use a short timeout since this is best-effort; we don't want to hang for 60s.
+            skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
+            await skyvern_frame.build_tree_from_body(
+                frame_name="main.frame",
+                frame_index=0,
+                timeout_ms=15000,
+            )
+            LOG.info("Injected element IDs on page for cached script execution")
+        except Exception:
+            LOG.debug(
+                "Failed to ensure element IDs on page, proceeding with action",
+                exc_info=True,
+            )
 
     async def get_actual_value(
         self,
