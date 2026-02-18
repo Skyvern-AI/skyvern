@@ -1326,8 +1326,27 @@ class ForgeAgent:
                             digit=current_text,
                         )
 
+                # Skip sleep and post-action artifacts for page-level SCROLL to preserve
+                # scroll-driven JS state. Many pages enable buttons only while scrolled to
+                # bottom (e.g. T&C "Agree" buttons) and re-disable them after any delay or
+                # programmatic scroll. Sub-container scrolls (strategies 1 & 2) don't affect
+                # page position, so they keep normal sleep and artifact recording.
+                is_page_level_scroll = action.action_type == ActionType.SCROLL and any(
+                    r.success and isinstance(r.data, dict) and r.data.get("page_level_scroll") for r in results
+                )
+                if is_page_level_scroll:
+                    wait_time = 0.0
+
                 await asyncio.sleep(wait_time)
-                await self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                if not is_page_level_scroll:
+                    await self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                else:
+                    LOG.info(
+                        "Skipping post-action artifacts for page-level scroll",
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        action_idx=action_idx,
+                    )
                 for result in results:
                     result.step_retry_number = step.retry_index
                     result.step_order = step.order

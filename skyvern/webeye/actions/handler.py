@@ -726,13 +726,29 @@ async def handle_click_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
-    try:
-        await skyvern_element.scroll_into_view()
-    except Exception:
+    # Skip scroll_into_view when a page-level SCROLL just completed on THIS element.
+    # The scroll positioned the page at the bottom to enable T&C buttons;
+    # scroll_into_view() would use programmatic window.scroll() to center the
+    # element, moving the page away from the bottom and re-disabling the button.
+    # Uses element ID matching (not a boolean) so unrelated clicks aren't affected.
+    skip_scroll_into_view = await page.evaluate(
+        "(id) => { const v = window.__skyvernPageScrolledElementId;"
+        " window.__skyvernPageScrolledElementId = null; return v === id; }",
+        action.element_id,
+    )
+    if skip_scroll_into_view:
         LOG.info(
-            "Failed to scroll into view, ignore it and continue executing",
+            "Skipping scroll_into_view after page-level scroll to preserve scroll position",
             element_id=skyvern_element.get_id(),
         )
+    else:
+        try:
+            await skyvern_element.scroll_into_view()
+        except Exception:
+            LOG.info(
+                "Failed to scroll into view, ignore it and continue executing",
+                element_id=skyvern_element.get_id(),
+            )
 
     if action.download:
         results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
@@ -2189,13 +2205,15 @@ async def handle_scroll_action(
         # Element-based scrolling from extract-action prompt. Uses
         # scrollNearestScrollableContainer() from domUtils.js which walks the DOM to find
         # the nearest scrollable ancestor or sibling container relative to the element.
+        # Returns: truthy value if scrolled (true for sub-container, "page" for page-level),
+        # false if nothing was scrollable.
         scroll_direction = "down" if action.scroll_y >= 0 else "up"
-        scrolled = False
+        scroll_result = False
         dom = DomUtil(scraped_page=scraped_page, page=page)
         skyvern_element = await dom.safe_get_skyvern_element_by_id(action.element_id)
         if skyvern_element:
             try:
-                scrolled = await skyvern_element.locator.evaluate(
+                scroll_result = await skyvern_element.locator.evaluate(
                     "(el, direction) => scrollNearestScrollableContainer(el, direction)",
                     scroll_direction,
                 )
@@ -2207,7 +2225,58 @@ async def handle_scroll_action(
                 )
         else:
             LOG.warning("Could not resolve element for scroll action", element_id=action.element_id)
-        if not scrolled:
+
+        if scroll_result == "page":
+            # No scrollable sub-container found, but the page itself is scrollable.
+            # Use incremental mouse.wheel events at the center of the viewport to
+            # simulate natural user scrolling. This fires native wheel/scroll events
+            # that page JavaScript (IntersectionObserver, scroll listeners, etc.) can
+            # detect — unlike programmatic window.scrollTo() or keyboard shortcuts
+            # which many pages ignore.
+            LOG.info(
+                "Page-level scroll, using mouse wheel at viewport center",
+                element_id=action.element_id,
+                direction=scroll_direction,
+            )
+            viewport = page.viewport_size
+            center_x = viewport["width"] // 2 if viewport else 640
+            center_y = viewport["height"] // 2 if viewport else 360
+            await page.mouse.move(center_x, center_y)
+            wheel_delta = 500 if scroll_direction == "down" else -500
+            # Dynamically compute iterations based on remaining scrollable distance
+            # so we reach the bottom even on very long T&C pages.
+            scroll_info = await page.evaluate(
+                "() => ({ scrollHeight: document.documentElement.scrollHeight,"
+                " scrollTop: window.pageYOffset, innerHeight: window.innerHeight })"
+            )
+            if scroll_direction == "down":
+                remaining = scroll_info["scrollHeight"] - scroll_info["scrollTop"] - scroll_info["innerHeight"]
+            else:
+                remaining = scroll_info["scrollTop"]
+            iterations = max(1, min(int(remaining / abs(wheel_delta)) + 1, 50))
+            LOG.info(
+                "Page-level scroll iterations",
+                remaining_px=remaining,
+                iterations=iterations,
+                wheel_delta=wheel_delta,
+            )
+            for _ in range(iterations):
+                await page.mouse.wheel(0, wheel_delta)
+                await page.wait_for_timeout(100)
+            # Wait for page JS to process scroll events (e.g. enabling buttons)
+            await page.wait_for_timeout(500)
+
+            # Record which element was just page-level scrolled. The click handler
+            # checks this to skip scroll_into_view() for the SAME element, which
+            # would use programmatic window.scroll() to center it — undoing the
+            # scroll position that enables buttons on T&C pages. Using the element
+            # ID (not a boolean) ensures unrelated clicks aren't affected.
+            await page.evaluate(
+                "(id) => { window.__skyvernPageScrolledElementId = id; }",
+                action.element_id,
+            )
+            return [ActionSuccess(data={"page_level_scroll": True})]
+        elif not scroll_result:
             LOG.warning(
                 "Could not find scrollable container near element, falling back to mouse wheel",
                 element_id=action.element_id,
