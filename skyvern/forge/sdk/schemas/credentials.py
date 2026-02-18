@@ -170,6 +170,116 @@ class CredentialResponse(BaseModel):
     )
     credential_type: CredentialType = Field(..., description="Type of the credential")
     name: str = Field(..., description="Name of the credential", examples=["Amazon Login"])
+    browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
+    tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
+
+
+class TestCredentialRequest(BaseModel):
+    """Request model for testing a credential by logging into a website."""
+
+    url: str = Field(
+        ...,
+        description="The login page URL to test the credential against",
+        examples=["https://example.com/login"],
+    )
+    save_browser_profile: bool = Field(
+        default=True,
+        description="Whether to save the browser profile after a successful login test",
+    )
+
+
+class TestLoginRequest(BaseModel):
+    """Request model for testing a login with inline credentials (no saved credential required)."""
+
+    url: str = Field(
+        ...,
+        description="The login page URL to test against",
+        examples=["https://example.com/login"],
+    )
+    username: str = Field(
+        ...,
+        min_length=1,
+        description="The username to test",
+        examples=["user@example.com"],
+    )
+    password: str = Field(
+        ...,
+        min_length=1,
+        description="The password to test",
+        examples=["securepassword123"],
+    )
+    totp: str | None = Field(
+        default=None,
+        description="Optional TOTP secret for 2FA",
+    )
+    totp_type: TotpType = Field(
+        default=TotpType.NONE,
+        description="Type of 2FA method",
+    )
+    totp_identifier: str | None = Field(
+        default=None,
+        description="Identifier (email or phone) for TOTP",
+    )
+
+
+class TestCredentialResponse(BaseModel):
+    """Response model for a credential test initiation."""
+
+    credential_id: str = Field(..., description="The credential being tested")
+    workflow_run_id: str = Field(
+        ...,
+        description="The workflow run ID to poll for test status",
+        examples=["wr_1234567890"],
+    )
+    status: str = Field(
+        ...,
+        description="Current status of the test",
+        examples=["running"],
+    )
+
+
+class TestLoginResponse(BaseModel):
+    """Response model for an inline login test (no saved credential)."""
+
+    credential_id: str = Field(
+        ...,
+        description="The temporary credential ID created for this test",
+    )
+    workflow_run_id: str = Field(
+        ...,
+        description="The workflow run ID to poll for test status",
+        examples=["wr_1234567890"],
+    )
+    status: str = Field(
+        ...,
+        description="Current status of the test",
+        examples=["running"],
+    )
+
+
+class TestCredentialStatusResponse(BaseModel):
+    """Response model for credential test status polling."""
+
+    credential_id: str = Field(..., description="The credential being tested")
+    workflow_run_id: str = Field(..., description="The workflow run ID")
+    status: str = Field(
+        ...,
+        description="Current status: created, running, completed, failed, timed_out",
+        examples=["completed"],
+    )
+    failure_reason: str | None = Field(default=None, description="Reason for failure, if any")
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="Browser profile ID created from successful test. Only present when status=completed and save_browser_profile was true.",
+    )
+    tested_url: str | None = Field(
+        default=None,
+        description="Login page URL used during the credential test.",
+    )
+    browser_profile_failure_reason: str | None = Field(
+        default=None,
+        description="Reason the browser profile failed to save, if applicable. Present when login succeeded but browser profile creation failed.",
+    )
 
 
 class Credential(BaseModel):
@@ -199,7 +309,19 @@ class Credential(BaseModel):
     card_last4: str | None = Field(..., description="For credit_card credentials: the last four digits of the card")
     card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")
     secret_label: str | None = Field(default=None, description="For secret credentials: optional label")
+    browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
+    tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
     deleted_at: datetime | None = Field(None, description="Timestamp when the credential was deleted, if applicable")
+
+
+class UpdateCredentialRequest(BaseModel):
+    """Request model for updating a credential."""
+
+    name: str | None = Field(
+        default=None,
+        description="New name for the credential",
+        examples=["My Updated Credential"],
+    )

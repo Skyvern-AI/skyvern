@@ -1364,6 +1364,57 @@ class WorkflowService:
                 model=block.model,
             )
 
+            # ── Skip LoginBlock when credential has a browser profile ────
+            if block.block_type == BlockType.LOGIN:
+                resolved_browser_profile_id = await self._resolve_login_block_browser_profile_id(
+                    workflow=workflow,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+                if resolved_browser_profile_id:
+                    LOG.info(
+                        "LoginBlock has credential with browser profile — skipping login block entirely",
+                        workflow_run_id=workflow_run_id,
+                        block_label=block.label,
+                        browser_profile_id=resolved_browser_profile_id,
+                    )
+                    # Persist the browser_profile_id on the workflow_run so
+                    # subsequent blocks create / reuse a browser with the
+                    # saved profile (cookies, localStorage, etc.).
+                    await app.DATABASE.update_workflow_run(
+                        workflow_run_id=workflow_run_id,
+                        browser_profile_id=resolved_browser_profile_id,
+                    )
+                    workflow_run = await app.DATABASE.get_workflow_run(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                    ) or workflow_run
+
+                    # Create a workflow_run_block record and mark it complete
+                    workflow_run_block = await app.DATABASE.create_workflow_run_block(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        parent_workflow_run_block_id=None,
+                        label=block.label,
+                        block_type=block.block_type,
+                        continue_on_failure=block.continue_on_failure,
+                    )
+                    workflow_run_block_result = await block.build_block_result(
+                        success=True,
+                        failure_reason=None,
+                        output_parameter_value={"browser_profile_id": resolved_browser_profile_id},
+                        status=BlockStatus.skipped,
+                        workflow_run_block_id=workflow_run_block.workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                    # Record the output parameter so downstream blocks can reference it
+                    workflow_run_context = block.get_workflow_run_context(workflow_run_id)
+                    await block.record_output_parameter_value(
+                        workflow_run_context, workflow_run_id, None
+                    )
+
+                    return workflow_run, blocks_to_update, workflow_run_block_result, False, branch_metadata
+
             valid_to_run_code = (
                 is_script_run and block.label and block.label in script_blocks_by_label and not block.disable_cache
             )
@@ -1519,6 +1570,87 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id, failure_reason=failure_reason
             )
             return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
+
+    async def _resolve_login_block_browser_profile_id(
+        self,
+        workflow: Workflow,
+        workflow_run_id: str,
+        organization_id: str | None,
+    ) -> str | None:
+        """Inspect the workflow-level parameters and return the browser_profile_id
+        from the credential parameter, if one exists.
+
+        Credentials are defined as workflow-level parameters (not block-level),
+        so we look at ``workflow.workflow_definition.parameters`` for:
+        1. ``CredentialParameter`` — has ``credential_id`` directly.
+        2. ``WorkflowParameter`` with ``workflow_parameter_type == CREDENTIAL_ID``
+           — the credential_id comes from the run-parameter value or the
+           parameter's ``default_value``.
+        """
+        params = workflow.workflow_definition.parameters if workflow.workflow_definition else []
+        for param in params:
+            credential_id: str | None = None
+
+            # Style 1: CredentialParameter (has credential_id directly)
+            if isinstance(param, CredentialParameter):
+                credential_id = param.credential_id
+
+            # Style 2: WorkflowParameter with type CREDENTIAL_ID
+            elif (
+                isinstance(param, WorkflowParameter)
+                and getattr(param, "workflow_parameter_type", None) == WorkflowParameterType.CREDENTIAL_ID
+            ):
+                # The credential_id is stored as the run-parameter value (or
+                # falls back to default_value on the workflow parameter).
+                try:
+                    param_tuples = await app.DATABASE.get_workflow_run_parameters(
+                        workflow_run_id=workflow_run_id,
+                    )
+                    for wf_param, run_param in param_tuples:
+                        if wf_param.key == param.key:
+                            if isinstance(run_param.value, str) and run_param.value:
+                                credential_id = run_param.value
+                            break
+                except Exception:
+                    LOG.warning(
+                        "Failed to fetch workflow run parameters for credential resolution",
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
+
+                # Fallback to default_value
+                if not credential_id:
+                    dv = getattr(param, "default_value", None)
+                    if isinstance(dv, str) and dv:
+                        credential_id = dv
+
+            if not credential_id:
+                continue
+
+            # Look up the credential and check for a browser_profile_id
+            if not organization_id:
+                continue
+            try:
+                db_cred = await app.DATABASE.get_credential(
+                    credential_id=credential_id,
+                    organization_id=organization_id,
+                )
+                if db_cred and db_cred.browser_profile_id:
+                    LOG.info(
+                        "Resolved browser_profile_id from LoginBlock credential",
+                        credential_id=credential_id,
+                        browser_profile_id=db_cred.browser_profile_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                    return db_cred.browser_profile_id
+            except Exception:
+                LOG.warning(
+                    "Failed to look up credential for browser profile",
+                    credential_id=credential_id,
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+        return None
 
     async def _handle_block_result_status(
         self,

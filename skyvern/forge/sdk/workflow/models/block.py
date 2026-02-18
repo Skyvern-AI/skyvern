@@ -816,6 +816,23 @@ class BaseTaskBlock(Block):
                     if working_page.url == "about:blank" and self.url:
                         await browser_state.navigate_to_url(page=working_page, url=self.url)
 
+                    # When a browser profile is loaded, wait for the page to fully settle
+                    # so that cookie-based authentication can redirect or restore the session
+                    # BEFORE the agent starts interacting with the page.
+                    if workflow_run.browser_profile_id:
+                        LOG.info(
+                            "Browser profile loaded — waiting for page to settle before agent acts",
+                            browser_profile_id=workflow_run.browser_profile_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                        )
+                        try:
+                            await working_page.wait_for_load_state("networkidle", timeout=10000)
+                        except Exception:
+                            LOG.debug(
+                                "networkidle timeout after browser profile load (non-fatal)",
+                                workflow_run_id=workflow_run.workflow_run_id,
+                            )
+
                 except Exception as e:
                     LOG.exception(
                         "Failed to get browser state for first task",

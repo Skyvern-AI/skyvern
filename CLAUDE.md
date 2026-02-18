@@ -87,3 +87,15 @@ Configure via environment variables or `skyvern init llm`:
 - TypeScript: ESLint + Prettier (configured in skyvern-frontend/)
 - Line length: 120 characters
 - Use type hints and async/await patterns
+
+### Workflow Execution
+- Always use `await AsyncExecutorFactory.get_executor().execute_workflow(...)` to execute workflows.
+  Do NOT use `background_tasks.add_task(app.WORKFLOW_SERVICE.execute_workflow, ...)`.
+  The cloud version of the executor enqueues the job and runs it in a separate worker.
+
+### Security Invariants
+- **Never return raw credential data in API responses.** Passwords, TOTP secrets, full card numbers,
+  CVVs, and secret values must never be included in any API response body. Credential endpoints
+  should only return metadata (name, type, username, card last4/brand, secret label, etc.).
+  Raw secrets are stored in the credential vault and must only be accessed internally during
+  workflow execution.

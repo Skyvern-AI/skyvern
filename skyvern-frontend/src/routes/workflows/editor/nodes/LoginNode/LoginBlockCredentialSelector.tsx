@@ -11,7 +11,7 @@ import CloudContext from "@/store/CloudContext";
 import { useContext, useMemo } from "react";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
-import { ExclamationTriangleIcon, PlusIcon } from "@radix-ui/react-icons";
+import { ExclamationTriangleIcon, PlusIcon, CheckCircledIcon } from "@radix-ui/react-icons";
 import {
   CredentialModalTypes,
   useCredentialModalState,
@@ -117,6 +117,8 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
     label: credential.name,
     value: credential.credential_id,
     type: "credential" as const,
+    hasBrowserProfile: !!credential.browser_profile_id,
+    browserProfileUrl: credential.tested_url ?? null,
   }));
 
   // Only show non-Skyvern credential parameters (Bitwarden, 1Password, Azure Vault)
@@ -247,7 +249,14 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
         <SelectContent>
           {options.map((option) => (
             <SelectItem key={option.value} value={option.value}>
-              {option.label}
+              <div className="flex items-center gap-2">
+                <span>{option.label}</span>
+                {"hasBrowserProfile" in option && option.hasBrowserProfile && (
+                  <span title={option.browserProfileUrl ? `Login-free credentials enabled for ${option.browserProfileUrl}` : "Login-free credentials enabled"}>
+                    <CheckCircledIcon className="size-3 text-green-400" />
+                  </span>
+                )}
+              </div>
             </SelectItem>
           ))}
           <SelectItem value="new">
