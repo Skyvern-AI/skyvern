@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 from collections import OrderedDict
 from contextvars import ContextVar, Token
@@ -12,6 +11,8 @@ import structlog
 from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
 from skyvern.library.skyvern import Skyvern
+
+from .api_key_hash import hash_api_key_for_cache
 
 _skyvern_instance: ContextVar[Skyvern | None] = ContextVar("skyvern_instance", default=None)
 _api_key_override: ContextVar[str | None] = ContextVar("skyvern_api_key_override", default=None)
@@ -34,7 +35,7 @@ _API_KEY_CLIENT_CACHE_MAX = _resolve_api_key_cache_size()
 
 def _cache_key(api_key: str) -> str:
     """Hash API key so raw secrets are never stored as dict keys."""
-    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    return hash_api_key_for_cache(api_key)
 
 
 def _resolve_api_key() -> str | None:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import time
 from collections import OrderedDict
@@ -17,6 +16,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.services.org_auth_service import resolve_org_from_api_key
 
+from .api_key_hash import hash_api_key_for_cache
 from .client import reset_api_key_override, set_api_key_override
 
 LOG = structlog.get_logger(__name__)
@@ -79,7 +79,7 @@ async def close_auth_db() -> None:
 
 
 def _cache_key(api_key: str) -> str:
-    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    return hash_api_key_for_cache(api_key)
 
 
 async def validate_mcp_api_key(api_key: str) -> str:
