@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.13"
+version = "1.0.15"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
