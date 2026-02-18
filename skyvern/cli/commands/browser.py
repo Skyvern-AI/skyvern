@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +27,8 @@ from skyvern.cli.core.guards import (
     validate_wait_until,
 )
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
+from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
+from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
 
 browser_app = typer.Typer(help="Browser automation commands.", no_args_is_help=True)
 session_app = typer.Typer(help="Manage browser sessions.", no_args_is_help=True)
@@ -90,6 +94,22 @@ def _resolve_ai_target(selector: str | None, intent: str | None, *, operation: s
 def _validate_wait_state(state: str) -> None:
     if state not in VALID_ELEMENT_STATES:
         raise GuardError(f"Invalid state: {state}", "Use visible, hidden, attached, or detached")
+
+
+def _emit_tool_result(result: dict[str, Any], *, json_output: bool, action: str) -> None:
+    if json_output:
+        json.dump(result, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+        if not result.get("ok", False):
+            raise SystemExit(1)
+        return
+
+    if result.get("ok", False):
+        output(result.get("data"), action=action, json_mode=False)
+        return
+
+    err = result.get("error") or {}
+    output_error(str(err.get("message") or "Unknown error"), hint=str(err.get("hint") or ""), json_mode=False)
 
 
 # ---------------------------------------------------------------------------
@@ -791,3 +811,110 @@ def validate(
         raise
     except Exception as e:
         output_error(str(e), hint="Check the page state and validation prompt.", json_mode=json_output)
+
+
+@browser_app.command("run-task")
+def run_task(
+    prompt: str = typer.Option(..., help="Natural language description of the task to automate."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    url: str | None = typer.Option(None, help="URL to navigate to before running."),
+    data_extraction_schema: str | None = typer.Option(
+        None,
+        "--schema",
+        "--data-extraction-schema",
+        help="JSON Schema string defining what data to extract.",
+    ),
+    max_steps: int | None = typer.Option(None, "--max-steps", min=1, help="Maximum number of agent steps."),
+    timeout_seconds: int = typer.Option(180, "--timeout", min=10, max=1800, help="Timeout in seconds."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Run a quick one-off browser automation task."""
+
+    async def _run() -> dict[str, Any]:
+        connection = _resolve_connection(session, cdp)
+        return await tool_run_task(
+            prompt=prompt,
+            session_id=connection.session_id if connection.mode == "cloud" else None,
+            cdp_url=connection.cdp_url if connection.mode == "cdp" else None,
+            url=url,
+            data_extraction_schema=data_extraction_schema,
+            max_steps=max_steps,
+            timeout_seconds=timeout_seconds,
+        )
+
+    try:
+        result = asyncio.run(_run())
+        _emit_tool_result(result, json_output=json_output, action="run_task")
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(str(e), hint="Check the prompt, active connection, and timeout settings.", json_mode=json_output)
+
+
+@browser_app.command("login")
+def login(
+    credential_type: str = typer.Option(
+        "skyvern",
+        "--credential-type",
+        help="Credential provider: skyvern, bitwarden, 1password, or azure_vault.",
+    ),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    url: str | None = typer.Option(None, help="Login page URL."),
+    credential_id: str | None = typer.Option(None, "--credential-id", help="Skyvern credential ID for type=skyvern."),
+    bitwarden_item_id: str | None = typer.Option(None, "--bitwarden-item-id", help="Bitwarden item ID."),
+    bitwarden_collection_id: str | None = typer.Option(
+        None, "--bitwarden-collection-id", help="Bitwarden collection ID."
+    ),
+    onepassword_vault_id: str | None = typer.Option(None, "--onepassword-vault-id", help="1Password vault ID."),
+    onepassword_item_id: str | None = typer.Option(None, "--onepassword-item-id", help="1Password item ID."),
+    azure_vault_name: str | None = typer.Option(None, "--azure-vault-name", help="Azure Vault name."),
+    azure_vault_username_key: str | None = typer.Option(
+        None, "--azure-vault-username-key", help="Azure Vault username key."
+    ),
+    azure_vault_password_key: str | None = typer.Option(
+        None, "--azure-vault-password-key", help="Azure Vault password key."
+    ),
+    azure_vault_totp_secret_key: str | None = typer.Option(
+        None, "--azure-vault-totp-secret-key", help="Azure Vault TOTP secret key."
+    ),
+    prompt: str | None = typer.Option(None, help="Additional login instructions."),
+    totp_identifier: str | None = typer.Option(None, "--totp-identifier", help="TOTP identifier for 2FA."),
+    totp_url: str | None = typer.Option(None, "--totp-url", help="URL to fetch TOTP codes."),
+    timeout_seconds: int = typer.Option(180, "--timeout", min=10, max=600, help="Timeout in seconds."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Log into a site using stored credentials from a supported provider."""
+
+    async def _run() -> dict[str, Any]:
+        connection = _resolve_connection(session, cdp)
+        return await tool_login(
+            credential_type=credential_type,
+            session_id=connection.session_id if connection.mode == "cloud" else None,
+            cdp_url=connection.cdp_url if connection.mode == "cdp" else None,
+            url=url,
+            credential_id=credential_id,
+            bitwarden_item_id=bitwarden_item_id,
+            bitwarden_collection_id=bitwarden_collection_id,
+            onepassword_vault_id=onepassword_vault_id,
+            onepassword_item_id=onepassword_item_id,
+            azure_vault_name=azure_vault_name,
+            azure_vault_username_key=azure_vault_username_key,
+            azure_vault_password_key=azure_vault_password_key,
+            azure_vault_totp_secret_key=azure_vault_totp_secret_key,
+            prompt=prompt,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            timeout_seconds=timeout_seconds,
+        )
+
+    try:
+        result = asyncio.run(_run())
+        _emit_tool_result(result, json_output=json_output, action="login")
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        output_error(
+            str(e), hint="Check credential inputs, active connection, and timeout settings.", json_mode=json_output
+        )
