@@ -80,6 +80,20 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     # Stop cleanup scheduler
     await stop_cleanup_scheduler()
 
+    # Close notification registry (e.g. cancel Redis listener tasks)
+    from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
+
+    registry = NotificationRegistryFactory.get_registry()
+    if hasattr(registry, "close"):
+        await registry.close()
+
+    # Close shared Redis client (after registry so listener tasks drain first)
+    from skyvern.forge.sdk.redis.factory import RedisClientFactory
+
+    redis_client = RedisClientFactory.get_client()
+    if redis_client is not None:
+        await redis_client.aclose()
+
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
         try:
