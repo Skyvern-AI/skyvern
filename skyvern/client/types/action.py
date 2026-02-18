@@ -51,7 +51,6 @@ class Action(UniversalBaseModel):
     click_context: typing.Optional[ClickContext] = None
     totp_timing_info: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     has_mini_agent: typing.Optional[bool] = None
-    skip_auto_complete_tab: typing.Optional[bool] = None
     created_at: typing.Optional[dt.datetime] = None
     modified_at: typing.Optional[dt.datetime] = None
     created_by: typing.Optional[str] = None
