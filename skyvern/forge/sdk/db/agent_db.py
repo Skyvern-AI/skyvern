@@ -968,6 +968,45 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def has_running_tasks_globally(self) -> bool:
+        """
+        Check if there are any running tasks across all organizations.
+        Used by cleanup service to determine if cleanup should be skipped.
+        """
+        try:
+            async with self.Session() as session:
+                running_statuses = [TaskStatus.created, TaskStatus.queued, TaskStatus.running]
+                count_query = select(func.count()).select_from(TaskModel).filter(TaskModel.status.in_(running_statuses))
+                count = (await session.execute(count_query)).scalar_one()
+                return count > 0
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in has_running_tasks_globally", exc_info=True)
+            raise
+
+    async def has_running_workflow_runs_globally(self) -> bool:
+        """
+        Check if there are any running workflow runs across all organizations.
+        Used by cleanup service to determine if cleanup should be skipped.
+        """
+        try:
+            async with self.Session() as session:
+                running_statuses = [
+                    WorkflowRunStatus.created,
+                    WorkflowRunStatus.queued,
+                    WorkflowRunStatus.running,
+                    WorkflowRunStatus.paused,
+                ]
+                count_query = (
+                    select(func.count())
+                    .select_from(WorkflowRunModel)
+                    .filter(WorkflowRunModel.status.in_(running_statuses))
+                )
+                count = (await session.execute(count_query)).scalar_one()
+                return count > 0
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in has_running_workflow_runs_globally", exc_info=True)
+            raise
+
     async def get_all_organizations(self) -> list[Organization]:
         try:
             async with self.Session() as session:
