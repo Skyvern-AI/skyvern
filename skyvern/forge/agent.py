@@ -1718,16 +1718,24 @@ class ForgeAgent:
                 message=llm_caller.current_tool_results,
                 message_length=len(llm_caller.message_history),
             )
+        type = "computer_20250124"
+        betas = ["computer-use-2025-01-24"]
+        # according to https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool
+        # "computer-use-2025-11-24" for Claude Opus 4.6, Claude Opus 4.5
+        # "computer-use-2025-01-24" for Claude Sonnet 4.6, Sonnet 4.5, Haiku 4.5, Opus 4.1, Sonnet 4, Opus 4, and Sonnet 3.7 (deprecated)
+
+        if "OPUS" in llm_caller.llm_key and ("4.6" in llm_caller.llm_key or "4.5" in llm_caller.llm_key):
+            type = "computer_20251124"
+            betas = ["computer-use-2025-11-24"]
         tools = [
             {
-                "type": "computer_20250124",
+                "type": type,
                 "name": "computer",
                 "display_height_px": settings.BROWSER_HEIGHT,
                 "display_width_px": settings.BROWSER_WIDTH,
             }
         ]
         thinking = {"type": "enabled", "budget_tokens": 1024}
-        betas = ["computer-use-2025-01-24"]
         window_dimension = cast(Resolution, scraped_page.window_dimension) if scraped_page.window_dimension else None
         if not llm_caller.message_history:
             llm_response = await llm_caller.call(
