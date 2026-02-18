@@ -901,7 +901,9 @@ class AgentDB(BaseAlchemyDB):
                     select(TaskModel)
                     .filter_by(organization_id=organization_id)
                     .filter_by(waiting_for_verification_code=True)
+                    .filter_by(workflow_run_id=None)
                     .filter(TaskModel.status.not_in(finalized_task_statuses))
+                    .filter(TaskModel.created_at > datetime.utcnow() - timedelta(hours=1))
                 )
             ).all()
             for t in task_rows:
