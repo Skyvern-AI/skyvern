@@ -3,6 +3,7 @@ import {
   useNotificationStream,
   type VerificationRequest,
 } from "@/hooks/useNotificationStream";
+import { enable2faNotifications } from "@/util/env";
 
 function notificationLabel(req: VerificationRequest): string {
   if (req.task_id) return `Task "${req.task_id}"`;
@@ -34,6 +35,11 @@ function VerificationCodeHandler({ req }: { req: VerificationRequest }) {
 }
 
 function GlobalNotificationListener() {
+  if (!enable2faNotifications) return null;
+  return <GlobalNotificationListenerInner />;
+}
+
+function GlobalNotificationListenerInner() {
   const { verificationRequests } = useNotificationStream();
 
   if (verificationRequests.length === 0) return null;
