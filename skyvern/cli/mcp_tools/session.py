@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 from typing import Annotated, Any
 
 from pydantic import Field
 
+from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
@@ -24,7 +24,7 @@ def _session_api_key_hash() -> str | None:
     api_key = get_active_api_key()
     if not api_key:
         return None
-    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    return hash_api_key_for_cache(api_key)
 
 
 async def skyvern_session_create(
