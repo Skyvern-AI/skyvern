@@ -2328,10 +2328,12 @@ function isWindowScrollable() {
 
 /**
  * Find the nearest scrollable container relative to the given element and scroll it.
- * Two strategies:
+ * Three strategies in priority order:
  *   1) Walk up from element to find a scrollable ancestor (element is inside container)
  *   2) Walk up the DOM checking siblings at each level (element is beside container)
- * Returns true if a scrollable container was found and scrolled, false otherwise.
+ *   3) Fall back to page-level scrolling (for pages where the body itself scrolls,
+ *      e.g. T&C pages with no scrollable sub-container)
+ * Returns: true (sub-container scrolled), "page" (page-level scroll needed), or false (nothing scrollable).
  */
 function scrollNearestScrollableContainer(element, direction) {
   function isContainerScrollable(node) {
@@ -2367,13 +2369,27 @@ function scrollNearestScrollableContainer(element, direction) {
     }
   }
 
-  if (!target) return false;
-  if (direction === "down") {
-    target.scrollTop = target.scrollHeight;
-  } else {
-    target.scrollTop = 0;
+  // Scroll the sub-container if found
+  if (target) {
+    if (direction === "down") {
+      target.scrollTop = target.scrollHeight;
+    } else {
+      target.scrollTop = 0;
+    }
+    return true;
   }
-  return true;
+
+  // Strategy 3: fall back to page-level scrolling when no sub-container exists.
+  // Many pages (e.g. T&C agreements) render content inline with the page body
+  // as the only scrollable area. Return "page" to signal the Python handler to
+  // use mouse.wheel events for native browser scrolling, which reliably triggers
+  // page JavaScript (IntersectionObserver, scroll listeners) that programmatic
+  // scrollTo/scrollTop methods may not.
+  if (isWindowScrollable()) {
+    return "page";
+  }
+
+  return false;
 }
 
 function scrollToElementBottom(element, page_by_page = false) {
