@@ -927,6 +927,7 @@ class AgentDB(BaseAlchemyDB):
                     .filter_by(organization_id=organization_id)
                     .filter_by(waiting_for_verification_code=True)
                     .filter(WorkflowRunModel.status.not_in(finalized_wr_statuses))
+                    .filter(WorkflowRunModel.created_at > datetime.utcnow() - timedelta(hours=1))
                 )
             ).all()
             for wr in wr_rows:
