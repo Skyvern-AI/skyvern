@@ -22,7 +22,9 @@ from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .console import console
 
-credentials_app = typer.Typer(help="Manage stored credentials for secure login.")
+credentials_app = typer.Typer(
+    help="Manage stored credentials for secure login. Use `credential` commands for MCP-parity list/get/delete."
+)
 
 
 @credentials_app.callback()

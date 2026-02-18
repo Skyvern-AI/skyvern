@@ -1,10 +1,11 @@
 import asyncio
+import atexit
 import json
 import logging
 import os
 import shutil
 import subprocess
-from typing import Any, List, Optional
+from typing import Annotated, List, Literal, Optional
 
 import psutil
 import typer
@@ -12,53 +13,61 @@ import uvicorn
 from dotenv import load_dotenv, set_key
 from rich.panel import Panel
 from rich.prompt import Confirm
+from starlette.middleware import Middleware
 
 from skyvern.cli.console import console
+from skyvern.cli.core.client import close_skyvern
+from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware, close_auth_db
+from skyvern.cli.core.session_manager import close_current_session, set_stateless_http_mode
 from skyvern.cli.mcp_tools import mcp  # Uses standalone fastmcp (v2.x)
 from skyvern.cli.utils import start_services
-from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.forge_log import setup_logger
-from skyvern.library.skyvern import Skyvern
 from skyvern.services.script_service import run_script
 from skyvern.utils import detect_os
 from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
+_mcp_cleanup_done = False
 
 
-@mcp.tool()
-async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
-    """Use Skyvern to execute anything in the browser. Useful for accomplishing tasks that require browser automation.
+async def _cleanup_mcp_resources() -> None:
+    try:
+        await close_current_session()
+    finally:
+        try:
+            await close_skyvern()
+        finally:
+            await close_auth_db()
 
-    This tool uses Skyvern's browser automation to navigate websites and perform actions to achieve
-    the user's intended outcome. It can handle tasks like form filling, clicking buttons, data extraction,
-    and multi-step workflows.
 
-    It can even help you find updated data on the internet if your model information is outdated.
+def _cleanup_mcp_resources_blocking() -> None:
+    global _mcp_cleanup_done
+    if _mcp_cleanup_done:
+        return
 
-    Args:
-        prompt: A natural language description of what needs to be accomplished (e.g. "Book a flight from
-               NYC to LA", "Sign up for the newsletter", "Find the price of item X", "Apply to a job")
-        url: The starting URL of the website where the task should be performed
-    """
-    skyvern_agent = Skyvern(
-        environment=SkyvernEnvironment.CLOUD,
-        base_url=settings.SKYVERN_BASE_URL,
-        api_key=settings.SKYVERN_API_KEY,
-    )
-    res = await skyvern_agent.run_task(prompt=prompt, url=url, user_agent="skyvern-mcp", wait_for_completion=True)
+    try:
+        asyncio.run(_cleanup_mcp_resources())
+        _mcp_cleanup_done = True
+    except Exception:
+        logging.getLogger(__name__).warning("MCP cleanup failed", exc_info=True)
 
-    output = res.model_dump()["output"]
-    if res.app_url:
-        task_url = res.app_url
-    else:
-        if res.run_id and res.run_id.startswith("wr_"):
-            task_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{res.run_id}/overview"
-        else:
-            task_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{res.run_id}/actions"
-    return {"output": output, "task_url": task_url, "run_id": res.run_id}
+
+def _cleanup_mcp_resources_sync() -> None:
+    """Atexit callback for MCP cleanup. Skips if an event loop is still running
+    because asyncio.run() cannot be called inside a running loop. This means
+    cleanup is best-effort for signal-based exits (e.g. SIGTERM) that fire atexit
+    while the MCP server's loop is still alive -- the finally block in run_mcp()
+    handles normal shutdown instead."""
+    logger = logging.getLogger(__name__)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        _cleanup_mcp_resources_blocking()
+        return
+
+    logger.debug("Skipping MCP cleanup because event loop is still running")
 
 
 def get_pids_on_port(port: int) -> List[int]:
@@ -256,11 +265,59 @@ def run_dev() -> None:
 
 
 @run_app.command(name="mcp")
-def run_mcp() -> None:
-    """Run the MCP server."""
-    # This breaks the MCP processing because it expects json output only
-    # console.print(Panel("[bold green]Starting MCP Server...[/bold green]", border_style="green"))
-    mcp.run(transport="stdio")
+def run_mcp(
+    transport: Annotated[
+        Literal["stdio", "sse", "streamable-http"],
+        typer.Option(
+            "--transport",
+            help="MCP transport: stdio (default), sse, or streamable-http.",
+        ),
+    ] = "stdio",
+    host: Annotated[str, typer.Option("--host", help="Host for HTTP transports.")] = "0.0.0.0",
+    port: Annotated[int, typer.Option("--port", help="Port for HTTP transports.")] = 8000,
+    path: Annotated[str, typer.Option("--path", help="HTTP endpoint path for MCP transport.")] = "/mcp",
+    stateless_http: Annotated[
+        bool,
+        typer.Option(
+            "--stateless-http/--no-stateless-http",
+            help="Use stateless HTTP semantics for HTTP transports (ignored for stdio).",
+        ),
+    ] = True,
+) -> None:
+    """Run the MCP server with configurable transport for local or remote hosting."""
+    path = _normalize_mcp_path(path)
+    stateless_http_enabled = transport != "stdio" and stateless_http
+    # atexit covers signal-based exits (SIGTERM); finally covers normal
+    # mcp.run() completion or unhandled exceptions. Both are needed because
+    # atexit doesn't fire on normal return and finally doesn't fire on signals.
+    atexit.register(_cleanup_mcp_resources_sync)
+    set_stateless_http_mode(stateless_http_enabled)
+    try:
+        if transport == "stdio":
+            mcp.run(transport="stdio")
+            return
+
+        middleware = [Middleware(MCPAPIKeyMiddleware)]
+        mcp.run(
+            transport=transport,
+            host=host,
+            port=port,
+            path=path,
+            middleware=middleware,
+            stateless_http=stateless_http_enabled,
+        )
+    finally:
+        set_stateless_http_mode(False)
+        _cleanup_mcp_resources_blocking()
+
+
+def _normalize_mcp_path(path: str) -> str:
+    path = path.strip()
+    if not path:
+        return "/mcp"
+    if not path.startswith("/"):
+        return f"/{path}"
+    return path
 
 
 @run_app.command(

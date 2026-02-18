@@ -2544,7 +2544,7 @@ class ForgeAgent:
                 step,
                 browser_state,
                 scraped_page,
-                verification_code_check=bool(task.totp_verification_url or task.totp_identifier),
+                verification_code_check=True,
                 expire_verification_code=True,
             )
 
@@ -3169,7 +3169,7 @@ class ForgeAgent:
 
         current_context = skyvern_context.ensure_context()
         verification_code = current_context.totp_codes.get(task.task_id)
-        if (task.totp_verification_url or task.totp_identifier) and verification_code:
+        if verification_code:
             if (
                 isinstance(final_navigation_payload, dict)
                 and SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload
@@ -4444,13 +4444,11 @@ class ForgeAgent:
         if not task.organization_id:
             return json_response, []
 
-        if not task.totp_verification_url and not task.totp_identifier:
-            return json_response, []
-
         should_verify_by_magic_link = json_response.get("should_verify_by_magic_link")
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
 
+        # If no OTP verification needed, return early to avoid unnecessary processing
         if (
             not should_verify_by_magic_link
             and not place_to_enter_verification_code
@@ -4466,8 +4464,10 @@ class ForgeAgent:
             return json_response, actions
 
         if should_verify_by_magic_link:
-            actions = await self.handle_potential_magic_link(task, step, scraped_page, browser_state, json_response)
-            return json_response, actions
+            # Magic links still require TOTP config (need a source to poll the link from)
+            if task.totp_verification_url or task.totp_identifier:
+                actions = await self.handle_potential_magic_link(task, step, scraped_page, browser_state, json_response)
+                return json_response, actions
 
         return json_response, []
 
@@ -4524,12 +4524,7 @@ class ForgeAgent:
     ) -> dict[str, Any]:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
-        if (
-            place_to_enter_verification_code
-            and should_enter_verification_code
-            and (task.totp_verification_url or task.totp_identifier)
-            and task.organization_id
-        ):
+        if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
             LOG.info("Need verification code")
             workflow_id = workflow_permanent_id = None
             if task.workflow_run_id:
