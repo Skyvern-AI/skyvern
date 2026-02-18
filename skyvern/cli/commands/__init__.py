@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from skyvern.forge.sdk.forge_log import setup_logger as _setup_logger
 from skyvern.utils.env_paths import resolve_backend_env_path
 
+from ..block import block_app
+from ..credential import credential_app
 from ..credentials import credentials_app
 from ..docs import docs_app
 from ..init_command import init_browser, init_env
@@ -51,9 +53,19 @@ cli_app.add_typer(
     name="run",
     help="Run Skyvern services like the API server, UI, and MCP.",
 )
+cli_app.add_typer(block_app, name="block", help="Inspect and validate workflow block schemas.")
+cli_app.add_typer(
+    credential_app,
+    name="credential",
+    help="MCP-parity credential commands (list/get/delete).",
+)
 cli_app.add_typer(workflow_app, name="workflow", help="Workflow management commands.")
 cli_app.add_typer(tasks_app, name="tasks", help="Task management commands.")
-cli_app.add_typer(credentials_app, name="credentials", help="Manage stored credentials for secure login.")
+cli_app.add_typer(
+    credentials_app,
+    name="credentials",
+    help="Secure credential management (use this for interactive `add`).",
+)
 cli_app.add_typer(docs_app, name="docs", help="Open Skyvern documentation.")
 cli_app.add_typer(status_app, name="status", help="Check if Skyvern services are running.")
 cli_app.add_typer(stop_app, name="stop", help="Stop Skyvern services.")
