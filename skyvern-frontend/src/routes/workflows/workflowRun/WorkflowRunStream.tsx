@@ -79,6 +79,9 @@ function WorkflowRunStream(props?: Props) {
               queryKey: ["workflowRun", workflowRunId],
             });
             queryClient.invalidateQueries({
+              queryKey: ["taskWorkflowRun", workflowRunId],
+            });
+            queryClient.invalidateQueries({
               queryKey: ["workflowTasks", workflowRunId],
             });
             queryClient.invalidateQueries({

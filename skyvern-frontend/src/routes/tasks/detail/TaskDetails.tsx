@@ -70,7 +70,9 @@ function TaskDetails() {
 
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useQuery<WorkflowRunStatusApiResponse>({
-      queryKey: ["workflowRun", task?.workflow_run_id],
+      // Keep this cache separate from workflow-run pages, which store
+      // a richer payload under ["workflowRun", workflowRunId].
+      queryKey: ["taskWorkflowRun", task?.workflow_run_id],
       queryFn: async () => {
         const client = await getClient(credentialGetter);
         return client
@@ -109,6 +111,9 @@ function TaskDetails() {
       if (task?.workflow_run_id) {
         queryClient.invalidateQueries({
           queryKey: ["workflowRun", task.workflow_run_id],
+        });
+        queryClient.invalidateQueries({
+          queryKey: ["taskWorkflowRun", task.workflow_run_id],
         });
         queryClient.invalidateQueries({
           queryKey: [
