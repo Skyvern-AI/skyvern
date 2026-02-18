@@ -11,7 +11,6 @@ import pytest
 
 from skyvern.forge.sdk.notification.redis import RedisNotificationRegistry
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
