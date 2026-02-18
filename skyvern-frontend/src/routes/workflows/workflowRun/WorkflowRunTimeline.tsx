@@ -8,11 +8,11 @@ import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuer
 import {
   isBlockItem,
   isObserverThought,
-  isTaskVariantBlockItem,
   isThoughtItem,
   ObserverThought,
   WorkflowRunBlock,
 } from "../types/workflowRunTypes";
+import { countActions } from "../utils";
 import { ThoughtCard } from "./ThoughtCard";
 import {
   ActionItem,
@@ -56,12 +56,7 @@ function WorkflowRunTimeline({
   const finallyBlockLabel =
     workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
 
-  const numberOfActions = workflowRunTimeline.reduce((total, current) => {
-    if (isTaskVariantBlockItem(current)) {
-      return total + current.block!.actions!.length;
-    }
-    return total + 0;
-  }, 0);
+  const numberOfActions = countActions(workflowRunTimeline);
 
   return (
     <div className="min-w-0 space-y-4 rounded bg-slate-elevation1 p-4">

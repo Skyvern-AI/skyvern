@@ -49,38 +49,46 @@ const artifactApiClient = axios.create({
   baseURL: artifactApiBaseUrl,
 });
 
+const clients = [client, v2Client, clientSansApiV1] as const;
+
+function setHeaderForAllClients(header: string, value: string) {
+  clients.forEach((instance) => {
+    instance.defaults.headers.common[header] = value;
+  });
+}
+
+function removeHeaderForAllClients(header: string) {
+  clients.forEach((instance) => {
+    // Axios stores headers at both `common` (shared across methods) and the
+    // top-level defaults object (can be set by initial config spread). Delete
+    // from both locations to ensure the header is fully removed.
+    delete instance.defaults.headers.common[header];
+    delete (instance.defaults.headers as Record<string, unknown>)[header];
+  });
+}
+
 export function setAuthorizationHeader(token: string) {
-  client.defaults.headers.common["Authorization"] = `Bearer ${token}`;
-  v2Client.defaults.headers.common["Authorization"] = `Bearer ${token}`;
-  clientSansApiV1.defaults.headers.common["Authorization"] = `Bearer ${token}`;
+  setHeaderForAllClients("Authorization", `Bearer ${token}`);
 }
 
 export function removeAuthorizationHeader() {
-  if (client.defaults.headers.common["Authorization"]) {
-    delete client.defaults.headers.common["Authorization"];
-    delete v2Client.defaults.headers.common["Authorization"];
-    delete clientSansApiV1.defaults.headers.common["Authorization"];
-  }
+  removeHeaderForAllClients("Authorization");
 }
 
 export function setApiKeyHeader(apiKey: string) {
   persistRuntimeApiKey(apiKey);
-  client.defaults.headers.common["X-API-Key"] = apiKey;
-  v2Client.defaults.headers.common["X-API-Key"] = apiKey;
-  clientSansApiV1.defaults.headers.common["X-API-Key"] = apiKey;
+  setHeaderForAllClients("X-API-Key", apiKey);
 }
 
-export function removeApiKeyHeader() {
-  clearRuntimeApiKey();
-  if (client.defaults.headers.common["X-API-Key"]) {
-    delete client.defaults.headers.common["X-API-Key"];
+export function removeApiKeyHeader({
+  clearStoredKey = true,
+}: {
+  clearStoredKey?: boolean;
+} = {}) {
+  if (clearStoredKey) {
+    clearRuntimeApiKey();
   }
-  if (v2Client.defaults.headers.common["X-API-Key"]) {
-    delete v2Client.defaults.headers.common["X-API-Key"];
-  }
-  if (clientSansApiV1.defaults.headers.common["X-API-Key"]) {
-    delete clientSansApiV1.defaults.headers.common["X-API-Key"];
-  }
+  removeHeaderForAllClients("X-API-Key");
 }
 
 async function getClient(
@@ -101,17 +109,24 @@ async function getClient(
     }
   };
 
-  if (credentialGetter) {
-    removeApiKeyHeader();
-
-    const credential = await credentialGetter();
-
-    if (!credential) {
-      console.warn("No credential found");
-      return get();
-    }
-
+  // Both auth headers are sent intentionally: Authorization (Bearer token from
+  // the credential getter, e.g. Clerk) is used for user-session auth, while
+  // X-API-Key is used for org-level API key auth. The backend accepts either
+  // and gives precedence to the API key when both are present. Sending both
+  // ensures requests succeed regardless of which auth method the org uses.
+  const credential = credentialGetter ? await credentialGetter() : null;
+  if (credential) {
     setAuthorizationHeader(credential);
+  } else {
+    removeAuthorizationHeader();
+  }
+
+  const apiKey = getRuntimeApiKey();
+  if (apiKey) {
+    setHeaderForAllClients("X-API-Key", apiKey);
+  } else {
+    // Avoid mutating persisted keys here - just control request headers.
+    removeApiKeyHeader({ clearStoredKey: false });
   }
 
   return get();
