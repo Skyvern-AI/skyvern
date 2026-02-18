@@ -95,10 +95,40 @@ async def skyvern_session_close(
     with Timer() as timer:
         try:
             if session_id:
+                matching_cloud_session = (
+                    current.context is not None
+                    and current.context.mode == "cloud_session"
+                    and current.context.session_id == session_id
+                )
+
                 skyvern = get_skyvern()
-                result = await do_session_close(skyvern, session_id)
-                if current.context and current.context.session_id == session_id:
+                result = None
+                close_error: Exception | None = None
+                try:
+                    result = await do_session_close(skyvern, session_id)
+                except Exception as e:
+                    close_error = e
+
+                if matching_cloud_session:
+                    if current.browser is None:
+                        set_current_session(SessionState())
+                        raise RuntimeError("Expected active browser for matching cloud session")
+                    try:
+                        await current.browser.close()
+                    except Exception as browser_err:
+                        if close_error is not None:
+                            raise browser_err from close_error
+                        raise
+                    finally:
+                        set_current_session(SessionState())
+                elif current.context and current.context.session_id == session_id:
                     set_current_session(SessionState())
+
+                if close_error is not None:
+                    raise close_error
+                if result is None:
+                    raise RuntimeError("Expected session close result after successful close operation")
+
                 timer.mark("sdk")
                 return make_result(
                     "skyvern_session_close",
