@@ -4440,11 +4440,15 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run_block.task_id = task_id
                 if failure_reason:
                     workflow_run_block.failure_reason = failure_reason
-                if loop_values:
+                # Use `is not None` instead of truthiness checks so that falsy
+                # values like current_index=0, empty loop_values=[], or
+                # current_value="" are correctly persisted. Without this,
+                # the first loop iteration (index 0) loses its metadata.
+                if loop_values is not None:
                     workflow_run_block.loop_values = loop_values
-                if current_value:
+                if current_value is not None:
                     workflow_run_block.current_value = current_value
-                if current_index:
+                if current_index is not None:
                     workflow_run_block.current_index = current_index
                 if recipients:
                     workflow_run_block.recipients = recipients
