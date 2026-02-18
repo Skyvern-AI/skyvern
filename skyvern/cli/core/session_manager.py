@@ -5,8 +5,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
+import structlog
+
 from .client import get_skyvern
 from .result import BrowserContext, ErrorCode, make_error
+
+LOG = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
@@ -23,18 +27,44 @@ class SessionState:
 
 
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
+_global_session: SessionState | None = None
 
 
 def get_current_session() -> SessionState:
+    global _global_session
+
     state = _current_session.get()
     if state is None:
-        state = SessionState()
+        if _global_session is None:
+            _global_session = SessionState()
+        state = _global_session
         _current_session.set(state)
     return state
 
 
 def set_current_session(state: SessionState) -> None:
+    global _global_session
+    _global_session = state
     _current_session.set(state)
+
+
+def _matches_current(
+    current: SessionState,
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+    local: bool = False,
+) -> bool:
+    if current.browser is None or current.context is None:
+        return False
+
+    if session_id:
+        return current.context.mode == "cloud_session" and current.context.session_id == session_id
+    if cdp_url:
+        return current.context.mode == "cdp" and current.context.cdp_url == cdp_url
+    if local:
+        return current.context.mode == "local"
+    return False
 
 
 async def resolve_browser(
@@ -53,6 +83,11 @@ async def resolve_browser(
     """
     skyvern = get_skyvern()
     current = get_current_session()
+
+    if _matches_current(current, session_id=session_id, cdp_url=cdp_url, local=local):
+        # _matches_current() guarantees both are non-None
+        assert current.browser is not None and current.context is not None
+        return current.browser, current.context
 
     browser: SkyvernBrowser | None = None
     try:
@@ -92,6 +127,31 @@ async def resolve_browser(
         return current.browser, current.context
 
     raise BrowserNotAvailableError()
+
+
+async def close_current_session() -> None:
+    """Close the active browser session (if any) and clear local session state."""
+    from .session_ops import do_session_close
+
+    current = get_current_session()
+    try:
+        if current.context and current.context.mode == "cloud_session" and current.context.session_id:
+            try:
+                skyvern = get_skyvern()
+                await do_session_close(skyvern, current.context.session_id)
+                # Prevent SkyvernBrowser.close() from making a redundant API call
+                if current.browser is not None:
+                    current.browser._browser_session_id = None
+            except Exception:
+                LOG.warning(
+                    "Best-effort cloud session close failed",
+                    session_id=current.context.session_id,
+                    exc_info=True,
+                )
+        if current.browser is not None:
+            await current.browser.close()
+    finally:
+        set_current_session(SessionState())
 
 
 async def get_page(
