@@ -3,6 +3,7 @@ import { LockClosedIcon, ExternalLinkIcon } from "@radix-ui/react-icons";
 import { Link } from "react-router-dom";
 import { toast } from "@/components/ui/use-toast";
 import { createElement } from "react";
+import { enable2faNotifications } from "@/util/env";
 
 const VERIFICATION_CODE_TIMEOUT_MINS = 15;
 
@@ -70,6 +71,7 @@ function useVerificationCodeAlert({
 
   // Browser notification + sound + in-app toast (fire once per waiting transition)
   useEffect(() => {
+    if (!enable2faNotifications) return;
     if (!isWaitingForCode || notifiedTags.has(notificationTag)) return;
     notifiedTags.add(notificationTag);
 
