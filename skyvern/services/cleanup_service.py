@@ -31,6 +31,9 @@ STALE_PROCESS_NAMES = frozenset(
         "chromium-browser",
         "google-chrome",
         "google-chrome-stable",
+        "msedge",
+        "microsoft-edge",
+        "microsoft-edge-stable",
     }
 )
 
