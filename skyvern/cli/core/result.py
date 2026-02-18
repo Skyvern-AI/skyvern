@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from skyvern import analytics
+
 
 class ErrorCode:
     NO_ACTIVE_BROWSER = "NO_ACTIVE_BROWSER"
@@ -63,6 +65,17 @@ def make_result(
     warnings: list[str] | None = None,
     error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    analytics.capture(
+        "mcp_tool_call",
+        data={
+            "tool": action,
+            "ok": ok,
+            "timing_ms": (timing_ms or {}).get("total"),
+            "error_code": error.get("code") if error else None,
+            "browser_mode": browser_context.mode if browser_context else None,
+            "session_id": browser_context.session_id if browser_context else None,
+        },
+    )
     return {
         "ok": ok,
         "action": action,

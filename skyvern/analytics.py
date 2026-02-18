@@ -44,7 +44,7 @@ def capture(
 
     distinct_id = settings.ANALYTICS_ID
 
-    payload: dict[str, Any] = data or {}
+    payload: dict[str, Any] = {**analytics_metadata(), **(data or {})}
     try:
         posthog.capture(distinct_id=distinct_id, event=event, properties=payload)
     except Exception as e:
