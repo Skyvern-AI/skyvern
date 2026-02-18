@@ -211,9 +211,6 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         browser_session_id=task_obj.browser_session_id,
         browser_address=task_obj.browser_address,
         download_timeout=task_obj.download_timeout,
-        waiting_for_verification_code=task_obj.waiting_for_verification_code or False,
-        verification_code_identifier=task_obj.verification_code_identifier,
-        verification_code_polling_started_at=task_obj.verification_code_polling_started_at,
     )
     return task
 
@@ -427,9 +424,6 @@ def convert_to_workflow_run(
         run_with=workflow_run_model.run_with,
         code_gen=workflow_run_model.code_gen,
         ai_fallback=workflow_run_model.ai_fallback,
-        waiting_for_verification_code=workflow_run_model.waiting_for_verification_code or False,
-        verification_code_identifier=workflow_run_model.verification_code_identifier,
-        verification_code_polling_started_at=workflow_run_model.verification_code_polling_started_at,
     )
 
 

@@ -3019,10 +3019,6 @@ class WorkflowService:
             browser_address=workflow_run.browser_address,
             script_run=workflow_run.script_run,
             errors=errors,
-            # 2FA verification code waiting state fields
-            waiting_for_verification_code=workflow_run.waiting_for_verification_code,
-            verification_code_identifier=workflow_run.verification_code_identifier,
-            verification_code_polling_started_at=workflow_run.verification_code_polling_started_at,
         )
 
     async def clean_up_workflow(
