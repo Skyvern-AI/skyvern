@@ -92,7 +92,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
 
     redis_client = RedisClientFactory.get_client()
     if redis_client is not None:
-        await redis_client.aclose()
+        await redis_client.close()
 
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
