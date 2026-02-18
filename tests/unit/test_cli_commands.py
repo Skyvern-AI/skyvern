@@ -296,3 +296,175 @@ class TestBrowserCommands:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert "Invalid state" in parsed["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Workflow command behavior
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowCommands:
+    def test_workflow_get_outputs_mcp_envelope_in_json_mode(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        expected = {
+            "ok": True,
+            "action": "skyvern_workflow_get",
+            "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+            "data": {"workflow_permanent_id": "wpid_123"},
+            "artifacts": [],
+            "timing_ms": {},
+            "warnings": [],
+            "error": None,
+        }
+        tool = AsyncMock(return_value=expected)
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_get", tool)
+
+        workflow_cmd.workflow_get(workflow_id="wpid_123", version=2, json_output=True)
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed == expected
+        assert tool.await_args.kwargs == {"workflow_id": "wpid_123", "version": 2}
+
+    def test_workflow_create_reads_definition_from_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        definition_file = tmp_path / "workflow.json"
+        definition_text = '{"title": "Example", "workflow_definition": {"blocks": []}}'
+        definition_file.write_text(definition_text)
+
+        tool = AsyncMock(
+            return_value={
+                "ok": True,
+                "action": "skyvern_workflow_create",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": {"workflow_permanent_id": "wpid_new"},
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_create", tool)
+
+        workflow_cmd.workflow_create(
+            definition=f"@{definition_file}",
+            definition_format="json",
+            folder_id="fld_123",
+            json_output=True,
+        )
+
+        assert tool.await_args.kwargs == {
+            "definition": definition_text,
+            "format": "json",
+            "folder_id": "fld_123",
+        }
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is True
+        assert parsed["data"]["workflow_permanent_id"] == "wpid_new"
+
+    def test_workflow_run_reads_params_file_and_maps_options(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        params_file = tmp_path / "params.json"
+        params_file.write_text('{"company": "Acme"}')
+
+        tool = AsyncMock(
+            return_value={
+                "ok": True,
+                "action": "skyvern_workflow_run",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": {"run_id": "wr_123", "status": "queued"},
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_run", tool)
+
+        workflow_cmd.workflow_run(
+            workflow_id="wpid_123",
+            params=f"@{params_file}",
+            session="pbs_456",
+            webhook="https://example.com/webhook",
+            proxy="RESIDENTIAL",
+            wait=True,
+            timeout=450,
+            json_output=True,
+        )
+
+        assert tool.await_args.kwargs == {
+            "workflow_id": "wpid_123",
+            "parameters": '{"company": "Acme"}',
+            "browser_session_id": "pbs_456",
+            "webhook_url": "https://example.com/webhook",
+            "proxy_location": "RESIDENTIAL",
+            "wait": True,
+            "timeout_seconds": 450,
+        }
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is True
+        assert parsed["data"]["run_id"] == "wr_123"
+
+    def test_workflow_status_json_error_exits_nonzero(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        tool = AsyncMock(
+            return_value={
+                "ok": False,
+                "action": "skyvern_workflow_status",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": None,
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": {
+                    "code": "RUN_NOT_FOUND",
+                    "message": "Run 'wr_missing' not found",
+                    "hint": "Verify the run ID",
+                    "details": {},
+                },
+            }
+        )
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_status", tool)
+
+        with pytest.raises(SystemExit, match="1"):
+            workflow_cmd.workflow_status(run_id="wr_missing", json_output=True)
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is False
+        assert parsed["error"]["code"] == "RUN_NOT_FOUND"
+
+    def test_workflow_update_missing_definition_file_raises_bad_parameter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        tool = AsyncMock()
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_update", tool)
+        missing_file = tmp_path / "missing-definition.json"
+
+        with pytest.raises(typer.BadParameter, match="Unable to read definition file"):
+            workflow_cmd.workflow_update(
+                workflow_id="wpid_123",
+                definition=f"@{missing_file}",
+                definition_format="json",
+                json_output=False,
+            )
+
+        tool.assert_not_called()

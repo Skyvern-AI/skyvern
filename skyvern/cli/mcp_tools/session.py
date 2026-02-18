@@ -4,7 +4,11 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
+from skyvern.cli.core.client import get_active_api_key
+from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
+from skyvern.schemas.runs import ProxyLocation
 
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
 from ._session import (
@@ -14,6 +18,13 @@ from ._session import (
     resolve_browser,
     set_current_session,
 )
+
+
+def _session_api_key_hash() -> str | None:
+    api_key = get_active_api_key()
+    if not api_key:
+        return None
+    return hash_api_key_for_cache(api_key)
 
 
 async def skyvern_session_create(
@@ -29,7 +40,33 @@ async def skyvern_session_create(
     """
     with Timer() as timer:
         try:
+            if is_stateless_http_mode() and local:
+                return make_result(
+                    "skyvern_session_create",
+                    ok=False,
+                    error=make_error(
+                        ErrorCode.INVALID_INPUT,
+                        "Local browser sessions are not supported in stateless HTTP mode",
+                        "Use cloud sessions for remote MCP transport",
+                    ),
+                )
+
             skyvern = get_skyvern()
+            if is_stateless_http_mode():
+                proxy = ProxyLocation(proxy_location) if proxy_location else None
+                session = await skyvern.create_browser_session(timeout=timeout or 60, proxy_location=proxy)
+                timer.mark("sdk")
+                ctx = BrowserContext(mode="cloud_session", session_id=session.browser_session_id)
+                return make_result(
+                    "skyvern_session_create",
+                    browser_context=ctx,
+                    data={
+                        "session_id": session.browser_session_id,
+                        "timeout_minutes": timeout or 60,
+                    },
+                    timing_ms=timer.timing_ms,
+                )
+
             browser, result = await do_session_create(
                 skyvern,
                 timeout=timeout or 60,
@@ -43,7 +80,7 @@ async def skyvern_session_create(
                 ctx = BrowserContext(mode="local")
             else:
                 ctx = BrowserContext(mode="cloud_session", session_id=result.session_id)
-            set_current_session(SessionState(browser=browser, context=ctx))
+            set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=_session_api_key_hash()))
 
         except ValueError as e:
             return make_result(
