@@ -8,7 +8,9 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 
 class SecretCredentialResponse(UniversalBaseModel):
     """
-    Response model for secret credentials.
+    Response model for secret credentials — non-sensitive fields only.
+
+    SECURITY: Must NEVER include the secret_value.
     """
 
     secret_label: typing.Optional[str] = pydantic.Field(default=None)
