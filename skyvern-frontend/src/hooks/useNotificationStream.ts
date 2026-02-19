@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { getRuntimeApiKey, wssBaseUrl } from "@/util/env";
+import { getRuntimeApiKey, newWssBaseUrl } from "@/util/env";
 
-type VerificationRequest = {
+export type VerificationRequest = {
   type: "verification_code";
   task_id?: string;
   workflow_run_id?: string;
@@ -10,116 +10,144 @@ type VerificationRequest = {
   polling_started_at?: string | null;
 };
 
-type NotificationEvent = VerificationRequest;
+// Aliased for future-proofing if more event types are added
+export type NotificationEvent = VerificationRequest;
 
-type NotificationMessage = {
+type NotificationMessage = Omit<NotificationEvent, "type"> & {
   type: string;
-  task_id?: string;
-  workflow_run_id?: string;
-  identifier?: string | null;
-  polling_started_at?: string | null;
 };
 
-const requestKey = (msg: { task_id?: string; workflow_run_id?: string }) =>
+const getRequestKey = (msg: Partial<NotificationMessage>) =>
   msg.task_id ?? msg.workflow_run_id ?? "";
 
-function useNotificationStream() {
-  const [eventMap, setEventMap] = useState(
-    new Map<string, NotificationEvent>(),
-  );
+export function useNotificationStream() {
+  // Use a Record (object) instead of a Map for easier immutable state updates
+  const [events, setEvents] = useState<Record<string, NotificationEvent>>({});
+
   const credentialGetter = useCredentialGetter();
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectDelayRef = useRef<number>(3000);
+  const authFailedRef = useRef<boolean>(false);
 
   useEffect(() => {
-    let cancelled = false;
+    let isCancelled = false;
 
     const connect = async () => {
-      if (cancelled) return;
+      // Prevent connecting if tab is hidden, auth failed, or unmounted
+      if (isCancelled || authFailedRef.current || document.hidden) return;
 
-      const credential = credentialGetter
-        ? `?token=Bearer ${await credentialGetter()}`
-        : getRuntimeApiKey()
-          ? `?apikey=${getRuntimeApiKey()}`
-          : "";
+      // Flatten authorization query building
+      let authQuery = "";
+      if (credentialGetter) {
+        authQuery = `?token=Bearer ${await credentialGetter()}`;
+      } else if (getRuntimeApiKey()) {
+        authQuery = `?apikey=${getRuntimeApiKey()}`;
+      }
 
-      if (!credential || cancelled) return;
+      if (!authQuery || isCancelled) return;
 
+      // Clean up existing socket before opening a new one
       socketRef.current?.close();
-      socketRef.current = null;
 
       const socket = new WebSocket(
-        `${wssBaseUrl}/stream/notifications${credential}`,
+        `${newWssBaseUrl}/stream/notifications${authQuery}`,
       );
       socketRef.current = socket;
+      let connectionOpened = false;
 
-      socket.addEventListener("message", ({ data }) => {
+      // Use direct event handlers (onopen) instead of addEventListener for readability
+      socket.onopen = () => {
+        connectionOpened = true;
+        reconnectDelayRef.current = 3000; // Reset backoff on success
+      };
+
+      socket.onmessage = ({ data }) => {
         try {
           const msg: NotificationMessage = JSON.parse(data);
-          if (msg.type === "heartbeat" || msg.type === "timeout") return;
-          const key = requestKey(msg);
+          if (["heartbeat", "timeout"].includes(msg.type)) return;
+
+          const key = getRequestKey(msg);
           if (!key) return;
 
-          setEventMap((prev) => {
-            const next = new Map(prev);
+          setEvents((prev) => {
+            const next = { ...prev }; // Easier to mutate a shallow copy than a Map
+
             if (msg.type === "verification_code_required") {
-              next.set(key, {
+              next[key] = {
                 type: "verification_code",
                 task_id: msg.task_id,
                 workflow_run_id: msg.workflow_run_id,
                 identifier: msg.identifier,
                 polling_started_at: msg.polling_started_at,
-              });
+              };
             } else if (msg.type === "verification_code_resolved") {
-              next.delete(key);
+              delete next[key];
             }
             return next;
           });
         } catch {
-          // Ignore malformed messages
+          // Ignore malformed JSON
         }
-      });
+      };
 
-      socket.addEventListener("close", () => {
-        if (socketRef.current === socket && !cancelled && !document.hidden) {
-          reconnectTimerRef.current = setTimeout(connect, 3000);
+      socket.onclose = (event) => {
+        if (socketRef.current !== socket || isCancelled) return;
+
+        const isAuthFailure =
+          event.code === 1002 || (!connectionOpened && event.code === 1006);
+
+        if (isAuthFailure) {
+          console.warn("WebSocket auth failed. Stopping reconnects.", {
+            code: event.code,
+          });
+          authFailedRef.current = true;
+          return;
         }
-      });
 
-      socket.addEventListener("error", () => {
+        // Exponential backoff for normal disconnections
+        reconnectTimerRef.current = setTimeout(
+          connect,
+          reconnectDelayRef.current,
+        );
+        reconnectDelayRef.current = Math.min(
+          reconnectDelayRef.current * 2,
+          30000,
+        );
+      };
+
+      socket.onerror = () => {
         if (socketRef.current === socket) socket.close();
-      });
+      };
     };
 
     const handleVisibilityChange = () => {
       if (document.hidden) {
-        reconnectTimerRef.current && clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
+        if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
         socketRef.current?.close();
         socketRef.current = null;
-      } else if (!socketRef.current && !cancelled) {
+      } else {
+        reconnectDelayRef.current = 3000;
         connect();
       }
     };
-    document.addEventListener("visibilitychange", handleVisibilityChange);
 
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     connect();
 
     return () => {
-      cancelled = true;
+      isCancelled = true;
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-      reconnectTimerRef.current && clearTimeout(reconnectTimerRef.current);
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       socketRef.current?.close();
     };
   }, [credentialGetter]);
 
-  const events = Array.from(eventMap.values());
-  const verificationRequests = events.filter(
+  // Derive final arrays from the object state
+  const eventList = Object.values(events);
+  const verificationRequests = eventList.filter(
     (e): e is VerificationRequest => e.type === "verification_code",
   );
 
-  return { events, verificationRequests };
+  return { events: eventList, verificationRequests };
 }
-
-export { useNotificationStream };
-export type { VerificationRequest, NotificationEvent };

@@ -97,7 +97,7 @@ function clearRuntimeApiKey(): void {
 const useNewRunsUrl = true as const;
 
 const enable2faNotifications =
-  import.meta.env.VITE_ENABLE_2FA_NOTIFICATIONS?.toLowerCase() !== "false";
+  import.meta.env.VITE_ENABLE_2FA_NOTIFICATIONS?.toLowerCase() === "true";
 
 export {
   apiBaseUrl,
