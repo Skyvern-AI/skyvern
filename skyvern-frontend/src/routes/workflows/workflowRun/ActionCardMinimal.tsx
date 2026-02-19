@@ -1,5 +1,5 @@
 import { LightningBoltIcon } from "@radix-ui/react-icons";
-import { ActionsApiResponse, Status } from "@/api/types";
+import { ActionsApiResponse, ActionTypes, Status } from "@/api/types";
 import {
   Tooltip,
   TooltipContent,
@@ -14,8 +14,12 @@ type Props = {
 };
 
 function ActionCardMinimal({ action }: Props) {
+  // Wait actions always succeed — they intentionally return ActionFailure
+  // from the backend but completing a wait is expected, not a failure.
   const success =
-    action.status === Status.Completed || action.status === Status.Skipped;
+    action.action_type === ActionTypes.wait ||
+    action.status === Status.Completed ||
+    action.status === Status.Skipped;
 
   return (
     <ItemStatusIndicator failure={!success} success={success} offset="-0.7rem">
