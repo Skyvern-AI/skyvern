@@ -4529,7 +4529,7 @@ class ForgeAgent:
             # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
             otp_value = try_generate_totp_from_credential(task.workflow_run_id)
             # Fall back to webhook/totp_identifier
-            if not otp_value and (task.totp_verification_url or task.totp_identifier):
+            if not otp_value:
                 workflow_id = workflow_permanent_id = None
                 if task.workflow_run_id:
                     workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
