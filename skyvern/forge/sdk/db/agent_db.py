@@ -2893,6 +2893,7 @@ class AgentDB(BaseAlchemyDB):
         waiting_for_verification_code: bool | None = None,
         verification_code_identifier: str | None = None,
         verification_code_polling_started_at: datetime | None = None,
+        browser_profile_id: str | None | object = _UNSET,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -2936,6 +2937,8 @@ class AgentDB(BaseAlchemyDB):
                     # Clear related fields when waiting is set to False
                     workflow_run.verification_code_identifier = None
                     workflow_run.verification_code_polling_started_at = None
+                if browser_profile_id is not _UNSET:
+                    workflow_run.browser_profile_id = browser_profile_id
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)
@@ -5448,7 +5451,12 @@ class AgentDB(BaseAlchemyDB):
             return [Credential.model_validate(credential) for credential in credentials]
 
     async def update_credential(
-        self, credential_id: str, organization_id: str, name: str | None = None, website_url: str | None = None
+        self,
+        credential_id: str,
+        organization_id: str,
+        name: str | None = None,
+        browser_profile_id: str | None | object = _UNSET,
+        tested_url: str | None | object = _UNSET,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -5456,14 +5464,17 @@ class AgentDB(BaseAlchemyDB):
                     select(CredentialModel)
                     .filter_by(credential_id=credential_id)
                     .filter_by(organization_id=organization_id)
+                    .filter(CredentialModel.deleted_at.is_(None))
                 )
             ).first()
             if not credential:
                 raise NotFoundError(f"Credential {credential_id} not found")
-            if name:
+            if name is not None:
                 credential.name = name
-            if website_url:
-                credential.website_url = website_url
+            if browser_profile_id is not _UNSET:
+                credential.browser_profile_id = browser_profile_id
+            if tested_url is not _UNSET:
+                credential.tested_url = tested_url
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
