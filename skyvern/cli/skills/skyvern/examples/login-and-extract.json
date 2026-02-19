@@ -1,0 +1,37 @@
+{
+  "title": "Login and Extract Account Summary",
+  "workflow_definition": {
+    "version": 2,
+    "parameters": [
+      {"parameter_type": "workflow", "key": "portal_url", "workflow_parameter_type": "string"},
+      {"parameter_type": "workflow", "key": "login_credential", "workflow_parameter_type": "credential_id"}
+    ],
+    "blocks": [
+      {
+        "block_type": "login",
+        "label": "login",
+        "next_block_label": "extract_summary",
+        "url": "{{portal_url}}",
+        "title": "Login",
+        "parameter_keys": ["login_credential"],
+        "complete_criterion": "The account dashboard is visible and no login form is present."
+      },
+      {
+        "block_type": "extraction",
+        "label": "extract_summary",
+        "next_block_label": null,
+        "title": "Extract Summary",
+        "data_extraction_goal": "Extract account name, current balance, and next due date.",
+        "data_schema": {
+          "type": "object",
+          "properties": {
+            "account_name": {"type": "string"},
+            "current_balance": {"type": "string"},
+            "next_due_date": {"type": "string"}
+          },
+          "required": ["account_name", "current_balance"]
+        }
+      }
+    ]
+  }
+}

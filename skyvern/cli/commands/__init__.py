@@ -13,6 +13,8 @@ from ..docs import docs_app
 from ..init_command import init_browser, init_env
 from ..quickstart import quickstart_app
 from ..run_commands import run_app
+from ..setup_commands import setup_app
+from ..skill_commands import skill_app
 from ..status import status_app
 from ..stop_commands import stop_app
 from ..tasks import tasks_app
@@ -82,6 +84,8 @@ cli_app.add_typer(
 
 # Browser automation commands
 cli_app.add_typer(browser_app, name="browser", help="Browser automation commands.")
+cli_app.add_typer(skill_app, name="skill", help="Manage bundled skill reference files.")
+cli_app.add_typer(setup_app, name="setup", help="Register Skyvern MCP with AI coding tools.")
 
 
 @init_app.callback()
