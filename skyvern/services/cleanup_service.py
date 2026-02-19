@@ -4,18 +4,22 @@ Cleanup service for periodic cleanup of temporary data.
 This service is responsible for:
 1. Cleaning up temporary files in the temp directory
 2. Killing stale playwright/node/browser processes
+3. Sending webhook notifications when cleanup is triggered
 """
 
 import asyncio
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import psutil
 import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 
 LOG = structlog.get_logger()
 
@@ -221,6 +225,106 @@ async def run_cleanup() -> None:
         LOG.info("Killed stale browser processes", processes_killed=processes_killed)
 
     LOG.debug("Cleanup process completed")
+
+    # Send cleanup webhook notifications to all organizations with webhook URLs
+    await send_cleanup_webhooks(
+        temp_files_removed=temp_files_removed,
+        processes_killed=processes_killed,
+        stale_tasks=stale_tasks,
+        stale_workflows=stale_workflows,
+    )
+
+
+async def send_cleanup_webhooks(
+    temp_files_removed: int,
+    processes_killed: int,
+    stale_tasks: int,
+    stale_workflows: int,
+) -> None:
+    """
+    Send cleanup webhook notifications to all organizations with webhook URLs configured.
+
+    The webhook payload includes cleanup metrics such as the number of temp files removed,
+    processes killed, and stale tasks/workflows found.
+    """
+    try:
+        organizations = await app.DATABASE.get_all_organizations()
+    except Exception:
+        LOG.exception("Failed to get organizations for cleanup webhook")
+        return
+
+    payload = {
+        "event": "cleanup_triggered",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "metrics": {
+            "temp_files_removed": temp_files_removed,
+            "processes_killed": processes_killed,
+            "stale_tasks": stale_tasks,
+            "stale_workflows": stale_workflows,
+        },
+    }
+
+    for org in organizations:
+        # Skip organizations without webhook URL
+        if not org.webhook_callback_url:
+            continue
+
+        try:
+            # Get API key for signature
+            api_key_obj = await app.DATABASE.get_valid_org_auth_token(
+                org.organization_id, OrganizationAuthTokenType.api
+            )
+            if not api_key_obj:
+                LOG.debug(
+                    "No API key found for organization, skipping cleanup webhook",
+                    organization_id=org.organization_id,
+                )
+                continue
+
+            # Generate signed payload
+            signed_data = generate_skyvern_webhook_signature(
+                payload=payload,
+                api_key=api_key_obj.token,
+            )
+
+            # Send webhook
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    org.webhook_callback_url,
+                    content=signed_data.signed_payload,
+                    headers=signed_data.headers,
+                    timeout=httpx.Timeout(30.0),
+                )
+
+            if response.is_success:
+                LOG.info(
+                    "Cleanup webhook sent successfully",
+                    organization_id=org.organization_id,
+                    status_code=response.status_code,
+                )
+            else:
+                LOG.warning(
+                    "Cleanup webhook returned non-success status",
+                    organization_id=org.organization_id,
+                    status_code=response.status_code,
+                )
+        except httpx.TimeoutException:
+            LOG.warning(
+                "Cleanup webhook timed out",
+                organization_id=org.organization_id,
+                webhook_url=org.webhook_callback_url,
+            )
+        except httpx.NetworkError as e:
+            LOG.warning(
+                "Cleanup webhook network error",
+                organization_id=org.organization_id,
+                error=str(e),
+            )
+        except Exception:
+            LOG.exception(
+                "Failed to send cleanup webhook",
+                organization_id=org.organization_id,
+            )
 
 
 async def cleanup_scheduler() -> None:
