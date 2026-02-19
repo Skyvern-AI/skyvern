@@ -73,7 +73,7 @@ def clear_workflow_script_cache(
     """
     keys_to_delete = []
 
-    for key in _workflow_script_cache.keys():
+    for key in list(_workflow_script_cache.keys()):
         # Key format: (org_id, workflow_permanent_id, cache_key_value, workflow_run_id, cache_key, statuses_key)
         if len(key) >= 2 and key[0] == organization_id:
             if workflow_permanent_id is None or key[1] == workflow_permanent_id:
