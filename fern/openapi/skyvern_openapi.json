@@ -7225,7 +7225,7 @@
           "brand"
         ],
         "title": "CreditCardCredentialResponse",
-        "description": "Response model for credit card credentials, containing only the last four digits and brand."
+        "description": "Response model for credit card credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include full card number, CVV, expiration date, or card holder name."
       },
       "DeployScriptRequest": {
         "properties": {
@@ -12459,7 +12459,7 @@
           "username"
         ],
         "title": "PasswordCredentialResponse",
-        "description": "Response model for password credentials, containing only the username."
+        "description": "Response model for password credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include password, TOTP secret, or TOTP identifier."
       },
       "PersistentBrowserType": {
         "type": "string",
@@ -13190,7 +13190,7 @@
         },
         "type": "object",
         "title": "SecretCredentialResponse",
-        "description": "Response model for secret credentials."
+        "description": "Response model for secret credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include the secret_value."
       },
       "SelectOption": {
         "properties": {

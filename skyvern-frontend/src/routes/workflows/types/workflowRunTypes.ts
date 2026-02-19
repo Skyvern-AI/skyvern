@@ -1,4 +1,4 @@
-import { ActionsApiResponse, Status } from "@/api/types";
+import { ActionsApiResponse, RunEngine, Status } from "@/api/types";
 import { isTaskVariantBlock, WorkflowBlockType } from "./workflowTypes";
 import { ActionItem } from "../workflowRun/WorkflowRunOverview";
 
@@ -41,6 +41,7 @@ export type WorkflowRunBlock = {
   terminate_criterion: string | null;
   complete_criterion: string | null;
   include_action_history_in_verification: boolean | null;
+  engine: RunEngine | null;
   actions: Array<ActionsApiResponse> | null;
   recipients?: Array<string> | null;
   attachments?: Array<string> | null;
