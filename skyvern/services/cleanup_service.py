@@ -272,7 +272,7 @@ async def send_cleanup_webhooks(
         try:
             # Get API key for signature
             api_key_obj = await app.DATABASE.get_valid_org_auth_token(
-                org.organization_id, OrganizationAuthTokenType.api
+                org.organization_id, OrganizationAuthTokenType.api.value
             )
             if not api_key_obj:
                 LOG.debug(
