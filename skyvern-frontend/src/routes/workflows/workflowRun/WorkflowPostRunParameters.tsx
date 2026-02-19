@@ -22,6 +22,12 @@ import { CodeBlockParameters } from "./blockInfo/CodeBlockParameters";
 import { TextPromptBlockParameters } from "./blockInfo/TextPromptBlockParameters";
 import { GotoUrlBlockParameters } from "./blockInfo/GotoUrlBlockParameters";
 import { FileDownloadBlockParameters } from "./blockInfo/FileDownloadBlockParameters";
+import { WaitBlockParameters } from "./blockInfo/WaitBlockParameters";
+import { HttpRequestBlockParameters } from "./blockInfo/HttpRequestBlockParameters";
+import { PrintPageBlockParameters } from "./blockInfo/PrintPageBlockParameters";
+import { HumanInteractionBlockParameters } from "./blockInfo/HumanInteractionBlockParameters";
+import { ConditionalBlockParameters } from "./blockInfo/ConditionalBlockParameters";
+import { Taskv2BlockParameters } from "./blockInfo/Taskv2BlockParameters";
 
 function WorkflowPostRunParameters() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
@@ -86,7 +92,10 @@ function WorkflowPostRunParameters() {
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
             <h1 className="text-lg font-bold">Block Parameters</h1>
-            <TaskBlockParameters block={activeBlock} />
+            <TaskBlockParameters
+              block={activeBlock}
+              definitionBlock={definitionBlock}
+            />
           </div>
         </div>
       ) : null}
@@ -191,6 +200,142 @@ function WorkflowPostRunParameters() {
           </div>
         </div>
       ) : null}
+      {activeBlock && activeBlock.block_type === WorkflowBlockTypes.Wait ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Wait Block</h1>
+            <WaitBlockParameters
+              waitSec={
+                activeBlock.wait_sec ??
+                (isBlockOfType(definitionBlock, WorkflowBlockTypes.Wait)
+                  ? definitionBlock.wait_sec ?? null
+                  : null)
+              }
+            />
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.HttpRequest &&
+      isBlockOfType(definitionBlock, WorkflowBlockTypes.HttpRequest) ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">HTTP Request Block</h1>
+            <HttpRequestBlockParameters
+              method={definitionBlock.method}
+              url={definitionBlock.url}
+              headers={definitionBlock.headers}
+              body={definitionBlock.body}
+              files={definitionBlock.files}
+              timeout={definitionBlock.timeout}
+              followRedirects={definitionBlock.follow_redirects}
+              downloadFilename={definitionBlock.download_filename}
+              saveResponseAsFile={definitionBlock.save_response_as_file}
+            />
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.PrintPage &&
+      isBlockOfType(definitionBlock, WorkflowBlockTypes.PrintPage) ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Print Page Block</h1>
+            <PrintPageBlockParameters
+              format={definitionBlock.format}
+              landscape={definitionBlock.landscape}
+              printBackground={definitionBlock.print_background}
+              includeTimestamp={definitionBlock.include_timestamp}
+              customFilename={definitionBlock.custom_filename}
+            />
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.HumanInteraction ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Human Interaction Block</h1>
+            <HumanInteractionBlockParameters
+              instructions={
+                activeBlock.instructions ??
+                (isBlockOfType(
+                  definitionBlock,
+                  WorkflowBlockTypes.HumanInteraction,
+                )
+                  ? definitionBlock.instructions
+                  : null)
+              }
+              positiveDescriptor={
+                activeBlock.positive_descriptor ??
+                (isBlockOfType(
+                  definitionBlock,
+                  WorkflowBlockTypes.HumanInteraction,
+                )
+                  ? definitionBlock.positive_descriptor
+                  : null)
+              }
+              negativeDescriptor={
+                activeBlock.negative_descriptor ??
+                (isBlockOfType(
+                  definitionBlock,
+                  WorkflowBlockTypes.HumanInteraction,
+                )
+                  ? definitionBlock.negative_descriptor
+                  : null)
+              }
+              timeoutSeconds={
+                isBlockOfType(
+                  definitionBlock,
+                  WorkflowBlockTypes.HumanInteraction,
+                )
+                  ? definitionBlock.timeout_seconds
+                  : null
+              }
+            />
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.Conditional ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Conditional Block</h1>
+            <ConditionalBlockParameters
+              branchConditions={
+                isBlockOfType(definitionBlock, WorkflowBlockTypes.Conditional)
+                  ? definitionBlock.branch_conditions
+                  : null
+              }
+              executedBranchId={activeBlock.executed_branch_id ?? null}
+              executedBranchExpression={
+                activeBlock.executed_branch_expression ?? null
+              }
+              executedBranchResult={activeBlock.executed_branch_result ?? null}
+              executedBranchNextBlock={
+                activeBlock.executed_branch_next_block ?? null
+              }
+            />
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.Taskv2 &&
+      isBlockOfType(definitionBlock, WorkflowBlockTypes.Taskv2) ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Task v2 Block</h1>
+            <Taskv2BlockParameters
+              prompt={activeBlock.prompt ?? definitionBlock.prompt ?? ""}
+              url={activeBlock.url ?? definitionBlock.url}
+              maxSteps={definitionBlock.max_steps}
+              totpVerificationUrl={definitionBlock.totp_verification_url}
+              totpIdentifier={definitionBlock.totp_identifier}
+              disableCache={definitionBlock.disable_cache}
+            />
+          </div>
+        </div>
+      ) : null}
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
           <h1 className="text-lg font-bold">Workflow Input Parameters</h1>
@@ -252,6 +397,36 @@ function WorkflowPostRunParameters() {
               />
             </div>
           </div>
+          {workflowRun.browser_session_id ? (
+            <div className="flex gap-16">
+              <div className="w-80">
+                <h1 className="text-lg">Browser Session ID</h1>
+              </div>
+              <Input value={workflowRun.browser_session_id} readOnly />
+            </div>
+          ) : null}
+          {workflow?.run_with ? (
+            <div className="flex gap-16">
+              <div className="w-80">
+                <h1 className="text-lg">Run With</h1>
+                <h2 className="text-base text-slate-400">
+                  Execution mode for this workflow
+                </h2>
+              </div>
+              <Input value={workflow.run_with} readOnly />
+            </div>
+          ) : null}
+          {workflowRun.max_screenshot_scrolls != null ? (
+            <div className="flex gap-16">
+              <div className="w-80">
+                <h1 className="text-lg">Max Screenshot Scrolls</h1>
+              </div>
+              <Input
+                value={workflowRun.max_screenshot_scrolls.toString()}
+                readOnly
+              />
+            </div>
+          ) : null}
         </div>
       </div>
       {workflowRun.task_v2 ? (
