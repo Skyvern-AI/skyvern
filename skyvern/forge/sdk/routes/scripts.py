@@ -10,6 +10,7 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.schemas.scripts import (
+    ClearCacheResponse,
     CreateScriptRequest,
     CreateScriptResponse,
     DeployScriptRequest,
@@ -573,3 +574,67 @@ async def delete_workflow_cache_key_value(
         raise HTTPException(status_code=404, detail="Cache key value not found")
 
     return {"message": "Cache key value deleted successfully"}
+
+
+@base_router.delete(
+    "/scripts/{workflow_permanent_id}/cache",
+    response_model=ClearCacheResponse,
+    summary="Clear cached scripts for workflow",
+    description="Clear all cached scripts for a specific workflow. This will trigger script regeneration on subsequent runs.",
+    tags=["Scripts"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "clear_workflow_cache",
+    },
+)
+@base_router.delete(
+    "/scripts/{workflow_permanent_id}/cache/",
+    response_model=ClearCacheResponse,
+    include_in_schema=False,
+)
+async def clear_workflow_cache(
+    workflow_permanent_id: str = Path(
+        ...,
+        description="The workflow permanent ID to clear cache for",
+        examples=["wpid_abc123"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ClearCacheResponse:
+    """Clear all cached scripts for a specific workflow."""
+    LOG.info(
+        "Clearing workflow cache",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    # Verify workflow exists
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    # Clear database cache (soft delete)
+    deleted_count = await app.DATABASE.delete_workflow_scripts_by_permanent_id(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    # Clear in-memory cache
+    workflow_script_service.clear_workflow_script_cache(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    LOG.info(
+        "Cleared workflow cache",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        deleted_count=deleted_count,
+    )
+
+    return ClearCacheResponse(
+        deleted_count=deleted_count,
+        message=f"Successfully cleared {deleted_count} cached script(s) for workflow {workflow_permanent_id}",
+    )
