@@ -622,7 +622,7 @@ async def clear_workflow_cache(
     )
 
     # Clear in-memory cache
-    workflow_script_service.clear_workflow_script_cache(
+    memory_cleared_count = workflow_script_service.clear_workflow_script_cache(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
     )
@@ -632,9 +632,10 @@ async def clear_workflow_cache(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         deleted_count=deleted_count,
+        memory_cleared_count=memory_cleared_count,
     )
 
     return ClearCacheResponse(
         deleted_count=deleted_count,
-        message=f"Successfully cleared {deleted_count} cached script(s) for workflow {workflow_permanent_id}",
+        message=f"Successfully cleared {deleted_count} cached script(s) and {memory_cleared_count} in-memory entries for workflow {workflow_permanent_id}",
     )
