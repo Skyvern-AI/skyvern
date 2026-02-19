@@ -240,7 +240,7 @@ function WorkflowRunTimelineBlockItem({
   const hasNestedChildren = subItems.length > 0;
   const isLoopBlock = block.block_type === "for_loop";
   const isConditionalBlock = block.block_type === "conditional";
-  const [childrenOpen, setChildrenOpen] = useState(!isConditionalBlock);
+  const [childrenOpen, setChildrenOpen] = useState(true);
 
   const loopIterationGroups = useMemo(
     () => getLoopIterationGroups(subItems),
@@ -250,7 +250,12 @@ function WorkflowRunTimelineBlockItem({
   const loopValues = Array.isArray(block.loop_values) ? block.loop_values : [];
 
   return (
-    <div className={cn({ "ml-3 border-l border-slate-700 pl-3": depth > 0 })}>
+    <div
+      className={cn({
+        "ml-3 pl-3": depth > 0,
+        "border-l border-slate-700": depth === 1,
+      })}
+    >
       <div
         className={cn(
           "cursor-pointer space-y-4 rounded border border-slate-600 p-4",
@@ -386,7 +391,7 @@ function WorkflowRunTimelineBlockItem({
                             evaluation.rendered_expression !==
                               evaluation.original_expression && (
                               <div className="text-slate-400">
-                                -&gt; rendered to{" "}
+                                → rendered to{" "}
                                 <code className="rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-200">
                                   {evaluation.rendered_expression}
                                 </code>
@@ -412,7 +417,7 @@ function WorkflowRunTimelineBlockItem({
                       )}
                       {evaluation.is_matched && evaluation.next_block_label && (
                         <div className="mt-1 text-slate-400">
-                          -&gt; Executing next block:{" "}
+                          → Executing next block:{" "}
                           <span className="font-medium text-slate-300">
                             {evaluation.next_block_label}
                           </span>
@@ -441,7 +446,7 @@ function WorkflowRunTimelineBlockItem({
                   )}
                   {block.executed_branch_next_block && (
                     <div className="text-slate-400">
-                      -&gt; Executing next block:{" "}
+                      → Executing next block:{" "}
                       <span className="font-medium text-slate-300">
                         {block.executed_branch_next_block}
                       </span>
