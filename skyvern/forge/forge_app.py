@@ -111,15 +111,14 @@ def create_forge_app() -> ForgeApp:
     app.STORAGE = StorageFactory.get_storage()
     app.CACHE = CacheFactory.get_cache()
 
-    if settings.NOTIFICATION_REGISTRY_TYPE == "redis":
+    if settings.NOTIFICATION_REGISTRY_TYPE == "redis" and settings.NOTIFICATION_REDIS_URL:
         from redis.asyncio import from_url as redis_from_url
 
         from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
         from skyvern.forge.sdk.notification.redis import RedisNotificationRegistry
         from skyvern.forge.sdk.redis.factory import RedisClientFactory
 
-        redis_url = settings.NOTIFICATION_REDIS_URL or settings.REDIS_URL
-        redis_client = redis_from_url(redis_url, decode_responses=True)
+        redis_client = redis_from_url(settings.NOTIFICATION_REDIS_URL, decode_responses=True)
         RedisClientFactory.set_client(redis_client)
         NotificationRegistryFactory.set_registry(RedisNotificationRegistry(redis_client))
     app.ARTIFACT_MANAGER = ArtifactManager()
