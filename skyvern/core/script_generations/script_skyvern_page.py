@@ -27,7 +27,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.services.otp_service import poll_otp_value
+from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -615,16 +615,21 @@ class ScriptSkyvernPage(SkyvernPage):
             if is_totp_value:
                 value = generate_totp_value(context.workflow_run_id, original_value)
             elif (totp_identifier or totp_url) and organization_id:
-                totp_value = await poll_otp_value(
-                    organization_id=organization_id,
-                    task_id=task_id,
-                    workflow_run_id=workflow_run_id,
-                    totp_verification_url=totp_url,
-                    totp_identifier=totp_identifier,
-                )
-                if totp_value:
-                    # use the totp verification code
-                    value = totp_value.value
+                # Try credential TOTP first (higher priority than webhook/totp_identifier)
+                credential_totp = try_generate_totp_from_credential(workflow_run_id)
+                if credential_totp:
+                    value = credential_totp.value
+                else:
+                    totp_value = await poll_otp_value(
+                        organization_id=organization_id,
+                        task_id=task_id,
+                        workflow_run_id=workflow_run_id,
+                        totp_verification_url=totp_url,
+                        totp_identifier=totp_identifier,
+                    )
+                    if totp_value:
+                        # use the totp verification code
+                        value = totp_value.value
 
         return value
 

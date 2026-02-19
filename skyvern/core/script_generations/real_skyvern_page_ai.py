@@ -19,7 +19,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import script_service
-from skyvern.services.otp_service import poll_otp_value
+from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (
@@ -245,7 +245,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 if value and isinstance(data, dict) and "value" not in data:
                     data["value"] = value
 
-                if (totp_identifier or totp_url) and context and organization_id and task_id:
+                # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
+                otp_value = try_generate_totp_from_credential(workflow_run_id)
+                # Fall back to webhook/totp_identifier
+                if not otp_value and (totp_identifier or totp_url) and context and organization_id and task_id:
                     if totp_identifier:
                         totp_identifier = _render_template_with_label(totp_identifier, label=self.current_label)
                     if totp_url:
@@ -257,16 +260,16 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         totp_identifier=totp_identifier,
                         totp_verification_url=totp_url,
                     )
-                    if otp_value and otp_value.get_otp_type() == OTPType.TOTP:
-                        verification_code = otp_value.value
-                        if isinstance(data, dict) and SPECIAL_FIELD_VERIFICATION_CODE not in data:
-                            data[SPECIAL_FIELD_VERIFICATION_CODE] = verification_code
-                        elif isinstance(data, str) and SPECIAL_FIELD_VERIFICATION_CODE not in data:
-                            data = f"{data}\n" + str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
-                        elif isinstance(data, list):
-                            data.append({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
-                        else:
-                            data = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
+                if otp_value and otp_value.get_otp_type() == OTPType.TOTP:
+                    verification_code = otp_value.value
+                    if isinstance(data, dict) and SPECIAL_FIELD_VERIFICATION_CODE not in data:
+                        data[SPECIAL_FIELD_VERIFICATION_CODE] = verification_code
+                    elif isinstance(data, str) and SPECIAL_FIELD_VERIFICATION_CODE not in data:
+                        data = f"{data}\n" + str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
+                    elif isinstance(data, list):
+                        data.append({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
+                    else:
+                        data = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
 
                 await self._refresh_scraped_page(take_screenshots=False)
 
