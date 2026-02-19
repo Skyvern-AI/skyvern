@@ -9,7 +9,7 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
-from skyvern.forge.sdk.routes.routers import base_router
+from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import _auth as local_auth
 from skyvern.forge.sdk.routes.streaming.auth import auth as real_auth
 
@@ -19,6 +19,23 @@ HEARTBEAT_INTERVAL = 60
 
 @base_router.websocket("/stream/notifications")
 async def notification_stream(
+    websocket: WebSocket,
+    apikey: str | None = None,
+    token: str | None = None,
+) -> None:
+    return await _notification_stream_handler(websocket=websocket, apikey=apikey, token=token)
+
+
+@legacy_base_router.websocket("/stream/notifications")
+async def notification_stream_legacy(
+    websocket: WebSocket,
+    apikey: str | None = None,
+    token: str | None = None,
+) -> None:
+    return await _notification_stream_handler(websocket=websocket, apikey=apikey, token=token)
+
+
+async def _notification_stream_handler(
     websocket: WebSocket,
     apikey: str | None = None,
     token: str | None = None,
