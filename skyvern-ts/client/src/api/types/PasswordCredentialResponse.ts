@@ -3,7 +3,9 @@
 import type * as Skyvern from "../index.js";
 
 /**
- * Response model for password credentials, containing only the username.
+ * Response model for password credentials — non-sensitive fields only.
+ *
+ * SECURITY: Must NEVER include password, TOTP secret, or TOTP identifier.
  */
 export interface PasswordCredentialResponse {
     /** The username associated with the credential */
