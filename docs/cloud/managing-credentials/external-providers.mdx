@@ -1,6 +1,6 @@
 ---
 title: External Credential Providers
-subtitle: Connect Bitwarden, 1Password, Azure Key Vault, AWS, or your own vault API
+subtitle: Connect Bitwarden, 1Password, Azure Key Vault, or your own vault API
 slug: cloud/managing-credentials/external-providers
 ---
 
@@ -55,8 +55,6 @@ Make sure your Bitwarden account is on `bitwarden.com`, not `bitwarden.eu`.
     In the Skyvern workflow editor, click **Parameters → Add Parameter → Credential Parameter** and select the **Bitwarden** tab. Enter your **Collection ID** and optionally an **Item ID** to target a specific vault item.
   </Step>
 </Steps>
-
-{/* <img src="/images/cloud/credentials-bitwarden-param.png" alt="Bitwarden tab in credential parameter configuration" /> */}
 
 ### Configuration options
 
@@ -130,13 +128,9 @@ Connects via a [service account token](https://developer.1password.com/docs/serv
   </Step>
 </Steps>
 
-{/* <img src="/images/cloud/credentials-1password-settings.png" alt="1Password configuration card in Settings" /> */}
-
 ### Using in a workflow
 
 In the workflow editor, add a **Credential Parameter** and select **1Password** as the source. Provide the **Vault ID** and **Item ID** from your 1Password web URLs.
-
-{/* <img src="/images/cloud/credentials-1password-param.png" alt="1Password tab in credential parameter configuration" /> */}
 
 <Warning>
 Credit cards from 1Password need a text field named **"Expire Date"** on the item in `MM/YYYY` format. This is a workaround for how 1Password structures card data internally.
@@ -162,13 +156,9 @@ Pulls credentials stored as Azure secrets. Supports passwords with optional TOTP
   </Step>
 </Steps>
 
-{/* <img src="/images/cloud/credentials-azure-settings.png" alt="Azure Key Vault configuration card in Settings" /> */}
-
 ### Using in a workflow
 
 In the workflow editor, add a **Credential Parameter** and select **Azure Key Vault** as the source. Provide the vault name and the **secret names** that store the username, password, and optionally a TOTP secret — not the values themselves, just the secret names.
-
-{/* <img src="/images/cloud/credentials-azure-param.png" alt="Azure Key Vault tab in credential parameter configuration" /> */}
 
 ---
 
@@ -244,8 +234,6 @@ Response: HTTP 200
     Click **Update Configuration**.
   </Step>
 </Steps>
-
-{/* <img src="/images/cloud/credentials-webhook-settings.png" alt="Custom Credential Service configuration card in Settings" /> */}
 
 <Accordion title="Example: minimal FastAPI implementation">
 ```python

@@ -4,32 +4,83 @@ subtitle: Configure two-factor authentication for automated logins
 slug: cloud/managing-credentials/totp-setup
 ---
 
-Skyvern handles 2FA through two mechanisms. **Authenticator App (TOTP)** generates codes locally from your secret key — fully automatic. **Email/SMS** waits for you to push the code via the UI or API. Both are configured on the [password credential](/cloud/managing-credentials/password-credentials) itself.
+Skyvern supports three 2FA methods for automated logins. **Authenticator App (TOTP)** is fully automatic — Skyvern generates codes locally. **Email** and **Text Message** require you to push codes via the UI or API. All three are configured on the [password credential](/cloud/managing-credentials/password-credentials) itself.
 
 ## Authenticator App (TOTP)
 
-The preferred method. Store a TOTP secret key in a password credential, and Skyvern generates valid 6-digit codes on demand during login flows. The Login block enters credentials, detects the 2FA prompt, generates a fresh code, and enters it — all automatic.
+The preferred method. Skyvern generates valid 6-digit codes on demand during login flows — no delay, no manual steps.
 
-**Setup:** Create a password credential → expand **Two-Factor Authentication** → select **Authenticator App** → paste the TOTP secret key into the **Authenticator Key** field.
+### How it works
 
-The secret key is the base32-encoded string behind the QR code you'd normally scan. Copy it from your password manager (Bitwarden: TOTP field; 1Password: One-Time Password field) or look for a "Can't scan the QR code?" link during the site's 2FA setup.
+1. The Login block enters the username and password
+2. The site prompts for a 2FA code
+3. Skyvern generates a fresh TOTP code from the stored secret key
+4. The code is entered automatically and login completes
 
-{/* <img src="/images/cloud/credentials-totp-authenticator.png" alt="Authenticator App secret key field on a credential" /> */}
+### Setting it up
 
-## Email and SMS codes
+<Steps>
+  <Step title="Create or open a password credential">
+    Go to the Credentials page and either create a new password credential or open an existing one.
+  </Step>
+  <Step title="Expand Two-Factor Authentication">
+    Below the password fields, click the **Two-Factor Authentication** accordion.
+  </Step>
+  <Step title="Select Authenticator App">
+    Choose **Authenticator App** from the three options.
+  </Step>
+  <Step title="Paste your TOTP secret key">
+    Enter the secret key into the **Authenticator Key** field and click **Save**.
+  </Step>
+</Steps>
 
-When a site sends codes via email or text, someone (or something) needs to deliver the code to Skyvern.
+<Accordion title="Finding your TOTP secret key">
+The secret key is the base32-encoded string behind the QR code you'd normally scan in an authenticator app. You can find it in a few places:
 
-The flow:
+- **Bitwarden**: Edit the login → TOTP field → copy the key
+- **1Password**: Edit the login → One-Time Password → copy the secret
+- **Site settings**: Many sites show a "Can't scan?" link during 2FA setup that reveals the text key
 
-1. Login block enters username and password
-2. Site sends a 2FA code to the configured email or phone
+If you only have a QR code, decode it to extract the `secret=` parameter from the `otpauth://totp/...?secret=BASE32KEY` URI.
+</Accordion>
+
+---
+
+## Email and Text Message codes
+
+When a site sends 2FA codes via email or SMS, someone (or something) needs to deliver the code to Skyvern before the login can complete.
+
+### How it works
+
+1. The Login block enters the username and password
+2. The site sends a 2FA code to the configured email or phone number
 3. You push the code to Skyvern via the **2FA tab** or the API
 4. Skyvern enters the code and completes the login
 
-{/* <img src="/images/cloud/credentials-2fa-tab.png" alt="The 2FA tab on the Credentials page" /> */}
+### Setting it up
 
-### Pushing a code manually
+<Steps>
+  <Step title="Create or open a password credential">
+    Go to the Credentials page and either create a new password credential or open an existing one.
+  </Step>
+  <Step title="Expand Two-Factor Authentication">
+    Below the password fields, click the **Two-Factor Authentication** accordion.
+  </Step>
+  <Step title="Select Email or Text Message">
+    Choose the method that matches how the site delivers codes.
+  </Step>
+  <Step title="Enter the identifier">
+    Provide the **email address** or **phone number** that receives the codes. For Email, this auto-fills from the Username field.
+  </Step>
+</Steps>
+
+---
+
+## Pushing codes to Skyvern
+
+Once a workflow is running and waiting for a 2FA code, you need to deliver it. There are two ways.
+
+### Via the UI
 
 Open the **2FA** tab on the Credentials page. The **Push a 2FA Code** form has two fields:
 
@@ -38,15 +89,15 @@ Open the **2FA** tab on the Credentials page. The **Push a 2FA Code** form has t
 | **Identifier** | The email address or phone number that received the code |
 | **Verification content** | The full email/SMS body, or just the code itself — Skyvern extracts the digits automatically |
 
-{/* <img src="/images/cloud/credentials-2fa-push-form.png" alt="Push a 2FA Code form" /> */}
+<img src="/images/cloud/credentials-2fa-push-form.png" alt="2FA tab showing the Push a 2FA Code form and code history table" />
 
 <Tip>
 If multiple workflows are running simultaneously, click **Add optional metadata** to link the code to a specific run using the workflow run ID, workflow ID, or task ID.
 </Tip>
 
-### Pushing codes via API
+### Via the API
 
-For production, automate code delivery. Set up a forwarding rule that sends 2FA emails/texts to a script, and the script calls:
+For production, automate code delivery. Set up a forwarding rule that sends 2FA emails or texts to a script, and the script calls:
 
 ```bash
 curl -X POST "https://api.skyvern.com/v1/credentials/totp" \
@@ -76,13 +127,13 @@ The `source` field is a free-text label for your own tracking (e.g., `"email_for
 This turns email-based 2FA into something nearly as automated as an authenticator app — the main difference is latency while the email arrives and gets forwarded.
 </Tip>
 
+---
+
 ## Viewing past codes
 
 The table below the push form shows all 2FA codes your organization has received: identifier, extracted code, source type, associated workflow run, and timestamps. Filter by identifier, OTP type (numeric code vs. magic link), and number of results per page.
 
 Use this for auditing and debugging — confirming that a code was received and delivered to the right run.
-
-{/* <img src="/images/cloud/credentials-2fa-history.png" alt="2FA code history table with filter options" /> */}
 
 <CardGroup cols={2}>
   <Card
