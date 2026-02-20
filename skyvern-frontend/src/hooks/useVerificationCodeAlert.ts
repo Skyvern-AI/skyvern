@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, createElement } from "react";
+import { useState, useEffect, useRef, createElement } from "react";
 import { toast } from "@/components/ui/use-toast";
 import { VerificationToastContent } from "@/components/VerificationToast";
 import { enable2faNotifications } from "@/util/env";
@@ -69,7 +69,7 @@ function useVerificationCodeAlert({
     return () => clearInterval(interval);
   }, [isWaitingForCode, pollingStartedAt, notificationTag]);
 
-  // Browser notification + sound + in-app toast (fire once per waiting transition)
+  // Browser notification + in-app toast (fire once per waiting transition)
   useEffect(() => {
     if (!enable2faNotifications) return;
     if (!isWaitingForCode || notifiedTags.has(notificationTag)) return;
@@ -98,14 +98,6 @@ function useVerificationCodeAlert({
       }
     }
 
-    // Sound alert
-    try {
-      const audio = new Audio("/dragon-cry.mp3");
-      audio.play().catch((e) => console.error("Failed to play sound:", e));
-    } catch (e) {
-      console.error("Failed to create audio:", e);
-    }
-
     // In-app toast — uses VerificationToastContent for clean JSX rendering
     const result = toast({
       variant: "default",
@@ -120,15 +112,9 @@ function useVerificationCodeAlert({
     toastDismissRef.current = result.dismiss;
   }, [isWaitingForCode, label, notificationTag, navigateUrl]);
 
-  const isTimeCritical = useMemo(
-    () =>
-      timeRemaining !== null && timeRemaining <= CRITICAL_TIME_THRESHOLD_SEC,
-    [timeRemaining],
-  );
-  const isTimedOut = useMemo(
-    () => timeRemaining !== null && timeRemaining <= 0,
-    [timeRemaining],
-  );
+  const isTimeCritical =
+    timeRemaining !== null && timeRemaining <= CRITICAL_TIME_THRESHOLD_SEC;
+  const isTimedOut = timeRemaining !== null && timeRemaining <= 0;
 
   return { timeRemaining, isTimeCritical, isTimedOut };
 }
