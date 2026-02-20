@@ -33,6 +33,8 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
+    generate_diagnosis_conversation_id,
+    generate_diagnosis_message_id,
     generate_folder_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
@@ -1129,6 +1131,68 @@ class WorkflowCopilotChatMessageModel(Base):
     sender = Column(String, nullable=False)
     content = Column(UnicodeText, nullable=False)
     global_llm_context = Column(UnicodeText, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class DiagnosisConversationModel(Base):
+    """
+    Stores conversations for the AI-powered diagnosis chatbot feature.
+    Each conversation is linked to a workflow run for failure diagnosis.
+    """
+
+    __tablename__ = "diagnosis_conversations"
+    __table_args__ = (
+        Index("idx_diagnosis_conversations_org_wfr", "organization_id", "workflow_run_id"),
+        Index("idx_diagnosis_conversations_org_created", "organization_id", "created_at"),
+    )
+
+    diagnosis_conversation_id = Column(String, primary_key=True, default=generate_diagnosis_conversation_id)
+    organization_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False, index=True)
+    # Optional reference to an escalation ticket (e.g., Linear issue ID)
+    escalation_ticket_id = Column(String, nullable=True)
+    escalation_ticket_url = Column(String, nullable=True)
+    # Conversation status: active, escalated, resolved
+    status = Column(String, nullable=False, default="active")
+    # Summary of the diagnosis for quick reference
+    summary = Column(UnicodeText, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class DiagnosisMessageModel(Base):
+    """
+    Stores individual messages within a diagnosis conversation.
+    Supports both user and assistant messages with metadata.
+    """
+
+    __tablename__ = "diagnosis_messages"
+    __table_args__ = (Index("idx_diagnosis_messages_conv_created", "diagnosis_conversation_id", "created_at"),)
+
+    diagnosis_message_id = Column(String, primary_key=True, default=generate_diagnosis_message_id)
+    diagnosis_conversation_id = Column(String, nullable=False, index=True)
+    organization_id = Column(String, nullable=False)
+    # Role: "user" or "assistant"
+    role = Column(String, nullable=False)
+    content = Column(UnicodeText, nullable=False)
+    # Optional metadata for the message (e.g., artifact references, tool calls)
+    message_metadata = Column(JSON, nullable=True)
+    # Token usage tracking
+    input_token_count = Column(Integer, nullable=True)
+    output_token_count = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

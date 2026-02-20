@@ -48,6 +48,8 @@ from skyvern.forge.sdk.db.models import (
     CredentialModel,
     CredentialParameterModel,
     DebugSessionModel,
+    DiagnosisConversationModel,
+    DiagnosisMessageModel,
     FolderModel,
     OnePasswordCredentialParameterModel,
     OrganizationAuthTokenModel,
@@ -106,6 +108,12 @@ from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession, DebugSessionRun
+from skyvern.forge.sdk.schemas.diagnosis_chat import (
+    DiagnosisConversation,
+    DiagnosisConversationStatus,
+    DiagnosisMessage,
+    DiagnosisMessageRole,
+)
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
@@ -6449,3 +6457,150 @@ class AgentDB(BaseAlchemyDB):
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    # ==================== Diagnosis Chat Methods ====================
+
+    async def create_diagnosis_conversation(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> DiagnosisConversation:
+        """Create a new diagnosis conversation for a workflow run."""
+        async with self.Session() as session:
+            new_conversation = DiagnosisConversationModel(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                status=DiagnosisConversationStatus.ACTIVE,
+            )
+            session.add(new_conversation)
+            await session.commit()
+            await session.refresh(new_conversation)
+            return DiagnosisConversation.model_validate(new_conversation)
+
+    async def get_diagnosis_conversation(
+        self,
+        diagnosis_conversation_id: str,
+        organization_id: str,
+    ) -> DiagnosisConversation | None:
+        """Get a diagnosis conversation by ID."""
+        async with self.Session() as session:
+            query = (
+                select(DiagnosisConversationModel)
+                .filter(DiagnosisConversationModel.organization_id == organization_id)
+                .filter(DiagnosisConversationModel.diagnosis_conversation_id == diagnosis_conversation_id)
+            )
+            conversation = (await session.scalars(query)).first()
+            if not conversation:
+                return None
+            return DiagnosisConversation.model_validate(conversation)
+
+    async def get_diagnosis_conversation_by_workflow_run(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> DiagnosisConversation | None:
+        """Get the latest diagnosis conversation for a workflow run."""
+        async with self.Session() as session:
+            query = (
+                select(DiagnosisConversationModel)
+                .filter(DiagnosisConversationModel.organization_id == organization_id)
+                .filter(DiagnosisConversationModel.workflow_run_id == workflow_run_id)
+                .order_by(DiagnosisConversationModel.created_at.desc())
+                .limit(1)
+            )
+            conversation = (await session.scalars(query)).first()
+            if not conversation:
+                return None
+            return DiagnosisConversation.model_validate(conversation)
+
+    async def update_diagnosis_conversation(
+        self,
+        diagnosis_conversation_id: str,
+        organization_id: str,
+        status: DiagnosisConversationStatus | None = None,
+        summary: str | None = None,
+        escalation_ticket_id: str | None = None,
+        escalation_ticket_url: str | None = None,
+    ) -> DiagnosisConversation | None:
+        """Update a diagnosis conversation."""
+        async with self.Session() as session:
+            conversation = (
+                await session.scalars(
+                    select(DiagnosisConversationModel)
+                    .where(DiagnosisConversationModel.organization_id == organization_id)
+                    .where(DiagnosisConversationModel.diagnosis_conversation_id == diagnosis_conversation_id)
+                )
+            ).first()
+            if not conversation:
+                return None
+
+            if status is not None:
+                conversation.status = status
+            if summary is not None:
+                conversation.summary = summary
+            if escalation_ticket_id is not None:
+                conversation.escalation_ticket_id = escalation_ticket_id
+            if escalation_ticket_url is not None:
+                conversation.escalation_ticket_url = escalation_ticket_url
+
+            await session.commit()
+            await session.refresh(conversation)
+            return DiagnosisConversation.model_validate(conversation)
+
+    async def create_diagnosis_message(
+        self,
+        diagnosis_conversation_id: str,
+        organization_id: str,
+        role: DiagnosisMessageRole,
+        content: str,
+        message_metadata: dict | None = None,
+        input_token_count: int | None = None,
+        output_token_count: int | None = None,
+    ) -> DiagnosisMessage:
+        """Create a new diagnosis message in a conversation."""
+        async with self.Session() as session:
+            new_message = DiagnosisMessageModel(
+                diagnosis_conversation_id=diagnosis_conversation_id,
+                organization_id=organization_id,
+                role=role,
+                content=content,
+                message_metadata=message_metadata,
+                input_token_count=input_token_count,
+                output_token_count=output_token_count,
+            )
+            session.add(new_message)
+            await session.commit()
+            await session.refresh(new_message)
+            return DiagnosisMessage.model_validate(new_message)
+
+    async def get_diagnosis_messages(
+        self,
+        diagnosis_conversation_id: str,
+    ) -> list[DiagnosisMessage]:
+        """Get all messages in a diagnosis conversation, ordered by creation time."""
+        async with self.Session() as session:
+            query = (
+                select(DiagnosisMessageModel)
+                .filter(DiagnosisMessageModel.diagnosis_conversation_id == diagnosis_conversation_id)
+                .order_by(DiagnosisMessageModel.created_at.asc())
+            )
+            messages = (await session.scalars(query)).all()
+            return [DiagnosisMessage.model_validate(message) for message in messages]
+
+    async def get_diagnosis_conversations_for_organization(
+        self,
+        organization_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[DiagnosisConversation]:
+        """Get all diagnosis conversations for an organization."""
+        async with self.Session() as session:
+            query = (
+                select(DiagnosisConversationModel)
+                .filter(DiagnosisConversationModel.organization_id == organization_id)
+                .order_by(DiagnosisConversationModel.created_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            conversations = (await session.scalars(query)).all()
+            return [DiagnosisConversation.model_validate(c) for c in conversations]

@@ -625,3 +625,105 @@ export type PylonEmailHash = {
 };
 
 export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;
+
+// Diagnosis Chat Types
+export const DiagnosisMessageRole = {
+  User: "user",
+  Assistant: "assistant",
+} as const;
+
+export type DiagnosisMessageRole =
+  (typeof DiagnosisMessageRole)[keyof typeof DiagnosisMessageRole];
+
+export const DiagnosisConversationStatus = {
+  Active: "active",
+  Escalated: "escalated",
+  Resolved: "resolved",
+} as const;
+
+export type DiagnosisConversationStatus =
+  (typeof DiagnosisConversationStatus)[keyof typeof DiagnosisConversationStatus];
+
+export const DiagnosisStreamMessageType = {
+  Processing: "processing",
+  Content: "content",
+  Artifact: "artifact",
+  Complete: "complete",
+  Error: "error",
+} as const;
+
+export type DiagnosisStreamMessageType =
+  (typeof DiagnosisStreamMessageType)[keyof typeof DiagnosisStreamMessageType];
+
+export type DiagnosisChatHistoryMessage = {
+  role: DiagnosisMessageRole;
+  content: string;
+  created_at: string;
+};
+
+export type DiagnosisChatHistoryResponse = {
+  diagnosis_conversation_id: string | null;
+  workflow_run_id: string;
+  status: DiagnosisConversationStatus;
+  messages: DiagnosisChatHistoryMessage[];
+  escalation_ticket_url: string | null;
+};
+
+export type DiagnosisChatRequest = {
+  message: string;
+  diagnosis_conversation_id?: string | null;
+};
+
+export type DiagnosisStreamProcessing = {
+  type: typeof DiagnosisStreamMessageType.Processing;
+  status: string;
+  timestamp: string;
+};
+
+export type DiagnosisStreamContent = {
+  type: typeof DiagnosisStreamMessageType.Content;
+  content: string;
+  timestamp: string;
+};
+
+export type DiagnosisStreamArtifact = {
+  type: typeof DiagnosisStreamMessageType.Artifact;
+  artifact_type: string;
+  artifact_url: string;
+  description: string | null;
+  timestamp: string;
+};
+
+export type DiagnosisStreamComplete = {
+  type: typeof DiagnosisStreamMessageType.Complete;
+  diagnosis_conversation_id: string;
+  full_response: string;
+  input_token_count: number | null;
+  output_token_count: number | null;
+  timestamp: string;
+};
+
+export type DiagnosisStreamError = {
+  type: typeof DiagnosisStreamMessageType.Error;
+  error: string;
+  timestamp: string;
+};
+
+export type DiagnosisStreamMessage =
+  | DiagnosisStreamProcessing
+  | DiagnosisStreamContent
+  | DiagnosisStreamArtifact
+  | DiagnosisStreamComplete
+  | DiagnosisStreamError;
+
+export type DiagnosisEscalateRequest = {
+  diagnosis_conversation_id: string;
+  additional_context?: string | null;
+};
+
+export type DiagnosisEscalateResponse = {
+  diagnosis_conversation_id: string;
+  escalation_ticket_id: string;
+  escalation_ticket_url: string;
+  status: DiagnosisConversationStatus;
+};

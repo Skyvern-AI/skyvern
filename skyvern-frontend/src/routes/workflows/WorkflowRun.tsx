@@ -25,6 +25,7 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { runsApiBaseUrl } from "@/util/env";
 import {
+  MagnifyingGlassIcon,
   CodeIcon,
   FileIcon,
   Pencil2Icon,
@@ -51,6 +52,7 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
 import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowRunStatusAlert";
+import { DiagnosisChatPanel } from "./diagnosis";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -113,6 +115,7 @@ function WorkflowRun() {
 
   const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
   const [replayOpen, setReplayOpen] = useState(false);
+  const [showDiagnosis, setShowDiagnosis] = useState(false);
 
   const cancelWorkflowMutation = useMutation({
     mutationFn: async () => {
@@ -299,6 +302,12 @@ function WorkflowRun() {
     workflowRun.status === Status.Completed;
 
   const isGeneratingCode = !isFinalized && !hasPublishedCode;
+
+  // Show diagnosis option for completed/failed/terminated runs
+  const canShowDiagnosis =
+    workflowRun?.status === Status.Completed ||
+    workflowRun?.status === Status.Failed ||
+    workflowRun?.status === Status.Terminated;
 
   const switchBarOptions: SwitchBarNavigationOption[] = [
     {
@@ -506,7 +515,25 @@ function WorkflowRun() {
       {workflowFailureReason}
       {!isEmbedded && (
         <div className="flex items-center justify-between">
-          <SwitchBarNavigation options={switchBarOptions} />
+          <SwitchBarNavigation
+            options={switchBarOptions}
+            actions={
+              canShowDiagnosis ? (
+                <button
+                  className={cn(
+                    "flex cursor-pointer items-center justify-center rounded-sm px-3 py-2 text-center hover:bg-slate-700",
+                    { "bg-slate-700": showDiagnosis },
+                  )}
+                  onClick={() => setShowDiagnosis(!showDiagnosis)}
+                >
+                  <span className="mr-1 flex items-center justify-center">
+                    <MagnifyingGlassIcon className="inline-block size-5" />
+                  </span>
+                  Diagnose
+                </button>
+              ) : undefined
+            }
+          />
           {workflowRun && (
             <WorkflowRunStatusAlert
               status={workflowRun.status}
@@ -517,10 +544,14 @@ function WorkflowRun() {
         </div>
       )}
       <div className="flex h-[42rem] gap-6">
-        <div className="w-2/3">
+        <div
+          className={cn("transition-all", showDiagnosis ? "w-1/2" : "w-2/3")}
+        >
           <Outlet />
         </div>
-        <div className="w-1/3">
+        <div
+          className={cn("transition-all", showDiagnosis ? "w-1/4" : "w-1/3")}
+        >
           <WorkflowRunTimeline
             activeItem={selection}
             onActionItemSelected={(item) => {
@@ -537,6 +568,14 @@ function WorkflowRun() {
             }}
           />
         </div>
+        {showDiagnosis && workflowRunId && (
+          <div className="w-1/4 overflow-hidden rounded-lg">
+            <DiagnosisChatPanel
+              workflowRunId={workflowRunId}
+              className="h-full"
+            />
+          </div>
+        )}
       </div>
     </div>
   );
