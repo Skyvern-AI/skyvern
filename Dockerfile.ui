@@ -8,10 +8,10 @@ COPY ./skyvern-frontend /app
 COPY ./entrypoint-skyvernui.sh /app/entrypoint-skyvernui.sh
 RUN npm install
 
-# Placeholders for runtime injection (will be replaced by entrypoint script)
-ENV VITE_API_BASE_URL=__VITE_API_BASE_URL_PLACEHOLDER__
-ENV VITE_WSS_BASE_URL=__VITE_WSS_BASE_URL_PLACEHOLDER__
-ENV VITE_ARTIFACT_API_BASE_URL=__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__
+ENV VITE_API_BASE_URL=http://localhost:8000/api/v1
+ENV VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
+ENV VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
+# Placeholder for runtime injection
 ENV VITE_SKYVERN_API_KEY=__SKYVERN_API_KEY_PLACEHOLDER__
 
 # Build at image time
