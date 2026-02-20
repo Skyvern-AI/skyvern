@@ -30,24 +30,13 @@ if [ "$run_migration" = true ]; then
     alembic check
 fi
 
-# Create .streamlit/secrets.toml only if:
-# 1. It doesn't already exist
-# 2. No SKYVERN_API_KEY or VITE_SKYVERN_API_KEY is provided via environment
 if [ ! -f ".streamlit/secrets.toml" ]; then
-    if [ -z "$SKYVERN_API_KEY" ] && [ -z "$VITE_SKYVERN_API_KEY" ]; then
-        echo "Creating organization and API token..."
-        org_output=$(python scripts/create_organization.py Skyvern-Open-Source)
-        api_token=$(echo "$org_output" | awk '/token=/{gsub(/.*token='\''|'\''.*/, ""); print}')
-        # Update the secrets-open-source.toml file
-        mkdir -p .streamlit
-        echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://skyvern:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
-        echo ".streamlit/secrets.toml file updated with organization details."
-    else
-        echo "Skipping .streamlit/secrets.toml creation - using API key from environment variable"
-        # Still create the file for healthcheck but with placeholder
-        mkdir -p .streamlit
-        touch .streamlit/secrets.toml
-    fi
+    echo "Creating organization and API token..."
+    org_output=$(python scripts/create_organization.py Skyvern-Open-Source)
+    api_token=$(echo "$org_output" | awk '/token=/{gsub(/.*token='\''|'\''.*/, ""); print}')
+    # Update the secrets-open-source.toml file
+    echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://skyvern:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
+    echo ".streamlit/secrets.toml file updated with organization details."
 fi
 
 _kill_xvfb_on_term() {
