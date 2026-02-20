@@ -360,6 +360,7 @@ export type ForLoopBlock = WorkflowBlockBase & {
   loop_blocks: Array<WorkflowBlock>;
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
+  data_schema?: Record<string, unknown> | string | null;
 };
 
 export type CodeBlock = WorkflowBlockBase & {
