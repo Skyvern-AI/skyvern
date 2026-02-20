@@ -530,6 +530,8 @@ export type CredentialApiResponse = {
     | SecretCredentialResponse;
   credential_type: "password" | "credit_card" | "secret";
   name: string;
+  browser_profile_id?: string | null;
+  tested_url?: string | null;
 };
 
 export function isPasswordCredential(
@@ -634,3 +636,27 @@ export type PylonEmailHash = {
 };
 
 export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;
+
+export type TestLoginResponse = {
+  credential_id: string;
+  workflow_run_id: string;
+  status: string;
+};
+
+export type TestCredentialStatusResponse = {
+  credential_id: string;
+  workflow_run_id: string;
+  status:
+    | "created"
+    | "queued"
+    | "running"
+    | "completed"
+    | "failed"
+    | "timed_out"
+    | "terminated"
+    | "canceled";
+  failure_reason?: string | null;
+  browser_profile_id?: string | null;
+  tested_url?: string | null;
+  browser_profile_failure_reason?: string | null;
+};
