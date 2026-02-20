@@ -6,6 +6,13 @@ const app = express();
 
 app.use(cors());
 
+// Request logging middleware
+app.use((req, res, next) => {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${req.method} ${req.path} ${req.query.path || ""}`);
+  next();
+});
+
 app.get("/artifact/recording", (req, res) => {
   const range = req.headers.range;
   const path = req.query.path;
@@ -50,4 +57,6 @@ app.get("/artifact/text", (req, res) => {
   res.send(contents);
 });
 
-app.listen(9090);
+app.listen(9090, () => {
+  console.log(`[${new Date().toISOString()}] Artifact server running at http://localhost:9090`);
+});
