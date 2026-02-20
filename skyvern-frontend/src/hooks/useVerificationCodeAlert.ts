@@ -45,7 +45,9 @@ function useVerificationCodeAlert({
   useEffect(() => {
     if (!isWaitingForCode || !pollingStartedAt) {
       setTimeRemaining(null);
-      notifiedTags.delete(notificationTag);
+      if (!isWaitingForCode) {
+        notifiedTags.delete(notificationTag);
+      }
       // Dismiss toast immediately when no longer waiting for code
       toastDismissRef.current?.();
       toastDismissRef.current = null;
