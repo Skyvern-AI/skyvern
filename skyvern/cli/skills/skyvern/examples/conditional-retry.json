@@ -1,0 +1,60 @@
+{
+  "title": "Extract Report with Conditional Retry",
+  "workflow_definition": {
+    "version": 2,
+    "parameters": [],
+    "blocks": [
+      {
+        "block_type": "navigation",
+        "label": "open_report",
+        "next_block_label": "if_report_ready",
+        "url": "https://example.com/reports",
+        "title": "Open Report",
+        "navigation_goal": "Open the latest report details view."
+      },
+      {
+        "block_type": "conditional",
+        "label": "if_report_ready",
+        "next_block_label": null,
+        "branch_conditions": [
+          {
+            "criteria": {
+              "criteria_type": "prompt",
+              "expression": "The page shows a report status of ready, a download CTA, or visible table rows."
+            },
+            "next_block_label": "extract_report",
+            "description": "Proceed when report is ready",
+            "is_default": false
+          },
+          {
+            "is_default": true,
+            "next_block_label": "wait_then_retry",
+            "description": "Fallback when report is still processing"
+          }
+        ]
+      },
+      {
+        "block_type": "wait",
+        "label": "wait_then_retry",
+        "next_block_label": "if_report_ready",
+        "wait_sec": 15
+      },
+      {
+        "block_type": "extraction",
+        "label": "extract_report",
+        "next_block_label": null,
+        "title": "Extract Report",
+        "data_extraction_goal": "Extract report id, generated_at, and row_count.",
+        "data_schema": {
+          "type": "object",
+          "properties": {
+            "report_id": {"type": "string"},
+            "generated_at": {"type": "string"},
+            "row_count": {"type": "integer"}
+          },
+          "required": ["report_id"]
+        }
+      }
+    ]
+  }
+}

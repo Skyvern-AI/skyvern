@@ -394,7 +394,7 @@ if settings.ENABLE_ANTHROPIC:
             "anthropic/claude-opus-4-6",
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
-            add_assistant_prefix=True,
+            add_assistant_prefix=False,  # Claude 4.6 does not support assistant message prefill
             max_completion_tokens=64000,
             temperature=1,  # Claude 4.6 only supports temperature=1
         ),
@@ -544,7 +544,7 @@ if settings.ENABLE_BEDROCK:
             "bedrock/us.anthropic.claude-opus-4-6-v1",
             ["AWS_REGION"],
             supports_vision=True,
-            add_assistant_prefix=True,
+            add_assistant_prefix=False,  # Claude 4.6 does not support assistant message prefill
             max_completion_tokens=64000,
             temperature=1,  # Claude 4.6 only supports temperature=1
         ),

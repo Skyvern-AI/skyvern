@@ -288,6 +288,10 @@ class Task(TaskBase):
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    # 2FA verification code waiting state fields
+    waiting_for_verification_code: bool = False
+    verification_code_identifier: str | None = None
+    verification_code_polling_started_at: datetime | None = None
 
     @property
     def llm_key(self) -> str | None:
@@ -365,6 +369,9 @@ class Task(TaskBase):
             max_screenshot_scrolls=self.max_screenshot_scrolls,
             step_count=step_count,
             browser_session_id=self.browser_session_id,
+            waiting_for_verification_code=self.waiting_for_verification_code,
+            verification_code_identifier=self.verification_code_identifier,
+            verification_code_polling_started_at=self.verification_code_polling_started_at,
         )
 
 
@@ -392,6 +399,10 @@ class TaskResponse(BaseModel):
     max_screenshot_scrolls: int | None = None
     step_count: int | None = None
     browser_session_id: str | None = None
+    # 2FA verification code waiting state fields
+    waiting_for_verification_code: bool = False
+    verification_code_identifier: str | None = None
+    verification_code_polling_started_at: datetime | None = None
 
 
 class TaskOutput(BaseModel):

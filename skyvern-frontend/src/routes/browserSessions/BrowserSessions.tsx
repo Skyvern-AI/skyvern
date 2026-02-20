@@ -64,7 +64,7 @@ function BrowserSessions() {
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [sessionOptions, setSessionOptions] = useState<{
     proxyLocation: ProxyLocation;
-    timeoutMinutes: number;
+    timeoutMinutes: number | null;
   }>({
     proxyLocation: ProxyLocation.Residential,
     timeoutMinutes: 60,
@@ -350,25 +350,31 @@ function BrowserSessions() {
                     <HelpTooltip content="Duration to keep the browser session open. Automatically extends as it is used." />
                   </div>
                   <Input
-                    value={sessionOptions.timeoutMinutes}
+                    type="number"
+                    min={5}
+                    max={1440}
+                    value={sessionOptions.timeoutMinutes ?? ""}
                     placeholder="timeout (minutes)"
                     onChange={(event) => {
                       const value =
                         event.target.value === ""
                           ? null
-                          : Number(event.target.value);
-
-                      if (value) {
-                        setSessionOptions({
-                          ...sessionOptions,
-                          timeoutMinutes: value,
-                        });
-                      }
+                          : parseInt(event.target.value, 10);
+                      setSessionOptions({
+                        ...sessionOptions,
+                        timeoutMinutes: value,
+                      });
                     }}
                   />
                 </div>
                 <Button
-                  disabled={createBrowserSessionMutation.isPending}
+                  disabled={
+                    createBrowserSessionMutation.isPending ||
+                    sessionOptions.timeoutMinutes === null ||
+                    Number.isNaN(sessionOptions.timeoutMinutes) ||
+                    sessionOptions.timeoutMinutes < 5 ||
+                    sessionOptions.timeoutMinutes > 1440
+                  }
                   className="mt-6 w-full"
                   onClick={() => {
                     createBrowserSessionMutation.mutate({

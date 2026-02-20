@@ -5,8 +5,13 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
-from .client import get_skyvern
+import structlog
+
+from .api_key_hash import hash_api_key_for_cache
+from .client import get_active_api_key, get_skyvern
 from .result import BrowserContext, ErrorCode, make_error
+
+LOG = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
@@ -17,24 +22,79 @@ if TYPE_CHECKING:
 class SessionState:
     browser: SkyvernBrowser | None = None
     context: BrowserContext | None = None
+    api_key_hash: str | None = None
     console_messages: list[dict[str, Any]] = field(default_factory=list)
     tracing_active: bool = False
     har_enabled: bool = False
 
 
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
+_global_session: SessionState | None = None
+_stateless_http_mode = False
 
 
 def get_current_session() -> SessionState:
+    global _global_session
+
     state = _current_session.get()
-    if state is None:
+    if state is not None:
+        return state
+
+    # In stateless HTTP mode, avoid process-wide fallback state so requests
+    # cannot inherit session context from other requests.
+    if _stateless_http_mode:
         state = SessionState()
         _current_session.set(state)
+        return state
+
+    if _global_session is None:
+        _global_session = SessionState()
+    state = _global_session
+    _current_session.set(state)
     return state
 
 
 def set_current_session(state: SessionState) -> None:
+    global _global_session
+    if not _stateless_http_mode:
+        _global_session = state
     _current_session.set(state)
+
+
+def set_stateless_http_mode(enabled: bool) -> None:
+    global _stateless_http_mode
+    _stateless_http_mode = enabled
+
+
+def is_stateless_http_mode() -> bool:
+    return _stateless_http_mode
+
+
+def _api_key_hash(api_key: str | None) -> str | None:
+    if not api_key:
+        return None
+    return hash_api_key_for_cache(api_key)
+
+
+def _matches_current(
+    current: SessionState,
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+    local: bool = False,
+) -> bool:
+    if current.browser is None or current.context is None:
+        return False
+    if current.api_key_hash != _api_key_hash(get_active_api_key()):
+        return False
+
+    if session_id:
+        return current.context.mode == "cloud_session" and current.context.session_id == session_id
+    if cdp_url:
+        return current.context.mode == "cdp" and current.context.cdp_url == cdp_url
+    if local:
+        return current.context.mode == "local"
+    return False
 
 
 async def resolve_browser(
@@ -54,30 +114,39 @@ async def resolve_browser(
     skyvern = get_skyvern()
     current = get_current_session()
 
+    if _stateless_http_mode and not (session_id or cdp_url or local or create_session):
+        raise BrowserNotAvailableError()
+
+    if _matches_current(current, session_id=session_id, cdp_url=cdp_url, local=local):
+        if current.browser is None or current.context is None:
+            raise RuntimeError("Expected active browser and context for matching session")
+        return current.browser, current.context
+
+    active_api_key_hash = _api_key_hash(get_active_api_key())
     browser: SkyvernBrowser | None = None
     try:
         if session_id:
             browser = await skyvern.connect_to_cloud_browser_session(session_id)
             ctx = BrowserContext(mode="cloud_session", session_id=session_id)
-            set_current_session(SessionState(browser=browser, context=ctx))
+            set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 
         if cdp_url:
             browser = await skyvern.connect_to_browser_over_cdp(cdp_url)
             ctx = BrowserContext(mode="cdp", cdp_url=cdp_url)
-            set_current_session(SessionState(browser=browser, context=ctx))
+            set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 
         if local:
             browser = await skyvern.launch_local_browser(headless=headless)
             ctx = BrowserContext(mode="local")
-            set_current_session(SessionState(browser=browser, context=ctx))
+            set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 
         if create_session:
             browser = await skyvern.launch_cloud_browser(timeout=timeout)
             ctx = BrowserContext(mode="cloud_session", session_id=browser.browser_session_id)
-            set_current_session(SessionState(browser=browser, context=ctx))
+            set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
     except Exception:
         if browser is not None:
@@ -92,6 +161,31 @@ async def resolve_browser(
         return current.browser, current.context
 
     raise BrowserNotAvailableError()
+
+
+async def close_current_session() -> None:
+    """Close the active browser session (if any) and clear local session state."""
+    from .session_ops import do_session_close
+
+    current = get_current_session()
+    try:
+        if current.context and current.context.mode == "cloud_session" and current.context.session_id:
+            try:
+                skyvern = get_skyvern()
+                await do_session_close(skyvern, current.context.session_id)
+                # Prevent SkyvernBrowser.close() from making a redundant API call
+                if current.browser is not None:
+                    current.browser._browser_session_id = None
+            except Exception:
+                LOG.warning(
+                    "Best-effort cloud session close failed",
+                    session_id=current.context.session_id,
+                    exc_info=True,
+                )
+        if current.browser is not None:
+            await current.browser.close()
+    finally:
+        set_current_session(SessionState())
 
 
 async def get_page(
