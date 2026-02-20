@@ -202,19 +202,49 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       setHasChanges(false);
     },
     onError: (error: AxiosError) => {
-      const detail = (error.response?.data as { detail?: string })?.detail;
+      const responseData = error.response?.data as
+        | {
+            detail?:
+              | string
+              | Array<{
+                  loc?: Array<string | number>;
+                  msg?: string;
+                  type?: string;
+                }>;
+          }
+        | undefined;
+      const rawDetail = responseData?.detail;
 
       if (
-        detail &&
-        detail.startsWith("No confirmation for code cache deletion")
+        typeof rawDetail === "string" &&
+        rawDetail.startsWith("No confirmation for code cache deletion")
       ) {
         setShowConfirmCodeCacheDeletion(true);
         return;
       }
 
+      let description: string;
+      if (typeof rawDetail === "string" && rawDetail) {
+        description = rawDetail;
+      } else if (Array.isArray(rawDetail) && rawDetail.length > 0) {
+        // FastAPI's own 422 responses (e.g. request body validation) return detail
+        // as an array; our custom ValidationError handler returns it as a string.
+        description = rawDetail
+          .map((err) => {
+            const loc = err.loc
+              ?.filter((part) => part !== "body" && part !== "__root__")
+              .join(" -> ");
+            return loc ? `${loc}: ${err.msg}` : err.msg ?? "Unknown error";
+          })
+          .join("; ");
+      } else {
+        description =
+          "Failed to save workflow. Please check your workflow configuration and try again.";
+      }
+
       toast({
-        title: "Error",
-        description: detail ? detail : error.message,
+        title: "Failed to save workflow",
+        description,
         variant: "destructive",
       });
     },
