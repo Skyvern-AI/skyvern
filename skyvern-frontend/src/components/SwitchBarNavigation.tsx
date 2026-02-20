@@ -9,9 +9,10 @@ type Option = {
 
 type Props = {
   options: Option[];
+  actions?: React.ReactNode;
 };
 
-function SwitchBarNavigation({ options }: Props) {
+function SwitchBarNavigation({ options, actions }: Props) {
   const [searchParams] = useSearchParams();
 
   return (
@@ -40,6 +41,7 @@ function SwitchBarNavigation({ options }: Props) {
           </NavLink>
         );
       })}
+      {actions}
     </div>
   );
 }

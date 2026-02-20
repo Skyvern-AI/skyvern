@@ -25,7 +25,7 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { runsApiBaseUrl } from "@/util/env";
 import {
-  ChatBubbleIcon,
+  MagnifyingGlassIcon,
   CodeIcon,
   FileIcon,
   Pencil2Icon,
@@ -454,15 +454,6 @@ function WorkflowRun() {
                 </Link>
               </Button>
             )}
-            {canShowDiagnosis && (
-              <Button
-                variant={showDiagnosis ? "default" : "secondary"}
-                onClick={() => setShowDiagnosis(!showDiagnosis)}
-              >
-                <ChatBubbleIcon className="mr-2 h-4 w-4" />
-                {showDiagnosis ? "Hide Diagnosis" : "Diagnose"}
-              </Button>
-            )}
           </div>
         </header>
       )}
@@ -524,7 +515,25 @@ function WorkflowRun() {
       {workflowFailureReason}
       {!isEmbedded && (
         <div className="flex items-center justify-between">
-          <SwitchBarNavigation options={switchBarOptions} />
+          <SwitchBarNavigation
+            options={switchBarOptions}
+            actions={
+              canShowDiagnosis ? (
+                <button
+                  className={cn(
+                    "flex cursor-pointer items-center justify-center rounded-sm px-3 py-2 text-center hover:bg-slate-700",
+                    { "bg-slate-700": showDiagnosis },
+                  )}
+                  onClick={() => setShowDiagnosis(!showDiagnosis)}
+                >
+                  <span className="mr-1 flex items-center justify-center">
+                    <MagnifyingGlassIcon className="inline-block size-5" />
+                  </span>
+                  Diagnose
+                </button>
+              ) : undefined
+            }
+          />
           {workflowRun && (
             <WorkflowRunStatusAlert
               status={workflowRun.status}
