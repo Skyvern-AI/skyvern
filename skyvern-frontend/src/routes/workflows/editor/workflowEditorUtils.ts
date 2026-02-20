@@ -297,7 +297,18 @@ function layout(
     const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
     const isTargetted =
       targettedBlockLabel && nodeLabel === targettedBlockLabel;
-    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
+    // Use measured header height when available, fall back to 225 for initial render.
+    // Add 28px to account for outer container (border-2 + p-2 = 10px) + gap (16px) + buffer.
+    const headerHeight = isLoopNode(node)
+      ? node.data._headerHeight
+      : undefined;
+    const baseMargin = headerHeight ? headerHeight + 28 : 225;
+    // Only add extra margin for the status row when using the fallback height,
+    // since the measured height already includes the status row content.
+    const marginy =
+      isTargetted && !headerHeight
+        ? baseMargin + TARGETTED_BLOCK_EXTRA_MARGIN
+        : baseMargin;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
@@ -506,9 +517,11 @@ function convertToNode(
           navigationGoal: block.navigation_goal ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
           dataSchema:
-            typeof block.data_schema === "string"
-              ? block.data_schema
-              : JSON.stringify(block.data_schema, null, 2),
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           allowDownloads: block.complete_on_download ?? false,
           downloadSuffix: block.download_suffix ?? null,
@@ -653,9 +666,11 @@ function convertToNode(
           url: block.url ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
           dataSchema:
-            typeof block.data_schema === "string"
-              ? block.data_schema
-              : JSON.stringify(block.data_schema, null, 2),
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
           parameterKeys: block.parameters.map((p) => p.key),
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
@@ -778,6 +793,12 @@ function convertToNode(
           loopVariableReference: loopVariableReference,
           completeIfEmpty: block.complete_if_empty,
           nextLoopOnFailure: block.next_loop_on_failure,
+          dataSchema:
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
         },
       };
     }
@@ -2514,6 +2535,7 @@ function getOrderedChildrenBlocks(
         loop_blocks: loopChildren,
         loop_variable_reference: currentNode.data.loopVariableReference,
         complete_if_empty: currentNode.data.completeIfEmpty,
+        data_schema: JSONSafeOrString(currentNode.data.dataSchema),
       });
     } else {
       children.push(getWorkflowBlock(currentNode, nodes, edges));
@@ -2550,6 +2572,7 @@ function getOrderedChildrenBlocks(
         loop_blocks: loopChildren,
         loop_variable_reference: node.data.loopVariableReference,
         complete_if_empty: node.data.completeIfEmpty,
+        data_schema: JSONSafeOrString(node.data.dataSchema),
       });
       includedIds.add(node.id);
       return;
@@ -2615,6 +2638,7 @@ function getWorkflowBlocksUtil(
           loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
           loop_variable_reference: node.data.loopVariableReference,
           complete_if_empty: node.data.completeIfEmpty,
+          data_schema: JSONSafeOrString(node.data.dataSchema),
         },
       ];
     }
@@ -3722,6 +3746,7 @@ function convertBlocksToBlockYAML(
           loop_blocks: convertBlocksToBlockYAML(block.loop_blocks),
           loop_variable_reference: block.loop_variable_reference,
           complete_if_empty: block.complete_if_empty,
+          data_schema: block.data_schema,
         };
         return blockYaml;
       }
