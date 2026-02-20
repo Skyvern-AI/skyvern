@@ -286,6 +286,14 @@ mcp.tool()(skyvern_workflow_run)
 mcp.tool()(skyvern_workflow_status)
 mcp.tool()(skyvern_workflow_cancel)
 
+# -- Admin impersonation (cloud-only, session-level org switching) --
+try:
+    from cloud.mcp_admin_tools import register_admin_tools  # noqa: PLC0415
+
+    register_admin_tools(mcp)
+except ImportError:
+    pass
+
 # -- Prompts (methodology guides injected into LLM conversations) --
 mcp.prompt()(build_workflow)
 mcp.prompt()(debug_automation)
