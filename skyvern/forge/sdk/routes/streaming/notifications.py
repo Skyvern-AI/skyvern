@@ -54,15 +54,22 @@ async def _notification_stream_handler(
         # Send initial state: all currently active verification requests
         active_requests = await app.DATABASE.get_active_verification_requests(organization_id)
         for req in active_requests:
-            await websocket.send_json(
-                {
-                    "type": "verification_code_required",
-                    "task_id": req.get("task_id"),
-                    "workflow_run_id": req.get("workflow_run_id"),
-                    "identifier": req.get("verification_code_identifier"),
-                    "polling_started_at": req.get("verification_code_polling_started_at"),
-                }
-            )
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "verification_code_required",
+                        "task_id": req.get("task_id"),
+                        "workflow_run_id": req.get("workflow_run_id"),
+                        "identifier": req.get("verification_code_identifier"),
+                        "polling_started_at": req.get("verification_code_polling_started_at"),
+                    }
+                )
+            except (WebSocketDisconnect, ConnectionClosedOK, ConnectionClosedError, RuntimeError):
+                LOG.info(
+                    "Notifications: Client disconnected during initial state send",
+                    organization_id=organization_id,
+                )
+                return
 
         # Watch for client disconnect while streaming events
         disconnect_event = asyncio.Event()
@@ -99,6 +106,12 @@ async def _notification_stream_handler(
                         )
                         return
                 except asyncio.CancelledError:
+                    return
+                except (WebSocketDisconnect, ConnectionClosedOK, ConnectionClosedError, RuntimeError):
+                    LOG.info(
+                        "Notifications: Client disconnected during send",
+                        organization_id=organization_id,
+                    )
                     return
         finally:
             watcher.cancel()

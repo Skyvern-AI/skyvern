@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import pyotp
@@ -16,6 +17,21 @@ from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
 LOG = structlog.get_logger()
+
+
+@dataclass(slots=True)
+class OTPPollContext:
+    organization_id: str
+    task_id: str | None = None
+    workflow_id: str | None = None
+    workflow_run_id: str | None = None
+    workflow_permanent_id: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+
+    @property
+    def needs_manual_input(self) -> bool:
+        return not self.totp_verification_url
 
 
 class OTPValue(BaseModel):
@@ -108,80 +124,37 @@ async def poll_otp_value(
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
 ) -> OTPValue | None:
-    timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
-    start_datetime = datetime.utcnow()
-    timeout_datetime = start_datetime + timeout
-    org_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api.value)
-    if not org_token:
-        LOG.error("Failed to get organization token when trying to get otp value")
-        return None
-    LOG.info(
-        "Polling otp value",
+    ctx = OTPPollContext(
+        organization_id=organization_id,
         task_id=task_id,
+        workflow_id=workflow_id,
         workflow_run_id=workflow_run_id,
         workflow_permanent_id=workflow_permanent_id,
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
     )
+    timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
+    start_datetime = datetime.utcnow()
+    timeout_datetime = start_datetime + timeout
+    org_api_key: str | None = None
+    if ctx.totp_verification_url:
+        org_token = await app.DATABASE.get_valid_org_auth_token(
+            ctx.organization_id, OrganizationAuthTokenType.api.value
+        )
+        if not org_token:
+            LOG.error("Failed to get organization token when trying to get otp value")
+            return None
+        org_api_key = org_token.token
+    LOG.info(
+        "Polling otp value",
+        task_id=ctx.task_id,
+        workflow_run_id=ctx.workflow_run_id,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        totp_verification_url=ctx.totp_verification_url,
+        totp_identifier=ctx.totp_identifier,
+    )
 
-    # Set the waiting state in the database when polling starts
-    identifier_for_ui = totp_identifier
-    if workflow_run_id:
-        try:
-            await app.DATABASE.update_workflow_run(
-                workflow_run_id=workflow_run_id,
-                waiting_for_verification_code=True,
-                verification_code_identifier=identifier_for_ui,
-                verification_code_polling_started_at=start_datetime,
-            )
-            LOG.info(
-                "Set 2FA waiting state for workflow run",
-                workflow_run_id=workflow_run_id,
-                verification_code_identifier=identifier_for_ui,
-            )
-            try:
-                NotificationRegistryFactory.get_registry().publish(
-                    organization_id,
-                    {
-                        "type": "verification_code_required",
-                        "workflow_run_id": workflow_run_id,
-                        "task_id": task_id,
-                        "identifier": identifier_for_ui,
-                        "polling_started_at": start_datetime.isoformat(),
-                    },
-                )
-            except Exception:
-                LOG.warning("Failed to publish 2FA required notification for workflow run", exc_info=True)
-        except Exception:
-            LOG.warning("Failed to set 2FA waiting state for workflow run", exc_info=True)
-    elif task_id:
-        try:
-            await app.DATABASE.update_task_2fa_state(
-                task_id=task_id,
-                organization_id=organization_id,
-                waiting_for_verification_code=True,
-                verification_code_identifier=identifier_for_ui,
-                verification_code_polling_started_at=start_datetime,
-            )
-            LOG.info(
-                "Set 2FA waiting state for task",
-                task_id=task_id,
-                verification_code_identifier=identifier_for_ui,
-            )
-            try:
-                NotificationRegistryFactory.get_registry().publish(
-                    organization_id,
-                    {
-                        "type": "verification_code_required",
-                        "task_id": task_id,
-                        "identifier": identifier_for_ui,
-                        "polling_started_at": start_datetime.isoformat(),
-                    },
-                )
-            except Exception:
-                LOG.warning("Failed to publish 2FA required notification for task", exc_info=True)
-        except Exception:
-            LOG.warning("Failed to set 2FA waiting state for task", exc_info=True)
+    await _set_waiting_state(ctx, start_datetime)
 
     try:
         while True:
@@ -190,80 +163,154 @@ async def poll_otp_value(
             if datetime.utcnow() > timeout_datetime:
                 LOG.warning("Polling otp value timed out")
                 raise NoTOTPVerificationCodeFound(
-                    task_id=task_id,
-                    workflow_run_id=workflow_run_id,
-                    workflow_id=workflow_permanent_id,
-                    totp_verification_url=totp_verification_url,
-                    totp_identifier=totp_identifier,
+                    task_id=ctx.task_id,
+                    workflow_run_id=ctx.workflow_run_id,
+                    workflow_id=ctx.workflow_permanent_id,
+                    totp_verification_url=ctx.totp_verification_url,
+                    totp_identifier=ctx.totp_identifier,
                 )
             otp_value: OTPValue | None = None
-            if totp_verification_url:
+            if ctx.totp_verification_url:
+                assert org_api_key is not None
                 otp_value = await _get_otp_value_from_url(
-                    organization_id,
-                    totp_verification_url,
-                    org_token.token,
-                    task_id=task_id,
-                    workflow_run_id=workflow_run_id,
+                    ctx.organization_id,
+                    ctx.totp_verification_url,
+                    org_api_key,
+                    task_id=ctx.task_id,
+                    workflow_run_id=ctx.workflow_run_id,
                 )
-            elif totp_identifier:
+            elif ctx.totp_identifier:
                 otp_value = await _get_otp_value_from_db(
-                    organization_id,
-                    totp_identifier,
-                    task_id=task_id,
-                    workflow_id=workflow_id,
-                    workflow_run_id=workflow_run_id,
+                    ctx.organization_id,
+                    ctx.totp_identifier,
+                    task_id=ctx.task_id,
+                    workflow_id=ctx.workflow_id,
+                    workflow_run_id=ctx.workflow_run_id,
                 )
                 if not otp_value:
                     otp_value = await _get_otp_value_by_run(
-                        organization_id,
-                        task_id=task_id,
-                        workflow_run_id=workflow_run_id,
+                        ctx.organization_id,
+                        task_id=ctx.task_id,
+                        workflow_run_id=ctx.workflow_run_id,
                     )
             else:
                 # No pre-configured TOTP — poll for manually submitted codes by run context
                 otp_value = await _get_otp_value_by_run(
-                    organization_id,
-                    task_id=task_id,
-                    workflow_run_id=workflow_run_id,
+                    ctx.organization_id,
+                    task_id=ctx.task_id,
+                    workflow_run_id=ctx.workflow_run_id,
                 )
             if otp_value:
                 LOG.info("Got otp value", otp_value=otp_value)
                 return otp_value
     finally:
-        # Clear the waiting state when polling completes (success, timeout, or error)
-        if workflow_run_id:
+        await _clear_waiting_state(ctx)
+
+
+async def _set_waiting_state(ctx: OTPPollContext, started_at: datetime) -> None:
+    if not ctx.needs_manual_input:
+        return
+
+    identifier_for_ui = ctx.totp_identifier
+    if ctx.workflow_run_id:
+        try:
+            await app.DATABASE.update_workflow_run(
+                workflow_run_id=ctx.workflow_run_id,
+                waiting_for_verification_code=True,
+                verification_code_identifier=identifier_for_ui,
+                verification_code_polling_started_at=started_at,
+            )
+            LOG.info(
+                "Set 2FA waiting state for workflow run",
+                workflow_run_id=ctx.workflow_run_id,
+                verification_code_identifier=identifier_for_ui,
+            )
             try:
-                await app.DATABASE.update_workflow_run(
-                    workflow_run_id=workflow_run_id,
-                    waiting_for_verification_code=False,
+                NotificationRegistryFactory.get_registry().publish(
+                    ctx.organization_id,
+                    {
+                        "type": "verification_code_required",
+                        "workflow_run_id": ctx.workflow_run_id,
+                        "task_id": ctx.task_id,
+                        "identifier": identifier_for_ui,
+                        "polling_started_at": started_at.isoformat(),
+                    },
                 )
-                LOG.info("Cleared 2FA waiting state for workflow run", workflow_run_id=workflow_run_id)
-                try:
-                    NotificationRegistryFactory.get_registry().publish(
-                        organization_id,
-                        {"type": "verification_code_resolved", "workflow_run_id": workflow_run_id, "task_id": task_id},
-                    )
-                except Exception:
-                    LOG.warning("Failed to publish 2FA resolved notification for workflow run", exc_info=True)
             except Exception:
-                LOG.warning("Failed to clear 2FA waiting state for workflow run", exc_info=True)
-        elif task_id:
+                LOG.warning("Failed to publish 2FA required notification for workflow run", exc_info=True)
+        except Exception:
+            LOG.warning("Failed to set 2FA waiting state for workflow run", exc_info=True)
+    elif ctx.task_id:
+        try:
+            await app.DATABASE.update_task_2fa_state(
+                task_id=ctx.task_id,
+                organization_id=ctx.organization_id,
+                waiting_for_verification_code=True,
+                verification_code_identifier=identifier_for_ui,
+                verification_code_polling_started_at=started_at,
+            )
+            LOG.info(
+                "Set 2FA waiting state for task",
+                task_id=ctx.task_id,
+                verification_code_identifier=identifier_for_ui,
+            )
             try:
-                await app.DATABASE.update_task_2fa_state(
-                    task_id=task_id,
-                    organization_id=organization_id,
-                    waiting_for_verification_code=False,
+                NotificationRegistryFactory.get_registry().publish(
+                    ctx.organization_id,
+                    {
+                        "type": "verification_code_required",
+                        "task_id": ctx.task_id,
+                        "identifier": identifier_for_ui,
+                        "polling_started_at": started_at.isoformat(),
+                    },
                 )
-                LOG.info("Cleared 2FA waiting state for task", task_id=task_id)
-                try:
-                    NotificationRegistryFactory.get_registry().publish(
-                        organization_id,
-                        {"type": "verification_code_resolved", "task_id": task_id},
-                    )
-                except Exception:
-                    LOG.warning("Failed to publish 2FA resolved notification for task", exc_info=True)
             except Exception:
-                LOG.warning("Failed to clear 2FA waiting state for task", exc_info=True)
+                LOG.warning("Failed to publish 2FA required notification for task", exc_info=True)
+        except Exception:
+            LOG.warning("Failed to set 2FA waiting state for task", exc_info=True)
+
+
+async def _clear_waiting_state(ctx: OTPPollContext) -> None:
+    if not ctx.needs_manual_input:
+        return
+
+    if ctx.workflow_run_id:
+        try:
+            await app.DATABASE.update_workflow_run(
+                workflow_run_id=ctx.workflow_run_id,
+                waiting_for_verification_code=False,
+            )
+            LOG.info("Cleared 2FA waiting state for workflow run", workflow_run_id=ctx.workflow_run_id)
+            try:
+                NotificationRegistryFactory.get_registry().publish(
+                    ctx.organization_id,
+                    {
+                        "type": "verification_code_resolved",
+                        "workflow_run_id": ctx.workflow_run_id,
+                        "task_id": ctx.task_id,
+                    },
+                )
+            except Exception:
+                LOG.warning("Failed to publish 2FA resolved notification for workflow run", exc_info=True)
+        except Exception:
+            LOG.warning("Failed to clear 2FA waiting state for workflow run", exc_info=True)
+    elif ctx.task_id:
+        try:
+            await app.DATABASE.update_task_2fa_state(
+                task_id=ctx.task_id,
+                organization_id=ctx.organization_id,
+                waiting_for_verification_code=False,
+            )
+            LOG.info("Cleared 2FA waiting state for task", task_id=ctx.task_id)
+            try:
+                NotificationRegistryFactory.get_registry().publish(
+                    ctx.organization_id,
+                    {"type": "verification_code_resolved", "task_id": ctx.task_id},
+                )
+            except Exception:
+                LOG.warning("Failed to publish 2FA resolved notification for task", exc_info=True)
+        except Exception:
+            LOG.warning("Failed to clear 2FA waiting state for task", exc_info=True)
 
 
 async def _get_otp_value_from_url(
