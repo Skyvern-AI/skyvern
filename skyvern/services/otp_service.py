@@ -124,9 +124,14 @@ async def poll_otp_value(
         totp_identifier=totp_identifier,
     )
 
+    # When totp_verification_url is configured, the backend auto-resolves the code
+    # silently — no need to notify the frontend or show manual-entry UI.
+    needs_manual_input = not totp_verification_url
+
     # Set the waiting state in the database when polling starts
-    identifier_for_ui = totp_identifier
-    if workflow_run_id:
+    if needs_manual_input:
+        identifier_for_ui = totp_identifier
+    if needs_manual_input and workflow_run_id:
         try:
             await app.DATABASE.update_workflow_run(
                 workflow_run_id=workflow_run_id,
@@ -154,7 +159,7 @@ async def poll_otp_value(
                 LOG.warning("Failed to publish 2FA required notification for workflow run", exc_info=True)
         except Exception:
             LOG.warning("Failed to set 2FA waiting state for workflow run", exc_info=True)
-    elif task_id:
+    elif needs_manual_input and task_id:
         try:
             await app.DATABASE.update_task_2fa_state(
                 task_id=task_id,
@@ -231,7 +236,8 @@ async def poll_otp_value(
                 return otp_value
     finally:
         # Clear the waiting state when polling completes (success, timeout, or error)
-        if workflow_run_id:
+        # Only clear if we set it (i.e., manual input was needed)
+        if needs_manual_input and workflow_run_id:
             try:
                 await app.DATABASE.update_workflow_run(
                     workflow_run_id=workflow_run_id,
@@ -247,7 +253,7 @@ async def poll_otp_value(
                     LOG.warning("Failed to publish 2FA resolved notification for workflow run", exc_info=True)
             except Exception:
                 LOG.warning("Failed to clear 2FA waiting state for workflow run", exc_info=True)
-        elif task_id:
+        elif needs_manual_input and task_id:
             try:
                 await app.DATABASE.update_task_2fa_state(
                     task_id=task_id,
