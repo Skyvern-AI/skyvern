@@ -614,6 +614,7 @@ class ForLoopBlockYAML(BlockYAML):
     loop_over_parameter_key: str = ""
     loop_variable_reference: str | None = None
     complete_if_empty: bool = False
+    data_schema: dict[str, Any] | str | None = None
 
 
 class BranchCriteriaYAML(BaseModel):
