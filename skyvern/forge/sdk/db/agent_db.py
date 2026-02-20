@@ -3430,11 +3430,12 @@ class AgentDB(BaseAlchemyDB):
     ) -> WorkflowParameter:
         try:
             async with self.Session() as session:
-                default_value = (
-                    json.dumps(default_value)
-                    if workflow_parameter_type == WorkflowParameterType.JSON
-                    else default_value
-                )
+                if default_value is None:
+                    pass
+                elif workflow_parameter_type == WorkflowParameterType.JSON:
+                    default_value = json.dumps(default_value)
+                else:
+                    default_value = str(default_value)
                 workflow_parameter = WorkflowParameterModel(
                     workflow_id=workflow_id,
                     workflow_parameter_type=workflow_parameter_type,
@@ -3490,11 +3491,12 @@ class AgentDB(BaseAlchemyDB):
     def _convert_parameter_to_model(parameter: PARAMETER_TYPE) -> Base:
         """Convert a parameter object to its corresponding SQLAlchemy model."""
         if isinstance(parameter, WorkflowParameter):
-            default_value = (
-                json.dumps(parameter.default_value)
-                if parameter.workflow_parameter_type == WorkflowParameterType.JSON
-                else parameter.default_value
-            )
+            if parameter.default_value is None:
+                default_value = None
+            elif parameter.workflow_parameter_type == WorkflowParameterType.JSON:
+                default_value = json.dumps(parameter.default_value)
+            else:
+                default_value = str(parameter.default_value)
             return WorkflowParameterModel(
                 workflow_parameter_id=parameter.workflow_parameter_id,
                 workflow_parameter_type=parameter.workflow_parameter_type.value,
