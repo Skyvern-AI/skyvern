@@ -66,6 +66,7 @@ export async function fetchStreamingSse<T>(
         headers: init.headers as Record<string, string>,
         body: init.body,
         signal: controller.signal,
+        openWhenHidden: true,
         onmessage: (event) => {
           if (!event.data || !event.data.trim()) {
             return;

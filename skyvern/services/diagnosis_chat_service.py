@@ -7,7 +7,7 @@ workflow runs, get suggestions for fixes, and escalate issues when needed.
 """
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, AsyncIterator
 
 import structlog
@@ -308,7 +308,7 @@ async def process_message(
         # Send processing update
         yield DiagnosisStreamProcessing(
             status="Loading workflow run context...",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
         )
 
         # Load run context
@@ -316,14 +316,14 @@ async def process_message(
         if not context:
             yield DiagnosisStreamError(
                 error="Workflow run not found or access denied",
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(UTC),
             )
             return
 
         # Get or create conversation
         yield DiagnosisStreamProcessing(
             status="Preparing conversation...",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
         )
 
         conversation = await get_or_create_conversation(workflow_run_id, organization_id, diagnosis_conversation_id)
@@ -342,7 +342,7 @@ async def process_message(
         # Build prompt with context
         yield DiagnosisStreamProcessing(
             status="Analyzing run data...",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
         )
 
         # Build messages for LLM
@@ -366,7 +366,7 @@ async def process_message(
         # Call LLM for response
         yield DiagnosisStreamProcessing(
             status="Generating diagnosis...",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
         )
 
         # Use the main LLM handler
@@ -403,14 +403,14 @@ async def process_message(
             # Stream the content
             yield DiagnosisStreamContent(
                 content=full_response,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(UTC),
             )
 
         except Exception as e:
             LOG.error("LLM call failed", error=str(e))
             yield DiagnosisStreamError(
                 error=f"Failed to generate diagnosis: {str(e)}",
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(UTC),
             )
             return
 
@@ -430,14 +430,14 @@ async def process_message(
             full_response=full_response,
             input_token_count=input_tokens,
             output_token_count=output_tokens,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
         )
 
     except Exception as e:
         LOG.exception("Error processing diagnosis message", error=str(e))
         yield DiagnosisStreamError(
             error=f"An error occurred: {str(e)}",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
         )
 
 

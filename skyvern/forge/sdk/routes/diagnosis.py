@@ -8,7 +8,7 @@ These endpoints allow users to:
 - Get suggestions for workflow fixes
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import structlog
 from fastapi import Depends, HTTPException, Request
@@ -96,7 +96,7 @@ async def diagnosis_chat(
             await stream.send(
                 DiagnosisStreamError(
                     error=f"An unexpected error occurred: {str(e)}",
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(UTC),
                 )
             )
 
