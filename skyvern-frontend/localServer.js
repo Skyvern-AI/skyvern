@@ -6,9 +6,16 @@ const port = 8080;
 const url = `http://localhost:${port}`;
 
 const server = createServer((request, response) => {
-  // Log incoming requests
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${request.method} ${request.url}`);
+  const start = Date.now();
+
+  // Hook into response finish to log status
+  response.on("finish", () => {
+    const duration = Date.now() - start;
+    const timestamp = new Date().toISOString();
+    console.log(
+      `[${timestamp}] ${request.method} ${request.url} ${response.statusCode} ${duration}ms`,
+    );
+  });
 
   // You pass two more arguments for config and middleware
   // More details here: https://github.com/vercel/serve-handler#options
