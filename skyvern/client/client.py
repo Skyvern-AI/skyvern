@@ -18,6 +18,7 @@ from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.change_tier_response import ChangeTierResponse
 from .types.checkout_session_response import CheckoutSessionResponse
+from .types.clear_cache_response import ClearCacheResponse
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
@@ -2099,6 +2100,39 @@ class Skyvern:
         )
         """
         _response = self._raw_client.deploy_script(script_id, files=files, request_options=request_options)
+        return _response.data
+
+    def clear_workflow_cache(
+        self, workflow_permanent_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> ClearCacheResponse:
+        """
+        Clear all cached scripts for a specific workflow. This will trigger script regeneration on subsequent runs.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            The workflow permanent ID to clear cache for
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        ClearCacheResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.clear_workflow_cache(
+            workflow_permanent_id="wpid_abc123",
+        )
+        """
+        _response = self._raw_client.clear_workflow_cache(workflow_permanent_id, request_options=request_options)
         return _response.data
 
     def run_sdk_action(
@@ -4645,6 +4679,47 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.deploy_script(script_id, files=files, request_options=request_options)
+        return _response.data
+
+    async def clear_workflow_cache(
+        self, workflow_permanent_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> ClearCacheResponse:
+        """
+        Clear all cached scripts for a specific workflow. This will trigger script regeneration on subsequent runs.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            The workflow permanent ID to clear cache for
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        ClearCacheResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.clear_workflow_cache(
+                workflow_permanent_id="wpid_abc123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.clear_workflow_cache(workflow_permanent_id, request_options=request_options)
         return _response.data
 
     async def run_sdk_action(

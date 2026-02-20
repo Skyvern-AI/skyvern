@@ -1,13 +1,23 @@
 FROM node:20.12-slim
 
+# Install tini for proper signal handling and zombie reaping
+RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY ./skyvern-frontend /app
 COPY ./entrypoint-skyvernui.sh /app/entrypoint-skyvernui.sh
 RUN npm install
 
-ENV VITE_API_BASE_URL=http://localhost:8000/api/v1
-ENV VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
-ENV VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
+# Placeholders for runtime injection (will be replaced by entrypoint script)
+ENV VITE_API_BASE_URL=__VITE_API_BASE_URL_PLACEHOLDER__
+ENV VITE_WSS_BASE_URL=__VITE_WSS_BASE_URL_PLACEHOLDER__
+ENV VITE_ARTIFACT_API_BASE_URL=__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__
+ENV VITE_SKYVERN_API_KEY=__SKYVERN_API_KEY_PLACEHOLDER__
 
-CMD [ "/bin/bash", "/app/entrypoint-skyvernui.sh" ]
+# Build at image time
+RUN npm run build
+
+# Use tini as init for proper signal handling and zombie reaping
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/bin/bash", "/app/entrypoint-skyvernui.sh"]
 

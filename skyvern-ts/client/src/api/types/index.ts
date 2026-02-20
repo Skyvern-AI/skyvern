@@ -28,6 +28,7 @@ export * from "./BrowserProfile.js";
 export * from "./BrowserSessionResponse.js";
 export * from "./ChangeTierResponse.js";
 export * from "./CheckoutSessionResponse.js";
+export * from "./ClearCacheResponse.js";
 export * from "./ClickAction.js";
 export * from "./ClickContext.js";
 export * from "./CodeBlock.js";
