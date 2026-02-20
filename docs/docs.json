@@ -121,7 +121,8 @@
               "cloud/managing-credentials/credentials-overview",
               "cloud/managing-credentials/password-credentials",
               "cloud/managing-credentials/credit-card-credentials",
-              "cloud/managing-credentials/totp-setup"
+              "cloud/managing-credentials/totp-setup",
+              "cloud/managing-credentials/external-providers"
             ]
           },
           {

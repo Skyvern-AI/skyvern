@@ -14,6 +14,8 @@ The preferred method. Store a TOTP secret key in a password credential, and Skyv
 
 The secret key is the base32-encoded string behind the QR code you'd normally scan. Copy it from your password manager (Bitwarden: TOTP field; 1Password: One-Time Password field) or look for a "Can't scan the QR code?" link during the site's 2FA setup.
 
+{/* <img src="/images/cloud/credentials-totp-authenticator.png" alt="Authenticator App secret key field on a credential" /> */}
+
 ## Email and SMS codes
 
 When a site sends codes via email or text, someone (or something) needs to deliver the code to Skyvern.
@@ -25,6 +27,8 @@ The flow:
 3. You push the code to Skyvern via the **2FA tab** or the API
 4. Skyvern enters the code and completes the login
 
+{/* <img src="/images/cloud/credentials-2fa-tab.png" alt="The 2FA tab on the Credentials page" /> */}
+
 ### Pushing a code manually
 
 Open the **2FA** tab on the Credentials page. The **Push a 2FA Code** form has two fields:
@@ -33,6 +37,8 @@ Open the **2FA** tab on the Credentials page. The **Push a 2FA Code** form has t
 |-------|--------------|
 | **Identifier** | The email address or phone number that received the code |
 | **Verification content** | The full email/SMS body, or just the code itself — Skyvern extracts the digits automatically |
+
+{/* <img src="/images/cloud/credentials-2fa-push-form.png" alt="Push a 2FA Code form" /> */}
 
 <Tip>
 If multiple workflows are running simultaneously, click **Add optional metadata** to link the code to a specific run using the workflow run ID, workflow ID, or task ID.
@@ -53,15 +59,30 @@ curl -X POST "https://api.skyvern.com/v1/credentials/totp" \
   }'
 ```
 
+**Response:**
+```json
+{
+  "totp_code_id": "tc_abc123",
+  "totp_identifier": "user@example.com",
+  "code": "847291",
+  "source": "email_forwarder",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
 The `source` field is a free-text label for your own tracking (e.g., `"email_forwarder"`, `"twilio_webhook"`).
 
-This turns email-based 2FA into something nearly as automated as authenticator app — the main difference is latency while the email arrives and gets forwarded.
+<Tip>
+This turns email-based 2FA into something nearly as automated as an authenticator app — the main difference is latency while the email arrives and gets forwarded.
+</Tip>
 
 ## Viewing past codes
 
 The table below the push form shows all 2FA codes your organization has received: identifier, extracted code, source type, associated workflow run, and timestamps. Filter by identifier, OTP type (numeric code vs. magic link), and number of results per page.
 
 Use this for auditing and debugging — confirming that a code was received and delivered to the right run.
+
+{/* <img src="/images/cloud/credentials-2fa-history.png" alt="2FA code history table with filter options" /> */}
 
 <CardGroup cols={2}>
   <Card
@@ -76,6 +97,6 @@ Use this for auditing and debugging — confirming that a code was received and 
     icon="lock"
     href="/cloud/managing-credentials/credentials-overview"
   >
-    All credential types, external providers, and security model
+    Security model, quick start, and all credential types
   </Card>
 </CardGroup>
