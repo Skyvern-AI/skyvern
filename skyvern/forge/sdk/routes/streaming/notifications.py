@@ -9,7 +9,7 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
-from skyvern.forge.sdk.routes.routers import base_router
+from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import _auth as local_auth
 from skyvern.forge.sdk.routes.streaming.auth import auth as real_auth
 
@@ -19,6 +19,23 @@ HEARTBEAT_INTERVAL = 60
 
 @base_router.websocket("/stream/notifications")
 async def notification_stream(
+    websocket: WebSocket,
+    apikey: str | None = None,
+    token: str | None = None,
+) -> None:
+    return await _notification_stream_handler(websocket=websocket, apikey=apikey, token=token)
+
+
+@legacy_base_router.websocket("/stream/notifications")
+async def notification_stream_legacy(
+    websocket: WebSocket,
+    apikey: str | None = None,
+    token: str | None = None,
+) -> None:
+    return await _notification_stream_handler(websocket=websocket, apikey=apikey, token=token)
+
+
+async def _notification_stream_handler(
     websocket: WebSocket,
     apikey: str | None = None,
     token: str | None = None,
@@ -37,15 +54,22 @@ async def notification_stream(
         # Send initial state: all currently active verification requests
         active_requests = await app.DATABASE.get_active_verification_requests(organization_id)
         for req in active_requests:
-            await websocket.send_json(
-                {
-                    "type": "verification_code_required",
-                    "task_id": req.get("task_id"),
-                    "workflow_run_id": req.get("workflow_run_id"),
-                    "identifier": req.get("verification_code_identifier"),
-                    "polling_started_at": req.get("verification_code_polling_started_at"),
-                }
-            )
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "verification_code_required",
+                        "task_id": req.get("task_id"),
+                        "workflow_run_id": req.get("workflow_run_id"),
+                        "identifier": req.get("verification_code_identifier"),
+                        "polling_started_at": req.get("verification_code_polling_started_at"),
+                    }
+                )
+            except (WebSocketDisconnect, ConnectionClosedOK, ConnectionClosedError, RuntimeError):
+                LOG.info(
+                    "Notifications: Client disconnected during initial state send",
+                    organization_id=organization_id,
+                )
+                return
 
         # Watch for client disconnect while streaming events
         disconnect_event = asyncio.Event()
@@ -82,6 +106,12 @@ async def notification_stream(
                         )
                         return
                 except asyncio.CancelledError:
+                    return
+                except (WebSocketDisconnect, ConnectionClosedOK, ConnectionClosedError, RuntimeError):
+                    LOG.info(
+                        "Notifications: Client disconnected during send",
+                        organization_id=organization_id,
+                    )
                     return
         finally:
             watcher.cancel()
