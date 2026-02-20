@@ -24,6 +24,7 @@ from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.change_tier_response import ChangeTierResponse
 from .types.checkout_session_response import CheckoutSessionResponse
+from .types.clear_cache_response import ClearCacheResponse
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
@@ -2864,6 +2865,56 @@ class RawSkyvern:
                     CreateScriptResponse,
                     parse_obj_as(
                         type_=CreateScriptResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def clear_workflow_cache(
+        self, workflow_permanent_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> HttpResponse[ClearCacheResponse]:
+        """
+        Clear all cached scripts for a specific workflow. This will trigger script regeneration on subsequent runs.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            The workflow permanent ID to clear cache for
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[ClearCacheResponse]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/scripts/{jsonable_encoder(workflow_permanent_id)}/cache",
+            method="DELETE",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    ClearCacheResponse,
+                    parse_obj_as(
+                        type_=ClearCacheResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -5993,6 +6044,56 @@ class AsyncRawSkyvern:
                     CreateScriptResponse,
                     parse_obj_as(
                         type_=CreateScriptResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def clear_workflow_cache(
+        self, workflow_permanent_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> AsyncHttpResponse[ClearCacheResponse]:
+        """
+        Clear all cached scripts for a specific workflow. This will trigger script regeneration on subsequent runs.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            The workflow permanent ID to clear cache for
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[ClearCacheResponse]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/scripts/{jsonable_encoder(workflow_permanent_id)}/cache",
+            method="DELETE",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    ClearCacheResponse,
+                    parse_obj_as(
+                        type_=ClearCacheResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )

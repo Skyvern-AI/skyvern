@@ -3300,6 +3300,73 @@
         }
       }
     },
+    "/v1/scripts/{workflow_permanent_id}/cache": {
+      "delete": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Clear cached scripts for workflow",
+        "description": "Clear all cached scripts for a specific workflow. This will trigger script regeneration on subsequent runs.",
+        "operationId": "clear_workflow_cache_v1_scripts__workflow_permanent_id__cache_delete",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The workflow permanent ID to clear cache for",
+              "examples": [
+                "wpid_abc123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "The workflow permanent ID to clear cache for"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClearCacheResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "clear_workflow_cache"
+      }
+    },
     "/v1/sdk/run_action": {
       "post": {
         "tags": [
@@ -6221,6 +6288,27 @@
         ],
         "title": "CheckoutSubscriptionRequest"
       },
+      "ClearCacheResponse": {
+        "properties": {
+          "deleted_count": {
+            "type": "integer",
+            "title": "Deleted Count",
+            "description": "Number of cached entries deleted"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Status message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "deleted_count",
+          "message"
+        ],
+        "title": "ClearCacheResponse",
+        "description": "Response model for cache clearing operations."
+      },
       "ClickAction": {
         "properties": {
           "type": {
@@ -7178,6 +7266,30 @@
             "examples": [
               "Amazon Login"
             ]
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "Browser profile ID linked to this credential"
+          },
+          "tested_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tested Url",
+            "description": "Login page URL used during the credential test"
           }
         },
         "type": "object",
@@ -18159,6 +18271,34 @@
               }
             ],
             "title": "Code Gen"
+          },
+          "waiting_for_verification_code": {
+            "type": "boolean",
+            "title": "Waiting For Verification Code",
+            "default": false
+          },
+          "verification_code_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verification Code Identifier"
+          },
+          "verification_code_polling_started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verification Code Polling Started At"
           },
           "queued_at": {
             "anyOf": [

@@ -1,7 +1,12 @@
 from datetime import datetime
 from enum import StrEnum
+from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import status
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from skyvern.exceptions import SkyvernHTTPException
+from skyvern.utils.url_validators import validate_url
 
 
 class CredentialVaultType(StrEnum):
@@ -170,6 +175,8 @@ class CredentialResponse(BaseModel):
     )
     credential_type: CredentialType = Field(..., description="Type of the credential")
     name: str = Field(..., description="Name of the credential", examples=["Amazon Login"])
+    browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
+    tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
 
 
 class Credential(BaseModel):
@@ -199,7 +206,159 @@ class Credential(BaseModel):
     card_last4: str | None = Field(..., description="For credit_card credentials: the last four digits of the card")
     card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")
     secret_label: str | None = Field(default=None, description="For secret credentials: optional label")
+    browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
+    tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
     deleted_at: datetime | None = Field(None, description="Timestamp when the credential was deleted, if applicable")
+
+
+class UpdateCredentialRequest(BaseModel):
+    """Request model for updating credential metadata."""
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        description="New name for the credential",
+        examples=["My Updated Credential"],
+    )
+    tested_url: str | None = Field(
+        default=None,
+        description="Optional login page URL associated with this credential",
+        examples=["https://example.com/login"],
+    )
+
+
+class TestCredentialRequest(BaseModel):
+    """Request model for testing a credential by logging into a website."""
+
+    url: str = Field(
+        ...,
+        description="The login page URL to test the credential against",
+        examples=["https://example.com/login"],
+    )
+    save_browser_profile: bool = Field(
+        default=True,
+        description="Whether to save the browser profile after a successful login test",
+    )
+
+    @model_validator(mode="after")
+    def validate_url(self) -> Self:
+        result = validate_url(self.url)
+        if result is None:
+            raise SkyvernHTTPException(message=f"Invalid URL: {self.url}", status_code=status.HTTP_400_BAD_REQUEST)
+        self.url = result
+        return self
+
+
+class TestLoginRequest(BaseModel):
+    """Request model for testing a login with inline credentials (no saved credential required)."""
+
+    url: str = Field(
+        ...,
+        description="The login page URL to test against",
+        examples=["https://example.com/login"],
+    )
+    username: str = Field(
+        ...,
+        min_length=1,
+        description="The username to test",
+        examples=["user@example.com"],
+    )
+    password: str = Field(
+        ...,
+        min_length=1,
+        description="The password to test",
+        examples=["securepassword123"],
+    )
+    totp: str | None = Field(
+        default=None,
+        description="Optional TOTP secret for 2FA",
+    )
+    totp_type: TotpType = Field(
+        default=TotpType.NONE,
+        description="Type of 2FA method",
+    )
+    totp_identifier: str | None = Field(
+        default=None,
+        description="Identifier (email or phone) for TOTP",
+    )
+
+    @model_validator(mode="after")
+    def validate_url(self) -> Self:
+        result = validate_url(self.url)
+        if result is None:
+            raise SkyvernHTTPException(message=f"Invalid URL: {self.url}", status_code=status.HTTP_400_BAD_REQUEST)
+        self.url = result
+        return self
+
+
+class TestCredentialResponse(BaseModel):
+    """Response model for a credential test initiation."""
+
+    credential_id: str = Field(..., description="The credential being tested")
+    workflow_run_id: str = Field(
+        ...,
+        description="The workflow run ID to poll for test status",
+        examples=["wr_1234567890"],
+    )
+    status: str = Field(
+        ...,
+        description="Current status of the test",
+        examples=["running"],
+    )
+
+
+class TestLoginResponse(BaseModel):
+    """Response model for an inline login test (no saved credential)."""
+
+    credential_id: str = Field(
+        ...,
+        description="The temporary credential ID created for this test",
+    )
+    workflow_run_id: str = Field(
+        ...,
+        description="The workflow run ID to poll for test status",
+        examples=["wr_1234567890"],
+    )
+    status: str = Field(
+        ...,
+        description="Current status of the test",
+        examples=["running"],
+    )
+
+
+class TestCredentialStatusResponse(BaseModel):
+    """Response model for credential test status polling."""
+
+    credential_id: str = Field(..., description="The credential being tested")
+    workflow_run_id: str = Field(..., description="The workflow run ID")
+    status: str = Field(
+        ...,
+        description="Current status: created, running, completed, failed, timed_out",
+        examples=["completed"],
+    )
+    failure_reason: str | None = Field(default=None, description="Reason for failure, if any")
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="Browser profile ID created from successful test.",
+    )
+    tested_url: str | None = Field(
+        default=None,
+        description="Login page URL used during the credential test.",
+    )
+    browser_profile_failure_reason: str | None = Field(
+        default=None,
+        description="Reason the browser profile failed to save, if applicable.",
+    )
+
+
+class CancelTestResponse(BaseModel):
+    """Response model for canceling a credential test."""
+
+    status: str = Field(
+        ...,
+        description="Result of the cancellation: 'canceled' or 'cancel_failed'",
+        examples=["canceled"],
+    )

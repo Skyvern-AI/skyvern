@@ -1484,6 +1484,9 @@ describe("SkyvernClient", () => {
                 sequential_key: "sequential_key",
                 ai_fallback: true,
                 code_gen: true,
+                waiting_for_verification_code: true,
+                verification_code_identifier: "verification_code_identifier",
+                verification_code_polling_started_at: "2024-01-15T09:30:00Z",
                 queued_at: "2024-01-15T09:30:00Z",
                 started_at: "2024-01-15T09:30:00Z",
                 finished_at: "2024-01-15T09:30:00Z",
@@ -1531,6 +1534,9 @@ describe("SkyvernClient", () => {
                 sequential_key: "sequential_key",
                 ai_fallback: true,
                 code_gen: true,
+                waiting_for_verification_code: true,
+                verification_code_identifier: "verification_code_identifier",
+                verification_code_polling_started_at: "2024-01-15T09:30:00Z",
                 queued_at: "2024-01-15T09:30:00Z",
                 started_at: "2024-01-15T09:30:00Z",
                 finished_at: "2024-01-15T09:30:00Z",
@@ -2627,6 +2633,8 @@ describe("SkyvernClient", () => {
                 },
                 credential_type: "password",
                 name: "Amazon Login",
+                browser_profile_id: "browser_profile_id",
+                tested_url: "tested_url",
             },
         ];
         server.mockEndpoint().get("/v1/credentials").respondWith().statusCode(200).jsonBody(rawResponseBody).build();
@@ -2645,6 +2653,8 @@ describe("SkyvernClient", () => {
                 },
                 credential_type: "password",
                 name: "Amazon Login",
+                browser_profile_id: "browser_profile_id",
+                tested_url: "tested_url",
             },
         ]);
     });
@@ -2678,6 +2688,8 @@ describe("SkyvernClient", () => {
             },
             credential_type: "password",
             name: "Amazon Login",
+            browser_profile_id: "browser_profile_id",
+            tested_url: "tested_url",
         };
         server
             .mockEndpoint()
@@ -2706,6 +2718,8 @@ describe("SkyvernClient", () => {
             },
             credential_type: "password",
             name: "Amazon Login",
+            browser_profile_id: "browser_profile_id",
+            tested_url: "tested_url",
         });
     });
 
@@ -2756,6 +2770,8 @@ describe("SkyvernClient", () => {
             },
             credential_type: "password",
             name: "Amazon Login",
+            browser_profile_id: "browser_profile_id",
+            tested_url: "tested_url",
         };
         server
             .mockEndpoint()
@@ -2783,6 +2799,8 @@ describe("SkyvernClient", () => {
             },
             credential_type: "password",
             name: "Amazon Login",
+            browser_profile_id: "browser_profile_id",
+            tested_url: "tested_url",
         });
     });
 
@@ -2857,6 +2875,8 @@ describe("SkyvernClient", () => {
             },
             credential_type: "password",
             name: "Amazon Login",
+            browser_profile_id: "browser_profile_id",
+            tested_url: "tested_url",
         };
         server
             .mockEndpoint()
@@ -2876,6 +2896,8 @@ describe("SkyvernClient", () => {
             },
             credential_type: "password",
             name: "Amazon Login",
+            browser_profile_id: "browser_profile_id",
+            tested_url: "tested_url",
         });
     });
 
@@ -3432,6 +3454,44 @@ describe("SkyvernClient", () => {
                     },
                 ],
             });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("clear_workflow_cache (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { deleted_count: 1, message: "message" };
+        server
+            .mockEndpoint()
+            .delete("/v1/scripts/wpid_abc123/cache")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.clearWorkflowCache("wpid_abc123");
+        expect(response).toEqual({
+            deleted_count: 1,
+            message: "message",
+        });
+    });
+
+    test("clear_workflow_cache (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .delete("/v1/scripts/workflow_permanent_id/cache")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.clearWorkflowCache("workflow_permanent_id");
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
