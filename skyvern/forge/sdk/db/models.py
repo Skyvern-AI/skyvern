@@ -118,7 +118,6 @@ class TaskModel(Base):
     model = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
     download_timeout = Column(Numeric, nullable=True)
-    # 2FA verification code waiting state fields
     waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
@@ -356,7 +355,6 @@ class WorkflowRunModel(Base):
     debug_session_id: Column = Column(String, nullable=True)
     ai_fallback = Column(Boolean, nullable=True)
     code_gen = Column(Boolean, nullable=True)
-    # 2FA verification code waiting state fields
     waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
