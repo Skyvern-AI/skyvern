@@ -12,6 +12,7 @@ import { useContext, useMemo } from "react";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { ExclamationTriangleIcon, PlusIcon } from "@radix-ui/react-icons";
+import { getHostname } from "@/util/getHostname";
 import {
   CredentialModalTypes,
   useCredentialModalState,
@@ -30,6 +31,10 @@ type Props = {
   nodeId: string;
   value?: string;
   onChange?: (value: string) => void;
+  /** Called when a credential with a tested_url is selected to auto-fill the login block URL */
+  onUrlAutoFill?: (url: string) => void;
+  /** Current URL value of the login block — skip auto-fill if already set */
+  currentUrl?: string;
 };
 
 // Function to generate a unique credential parameter key
@@ -50,7 +55,13 @@ function generateDefaultCredentialParameterKey(existingKeys: string[]): string {
   return `${baseName}_${counter}`;
 }
 
-function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
+function LoginBlockCredentialSelector({
+  nodeId,
+  value,
+  onChange,
+  onUrlAutoFill,
+  currentUrl,
+}: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
   const nodes = useNodes<AppNode>();
   const {
@@ -117,6 +128,8 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
     label: credential.name,
     value: credential.credential_id,
     type: "credential" as const,
+    hasBrowserProfile: !!credential.browser_profile_id,
+    browserProfileUrl: credential.tested_url ?? null,
   }));
 
   // Only show non-Skyvern credential parameters (Bitwarden, 1Password, Azure Vault)
@@ -226,6 +239,16 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
           // with the new value, so selectedCredentialId computes correctly
           setWorkflowParameters(newParameters);
           onChange?.(parameterKeyToUse);
+
+          // Auto-fill the login block URL from the credential's tested_url
+          // when the URL field is empty.
+          if (
+            selectedCredential &&
+            !currentUrl?.trim() &&
+            selectedCredential.browserProfileUrl
+          ) {
+            onUrlAutoFill?.(selectedCredential.browserProfileUrl);
+          }
         }}
       >
         <SelectTrigger
@@ -247,7 +270,21 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
         <SelectContent>
           {options.map((option) => (
             <SelectItem key={option.value} value={option.value}>
-              {option.label}
+              <div className="flex items-center gap-2">
+                <span>{option.label}</span>
+                {"hasBrowserProfile" in option && option.hasBrowserProfile && (
+                  <>
+                    <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-[10px] text-green-400">
+                      login-free
+                    </span>
+                    {option.browserProfileUrl && (
+                      <span className="text-[10px] text-muted-foreground">
+                        {getHostname(option.browserProfileUrl)}
+                      </span>
+                    )}
+                  </>
+                )}
+              </div>
             </SelectItem>
           ))}
           <SelectItem value="new">
