@@ -13,7 +13,7 @@ export function useDiagnosisChatHistoryQuery({
   return useQuery<DiagnosisChatHistoryResponse>({
     queryKey: ["diagnosisChat", workflowRunId],
     queryFn: async () => {
-      const client = await getClient(credentialGetter);
+      const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.get<DiagnosisChatHistoryResponse>(
         `/workflow_runs/${workflowRunId}/diagnosis/history`,
       );

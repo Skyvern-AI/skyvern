@@ -112,7 +112,7 @@ export function DiagnosisChatPanel({
         const sseClient = await getSseClient(credentialGetter);
 
         await sseClient.postStreaming<DiagnosisStreamMessage>(
-          `/v1/workflow_runs/${workflowRunId}/diagnosis/chat`,
+          `/workflow_runs/${workflowRunId}/diagnosis/chat`,
           {
             message,
             diagnosis_conversation_id: conversationId,
