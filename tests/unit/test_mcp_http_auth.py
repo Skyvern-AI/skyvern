@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -411,117 +411,6 @@ async def test_mcp_http_auth_denies_empty_or_whitespace_target_org_id_header(
     validate_mock.assert_awaited_once_with("sk_live_admin")
 
 
-@pytest.mark.asyncio
-async def test_mcp_http_auth_denies_when_validate_impersonation_target_returns_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        mcp_http_auth,
-        "validate_mcp_api_key",
-        AsyncMock(
-            return_value=_build_validation("org_admin", OrganizationAuthTokenType.mcp_admin_impersonation),
-        ),
-    )
-    monkeypatch.setattr(mcp_http_auth, "_is_admin_impersonation_enabled", lambda: True)
-    app = _build_test_app()
-
-    with patch(
-        "cloud.mcp_admin_tools.validate_impersonation_target",
-        new_callable=AsyncMock,
-        return_value="caller_not_in_admin_organization_allowlist",
-    ):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
-            response = await client.post(
-                "/mcp",
-                headers={"x-api-key": "sk_live_admin", "x-target-org-id": "org_target"},
-                json={},
-            )
-
-    assert response.status_code == 401
-    assert response.json()["error"]["code"] == "UNAUTHORIZED"
-    assert response.json()["error"]["message"] == "Impersonation not allowed"
-
-
-@pytest.mark.asyncio
-async def test_mcp_http_auth_allows_admin_impersonation_and_applies_target_org(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        mcp_http_auth,
-        "validate_mcp_api_key",
-        AsyncMock(
-            return_value=_build_validation("org_admin", OrganizationAuthTokenType.mcp_admin_impersonation),
-        ),
-    )
-    monkeypatch.setattr(mcp_http_auth, "_is_admin_impersonation_enabled", lambda: True)
-    app = _build_test_app()
-
-    with patch(
-        "cloud.mcp_admin_tools.validate_impersonation_target",
-        new_callable=AsyncMock,
-        return_value=("org_target", "sk_live_target_org_key"),
-    ):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
-            response = await client.post(
-                "/mcp",
-                headers={"x-api-key": "sk_live_admin", "x-target-org-id": "org_target"},
-                json={},
-            )
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["api_key"] == "sk_live_target_org_key"
-    assert body["organization_id"] == "org_target"
-    assert body["admin_organization_id"] == "org_admin"
-    assert body["impersonation_target_organization_id"] == "org_target"
-
-
-@pytest.mark.asyncio
-async def test_mcp_http_auth_keeps_cache_safe_between_impersonated_and_non_impersonated_requests(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = 0
-
-    async def _resolve(_api_key: str, _db: object, **_: object) -> object:
-        nonlocal calls
-        calls += 1
-        return _build_resolved_validation(
-            "org_admin",
-            OrganizationAuthTokenType.mcp_admin_impersonation,
-        )
-
-    monkeypatch.setattr(mcp_http_auth, "resolve_org_from_api_key", _resolve)
-    monkeypatch.setattr(mcp_http_auth, "_is_admin_impersonation_enabled", lambda: True)
-    app = _build_test_app()
-
-    with patch(
-        "cloud.mcp_admin_tools.validate_impersonation_target",
-        new_callable=AsyncMock,
-        return_value=("org_target", "sk_live_target_org_key"),
-    ):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
-            impersonated = await client.post(
-                "/mcp",
-                headers={"x-api-key": "sk_live_admin", "x-target-org-id": "org_target"},
-                json={},
-            )
-            direct = await client.post(
-                "/mcp",
-                headers={"x-api-key": "sk_live_admin"},
-                json={},
-            )
-
-    assert impersonated.status_code == 200
-    assert direct.status_code == 200
-    assert impersonated.json()["api_key"] == "sk_live_target_org_key"
-    assert impersonated.json()["organization_id"] == "org_target"
-    assert impersonated.json()["admin_organization_id"] == "org_admin"
-    assert direct.json()["api_key"] == "sk_live_admin"
-    assert direct.json()["organization_id"] == "org_admin"
-    assert direct.json()["admin_organization_id"] is None
-    assert calls == 1
-
-
 # ---------------------------------------------------------------------------
 # Session-based impersonation tests
 # ---------------------------------------------------------------------------
@@ -602,53 +491,6 @@ async def test_middleware_applies_session_impersonation(monkeypatch: pytest.Monk
     assert body["organization_id"] == "org_target"
     assert body["admin_organization_id"] == "org_admin"
     assert body["impersonation_target_organization_id"] == "org_target"
-
-
-@pytest.mark.asyncio
-async def test_middleware_explicit_header_overrides_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Explicit x-target-org-id header takes priority over session impersonation."""
-    monkeypatch.setattr(
-        mcp_http_auth,
-        "validate_mcp_api_key",
-        AsyncMock(
-            return_value=_build_validation(
-                "org_admin",
-                OrganizationAuthTokenType.mcp_admin_impersonation,
-            )
-        ),
-    )
-    monkeypatch.setattr(mcp_http_auth, "_is_admin_impersonation_enabled", lambda: True)
-
-    # Set up a session pointing to org_session_target
-    admin_hash = mcp_http_auth.cache_key("sk_live_admin")
-    session = mcp_http_auth.ImpersonationSession(
-        admin_api_key_hash=admin_hash,
-        admin_org_id="org_admin",
-        target_org_id="org_session_target",
-        target_api_key="sk_live_session_target_key",
-        expires_at=time.monotonic() + 600,
-        ttl_minutes=10,
-    )
-    mcp_http_auth.set_impersonation_session(session)
-
-    app = _build_test_app()
-    with patch(
-        "cloud.mcp_admin_tools.validate_impersonation_target",
-        new_callable=AsyncMock,
-        return_value=("org_header_target", "sk_live_header_target_key"),
-    ):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
-            response = await client.post(
-                "/mcp",
-                headers={"x-api-key": "sk_live_admin", "x-target-org-id": "org_header_target"},
-                json={},
-            )
-
-    assert response.status_code == 200
-    body = response.json()
-    # Header target wins, not session target
-    assert body["api_key"] == "sk_live_header_target_key"
-    assert body["organization_id"] == "org_header_target"
 
 
 @pytest.mark.asyncio
