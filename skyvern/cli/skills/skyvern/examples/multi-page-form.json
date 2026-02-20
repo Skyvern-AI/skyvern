@@ -1,0 +1,43 @@
+{
+  "title": "Submit Multi-Page Intake Form",
+  "workflow_definition": {
+    "version": 2,
+    "parameters": [
+      {"parameter_type": "workflow", "key": "start_url", "workflow_parameter_type": "string"},
+      {"parameter_type": "workflow", "key": "first_name", "workflow_parameter_type": "string"},
+      {"parameter_type": "workflow", "key": "last_name", "workflow_parameter_type": "string"},
+      {"parameter_type": "workflow", "key": "email", "workflow_parameter_type": "string"}
+    ],
+    "blocks": [
+      {
+        "block_type": "navigation",
+        "label": "personal_info",
+        "url": "{{start_url}}",
+        "title": "Personal Info",
+        "navigation_goal": "Fill first name {{first_name}}, last name {{last_name}}, email {{email}}, then click Continue.",
+        "next_block_label": "review_submit"
+      },
+      {
+        "block_type": "navigation",
+        "label": "review_submit",
+        "title": "Review and Submit",
+        "navigation_goal": "Review entered data and submit the form only once.",
+        "next_block_label": "extract_confirmation"
+      },
+      {
+        "block_type": "extraction",
+        "label": "extract_confirmation",
+        "title": "Extract Confirmation",
+        "data_extraction_goal": "Extract submission confirmation number and status text.",
+        "data_schema": {
+          "type": "object",
+          "properties": {
+            "confirmation_number": {"type": "string"},
+            "status": {"type": "string"}
+          },
+          "required": ["status"]
+        }
+      }
+    ]
+  }
+}
