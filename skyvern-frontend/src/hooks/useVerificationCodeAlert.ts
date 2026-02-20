@@ -1,11 +1,16 @@
-import { useState, useEffect, useMemo, useRef } from "react";
-import { LockClosedIcon, ExternalLinkIcon } from "@radix-ui/react-icons";
-import { Link } from "react-router-dom";
+import { useState, useEffect, useMemo, useRef, createElement } from "react";
 import { toast } from "@/components/ui/use-toast";
-import { createElement } from "react";
+import { VerificationToastContent } from "@/components/VerificationToast";
 import { enable2faNotifications } from "@/util/env";
 
-const VERIFICATION_CODE_TIMEOUT_MINS = 15;
+/** How long (minutes) before we consider the 2FA request timed out */
+const VERIFICATION_TIMEOUT_MINS = 15;
+/** Seconds remaining at which the countdown turns "critical" (red) */
+const CRITICAL_TIME_THRESHOLD_SEC = 60;
+/** How long the in-app toast stays visible (ms) */
+const TOAST_AUTO_DISMISS_MS = 15_000;
+/** Timer tick interval (ms) */
+const TIMER_TICK_MS = 1_000;
 
 // Module-level set to track which notification tags have already fired,
 // preventing re-notification when navigating to a workflow page that
@@ -35,9 +40,6 @@ function useVerificationCodeAlert({
 }: UseVerificationCodeAlertOptions): UseVerificationCodeAlertReturn {
   const [timeRemaining, setTimeRemaining] = useState<number | null>(null);
   const toastDismissRef = useRef<(() => void) | null>(null);
-  const autoDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null,
-  );
 
   // Countdown timer — reset when waiting state changes
   useEffect(() => {
@@ -47,15 +49,11 @@ function useVerificationCodeAlert({
       // Dismiss toast immediately when no longer waiting for code
       toastDismissRef.current?.();
       toastDismissRef.current = null;
-      if (autoDismissTimerRef.current) {
-        clearTimeout(autoDismissTimerRef.current);
-        autoDismissTimerRef.current = null;
-      }
       return;
     }
 
     const startTime = new Date(pollingStartedAt).getTime();
-    const timeoutMs = VERIFICATION_CODE_TIMEOUT_MINS * 60 * 1000;
+    const timeoutMs = VERIFICATION_TIMEOUT_MINS * 60 * TIMER_TICK_MS;
 
     const updateTimer = () => {
       const now = Date.now();
@@ -65,7 +63,7 @@ function useVerificationCodeAlert({
     };
 
     updateTimer();
-    const interval = setInterval(updateTimer, 1000);
+    const interval = setInterval(updateTimer, TIMER_TICK_MS);
     return () => clearInterval(interval);
   }, [isWaitingForCode, pollingStartedAt, notificationTag]);
 
@@ -106,57 +104,23 @@ function useVerificationCodeAlert({
       console.error("Failed to create audio:", e);
     }
 
-    // In-app toast — Figma Option C style (dark bg, amber outline, lock icon, nav link)
+    // In-app toast — uses VerificationToastContent for clean JSX rendering
     const result = toast({
       variant: "default",
       className: "border-warning/50",
-      title: createElement(
-        "div",
-        { className: "flex items-start gap-2" },
-        createElement(LockClosedIcon, {
-          className: "mt-0.5 h-4 w-4 flex-shrink-0 text-warning",
-        }),
-        createElement("span", null, "2FA Code Required"),
-      ),
-      description: createElement(
-        "div",
-        { className: "space-y-2" },
-        createElement(
-          "p",
-          { className: "text-muted-foreground" },
-          `${label} needs verification to continue.`,
-        ),
-        navigateUrl
-          ? createElement(
-              Link,
-              {
-                to: navigateUrl,
-                className:
-                  "inline-flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300",
-              },
-              "Go to workflow",
-              createElement(ExternalLinkIcon, { className: "h-3 w-3" }),
-            )
-          : null,
-      ),
+      duration: TOAST_AUTO_DISMISS_MS,
+      description: createElement(VerificationToastContent, {
+        label,
+        navigateUrl,
+      }),
     });
 
     toastDismissRef.current = result.dismiss;
-    autoDismissTimerRef.current = setTimeout(() => {
-      result.dismiss();
-      autoDismissTimerRef.current = null;
-    }, 15_000);
-
-    return () => {
-      if (autoDismissTimerRef.current) {
-        clearTimeout(autoDismissTimerRef.current);
-        autoDismissTimerRef.current = null;
-      }
-    };
   }, [isWaitingForCode, label, notificationTag, navigateUrl]);
 
   const isTimeCritical = useMemo(
-    () => timeRemaining !== null && timeRemaining <= 60,
+    () =>
+      timeRemaining !== null && timeRemaining <= CRITICAL_TIME_THRESHOLD_SEC,
     [timeRemaining],
   );
   const isTimedOut = useMemo(
