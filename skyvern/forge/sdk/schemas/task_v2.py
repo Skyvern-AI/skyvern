@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from skyvern.config import settings
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 from skyvern.utils.url_validators import validate_url
 
@@ -95,7 +95,7 @@ class TaskV2(BaseModel):
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
-                mapping = settings.get_model_name_to_llm_key()
+                mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
                 llm_key = mapping.get(model_name, {}).get("llm_key")
                 if llm_key:
                     return llm_key
