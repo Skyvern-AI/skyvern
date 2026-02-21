@@ -6,7 +6,6 @@ from typing import Optional
 
 from alembic import command
 from alembic.config import Config
-from skyvern.analytics import capture_setup_error, capture_setup_event
 from skyvern.constants import REPO_ROOT_DIR
 
 
@@ -33,6 +32,9 @@ def setup_windows_event_loop_policy() -> None:
 
 
 def migrate_db() -> None:
+    # Import here to avoid circular import (config -> utils -> analytics -> config)
+    from skyvern.analytics import capture_setup_error, capture_setup_event
+
     capture_setup_event("migration-start")
     try:
         alembic_cfg = Config()
