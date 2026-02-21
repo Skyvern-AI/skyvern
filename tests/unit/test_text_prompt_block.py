@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.config import settings as base_settings
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.block import TextPromptBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 
@@ -20,6 +22,8 @@ block_module = sys.modules["skyvern.forge.sdk.workflow.models.block"]
     ],
 )
 async def test_text_prompt_block_uses_selected_model(monkeypatch, model_name, expected_llm_key):
+    # Reset SettingsManager to base settings so cloud overrides from earlier tests don't leak
+    monkeypatch.setattr(SettingsManager, "_SettingsManager__instance", base_settings)
     now = datetime.now(timezone.utc)
     output_parameter = OutputParameter(
         parameter_type=ParameterType.OUTPUT,
