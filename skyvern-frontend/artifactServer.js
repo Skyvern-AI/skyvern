@@ -13,7 +13,13 @@ app.use((req, res, next) => {
     const duration = Date.now() - start;
     const timestamp = new Date().toISOString();
     console.log(
-      `[${timestamp}] ${req.method} ${req.path} ${res.statusCode} ${duration}ms${req.query.path ? " " + req.query.path : ""}`,
+      "[%s] %s %s %d %dms%s",
+      timestamp,
+      req.method,
+      req.path,
+      res.statusCode,
+      duration,
+      req.query.path ? " " + req.query.path : "",
     );
   });
   next();
@@ -69,7 +75,7 @@ app.get("/artifact/text", (req, res) => {
 // Error handling middleware — catches unhandled errors in routes
 app.use((err, req, res, _next) => {
   const timestamp = new Date().toISOString();
-  console.error(`[${timestamp}] ERROR ${req.method} ${req.path}:`, err.message);
+  console.error("[%s] ERROR %s %s:", timestamp, req.method, req.path, err.message);
   res.status(500).send("Internal server error");
 });
 

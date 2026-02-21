@@ -13,7 +13,12 @@ const server = createServer((request, response) => {
     const duration = Date.now() - start;
     const timestamp = new Date().toISOString();
     console.log(
-      `[${timestamp}] ${request.method} ${request.url} ${response.statusCode} ${duration}ms`,
+      "[%s] %s %s %d %dms",
+      timestamp,
+      request.method,
+      request.url,
+      response.statusCode,
+      duration,
     );
   });
 
