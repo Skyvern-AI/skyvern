@@ -36,6 +36,8 @@ const server = createServer((request, response) => {
 });
 
 server.listen(8080, async () => {
-  console.log(`[${new Date().toISOString()}] Frontend server running at ${url}`);
+  console.log(
+    `[${new Date().toISOString()}] Frontend server running at ${url}`,
+  );
   await open(url);
 });

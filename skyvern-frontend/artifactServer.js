@@ -75,7 +75,13 @@ app.get("/artifact/text", (req, res) => {
 // Error handling middleware — catches unhandled errors in routes
 app.use((err, req, res, _next) => {
   const timestamp = new Date().toISOString();
-  console.error("[%s] ERROR %s %s:", timestamp, req.method, req.path, err.message);
+  console.error(
+    "[%s] ERROR %s %s:",
+    timestamp,
+    req.method,
+    req.path,
+    err.message,
+  );
   res.status(500).send("Internal server error");
 });
 
