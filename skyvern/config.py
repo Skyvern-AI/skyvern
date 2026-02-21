@@ -98,6 +98,13 @@ class Settings(BaseSettings):
     # Supported storage types: local, s3cloud, azureblob
     SKYVERN_STORAGE_TYPE: str = "local"
 
+    # Shared Redis URL (used by any service that needs Redis)
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    # Notification registry settings ("local" or "redis")
+    NOTIFICATION_REGISTRY_TYPE: str = "local"
+    NOTIFICATION_REDIS_URL: str | None = None  # Deprecated: falls back to REDIS_URL
+
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
@@ -427,6 +434,14 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
 
+    # Cleanup Cron Settings
+    ENABLE_CLEANUP_CRON: bool = False
+    """Enable periodic cleanup of temporary data (temp files and stale processes)."""
+    CLEANUP_CRON_INTERVAL_MINUTES: int = 10
+    """Interval in minutes for the cleanup cron job."""
+    CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
+    """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
+
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "skyvern"
@@ -498,6 +513,18 @@ class Settings(BaseSettings):
             "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
             "label": "Anthropic Claude 4.5 Haiku",
         }
+
+        # Anthropic Claude 4.6 Opus: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-opus-4-6"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4.6_OPUS_INFERENCE_PROFILE",
+                "label": "Anthropic Claude 4.6 Opus",
+            }
+        else:
+            mapping["claude-opus-4-6"] = {
+                "llm_key": "ANTHROPIC_CLAUDE4.6_OPUS",
+                "label": "Anthropic Claude 4.6 Opus",
+            }
 
         return mapping
 

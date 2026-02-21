@@ -14,6 +14,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { DeleteCredentialButton } from "./DeleteCredentialButton";
+import { getHostname } from "@/util/getHostname";
 import { CredentialsModal } from "./CredentialsModal";
 import { credentialTypeToModalType } from "./useCredentialModalState";
 
@@ -109,6 +110,18 @@ function CredentialItem({ credential }: Props) {
           {credential.name}
         </p>
         <p className="text-sm text-slate-400">{credential.credential_id}</p>
+        {credential.browser_profile_id && (
+          <div className="flex items-center gap-1 text-xs">
+            <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-green-400">
+              login-free
+            </span>
+            {credential.tested_url && (
+              <span className="text-muted-foreground">
+                {getHostname(credential.tested_url) ?? credential.tested_url}
+              </span>
+            )}
+          </div>
+        )}
       </div>
       {credentialDetails}
       <div className="ml-auto flex gap-1">

@@ -8,7 +8,9 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 
 class CreditCardCredentialResponse(UniversalBaseModel):
     """
-    Response model for credit card credentials, containing only the last four digits and brand.
+    Response model for credit card credentials — non-sensitive fields only.
+
+    SECURITY: Must NEVER include full card number, CVV, expiration date, or card holder name.
     """
 
     last_four: str = pydantic.Field()

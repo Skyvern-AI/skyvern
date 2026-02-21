@@ -182,3 +182,10 @@ class WorkflowScript(BaseModel):
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
+
+
+class ClearCacheResponse(BaseModel):
+    """Response model for cache clearing operations."""
+
+    deleted_count: int = Field(..., description="Number of cached entries deleted")
+    message: str = Field(..., description="Status message")

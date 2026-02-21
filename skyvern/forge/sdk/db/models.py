@@ -116,6 +116,9 @@ class TaskModel(Base):
     model = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
     download_timeout = Column(Numeric, nullable=True)
+    waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
+    verification_code_identifier = Column(String, nullable=True)
+    verification_code_polling_started_at = Column(DateTime, nullable=True)
 
 
 class StepModel(Base):
@@ -350,6 +353,9 @@ class WorkflowRunModel(Base):
     debug_session_id: Column = Column(String, nullable=True)
     ai_fallback = Column(Boolean, nullable=True)
     code_gen = Column(Boolean, nullable=True)
+    waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
+    verification_code_identifier = Column(String, nullable=True)
+    verification_code_polling_started_at = Column(DateTime, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -942,6 +948,8 @@ class CredentialModel(Base):
     card_last4 = Column(String, nullable=True)
     card_brand = Column(String, nullable=True)
     secret_label = Column(String, nullable=True)
+    browser_profile_id = Column(String, nullable=True)
+    tested_url = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

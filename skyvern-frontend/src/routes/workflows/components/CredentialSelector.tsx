@@ -10,6 +10,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCredentialsQuery } from "../hooks/useCredentialsQuery";
 import { PlusIcon } from "@radix-ui/react-icons";
+import { getHostname } from "@/util/getHostname";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import {
   CredentialModalTypes,
@@ -58,9 +59,23 @@ function CredentialSelector({ value, onChange }: Props) {
               value={credential.credential_id}
             >
               <div className="space-y-2">
-                <p className="text-sm font-medium">
-                  <SelectItemText>{credential.name}</SelectItemText>
-                </p>
+                <div className="flex items-center gap-2">
+                  <p className="text-sm font-medium">
+                    <SelectItemText>{credential.name}</SelectItemText>
+                  </p>
+                  {credential.browser_profile_id && (
+                    <>
+                      <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-[10px] text-green-400">
+                        login-free
+                      </span>
+                      {credential.tested_url && (
+                        <span className="text-[10px] text-muted-foreground">
+                          {getHostname(credential.tested_url)}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </div>
                 <p className="text-xs text-slate-400">
                   {credential.credential_type === "password"
                     ? "Password"

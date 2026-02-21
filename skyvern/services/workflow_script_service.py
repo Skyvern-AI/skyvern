@@ -57,6 +57,41 @@ def _make_workflow_script_cache_key(
     return (organization_id, workflow_permanent_id, cache_key_value, workflow_run_id, cache_key, statuses_key)
 
 
+def clear_workflow_script_cache(
+    organization_id: str,
+    workflow_permanent_id: str | None = None,
+) -> int:
+    """
+    Clear in-memory cached scripts for a workflow or all workflows in an organization.
+
+    Args:
+        organization_id: The organization ID to clear cache for.
+        workflow_permanent_id: Optional workflow permanent ID. If None, clears all workflows.
+
+    Returns:
+        The number of cache entries cleared.
+    """
+    keys_to_delete = []
+
+    for key in list(_workflow_script_cache.keys()):
+        # Key format: (org_id, workflow_permanent_id, cache_key_value, workflow_run_id, cache_key, statuses_key)
+        if len(key) >= 2 and key[0] == organization_id:
+            if workflow_permanent_id is None or key[1] == workflow_permanent_id:
+                keys_to_delete.append(key)
+
+    for key in keys_to_delete:
+        _workflow_script_cache.pop(key, None)
+
+    LOG.info(
+        "Cleared workflow script in-memory cache",
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cleared_count=len(keys_to_delete),
+    )
+
+    return len(keys_to_delete)
+
+
 async def generate_or_update_pending_workflow_script(
     workflow_run: WorkflowRun,
     workflow: Workflow,
