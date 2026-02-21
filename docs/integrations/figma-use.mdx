@@ -1,0 +1,219 @@
+---
+title: Figma MCP Server (figma-use)
+subtitle: Enable AI agents to create and modify Figma designs via Model Context Protocol
+slug: integrations/figma-use
+---
+
+The [figma-use](https://github.com/dannote/figma-use) MCP server enables AI assistants to programmatically create, modify, and export Figma designs. With 90+ tools, it's the most comprehensive write-capable Figma MCP available.
+
+<Note>
+Requires Figma Desktop running with Chrome DevTools Protocol (CDP) enabled.
+</Note>
+
+## What you can do
+
+| Category | Key tools | What they do |
+|----------|-----------|--------------|
+| **Create** | `figma_create_frame`, `figma_create_rect`, `figma_create_text`, `figma_create_icon` | Create shapes, frames, text, and 150k+ Iconify icons |
+| **Modify** | `figma_set_fill`, `figma_set_stroke`, `figma_set_layout`, `figma_set_font` | Change colors, styles, layouts, and properties |
+| **Query** | `figma_query`, `figma_find`, `figma_node_tree` | Find elements using XPath 3.1 selectors |
+| **Variables** | `figma_variable_create`, `figma_variable_set` | Manage design tokens and variables |
+| **Export** | `figma_export_png`, `figma_export_svg`, `figma_export_jsx` | Export designs in various formats |
+| **Render** | `figma_render` | Render JSX component trees directly to Figma |
+
+## Prerequisites
+
+- Figma Desktop (macOS, Windows, or Linux)
+- [Bun](https://bun.sh) runtime installed
+- Figma account with access to target design files
+
+## Setup
+
+### Step 1: Install figma-use
+
+```bash
+bun install -g @dannote/figma-use
+```
+
+### Step 2: Launch Figma Desktop with CDP enabled
+
+<Tabs>
+  <Tab title="macOS">
+    ```bash
+    open -a Figma --args --remote-debugging-port=9222
+    ```
+  </Tab>
+  <Tab title="Windows">
+    ```bash
+    "C:\Users\%USERNAME%\AppData\Local\Figma\Figma.exe" --remote-debugging-port=9222
+    ```
+  </Tab>
+  <Tab title="Linux">
+    ```bash
+    figma --remote-debugging-port=9222
+    ```
+  </Tab>
+</Tabs>
+
+Open the target Figma design file after launch.
+
+### Step 3: Start the MCP server
+
+```bash
+figma-use mcp serve
+```
+
+This starts the MCP HTTP server on **port 38451** at `/mcp`.
+
+### Step 4: Verify connection
+
+```bash
+figma-use me
+figma-use file info
+figma-use page list
+```
+
+All three should return data from the open Figma file.
+
+### Step 5: Configure MCP client
+
+Add to your MCP client configuration file:
+
+```json
+{
+  "mcpServers": {
+    "figma": {
+      "type": "http",
+      "url": "http://localhost:38451/mcp"
+    }
+  }
+}
+```
+
+<Accordion title="Config file locations by client">
+
+| Client | Path |
+|--------|------|
+| **Claude Desktop** (macOS) | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Claude Desktop** (Linux) | `~/.config/Claude/claude_desktop_config.json` |
+| **Cursor** | `~/.cursor/mcp.json` |
+| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` |
+
+</Accordion>
+
+### Step 6: Test write operations
+
+Verify full write access with a basic creation test:
+
+```bash
+figma-use create frame --name "Test Frame" --width 1440 --height 900
+figma-use create text --text "Hello from figma-use" --parent "Test Frame"
+figma-use create rect --width 200 --height 50 --fill "#4A90D9" --parent "Test Frame"
+```
+
+Check that elements appear in the open Figma file.
+
+## Remote access setup
+
+If your AI agent runs on a different machine than Figma:
+
+1. Replace `localhost` with the Figma machine's IP address:
+
+```json
+{
+  "mcpServers": {
+    "figma": {
+      "type": "http",
+      "url": "http://192.168.1.100:38451/mcp"
+    }
+  }
+}
+```
+
+2. Configure firewall to allow port 38451 from trusted hosts only
+
+<Warning>
+The MCP server has **no built-in authentication**. Restrict network access to trusted hosts using firewall rules.
+</Warning>
+
+## Start/stop procedures
+
+### Start Figma + MCP server
+
+```bash
+# 1. Start Figma with CDP
+open -a Figma --args --remote-debugging-port=9222  # macOS
+# or: figma --remote-debugging-port=9222           # Linux
+
+# 2. Open your design file in Figma
+
+# 3. Start MCP server
+figma-use mcp serve
+
+# 4. Verify connection
+figma-use status
+```
+
+### Stop
+
+```bash
+# Stop MCP server: Ctrl+C in terminal running `figma-use mcp serve`
+# Quit Figma Desktop normally
+```
+
+### Persistent setup (unattended)
+
+For always-on Figma automation, consider:
+
+- **Dedicated machine** with display (Mac Mini, Windows desktop)
+- **Cloud VM** with virtual display (AWS WorkSpaces, Azure)
+- **Systemd service** (Linux) to auto-restart the MCP server
+
+## Troubleshooting
+
+<Accordion title="figma-use status shows 'Not connected'">
+Ensure Figma Desktop is running with the CDP flag:
+
+```bash
+# Check if Figma is running with CDP
+curl -s http://localhost:9222/json
+
+# If no response, restart Figma with CDP enabled
+open -a Figma --args --remote-debugging-port=9222
+```
+
+You must have a Figma design file open (not just the file browser).
+</Accordion>
+
+<Accordion title="MCP server not reachable">
+Verify the server is running:
+
+```bash
+curl -s http://localhost:38451/mcp
+```
+
+If connection refused, start the MCP server:
+
+```bash
+figma-use mcp serve
+```
+</Accordion>
+
+<Accordion title="Write operations fail">
+Ensure you have edit access to the Figma file. View-only access won't allow creating or modifying elements.
+</Accordion>
+
+<Accordion title="Port 38451 already in use">
+Stop any existing figma-use process:
+
+```bash
+pkill -f "figma-use mcp"
+figma-use mcp serve
+```
+</Accordion>
+
+## Resources
+
+- [figma-use GitHub](https://github.com/dannote/figma-use)
+- [Full command reference](https://github.com/dannote/figma-use/blob/master/REFERENCE.md)
+- [SKILL.md for AI guidance](https://github.com/dannote/figma-use/blob/master/SKILL.md)
