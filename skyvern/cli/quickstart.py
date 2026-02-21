@@ -9,6 +9,8 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm
 
+from skyvern.analytics import capture_setup_error, capture_setup_event
+
 # Import console after skyvern.cli to ensure proper initialization
 from skyvern.cli.console import console
 from skyvern.cli.init_command import init_env  # init is used directly
@@ -27,8 +29,24 @@ def check_docker() -> bool:
             stderr=subprocess.PIPE,
             text=True,
         )
-        return result.returncode == 0
-    except (FileNotFoundError, subprocess.SubprocessError):
+        is_running = result.returncode == 0
+        capture_setup_event(
+            "docker-check",
+            success=is_running,
+            error_type=None if is_running else "docker_not_running",
+            error_message=None if is_running else result.stderr.strip() if result.stderr else "Docker not running",
+        )
+        return is_running
+    except FileNotFoundError:
+        capture_setup_event(
+            "docker-check",
+            success=False,
+            error_type="docker_not_installed",
+            error_message="Docker command not found",
+        )
+        return False
+    except subprocess.SubprocessError as e:
+        capture_setup_error("docker-check", e, error_type="docker_subprocess_error")
         return False
 
 
@@ -54,9 +72,17 @@ def check_postgres_container_conflict() -> bool:
 def run_docker_compose_setup() -> None:
     """Run the Docker Compose setup for Skyvern."""
     console.print("\n[bold blue]Setting up Skyvern with Docker Compose...[/bold blue]")
+    capture_setup_event("docker-compose-start", success=True)
 
     # Check for postgres container conflict
     if check_postgres_container_conflict():
+        capture_setup_event(
+            "docker-port-conflict",
+            success=False,
+            error_type="port_conflict",
+            error_message="PostgreSQL container 'postgresql-container' already exists on port 5432",
+            extra_data={"port": 5432},
+        )
         console.print(
             Panel(
                 "[bold yellow]Warning: Existing PostgreSQL container detected![/bold yellow]\n\n"
@@ -70,6 +96,12 @@ def run_docker_compose_setup() -> None:
         proceed = Confirm.ask("Do you want to continue anyway?", default=False)
         if not proceed:
             console.print("[yellow]Aborting Docker Compose setup. Please remove the container and try again.[/yellow]")
+            capture_setup_event(
+                "docker-compose-abort",
+                success=False,
+                error_type="user_abort",
+                error_message="User aborted due to port conflict",
+            )
             raise typer.Exit(0)
 
     # Configure LLM provider
@@ -90,7 +122,14 @@ def run_docker_compose_setup() -> None:
                 text=True,
             )
             console.print("✅ [green]Docker Compose started successfully.[/green]")
+            capture_setup_event("docker-compose-complete", success=True)
         except subprocess.CalledProcessError as e:
+            capture_setup_event(
+                "docker-compose-fail",
+                success=False,
+                error_type="docker_compose_error",
+                error_message=e.stderr.strip() if e.stderr else str(e),
+            )
             console.print(f"[bold red]Error starting Docker Compose: {e.stderr}[/bold red]")
             raise typer.Exit(1)
 
@@ -187,7 +226,14 @@ def quickstart(
                 try:
                     subprocess.run(["playwright", "install", "chromium"], check=True, capture_output=True, text=True)
                     console.print("✅ [green]Chromium installation complete.[/green]")
+                    capture_setup_event("playwright-install-complete", success=True)
                 except subprocess.CalledProcessError as e:
+                    capture_setup_event(
+                        "playwright-install-fail",
+                        success=False,
+                        error_type="playwright_install_error",
+                        error_message=e.stderr.strip() if e.stderr else str(e),
+                    )
                     console.print(f"[yellow]Warning: Failed to install Chromium: {e.stderr}[/yellow]")
         else:
             console.print("⏭️ [yellow]Skipping Chromium installation as requested.[/yellow]")
@@ -204,8 +250,15 @@ def quickstart(
                 )
 
     except KeyboardInterrupt:
+        capture_setup_event(
+            "quickstart-interrupt",
+            success=False,
+            error_type="user_interrupt",
+            error_message="Quickstart interrupted by user",
+        )
         console.print("\n[bold yellow]Quickstart process interrupted by user.[/bold yellow]")
         raise typer.Exit(0)
     except Exception as e:
+        capture_setup_error("quickstart-fail", e, error_type="quickstart_error")
         console.print(f"[bold red]Error during quickstart: {str(e)}[/bold red]")
         raise typer.Exit(1)

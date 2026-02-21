@@ -6,6 +6,7 @@ from typing import Optional
 
 from alembic import command
 from alembic.config import Config
+from skyvern.analytics import capture_setup_error, capture_setup_event
 from skyvern.constants import REPO_ROOT_DIR
 
 
@@ -32,10 +33,16 @@ def setup_windows_event_loop_policy() -> None:
 
 
 def migrate_db() -> None:
-    alembic_cfg = Config()
-    path = f"{REPO_ROOT_DIR}/alembic"
-    alembic_cfg.set_main_option("script_location", path)
-    command.upgrade(alembic_cfg, "head")
+    capture_setup_event("migration-start", success=True)
+    try:
+        alembic_cfg = Config()
+        path = f"{REPO_ROOT_DIR}/alembic"
+        alembic_cfg.set_main_option("script_location", path)
+        command.upgrade(alembic_cfg, "head")
+        capture_setup_event("migration-complete", success=True)
+    except Exception as e:
+        capture_setup_error("migration-fail", e, error_type="alembic_migration_error")
+        raise
 
 
 def detect_os() -> str:

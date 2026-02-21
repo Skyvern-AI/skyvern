@@ -1,7 +1,8 @@
 import functools
 import importlib.metadata
 import platform
-from typing import Any, Dict
+import traceback
+from typing import Any, Dict, Optional
 
 import structlog
 import typer
@@ -53,6 +54,63 @@ def capture(
         posthog.capture(distinct_id=distinct_id, event=event, properties=payload)
     except Exception:
         LOG.debug("analytics capture failed", event=event, exc_info=True)
+
+
+def capture_setup_event(
+    event_name: str,
+    success: bool = True,
+    error_type: Optional[str] = None,
+    error_message: Optional[str] = None,
+    extra_data: Optional[dict[str, Any]] = None,
+) -> None:
+    """Capture a setup-related analytics event.
+
+    Args:
+        event_name: The event name (will be prefixed with 'skyvern-oss-setup-')
+        success: Whether the setup step succeeded
+        error_type: Type/category of error (e.g., 'docker_not_running', 'port_conflict')
+        error_message: Human-readable error message
+        extra_data: Additional event properties
+    """
+    data: dict[str, Any] = {
+        **analytics_metadata(),
+        "success": success,
+    }
+    if error_type:
+        data["error_type"] = error_type
+    if error_message:
+        data["error_message"] = error_message
+    if extra_data:
+        data.update(extra_data)
+
+    capture(f"skyvern-oss-setup-{event_name}", data)
+
+
+def capture_setup_error(
+    event_name: str,
+    error: Exception,
+    error_type: Optional[str] = None,
+    extra_data: Optional[dict[str, Any]] = None,
+) -> None:
+    """Capture a setup error with exception details.
+
+    Args:
+        event_name: The event name (will be prefixed with 'skyvern-oss-setup-')
+        error: The exception that occurred
+        error_type: Optional error type/category
+        extra_data: Additional event properties
+    """
+    data: dict[str, Any] = {
+        **analytics_metadata(),
+        "success": False,
+        "error_type": error_type or type(error).__name__,
+        "error_message": str(error),
+        "stack_trace": traceback.format_exc(),
+    }
+    if extra_data:
+        data.update(extra_data)
+
+    capture(f"skyvern-oss-setup-{event_name}", data)
 
 
 # This is the main function that will be called by the typer CLI. This is separate from capture because typer
