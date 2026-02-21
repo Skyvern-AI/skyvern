@@ -12,14 +12,15 @@ app.use((req, res, next) => {
   res.on("finish", () => {
     const duration = Date.now() - start;
     const timestamp = new Date().toISOString();
+    const artifactPath = req.query.path || "";
     console.log(
-      "[%s] %s %s %d %dms%s",
+      "[%s] %s %s %d %dms %s",
       timestamp,
       req.method,
       req.path,
       res.statusCode,
       duration,
-      req.query.path ? " " + req.query.path : "",
+      artifactPath,
     );
   });
   next();
