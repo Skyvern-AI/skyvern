@@ -35,9 +35,26 @@ type Props = {
     totp_type: "authenticator" | "email" | "text" | "none";
     totp_identifier: string;
   }) => void;
+  /** Login page URL value — when onUrlChange is provided, a URL field is rendered after Name */
+  url?: string;
+  onUrlChange?: (url: string) => void;
+  /** Show a required asterisk on the URL label */
+  urlRequired?: boolean;
+  /** Disable the URL input (e.g. during test) */
+  urlDisabled?: boolean;
+  /** Slot rendered between URL and the separator before Username (e.g. browser profile checkbox) */
+  afterUrl?: React.ReactNode;
 };
 
-function PasswordCredentialContent({ values, onChange }: Props) {
+function PasswordCredentialContent({
+  values,
+  onChange,
+  url,
+  onUrlChange,
+  urlRequired,
+  urlDisabled,
+  afterUrl,
+}: Props) {
   const { name, username, password, totp, totp_type, totp_identifier } = values;
   const [totpMethod, setTotpMethod] = useState<
     "authenticator" | "email" | "text"
@@ -114,18 +131,36 @@ function PasswordCredentialContent({ values, onChange }: Props) {
 
   return (
     <div className="space-y-5">
-      <div className="flex">
-        <div className="w-72 shrink-0 space-y-1">
+      <div className="flex items-center gap-12">
+        <div className="w-40 shrink-0">
           <Label>Name</Label>
-          <div className="text-sm text-slate-400">
-            The name of the credential
-          </div>
         </div>
         <Input
           value={name}
           onChange={(e) => updateValues({ name: e.target.value })}
         />
       </div>
+
+      {onUrlChange !== undefined && (
+        <>
+          <Separator />
+          <div className="flex items-center gap-12">
+            <div className="w-40 shrink-0">
+              <Label>
+                Login Page URL
+                {urlRequired && <span className="text-destructive"> *</span>}
+              </Label>
+            </div>
+            <Input
+              value={url ?? ""}
+              onChange={(e) => onUrlChange(e.target.value)}
+              placeholder="https://example.com/login"
+              disabled={urlDisabled}
+            />
+          </div>
+        </>
+      )}
+      {afterUrl}
       <Separator />
       <div className="flex items-center gap-12">
         <div className="w-40 shrink-0">

@@ -223,6 +223,7 @@ function WorkflowRunTimelineBlockItem({
   }, []);
 
   const showStatusIndicator = block.status !== null;
+
   const showSuccessIndicator =
     showStatusIndicator && block.status === Status.Completed;
   const showFailureIndicator =
