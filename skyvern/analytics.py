@@ -15,6 +15,7 @@ posthog = Posthog(
     "phc_bVT2ugnZhMHRWqMvSRHPdeTjaPxQqT3QSsI3r5FlQR5",
     host="https://app.posthog.com",
     disable_geoip=False,
+    timeout=2,
 )
 
 DISTINCT_ID = "oss"
