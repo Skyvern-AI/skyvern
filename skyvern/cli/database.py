@@ -136,7 +136,8 @@ def setup_postgresql(no_postgres: bool = False) -> None:
                     console.print(
                         "[red]Warning: Failed to start PostgreSQL container. Check Docker logs for details.[/red]"
                     )
-            console.print("✅ [green]PostgreSQL has been installed and started using Docker.[/green]")
+                else:
+                    console.print("✅ [green]PostgreSQL has been installed and started using Docker.[/green]")
         else:
             with console.status("[bold blue]Starting existing PostgreSQL container...[/bold blue]"):
                 run_command("docker start postgresql-container")
