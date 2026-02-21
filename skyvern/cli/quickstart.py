@@ -72,7 +72,7 @@ def check_postgres_container_conflict() -> bool:
 def run_docker_compose_setup() -> None:
     """Run the Docker Compose setup for Skyvern."""
     console.print("\n[bold blue]Setting up Skyvern with Docker Compose...[/bold blue]")
-    capture_setup_event("docker-compose-start", success=True)
+    capture_setup_event("docker-compose-start")
 
     # Check for postgres container conflict
     if check_postgres_container_conflict():

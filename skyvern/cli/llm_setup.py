@@ -61,7 +61,7 @@ def setup_llm_providers() -> None:
     """Configure Large Language Model (LLM) Providers."""
     console.print(Panel("[bold magenta]LLM Provider Configuration[/bold magenta]", border_style="purple"))
     console.print("[italic]Note: All information provided here will be stored only on your local machine.[/italic]")
-    capture_setup_event("llm-start", success=True)
+    capture_setup_event("llm-start")
     model_options: list[str] = []
     enabled_providers: list[str] = []
 

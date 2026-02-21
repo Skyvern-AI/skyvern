@@ -15,7 +15,7 @@ async def start_services(server_only: bool = False) -> None:
     Args:
         server_only: If True, only start the server, not the UI.
     """
-    capture_setup_event("services-start", success=True, extra_data={"server_only": server_only})
+    capture_setup_event("services-start", extra_data={"server_only": server_only})
     try:
         # Start server in the background
         server_process = await asyncio.create_subprocess_exec(

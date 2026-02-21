@@ -71,7 +71,7 @@ def is_postgres_container_exists() -> bool:
 def setup_postgresql(no_postgres: bool = False) -> None:
     """Set up PostgreSQL database for Skyvern."""
     console.print(Panel("[bold cyan]PostgreSQL Setup[/bold cyan]", border_style="blue"))
-    capture_setup_event("database-start", success=True)
+    capture_setup_event("database-start")
 
     if command_exists("psql") and is_postgres_running():
         console.print("✨ [green]PostgreSQL is already running locally.[/green]")
@@ -133,6 +133,8 @@ def setup_postgresql(no_postgres: bool = False) -> None:
                         error_type="docker_run_error",
                         error_message=output or "Failed to start PostgreSQL container",
                     )
+                    console.print("[red]Failed to start PostgreSQL container. Check Docker logs for details.[/red]")
+                    raise SystemExit(1)
             console.print("✅ [green]PostgreSQL has been installed and started using Docker.[/green]")
         else:
             with console.status("[bold blue]Starting existing PostgreSQL container...[/bold blue]"):
@@ -163,6 +165,8 @@ def setup_postgresql(no_postgres: bool = False) -> None:
                     error_type="createuser_error",
                     error_message=output or "Failed to create database user",
                 )
+                console.print("[red]Failed to create database user.[/red]")
+                raise SystemExit(1)
             console.print("✅ [green]Database user created.[/green]")
 
     with console.status("[bold green]Checking database...[/bold green]"):
@@ -182,6 +186,8 @@ def setup_postgresql(no_postgres: bool = False) -> None:
                     error_type="createdb_error",
                     error_message=output or "Failed to create database",
                 )
+                console.print("[red]Failed to create database.[/red]")
+                raise SystemExit(1)
             console.print("✅ [green]Database and user created successfully.[/green]")
 
     capture_setup_event("database-complete", success=True, extra_data={"source": "docker"})

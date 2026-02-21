@@ -135,7 +135,7 @@ def init_env(
 
     if run_local:
         console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
-        capture_setup_event("playwright-install-start", success=True)
+        capture_setup_event("playwright-install-start")
         with Progress(
             SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
         ) as progress:
@@ -164,7 +164,7 @@ def init_env(
 def init_browser() -> None:
     """Initialize only the browser configuration and install Chromium."""
     console.print("\n[bold blue]Configuring browser settings...[/bold blue]")
-    capture_setup_event("browser-config-start", success=True)
+    capture_setup_event("browser-config-start")
     browser_type, browser_location, remote_debugging_url = setup_browser_config()
     update_or_add_env_var("BROWSER_TYPE", browser_type)
     if browser_location:
@@ -179,7 +179,7 @@ def init_browser() -> None:
     console.print("✅ [green]Browser configuration complete.[/green]")
 
     console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
-    capture_setup_event("playwright-install-start", success=True)
+    capture_setup_event("playwright-install-start")
     with Progress(
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
     ) as progress:

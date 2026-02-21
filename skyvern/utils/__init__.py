@@ -33,7 +33,7 @@ def setup_windows_event_loop_policy() -> None:
 
 
 def migrate_db() -> None:
-    capture_setup_event("migration-start", success=True)
+    capture_setup_event("migration-start")
     try:
         alembic_cfg = Config()
         path = f"{REPO_ROOT_DIR}/alembic"
