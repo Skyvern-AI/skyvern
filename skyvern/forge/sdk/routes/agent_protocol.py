@@ -87,6 +87,7 @@ from skyvern.forge.sdk.schemas.tasks import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -1699,7 +1700,7 @@ async def models() -> ModelsResponse:
     """
     Get a list of available models.
     """
-    mapping = settings.get_model_name_to_llm_key()
+    mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
     just_labels = {k: v["label"] for k, v in mapping.items() if "anthropic" not in k.lower()}
 
     return ModelsResponse(models=just_labels)
