@@ -76,6 +76,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, validate_pdf_file
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
@@ -182,7 +183,7 @@ class Block(BaseModel, abc.ABC):
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
-                mapping = settings.get_model_name_to_llm_key()
+                mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
                 return mapping.get(model_name, {}).get("llm_key")
 
         return None
