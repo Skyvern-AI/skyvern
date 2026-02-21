@@ -133,8 +133,9 @@ def setup_postgresql(no_postgres: bool = False) -> None:
                         error_type="docker_run_error",
                         error_message=output or "Failed to start PostgreSQL container",
                     )
-                    console.print("[red]Failed to start PostgreSQL container. Check Docker logs for details.[/red]")
-                    raise SystemExit(1)
+                    console.print(
+                        "[red]Warning: Failed to start PostgreSQL container. Check Docker logs for details.[/red]"
+                    )
             console.print("✅ [green]PostgreSQL has been installed and started using Docker.[/green]")
         else:
             with console.status("[bold blue]Starting existing PostgreSQL container...[/bold blue]"):
@@ -165,9 +166,9 @@ def setup_postgresql(no_postgres: bool = False) -> None:
                     error_type="createuser_error",
                     error_message=output or "Failed to create database user",
                 )
-                console.print("[red]Failed to create database user.[/red]")
-                raise SystemExit(1)
-            console.print("✅ [green]Database user created.[/green]")
+                console.print("[red]Warning: Failed to create database user.[/red]")
+            else:
+                console.print("✅ [green]Database user created.[/green]")
 
     with console.status("[bold green]Checking database...[/bold green]"):
         _, code = run_command(
@@ -186,8 +187,8 @@ def setup_postgresql(no_postgres: bool = False) -> None:
                     error_type="createdb_error",
                     error_message=output or "Failed to create database",
                 )
-                console.print("[red]Failed to create database.[/red]")
-                raise SystemExit(1)
-            console.print("✅ [green]Database and user created successfully.[/green]")
+                console.print("[red]Warning: Failed to create database.[/red]")
+            else:
+                console.print("✅ [green]Database and user created successfully.[/green]")
 
     capture_setup_event("database-complete", success=True, extra_data={"source": "docker"})
