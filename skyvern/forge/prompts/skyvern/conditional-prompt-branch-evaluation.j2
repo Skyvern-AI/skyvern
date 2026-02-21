@@ -13,10 +13,5 @@ Use this context to understand variable values:
 {% endif %}
 
 For each condition, provide IN THIS ORDER:
-1. "rendered_condition": REPLACE all variable names and references with their actual values.
-   - REMOVE the variable names entirely and put only the values in their place
-   - Do NOT include both the variable name and value - only the value
-   - Example: "base_date is same as date_3" → "01-25-2026 is same as 01-25-2026" (NOT "base_date 01-25-2026 is same as date_3 01-25-2026")
-   - Example: "date shown in the website is not same with date_3" → "01-27-2026 is not same with 01-07-2025"
-2. "reasoning": Explain your reasoning for evaluating the rendered condition. Compare the actual values.
-3. "result": The boolean result (true/false) based on the rendered condition.
+1. "reasoning": Explain your reasoning for evaluating the condition. Compare the actual values.
+2. "result": The boolean result (true/false) based on the condition.
