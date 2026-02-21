@@ -67,9 +67,17 @@ function localTimeFormatWithShortDate(time: string): string {
   return `${dateString} at ${timeString}`;
 }
 
+function formatTimeRemaining(seconds: number): string {
+  if (seconds <= 0) return "0:00";
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
 export {
   basicLocalTimeFormat,
   basicTimeFormat,
   timeFormatWithShortDate,
   localTimeFormatWithShortDate,
+  formatTimeRemaining,
 };
