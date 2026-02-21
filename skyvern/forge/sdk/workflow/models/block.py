@@ -5327,22 +5327,23 @@ def _parse_single_evaluation(
     Parse a single evaluation from the LLM response.
 
     Handles two formats:
-    - New format (dict): {result: bool, rendered_condition: str, reasoning: str}
+    - Dict format: {result: bool, reasoning: str}
     - Legacy format: just a boolean value
+
+    The rendered expression always comes from the Jinja pre-rendering step (fallback),
+    not from the LLM response, to avoid the LLM re-interpreting already-resolved values.
 
     Args:
         evaluation: Single evaluation object from LLM (dict or bool)
         idx: Index of this evaluation (for fallback lookup)
-        fallback_rendered_expressions: Pre-rendered expressions to use if LLM didn't provide one
+        fallback_rendered_expressions: Pre-rendered expressions from Jinja rendering
 
     Returns:
-        Tuple of (boolean_result, rendered_condition_string)
+        Tuple of (boolean_result, rendered_expression_string)
     """
-    # Determine fallback rendered expression
-    fallback_rendered = fallback_rendered_expressions[idx] if idx < len(fallback_rendered_expressions) else ""
+    rendered_expression = fallback_rendered_expressions[idx] if idx < len(fallback_rendered_expressions) else ""
 
     if isinstance(evaluation, dict):
-        # New format: {result, rendered_condition, reasoning}
         result = evaluation.get("result")
         if isinstance(result, bool):
             bool_result = result
@@ -5355,13 +5356,6 @@ def _parse_single_evaluation(
                 evaluated_result=bool_result,
             )
 
-        # Get rendered_condition, fallback to pre-rendered expression
-        rendered_cond = evaluation.get("rendered_condition")
-        if rendered_cond and isinstance(rendered_cond, str):
-            rendered_expression = rendered_cond
-        else:
-            rendered_expression = fallback_rendered
-
         return (bool_result, rendered_expression)
     else:
         # Legacy format: just a boolean
@@ -5370,7 +5364,7 @@ def _parse_single_evaluation(
         else:
             bool_result = _evaluate_truthy_string(str(evaluation))
 
-        return (bool_result, fallback_rendered)
+        return (bool_result, rendered_expression)
 
 
 class BranchCondition(BaseModel):
@@ -5534,7 +5528,7 @@ class ConditionalBlock(Block):
         )
 
         # Step 3: Build schema for array of evaluation results
-        # Order matters: rendered_condition -> reasoning -> result (chain-of-thought)
+        # Order matters: reasoning -> result (chain-of-thought)
         data_schema = {
             "type": "object",
             "properties": {
@@ -5543,22 +5537,16 @@ class ConditionalBlock(Block):
                     "items": {
                         "type": "object",
                         "properties": {
-                            "rendered_condition": {
-                                "type": "string",
-                                "description": (
-                                    "The condition with all variable names and references replaced with actual values."
-                                ),
-                            },
                             "reasoning": {
                                 "type": "string",
-                                "description": "Explanation of the reasoning behind evaluating the rendered condition.",
+                                "description": "Explanation of the reasoning behind evaluating the condition.",
                             },
                             "result": {
                                 "type": "boolean",
-                                "description": "TRUE if the rendered condition is satisfied, FALSE otherwise.",
+                                "description": "TRUE if the condition is satisfied, FALSE otherwise.",
                             },
                         },
-                        "required": ["rendered_condition", "reasoning", "result"],
+                        "required": ["reasoning", "result"],
                     },
                     "description": "Array of evaluation results for each condition in the same order.",
                     "minItems": len(branches),
@@ -5644,7 +5632,7 @@ class ConditionalBlock(Block):
                     force_dict=True,
                 )
 
-            # Step 5: Extract the evaluation results (result + rendered_condition)
+            # Step 5: Extract the evaluation results (reasoning + result)
             results_array: list[bool] = []
             llm_rendered_expressions: list[str] = []
 
@@ -5657,7 +5645,7 @@ class ConditionalBlock(Block):
             # Find evaluations array from LLM output (handles ExtractionBlock nesting)
             raw_evaluations = _find_evaluations_array(output_value)
 
-            # Parse each evaluation to extract result and rendered_condition
+            # Parse each evaluation to extract result (rendered expression comes from Jinja pre-rendering)
             for idx, evaluation in enumerate(raw_evaluations):
                 bool_result, rendered_expr = _parse_single_evaluation(
                     evaluation=evaluation,
