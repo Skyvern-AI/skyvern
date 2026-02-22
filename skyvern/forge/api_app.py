@@ -75,7 +75,18 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     if cleanup_task:
         LOG.info("Cleanup scheduler started")
 
-    yield
+    # Start MCP sub-application lifespan if mounted. Starlette Mount does NOT
+    # forward lifespan events to sub-apps, so we must enter the MCP app's
+    # lifespan here. This initializes the streamable-http session manager's
+    # task group which is required for handling MCP requests.
+    mcp_app = getattr(fastapi_app.state, "mcp_starlette_app", None)
+    if mcp_app:
+        async with mcp_app.lifespan(mcp_app):
+            LOG.info("MCP remote server lifespan started")
+            yield
+        LOG.info("MCP remote server lifespan stopped")
+    else:
+        yield
 
     # Stop cleanup scheduler
     await stop_cleanup_scheduler()
