@@ -4,7 +4,7 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDe
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
-from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocationInput
 
 MIN_TIMEOUT = 5
 MAX_TIMEOUT = 60 * 24  # 24 hours

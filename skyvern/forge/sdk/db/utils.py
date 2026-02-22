@@ -130,7 +130,9 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
         return result
     except ValueError:
         # If all else fails, return as-is (custom proxy URL)
-        LOG.warning("Failed to deserialize proxy_location as enum, assuming it is a custom proxy url string", db_value=value)
+        LOG.warning(
+            "Failed to deserialize proxy_location as enum, assuming it is a custom proxy url string", db_value=value
+        )
         return value
 
 
