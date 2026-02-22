@@ -45,6 +45,7 @@ from skyvern.exceptions import (
     WorkflowNotFoundForWorkflowRun,
     WorkflowRunNotFound,
     WorkflowRunParameterPersistenceError,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -651,9 +652,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
             )
 
-            failure_reason = f"Setup workflow failed due to an unexpected exception: {str(e)}"
-            if isinstance(e, SkyvernException):
-                failure_reason = f"Setup workflow failed due to an SkyvernException({e.__class__.__name__}): {str(e)}"
+            failure_reason = f"Setup workflow failed. failure reason: {get_user_facing_exception_message(e)}"
 
             workflow_run = await self.mark_workflow_run_as_failed(
                 workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
@@ -821,9 +820,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id,
             )
 
-            exception_message = f"Unexpected error: {str(e)}"
-            if isinstance(e, SkyvernException):
-                exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+            exception_message = get_user_facing_exception_message(e)
 
             failure_reason = f"Failed to initialize workflow run context. failure reason: {exception_message}"
             workflow_run = await self.mark_workflow_run_as_failed(
@@ -1604,9 +1601,7 @@ class WorkflowService:
                 block_label=block.label,
             )
 
-            exception_message = f"Unexpected error: {str(e)}"
-            if isinstance(e, SkyvernException):
-                exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+            exception_message = get_user_facing_exception_message(e)
 
             failure_reason = f"{block.block_type} block failed. failure reason: {exception_message}"
             workflow_run = await self.mark_workflow_run_as_failed(
