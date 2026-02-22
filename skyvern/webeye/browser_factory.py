@@ -254,12 +254,25 @@ class BrowserContextFactory:
         if settings.BROWSER_LOCALE:
             args["locale"] = settings.BROWSER_LOCALE
 
-        if settings.ENABLE_PROXY:
+        custom_proxy_config = None
+        if proxy_location and isinstance(proxy_location, str) and _is_valid_proxy_url(proxy_location):
+            parsed = urlparse(proxy_location)
+            custom_proxy_config = {
+                "server": f"{parsed.scheme}://{parsed.hostname}" + (f":{parsed.port}" if parsed.port else ""),
+            }
+            if parsed.username:
+                custom_proxy_config["username"] = parsed.username
+            if parsed.password:
+                custom_proxy_config["password"] = parsed.password
+
+        if custom_proxy_config:
+            args["proxy"] = custom_proxy_config
+        elif settings.ENABLE_PROXY:
             proxy_config = setup_proxy()
             if proxy_config:
                 args["proxy"] = proxy_config
 
-        if proxy_location:
+        if proxy_location and not custom_proxy_config:
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
                 args["timezone_id"] = tz_info.key
         return args

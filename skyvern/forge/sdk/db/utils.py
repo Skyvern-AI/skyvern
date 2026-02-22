@@ -129,9 +129,9 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
         result = ProxyLocation(value)
         return result
     except ValueError:
-        # If all else fails, return as-is (shouldn't happen with valid data)
-        LOG.warning("Failed to deserialize proxy_location", db_value=value)
-        return None
+        # If all else fails, return as-is (custom proxy URL)
+        LOG.warning("Failed to deserialize proxy_location as enum, assuming it is a custom proxy url string", db_value=value)
+        return value
 
 
 # Mapping of action types to their corresponding action classes
