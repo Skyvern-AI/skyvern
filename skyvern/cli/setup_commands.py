@@ -22,7 +22,7 @@ from skyvern.utils.env_paths import resolve_backend_env_path
 # migrated to use _upsert_mcp_config() in a follow-up.
 setup_app = typer.Typer(help="Register Skyvern MCP with AI coding tools.")
 
-_DEFAULT_REMOTE_URL = "https://mcp.skyvern.com/mcp"
+_DEFAULT_REMOTE_URL = "https://api.skyvern.com/mcp"
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +207,7 @@ _local_opt = typer.Option(False, "--local", help="Use local stdio transport inst
 _python_path_opt = typer.Option(
     False, "--use-python-path", help="(local only) Use python -m skyvern instead of skyvern entrypoint"
 )
-_url_opt = typer.Option(None, "--url", help="Remote MCP endpoint URL (default: https://mcp.skyvern.com/mcp)")
+_url_opt = typer.Option(None, "--url", help="Remote MCP endpoint URL (default: https://api.skyvern.com/mcp)")
 
 
 # ---------------------------------------------------------------------------
