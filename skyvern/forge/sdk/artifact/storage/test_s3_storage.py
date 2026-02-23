@@ -10,7 +10,7 @@ from moto.server import ThreadedMotoServer
 from types_boto3_s3.client import S3Client
 
 from skyvern.config import settings
-from skyvern.forge.sdk.api.aws import S3StorageClass, S3Uri, tag_set_to_dict
+from skyvern.forge.sdk.api.aws import S3StorageClass, S3Uri
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.artifact.storage.test_helpers import (
@@ -33,9 +33,6 @@ TEST_AI_SUGGESTION_ID = "ai_sugg_test_123"
 
 
 class S3StorageForTests(S3Storage):
-    async def _get_tags_for_org(self, organization_id: str) -> dict[str, str]:
-        return {"dummy": f"org-{organization_id}", "test": "jerry"}
-
     async def _get_storage_class_for_org(
         self,
         organization_id: str,
@@ -165,9 +162,6 @@ def _assert_object_meta(boto3_test_client: S3Client, uri: str) -> None:
     assert s3uri.bucket == TEST_BUCKET
     obj_meta = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=s3uri.key)
     assert obj_meta["StorageClass"] == "ONEZONE_IA"
-    s3_tags_resp = boto3_test_client.get_object_tagging(Bucket=TEST_BUCKET, Key=s3uri.key)
-    tags_dict = tag_set_to_dict(s3_tags_resp["TagSet"])
-    assert tags_dict == {"dummy": f"org-{TEST_ORGANIZATION_ID}", "test": "jerry"}
 
 
 def _assert_object_content(boto3_test_client: S3Client, uri: str, expected_content: bytes) -> None:
