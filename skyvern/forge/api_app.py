@@ -33,6 +33,27 @@ except ImportError:
 LOG = structlog.get_logger()
 
 
+def format_validation_errors(exc: ValidationError) -> str:
+    """Format a Pydantic ValidationError into a human-readable string.
+
+    Filters out uninformative path segments ('__root__', 'body') and joins
+    multiple errors with '; '.
+    """
+    error_messages = []
+    for error in exc.errors():
+        loc = " -> ".join(str(part) for part in error["loc"] if part not in ("__root__", "body"))
+        msg = error["msg"]
+        if loc:
+            error_messages.append(f"{loc}: {msg}")
+        else:
+            error_messages.append(msg)
+    return (
+        "; ".join(error_messages)
+        if error_messages
+        else "A validation error occurred. Please check your input and try again."
+    )
+
+
 class ExecutionDatePlugin(Plugin):
     key = "execution_date"
 
@@ -175,9 +196,10 @@ def create_api_app() -> FastAPI:
 
     @fastapi_app.exception_handler(ValidationError)
     async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
+        detail = format_validation_errors(exc)
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"detail": str(exc)},
+            content={"detail": detail},
         )
 
     @fastapi_app.exception_handler(Exception)
