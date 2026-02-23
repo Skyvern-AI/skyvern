@@ -1,82 +1,262 @@
+{/* This file (fern/) and docs/integrations/mcp.mdx must stay in sync. fern/ is for Fern, docs/ is for Mintlify. Minor formatting differences (Tip vs inline text, CardGroup) are OK since the platforms support different components. */}
 ---
-title: Skyvern MCP
+title: MCP Server
+subtitle: Connect AI assistants to browser automation via Model Context Protocol
 slug: integrations/mcp
 ---
 
-# Model Context Protocol (MCP)
+The Skyvern MCP server lets AI assistants like Claude Desktop, Claude Code, Codex, Cursor, and Windsurf control a browser. Your AI can fill out forms, extract data, download files, and run multi-step workflows, all through natural language.
 
-Skyvern's MCP server implementation helps connect your AI applications to the browser. This allows your AI applications to do things like: fill out forms, download files, research information on the web, and more.
+## What you can do
 
-You can connect your MCP-enabled applications to Skyvern in two ways:
-1. **Local Skyvern Server**
-   - Use your favourite LLM to power Skyvern
-2. **Skyvern Cloud**
-   - Create an account at [app.skyvern.com](https://app.skyvern.com)
-   - Get the API key from the settings page which will be used for setup
+The MCP server exposes 33 tools across 6 categories:
 
-## Quickstart
+| Category | Key tools | What they do |
+|----------|-----------|--------------|
+| **Session management** | `skyvern_session_create`, `skyvern_session_close`, `skyvern_session_list`, `skyvern_session_connect` | Open, manage, and reuse browser sessions |
+| **Browser actions** | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait` | Control the browser with natural language or CSS/XPath selectors |
+| **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured data from pages, capture screenshots, run JavaScript |
+| **Validation** | `skyvern_validate` | Check page conditions using AI (returns true/false) |
+| **Credentials** | `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete` | Look up stored credentials for login flows |
+| **Workflows** | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete` | Build and execute multi-step automations |
+
+Your AI assistant decides which tools to call based on your instructions. For example, asking "go to Hacker News and get the top post title" triggers `skyvern_session_create`, `skyvern_navigate`, `skyvern_extract`, and `skyvern_session_close` automatically.
+
+## Quick start
+
+Pick your client and follow the setup below. Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboard.
+
+<Tabs>
+<Tab title="Claude Code">
+
+```bash
+claude mcp add-json skyvern '{"type":"streamable-http","url":"https://api.skyvern.com/mcp","headers":{"x-api-key":"YOUR_SKYVERN_API_KEY"}}' --scope user
+```
+
+</Tab>
+<Tab title="Claude Desktop">
+
+Add to your Claude Desktop config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `~/.config/Claude/claude_desktop_config.json` on Linux):
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp",
+      "headers": {
+        "x-api-key": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Cursor">
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp",
+      "headers": {
+        "x-api-key": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Windsurf">
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp",
+      "headers": {
+        "x-api-key": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Codex">
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.skyvern]
+url = "https://api.skyvern.com/mcp"
+
+[mcp_servers.skyvern.http_headers]
+x-api-key = "YOUR_SKYVERN_API_KEY"
+```
+
+To load the API key from an environment variable instead, use `env_http_headers`:
+
+```toml
+[mcp_servers.skyvern.env_http_headers]
+x-api-key = "SKYVERN_API_KEY"
+```
+
+</Tab>
+</Tabs>
+
+That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS.
+
+## Alternative: Local mode (stdio)
+
+If you prefer to run Skyvern locally or need to use your own LLM provider, use stdio transport instead.
+
 <Tip title="Supported Python Versions" icon="fa-brands fa-python">
-Python 3.11, 3.12 and 3.13
+Local mode requires Python 3.11, 3.12, or 3.13.
 </Tip>
 
-1. **Install Skyvern**
 ```bash
 pip install skyvern
 ```
 
-2. **Configure Skyvern** Run the setup wizard which will guide you through the configuration process. You can connect to either [Skyvern Cloud](https://app.skyvern.com) or a local version of Skyvern.
+<Tabs>
+<Tab title="Claude Code">
+
 ```bash
-skyvern init
+claude mcp add --transport stdio skyvern \
+  --env SKYVERN_BASE_URL=https://api.skyvern.com \
+  --env SKYVERN_API_KEY=YOUR_SKYVERN_API_KEY \
+  -- python3 -m skyvern run mcp
 ```
 
-3. **(Optional) Launch the Skyvern Server. Only required in local mode**
+For a local server, set `SKYVERN_BASE_URL=http://localhost:8000`.
+
+</Tab>
+<Tab title="Claude Desktop / Cursor / Windsurf">
+
+Add to your client's config file:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "command": "/usr/bin/python3",
+      "args": ["-m", "skyvern", "run", "mcp"],
+      "env": {
+        "SKYVERN_BASE_URL": "https://api.skyvern.com",
+        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+Replace `/usr/bin/python3` with the output of `which python3`. For a local server, set `SKYVERN_BASE_URL` to `http://localhost:8000`.
+
+</Tab>
+<Tab title="Codex">
+
+```toml
+[mcp_servers.skyvern]
+command = "/usr/bin/python3"
+args = ["-m", "skyvern", "run", "mcp"]
+
+[mcp_servers.skyvern.env]
+SKYVERN_BASE_URL = "https://api.skyvern.com"
+SKYVERN_API_KEY = "YOUR_SKYVERN_API_KEY"
+```
+
+Replace `/usr/bin/python3` with the output of `which python3`.
+
+</Tab>
+</Tabs>
+
+<Tip>
+You can also run `skyvern init` to auto-detect installed clients and write configs automatically.
+
+If using local mode, start the server before using MCP:
+
 ```bash
 skyvern run server
 ```
+</Tip>
 
-## Examples
-### Skyvern allows Claude to look up the top Hackernews posts today
+<Accordion title="Config file locations by client">
+
+| Client | Format | Path |
+|--------|--------|------|
+| **Claude Desktop** (macOS) | JSON | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Claude Desktop** (Linux) | JSON | `~/.config/Claude/claude_desktop_config.json` |
+| **Claude Code** (project) | JSON | `.mcp.json` in project root |
+| **Claude Code** (global) | JSON | `~/.claude.json` |
+| **Codex** (global) | TOML | `~/.codex/config.toml` |
+| **Codex** (project) | TOML | `.codex/config.toml` in trusted project |
+| **Cursor** | JSON | `~/.cursor/mcp.json` |
+| **Windsurf** | JSON | `~/.codeium/windsurf/mcp_config.json` |
+
+</Accordion>
+
+## See it in action
+
+**Claude Desktop** looking up the top Hacker News posts:
 
 <video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
   <source src="https://github.com/user-attachments/assets/0c10dd96-c6ff-4b99-ad99-f34a5afd04fe" type="video/mp4" />
 </video>
 
-### Cursor looking up the top programming jobs in your area
+**Cursor** finding programming jobs:
 
 <video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
   <source src="https://github.com/user-attachments/assets/084c89c9-6229-4bac-adc9-6ad69b41327d" type="video/mp4" />
 </video>
 
-### Ask Windsurf to do a form 5500 search and download some files
+**Windsurf** searching Form 5500 and downloading files:
 
 <video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
   <source src="https://github.com/user-attachments/assets/70cfe310-24dc-431a-adde-e72691f198a7" type="video/mp4" />
 </video>
 
-## Supported Applications
-`skyvern init` helps configure the following applications for you:
-- Cursor
-- Windsurf
-- Claude Desktop
-- Your custom MCP App?
+## Troubleshooting
 
-Use the following config if you want to set up Skyvern for any other MCP-enabled application
-```json
-{
-  "mcpServers": {
-    "Skyvern": {
-      "env": {
-        "SKYVERN_BASE_URL": "https://api.skyvern.com", # "http://localhost:8000" if running locally
-        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY" # find the local SKYVERN_API_KEY in the .env file after running `skyvern init` or in your Skyvern Cloud console
-      },
-      "command": "PATH_TO_PYTHON",
-      "args": [
-        "-m",
-        "skyvern",
-        "run",
-        "mcp"
-      ]
-    }
-  }
-}
+<Accordion title="Python version errors (local mode only)">
+The Skyvern MCP server requires Python 3.11, 3.12, or 3.13. Check your version with `python3 --version`. If you have multiple Python versions installed, make sure the `command` in your MCP config points to a supported version:
+
+```bash
+which python3.11
+# Use this path in your MCP config
 ```
+
+You can also use `pipx` to install in an isolated environment:
+
+```bash
+pipx install skyvern
+```
+</Accordion>
+
+<Accordion title="Connection refused (local mode)">
+Make sure the Skyvern server is running before using MCP tools:
+
+```bash
+skyvern run server
+```
+
+Confirm the server is reachable at `http://localhost:8000`. If you changed the port, update `SKYVERN_BASE_URL` in your MCP config to match.
+</Accordion>
+
+<Accordion title="MCP client doesn't detect Skyvern">
+Verify that the `command` path in your MCP config is correct:
+
+```bash
+which python3
+```
+
+Use the full absolute path (e.g., `/usr/bin/python3` or `/Users/you/.pyenv/shims/python3`), not just `python3`. Restart your MCP client after editing the config file.
+</Accordion>
