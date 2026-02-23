@@ -7,6 +7,8 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm
 
+from skyvern.analytics import capture_setup_event
+
 from .console import console
 
 
@@ -69,13 +71,16 @@ def is_postgres_container_exists() -> bool:
 def setup_postgresql(no_postgres: bool = False) -> None:
     """Set up PostgreSQL database for Skyvern."""
     console.print(Panel("[bold cyan]PostgreSQL Setup[/bold cyan]", border_style="blue"))
+    capture_setup_event("database-start")
 
     if command_exists("psql") and is_postgres_running():
         console.print("✨ [green]PostgreSQL is already running locally.[/green]")
+        capture_setup_event("database-local-detected", success=True, extra_data={"source": "local"})
         if database_exists("skyvern", "skyvern"):
             console.print("✅ [green]Database and user exist.[/green]")
         else:
             create_database_and_user()
+        capture_setup_event("database-complete", success=True, extra_data={"source": "local"})
         return
 
     if no_postgres:
@@ -83,9 +88,16 @@ def setup_postgresql(no_postgres: bool = False) -> None:
         console.print(
             "[italic]If you plan to use Docker Compose, its Postgres service will start automatically.[/italic]"
         )
+        capture_setup_event("database-skip", success=True, extra_data={"reason": "no_postgres_flag"})
         return
 
     if not is_docker_running():
+        capture_setup_event(
+            "database-fail",
+            success=False,
+            error_type="docker_not_running",
+            error_message="Docker is not running or not installed",
+        )
         console.print(
             "[red]Docker is not running or not installed. Please install or start Docker and try again.[/red]"
         )
@@ -93,6 +105,7 @@ def setup_postgresql(no_postgres: bool = False) -> None:
 
     if is_postgres_running_in_docker():
         console.print("🐳 [green]PostgreSQL is already running in a Docker container.[/green]")
+        capture_setup_event("database-docker-detected", success=True, extra_data={"source": "docker_existing"})
     else:
         if not no_postgres:
             start_postgres = Confirm.ask(
@@ -104,15 +117,27 @@ def setup_postgresql(no_postgres: bool = False) -> None:
                 console.print(
                     "[italic]If you plan to use Docker Compose, its Postgres service will start automatically.[/italic]"
                 )
+                capture_setup_event("database-skip", success=True, extra_data={"reason": "user_declined"})
                 return
 
         console.print("🚀 [bold green]Attempting to install PostgreSQL via Docker...[/bold green]")
         if not is_postgres_container_exists():
             with console.status("[bold blue]Pulling and starting PostgreSQL container...[/bold blue]"):
-                run_command(
+                output, code = run_command(
                     "docker run --name postgresql-container -e POSTGRES_HOST_AUTH_METHOD=trust -d -p 5432:5432 postgres:14"
                 )
-            console.print("✅ [green]PostgreSQL has been installed and started using Docker.[/green]")
+                if code != 0:
+                    capture_setup_event(
+                        "database-container-fail",
+                        success=False,
+                        error_type="docker_run_error",
+                        error_message=output or "Failed to start PostgreSQL container",
+                    )
+                    console.print(
+                        "[red]Warning: Failed to start PostgreSQL container. Check Docker logs for details.[/red]"
+                    )
+                else:
+                    console.print("✅ [green]PostgreSQL has been installed and started using Docker.[/green]")
         else:
             with console.status("[bold blue]Starting existing PostgreSQL container...[/bold blue]"):
                 run_command("docker start postgresql-container")
@@ -134,8 +159,17 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             console.print("✅ [green]Database user exists.[/green]")
         else:
             console.print("🚀 [bold green]Creating database user...[/bold green]")
-            run_command("docker exec postgresql-container createuser -U postgres skyvern")
-            console.print("✅ [green]Database user created.[/green]")
+            output, user_code = run_command("docker exec postgresql-container createuser -U postgres skyvern")
+            if user_code != 0:
+                capture_setup_event(
+                    "database-user-create-fail",
+                    success=False,
+                    error_type="createuser_error",
+                    error_message=output or "Failed to create database user",
+                )
+                console.print("[red]Warning: Failed to create database user.[/red]")
+            else:
+                console.print("✅ [green]Database user created.[/green]")
 
     with console.status("[bold green]Checking database...[/bold green]"):
         _, code = run_command(
@@ -146,5 +180,16 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             console.print("✅ [green]Database exists.[/green]")
         else:
             console.print("🚀 [bold green]Creating database...[/bold green]")
-            run_command("docker exec postgresql-container createdb -U postgres skyvern -O skyvern")
-            console.print("✅ [green]Database and user created successfully.[/green]")
+            output, db_code = run_command("docker exec postgresql-container createdb -U postgres skyvern -O skyvern")
+            if db_code != 0:
+                capture_setup_event(
+                    "database-create-fail",
+                    success=False,
+                    error_type="createdb_error",
+                    error_message=output or "Failed to create database",
+                )
+                console.print("[red]Warning: Failed to create database.[/red]")
+            else:
+                console.print("✅ [green]Database and user created successfully.[/green]")
+
+    capture_setup_event("database-complete", success=True, extra_data={"source": "docker"})

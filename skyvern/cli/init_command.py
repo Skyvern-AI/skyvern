@@ -8,6 +8,7 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
 
+from skyvern.analytics import capture_setup_event
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.utils import migrate_db
 from skyvern.utils.env_paths import resolve_backend_env_path
@@ -134,14 +135,26 @@ def init_env(
 
     if run_local:
         console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
+        capture_setup_event("playwright-install-start")
         with Progress(
             SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
         ) as progress:
             progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
-            subprocess.run(["playwright", "install", "chromium"], check=True)
+            try:
+                subprocess.run(["playwright", "install", "chromium"], check=True, capture_output=True, text=True)
+                capture_setup_event("playwright-install-complete", success=True)
+            except subprocess.CalledProcessError as e:
+                capture_setup_event(
+                    "playwright-install-fail",
+                    success=False,
+                    error_type="playwright_install_error",
+                    error_message=e.stderr.strip() if e.stderr else str(e),
+                )
+                raise
         console.print("✅ [green]Chromium installation complete.[/green]")
 
         console.print("\n🎉 [bold green]Skyvern setup complete![/bold green]")
+        capture_setup_event("init-complete", success=True, extra_data={"mode": "local"})
         console.print("[bold]To start using Skyvern, run:[/bold]")
         console.print(Padding("skyvern run server", (1, 4), style="reverse green"))
 
@@ -151,18 +164,35 @@ def init_env(
 def init_browser() -> None:
     """Initialize only the browser configuration and install Chromium."""
     console.print("\n[bold blue]Configuring browser settings...[/bold blue]")
+    capture_setup_event("browser-config-start")
     browser_type, browser_location, remote_debugging_url = setup_browser_config()
     update_or_add_env_var("BROWSER_TYPE", browser_type)
     if browser_location:
         update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
     if remote_debugging_url:
         update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
+    capture_setup_event(
+        "browser-config-complete",
+        success=True,
+        extra_data={"browser_type": browser_type, "has_custom_path": browser_location is not None},
+    )
     console.print("✅ [green]Browser configuration complete.[/green]")
 
     console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
+    capture_setup_event("playwright-install-start")
     with Progress(
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
     ) as progress:
         progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
-        subprocess.run(["playwright", "install", "chromium"], check=True)
+        try:
+            subprocess.run(["playwright", "install", "chromium"], check=True, capture_output=True, text=True)
+            capture_setup_event("playwright-install-complete", success=True)
+        except subprocess.CalledProcessError as e:
+            capture_setup_event(
+                "playwright-install-fail",
+                success=False,
+                error_type="playwright_install_error",
+                error_message=e.stderr.strip() if e.stderr else str(e),
+            )
+            raise
     console.print("✅ [green]Chromium installation complete.[/green]")

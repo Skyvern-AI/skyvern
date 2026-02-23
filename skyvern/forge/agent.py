@@ -55,7 +55,6 @@ from skyvern.exceptions import (
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
     ScrapingFailed,
-    SkyvernException,
     StepTerminationError,
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
@@ -63,6 +62,7 @@ from skyvern.exceptions import (
     TaskNotFound,
     UnsupportedActionType,
     UnsupportedTaskType,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
@@ -842,9 +842,7 @@ class ForgeAgent:
         except Exception as e:
             LOG.exception("Got an unexpected exception in step, marking task as failed")
 
-            failure_reason = f"Unexpected error: {str(e)}"
-            if isinstance(e, SkyvernException):
-                failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+            failure_reason = get_user_facing_exception_message(e)
 
             is_task_marked_as_failed = await self.fail_task(task, step, failure_reason)
             if is_task_marked_as_failed:

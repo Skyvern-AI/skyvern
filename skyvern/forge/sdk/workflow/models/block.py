@@ -46,9 +46,9 @@ from skyvern.exceptions import (
     MissingBrowserState,
     MissingBrowserStatePage,
     PDFParsingError,
-    SkyvernException,
     TaskNotFound,
     UnexpectedTaskStatus,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -559,9 +559,7 @@ class Block(BaseModel, abc.ABC):
             if not workflow_run_context.has_value(self.output_parameter.key):
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
 
-            failure_reason = f"Unexpected error: {str(e)}"
-            if isinstance(e, SkyvernException):
-                failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+            failure_reason = get_user_facing_exception_message(e)
 
             return await self.build_block_result(
                 success=False,
