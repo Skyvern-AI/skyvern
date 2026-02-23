@@ -54,7 +54,18 @@ function useVerificationCodeAlert({
       return;
     }
 
-    const startTime = new Date(pollingStartedAt).getTime();
+    // Normalize to UTC: backend sends ISO 8601 without timezone suffix
+    // (e.g., "2026-02-21T12:00:00.000000" from Python's datetime.utcnow().isoformat())
+    // JavaScript interprets timestamps without "Z" as local time, causing incorrect calculations
+    let normalizedTimestamp = pollingStartedAt;
+    if (
+      !pollingStartedAt.endsWith("Z") &&
+      !pollingStartedAt.includes("+") &&
+      !pollingStartedAt.includes("-", 10)
+    ) {
+      normalizedTimestamp = pollingStartedAt + "Z";
+    }
+    const startTime = new Date(normalizedTimestamp).getTime();
     const timeoutMs = VERIFICATION_TIMEOUT_MINS * 60 * TIMER_TICK_MS;
 
     const updateTimer = () => {
