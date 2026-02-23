@@ -1,0 +1,245 @@
+{/* This file (docs/) and fern/integrations/cli.mdx must stay in sync. docs/ is for Mintlify, fern/ is for Fern. */}
+---
+title: CLI & Skills
+subtitle: Automate browsers and manage workflows from the command line
+slug: going-to-production/cli
+---
+
+The `skyvern` CLI gives you direct access to browser automation, workflow management, credential storage, and more — all from your terminal. Use it in shell scripts, CI/CD pipelines, or for quick one-off tasks.
+
+## Install
+
+```bash
+pip install skyvern
+```
+
+Set your API key:
+
+```bash
+export SKYVERN_API_KEY="YOUR_KEY"  # get one at https://app.skyvern.com
+```
+
+Optionally run the interactive setup wizard to configure your environment:
+
+```bash
+skyvern init
+```
+
+## Command reference
+
+### Services
+
+```bash
+skyvern run server            # Start the local API server
+skyvern run mcp               # Start the MCP server (stdio transport)
+skyvern run mcp --http        # Start the MCP server (HTTP transport)
+skyvern status                # Check if services are running
+skyvern stop                  # Stop running services
+```
+
+### Browser automation
+
+All browser commands operate on an active session. Create one first, then run actions against it.
+
+```bash
+# Session management
+skyvern browser session create              # Start a cloud browser session
+skyvern browser session create --timeout 30 # Custom timeout (minutes)
+skyvern browser session list                # List active sessions
+skyvern browser session get --session pbs_xxx
+skyvern browser session connect --cdp ws://localhost:9222  # Connect to local Chrome
+skyvern browser session close               # Close the active session
+
+# Navigation
+skyvern browser navigate --url https://example.com
+
+# AI-powered actions
+skyvern browser act --prompt "Click the Sign In button"
+skyvern browser extract --prompt "Get all product names and prices"
+skyvern browser validate --prompt "Is the user logged in?"
+
+# Precision actions (CSS/XPath selectors or natural language intent)
+skyvern browser click --selector "#submit-btn"
+skyvern browser click --intent "the checkout button"
+skyvern browser type --selector "#email" --text "user@example.com"
+skyvern browser select --selector "#country" --value "US"
+skyvern browser scroll --direction down --amount 500
+skyvern browser press-key --key Enter
+skyvern browser hover --selector ".menu-item"
+skyvern browser wait --selector "#results" --state visible
+
+# Screenshots
+skyvern browser screenshot
+skyvern browser screenshot --full-page --output page.png
+
+# Run JavaScript
+skyvern browser evaluate --expression "document.title"
+
+# Full task automation (multi-step agent)
+skyvern browser run-task --prompt "Find the cheapest flight from NYC to LA"
+skyvern browser login --url https://app.example.com --credential-id cred_xxx
+```
+
+<Tip>
+Every browser command supports `--json` for machine-readable output, and `--session` / `--cdp` to target a specific session. If omitted, the CLI uses the last active session automatically.
+</Tip>
+
+### Workflows
+
+```bash
+skyvern workflow list                              # List all workflows
+skyvern workflow get --workflow-id wpid_xxx         # Get workflow details
+skyvern workflow create --file workflow.json         # Create from JSON definition
+skyvern workflow update --workflow-id wpid_xxx --file updated.json
+skyvern workflow delete --workflow-id wpid_xxx
+skyvern workflow run --workflow-id wpid_xxx          # Execute a workflow
+skyvern workflow run --workflow-id wpid_xxx --params '{"url": "https://example.com"}'
+skyvern workflow status --run-id wr_xxx              # Check run status
+skyvern workflow cancel --run-id wr_xxx              # Cancel a running workflow
+```
+
+### Credentials
+
+Credentials are created interactively via stdin so secrets never appear in shell history.
+
+```bash
+skyvern credentials add            # Interactive credential creation (password or credit card)
+skyvern credential list            # List stored credentials
+skyvern credential get --id cred_xxx
+skyvern credential delete --id cred_xxx
+```
+
+Note: `credentials` (plural) is used for the interactive `add` command; `credential` (singular) for list/get/delete. Both forms are intentional.
+
+### Workflow blocks
+
+```bash
+skyvern block schema --block-type task     # Show the JSON schema for a block type
+skyvern block validate --file block.json   # Validate a block definition
+```
+
+### MCP setup
+
+Register Skyvern's MCP server with your AI coding tool in one command:
+
+```bash
+skyvern setup claude-code        # Register with Claude Code (global)
+skyvern setup claude-code --project  # Register with Claude Code (project-level)
+skyvern setup claude-desktop     # Register with Claude Desktop
+skyvern setup cursor             # Register with Cursor
+skyvern setup windsurf           # Register with Windsurf
+skyvern setup codex              # Register with Codex
+```
+
+### Other
+
+```bash
+skyvern docs                     # Open documentation in your browser
+skyvern quickstart               # One-command setup + start
+skyvern init browser             # Initialize browser configuration only
+```
+
+## CLI vs MCP: when to use which
+
+| Use case | CLI | MCP |
+|----------|-----|-----|
+| Shell scripts and CI/CD | Yes | No |
+| One-off browser tasks | Yes | Yes |
+| AI assistant integration (Claude, Cursor, Codex) | No | Yes |
+| Credential creation (secrets via stdin) | Yes | No |
+| Starting/stopping services | Yes | No |
+| Composing with Unix pipes (`--json` output) | Yes | No |
+| Natural language orchestration by an AI agent | No | Yes |
+
+The CLI and MCP server share the same underlying logic. The CLI is for humans and scripts; MCP is for AI assistants that call tools programmatically.
+
+## Skills
+
+Skills are bundled reference markdown files that teach AI coding tools how to use Skyvern. They are **not** the same as MCP tools — they are documentation that an AI agent can load to learn the CLI and API.
+
+```bash
+skyvern skill list                  # List available skills
+skyvern skill show skyvern          # Render a skill in the terminal
+skyvern skill path skyvern          # Print the absolute path to a skill file
+skyvern skill path                  # Print the skills directory
+skyvern skill copy --output ./docs  # Copy all skills to a local directory
+skyvern skill copy skyvern -o .     # Copy a single skill
+```
+
+<Accordion title="Loading skills into AI tools">
+
+Skills are plain markdown files. You can load them into any AI coding tool that supports custom instructions:
+
+**Claude Code** — add the skill path as a custom instructions file or use `skyvern setup claude-code` which configures MCP (the richer integration path).
+
+**Codex** — copy the skill into your project's `.codex/skills/` directory:
+
+```bash
+skyvern skill copy skyvern -o .codex/skills/
+```
+
+**Any tool** — point your tool at the file path returned by `skyvern skill path skyvern`.
+
+</Accordion>
+
+## JSON output
+
+All commands support `--json` for structured output, making it easy to compose with `jq` and other tools:
+
+```bash
+# Extract the session ID from a new session
+SESSION=$(skyvern browser session create --json | jq -r '.session_id')
+
+# Extract data and pipe to a file
+skyvern browser extract --prompt "Get all links" --json | jq '.extracted' > links.json
+
+# Check workflow run status in a script
+STATUS=$(skyvern workflow status --run-id wr_xxx --json | jq -r '.status')
+```
+
+## Troubleshooting
+
+<Accordion title="Command not found: skyvern">
+Make sure the package is installed and on your PATH:
+
+```bash
+pip install skyvern
+which skyvern
+```
+
+If using a virtual environment, activate it first. You can also run via module:
+
+```bash
+python3 -m skyvern --help
+```
+</Accordion>
+
+<Accordion title="Authentication errors">
+Verify your API key is set:
+
+```bash
+echo $SKYVERN_API_KEY
+```
+
+You can also pass it directly:
+
+```bash
+skyvern credentials add --api-key YOUR_KEY
+```
+
+Get an API key from [Settings](https://app.skyvern.com/settings/api-keys) in the Skyvern dashboard.
+</Accordion>
+
+<Accordion title="No active browser session">
+Browser commands require an active session. Create one first:
+
+```bash
+skyvern browser session create
+```
+
+Or specify a session explicitly:
+
+```bash
+skyvern browser navigate --url https://example.com --session pbs_xxx
+```
+</Accordion>

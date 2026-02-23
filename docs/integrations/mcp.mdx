@@ -1,3 +1,4 @@
+{/* This file (docs/) and fern/integrations/mcp.mdx must stay in sync. docs/ is for Mintlify, fern/ is for Fern. Minor formatting differences (Tip vs inline text, CardGroup) are OK since the platforms support different components. */}
 ---
 title: MCP Server
 subtitle: Connect AI assistants to browser automation via Model Context Protocol
@@ -6,127 +7,36 @@ slug: going-to-production/mcp
 
 The Skyvern MCP server lets AI assistants like Claude Desktop, Claude Code, Codex, Cursor, and Windsurf control a browser. Your AI can fill out forms, extract data, download files, and run multi-step workflows, all through natural language.
 
-<Note>
-Local (stdio) mode requires Python 3.11, 3.12, or 3.13. Remote HTTP mode has no local dependencies.
-</Note>
-
 ## What you can do
 
-The MCP server exposes 31 tools across 5 categories:
+The MCP server exposes 33 tools across 6 categories:
 
 | Category | Key tools | What they do |
 |----------|-----------|--------------|
-| **Session management** | `session_create`, `session_close`, `session_list`, `session_connect` | Open, manage, and reuse browser sessions |
-| **Browser actions** | `act`, `navigate`, `click`, `type`, `scroll`, `select_option`, `press_key`, `wait` | Control the browser with natural language or CSS/XPath selectors |
-| **Data extraction** | `extract`, `screenshot`, `evaluate` | Pull structured data from pages, capture screenshots, run JavaScript |
-| **Validation** | `validate` | Check page conditions using AI (returns true/false) |
-| **Workflows** | `workflow_create`, `workflow_run`, `workflow_status`, `workflow_get`, `workflow_update`, `workflow_delete` | Build and execute multi-step automations |
+| **Session management** | `skyvern_session_create`, `skyvern_session_close`, `skyvern_session_list`, `skyvern_session_connect` | Open, manage, and reuse browser sessions |
+| **Browser actions** | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait` | Control the browser with natural language or CSS/XPath selectors |
+| **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured data from pages, capture screenshots, run JavaScript |
+| **Validation** | `skyvern_validate` | Check page conditions using AI (returns true/false) |
+| **Credentials** | `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete` | Look up stored credentials for login flows |
+| **Workflows** | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete` | Build and execute multi-step automations |
 
-Your AI assistant decides which tools to call based on your instructions. For example, asking "go to Hacker News and get the top post title" triggers `session_create`, `navigate`, `extract`, and `session_close` automatically.
+Your AI assistant decides which tools to call based on your instructions. For example, asking "go to Hacker News and get the top post title" triggers `skyvern_session_create`, `skyvern_navigate`, `skyvern_extract`, and `skyvern_session_close` automatically.
 
-## Setup
+## Quick start
 
-### Option A: Setup wizard (recommended)
+Pick your client and follow the setup below. Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboard.
 
-```bash
-pip install skyvern
-skyvern init
-```
-
-The wizard will:
-1. Ask whether to use Skyvern Cloud or a local server
-2. Configure your LLM provider (if local)
-3. Detect your MCP clients (Claude Desktop, Cursor, Windsurf)
-4. Write the MCP configuration file for each client automatically
-
-<Tip>
-If you chose local mode, start the server before using MCP:
+<Tabs>
+<Tab title="Claude Code">
 
 ```bash
-skyvern run server
-```
-</Tip>
-
-### Option B: Manual configuration (stdio — runs locally)
-
-Each client has its own config file and format. Pick your client below.
-
-<Accordion title="Claude Desktop / Cursor / Windsurf (JSON)">
-
-Add to your client's config file (see config file locations table below):
-
-```json
-{
-  "mcpServers": {
-    "Skyvern": {
-      "env": {
-        "SKYVERN_BASE_URL": "https://api.skyvern.com",
-        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
-      },
-      "command": "/usr/bin/python3",
-      "args": ["-m", "skyvern", "run", "mcp"]
-    }
-  }
-}
+claude mcp add-json skyvern '{"type":"streamable-http","url":"https://api.skyvern.com/mcp","headers":{"x-api-key":"YOUR_SKYVERN_API_KEY"}}' --scope user
 ```
 
-Replace `/usr/bin/python3` with the output of `which python3` on your machine. For local mode, set `SKYVERN_BASE_URL` to `http://localhost:8000`.
+</Tab>
+<Tab title="Claude Desktop">
 
-</Accordion>
-
-<Accordion title="Claude Code (JSON)">
-
-Add to `.mcp.json` in your project root (version-controlled), or `~/.claude.json` for global config:
-
-```json
-{
-  "mcpServers": {
-    "skyvern": {
-      "type": "stdio",
-      "command": "/usr/bin/python3",
-      "args": ["-m", "skyvern", "run", "mcp"],
-      "env": {
-        "SKYVERN_BASE_URL": "https://api.skyvern.com",
-        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
-      }
-    }
-  }
-}
-```
-
-Replace `/usr/bin/python3` with the output of `which python3`.
-
-</Accordion>
-
-<Accordion title="Codex (TOML)">
-
-Add to `~/.codex/config.toml` (global) or `.codex/config.toml` in a trusted project:
-
-```toml
-[mcp_servers.skyvern]
-command = "/usr/bin/python3"
-args = ["-m", "skyvern", "run", "mcp"]
-
-[mcp_servers.skyvern.env]
-SKYVERN_BASE_URL = "https://api.skyvern.com"
-SKYVERN_API_KEY = "YOUR_SKYVERN_API_KEY"
-```
-
-Replace `/usr/bin/python3` with the output of `which python3`. You can also run `codex mcp add skyvern -- python3 -m skyvern run mcp` to add it interactively.
-
-</Accordion>
-
-### Option C: Remote MCP over HTTPS (streamable HTTP) — recommended for cloud users
-
-Connect directly to Skyvern's hosted MCP endpoint. No local Python installation required.
-
-In remote HTTP mode:
-- Clients must send `x-api-key` on every request.
-- Use `skyvern_session_create` first, then pass `session_id` explicitly on subsequent browser tool calls.
-
-If your MCP client supports native remote HTTP transport, configure it directly.
-
-<Accordion title="Claude Desktop / Cursor / Windsurf / Claude Code (JSON)">
+Add to your Claude Desktop config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `~/.config/Claude/claude_desktop_config.json` on Linux):
 
 ```json
 {
@@ -142,21 +52,48 @@ If your MCP client supports native remote HTTP transport, configure it directly.
 }
 ```
 
-For Claude Code, add to `.mcp.json` in your project root or `~/.claude.json` globally.
+</Tab>
+<Tab title="Cursor">
 
-</Accordion>
+Add to `~/.cursor/mcp.json`:
 
-<Accordion title="Codex (TOML)">
-
-```toml
-[mcp_servers.skyvern]
-url = "https://api.skyvern.com/mcp"
-
-[mcp_servers.skyvern.env_http_headers]
-x-api-key = "SKYVERN_API_KEY"
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp",
+      "headers": {
+        "x-api-key": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
 ```
 
-Set the `SKYVERN_API_KEY` environment variable, or use `http_headers` for a static value:
+</Tab>
+<Tab title="Windsurf">
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp",
+      "headers": {
+        "x-api-key": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Codex">
+
+Add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.skyvern]
@@ -166,11 +103,86 @@ url = "https://api.skyvern.com/mcp"
 x-api-key = "YOUR_SKYVERN_API_KEY"
 ```
 
-</Accordion>
+To load the API key from an environment variable instead, use `env_http_headers`:
+
+```toml
+[mcp_servers.skyvern.env_http_headers]
+x-api-key = "SKYVERN_API_KEY"
+```
+
+</Tab>
+</Tabs>
+
+That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS.
+
+## Alternative: Local mode (stdio)
+
+If you prefer to run Skyvern locally or need to use your own LLM provider, use stdio transport instead. This requires Python 3.11, 3.12, or 3.13.
+
+```bash
+pip install skyvern
+```
+
+<Tabs>
+<Tab title="Claude Code">
+
+```bash
+claude mcp add --transport stdio skyvern \
+  --env SKYVERN_BASE_URL=https://api.skyvern.com \
+  --env SKYVERN_API_KEY=YOUR_SKYVERN_API_KEY \
+  -- python3 -m skyvern run mcp
+```
+
+For a local server, set `SKYVERN_BASE_URL=http://localhost:8000`.
+
+</Tab>
+<Tab title="Claude Desktop / Cursor / Windsurf">
+
+Add to your client's config file:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "command": "/usr/bin/python3",
+      "args": ["-m", "skyvern", "run", "mcp"],
+      "env": {
+        "SKYVERN_BASE_URL": "https://api.skyvern.com",
+        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+Replace `/usr/bin/python3` with the output of `which python3`. For a local server, set `SKYVERN_BASE_URL` to `http://localhost:8000`.
+
+</Tab>
+<Tab title="Codex">
+
+```toml
+[mcp_servers.skyvern]
+command = "/usr/bin/python3"
+args = ["-m", "skyvern", "run", "mcp"]
+
+[mcp_servers.skyvern.env]
+SKYVERN_BASE_URL = "https://api.skyvern.com"
+SKYVERN_API_KEY = "YOUR_SKYVERN_API_KEY"
+```
+
+Replace `/usr/bin/python3` with the output of `which python3`.
+
+</Tab>
+</Tabs>
 
 <Tip>
-This is the simplest setup for Skyvern Cloud users — no Python, no `pip install`, just paste the config and go.
-Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboard.
+You can also run `skyvern init` to auto-detect installed clients and write configs automatically.
+
+If using local mode, start the server before using MCP:
+
+```bash
+skyvern run server
+```
 </Tip>
 
 <Accordion title="Config file locations by client">
@@ -210,7 +222,7 @@ Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboa
 
 ## Troubleshooting
 
-<Accordion title="Python version errors">
+<Accordion title="Python version errors (local mode only)">
 The Skyvern MCP server requires Python 3.11, 3.12, or 3.13. Check your version with `python3 --version`. If you have multiple Python versions installed, make sure the `command` in your MCP config points to a supported version:
 
 ```bash
@@ -245,21 +257,3 @@ which python3
 Use the full absolute path (e.g., `/usr/bin/python3` or `/Users/you/.pyenv/shims/python3`), not just `python3`. Restart your MCP client after editing the config file.
 </Accordion>
 
-## Next steps
-
-<CardGroup cols={2}>
-  <Card
-    title="Run a Task"
-    icon="play"
-    href="/running-automations/run-a-task"
-  >
-    Learn the API for running browser automations
-  </Card>
-  <Card
-    title="API Quickstart"
-    icon="rocket"
-    href="/getting-started/quickstart"
-  >
-    Get started with the Skyvern SDK
-  </Card>
-</CardGroup>
