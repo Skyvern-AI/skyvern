@@ -9516,6 +9516,21 @@
             "type": "boolean",
             "title": "Complete If Empty",
             "default": false
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema"
           }
         },
         "type": "object",
@@ -9670,6 +9685,21 @@
             "type": "boolean",
             "title": "Complete If Empty",
             "default": false
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema"
           }
         },
         "type": "object",
