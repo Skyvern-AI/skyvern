@@ -5554,81 +5554,70 @@ class ConditionalBlock(Block):
             "required": ["evaluations"],
         }
 
+        # Step 4: Create and execute single ExtractionBlock.
+        # When all expressions have been Jinja-rendered successfully, omit
+        # browser_session_id so the LLM won't reinterpret resolved literal
+        # values as on-screen references (SKY-7985).
+        effective_browser_session_id = browser_session_id if has_any_pure_natlang else None
+
+        output_param = OutputParameter(
+            output_parameter_id=str(uuid.uuid4()),
+            key=f"conditional_branch_eval_{generate_random_string()}",
+            workflow_id=self.output_parameter.workflow_id,
+            created_at=datetime.now(),
+            modified_at=datetime.now(),
+            parameter_type=ParameterType.OUTPUT,
+            description=f"Conditional branch evaluation results ({len(branches)} conditions)",
+        )
+        extraction_block = ExtractionBlock(
+            label=f"conditional_branch_eval_{generate_random_string()}",
+            data_extraction_goal=extraction_goal,
+            data_schema=data_schema,
+            output_parameter=output_param,
+        )
+
+        LOG.info(
+            "Conditional branch ExtractionBlock created (batched)",
+            block_label=self.label,
+            num_conditions=len(branches),
+            extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
+            has_browser_session=effective_browser_session_id is not None,
+            has_any_pure_natlang=has_any_pure_natlang,
+            has_context=context_json is not None,
+        )
+
         try:
-            # Step 4: Evaluate conditions.
-            if has_any_pure_natlang:
-                output_param = OutputParameter(
-                    output_parameter_id=str(uuid.uuid4()),
-                    key=f"conditional_branch_eval_{generate_random_string()}",
-                    workflow_id=self.output_parameter.workflow_id,
-                    created_at=datetime.now(),
-                    modified_at=datetime.now(),
-                    parameter_type=ParameterType.OUTPUT,
-                    description=f"Conditional branch evaluation results ({len(branches)} conditions)",
-                )
-                extraction_block = ExtractionBlock(
-                    label=f"conditional_branch_eval_{generate_random_string()}",
-                    data_extraction_goal=extraction_goal,
-                    data_schema=data_schema,
-                    output_parameter=output_param,
-                )
-                LOG.info(
-                    "Conditional branch ExtractionBlock created (batched)",
-                    block_label=self.label,
-                    num_conditions=len(branches),
-                    extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-                    has_browser_session=browser_session_id is not None,
-                    has_any_pure_natlang=has_any_pure_natlang,
-                    using_browser_session=browser_session_id is not None,
-                    has_context=context_json is not None,
-                )
-                extraction_result = await extraction_block.execute(
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                    browser_session_id=browser_session_id,
-                )
+            extraction_result = await extraction_block.execute(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=effective_browser_session_id,
+            )
 
-                if not extraction_result.success:
-                    LOG.error(
-                        "Conditional branch ExtractionBlock failed",
-                        block_label=self.label,
-                        failure_reason=extraction_result.failure_reason,
+            if not extraction_result.success:
+                LOG.error(
+                    "Conditional branch ExtractionBlock failed",
+                    block_label=self.label,
+                    failure_reason=extraction_result.failure_reason,
+                )
+                raise ValueError(f"Branch evaluation failed: {extraction_result.failure_reason}")
+
+            if workflow_run_context:
+                try:
+                    await extraction_block.record_output_parameter_value(
+                        workflow_run_context=workflow_run_context,
+                        workflow_run_id=workflow_run_id,
+                        value=extraction_result.output_parameter_value,
                     )
-                    raise ValueError(f"Branch evaluation failed: {extraction_result.failure_reason}")
+                except Exception:
+                    LOG.warning(
+                        "Failed to record conditional branch evaluation output",
+                        workflow_run_id=workflow_run_id,
+                        block_label=self.label,
+                        exc_info=True,
+                    )
 
-                if workflow_run_context:
-                    try:
-                        await extraction_block.record_output_parameter_value(
-                            workflow_run_context=workflow_run_context,
-                            workflow_run_id=workflow_run_id,
-                            value=extraction_result.output_parameter_value,
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to record conditional branch evaluation output",
-                            workflow_run_id=workflow_run_id,
-                            block_label=self.label,
-                            exc_info=True,
-                        )
-
-                output_value = extraction_result.output_parameter_value
-            else:
-                # Do not use ExtractionBlock when every expression has already been Jinja-rendered.
-                # ExtractionBlock may still have page/browser context, which can cause the LLM to
-                # reinterpret resolved literals as on-screen references.
-                LOG.info(
-                    "Conditional branch using direct LLM evaluation (no browser context)",
-                    block_label=self.label,
-                    num_conditions=len(branches),
-                    extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-                    has_context=False,
-                )
-                output_value = await app.LLM_API_HANDLER(
-                    prompt=extraction_goal,
-                    prompt_name="conditional-prompt-branch-evaluation",
-                    force_dict=True,
-                )
+            output_value = extraction_result.output_parameter_value
 
             # Step 5: Extract the evaluation results (reasoning + result)
             results_array: list[bool] = []
