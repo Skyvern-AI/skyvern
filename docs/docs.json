@@ -58,7 +58,8 @@
               "going-to-production/error-handling",
               "going-to-production/reliability-tips",
               "going-to-production/captcha-bot-detection",
-              "integrations/mcp"
+              "integrations/mcp",
+              "integrations/cli"
             ]
           },
           {
