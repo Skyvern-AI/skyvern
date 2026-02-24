@@ -1,3 +1,6 @@
+type BrowserSessionExtension = "ad-blocker" | "captcha-solver";
+type BrowserSessionType = "msedge" | "chrome";
+
 interface BrowserSession {
   browser_address: string | null;
   browser_session_id: string;
@@ -8,6 +11,8 @@ interface BrowserSession {
   started_at: string | null;
   status: string;
   timeout: number | null;
+  extensions?: BrowserSessionExtension[] | null;
+  browser_type?: BrowserSessionType | null;
   vnc_streaming_supported: boolean;
 }
 
@@ -18,4 +23,9 @@ interface Recording {
   modified_at: string;
 }
 
-export { type BrowserSession, type Recording };
+export {
+  type BrowserSession,
+  type BrowserSessionExtension,
+  type BrowserSessionType,
+  type Recording,
+};
