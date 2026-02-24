@@ -117,6 +117,9 @@ else:
     jinja_sandbox_env = SandboxedEnvironment()
 
 
+# Date format used for the built-in {{current_date}} reserved parameter.
+CURRENT_DATE_FORMAT = "%Y-%m-%d"
+
 # Sentinel marker for native JSON type injection via | json filter.
 _JSON_TYPE_MARKER = "__SKYVERN_RAW_JSON__"
 
@@ -399,6 +402,8 @@ class Block(BaseModel, abc.ABC):
             template_data["workflow_permanent_id"] = workflow_run_context.workflow_permanent_id
         if "workflow_run_id" not in template_data:
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
+        if "current_date" not in template_data:
+            template_data["current_date"] = datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT)
 
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
         template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
@@ -5059,6 +5064,7 @@ class BranchEvaluationContext:
         template_data.setdefault("workflow_id", ctx.workflow_id)
         template_data.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
         template_data.setdefault("workflow_run_id", ctx.workflow_run_id)
+        template_data.setdefault("current_date", datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT))
 
         template_data.setdefault("params", template_data.get("params", {}))
         template_data.setdefault("outputs", template_data.get("outputs", {}))
