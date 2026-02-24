@@ -1,4 +1,5 @@
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -17,6 +18,38 @@ from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
 LOG = structlog.get_logger()
+
+_MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED = {
+    "verificationcode",
+    "mfachoice",
+    "mfacode",
+    "otp",
+    "otpcode",
+    "twofactorcode",
+    "2facode",
+    "authenticationcode",
+    "authcode",
+}
+_NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
+_OTP_CODE_PATTERN = re.compile(r"^\d{4,10}$")
+_OTP_TEXT_BEFORE_CODE_PATTERN = re.compile(
+    r"\b(?:verification code|authentication code|security code|otp|mfa|2fa|two-factor|two factor|"
+    r"one-time password|one time password|one-time code|one time code)\b[^\d]{0,40}(\d{4,10})\b",
+    re.IGNORECASE,
+)
+_OTP_CODE_BEFORE_TEXT_PATTERN = re.compile(
+    r"\b(\d{4,10})\b[^\w]{0,20}(?:verification code|authentication code|security code|otp|mfa|2fa|two-factor|two factor)\b",
+    re.IGNORECASE,
+)
+_OTP_CONTEXT_PATTERN = re.compile(
+    r"\b(?:verification code|authentication code|security code|otp|mfa|2fa|two-factor|two factor|"
+    r"one-time password|one time password|one-time code|one time code)\b",
+    re.IGNORECASE,
+)
+_OTP_INPUT_ACTION_CODE_PATTERN = re.compile(
+    r"\b(?:input|enter|type|fill|use|submit)\b[^\d]{0,30}(\d{4,10})\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -52,6 +85,101 @@ class OTPResultParsedByLLM(BaseModel):
     otp_type: OTPType | None = Field(None, description="The type of the OTP code.")
     otp_value_found: bool = Field(..., description="Whether the OTP value is found.")
     otp_value: str | None = Field(None, description="The OTP value.")
+
+
+def _iter_mfa_payload_values(payload: dict | list | str | None) -> list[str]:
+    if isinstance(payload, dict):
+        values: list[str] = []
+        for key, value in payload.items():
+            if _normalize_payload_key(key) in _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED:
+                candidate_value = _coerce_mfa_candidate_value(value)
+                if candidate_value is not None:
+                    values.append(candidate_value)
+            if isinstance(value, (dict, list)):
+                values.extend(_iter_mfa_payload_values(value))
+        return values
+
+    if isinstance(payload, list):
+        list_values: list[str] = []
+        for item in payload:
+            if isinstance(item, (dict, list)):
+                list_values.extend(_iter_mfa_payload_values(item))
+        return list_values
+
+    return []
+
+
+def _normalize_payload_key(key: object) -> str:
+    return _NON_ALNUM_PATTERN.sub("", str(key).lower())
+
+
+def _coerce_mfa_candidate_value(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
+def extract_totp_from_text(text: object, *, assume_otp_context: bool = False) -> OTPValue | None:
+    if not isinstance(text, str) or not text:
+        return None
+
+    stripped_text = text.strip()
+    if not stripped_text:
+        return None
+
+    for pattern in (_OTP_TEXT_BEFORE_CODE_PATTERN, _OTP_CODE_BEFORE_TEXT_PATTERN):
+        match = pattern.search(stripped_text)
+        if match:
+            return OTPValue(value=match.group(1), type=OTPType.TOTP)
+
+    context_found = assume_otp_context or bool(_OTP_CONTEXT_PATTERN.search(stripped_text))
+    if not context_found:
+        return None
+
+    input_action_match = _OTP_INPUT_ACTION_CODE_PATTERN.search(stripped_text)
+    if input_action_match:
+        return OTPValue(value=input_action_match.group(1), type=OTPType.TOTP)
+
+    return None
+
+
+def extract_totp_from_navigation_payload(payload: dict | list | str | None) -> OTPValue | None:
+    """Extract a TOTP code from navigation payload using explicit MFA aliases.
+
+    The extractor is intentionally strict:
+    - only exact alias keys are considered
+    - values must be numeric and between 4 and 10 digits
+    """
+    for value in _iter_mfa_payload_values(payload):
+        stripped_value = value.strip()
+        if _OTP_CODE_PATTERN.fullmatch(stripped_value):
+            return OTPValue(value=stripped_value, type=OTPType.TOTP)
+        otp_from_text = extract_totp_from_text(stripped_value, assume_otp_context=True)
+        if otp_from_text:
+            return otp_from_text
+
+    if isinstance(payload, str):
+        return extract_totp_from_text(payload, assume_otp_context=True)
+
+    return None
+
+
+def extract_totp_from_navigation_inputs(
+    navigation_payload: dict | list | str | None,
+    navigation_goal: object,
+) -> OTPValue | None:
+    """Extract TOTP from runtime navigation inputs with explicit precedence.
+
+    Priority:
+    1. `navigation_payload` explicit MFA aliases
+    2. `navigation_goal` textual instructions (e.g. "Input 520265")
+    """
+    otp_value = extract_totp_from_navigation_payload(navigation_payload)
+    if otp_value:
+        return otp_value
+    return extract_totp_from_text(navigation_goal)
 
 
 async def parse_otp_login(
