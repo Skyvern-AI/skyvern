@@ -155,6 +155,7 @@ if typing.TYPE_CHECKING:
     from .file_upload_block import FileUploadBlock
     from .file_upload_block_yaml import FileUploadBlockYaml
     from .for_loop_block import ForLoopBlock
+    from .for_loop_block_data_schema import ForLoopBlockDataSchema
     from .for_loop_block_loop_blocks_item import (
         ForLoopBlockLoopBlocksItem,
         ForLoopBlockLoopBlocksItem_Action,
@@ -196,6 +197,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockLoopOver_Workflow,
     )
     from .for_loop_block_yaml import ForLoopBlockYaml
+    from .for_loop_block_yaml_data_schema import ForLoopBlockYamlDataSchema
     from .for_loop_block_yaml_loop_blocks_item import (
         ForLoopBlockYamlLoopBlocksItem,
         ForLoopBlockYamlLoopBlocksItem_Action,
@@ -714,6 +716,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "FileUploadBlock": ".file_upload_block",
     "FileUploadBlockYaml": ".file_upload_block_yaml",
     "ForLoopBlock": ".for_loop_block",
+    "ForLoopBlockDataSchema": ".for_loop_block_data_schema",
     "ForLoopBlockLoopBlocksItem": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Action": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Code": ".for_loop_block_loop_blocks_item",
@@ -751,6 +754,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockLoopOver_Output": ".for_loop_block_loop_over",
     "ForLoopBlockLoopOver_Workflow": ".for_loop_block_loop_over",
     "ForLoopBlockYaml": ".for_loop_block_yaml",
+    "ForLoopBlockYamlDataSchema": ".for_loop_block_yaml_data_schema",
     "ForLoopBlockYamlLoopBlocksItem": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Action": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Code": ".for_loop_block_yaml_loop_blocks_item",
@@ -1259,6 +1263,7 @@ __all__ = [
     "FileUploadBlock",
     "FileUploadBlockYaml",
     "ForLoopBlock",
+    "ForLoopBlockDataSchema",
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
     "ForLoopBlockLoopBlocksItem_Code",
@@ -1296,6 +1301,7 @@ __all__ = [
     "ForLoopBlockLoopOver_Output",
     "ForLoopBlockLoopOver_Workflow",
     "ForLoopBlockYaml",
+    "ForLoopBlockYamlDataSchema",
     "ForLoopBlockYamlLoopBlocksItem",
     "ForLoopBlockYamlLoopBlocksItem_Action",
     "ForLoopBlockYamlLoopBlocksItem_Code",

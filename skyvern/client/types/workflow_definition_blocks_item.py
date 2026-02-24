@@ -19,6 +19,7 @@ from .file_download_block_data_schema import FileDownloadBlockDataSchema
 from .file_download_block_parameters_item import FileDownloadBlockParametersItem
 from .file_storage_type import FileStorageType
 from .file_type import FileType
+from .for_loop_block_data_schema import ForLoopBlockDataSchema
 from .for_loop_block_loop_over import ForLoopBlockLoopOver
 from .http_request_block_parameters_item import HttpRequestBlockParametersItem
 from .human_interaction_block_data_schema import HumanInteractionBlockDataSchema
@@ -289,6 +290,7 @@ class WorkflowDefinitionBlocksItem_ForLoop(UniversalBaseModel):
     loop_over: typing.Optional[ForLoopBlockLoopOver] = None
     loop_variable_reference: typing.Optional[str] = None
     complete_if_empty: typing.Optional[bool] = None
+    data_schema: typing.Optional[ForLoopBlockDataSchema] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
