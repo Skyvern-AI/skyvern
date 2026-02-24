@@ -4497,13 +4497,29 @@ class ForgeAgent:
             return json_response, []
 
         if place_to_enter_verification_code and should_enter_verification_code:
+            # If the payload already includes a verification code, clear any stale
+            # waiting state up front. This avoids a stuck 2FA banner even when we
+            # later short-circuit or bypass polling.
+            payload_otp = self._extract_code_from_navigation_payload(task)
+            if payload_otp and task.workflow_run_id:
+                await clear_stale_2fa_waiting_state(
+                    organization_id=task.organization_id,
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+
             # If LLM already included the code in its actions (e.g., user provided
             # code directly in navigation goal), skip the verification flow entirely
             # and let the original actions pass through without re-prompting.
             if self._extract_code_from_llm_actions(json_response):
                 return json_response, []
             json_response = await self.handle_potential_verification_code(
-                task, step, scraped_page, browser_state, json_response
+                task,
+                step,
+                scraped_page,
+                browser_state,
+                json_response,
+                pre_extracted_otp=payload_otp,
             )
             actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
             return json_response, actions
@@ -4566,28 +4582,14 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         browser_state: BrowserState,
         json_response: dict[str, Any],
+        pre_extracted_otp: OTPValue | None = None,
     ) -> dict[str, Any]:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
         if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
             LOG.info("Need verification code")
 
-            # SKY-48 Bug #3: Check if navigation_payload already contains a verification code
-            # (e.g., mfaChoice from mfa_answer block). If so, use it directly without polling,
-            # which also prevents the 2FA banner from appearing.
-            otp_value = self._extract_code_from_navigation_payload(task)
-
-            # SKY-48 edge case: If the code was found in the payload, clear any stale
-            # waiting_for_verification_code flag on the workflow run. A previous block
-            # may have set this flag (via poll_otp_value), and since we're skipping
-            # poll_otp_value entirely, _clear_waiting_state never runs. Without this,
-            # the frontend 2FA banner persists even though no manual input is needed.
-            if otp_value and task.workflow_run_id:
-                await clear_stale_2fa_waiting_state(
-                    organization_id=task.organization_id,
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
+            otp_value = pre_extracted_otp
 
             if not otp_value:
                 # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)

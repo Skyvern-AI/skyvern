@@ -768,6 +768,8 @@ async def test_handle_otp_actions_enters_verification_when_no_code_in_actions():
 
     task = MagicMock()
     task.organization_id = "org_1"
+    task.workflow_run_id = None
+    task.navigation_payload = None
 
     step = MagicMock()
     scraped_page = MagicMock()
@@ -796,3 +798,92 @@ async def test_handle_otp_actions_enters_verification_when_no_code_in_actions():
 
     # handle_potential_verification_code SHOULD be called
     mock_verify.assert_called_once()
+    assert mock_verify.call_args.kwargs["pre_extracted_otp"] is None
+
+
+@pytest.mark.asyncio
+async def test_handle_otp_actions_payload_and_llm_code_short_circuit_and_clear_stale_state():
+    """When payload and LLM actions both include a code, skip verification flow and clear stale state."""
+    agent = ForgeAgent.__new__(ForgeAgent)
+
+    task = MagicMock()
+    task.organization_id = "org_1"
+    task.task_id = "tsk_1"
+    task.workflow_run_id = "wr_1"
+    task.navigation_payload = {"verification_code": "654321"}
+
+    step = MagicMock()
+    scraped_page = MagicMock()
+    browser_state = MagicMock()
+
+    json_response = {
+        "should_enter_verification_code": True,
+        "place_to_enter_verification_code": True,
+        "actions": [
+            {"action_type": "INPUT_TEXT", "id": "el_1", "text": "654321"},
+            {"action_type": "CLICK", "id": "el_2"},
+        ],
+    }
+
+    with (
+        patch.object(agent, "handle_potential_verification_code", new_callable=AsyncMock) as mock_verify,
+        patch("skyvern.forge.agent.clear_stale_2fa_waiting_state", new_callable=AsyncMock) as mock_clear_state,
+    ):
+        result_json, result_actions = await agent.handle_potential_OTP_actions(
+            task, step, scraped_page, browser_state, json_response
+        )
+
+    mock_clear_state.assert_awaited_once_with(
+        organization_id="org_1",
+        task_id="tsk_1",
+        workflow_run_id="wr_1",
+    )
+    mock_verify.assert_not_called()
+    assert result_actions == []
+    assert result_json is json_response
+
+
+@pytest.mark.asyncio
+async def test_handle_otp_actions_payload_code_without_llm_code_passes_pre_extracted_code():
+    """When payload has code but LLM actions do not, continue verification flow with pre_extracted_otp."""
+    agent = ForgeAgent.__new__(ForgeAgent)
+
+    task = MagicMock()
+    task.organization_id = "org_1"
+    task.task_id = "tsk_1"
+    task.workflow_run_id = "wr_1"
+    task.navigation_payload = {"verification_code": "654321"}
+
+    step = MagicMock()
+    scraped_page = MagicMock()
+    browser_state = MagicMock()
+
+    json_response = {
+        "should_enter_verification_code": True,
+        "place_to_enter_verification_code": True,
+        "actions": [
+            {"action_type": "CLICK", "id": "el_1"},
+        ],
+    }
+
+    with (
+        patch.object(
+            agent,
+            "handle_potential_verification_code",
+            new_callable=AsyncMock,
+            return_value={"actions": [{"action_type": "CLICK", "id": "el_1"}]},
+        ) as mock_verify,
+        patch("skyvern.forge.agent.clear_stale_2fa_waiting_state", new_callable=AsyncMock) as mock_clear_state,
+        patch("skyvern.forge.agent.parse_actions", return_value=[]),
+    ):
+        await agent.handle_potential_OTP_actions(task, step, scraped_page, browser_state, json_response)
+
+    mock_clear_state.assert_awaited_once_with(
+        organization_id="org_1",
+        task_id="tsk_1",
+        workflow_run_id="wr_1",
+    )
+    mock_verify.assert_called_once()
+    pre_extracted_otp = mock_verify.call_args.kwargs["pre_extracted_otp"]
+    assert isinstance(pre_extracted_otp, OTPValue)
+    assert pre_extracted_otp.value == "654321"
