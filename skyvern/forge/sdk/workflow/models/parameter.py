@@ -17,6 +17,8 @@ RESERVED_PARAMETER_KEYS = [
     "workflow_id",
     "workflow_permanent_id",
     "workflow_run_id",
+    "workflow_run_outputs",
+    "workflow_run_summary",
 ]
 
 

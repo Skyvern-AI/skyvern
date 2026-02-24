@@ -4112,10 +4112,13 @@ function isNodeInsideForLoop(nodes: Array<AppNode>, nodeId: string): boolean {
   if (!currentNode) {
     return false;
   }
-  const parentNode = currentNode.parentId
-    ? nodes.find((n) => n.id === currentNode.parentId)
-    : null;
-  return parentNode?.type === "loop";
+  let current: AppNode | undefined = currentNode;
+  while (current?.parentId) {
+    const parent = nodes.find((n) => n.id === current!.parentId);
+    if (parent?.type === "loop") return true;
+    current = parent;
+  }
+  return false;
 }
 
 export {
