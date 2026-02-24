@@ -92,7 +92,8 @@ from skyvern.schemas.workflows import (
     WorkflowParameterYAML,
     WorkflowStatus,
 )
-from skyvern.services.otp_service import OTPValue, parse_otp_login
+from skyvern.services.otp.models import OTPValue
+from skyvern.services.otp.parsing import parse_otp_login
 from skyvern.services.run_service import cancel_workflow_run
 
 LOG = structlog.get_logger()

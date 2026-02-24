@@ -19,7 +19,8 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import script_service
-from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
+from skyvern.services.otp.credential_totp import try_generate_totp_from_credential
+from skyvern.services.otp.polling import poll_otp_value
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (

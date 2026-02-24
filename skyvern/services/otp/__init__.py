@@ -1,7 +1,4 @@
-"""Compatibility shim for OTP service symbols.
-
-Prefer importing from `skyvern.services.otp.*` modules directly for new code.
-"""
+"""OTP service package with focused modules for extraction, parsing, and polling."""
 
 from skyvern.services.otp.credential_totp import try_generate_totp_from_credential
 from skyvern.services.otp.extractors import (
@@ -11,25 +8,13 @@ from skyvern.services.otp.extractors import (
 )
 from skyvern.services.otp.models import MFANavigationPayload, OTPPollContext, OTPResultParsedByLLM, OTPValue
 from skyvern.services.otp.parsing import parse_otp_login
-from skyvern.services.otp.polling import (
-    _clear_waiting_state,
-    _get_otp_value_by_run,
-    _get_otp_value_from_db,
-    _get_otp_value_from_url,
-    _set_waiting_state,
-    poll_otp_value,
-)
+from skyvern.services.otp.polling import poll_otp_value
 
 __all__ = [
     "MFANavigationPayload",
     "OTPPollContext",
     "OTPResultParsedByLLM",
     "OTPValue",
-    "_clear_waiting_state",
-    "_get_otp_value_by_run",
-    "_get_otp_value_from_db",
-    "_get_otp_value_from_url",
-    "_set_waiting_state",
     "extract_totp_from_navigation_inputs",
     "extract_totp_from_navigation_payload",
     "extract_totp_from_text",

@@ -14,7 +14,9 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
+from skyvern.services.otp.credential_totp import try_generate_totp_from_credential
+from skyvern.services.otp.extractors import extract_totp_from_navigation_inputs
+from skyvern.services.otp.polling import poll_otp_value
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -913,8 +915,14 @@ async def generate_cua_fallback_actions(
             )
 
     elif skyvern_action_type == "get_verification_code":
-        # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
-        otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+        # Prefer explicit payload code when provided at runtime.
+        otp_value = extract_totp_from_navigation_inputs(
+            getattr(task, "navigation_payload", None),
+            getattr(task, "navigation_goal", None),
+        )
+        # Fall back to credential TOTP (doesn't need totp_url/totp_identifier).
+        if not otp_value:
+            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
         # Fall back to webhook/totp_identifier
         if not otp_value and task.organization_id:
             LOG.info(
