@@ -352,7 +352,7 @@ async def test_session_close_with_matching_session_id_closes_browser_handle(monk
     do_session_close = AsyncMock(return_value=SessionCloseResult(session_id="pbs_456", closed=True))
     monkeypatch.setattr(mcp_session, "do_session_close", do_session_close)
 
-    result = await mcp_session.skyvern_session_close(session_id="pbs_456")
+    result = await mcp_session.skyvern_browser_session_close(session_id="pbs_456")
 
     assert result["ok"] is True
     assert result["data"] == {"session_id": "pbs_456", "closed": True}
@@ -384,7 +384,7 @@ async def test_session_close_chains_exceptions_when_both_api_and_browser_fail(
     do_session_close = AsyncMock(side_effect=api_error)
     monkeypatch.setattr(mcp_session, "do_session_close", do_session_close)
 
-    result = await mcp_session.skyvern_session_close(session_id="pbs_dual")
+    result = await mcp_session.skyvern_browser_session_close(session_id="pbs_dual")
 
     # The outer exception handler catches and returns an error result
     assert result["ok"] is False
@@ -410,7 +410,7 @@ async def test_session_close_matching_context_without_browser_returns_error(
     do_session_close = AsyncMock(return_value=SessionCloseResult(session_id="pbs_999", closed=True))
     monkeypatch.setattr(mcp_session, "do_session_close", do_session_close)
 
-    result = await mcp_session.skyvern_session_close(session_id="pbs_999")
+    result = await mcp_session.skyvern_browser_session_close(session_id="pbs_999")
 
     assert result["ok"] is False
     assert result["error"]["code"] == mcp_session.ErrorCode.SDK_ERROR
@@ -521,7 +521,7 @@ async def test_session_create_stateless_mode_returns_session_without_persisting_
     monkeypatch.setattr(mcp_session, "do_session_create", do_session_create)
 
     try:
-        result = await mcp_session.skyvern_session_create(timeout=45)
+        result = await mcp_session.skyvern_browser_session_create(timeout=45)
     finally:
         session_manager.set_stateless_http_mode(False)
 
@@ -536,7 +536,7 @@ async def test_session_create_stateless_mode_returns_session_without_persisting_
 async def test_session_create_stateless_mode_rejects_local() -> None:
     session_manager.set_stateless_http_mode(True)
     try:
-        result = await mcp_session.skyvern_session_create(local=True)
+        result = await mcp_session.skyvern_browser_session_create(local=True)
     finally:
         session_manager.set_stateless_http_mode(False)
 
@@ -562,7 +562,7 @@ async def test_session_create_persists_active_api_key_hash_in_session_state(
 
     token = client_mod.set_api_key_override("sk_key_create")
     try:
-        result = await mcp_session.skyvern_session_create(timeout=60)
+        result = await mcp_session.skyvern_browser_session_create(timeout=60)
     finally:
         client_mod.reset_api_key_override(token)
 
