@@ -104,7 +104,12 @@ from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
-from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
+from skyvern.services.otp_service import (
+    OTPValue,
+    clear_stale_2fa_waiting_state,
+    poll_otp_value,
+    try_generate_totp_from_credential,
+)
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
@@ -3156,6 +3161,22 @@ class ForgeAgent:
 
         return is_multi_field_totp
 
+    @staticmethod
+    def _extract_code_from_navigation_payload(task: Task) -> OTPValue | None:
+        """Extract a pre-provided verification code from task.navigation_payload.
+
+        Checks for known keys like verification_code, mfaChoice, mfa_code, totp_code.
+        Returns OTPValue if found, None otherwise.
+        """
+        payload = task.navigation_payload
+        if not isinstance(payload, dict):
+            return None
+        for key in ("verification_code", "mfaChoice", "mfa_code", "totp_code"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return OTPValue(value=value.strip(), type=OTPType.TOTP)
+        return None
+
     def _build_navigation_payload(
         self,
         task: Task,
@@ -4455,8 +4476,24 @@ class ForgeAgent:
             return json_response, []
 
         if place_to_enter_verification_code and should_enter_verification_code:
+            # If the payload already includes a verification code, clear any stale
+            # waiting state up front. This avoids a stuck 2FA banner even when we
+            # later short-circuit or bypass polling.
+            payload_otp = self._extract_code_from_navigation_payload(task)
+            if payload_otp and task.workflow_run_id:
+                await clear_stale_2fa_waiting_state(
+                    organization_id=task.organization_id,
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+
             json_response = await self.handle_potential_verification_code(
-                task, step, scraped_page, browser_state, json_response
+                task,
+                step,
+                scraped_page,
+                browser_state,
+                json_response,
+                pre_extracted_otp=payload_otp,
             )
             actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
             return json_response, actions
@@ -4519,35 +4556,51 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         browser_state: BrowserState,
         json_response: dict[str, Any],
+        pre_extracted_otp: OTPValue | None = None,
     ) -> dict[str, Any]:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
         if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
             LOG.info("Need verification code")
-            # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-            # Fall back to webhook/totp_identifier
+
+            otp_value = pre_extracted_otp
+
             if not otp_value:
-                workflow_id = workflow_permanent_id = None
-                if task.workflow_run_id:
-                    workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
-                    if workflow_run:
-                        workflow_id = workflow_run.workflow_id
-                        workflow_permanent_id = workflow_run.workflow_permanent_id
-                otp_value = await poll_otp_value(
-                    organization_id=task.organization_id,
-                    task_id=task.task_id,
-                    workflow_id=workflow_id,
-                    workflow_run_id=task.workflow_run_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                    totp_verification_url=task.totp_verification_url,
-                    totp_identifier=task.totp_identifier,
-                )
+                # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
+                otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+                # Fall back to webhook/totp_identifier
+                if not otp_value:
+                    workflow_id = workflow_permanent_id = None
+                    if task.workflow_run_id:
+                        workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
+                        if workflow_run:
+                            workflow_id = workflow_run.workflow_id
+                            workflow_permanent_id = workflow_run.workflow_permanent_id
+                    # SKY-48 Bug #3: Check navigation_payload for TOTP config that suppresses
+                    # the 2FA banner (by setting totp_verification_url/totp_identifier on the
+                    # poll context, needs_manual_input returns False and banner is skipped).
+                    totp_verification_url = task.totp_verification_url
+                    totp_identifier = task.totp_identifier
+                    if isinstance(task.navigation_payload, dict):
+                        if not totp_verification_url:
+                            totp_verification_url = task.navigation_payload.get("totp_url")
+                        if not totp_identifier:
+                            totp_identifier = task.navigation_payload.get("totp_identifier")
+                    otp_value = await poll_otp_value(
+                        organization_id=task.organization_id,
+                        task_id=task.task_id,
+                        workflow_id=workflow_id,
+                        workflow_run_id=task.workflow_run_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        totp_verification_url=totp_verification_url,
+                        totp_identifier=totp_identifier,
+                    )
             if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
                 return json_response
 
-            current_context = skyvern_context.ensure_context()
-            current_context.totp_codes[task.task_id] = otp_value.value
+            current_context = skyvern_context.current()
+            if current_context:
+                current_context.totp_codes[task.task_id] = otp_value.value
 
             extract_action_prompt, use_caching, prompt_name = await self._build_extract_action_prompt(
                 task,

@@ -1,4 +1,5 @@
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -17,6 +18,65 @@ from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
 LOG = structlog.get_logger()
+
+MFANavigationPayload = dict | list | str | None
+
+_MIN_OTP_DIGITS = 4
+_MAX_OTP_DIGITS = 10
+_OTP_CONTEXT_TERMS = (
+    "verification code",
+    "authentication code",
+    "security code",
+    "otp",
+    "mfa",
+    "2fa",
+    "two-factor",
+    "two factor",
+    "one-time password",
+    "one time password",
+    "one-time code",
+    "one time code",
+)
+_OTP_INPUT_ACTION_TERMS = ("input", "enter", "type", "fill", "use", "submit")
+_MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED = {
+    "verificationcode",
+    "mfachoice",
+    "mfacode",
+    "otp",
+    "otpcode",
+    "twofactorcode",
+    "2facode",
+    "authenticationcode",
+    "authcode",
+}
+_NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
+
+
+def _build_regex_alternation(terms: tuple[str, ...]) -> str:
+    """Build a safe regex alternation fragment from plain text terms."""
+    return "|".join(re.escape(term) for term in terms)
+
+
+_OTP_TERM_ALTERNATION = _build_regex_alternation(_OTP_CONTEXT_TERMS)
+_OTP_ACTION_TERM_ALTERNATION = _build_regex_alternation(_OTP_INPUT_ACTION_TERMS)
+_OTP_DIGITS_PATTERN = rf"\d{{{_MIN_OTP_DIGITS},{_MAX_OTP_DIGITS}}}"
+_OTP_CODE_PATTERN = re.compile(rf"^{_OTP_DIGITS_PATTERN}$")
+_OTP_TEXT_BEFORE_CODE_PATTERN = re.compile(
+    rf"\b(?:{_OTP_TERM_ALTERNATION})\b[^\d]{{0,40}}({_OTP_DIGITS_PATTERN})\b",
+    re.IGNORECASE,
+)
+_OTP_CODE_BEFORE_TEXT_PATTERN = re.compile(
+    rf"\b({_OTP_DIGITS_PATTERN})\b[^\w]{{0,20}}(?:{_OTP_TERM_ALTERNATION})\b",
+    re.IGNORECASE,
+)
+_OTP_CONTEXT_PATTERN = re.compile(
+    rf"\b(?:{_OTP_TERM_ALTERNATION})\b",
+    re.IGNORECASE,
+)
+_OTP_INPUT_ACTION_CODE_PATTERN = re.compile(
+    rf"\b(?:{_OTP_ACTION_TERM_ALTERNATION})\b[^\d]{{0,30}}({_OTP_DIGITS_PATTERN})\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -52,6 +112,124 @@ class OTPResultParsedByLLM(BaseModel):
     otp_type: OTPType | None = Field(None, description="The type of the OTP code.")
     otp_value_found: bool = Field(..., description="Whether the OTP value is found.")
     otp_value: str | None = Field(None, description="The OTP value.")
+
+
+def _iter_mfa_payload_values(payload: MFANavigationPayload) -> list[str]:
+    """Collect candidate MFA values while preserving recursive traversal order.
+
+    Traversal is cycle-safe to avoid recursive blowups for malformed payload objects.
+    Plain strings inside non-alias lists are intentionally ignored.
+    """
+    if not isinstance(payload, (dict, list)):
+        return []
+
+    values: list[str] = []
+    traversal_stack: list[dict | list | str] = [payload]
+    visited_container_ids: set[int] = set()
+
+    while traversal_stack:
+        current_item = traversal_stack.pop()
+        if isinstance(current_item, str):
+            values.append(current_item)
+            continue
+
+        current_id = id(current_item)
+        if current_id in visited_container_ids:
+            continue
+        visited_container_ids.add(current_id)
+
+        if isinstance(current_item, list):
+            for item in reversed(current_item):
+                if isinstance(item, (dict, list)):
+                    traversal_stack.append(item)
+            continue
+
+        for key, value in reversed(list(current_item.items())):
+            if isinstance(value, (dict, list)):
+                traversal_stack.append(value)
+            if _normalize_payload_key(key) not in _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED:
+                continue
+            candidate_value = _coerce_candidate_code_source(value)
+            if candidate_value is not None:
+                traversal_stack.append(candidate_value)
+
+    return values
+
+
+def _normalize_payload_key(key: object) -> str:
+    """Normalize payload keys for alias matching across separators and casing.
+
+    Examples:
+    - "MFA Code" -> "mfacode"
+    - "mfa-code" -> "mfacode"
+    """
+    return _NON_ALNUM_PATTERN.sub("", str(key).lower())
+
+
+def _coerce_candidate_code_source(value: object) -> str | None:
+    """Coerce alias values to a string candidate while rejecting bools."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (str, int)):
+        return str(value)
+    return None
+
+
+def extract_totp_from_text(text: object, *, assume_otp_context: bool = False) -> OTPValue | None:
+    """Extract a numeric OTP from free-form text with optional OTP-context override."""
+    if not isinstance(text, str):
+        return None
+
+    stripped_text = text.strip()
+    if not stripped_text:
+        return None
+
+    for pattern in (_OTP_TEXT_BEFORE_CODE_PATTERN, _OTP_CODE_BEFORE_TEXT_PATTERN):
+        if direct_match := pattern.search(stripped_text):
+            return OTPValue(value=direct_match.group(1), type=OTPType.TOTP)
+
+    context_found = assume_otp_context or bool(_OTP_CONTEXT_PATTERN.search(stripped_text))
+    if not context_found:
+        return None
+
+    if action_prompt_match := _OTP_INPUT_ACTION_CODE_PATTERN.search(stripped_text):
+        return OTPValue(value=action_prompt_match.group(1), type=OTPType.TOTP)
+
+    return None
+
+
+def extract_totp_from_navigation_payload(payload: MFANavigationPayload) -> OTPValue | None:
+    """Extract a TOTP code from navigation payload using explicit MFA aliases.
+
+    The extractor is intentionally strict:
+    - only exact alias keys are considered
+    - values must be numeric and between 4 and 10 digits
+    """
+    for candidate_value in _iter_mfa_payload_values(payload):
+        candidate_value = candidate_value.strip()
+        if _OTP_CODE_PATTERN.fullmatch(candidate_value):
+            return OTPValue(value=candidate_value, type=OTPType.TOTP)
+
+        if otp_from_text := extract_totp_from_text(candidate_value, assume_otp_context=True):
+            return otp_from_text
+
+    if isinstance(payload, str):
+        # String payloads are treated as OTP-context text because this input channel
+        # is used specifically for verification-code navigation steps.
+        return extract_totp_from_text(payload, assume_otp_context=True)
+
+    return None
+
+
+def extract_totp_from_navigation_inputs(
+    navigation_payload: MFANavigationPayload, _navigation_goal: object
+) -> OTPValue | None:
+    """Extract TOTP from runtime navigation inputs.
+
+    Runtime inline OTP extraction is intentionally payload-only.
+    `_navigation_goal` is kept for call-site compatibility with existing callers.
+    """
+    return extract_totp_from_navigation_payload(navigation_payload)
 
 
 async def parse_otp_login(
@@ -312,6 +490,43 @@ async def _clear_waiting_state(ctx: OTPPollContext) -> None:
                 LOG.warning("Failed to publish 2FA resolved notification for task", exc_info=True)
         except Exception:
             LOG.warning("Failed to clear 2FA waiting state for task", exc_info=True)
+
+
+async def clear_stale_2fa_waiting_state(
+    organization_id: str,
+    task_id: str,
+    workflow_run_id: str | None,
+) -> None:
+    """Clear leftover waiting_for_verification_code flag and notify frontend.
+
+    Called when a code is found in the navigation payload (e.g. from mfa_answer block),
+    bypassing poll_otp_value entirely. Without this, the 2FA banner persists.
+    """
+    if not workflow_run_id:
+        return
+    try:
+        await app.DATABASE.update_workflow_run(
+            workflow_run_id=workflow_run_id,
+            waiting_for_verification_code=False,
+        )
+        try:
+            NotificationRegistryFactory.get_registry().publish(
+                organization_id,
+                {
+                    "type": "verification_code_resolved",
+                    "workflow_run_id": workflow_run_id,
+                    "task_id": task_id,
+                },
+            )
+        except Exception:
+            LOG.warning("Failed to publish 2FA resolved notification for stale state cleanup", exc_info=True)
+    except Exception:
+        LOG.warning(
+            "Failed to clear stale 2FA waiting state after payload code extraction",
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
 
 
 async def _get_otp_value_from_url(
