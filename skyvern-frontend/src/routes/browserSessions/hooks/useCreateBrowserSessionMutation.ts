@@ -5,7 +5,11 @@ import { useMutation } from "@tanstack/react-query";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { BrowserSession } from "@/routes/workflows/types/browserSessionTypes";
+import {
+  BrowserSession,
+  BrowserSessionExtension,
+  BrowserSessionType,
+} from "@/routes/workflows/types/browserSessionTypes";
 import { ProxyLocation } from "@/api/types";
 
 function useCreateBrowserSessionMutation() {
@@ -17,9 +21,13 @@ function useCreateBrowserSessionMutation() {
     mutationFn: async ({
       proxyLocation = null,
       timeout = null,
+      extensions = [],
+      browserType = null,
     }: {
       proxyLocation: ProxyLocation | null;
       timeout: number | null;
+      extensions?: BrowserSessionExtension[];
+      browserType?: BrowserSessionType | null;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       return client.post<string, { data: BrowserSession }>(
@@ -27,6 +35,8 @@ function useCreateBrowserSessionMutation() {
         {
           proxy_location: proxyLocation,
           timeout,
+          extensions,
+          browser_type: browserType,
         },
       );
     },

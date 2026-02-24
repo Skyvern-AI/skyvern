@@ -28,12 +28,16 @@ interface GeoTargetSelectorProps {
   value: GeoTarget | null;
   onChange: (value: GeoTarget) => void;
   className?: string;
+  allowGranularSearch?: boolean;
+  modalPopover?: boolean;
 }
 
 export function GeoTargetSelector({
   value,
   onChange,
   className,
+  allowGranularSearch = true,
+  modalPopover = false,
 }: GeoTargetSelectorProps) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
@@ -47,7 +51,9 @@ export function GeoTargetSelector({
   const handleSearch = useDebouncedCallback(async (searchQuery: string) => {
     setLoading(true);
     try {
-      const data = await searchGeoData(searchQuery);
+      const data = await searchGeoData(searchQuery, {
+        includeGranularResults: allowGranularSearch,
+      });
       setResults(data);
     } catch (error) {
       console.error("Failed to search geo data", error);
@@ -84,7 +90,7 @@ export function GeoTargetSelector({
   };
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={setOpen} modal={modalPopover}>
       <PopoverTrigger asChild>
         <Button
           variant="outline"
@@ -98,10 +104,14 @@ export function GeoTargetSelector({
           <CaretSortIcon className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-[400px] p-0" align="start">
+      <PopoverContent className="z-[100] w-[400px] p-0" align="start">
         <Command shouldFilter={false}>
           <CommandInput
-            placeholder="Search country, state, or city..."
+            placeholder={
+              allowGranularSearch
+                ? "Search country, state, or city..."
+                : "Search country..."
+            }
             value={query}
             onValueChange={onInput}
           />
@@ -143,7 +153,7 @@ export function GeoTargetSelector({
                   </CommandGroup>
                 )}
 
-                {results.subdivisions.length > 0 && (
+                {allowGranularSearch && results.subdivisions.length > 0 && (
                   <CommandGroup heading="States / Regions">
                     {results.subdivisions.map((item) => (
                       <CommandItem
@@ -171,7 +181,7 @@ export function GeoTargetSelector({
                   </CommandGroup>
                 )}
 
-                {results.cities.length > 0 && (
+                {allowGranularSearch && results.cities.length > 0 && (
                   <CommandGroup heading="Cities">
                     {results.cities.map((item) => (
                       <CommandItem
