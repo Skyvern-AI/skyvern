@@ -15,6 +15,7 @@ from skyvern.services.otp_service import (
     OTPValue,
     _get_otp_value_by_run,
     extract_totp_from_navigation_payload,
+    extract_totp_from_text,
     poll_otp_value,
 )
 
@@ -129,6 +130,131 @@ def test_extract_totp_from_navigation_payload_rejects_invalid_alias_value():
     otp_value = extract_totp_from_navigation_payload(payload)
 
     assert otp_value is None
+
+
+@pytest.mark.parametrize(
+    ("alias_key", "otp_code"),
+    [
+        ("mfa_code", "520265"),
+        ("MFA Code", "520266"),
+        ("mfa-code", "520267"),
+    ],
+)
+def test_extract_totp_from_navigation_payload_normalizes_alias_keys(alias_key: str, otp_code: str):
+    """Alias matching should be robust to separators and casing."""
+    payload = {alias_key: otp_code}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == otp_code
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+@pytest.mark.parametrize(
+    ("otp_code", "should_match"),
+    [
+        ("123", False),
+        ("1234", True),
+        ("1234567890", True),
+        ("12345678901", False),
+    ],
+)
+def test_extract_totp_from_navigation_payload_enforces_digit_length_bounds(otp_code: str, should_match: bool):
+    """Only 4-10 digit OTP values should be accepted for explicit aliases."""
+    payload = {"verification_code": otp_code}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    if should_match:
+        assert otp_value is not None
+        assert otp_value.value == otp_code
+        assert otp_value.get_otp_type() == OTPType.TOTP
+    else:
+        assert otp_value is None
+
+
+def test_extract_totp_from_navigation_payload_rejects_alias_bool_values():
+    """Bool values should not be coerced as OTP integer values."""
+    payload = {"verification_code": True}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is None
+
+
+def test_extract_totp_from_navigation_payload_handles_cyclic_payload():
+    """Self-referential payloads should not recurse forever."""
+    payload: dict = {"mfa_choice": "520265"}
+    payload["self"] = payload
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == "520265"
+
+
+def test_extract_totp_from_navigation_payload_handles_very_deep_payloads():
+    """Deep nested payloads should work without recursion depth errors."""
+    payload: dict = {}
+    cursor = payload
+    for _ in range(1500):
+        nested: dict = {}
+        cursor["nested"] = [nested]
+        cursor = nested
+    cursor["otp_code"] = "654321"
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == "654321"
+
+
+def test_extract_totp_from_navigation_payload_preserves_recursive_precedence():
+    """Traversal order should continue preferring nested earlier keys before later aliases."""
+    payload = {
+        "first": {"otp_code": "111111"},
+        "otp_code": "222222",
+    }
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == "111111"
+
+
+def test_extract_totp_from_text_matches_text_before_code():
+    """Context term before a code should be extracted."""
+    otp_value = extract_totp_from_text("Use this verification code: 654321 to continue.")
+
+    assert otp_value is not None
+    assert otp_value.value == "654321"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_text_matches_code_before_text():
+    """Code before context term should be extracted."""
+    otp_value = extract_totp_from_text("654321 - authentication code")
+
+    assert otp_value is not None
+    assert otp_value.value == "654321"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_text_rejects_code_without_otp_context():
+    """Unrelated numbers should not be treated as OTP values."""
+    otp_value = extract_totp_from_text("Your package 654321 is out for delivery.")
+
+    assert otp_value is None
+
+
+def test_extract_totp_from_text_supports_assumed_context_for_instruction_text():
+    """assume_otp_context should enable instruction-based extraction."""
+    otp_value = extract_totp_from_text("Please enter 739201", assume_otp_context=True)
+
+    assert otp_value is not None
+    assert otp_value.value == "739201"
+    assert otp_value.get_otp_type() == OTPType.TOTP
 
 
 # === Task 3: poll_otp_value without identifier ===

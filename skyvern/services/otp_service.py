@@ -19,6 +19,25 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
 LOG = structlog.get_logger()
 
+MFANavigationPayload = dict | list | str | None
+
+_MIN_OTP_DIGITS = 4
+_MAX_OTP_DIGITS = 10
+_OTP_CONTEXT_TERMS = (
+    "verification code",
+    "authentication code",
+    "security code",
+    "otp",
+    "mfa",
+    "2fa",
+    "two-factor",
+    "two factor",
+    "one-time password",
+    "one time password",
+    "one-time code",
+    "one time code",
+)
+_OTP_INPUT_ACTION_TERMS = ("input", "enter", "type", "fill", "use", "submit")
 _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED = {
     "verificationcode",
     "mfachoice",
@@ -31,23 +50,31 @@ _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED = {
     "authcode",
 }
 _NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
-_OTP_CODE_PATTERN = re.compile(r"^\d{4,10}$")
+
+
+def _build_regex_alternation(terms: tuple[str, ...]) -> str:
+    """Build a safe regex alternation fragment from plain text terms."""
+    return "|".join(re.escape(term) for term in terms)
+
+
+_OTP_TERM_ALTERNATION = _build_regex_alternation(_OTP_CONTEXT_TERMS)
+_OTP_ACTION_TERM_ALTERNATION = _build_regex_alternation(_OTP_INPUT_ACTION_TERMS)
+_OTP_DIGITS_PATTERN = rf"\d{{{_MIN_OTP_DIGITS},{_MAX_OTP_DIGITS}}}"
+_OTP_CODE_PATTERN = re.compile(rf"^{_OTP_DIGITS_PATTERN}$")
 _OTP_TEXT_BEFORE_CODE_PATTERN = re.compile(
-    r"\b(?:verification code|authentication code|security code|otp|mfa|2fa|two-factor|two factor|"
-    r"one-time password|one time password|one-time code|one time code)\b[^\d]{0,40}(\d{4,10})\b",
+    rf"\b(?:{_OTP_TERM_ALTERNATION})\b[^\d]{{0,40}}({_OTP_DIGITS_PATTERN})\b",
     re.IGNORECASE,
 )
 _OTP_CODE_BEFORE_TEXT_PATTERN = re.compile(
-    r"\b(\d{4,10})\b[^\w]{0,20}(?:verification code|authentication code|security code|otp|mfa|2fa|two-factor|two factor)\b",
+    rf"\b({_OTP_DIGITS_PATTERN})\b[^\w]{{0,20}}(?:{_OTP_TERM_ALTERNATION})\b",
     re.IGNORECASE,
 )
 _OTP_CONTEXT_PATTERN = re.compile(
-    r"\b(?:verification code|authentication code|security code|otp|mfa|2fa|two-factor|two factor|"
-    r"one-time password|one time password|one-time code|one time code)\b",
+    rf"\b(?:{_OTP_TERM_ALTERNATION})\b",
     re.IGNORECASE,
 )
 _OTP_INPUT_ACTION_CODE_PATTERN = re.compile(
-    r"\b(?:input|enter|type|fill|use|submit)\b[^\d]{0,30}(\d{4,10})\b",
+    rf"\b(?:{_OTP_ACTION_TERM_ALTERNATION})\b[^\d]{{0,30}}({_OTP_DIGITS_PATTERN})\b",
     re.IGNORECASE,
 )
 
@@ -87,33 +114,52 @@ class OTPResultParsedByLLM(BaseModel):
     otp_value: str | None = Field(None, description="The OTP value.")
 
 
-def _iter_mfa_payload_values(payload: dict | list | str | None) -> list[str]:
-    if isinstance(payload, dict):
-        values: list[str] = []
-        for key, value in payload.items():
-            if _normalize_payload_key(key) in _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED:
-                candidate_value = _coerce_mfa_candidate_value(value)
-                if candidate_value is not None:
-                    values.append(candidate_value)
-            if isinstance(value, (dict, list)):
-                values.extend(_iter_mfa_payload_values(value))
-        return values
+def _iter_mfa_payload_values(payload: MFANavigationPayload) -> list[str]:
+    """Collect candidate MFA values while preserving recursive traversal order.
 
-    if isinstance(payload, list):
-        list_values: list[str] = []
-        for item in payload:
-            if isinstance(item, (dict, list)):
-                list_values.extend(_iter_mfa_payload_values(item))
-        return list_values
+    Traversal is cycle-safe to avoid recursive blowups for malformed payload objects.
+    """
+    if not isinstance(payload, (dict, list)):
+        return []
 
-    return []
+    values: list[str] = []
+    traversal_stack: list[dict | list | str] = [payload]
+    visited_container_ids: set[int] = set()
+
+    while traversal_stack:
+        current_item = traversal_stack.pop()
+        if isinstance(current_item, str):
+            values.append(current_item)
+            continue
+
+        current_id = id(current_item)
+        if current_id in visited_container_ids:
+            continue
+        visited_container_ids.add(current_id)
+
+        if isinstance(current_item, dict):
+            for key, value in reversed(list(current_item.items())):
+                if isinstance(value, (dict, list)):
+                    traversal_stack.append(value)
+                if _normalize_payload_key(key) in _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED:
+                    candidate_value = _coerce_candidate_code_source(value)
+                    if candidate_value is not None:
+                        traversal_stack.append(candidate_value)
+        else:
+            for item in reversed(current_item):
+                if isinstance(item, (dict, list)):
+                    traversal_stack.append(item)
+
+    return values
 
 
 def _normalize_payload_key(key: object) -> str:
+    """Normalize payload keys for alias matching across separators and casing."""
     return _NON_ALNUM_PATTERN.sub("", str(key).lower())
 
 
-def _coerce_mfa_candidate_value(value: object) -> str | None:
+def _coerce_candidate_code_source(value: object) -> str | None:
+    """Coerce alias values to strings while intentionally rejecting bools."""
     if isinstance(value, str):
         return value
     if isinstance(value, int) and not isinstance(value, bool):
@@ -122,6 +168,7 @@ def _coerce_mfa_candidate_value(value: object) -> str | None:
 
 
 def extract_totp_from_text(text: object, *, assume_otp_context: bool = False) -> OTPValue | None:
+    """Extract a numeric OTP from free-form text with optional OTP-context override."""
     if not isinstance(text, str) or not text:
         return None
 
@@ -145,7 +192,7 @@ def extract_totp_from_text(text: object, *, assume_otp_context: bool = False) ->
     return None
 
 
-def extract_totp_from_navigation_payload(payload: dict | list | str | None) -> OTPValue | None:
+def extract_totp_from_navigation_payload(payload: MFANavigationPayload) -> OTPValue | None:
     """Extract a TOTP code from navigation payload using explicit MFA aliases.
 
     The extractor is intentionally strict:
@@ -167,8 +214,7 @@ def extract_totp_from_navigation_payload(payload: dict | list | str | None) -> O
 
 
 def extract_totp_from_navigation_inputs(
-    navigation_payload: dict | list | str | None,
-    navigation_goal: object,
+    navigation_payload: MFANavigationPayload, navigation_goal: object
 ) -> OTPValue | None:
     """Extract TOTP from runtime navigation inputs with explicit precedence.
 
