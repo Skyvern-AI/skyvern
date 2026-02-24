@@ -350,6 +350,14 @@ function WorkflowRun() {
               ) : null}
             </div>
             <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
+            {workflowRun?.browser_session_id && (
+              <Link
+                className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
+                to={`/browser-session/${workflowRun.browser_session_id}/stream`}
+              >
+                Browser Session: {workflowRun.browser_session_id}
+              </Link>
+            )}
           </div>
 
           <div className="flex gap-2">
