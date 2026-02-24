@@ -186,6 +186,7 @@ function WorkflowParameterEditPanel({
     "workflow_permanent_id",
     "workflow_run_id",
     "workflow_run_outputs",
+    "workflow_run_summary",
   ];
   const isCloud = useContext(CloudContext);
   const isEditMode = !!initialValues;
