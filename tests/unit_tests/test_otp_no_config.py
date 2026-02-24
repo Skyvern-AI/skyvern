@@ -9,9 +9,15 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.notification.local import LocalNotificationRegistry
 from skyvern.forge.sdk.routes.credentials import send_totp_code
-from skyvern.forge.sdk.schemas.totp_codes import TOTPCodeCreate
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCodeCreate
 from skyvern.schemas.runs import RunEngine
-from skyvern.services.otp_service import OTPValue, _get_otp_value_by_run, poll_otp_value
+from skyvern.services.otp_service import (
+    OTPValue,
+    _get_otp_value_by_run,
+    extract_totp_from_navigation_payload,
+    extract_totp_from_text,
+    poll_otp_value,
+)
 
 
 @pytest.mark.asyncio
@@ -70,6 +76,185 @@ async def test_get_otp_value_by_run_returns_none_when_no_codes():
             task_id="tsk_1",
         )
     assert result is None
+
+
+# === Task: extract_totp_from_navigation_payload helper ===
+
+
+def test_extract_totp_from_navigation_payload_accepts_alias_numeric_code():
+    """Should accept valid numeric code from MFA alias keys."""
+    payload = {"mfaChoice": "520265", "promo_code": "999999"}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == "520265"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_navigation_payload_accepts_nested_alias_numeric_code():
+    """Should find valid numeric code in nested payload structures."""
+    payload = {"meta": [{"field": "ignore"}, {"otp_code": "654321"}]}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == "654321"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_navigation_payload_accepts_alias_integer_code():
+    """Should accept integer values for explicit MFA aliases."""
+    payload = {"verification_code": 520265}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == "520265"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_navigation_payload_rejects_non_alias_key():
+    """Should not treat non-MFA keys as OTP, even with numeric-looking values."""
+    payload = {"promo_code": "520265", "nested": {"coupon": "123456"}}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is None
+
+
+def test_extract_totp_from_navigation_payload_rejects_invalid_alias_value():
+    """Should reject alias values that are not strictly numeric OTP codes."""
+    payload = {"mfaChoice": "AB12CD"}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is None
+
+
+@pytest.mark.parametrize(
+    ("alias_key", "otp_code"),
+    [
+        ("mfa_code", "520265"),
+        ("MFA Code", "520266"),
+        ("mfa-code", "520267"),
+    ],
+)
+def test_extract_totp_from_navigation_payload_normalizes_alias_keys(alias_key: str, otp_code: str):
+    """Alias matching should be robust to separators and casing."""
+    payload = {alias_key: otp_code}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == otp_code
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+@pytest.mark.parametrize(
+    ("otp_code", "should_match"),
+    [
+        ("123", False),
+        ("1234", True),
+        ("1234567890", True),
+        ("12345678901", False),
+    ],
+)
+def test_extract_totp_from_navigation_payload_enforces_digit_length_bounds(otp_code: str, should_match: bool):
+    """Only 4-10 digit OTP values should be accepted for explicit aliases."""
+    payload = {"verification_code": otp_code}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    if should_match:
+        assert otp_value is not None
+        assert otp_value.value == otp_code
+        assert otp_value.get_otp_type() == OTPType.TOTP
+    else:
+        assert otp_value is None
+
+
+def test_extract_totp_from_navigation_payload_rejects_alias_bool_values():
+    """Bool values should not be coerced as OTP integer values."""
+    payload = {"verification_code": True}
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is None
+
+
+def test_extract_totp_from_navigation_payload_handles_cyclic_payload():
+    """Self-referential payloads should not recurse forever."""
+    payload: dict = {"mfa_choice": "520265"}
+    payload["self"] = payload
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == "520265"
+
+
+def test_extract_totp_from_navigation_payload_handles_very_deep_payloads():
+    """Deep nested payloads should work without recursion depth errors."""
+    payload: dict = {}
+    cursor = payload
+    for _ in range(1500):
+        nested: dict = {}
+        cursor["nested"] = [nested]
+        cursor = nested
+    cursor["otp_code"] = "654321"
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == "654321"
+
+
+def test_extract_totp_from_navigation_payload_preserves_recursive_precedence():
+    """Traversal order should continue preferring nested earlier keys before later aliases."""
+    payload = {
+        "first": {"otp_code": "111111"},
+        "otp_code": "222222",
+    }
+
+    otp_value = extract_totp_from_navigation_payload(payload)
+
+    assert otp_value is not None
+    assert otp_value.value == "111111"
+
+
+def test_extract_totp_from_text_matches_text_before_code():
+    """Context term before a code should be extracted."""
+    otp_value = extract_totp_from_text("Use this verification code: 654321 to continue.")
+
+    assert otp_value is not None
+    assert otp_value.value == "654321"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_text_matches_code_before_text():
+    """Code before context term should be extracted."""
+    otp_value = extract_totp_from_text("654321 - authentication code")
+
+    assert otp_value is not None
+    assert otp_value.value == "654321"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_text_rejects_code_without_otp_context():
+    """Unrelated numbers should not be treated as OTP values."""
+    otp_value = extract_totp_from_text("Your package 654321 is out for delivery.")
+
+    assert otp_value is None
+
+
+def test_extract_totp_from_text_supports_assumed_context_for_instruction_text():
+    """assume_otp_context should enable instruction-based extraction."""
+    otp_value = extract_totp_from_text("Please enter 739201", assume_otp_context=True)
+
+    assert otp_value is not None
+    assert otp_value.value == "739201"
+    assert otp_value.get_otp_type() == OTPType.TOTP
 
 
 # === Task 3: poll_otp_value without identifier ===
@@ -134,6 +319,73 @@ async def test_handle_potential_OTP_actions_without_totp_config():
                 task, step, scraped_page, browser_state, json_response
             )
         mock_handler.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_potential_verification_code_uses_navigation_payload_and_skips_poll():
+    """When payload includes MFA code, should consume it and skip poll_otp_value."""
+    from skyvern.forge import agent as forge_agent_module
+
+    agent = ForgeAgent.__new__(ForgeAgent)
+
+    task = MagicMock()
+    task.organization_id = "org_1"
+    task.totp_verification_url = None
+    task.totp_identifier = None
+    task.task_id = "tsk_payload_code"
+    task.workflow_run_id = None
+    task.navigation_payload = {"mfaChoice": "520265"}
+    task.llm_key = None
+
+    step = MagicMock()
+    step.step_id = "step_1"
+    step.order = 0
+
+    scraped_page = MagicMock()
+    scraped_page.screenshots = []
+    browser_state = MagicMock()
+    json_response = {
+        "should_enter_verification_code": True,
+        "place_to_enter_verification_code": "input#otp-code",
+    }
+
+    original_app_inst = object.__getattribute__(forge_agent_module.app, "_inst")
+    object.__setattr__(forge_agent_module.app, "_inst", MagicMock(LLM_API_HANDLER=AsyncMock()))
+    try:
+        with (
+            patch("skyvern.forge.agent.try_generate_totp_from_credential") as mock_credential_totp,
+            patch("skyvern.forge.agent.poll_otp_value", new_callable=AsyncMock) as mock_poll,
+            patch("skyvern.forge.agent.skyvern_context") as mock_skyvern_context,
+            patch("skyvern.forge.agent.service_utils.is_cua_task", new_callable=AsyncMock, return_value=False),
+            patch(
+                "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                return_value=AsyncMock(return_value={"actions": []}),
+            ),
+            patch.object(
+                agent,
+                "_build_extract_action_prompt",
+                new_callable=AsyncMock,
+                return_value=("prompt", False, "extract-actions"),
+            ),
+        ):
+            mock_context = MagicMock()
+            mock_context.totp_codes = {}
+            mock_skyvern_context.ensure_context.return_value = mock_context
+            mock_skyvern_context.current.return_value = None
+
+            await agent.handle_potential_verification_code(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                browser_state=browser_state,
+                json_response=json_response,
+            )
+    finally:
+        object.__setattr__(forge_agent_module.app, "_inst", original_app_inst)
+
+    mock_credential_totp.assert_not_called()
+    mock_poll.assert_not_called()
+    assert mock_context.totp_codes["tsk_payload_code"] == "520265"
 
 
 @pytest.mark.asyncio
