@@ -115,6 +115,43 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
     return None
 
 
+async def clear_stale_2fa_waiting_state(
+    organization_id: str,
+    task_id: str,
+    workflow_run_id: str | None,
+) -> None:
+    """Clear leftover waiting_for_verification_code flag and notify frontend.
+
+    Called when a code is found in the navigation payload (e.g. from mfa_answer block),
+    bypassing poll_otp_value entirely. Without this, the 2FA banner persists.
+    """
+    if not workflow_run_id:
+        return
+    try:
+        await app.DATABASE.update_workflow_run(
+            workflow_run_id=workflow_run_id,
+            waiting_for_verification_code=False,
+        )
+        try:
+            NotificationRegistryFactory.get_registry().publish(
+                organization_id,
+                {
+                    "type": "verification_code_resolved",
+                    "workflow_run_id": workflow_run_id,
+                    "task_id": task_id,
+                },
+            )
+        except Exception:
+            LOG.warning("Failed to publish 2FA resolved notification for stale state cleanup", exc_info=True)
+    except Exception:
+        LOG.warning(
+            "Failed to clear stale 2FA waiting state after payload code extraction",
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+
+
 async def poll_otp_value(
     organization_id: str,
     task_id: str | None = None,

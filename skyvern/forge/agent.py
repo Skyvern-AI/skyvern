@@ -104,7 +104,12 @@ from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
-from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
+from skyvern.services.otp_service import (
+    OTPValue,
+    clear_stale_2fa_waiting_state,
+    poll_otp_value,
+    try_generate_totp_from_credential,
+)
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
@@ -3156,6 +3161,43 @@ class ForgeAgent:
 
         return is_multi_field_totp
 
+    @staticmethod
+    def _extract_code_from_navigation_payload(task: Task) -> OTPValue | None:
+        """Extract a pre-provided verification code from task.navigation_payload.
+
+        Checks for known keys like verification_code, mfaChoice, mfa_code, totp_code.
+        Returns OTPValue if found, None otherwise.
+        """
+        payload = task.navigation_payload
+        if not isinstance(payload, dict):
+            return None
+        for key in ("verification_code", "mfaChoice", "mfa_code", "totp_code"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return OTPValue(value=value.strip(), type=OTPType.TOTP)
+        return None
+
+    @staticmethod
+    def _extract_code_from_llm_actions(json_response: dict[str, Any]) -> OTPValue | None:
+        """Extract a verification code from the LLM's existing INPUT_TEXT actions.
+
+        When the navigation goal includes the code directly, the LLM may generate
+        INPUT_TEXT actions that already contain the code. This avoids entering the
+        OTP polling flow unnecessarily.
+        """
+        actions = json_response.get("actions", [])
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            if action.get("action_type") != "INPUT_TEXT":
+                continue
+            text = action.get("text", "")
+            if isinstance(text, str):
+                text = text.strip()
+                if re.fullmatch(r"\d{4,8}", text):
+                    return OTPValue(value=text, type=OTPType.TOTP)
+        return None
+
     def _build_navigation_payload(
         self,
         task: Task,
@@ -4455,6 +4497,11 @@ class ForgeAgent:
             return json_response, []
 
         if place_to_enter_verification_code and should_enter_verification_code:
+            # If LLM already included the code in its actions (e.g., user provided
+            # code directly in navigation goal), skip the verification flow entirely
+            # and let the original actions pass through without re-prompting.
+            if self._extract_code_from_llm_actions(json_response):
+                return json_response, []
             json_response = await self.handle_potential_verification_code(
                 task, step, scraped_page, browser_state, json_response
             )
@@ -4536,49 +4583,13 @@ class ForgeAgent:
             # poll_otp_value entirely, _clear_waiting_state never runs. Without this,
             # the frontend 2FA banner persists even though no manual input is needed.
             if otp_value and task.workflow_run_id:
-                try:
-                    await app.DATABASE.update_workflow_run(
-                        workflow_run_id=task.workflow_run_id,
-                        waiting_for_verification_code=False,
-                    )
-                    NotificationRegistryFactory.get_registry().publish(
-                        task.organization_id,
-                        {
-                            "type": "verification_code_resolved",
-                            "workflow_run_id": task.workflow_run_id,
-                            "task_id": task.task_id,
-                        },
-                    )
-                except Exception:
-                    LOG.warning(
-                        "Failed to clear stale 2FA waiting state after payload code extraction",
-                        task_id=task.task_id,
-                        workflow_run_id=task.workflow_run_id,
-                        exc_info=True,
-                    )
+                await clear_stale_2fa_waiting_state(
+                    organization_id=task.organization_id,
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
 
             if not otp_value:
-                # SKY-48 Bug #2: Detect TOTP rejection from page content and handle retries.
-                # If the page shows "Invalid code" or similar, clear the cached code and
-                # enforce retry limit to prevent infinite expired-code loops.
-                current_context = skyvern_context.current()
-                page_text = scraped_page.html if scraped_page.html else ""
-                if current_context and detect_totp_error_in_text(page_text):
-                    retry_count = current_context.totp_retry_counts.get(task.task_id, 0)
-                    should_retry = handle_totp_rejection(
-                        task_id=task.task_id,
-                        error_message=page_text[:500],
-                        retry_count=retry_count,
-                    )
-                    current_context.totp_retry_counts[task.task_id] = retry_count + 1
-                    if not should_retry:
-                        LOG.warning(
-                            "TOTP retry limit exceeded, skipping verification code entry",
-                            task_id=task.task_id,
-                            retry_count=retry_count,
-                        )
-                        return json_response
-
                 # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
                 otp_value = try_generate_totp_from_credential(task.workflow_run_id)
                 # Fall back to webhook/totp_identifier

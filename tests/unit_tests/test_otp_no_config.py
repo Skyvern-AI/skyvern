@@ -542,3 +542,257 @@ async def test_poll_otp_value_publishes_required_event_for_workflow_run():
 
     required = next(m for m in messages if m["type"] == "verification_code_required")
     assert required["workflow_run_id"] == "wr_1"
+
+
+# === clear_stale_2fa_waiting_state ===
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_2fa_waiting_state_workflow_run():
+    """Should update DB and publish notification for workflow run."""
+    from skyvern.services.otp_service import clear_stale_2fa_waiting_state
+
+    mock_db = AsyncMock()
+    mock_db.update_workflow_run = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.DATABASE = mock_db
+
+    registry = LocalNotificationRegistry()
+    queue = registry.subscribe("org_1")
+
+    with (
+        patch("skyvern.services.otp_service.app", new=mock_app),
+        patch(
+            "skyvern.forge.sdk.notification.factory.NotificationRegistryFactory._NotificationRegistryFactory__registry",
+            new=registry,
+        ),
+    ):
+        await clear_stale_2fa_waiting_state(
+            organization_id="org_1",
+            task_id="tsk_1",
+            workflow_run_id="wr_1",
+        )
+
+    mock_db.update_workflow_run.assert_called_once_with(
+        workflow_run_id="wr_1",
+        waiting_for_verification_code=False,
+    )
+    messages = []
+    while not queue.empty():
+        messages.append(queue.get_nowait())
+    assert len(messages) == 1
+    assert messages[0]["type"] == "verification_code_resolved"
+    assert messages[0]["workflow_run_id"] == "wr_1"
+    assert messages[0]["task_id"] == "tsk_1"
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_2fa_waiting_state_handles_db_error():
+    """Should log warning and not raise when DB update fails."""
+    from skyvern.services.otp_service import clear_stale_2fa_waiting_state
+
+    mock_db = AsyncMock()
+    mock_db.update_workflow_run = AsyncMock(side_effect=Exception("DB error"))
+    mock_app = MagicMock()
+    mock_app.DATABASE = mock_db
+
+    with patch("skyvern.services.otp_service.app", new=mock_app):
+        await clear_stale_2fa_waiting_state(
+            organization_id="org_1",
+            task_id="tsk_1",
+            workflow_run_id="wr_1",
+        )
+
+
+# === _extract_code_from_navigation_payload ===
+
+
+def test_extract_code_from_navigation_payload_verification_code():
+    """Should extract verification_code from dict payload."""
+    task = MagicMock()
+    task.navigation_payload = {"username": "user@example.com", "verification_code": "654321"}
+    result = ForgeAgent._extract_code_from_navigation_payload(task)
+    assert result is not None
+    assert result.value == "654321"
+
+
+def test_extract_code_from_navigation_payload_mfa_choice():
+    """Should extract mfaChoice from dict payload."""
+    task = MagicMock()
+    task.navigation_payload = {"mfaChoice": " 123456 "}
+    result = ForgeAgent._extract_code_from_navigation_payload(task)
+    assert result is not None
+    assert result.value == "123456"
+
+
+def test_extract_code_from_navigation_payload_none():
+    """Should return None when payload is None."""
+    task = MagicMock()
+    task.navigation_payload = None
+    result = ForgeAgent._extract_code_from_navigation_payload(task)
+    assert result is None
+
+
+def test_extract_code_from_navigation_payload_no_code_key():
+    """Should return None when payload dict has no recognized code key."""
+    task = MagicMock()
+    task.navigation_payload = {"username": "user@example.com", "password": "secret"}
+    result = ForgeAgent._extract_code_from_navigation_payload(task)
+    assert result is None
+
+
+def test_extract_code_from_navigation_payload_empty_string():
+    """Should return None when code value is empty string."""
+    task = MagicMock()
+    task.navigation_payload = {"verification_code": ""}
+    result = ForgeAgent._extract_code_from_navigation_payload(task)
+    assert result is None
+
+
+# === _extract_code_from_llm_actions ===
+
+
+def test_extract_code_from_llm_actions_finds_digit_code():
+    """Should extract 6-digit code from LLM INPUT_TEXT action."""
+    json_response = {
+        "actions": [
+            {"action_type": "INPUT_TEXT", "id": "el_1", "text": "520265"},
+            {"action_type": "CLICK", "id": "el_2"},
+        ]
+    }
+    result = ForgeAgent._extract_code_from_llm_actions(json_response)
+    assert result is not None
+    assert result.value == "520265"
+
+
+def test_extract_code_from_llm_actions_finds_4_digit_code():
+    """Should extract 4-digit code."""
+    json_response = {"actions": [{"action_type": "INPUT_TEXT", "id": "el_1", "text": "1234"}]}
+    result = ForgeAgent._extract_code_from_llm_actions(json_response)
+    assert result is not None
+    assert result.value == "1234"
+
+
+def test_extract_code_from_llm_actions_strips_whitespace():
+    """Should strip whitespace from code."""
+    json_response = {"actions": [{"action_type": "INPUT_TEXT", "id": "el_1", "text": " 654321 "}]}
+    result = ForgeAgent._extract_code_from_llm_actions(json_response)
+    assert result is not None
+    assert result.value == "654321"
+
+
+def test_extract_code_from_llm_actions_ignores_non_digit_text():
+    """Should not match text that isn't all digits."""
+    json_response = {"actions": [{"action_type": "INPUT_TEXT", "id": "el_1", "text": "user@example.com"}]}
+    result = ForgeAgent._extract_code_from_llm_actions(json_response)
+    assert result is None
+
+
+def test_extract_code_from_llm_actions_ignores_long_numbers():
+    """Should not match numbers longer than 8 digits (e.g., phone numbers)."""
+    json_response = {"actions": [{"action_type": "INPUT_TEXT", "id": "el_1", "text": "5551234567"}]}
+    result = ForgeAgent._extract_code_from_llm_actions(json_response)
+    assert result is None
+
+
+def test_extract_code_from_llm_actions_ignores_short_numbers():
+    """Should not match numbers shorter than 4 digits."""
+    json_response = {"actions": [{"action_type": "INPUT_TEXT", "id": "el_1", "text": "12"}]}
+    result = ForgeAgent._extract_code_from_llm_actions(json_response)
+    assert result is None
+
+
+def test_extract_code_from_llm_actions_no_actions():
+    """Should return None when no actions in response."""
+    json_response = {"actions": []}
+    result = ForgeAgent._extract_code_from_llm_actions(json_response)
+    assert result is None
+
+
+def test_extract_code_from_llm_actions_click_only():
+    """Should not match CLICK actions."""
+    json_response = {"actions": [{"action_type": "CLICK", "id": "el_1"}]}
+    result = ForgeAgent._extract_code_from_llm_actions(json_response)
+    assert result is None
+
+
+# === Integration: LLM actions bypass OTP polling ===
+
+
+@pytest.mark.asyncio
+async def test_handle_otp_actions_skips_verification_when_llm_has_code():
+    """When LLM actions already contain a digit code, handle_potential_OTP_actions
+    should return empty actions (letting original actions pass through) without
+    calling handle_potential_verification_code or re-prompting the LLM."""
+    agent = ForgeAgent.__new__(ForgeAgent)
+
+    task = MagicMock()
+    task.organization_id = "org_1"
+    task.totp_verification_url = None
+    task.totp_identifier = None
+    task.task_id = "tsk_1"
+    task.workflow_run_id = None
+    task.navigation_payload = 1  # Not a dict, no code keys
+
+    step = MagicMock()
+    scraped_page = MagicMock()
+    browser_state = MagicMock()
+
+    json_response = {
+        "should_enter_verification_code": True,
+        "place_to_enter_verification_code": True,
+        "actions": [
+            {"action_type": "INPUT_TEXT", "id": "el_1", "text": "520265"},
+            {"action_type": "CLICK", "id": "el_2"},
+        ],
+    }
+
+    with patch.object(agent, "handle_potential_verification_code", new_callable=AsyncMock) as mock_verify:
+        result_json, result_actions = await agent.handle_potential_OTP_actions(
+            task, step, scraped_page, browser_state, json_response
+        )
+
+    # handle_potential_verification_code should NOT have been called
+    mock_verify.assert_not_called()
+    # Should return empty actions so caller uses original actions
+    assert result_actions == []
+    # json_response should be returned unchanged
+    assert result_json is json_response
+
+
+@pytest.mark.asyncio
+async def test_handle_otp_actions_enters_verification_when_no_code_in_actions():
+    """When LLM actions don't contain a digit code, should proceed to
+    handle_potential_verification_code as normal."""
+    agent = ForgeAgent.__new__(ForgeAgent)
+
+    task = MagicMock()
+    task.organization_id = "org_1"
+
+    step = MagicMock()
+    scraped_page = MagicMock()
+    browser_state = MagicMock()
+
+    json_response = {
+        "should_enter_verification_code": True,
+        "place_to_enter_verification_code": True,
+        "actions": [
+            {"action_type": "CLICK", "id": "el_1"},
+        ],
+    }
+
+    with (
+        patch.object(
+            agent,
+            "handle_potential_verification_code",
+            new_callable=AsyncMock,
+            return_value={"actions": [{"action_type": "CLICK", "id": "el_1"}]},
+        ) as mock_verify,
+        patch("skyvern.forge.agent.parse_actions", return_value=[]),
+    ):
+        result_json, result_actions = await agent.handle_potential_OTP_actions(
+            task, step, scraped_page, browser_state, json_response
+        )
+
+    # handle_potential_verification_code SHOULD be called
+    mock_verify.assert_called_once()
