@@ -2601,7 +2601,7 @@ class WorkflowService:
                 browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                     organization_id=organization_id,
                     proxy_location=workflow_request.proxy_location,
-                    timeout_minutes=60,  # 1 hour default timeout for forced browser sessions
+                    timeout_minutes=30,  # 30 minutes default timeout for forced browser sessions
                 )
                 browser_session_id = browser_session.persistent_browser_session_id
                 LOG.info(
