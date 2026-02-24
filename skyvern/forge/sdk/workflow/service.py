@@ -2581,11 +2581,40 @@ class WorkflowService:
                     organization_id=organization_id,
                 )
 
+        # Check if this workflow/org should use browser sessions (anti-bot detection mitigation)
+        browser_session_id = workflow_request.browser_session_id
+        if not browser_session_id:
+            force_browser_session = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "FORCE_BROWSER_SESSION",
+                workflow_permanent_id,
+                properties={
+                    "organization_id": organization_id,
+                    "workflow_permanent_id": workflow_permanent_id,
+                },
+            )
+            if force_browser_session:
+                LOG.info(
+                    "Force-creating browser session for workflow run",
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                )
+                browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    organization_id=organization_id,
+                    proxy_location=workflow_request.proxy_location,
+                    timeout_minutes=60,  # 1 hour default timeout for forced browser sessions
+                )
+                browser_session_id = browser_session.persistent_browser_session_id
+                LOG.info(
+                    "Browser session created for workflow run",
+                    workflow_permanent_id=workflow_permanent_id,
+                    browser_session_id=browser_session_id,
+                )
+
         return await app.DATABASE.create_workflow_run(
             workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
             organization_id=organization_id,
-            browser_session_id=workflow_request.browser_session_id,
+            browser_session_id=browser_session_id,
             browser_profile_id=workflow_request.browser_profile_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
