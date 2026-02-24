@@ -5,10 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import skyvern.services.otp.polling as otp_polling
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.notification.local import LocalNotificationRegistry
-from skyvern.services import otp_service
-from skyvern.services.otp_service import OTPValue, poll_otp_value
+from skyvern.services.otp.models import OTPPollContext, OTPValue
+from skyvern.services.otp.polling import poll_otp_value
 
 
 @pytest.mark.asyncio
@@ -24,13 +25,13 @@ async def test_poll_otp_value_without_totp_url_does_not_require_org_token() -> N
     mock_app.DATABASE = mock_db
 
     with (
-        patch("skyvern.services.otp_service.app", new=mock_app),
+        patch("skyvern.services.otp.polling.app", new=mock_app),
         patch(
-            "skyvern.services.otp_service._get_otp_value_by_run",
+            "skyvern.services.otp.polling._get_otp_value_by_run",
             new_callable=AsyncMock,
             return_value=expected_otp,
         ) as mock_get_otp_by_run,
-        patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+        patch("skyvern.services.otp.polling.asyncio.sleep", new_callable=AsyncMock),
     ):
         result = await poll_otp_value(
             organization_id="org_1",
@@ -56,8 +57,8 @@ async def test_poll_otp_value_with_totp_url_still_checks_org_token() -> None:
     mock_app.DATABASE = mock_db
 
     with (
-        patch("skyvern.services.otp_service.app", new=mock_app),
-        patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock) as mock_from_url,
+        patch("skyvern.services.otp.polling.app", new=mock_app),
+        patch("skyvern.services.otp.polling._get_otp_value_from_url", new_callable=AsyncMock) as mock_from_url,
     ):
         result = await poll_otp_value(
             organization_id="org_1",
@@ -87,19 +88,19 @@ async def test_set_waiting_state_updates_task_and_publishes_required_event() -> 
     registry = LocalNotificationRegistry()
     queue = registry.subscribe("org_1")
 
-    ctx = otp_service.OTPPollContext(
+    ctx = OTPPollContext(
         organization_id="org_1",
         task_id="tsk_1",
     )
 
     with (
-        patch("skyvern.services.otp_service.app", new=mock_app),
+        patch("skyvern.services.otp.polling.app", new=mock_app),
         patch(
             "skyvern.forge.sdk.notification.factory.NotificationRegistryFactory._NotificationRegistryFactory__registry",
             new=registry,
         ),
     ):
-        await otp_service._set_waiting_state(ctx, started_at)
+        await otp_polling._set_waiting_state(ctx, started_at)
 
     mock_db.update_task_2fa_state.assert_awaited_once()
     update_kwargs = mock_db.update_task_2fa_state.await_args.kwargs
@@ -126,19 +127,19 @@ async def test_clear_waiting_state_updates_task_and_publishes_resolved_event() -
     registry = LocalNotificationRegistry()
     queue = registry.subscribe("org_1")
 
-    ctx = otp_service.OTPPollContext(
+    ctx = OTPPollContext(
         organization_id="org_1",
         task_id="tsk_1",
     )
 
     with (
-        patch("skyvern.services.otp_service.app", new=mock_app),
+        patch("skyvern.services.otp.polling.app", new=mock_app),
         patch(
             "skyvern.forge.sdk.notification.factory.NotificationRegistryFactory._NotificationRegistryFactory__registry",
             new=registry,
         ),
     ):
-        await otp_service._clear_waiting_state(ctx)
+        await otp_polling._clear_waiting_state(ctx)
 
     mock_db.update_task_2fa_state.assert_awaited_once()
     update_kwargs = mock_db.update_task_2fa_state.await_args.kwargs

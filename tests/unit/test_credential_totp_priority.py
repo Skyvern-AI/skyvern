@@ -11,7 +11,8 @@ import pyotp
 import pytest
 
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.services.otp_service import OTPValue, try_generate_totp_from_credential
+from skyvern.services.otp.credential_totp import try_generate_totp_from_credential
+from skyvern.services.otp.models import OTPValue
 
 # A valid base32 TOTP secret for testing
 TEST_TOTP_SECRET = "JBSWY3DPEHPK3PXP"
@@ -46,14 +47,14 @@ class TestTryGenerateTotpFromCredential:
         assert result is None
 
     def test_returns_none_when_no_workflow_run_context(self) -> None:
-        with patch("skyvern.services.otp_service.app") as mock_app:
+        with patch("skyvern.services.otp.credential_totp.app") as mock_app:
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = None
             result = try_generate_totp_from_credential("wfr_123")
             assert result is None
 
     def test_returns_none_when_no_credential_values(self) -> None:
         ctx = _make_workflow_run_context(values={"some_param": "plain_string"})
-        with patch("skyvern.services.otp_service.app") as mock_app:
+        with patch("skyvern.services.otp.credential_totp.app") as mock_app:
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = ctx
             result = try_generate_totp_from_credential("wfr_123")
             assert result is None
@@ -62,7 +63,7 @@ class TestTryGenerateTotpFromCredential:
         ctx = _make_workflow_run_context(
             values={"cred_param": {"username": "user", "password": "pass"}},
         )
-        with patch("skyvern.services.otp_service.app") as mock_app:
+        with patch("skyvern.services.otp.credential_totp.app") as mock_app:
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = ctx
             result = try_generate_totp_from_credential("wfr_123")
             assert result is None
@@ -71,7 +72,7 @@ class TestTryGenerateTotpFromCredential:
         ctx = _make_workflow_run_context(
             values={"cred_param": {"totp": ""}},
         )
-        with patch("skyvern.services.otp_service.app") as mock_app:
+        with patch("skyvern.services.otp.credential_totp.app") as mock_app:
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = ctx
             result = try_generate_totp_from_credential("wfr_123")
             assert result is None
@@ -82,7 +83,7 @@ class TestTryGenerateTotpFromCredential:
             values={"cred_param": {"totp": "secret_id_123"}},
             secrets={},  # no secret stored
         )
-        with patch("skyvern.services.otp_service.app") as mock_app:
+        with patch("skyvern.services.otp.credential_totp.app") as mock_app:
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = ctx
             result = try_generate_totp_from_credential("wfr_123")
             assert result is None
@@ -93,7 +94,7 @@ class TestTryGenerateTotpFromCredential:
             values={"cred_param": {"username": "user", "password": "pass", "totp": "totp_ref_1"}},
             secrets={"totp_ref_1_value": TEST_TOTP_SECRET},
         )
-        with patch("skyvern.services.otp_service.app") as mock_app:
+        with patch("skyvern.services.otp.credential_totp.app") as mock_app:
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = ctx
             result = try_generate_totp_from_credential("wfr_123")
 
@@ -116,7 +117,7 @@ class TestTryGenerateTotpFromCredential:
                 "ref_b_value": "ORSXG5DJNZTQ====",
             },
         )
-        with patch("skyvern.services.otp_service.app") as mock_app:
+        with patch("skyvern.services.otp.credential_totp.app") as mock_app:
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = ctx
             result = try_generate_totp_from_credential("wfr_123")
 
@@ -135,7 +136,7 @@ class TestTryGenerateTotpFromCredential:
                 "ref_good_value": TEST_TOTP_SECRET,
             },
         )
-        with patch("skyvern.services.otp_service.app") as mock_app:
+        with patch("skyvern.services.otp.credential_totp.app") as mock_app:
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = ctx
             result = try_generate_totp_from_credential("wfr_123")
 
@@ -147,7 +148,7 @@ class TestTryGenerateTotpFromCredential:
         ctx = _make_workflow_run_context(
             values={"cred_param": {"totp": 12345}},
         )
-        with patch("skyvern.services.otp_service.app") as mock_app:
+        with patch("skyvern.services.otp.credential_totp.app") as mock_app:
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = ctx
             result = try_generate_totp_from_credential("wfr_123")
             assert result is None
@@ -162,7 +163,7 @@ class TestTryGenerateTotpFromCredential:
                 "none_param": None,
             },
         )
-        with patch("skyvern.services.otp_service.app") as mock_app:
+        with patch("skyvern.services.otp.credential_totp.app") as mock_app:
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = ctx
             result = try_generate_totp_from_credential("wfr_123")
             assert result is None

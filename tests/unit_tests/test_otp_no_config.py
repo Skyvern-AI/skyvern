@@ -11,13 +11,9 @@ from skyvern.forge.sdk.notification.local import LocalNotificationRegistry
 from skyvern.forge.sdk.routes.credentials import send_totp_code
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCodeCreate
 from skyvern.schemas.runs import RunEngine
-from skyvern.services.otp_service import (
-    OTPValue,
-    _get_otp_value_by_run,
-    extract_totp_from_navigation_payload,
-    extract_totp_from_text,
-    poll_otp_value,
-)
+from skyvern.services.otp.extractors import extract_totp_from_navigation_payload, extract_totp_from_text
+from skyvern.services.otp.models import OTPValue
+from skyvern.services.otp.polling import _get_otp_value_by_run, poll_otp_value
 
 
 @pytest.mark.asyncio
@@ -52,7 +48,7 @@ async def test_get_otp_value_by_run_returns_code():
     mock_app = MagicMock()
     mock_app.DATABASE = mock_db
 
-    with patch("skyvern.services.otp_service.app", new=mock_app):
+    with patch("skyvern.services.otp.polling.app", new=mock_app):
         result = await _get_otp_value_by_run(
             organization_id="org_1",
             task_id="tsk_1",
@@ -70,7 +66,7 @@ async def test_get_otp_value_by_run_returns_none_when_no_codes():
     mock_app = MagicMock()
     mock_app.DATABASE = mock_db
 
-    with patch("skyvern.services.otp_service.app", new=mock_app):
+    with patch("skyvern.services.otp.polling.app", new=mock_app):
         result = await _get_otp_value_by_run(
             organization_id="org_1",
             task_id="tsk_1",
@@ -276,8 +272,8 @@ async def test_poll_otp_value_without_identifier_uses_run_lookup():
     mock_app.DATABASE = mock_db
 
     with (
-        patch("skyvern.services.otp_service.app", new=mock_app),
-        patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+        patch("skyvern.services.otp.polling.app", new=mock_app),
+        patch("skyvern.services.otp.polling.asyncio.sleep", new_callable=AsyncMock),
     ):
         result = await poll_otp_value(
             organization_id="org_1",
@@ -517,10 +513,10 @@ async def test_poll_otp_value_passes_workflow_id_not_permanent_id():
     mock_app.DATABASE = mock_db
 
     with (
-        patch("skyvern.services.otp_service.app", new=mock_app),
-        patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+        patch("skyvern.services.otp.polling.app", new=mock_app),
+        patch("skyvern.services.otp.polling.asyncio.sleep", new_callable=AsyncMock),
         patch(
-            "skyvern.services.otp_service._get_otp_value_from_db",
+            "skyvern.services.otp.polling._get_otp_value_from_db",
             new_callable=AsyncMock,
             return_value=OTPValue(value="654321", type="totp"),
         ) as mock_get_from_db,
@@ -731,8 +727,8 @@ async def test_poll_otp_value_publishes_required_event_for_task():
     queue = registry.subscribe("org_1")
 
     with (
-        patch("skyvern.services.otp_service.app", new=mock_app),
-        patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+        patch("skyvern.services.otp.polling.app", new=mock_app),
+        patch("skyvern.services.otp.polling.asyncio.sleep", new_callable=AsyncMock),
         patch(
             "skyvern.forge.sdk.notification.factory.NotificationRegistryFactory._NotificationRegistryFactory__registry",
             new=registry,
@@ -775,8 +771,8 @@ async def test_poll_otp_value_publishes_required_event_for_workflow_run():
     queue = registry.subscribe("org_1")
 
     with (
-        patch("skyvern.services.otp_service.app", new=mock_app),
-        patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+        patch("skyvern.services.otp.polling.app", new=mock_app),
+        patch("skyvern.services.otp.polling.asyncio.sleep", new_callable=AsyncMock),
         patch(
             "skyvern.forge.sdk.notification.factory.NotificationRegistryFactory._NotificationRegistryFactory__registry",
             new=registry,
