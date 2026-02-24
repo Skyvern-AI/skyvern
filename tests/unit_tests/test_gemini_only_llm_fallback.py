@@ -9,11 +9,12 @@ enabled provider's default key instead of falling back to OPENAI_GPT4O.
 import importlib
 
 from skyvern import config
+from skyvern.config import Settings
 from skyvern.forge.sdk.api.llm import config_registry
 
 
 def _setup_gemini_only_env(monkeypatch):
-    """Configure settings to simulate a Gemini-only Docker environment."""
+    """Configure settings to simulate a Gemini-only Docker environment on the global singleton."""
     monkeypatch.setattr(config.settings, "ENABLE_OPENAI", False)
     monkeypatch.setattr(config.settings, "ENABLE_ANTHROPIC", False)
     monkeypatch.setattr(config.settings, "ENABLE_GEMINI", True)
@@ -31,31 +32,45 @@ def _setup_gemini_only_env(monkeypatch):
     monkeypatch.setattr(config.settings, "ENABLE_VERTEX_AI", False)
 
 
+def _reset_llm_key_to_default():
+    """Reset LLM_KEY to its default value on the global singleton without marking it as explicitly set.
+
+    Uses object.__setattr__ to bypass Pydantic's __setattr__ which would add
+    LLM_KEY to model_fields_set, making _resolve_llm_key_default think it was
+    explicitly provided.
+    """
+    object.__setattr__(config.settings, "LLM_KEY", "OPENAI_GPT4O")
+    object.__setattr__(
+        config.settings,
+        "__pydantic_fields_set__",
+        config.settings.__pydantic_fields_set__ - {"LLM_KEY"},
+    )
+
+
 class TestLLMKeyAutoResolution:
     """Tests for the LLM_KEY auto-resolution logic in Settings._resolve_llm_key_default."""
 
     def test_resolves_to_gemini_when_only_gemini_enabled(self, monkeypatch):
         """When ENABLE_GEMINI=true and ENABLE_OPENAI=false, LLM_KEY should auto-resolve
         to GEMINI_FLASH_2_0 instead of staying at the OPENAI_GPT4O default."""
-        _setup_gemini_only_env(monkeypatch)
-        # Reset LLM_KEY to the default to simulate fresh startup
-        monkeypatch.setattr(config.settings, "LLM_KEY", "OPENAI_GPT4O")
+        monkeypatch.delenv("LLM_KEY", raising=False)
+        monkeypatch.setenv("ENABLE_OPENAI", "false")
+        monkeypatch.setenv("ENABLE_GEMINI", "true")
 
-        config.settings._resolve_llm_key_default()
+        fresh_settings = Settings()
 
-        assert config.settings.LLM_KEY == "GEMINI_FLASH_2_0"
+        assert fresh_settings.LLM_KEY == "GEMINI_FLASH_2_0"
 
     def test_resolves_to_anthropic_when_only_anthropic_enabled(self, monkeypatch):
         """When ENABLE_ANTHROPIC=true and ENABLE_OPENAI=false, LLM_KEY should auto-resolve
         to ANTHROPIC_CLAUDE3."""
-        _setup_gemini_only_env(monkeypatch)
-        monkeypatch.setattr(config.settings, "ENABLE_GEMINI", False)
-        monkeypatch.setattr(config.settings, "ENABLE_ANTHROPIC", True)
-        monkeypatch.setattr(config.settings, "LLM_KEY", "OPENAI_GPT4O")
+        monkeypatch.delenv("LLM_KEY", raising=False)
+        monkeypatch.setenv("ENABLE_OPENAI", "false")
+        monkeypatch.setenv("ENABLE_ANTHROPIC", "true")
 
-        config.settings._resolve_llm_key_default()
+        fresh_settings = Settings()
 
-        assert config.settings.LLM_KEY == "ANTHROPIC_CLAUDE3"
+        assert fresh_settings.LLM_KEY == "ANTHROPIC_CLAUDE3"
 
     def test_keeps_openai_default_when_openai_enabled(self, monkeypatch):
         """When ENABLE_OPENAI=true, LLM_KEY should stay as OPENAI_GPT4O."""
@@ -84,6 +99,58 @@ class TestLLMKeyAutoResolution:
 
         assert config.settings.LLM_KEY == "gemini/gemini-2.0-flash"
 
+    def test_explicit_openai_gpt4o_preserved_when_openai_disabled(self, monkeypatch):
+        """When LLM_KEY=OPENAI_GPT4O is explicitly set via env var but ENABLE_OPENAI
+        is disabled and ENABLE_GEMINI is enabled, the explicit LLM_KEY should be
+        preserved — not auto-resolved to GEMINI_FLASH_2_0.
+
+        Bug: _resolve_llm_key_default uses value-equality (LLM_KEY != "OPENAI_GPT4O")
+        as a proxy for "explicitly set". This fails when the user explicitly sets the
+        value to the same string as the default. The method should use model_fields_set
+        to detect whether LLM_KEY was provided via env/initialization.
+        """
+        monkeypatch.setenv("LLM_KEY", "OPENAI_GPT4O")
+        monkeypatch.setenv("ENABLE_OPENAI", "false")
+        monkeypatch.setenv("ENABLE_GEMINI", "true")
+
+        fresh_settings = Settings()
+
+        # Pydantic-settings includes env-sourced fields in model_fields_set
+        assert "LLM_KEY" in fresh_settings.model_fields_set, (
+            "Pydantic should track LLM_KEY as explicitly set when provided via env var"
+        )
+
+        # The explicit LLM_KEY=OPENAI_GPT4O must NOT be overridden
+        assert fresh_settings.LLM_KEY == "OPENAI_GPT4O", (
+            f"Explicitly set LLM_KEY=OPENAI_GPT4O was overridden to '{fresh_settings.LLM_KEY}'. "
+            "_resolve_llm_key_default should use model_fields_set to detect explicit settings "
+            "instead of value-equality checking against the default."
+        )
+
+    def test_default_llm_key_still_auto_resolves(self, monkeypatch):
+        """When LLM_KEY is NOT explicitly set (using default) and ENABLE_OPENAI is
+        disabled, _resolve_llm_key_default should still auto-resolve to the first
+        enabled provider's key.
+
+        This is the complement to test_explicit_openai_gpt4o_preserved_when_openai_disabled
+        — ensures the auto-resolve still works for the default case.
+        """
+        monkeypatch.delenv("LLM_KEY", raising=False)
+        monkeypatch.setenv("ENABLE_OPENAI", "false")
+        monkeypatch.setenv("ENABLE_GEMINI", "true")
+
+        fresh_settings = Settings()
+
+        # LLM_KEY was not set via env, so it should NOT be in model_fields_set
+        assert "LLM_KEY" not in fresh_settings.model_fields_set, (
+            "LLM_KEY should not be in model_fields_set when using default value"
+        )
+
+        # Auto-resolve should kick in and pick Gemini
+        assert fresh_settings.LLM_KEY == "GEMINI_FLASH_2_0", (
+            f"Expected auto-resolved LLM_KEY='GEMINI_FLASH_2_0' but got '{fresh_settings.LLM_KEY}'"
+        )
+
 
 class TestGeminiOnlyEndToEnd:
     """End-to-end tests verifying that Gemini-only config resolves to a registered model."""
@@ -91,7 +158,7 @@ class TestGeminiOnlyEndToEnd:
     def test_resolved_llm_key_is_registered(self, monkeypatch):
         """After auto-resolution, LLM_KEY should point to a registered model in the registry."""
         _setup_gemini_only_env(monkeypatch)
-        monkeypatch.setattr(config.settings, "LLM_KEY", "OPENAI_GPT4O")
+        _reset_llm_key_to_default()
 
         config.settings._resolve_llm_key_default()
 
@@ -107,7 +174,7 @@ class TestGeminiOnlyEndToEnd:
     def test_resolved_config_uses_gemini_model_name(self, monkeypatch):
         """The resolved config should use a proper Gemini model name for litellm."""
         _setup_gemini_only_env(monkeypatch)
-        monkeypatch.setattr(config.settings, "LLM_KEY", "OPENAI_GPT4O")
+        _reset_llm_key_to_default()
 
         config.settings._resolve_llm_key_default()
 

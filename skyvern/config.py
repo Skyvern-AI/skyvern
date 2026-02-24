@@ -580,7 +580,7 @@ class Settings(BaseSettings):
         because that key is only registered when ENABLE_OPENAI=true. This method detects the
         mismatch and selects the first enabled provider's default key instead.
         """
-        if self.LLM_KEY != "OPENAI_GPT4O" or self.ENABLE_OPENAI:
+        if "LLM_KEY" in self.model_fields_set or self.ENABLE_OPENAI:
             return
 
         for flag_name, default_key in self._PROVIDER_DEFAULT_LLM_KEYS:
