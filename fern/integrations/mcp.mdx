@@ -13,18 +13,29 @@ The MCP server exposes 33 tools across 6 categories:
 
 | Category | Key tools | What they do |
 |----------|-----------|--------------|
-| **Session management** | `skyvern_session_create`, `skyvern_session_close`, `skyvern_session_list`, `skyvern_session_connect` | Open, manage, and reuse browser sessions |
+| **Browser session management** | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_connect` | Open, manage, and reuse browser sessions |
 | **Browser actions** | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait` | Control the browser with natural language or CSS/XPath selectors |
 | **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured data from pages, capture screenshots, run JavaScript |
 | **Validation** | `skyvern_validate` | Check page conditions using AI (returns true/false) |
 | **Credentials** | `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete` | Look up stored credentials for login flows |
 | **Workflows** | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete` | Build and execute multi-step automations |
 
-Your AI assistant decides which tools to call based on your instructions. For example, asking "go to Hacker News and get the top post title" triggers `skyvern_session_create`, `skyvern_navigate`, `skyvern_extract`, and `skyvern_session_close` automatically.
+Your AI assistant decides which tools to call based on your instructions. For example, asking "go to Hacker News and get the top post title" triggers `skyvern_browser_session_create`, `skyvern_navigate`, `skyvern_extract`, and `skyvern_browser_session_close` automatically.
+
+## Which setup should I use?
+
+| | Cloud setup (recommended) | Local mode |
+|---|---|---|
+| **Best for** | Most users — Skyvern Cloud handles everything | Self-hosting Skyvern with your own infrastructure |
+| **Install required** | None | Python 3.11+ and `pip install skyvern` |
+| **How it connects** | Your AI client connects to Skyvern Cloud over HTTPS | A local Python process runs on your machine |
+| **API key** | From [app.skyvern.com](https://app.skyvern.com) | From your self-hosted Skyvern instance |
+
+If you have a Skyvern Cloud account, use the cloud setup below. It takes 30 seconds and works immediately.
 
 ## Quick start
 
-Pick your client and follow the setup below. Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboard.
+Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboard, then pick your client below.
 
 <Tabs>
 <Tab title="Claude Code">
@@ -115,9 +126,9 @@ x-api-key = "SKYVERN_API_KEY"
 
 That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS.
 
-## Alternative: Local mode (stdio)
+## Alternative: Local mode (self-hosted)
 
-If you prefer to run Skyvern locally or need to use your own LLM provider, use stdio transport instead.
+Use this if you are self-hosting Skyvern and want the MCP server to talk to your own instance instead of Skyvern Cloud. This runs a lightweight Python process on your machine that connects to your local Skyvern server.
 
 <Tip title="Supported Python Versions" icon="fa-brands fa-python">
 Local mode requires Python 3.11, 3.12, or 3.13.
@@ -127,17 +138,24 @@ Local mode requires Python 3.11, 3.12, or 3.13.
 pip install skyvern
 ```
 
+Before using MCP, start your local Skyvern server:
+
+```bash
+skyvern run server
+```
+
+Then configure your AI client to use stdio transport:
+
 <Tabs>
 <Tab title="Claude Code">
 
 ```bash
+# For Skyvern Cloud, use https://api.skyvern.com instead of localhost
 claude mcp add --transport stdio skyvern \
-  --env SKYVERN_BASE_URL=https://api.skyvern.com \
+  --env SKYVERN_BASE_URL=http://localhost:8000 \
   --env SKYVERN_API_KEY=YOUR_SKYVERN_API_KEY \
   -- python3 -m skyvern run mcp
 ```
-
-For a local server, set `SKYVERN_BASE_URL=http://localhost:8000`.
 
 </Tab>
 <Tab title="Claude Desktop / Cursor / Windsurf">
@@ -151,7 +169,7 @@ Add to your client's config file:
       "command": "/usr/bin/python3",
       "args": ["-m", "skyvern", "run", "mcp"],
       "env": {
-        "SKYVERN_BASE_URL": "https://api.skyvern.com",
+        "SKYVERN_BASE_URL": "http://localhost:8000",
         "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
       }
     }
@@ -159,7 +177,7 @@ Add to your client's config file:
 }
 ```
 
-Replace `/usr/bin/python3` with the output of `which python3`. For a local server, set `SKYVERN_BASE_URL` to `http://localhost:8000`.
+Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud, change `SKYVERN_BASE_URL` to `https://api.skyvern.com`.
 
 </Tab>
 <Tab title="Codex">
@@ -170,23 +188,17 @@ command = "/usr/bin/python3"
 args = ["-m", "skyvern", "run", "mcp"]
 
 [mcp_servers.skyvern.env]
-SKYVERN_BASE_URL = "https://api.skyvern.com"
+SKYVERN_BASE_URL = "http://localhost:8000"
 SKYVERN_API_KEY = "YOUR_SKYVERN_API_KEY"
 ```
 
-Replace `/usr/bin/python3` with the output of `which python3`.
+Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud, change `SKYVERN_BASE_URL` to `https://api.skyvern.com`.
 
 </Tab>
 </Tabs>
 
 <Tip>
 You can also run `skyvern init` to auto-detect installed clients and write configs automatically.
-
-If using local mode, start the server before using MCP:
-
-```bash
-skyvern run server
-```
 </Tip>
 
 <Accordion title="Config file locations by client">
@@ -225,6 +237,18 @@ skyvern run server
 </video>
 
 ## Troubleshooting
+
+<Accordion title="Invalid API key or 401 errors">
+Double-check that your API key is correct. You can find or regenerate it at [Settings](https://app.skyvern.com). Make sure there are no extra spaces or newlines when pasting the key.
+
+If you recently regenerated your API key, update it in your MCP config and restart your AI client.
+</Accordion>
+
+<Accordion title="Tools not responding or timing out">
+Skyvern browser sessions take a few seconds to start. If a tool call times out, try again — the first call in a new session is slower than subsequent ones.
+
+If timeouts persist, check that your Skyvern account is active and has available credits at [app.skyvern.com](https://app.skyvern.com).
+</Accordion>
 
 <Accordion title="Python version errors (local mode only)">
 The Skyvern MCP server requires Python 3.11, 3.12, or 3.13. Check your version with `python3 --version`. If you have multiple Python versions installed, make sure the `command` in your MCP config points to a supported version:
