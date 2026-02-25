@@ -1,11 +1,6 @@
 import { useLocation } from "react-router-dom";
 import type { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import {
-  isBlockItem,
-  isTaskVariantBlockItem,
-  WorkflowRunTimelineItem,
-} from "./types/workflowRunTypes";
 
 type Location = ReturnType<typeof useLocation>;
 
@@ -77,20 +72,6 @@ export const formatDuration = (duration: Duration): string => {
     return `${duration.second}s`;
   }
 };
-
-export function countActions(items: Array<WorkflowRunTimelineItem>): number {
-  return items.reduce((total, item) => {
-    if (!isBlockItem(item)) {
-      return total;
-    }
-
-    const blockActionCount = isTaskVariantBlockItem(item)
-      ? item.block.actions?.length ?? 0
-      : 0;
-
-    return total + blockActionCount + countActions(item.children);
-  }, 0);
-}
 
 export const getOrderedBlockLabels = (workflow?: WorkflowApiResponse) => {
   if (!workflow) {

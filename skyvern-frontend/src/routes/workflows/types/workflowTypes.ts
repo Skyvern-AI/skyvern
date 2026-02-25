@@ -260,15 +260,7 @@ export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
 export function isTaskVariantBlock(item: {
   block_type: WorkflowBlockType;
 }): boolean {
-  return (
-    item.block_type === "task" ||
-    item.block_type === "navigation" ||
-    item.block_type === "action" ||
-    item.block_type === "extraction" ||
-    item.block_type === "validation" ||
-    item.block_type === "login" ||
-    item.block_type === "file_download"
-  );
+  return scriptableWorkflowBlockTypes.has(item.block_type);
 }
 
 export type WorkflowBlockType =
@@ -360,6 +352,7 @@ export type ForLoopBlock = WorkflowBlockBase & {
   loop_blocks: Array<WorkflowBlock>;
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
+  data_schema?: Record<string, unknown> | string | null;
 };
 
 export type CodeBlock = WorkflowBlockBase & {

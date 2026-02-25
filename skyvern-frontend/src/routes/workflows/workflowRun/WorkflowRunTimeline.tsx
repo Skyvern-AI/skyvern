@@ -6,13 +6,13 @@ import { DotFilledIcon } from "@radix-ui/react-icons";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
+  countActionsInTimeline,
   isBlockItem,
   isObserverThought,
   isThoughtItem,
   ObserverThought,
   WorkflowRunBlock,
 } from "../types/workflowRunTypes";
-import { countActions } from "../utils";
 import { ThoughtCard } from "./ThoughtCard";
 import {
   ActionItem,
@@ -56,7 +56,7 @@ function WorkflowRunTimeline({
   const finallyBlockLabel =
     workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
 
-  const numberOfActions = countActions(workflowRunTimeline);
+  const numberOfActions = countActionsInTimeline(workflowRunTimeline);
 
   return (
     <div className="min-w-0 space-y-4 rounded bg-slate-elevation1 p-4">
