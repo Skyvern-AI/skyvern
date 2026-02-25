@@ -917,12 +917,12 @@ async def generate_cua_fallback_actions(
             )
 
     elif skyvern_action_type == "get_verification_code":
-        # 1. Check navigation payload first for parameters
+        # 1. Check navigation payload first for inline OTP.
         otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-        # 2. Then try to generate TOTP from credential if parameters are not in navigation payload
+        # 2. Then try to generate TOTP from credential if payload has no OTP.
         if not otp_value:
             otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-        # 3. Lastly, poll for OTP value if organization has the necessary parameters for polling and OTP value is not obtained from previous steps
+        # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
         if not otp_value and task.organization_id:
             LOG.info(
                 "Getting verification code for CUA",
