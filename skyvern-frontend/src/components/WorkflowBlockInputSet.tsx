@@ -77,7 +77,7 @@ function WorkflowBlockInputSet(props: Props) {
               <PlusIcon className="size-4" />
             </div>
           </PopoverTrigger>
-          <PopoverContent className="w-[22rem]">
+          <PopoverContent className="w-[19rem]">
             <WorkflowBlockParameterSelect
               nodeId={nodeId}
               onAdd={(parameterKey) => {

@@ -108,7 +108,7 @@ async def resolve_browser(
     """Resolve browser from parameters or current session.
 
     Note: For MCP tools, sessions are stored in ContextVar and persist across tool calls.
-    Cleanup is done via explicit skyvern_session_close() call. For scripts that need
+    Cleanup is done via explicit skyvern_browser_session_close() call. For scripts that need
     guaranteed cleanup, use the browser_session() context manager instead.
     """
     skyvern = get_skyvern()
@@ -243,5 +243,5 @@ def no_browser_error() -> dict[str, Any]:
     return make_error(
         ErrorCode.NO_ACTIVE_BROWSER,
         "No browser session available",
-        "Create a session with skyvern_session_create, provide session_id, or cdp_url",
+        "Create a session with skyvern_browser_session_create, provide session_id, or cdp_url",
     )

@@ -107,6 +107,8 @@ type Props = {
   editingCredential?: CredentialApiResponse;
   /** Override the modal type (used in edit mode to set the correct form) */
   overrideType?: CredentialModalType;
+  /** Called after a credential is saved with "Dedicated browser profile?" to trigger an async test */
+  onStartBackgroundTest?: (credentialId: string, url: string) => void;
 };
 
 function CredentialsModal({
@@ -115,6 +117,7 @@ function CredentialsModal({
   onOpenChange: controlledOnOpenChange,
   editingCredential,
   overrideType,
+  onStartBackgroundTest,
 }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -165,6 +168,13 @@ function CredentialsModal({
   const pollErrorCountRef = useRef(0);
   // Guards against in-flight poll responses updating state after cancel/close
   const pollCancelledRef = useRef(false);
+
+  // Captures save intent before mutation fires — testAndSave/testUrl may be
+  // reset by the time onSuccess runs, so we snapshot them here.
+  const saveIntentRef = useRef<{
+    shouldTestAfterSave: boolean;
+    testUrl: string;
+  }>({ shouldTestAfterSave: false, testUrl: "" });
 
   // Cleanup polling on unmount
   useEffect(() => {
@@ -276,6 +286,7 @@ function CredentialsModal({
     pollStartTimeRef.current = null;
     pollErrorCountRef.current = 0;
     pollCancelledRef.current = false;
+    saveIntentRef.current = { shouldTestAfterSave: false, testUrl: "" };
     if (pollIntervalRef.current) {
       clearTimeout(pollIntervalRef.current);
       pollIntervalRef.current = null;
@@ -470,14 +481,16 @@ function CredentialsModal({
       return response.data;
     },
     onSuccess: async (data) => {
+      const { shouldTestAfterSave, testUrl: capturedTestUrl } =
+        saveIntentRef.current;
+
       // If the user entered a URL, save it on the credential as metadata
-      const url = testUrl.trim();
-      if (url) {
+      if (capturedTestUrl) {
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
           await client.patch(`/credentials/${data.credential_id}`, {
             name: data.name,
-            tested_url: url,
+            tested_url: capturedTestUrl,
           });
         } catch {
           // Best-effort — credential was created, URL is just metadata
@@ -489,11 +502,30 @@ function CredentialsModal({
       onCredentialCreated?.(data.credential_id);
       reset();
       setIsOpen(false);
-      toast({
-        title: "Credential created",
-        description: "Your credential has been created successfully",
-        variant: "success",
-      });
+
+      if (shouldTestAfterSave && onStartBackgroundTest) {
+        onStartBackgroundTest(data.credential_id, capturedTestUrl);
+        toast({
+          title: "Credential saved",
+          description:
+            "Testing browser profile in the background. You'll be notified when it's ready.",
+          variant: "success",
+        });
+      } else if (shouldTestAfterSave) {
+        // Background test hook not available in this context (e.g. workflow editor)
+        toast({
+          title: "Credential saved",
+          description:
+            "To set up a browser profile, test this credential from the Credentials page.",
+          variant: "success",
+        });
+      } else {
+        toast({
+          title: "Credential created",
+          description: "Your credential has been created successfully",
+          variant: "success",
+        });
+      }
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -625,6 +657,13 @@ function CredentialsModal({
         });
         return;
       }
+
+      // Capture intent before mutation — state will be reset in onSuccess
+      saveIntentRef.current = {
+        shouldTestAfterSave:
+          testAndSave && testStatus !== "completed" && testUrl.trim() !== "",
+        testUrl: testUrl.trim(),
+      };
 
       activeMutation.mutate({
         name,
@@ -992,8 +1031,7 @@ function CredentialsModal({
               disabled={
                 activeMutation.isPending ||
                 renameCredentialMutation.isPending ||
-                isTestInProgress ||
-                (testAndSave && testStatus !== "completed")
+                isTestInProgress
               }
             >
               {activeMutation.isPending ||

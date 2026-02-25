@@ -138,7 +138,17 @@ def _get_auth_db() -> AgentDB:
     # Guard singleton init in case HTTP transport is served with threaded workers.
     with _auth_db_lock:
         if _auth_db is None:
-            _auth_db = AgentDB(settings.DATABASE_STRING, debug_enabled=settings.DEBUG_MODE)
+            # Prefer CloudAgentDB when available (cloud deploys) because the base
+            # AgentDB.validate_org_auth_token does not handle encrypted tokens,
+            # causing all API key validation to fail when ENABLE_ENCRYPTION is on.
+            try:
+                from cloud.db.cloud_agent_db import CloudAgentDB  # noqa: PLC0415
+
+                _auth_db = CloudAgentDB(settings.DATABASE_STRING, debug_enabled=settings.DEBUG_MODE)
+                LOG.info("MCP auth DB initialized", db_class="CloudAgentDB")
+            except ImportError:
+                _auth_db = AgentDB(settings.DATABASE_STRING, debug_enabled=settings.DEBUG_MODE)
+                LOG.info("MCP auth DB initialized", db_class="AgentDB")
     return _auth_db
 
 

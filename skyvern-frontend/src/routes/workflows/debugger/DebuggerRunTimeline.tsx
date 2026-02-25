@@ -5,13 +5,13 @@ import { cn } from "@/util/utils";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
+  countActionsInTimeline,
   isBlockItem,
   isObserverThought,
   isThoughtItem,
   ObserverThought,
   WorkflowRunBlock,
 } from "../types/workflowRunTypes";
-import { countActions } from "../utils";
 import { ThoughtCard } from "@/routes/workflows/workflowRun/ThoughtCard";
 import {
   ActionItem,
@@ -48,7 +48,7 @@ function DebuggerRunTimeline({
 
   const workflowRunIsFinalized = statusIsFinalized(workflowRun);
 
-  const numberOfActions = countActions(workflowRunTimeline);
+  const numberOfActions = countActionsInTimeline(workflowRunTimeline);
 
   const firstActionOrThoughtIsPending =
     !workflowRunIsFinalized && workflowRunTimeline.length === 0;
