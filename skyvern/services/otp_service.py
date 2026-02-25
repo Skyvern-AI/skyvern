@@ -178,6 +178,7 @@ async def poll_otp_value(
                     org_api_key,
                     task_id=ctx.task_id,
                     workflow_run_id=ctx.workflow_run_id,
+                    workflow_permanent_id=ctx.workflow_permanent_id,
                 )
             elif ctx.totp_identifier:
                 otp_value = await _get_otp_value_from_db(
