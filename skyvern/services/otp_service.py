@@ -222,14 +222,19 @@ def extract_totp_from_navigation_payload(payload: MFANavigationPayload) -> OTPVa
 
 
 def extract_totp_from_navigation_inputs(
-    navigation_payload: MFANavigationPayload, _navigation_goal: object
+    navigation_payload: MFANavigationPayload, navigation_goal: object
 ) -> OTPValue | None:
     """Extract TOTP from runtime navigation inputs.
 
-    Runtime inline OTP extraction is intentionally payload-only.
-    `_navigation_goal` is kept for call-site compatibility with existing callers.
+    Checks navigation_payload first (explicit MFA alias keys),
+    then falls back to navigation_goal text extraction.
     """
-    return extract_totp_from_navigation_payload(navigation_payload)
+    if payload_otp := extract_totp_from_navigation_payload(navigation_payload):
+        return payload_otp
+    # Navigation goals are inherently OTP-context (e.g. "Input 522225"),
+    # so assume_otp_context=True lets action-term patterns match without
+    # requiring additional OTP context terms like "verification code".
+    return extract_totp_from_text(navigation_goal, assume_otp_context=True)
 
 
 async def parse_otp_login(

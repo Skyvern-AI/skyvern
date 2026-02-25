@@ -360,11 +360,35 @@ def test_extract_totp_from_navigation_inputs_prefers_payload_code_over_goal_text
     assert otp_value.get_otp_type() == OTPType.TOTP
 
 
-def test_extract_totp_from_navigation_inputs_ignores_navigation_goal_when_payload_missing():
-    """Goal text alone should not produce inline OTP when payload-only filtering is used."""
+def test_extract_totp_from_navigation_inputs_falls_back_to_goal_text():
+    """Goal text should produce inline OTP when payload extraction fails."""
     otp_value = extract_totp_from_navigation_inputs(
         None,
         "Sign in and use verification code 520265 when prompted.",
+    )
+
+    assert otp_value is not None
+    assert otp_value.value == "520265"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_navigation_inputs_goal_with_input_action():
+    """Goal text with 'input' action keyword should extract the code."""
+    otp_value = extract_totp_from_navigation_inputs(
+        {},
+        "Input 522225",
+    )
+
+    assert otp_value is not None
+    assert otp_value.value == "522225"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_navigation_inputs_no_code_anywhere():
+    """No code in payload or goal should return None."""
+    otp_value = extract_totp_from_navigation_inputs(
+        None,
+        "Navigate to the login page",
     )
 
     assert otp_value is None
@@ -509,7 +533,7 @@ def test_extract_code_from_navigation_payload_supports_nested_alias_values():
     }
     task.navigation_goal = "Use the verification code shown by your provider."
 
-    otp_value = ForgeAgent._extract_code_from_navigation_payload(task)
+    otp_value = ForgeAgent._extract_code_from_navigation_inputs(task)
 
     assert otp_value is not None
     assert otp_value.value == "654321"
@@ -522,7 +546,7 @@ def test_extract_code_from_navigation_payload_supports_normalized_alias_keys():
     task.navigation_payload = {"MFA Code": "520266"}
     task.navigation_goal = "Complete login with the code."
 
-    otp_value = ForgeAgent._extract_code_from_navigation_payload(task)
+    otp_value = ForgeAgent._extract_code_from_navigation_inputs(task)
 
     assert otp_value is not None
     assert otp_value.value == "520266"
@@ -535,7 +559,7 @@ def test_extract_code_from_navigation_payload_rejects_non_alias_numeric_values()
     task.navigation_payload = {"promo_code": "654321"}
     task.navigation_goal = "Apply your coupon code."
 
-    otp_value = ForgeAgent._extract_code_from_navigation_payload(task)
+    otp_value = ForgeAgent._extract_code_from_navigation_inputs(task)
 
     assert otp_value is None
 

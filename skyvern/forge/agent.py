@@ -3163,8 +3163,8 @@ class ForgeAgent:
         return is_multi_field_totp
 
     @staticmethod
-    def _extract_code_from_navigation_payload(task: Task) -> OTPValue | None:
-        """Extract a verification code from navigation payload using OTP service rules."""
+    def _extract_code_from_navigation_inputs(task: Task) -> OTPValue | None:
+        """Extract a verification code from navigation payload or goal."""
         return extract_totp_from_navigation_inputs(
             task.navigation_payload,
             task.navigation_goal,
@@ -4472,12 +4472,8 @@ class ForgeAgent:
             # If the payload already includes a verification code, clear any stale
             # waiting state up front. This avoids a stuck 2FA banner even when we
             # later short-circuit or bypass polling.
-            payload_otp = self._extract_code_from_navigation_payload(task)
-            LOG.info(
-                "Navigation payload OTP pre-extraction",
-                task_id=task.task_id,
-                found_payload_otp=bool(payload_otp),
-            )
+            payload_otp = self._extract_code_from_navigation_inputs(task)
+
             if payload_otp and task.workflow_run_id:
                 await clear_stale_2fa_waiting_state(
                     organization_id=task.organization_id,
@@ -4565,7 +4561,7 @@ class ForgeAgent:
             source = "pre_extracted_payload" if otp_value else None
 
             if not otp_value:
-                otp_value = self._extract_code_from_navigation_payload(task)
+                otp_value = self._extract_code_from_navigation_inputs(task)
                 if otp_value:
                     source = "navigation_payload"
 
