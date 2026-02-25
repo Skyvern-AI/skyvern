@@ -34,6 +34,7 @@ type Props = {
   onChange: (value: string) => void;
   suggestionContext: Record<string, unknown>;
   exampleValue: Record<string, unknown>;
+  helpTooltip?: string;
 };
 
 function WorkflowDataSchemaInputGroup({
@@ -41,6 +42,7 @@ function WorkflowDataSchemaInputGroup({
   onChange,
   suggestionContext,
   exampleValue,
+  helpTooltip,
 }: Props) {
   const credentialGetter = useCredentialGetter();
   const [generateWithAIActive, setGenerateWithAIActive] = useState(false);
@@ -91,7 +93,9 @@ function WorkflowDataSchemaInputGroup({
         <div className="flex gap-4">
           <div className="flex gap-2">
             <Label className="text-xs text-slate-300">Data Schema</Label>
-            <HelpTooltip content={helpTooltips["task"]["dataSchema"]} />
+            <HelpTooltip
+              content={helpTooltip ?? helpTooltips["task"]["dataSchema"]}
+            />
           </div>
           <Checkbox
             checked={value !== "null"}
