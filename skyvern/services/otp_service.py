@@ -70,6 +70,7 @@ def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload
 
     Runtime inline OTP extraction is intentionally payload-only.
     """
+    # Early return if payload is not a traversable container
     if not isinstance(navigation_payload, (dict, list)):
         return None
 
@@ -79,31 +80,38 @@ def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload
     while traversal_stack:
         current_item = traversal_stack.pop()
 
+        # Only save OTP if a string
         if isinstance(current_item, str):
             return OTPValue(value=current_item, type=OTPType.TOTP)
 
+        # Check if we've already visited this container to avoid cycles
         current_id = id(current_item)
         if current_id in visited_container_ids:
             continue
         visited_container_ids.add(current_id)
 
+        # For lists, add all nested containers to the stack for further traversal
         if isinstance(current_item, list):
             for item in reversed(current_item):
                 if isinstance(item, (dict, list)):
                     traversal_stack.append(item)
             continue
 
+        # For dictionaries, process key-value pairs
         for key, value in reversed(list(current_item.items())):
+            # Add nested containers (dicts/lists) to the stack regardless of key name
             if isinstance(value, (dict, list)):
                 traversal_stack.append(value)
+            # Only process string values if the key suggests it's MFA-related
             if not _is_mfa_like_parameter_key(key):
                 continue
             if not isinstance(value, str):
                 continue
+            # If the value is a non-empty string under an MFA-like key, add it for evaluation
             candidate_value = value.strip()
             if candidate_value:
                 traversal_stack.append(candidate_value)
-
+    # No OTP code found after traversing the entire payload
     return None
 
 
