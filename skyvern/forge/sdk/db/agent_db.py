@@ -33,6 +33,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB, read_retry
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.mixins import CredentialsMixin, FoldersMixin, OTPMixin
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     AISuggestionModel,
@@ -45,13 +46,11 @@ from skyvern.forge.sdk.db.models import (
     BitwardenSensitiveInformationParameterModel,
     BlockRunModel,
     BrowserProfileModel,
-    CredentialModel,
     CredentialParameterModel,
     DebugSessionModel,
     FolderModel,
     OnePasswordCredentialParameterModel,
     OrganizationAuthTokenModel,
-    OrganizationBitwardenCollectionModel,
     OrganizationModel,
     OutputParameterModel,
     PersistentBrowserSessionModel,
@@ -64,7 +63,6 @@ from skyvern.forge.sdk.db.models import (
     TaskRunModel,
     TaskV2Model,
     ThoughtModel,
-    TOTPCodeModel,
     WorkflowCopilotChatMessageModel,
     WorkflowCopilotChatModel,
     WorkflowModel,
@@ -104,9 +102,7 @@ from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
-from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession, DebugSessionRun
-from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
@@ -122,7 +118,6 @@ from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
-from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
@@ -133,13 +128,7 @@ from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
-    AzureVaultCredentialParameter,
-    BitwardenCreditCardDataParameter,
-    BitwardenLoginCredentialParameter,
-    BitwardenSensitiveInformationParameter,
     ContextParameter,
-    CredentialParameter,
-    OnePasswordCredentialParameter,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -196,7 +185,7 @@ elif "postgresql+asyncpg" in settings.DATABASE_STRING:
     DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
 
 
-class AgentDB(BaseAlchemyDB):
+class AgentDB(OTPMixin, CredentialsMixin, FoldersMixin, BaseAlchemyDB):
     def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
         super().__init__(
             db_engine
@@ -848,102 +837,6 @@ class AgentDB(BaseAlchemyDB):
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
-
-    async def update_task_2fa_state(
-        self,
-        task_id: str,
-        organization_id: str,
-        waiting_for_verification_code: bool,
-        verification_code_identifier: str | None = None,
-        verification_code_polling_started_at: datetime | None = None,
-    ) -> Task:
-        """Update task 2FA verification code waiting state."""
-        try:
-            async with self.Session() as session:
-                if task := (
-                    await session.scalars(
-                        select(TaskModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
-                    )
-                ).first():
-                    task.waiting_for_verification_code = waiting_for_verification_code
-                    if verification_code_identifier is not None:
-                        task.verification_code_identifier = verification_code_identifier
-                    if verification_code_polling_started_at is not None:
-                        task.verification_code_polling_started_at = verification_code_polling_started_at
-                    if not waiting_for_verification_code:
-                        # Clear identifiers when no longer waiting
-                        task.verification_code_identifier = None
-                        task.verification_code_polling_started_at = None
-                    await session.commit()
-                    updated_task = await self.get_task(task_id, organization_id=organization_id)
-                    if not updated_task:
-                        raise NotFoundError("Task not found")
-                    return updated_task
-                else:
-                    raise NotFoundError("Task not found")
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
-
-    @read_retry()
-    async def get_active_verification_requests(self, organization_id: str) -> list[dict]:
-        """Return active 2FA verification requests for an organization.
-
-        Queries both tasks and workflow runs where waiting_for_verification_code=True.
-        Used to provide initial state when a WebSocket notification client connects.
-        """
-        results: list[dict] = []
-        async with self.Session() as session:
-            # Tasks waiting for verification (exclude finalized tasks)
-            finalized_task_statuses = [s.value for s in TaskStatus if s.is_final()]
-            task_rows = (
-                await session.scalars(
-                    select(TaskModel)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(waiting_for_verification_code=True)
-                    .filter_by(workflow_run_id=None)
-                    .filter(TaskModel.status.not_in(finalized_task_statuses))
-                    .filter(TaskModel.created_at > datetime.utcnow() - timedelta(hours=1))
-                )
-            ).all()
-            for t in task_rows:
-                results.append(
-                    {
-                        "task_id": t.task_id,
-                        "workflow_run_id": None,
-                        "verification_code_identifier": t.verification_code_identifier,
-                        "verification_code_polling_started_at": (
-                            t.verification_code_polling_started_at.isoformat()
-                            if t.verification_code_polling_started_at
-                            else None
-                        ),
-                    }
-                )
-            # Workflow runs waiting for verification (exclude finalized runs)
-            finalized_wr_statuses = [s.value for s in WorkflowRunStatus if s.is_final()]
-            wr_rows = (
-                await session.scalars(
-                    select(WorkflowRunModel)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(waiting_for_verification_code=True)
-                    .filter(WorkflowRunModel.status.not_in(finalized_wr_statuses))
-                    .filter(WorkflowRunModel.created_at > datetime.utcnow() - timedelta(hours=1))
-                )
-            ).all()
-            for wr in wr_rows:
-                results.append(
-                    {
-                        "task_id": None,
-                        "workflow_run_id": wr.workflow_run_id,
-                        "verification_code_identifier": wr.verification_code_identifier,
-                        "verification_code_polling_started_at": (
-                            wr.verification_code_polling_started_at.isoformat()
-                            if wr.verification_code_polling_started_at
-                            else None
-                        ),
-                    }
-                )
-        return results
 
     async def bulk_update_tasks(
         self,
@@ -2459,372 +2352,6 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("SQLAlchemyError in is_workflow_template", exc_info=True)
             raise
 
-    async def create_folder(
-        self,
-        organization_id: str,
-        title: str,
-        description: str | None = None,
-    ) -> FolderModel:
-        """Create a new folder."""
-        try:
-            async with self.Session() as session:
-                folder = FolderModel(
-                    organization_id=organization_id,
-                    title=title,
-                    description=description,
-                )
-                session.add(folder)
-                await session.commit()
-                await session.refresh(folder)
-                return folder
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in create_folder", exc_info=True)
-            raise
-
-    async def get_folders(
-        self,
-        organization_id: str,
-        page: int = 1,
-        page_size: int = 10,
-        search_query: str | None = None,
-    ) -> list[FolderModel]:
-        """Get all folders for an organization with pagination and optional search."""
-        try:
-            async with self.Session() as session:
-                stmt = (
-                    select(FolderModel)
-                    .filter_by(organization_id=organization_id)
-                    .filter(FolderModel.deleted_at.is_(None))
-                )
-
-                if search_query:
-                    search_pattern = f"%{search_query}%"
-                    stmt = stmt.filter(
-                        or_(
-                            FolderModel.title.ilike(search_pattern),
-                            FolderModel.description.ilike(search_pattern),
-                        )
-                    )
-
-                stmt = stmt.order_by(FolderModel.modified_at.desc())
-                stmt = stmt.offset((page - 1) * page_size).limit(page_size)
-
-                result = await session.execute(stmt)
-                return list(result.scalars().all())
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in get_folders", exc_info=True)
-            raise
-
-    async def get_folder(
-        self,
-        folder_id: str,
-        organization_id: str,
-    ) -> FolderModel | None:
-        """Get a folder by ID."""
-        try:
-            async with self.Session() as session:
-                stmt = (
-                    select(FolderModel)
-                    .filter_by(folder_id=folder_id, organization_id=organization_id)
-                    .filter(FolderModel.deleted_at.is_(None))
-                )
-                result = await session.execute(stmt)
-                return result.scalar_one_or_none()
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in get_folder", exc_info=True)
-            raise
-
-    async def update_folder(
-        self,
-        folder_id: str,
-        organization_id: str,
-        title: str | None = None,
-        description: str | None = None,
-    ) -> FolderModel | None:
-        """Update a folder's title or description."""
-        try:
-            async with self.Session() as session:
-                stmt = (
-                    select(FolderModel)
-                    .filter_by(folder_id=folder_id, organization_id=organization_id)
-                    .filter(FolderModel.deleted_at.is_(None))
-                )
-                result = await session.execute(stmt)
-                folder = result.scalar_one_or_none()
-                if not folder:
-                    return None
-
-                if title is not None:
-                    folder.title = title
-                if description is not None:
-                    folder.description = description
-
-                folder.modified_at = datetime.utcnow()
-                await session.commit()
-                await session.refresh(folder)
-                return folder
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in update_folder", exc_info=True)
-            raise
-
-    async def get_workflow_permanent_ids_in_folder(
-        self,
-        folder_id: str,
-        organization_id: str,
-    ) -> list[str]:
-        """Get workflow permanent IDs (latest versions only) in a folder."""
-        try:
-            async with self.Session() as session:
-                # Subquery to get the latest version for each workflow
-                subquery = (
-                    select(
-                        WorkflowModel.organization_id,
-                        WorkflowModel.workflow_permanent_id,
-                        func.max(WorkflowModel.version).label("max_version"),
-                    )
-                    .where(WorkflowModel.organization_id == organization_id)
-                    .where(WorkflowModel.deleted_at.is_(None))
-                    .group_by(
-                        WorkflowModel.organization_id,
-                        WorkflowModel.workflow_permanent_id,
-                    )
-                    .subquery()
-                )
-
-                # Get workflow_permanent_ids where the latest version is in this folder
-                stmt = (
-                    select(WorkflowModel.workflow_permanent_id)
-                    .join(
-                        subquery,
-                        (WorkflowModel.organization_id == subquery.c.organization_id)
-                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
-                        & (WorkflowModel.version == subquery.c.max_version),
-                    )
-                    .where(WorkflowModel.folder_id == folder_id)
-                )
-                result = await session.execute(stmt)
-                return list(result.scalars().all())
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in get_workflow_permanent_ids_in_folder", exc_info=True)
-            raise
-
-    async def soft_delete_folder(
-        self,
-        folder_id: str,
-        organization_id: str,
-        delete_workflows: bool = False,
-    ) -> bool:
-        """Soft delete a folder. Optionally delete all workflows in the folder."""
-        try:
-            async with self.Session() as session:
-                # Check if folder exists
-                folder_stmt = (
-                    select(FolderModel)
-                    .filter_by(folder_id=folder_id, organization_id=organization_id)
-                    .filter(FolderModel.deleted_at.is_(None))
-                )
-                folder_result = await session.execute(folder_stmt)
-                folder = folder_result.scalar_one_or_none()
-                if not folder:
-                    return False
-
-                # If delete_workflows is True, delete all workflows in the folder
-                if delete_workflows:
-                    # Get workflow permanent IDs in the folder (inline logic)
-                    subquery = (
-                        select(
-                            WorkflowModel.organization_id,
-                            WorkflowModel.workflow_permanent_id,
-                            func.max(WorkflowModel.version).label("max_version"),
-                        )
-                        .where(WorkflowModel.organization_id == organization_id)
-                        .where(WorkflowModel.deleted_at.is_(None))
-                        .group_by(
-                            WorkflowModel.organization_id,
-                            WorkflowModel.workflow_permanent_id,
-                        )
-                        .subquery()
-                    )
-
-                    workflow_permanent_ids_stmt = (
-                        select(WorkflowModel.workflow_permanent_id)
-                        .join(
-                            subquery,
-                            (WorkflowModel.organization_id == subquery.c.organization_id)
-                            & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
-                            & (WorkflowModel.version == subquery.c.max_version),
-                        )
-                        .where(WorkflowModel.folder_id == folder_id)
-                    )
-                    result = await session.execute(workflow_permanent_ids_stmt)
-                    workflow_permanent_ids = list(result.scalars().all())
-
-                    # Soft delete all workflows with these permanent IDs in a single bulk update
-                    if workflow_permanent_ids:
-                        update_workflows_query = (
-                            update(WorkflowModel)
-                            .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
-                            .where(WorkflowModel.organization_id == organization_id)
-                            .where(WorkflowModel.deleted_at.is_(None))
-                            .values(deleted_at=datetime.utcnow())
-                        )
-                        await session.execute(update_workflows_query)
-                else:
-                    # Just remove folder_id from all workflows in this folder
-                    update_workflows_query = (
-                        update(WorkflowModel)
-                        .where(WorkflowModel.folder_id == folder_id)
-                        .where(WorkflowModel.organization_id == organization_id)
-                        .values(folder_id=None, modified_at=datetime.utcnow())
-                    )
-                    await session.execute(update_workflows_query)
-
-                # Soft delete the folder
-                folder.deleted_at = datetime.utcnow()
-                await session.commit()
-                return True
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in soft_delete_folder", exc_info=True)
-            raise
-
-    async def get_folder_workflow_count(
-        self,
-        folder_id: str,
-        organization_id: str,
-    ) -> int:
-        """Get the count of workflows (latest versions only) in a folder."""
-        try:
-            async with self.Session() as session:
-                # Subquery to get the latest version for each workflow (same pattern as get_workflows_by_organization_id)
-                subquery = (
-                    select(
-                        WorkflowModel.organization_id,
-                        WorkflowModel.workflow_permanent_id,
-                        func.max(WorkflowModel.version).label("max_version"),
-                    )
-                    .where(WorkflowModel.organization_id == organization_id)
-                    .where(WorkflowModel.deleted_at.is_(None))
-                    .group_by(
-                        WorkflowModel.organization_id,
-                        WorkflowModel.workflow_permanent_id,
-                    )
-                    .subquery()
-                )
-
-                # Count workflows where the latest version is in this folder
-                stmt = (
-                    select(func.count(WorkflowModel.workflow_permanent_id))
-                    .join(
-                        subquery,
-                        (WorkflowModel.organization_id == subquery.c.organization_id)
-                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
-                        & (WorkflowModel.version == subquery.c.max_version),
-                    )
-                    .where(WorkflowModel.folder_id == folder_id)
-                )
-                result = await session.execute(stmt)
-                return result.scalar_one()
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in get_folder_workflow_count", exc_info=True)
-            raise
-
-    async def get_folder_workflow_counts_batch(
-        self,
-        folder_ids: list[str],
-        organization_id: str,
-    ) -> dict[str, int]:
-        """Get workflow counts for multiple folders in a single query."""
-        try:
-            async with self.Session() as session:
-                # Subquery to get the latest version for each workflow
-                subquery = (
-                    select(
-                        WorkflowModel.organization_id,
-                        WorkflowModel.workflow_permanent_id,
-                        func.max(WorkflowModel.version).label("max_version"),
-                    )
-                    .where(WorkflowModel.organization_id == organization_id)
-                    .where(WorkflowModel.deleted_at.is_(None))
-                    .group_by(
-                        WorkflowModel.organization_id,
-                        WorkflowModel.workflow_permanent_id,
-                    )
-                    .subquery()
-                )
-
-                # Count workflows grouped by folder_id
-                stmt = (
-                    select(
-                        WorkflowModel.folder_id,
-                        func.count(WorkflowModel.workflow_permanent_id).label("count"),
-                    )
-                    .join(
-                        subquery,
-                        (WorkflowModel.organization_id == subquery.c.organization_id)
-                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
-                        & (WorkflowModel.version == subquery.c.max_version),
-                    )
-                    .where(WorkflowModel.folder_id.in_(folder_ids))
-                    .group_by(WorkflowModel.folder_id)
-                )
-                result = await session.execute(stmt)
-                rows = result.all()
-
-                # Convert to dict, defaulting to 0 for folders with no workflows
-                return {row.folder_id: row.count for row in rows}
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in get_folder_workflow_counts_batch", exc_info=True)
-            raise
-
-    async def update_workflow_folder(
-        self,
-        workflow_permanent_id: str,
-        organization_id: str,
-        folder_id: str | None,
-    ) -> Workflow | None:
-        """Update folder assignment for the latest version of a workflow."""
-        try:
-            # Get the latest version of the workflow
-            latest_workflow = await self.get_workflow_by_permanent_id(
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=organization_id,
-            )
-
-            if not latest_workflow:
-                return None
-
-            async with self.Session() as session:
-                # Validate folder exists in-org if folder_id is provided
-                if folder_id:
-                    stmt = (
-                        select(FolderModel.folder_id)
-                        .where(FolderModel.folder_id == folder_id)
-                        .where(FolderModel.organization_id == organization_id)
-                        .where(FolderModel.deleted_at.is_(None))
-                    )
-                    if (await session.scalar(stmt)) is None:
-                        raise ValueError(f"Folder {folder_id} not found")
-
-                workflow_model = await session.get(WorkflowModel, latest_workflow.workflow_id)
-                if workflow_model:
-                    workflow_model.folder_id = folder_id
-                    workflow_model.modified_at = datetime.utcnow()
-
-                    # Update folder's modified_at in the same transaction
-                    if folder_id:
-                        folder_model = await session.get(FolderModel, folder_id)
-                        if folder_model:
-                            folder_model.modified_at = datetime.utcnow()
-
-                    await session.commit()
-                    await session.refresh(workflow_model)
-
-                    return convert_to_workflow(workflow_model, self.debug_enabled)
-                return None
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in update_workflow_folder", exc_info=True)
-            raise
-
     async def create_workflow_run(
         self,
         workflow_permanent_id: str,
@@ -3521,80 +3048,9 @@ class AgentDB(BaseAlchemyDB):
                 aws_key=parameter.aws_key,
                 deleted_at=parameter.deleted_at,
             )
-        elif isinstance(parameter, BitwardenLoginCredentialParameter):
-            return BitwardenLoginCredentialParameterModel(
-                bitwarden_login_credential_parameter_id=parameter.bitwarden_login_credential_parameter_id,
-                workflow_id=parameter.workflow_id,
-                key=parameter.key,
-                description=parameter.description,
-                bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
-                bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
-                bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
-                bitwarden_collection_id=parameter.bitwarden_collection_id,
-                bitwarden_item_id=parameter.bitwarden_item_id,
-                url_parameter_key=parameter.url_parameter_key,
-                deleted_at=parameter.deleted_at,
-            )
-        elif isinstance(parameter, BitwardenSensitiveInformationParameter):
-            return BitwardenSensitiveInformationParameterModel(
-                bitwarden_sensitive_information_parameter_id=parameter.bitwarden_sensitive_information_parameter_id,
-                workflow_id=parameter.workflow_id,
-                key=parameter.key,
-                description=parameter.description,
-                bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
-                bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
-                bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
-                bitwarden_collection_id=parameter.bitwarden_collection_id,
-                bitwarden_identity_key=parameter.bitwarden_identity_key,
-                bitwarden_identity_fields=parameter.bitwarden_identity_fields,
-                deleted_at=parameter.deleted_at,
-            )
-        elif isinstance(parameter, BitwardenCreditCardDataParameter):
-            return BitwardenCreditCardDataParameterModel(
-                bitwarden_credit_card_data_parameter_id=parameter.bitwarden_credit_card_data_parameter_id,
-                workflow_id=parameter.workflow_id,
-                key=parameter.key,
-                description=parameter.description,
-                bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
-                bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
-                bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
-                bitwarden_collection_id=parameter.bitwarden_collection_id,
-                bitwarden_item_id=parameter.bitwarden_item_id,
-                deleted_at=parameter.deleted_at,
-            )
-        elif isinstance(parameter, CredentialParameter):
-            return CredentialParameterModel(
-                credential_parameter_id=parameter.credential_parameter_id,
-                workflow_id=parameter.workflow_id,
-                key=parameter.key,
-                description=parameter.description,
-                credential_id=parameter.credential_id,
-                deleted_at=parameter.deleted_at,
-            )
-        elif isinstance(parameter, OnePasswordCredentialParameter):
-            return OnePasswordCredentialParameterModel(
-                onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
-                workflow_id=parameter.workflow_id,
-                key=parameter.key,
-                description=parameter.description,
-                vault_id=parameter.vault_id,
-                item_id=parameter.item_id,
-                deleted_at=parameter.deleted_at,
-            )
-        elif isinstance(parameter, AzureVaultCredentialParameter):
-            return AzureVaultCredentialParameterModel(
-                azure_vault_credential_parameter_id=parameter.azure_vault_credential_parameter_id,
-                workflow_id=parameter.workflow_id,
-                key=parameter.key,
-                description=parameter.description,
-                vault_name=parameter.vault_name,
-                username_key=parameter.username_key,
-                password_key=parameter.password_key,
-                totp_secret_key=parameter.totp_secret_key,
-                deleted_at=parameter.deleted_at,
-            )
         else:
-            raise ValueError(f"Unsupported workflow definition parameter type: {type(parameter).__name__}")
+            # Delegate credential parameter types to the credentials mixin
+            return CredentialsMixin._convert_credential_parameter_to_model(parameter)
 
     async def save_workflow_definition_parameters(self, parameters: list[PARAMETER_TYPE]) -> None:
         """Save multiple workflow definition parameters in a single transaction."""
@@ -4067,137 +3523,6 @@ class AgentDB(BaseAlchemyDB):
             if not task_generation:
                 return None
             return TaskGeneration.model_validate(task_generation)
-
-    async def get_otp_codes(
-        self,
-        organization_id: str,
-        totp_identifier: str,
-        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
-        otp_type: OTPType | None = None,
-        workflow_run_id: str | None = None,
-        limit: int | None = None,
-    ) -> list[TOTPCode]:
-        """
-        1. filter by:
-        - organization_id
-        - totp_identifier
-        - workflow_run_id (optional)
-        2. make sure created_at is within the valid lifespan
-        3. sort by task_id/workflow_id/workflow_run_id nullslast and created_at desc
-        4. apply an optional limit at the DB layer
-        """
-        all_null = and_(
-            TOTPCodeModel.task_id.is_(None),
-            TOTPCodeModel.workflow_id.is_(None),
-            TOTPCodeModel.workflow_run_id.is_(None),
-        )
-        async with self.Session() as session:
-            query = (
-                select(TOTPCodeModel)
-                .filter_by(organization_id=organization_id)
-                .filter_by(totp_identifier=totp_identifier)
-                .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
-            )
-            if otp_type:
-                query = query.filter(TOTPCodeModel.otp_type == otp_type)
-            if workflow_run_id is not None:
-                query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
-            query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc())
-            if limit is not None:
-                query = query.limit(limit)
-            totp_code = (await session.scalars(query)).all()
-            return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
-
-    async def get_otp_codes_by_run(
-        self,
-        organization_id: str,
-        task_id: str | None = None,
-        workflow_run_id: str | None = None,
-        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
-        limit: int = 1,
-    ) -> list[TOTPCode]:
-        """Get OTP codes matching a specific task or workflow run (no totp_identifier required).
-
-        Used when the agent detects a 2FA page but no TOTP credentials are pre-configured.
-        The user submits codes manually via the UI, and this method finds them by run context.
-        """
-        if not workflow_run_id and not task_id:
-            return []
-        async with self.Session() as session:
-            query = (
-                select(TOTPCodeModel)
-                .filter_by(organization_id=organization_id)
-                .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
-            )
-            if workflow_run_id:
-                query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
-            elif task_id:
-                query = query.filter(TOTPCodeModel.task_id == task_id)
-            query = query.order_by(TOTPCodeModel.created_at.desc()).limit(limit)
-            results = (await session.scalars(query)).all()
-            return [TOTPCode.model_validate(r) for r in results]
-
-    async def get_recent_otp_codes(
-        self,
-        organization_id: str,
-        limit: int = 50,
-        valid_lifespan_minutes: int | None = None,
-        otp_type: OTPType | None = None,
-        workflow_run_id: str | None = None,
-        totp_identifier: str | None = None,
-    ) -> list[TOTPCode]:
-        """
-        Return recent otp codes for an organization ordered by newest first with optional
-        workflow_run_id filtering.
-        """
-        async with self.Session() as session:
-            query = select(TOTPCodeModel).filter_by(organization_id=organization_id)
-
-            if valid_lifespan_minutes is not None:
-                query = query.filter(
-                    TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes)
-                )
-
-            if otp_type:
-                query = query.filter(TOTPCodeModel.otp_type == otp_type)
-            if workflow_run_id is not None:
-                query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
-            if totp_identifier:
-                query = query.filter(TOTPCodeModel.totp_identifier == totp_identifier)
-            query = query.order_by(TOTPCodeModel.created_at.desc()).limit(limit)
-            totp_codes = (await session.scalars(query)).all()
-            return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]
-
-    async def create_otp_code(
-        self,
-        organization_id: str,
-        totp_identifier: str,
-        content: str,
-        code: str,
-        otp_type: OTPType,
-        task_id: str | None = None,
-        workflow_id: str | None = None,
-        workflow_run_id: str | None = None,
-        source: str | None = None,
-        expired_at: datetime | None = None,
-    ) -> TOTPCode:
-        async with self.Session() as session:
-            new_totp_code = TOTPCodeModel(
-                organization_id=organization_id,
-                totp_identifier=totp_identifier,
-                content=content,
-                code=code,
-                task_id=task_id,
-                workflow_id=workflow_id,
-                workflow_run_id=workflow_run_id,
-                source=source,
-                expired_at=expired_at,
-                otp_type=otp_type,
-            )
-            session.add(new_totp_code)
-            await session.commit()
-            await session.refresh(new_totp_code)
-            return TOTPCode.model_validate(new_totp_code)
 
     async def create_action(self, action: Action) -> Action:
         async with self.Session() as session:
@@ -5388,181 +4713,6 @@ class AgentDB(BaseAlchemyDB):
             if compute_cost is not None:
                 task_run.compute_cost = compute_cost
             await session.commit()
-
-    async def create_credential(
-        self,
-        organization_id: str,
-        name: str,
-        vault_type: CredentialVaultType,
-        item_id: str,
-        credential_type: CredentialType,
-        username: str | None,
-        totp_type: str,
-        card_last4: str | None,
-        card_brand: str | None,
-        totp_identifier: str | None = None,
-        secret_label: str | None = None,
-    ) -> Credential:
-        async with self.Session() as session:
-            credential = CredentialModel(
-                organization_id=organization_id,
-                name=name,
-                vault_type=vault_type,
-                item_id=item_id,
-                credential_type=credential_type,
-                username=username,
-                totp_type=totp_type,
-                totp_identifier=totp_identifier,
-                card_last4=card_last4,
-                card_brand=card_brand,
-                secret_label=secret_label,
-            )
-            session.add(credential)
-            await session.commit()
-            await session.refresh(credential)
-            return Credential.model_validate(credential)
-
-    async def get_credential(self, credential_id: str, organization_id: str) -> Credential | None:
-        async with self.Session() as session:
-            credential = (
-                await session.scalars(
-                    select(CredentialModel)
-                    .filter_by(credential_id=credential_id)
-                    .filter_by(organization_id=organization_id)
-                    .filter(CredentialModel.deleted_at.is_(None))
-                )
-            ).first()
-            if credential:
-                return Credential.model_validate(credential)
-            return None
-
-    async def get_credentials(self, organization_id: str, page: int = 1, page_size: int = 10) -> list[Credential]:
-        async with self.Session() as session:
-            credentials = (
-                await session.scalars(
-                    select(CredentialModel)
-                    .filter_by(organization_id=organization_id)
-                    .filter(CredentialModel.deleted_at.is_(None))
-                    .order_by(CredentialModel.created_at.desc())
-                    .offset((page - 1) * page_size)
-                    .limit(page_size)
-                )
-            ).all()
-            return [Credential.model_validate(credential) for credential in credentials]
-
-    async def update_credential(
-        self,
-        credential_id: str,
-        organization_id: str,
-        name: str | None = None,
-        browser_profile_id: str | None | object = _UNSET,
-        tested_url: str | None | object = _UNSET,
-    ) -> Credential:
-        async with self.Session() as session:
-            credential = (
-                await session.scalars(
-                    select(CredentialModel)
-                    .filter_by(credential_id=credential_id)
-                    .filter_by(organization_id=organization_id)
-                    .filter(CredentialModel.deleted_at.is_(None))
-                )
-            ).first()
-            if not credential:
-                raise NotFoundError(f"Credential {credential_id} not found")
-            if name is not None:
-                credential.name = name
-            if browser_profile_id is not _UNSET:
-                credential.browser_profile_id = browser_profile_id
-            if tested_url is not _UNSET:
-                credential.tested_url = tested_url
-            await session.commit()
-            await session.refresh(credential)
-            return Credential.model_validate(credential)
-
-    async def update_credential_vault_data(
-        self,
-        credential_id: str,
-        organization_id: str,
-        item_id: str,
-        name: str,
-        credential_type: CredentialType,
-        username: str | None = None,
-        totp_type: str = "none",
-        totp_identifier: str | None = None,
-        card_last4: str | None = None,
-        card_brand: str | None = None,
-        secret_label: str | None = None,
-    ) -> Credential:
-        async with self.Session() as session:
-            credential = (
-                await session.scalars(
-                    select(CredentialModel)
-                    .filter_by(credential_id=credential_id)
-                    .filter_by(organization_id=organization_id)
-                    .filter(CredentialModel.deleted_at.is_(None))
-                    .with_for_update()
-                )
-            ).first()
-            if not credential:
-                raise NotFoundError(f"Credential {credential_id} not found")
-            credential.item_id = item_id
-            credential.name = name
-            credential.credential_type = credential_type
-            credential.username = username
-            credential.totp_type = totp_type
-            credential.totp_identifier = totp_identifier
-            credential.card_last4 = card_last4
-            credential.card_brand = card_brand
-            credential.secret_label = secret_label
-            await session.commit()
-            await session.refresh(credential)
-            return Credential.model_validate(credential)
-
-    async def delete_credential(self, credential_id: str, organization_id: str) -> None:
-        async with self.Session() as session:
-            credential = (
-                await session.scalars(
-                    select(CredentialModel)
-                    .filter_by(credential_id=credential_id)
-                    .filter_by(organization_id=organization_id)
-                )
-            ).first()
-            if not credential:
-                raise NotFoundError(f"Credential {credential_id} not found")
-            credential.deleted_at = datetime.utcnow()
-            await session.commit()
-            await session.refresh(credential)
-            return None
-
-    async def create_organization_bitwarden_collection(
-        self,
-        organization_id: str,
-        collection_id: str,
-    ) -> OrganizationBitwardenCollection:
-        async with self.Session() as session:
-            organization_bitwarden_collection = OrganizationBitwardenCollectionModel(
-                organization_id=organization_id, collection_id=collection_id
-            )
-            session.add(organization_bitwarden_collection)
-            await session.commit()
-            await session.refresh(organization_bitwarden_collection)
-            return OrganizationBitwardenCollection.model_validate(organization_bitwarden_collection)
-
-    async def get_organization_bitwarden_collection(
-        self,
-        organization_id: str,
-    ) -> OrganizationBitwardenCollection | None:
-        async with self.Session() as session:
-            organization_bitwarden_collection = (
-                await session.scalars(
-                    select(OrganizationBitwardenCollectionModel)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(deleted_at=None)
-                )
-            ).first()
-            if organization_bitwarden_collection:
-                return OrganizationBitwardenCollection.model_validate(organization_bitwarden_collection)
-            return None
 
     async def cache_task_run(self, run_id: str, organization_id: str | None = None) -> Run:
         async with self.Session() as session:
