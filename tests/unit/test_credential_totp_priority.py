@@ -426,7 +426,7 @@ class TestPayloadVerificationCodePriority:
             mock_context = MagicMock()
             mock_context.totp_codes = {}
             mock_skyvern_context.ensure_context.return_value = mock_context
-            mock_skyvern_context.current.return_value = None
+            mock_skyvern_context.current.return_value = mock_context
 
             task = MagicMock()
             task.navigation_payload = {"mfaChoice": "520265"}
@@ -487,7 +487,7 @@ class TestPayloadVerificationCodePriority:
             mock_context = MagicMock()
             mock_context.totp_codes = {}
             mock_skyvern_context.ensure_context.return_value = mock_context
-            mock_skyvern_context.current.return_value = None
+            mock_skyvern_context.current.return_value = mock_context
 
             task = MagicMock()
             task.navigation_payload = None
@@ -549,7 +549,7 @@ class TestPayloadVerificationCodePriority:
             mock_context = MagicMock()
             mock_context.totp_codes = {}
             mock_skyvern_context.ensure_context.return_value = mock_context
-            mock_skyvern_context.current.return_value = None
+            mock_skyvern_context.current.return_value = mock_context
 
             task = MagicMock()
             task.navigation_payload = None

@@ -18,65 +18,10 @@ from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
 LOG = structlog.get_logger()
-
-MFANavigationPayload = dict | list | str | None
-
-_MIN_OTP_DIGITS = 4
-_MAX_OTP_DIGITS = 10
-_OTP_CONTEXT_TERMS = (
-    "verification code",
-    "authentication code",
-    "security code",
-    "otp",
-    "mfa",
-    "2fa",
-    "two-factor",
-    "two factor",
-    "one-time password",
-    "one time password",
-    "one-time code",
-    "one time code",
-)
-_OTP_INPUT_ACTION_TERMS = ("input", "enter", "type", "fill", "use", "submit")
-_MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED = {
-    "verificationcode",
-    "mfachoice",
-    "mfacode",
-    "otp",
-    "otpcode",
-    "twofactorcode",
-    "2facode",
-    "authenticationcode",
-    "authcode",
-}
+_MFA_PARAMETER_KEY_HINTS = ("mfa", "otp", "verification")
 _NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
 
-
-def _build_regex_alternation(terms: tuple[str, ...]) -> str:
-    """Build a safe regex alternation fragment from plain text terms."""
-    return "|".join(re.escape(term) for term in terms)
-
-
-_OTP_TERM_ALTERNATION = _build_regex_alternation(_OTP_CONTEXT_TERMS)
-_OTP_ACTION_TERM_ALTERNATION = _build_regex_alternation(_OTP_INPUT_ACTION_TERMS)
-_OTP_DIGITS_PATTERN = rf"\d{{{_MIN_OTP_DIGITS},{_MAX_OTP_DIGITS}}}"
-_OTP_CODE_PATTERN = re.compile(rf"^{_OTP_DIGITS_PATTERN}$")
-_OTP_TEXT_BEFORE_CODE_PATTERN = re.compile(
-    rf"\b(?:{_OTP_TERM_ALTERNATION})\b[^\d]{{0,40}}({_OTP_DIGITS_PATTERN})\b",
-    re.IGNORECASE,
-)
-_OTP_CODE_BEFORE_TEXT_PATTERN = re.compile(
-    rf"\b({_OTP_DIGITS_PATTERN})\b[^\w]{{0,20}}(?:{_OTP_TERM_ALTERNATION})\b",
-    re.IGNORECASE,
-)
-_OTP_CONTEXT_PATTERN = re.compile(
-    rf"\b(?:{_OTP_TERM_ALTERNATION})\b",
-    re.IGNORECASE,
-)
-_OTP_INPUT_ACTION_CODE_PATTERN = re.compile(
-    rf"\b(?:{_OTP_ACTION_TERM_ALTERNATION})\b[^\d]{{0,30}}({_OTP_DIGITS_PATTERN})\b",
-    re.IGNORECASE,
-)
+MFANavigationPayload = dict | list | str | None
 
 
 @dataclass(slots=True)
@@ -114,122 +59,60 @@ class OTPResultParsedByLLM(BaseModel):
     otp_value: str | None = Field(None, description="The OTP value.")
 
 
-def _iter_mfa_payload_values(payload: MFANavigationPayload) -> list[str]:
-    """Collect candidate MFA values while preserving recursive traversal order.
+def _is_mfa_like_parameter_key(key: object) -> bool:
+    """Return True when a payload key appears to represent an MFA/OTP parameter."""
+    normalized_key = _NON_ALNUM_PATTERN.sub("", str(key).lower())
+    return any(hint in normalized_key for hint in _MFA_PARAMETER_KEY_HINTS)
 
-    Traversal is cycle-safe to avoid recursive blowups for malformed payload objects.
-    Plain strings inside non-alias lists are intentionally ignored.
+
+def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload) -> OTPValue | None:
+    """Extract TOTP from runtime navigation inputs.
+
+    Runtime inline OTP extraction is intentionally payload-only.
     """
-    if not isinstance(payload, (dict, list)):
-        return []
+    # Early return if payload is not a traversable container
+    if not isinstance(navigation_payload, (dict, list)):
+        return None
 
-    values: list[str] = []
-    traversal_stack: list[dict | list | str] = [payload]
+    traversal_stack: list[dict | list | str] = [navigation_payload]
     visited_container_ids: set[int] = set()
 
     while traversal_stack:
         current_item = traversal_stack.pop()
-        if isinstance(current_item, str):
-            values.append(current_item)
-            continue
 
+        # Only save OTP if a string
+        if isinstance(current_item, str):
+            return OTPValue(value=current_item, type=OTPType.TOTP)
+
+        # Check if we've already visited this container to avoid cycles
         current_id = id(current_item)
         if current_id in visited_container_ids:
             continue
         visited_container_ids.add(current_id)
 
+        # For lists, add all nested containers to the stack for further traversal
         if isinstance(current_item, list):
             for item in reversed(current_item):
                 if isinstance(item, (dict, list)):
                     traversal_stack.append(item)
             continue
 
+        # For dictionaries, process key-value pairs
         for key, value in reversed(list(current_item.items())):
+            # Add nested containers (dicts/lists) to the stack regardless of key name
             if isinstance(value, (dict, list)):
                 traversal_stack.append(value)
-            if _normalize_payload_key(key) not in _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED:
+            # Only process string values if the key suggests it's MFA-related
+            if not _is_mfa_like_parameter_key(key):
                 continue
-            candidate_value = _coerce_candidate_code_source(value)
-            if candidate_value is not None:
+            if not isinstance(value, str):
+                continue
+            # If the value is a non-empty string under an MFA-like key, add it for evaluation
+            candidate_value = value.strip()
+            if candidate_value:
                 traversal_stack.append(candidate_value)
-
-    return values
-
-
-def _normalize_payload_key(key: object) -> str:
-    """Normalize payload keys for alias matching across separators and casing.
-
-    Examples:
-    - "MFA Code" -> "mfacode"
-    - "mfa-code" -> "mfacode"
-    """
-    return _NON_ALNUM_PATTERN.sub("", str(key).lower())
-
-
-def _coerce_candidate_code_source(value: object) -> str | None:
-    """Coerce alias values to a string candidate while rejecting bools."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (str, int)):
-        return str(value)
+    # No OTP code found after traversing the entire payload
     return None
-
-
-def extract_totp_from_text(text: object, *, assume_otp_context: bool = False) -> OTPValue | None:
-    """Extract a numeric OTP from free-form text with optional OTP-context override."""
-    if not isinstance(text, str):
-        return None
-
-    stripped_text = text.strip()
-    if not stripped_text:
-        return None
-
-    for pattern in (_OTP_TEXT_BEFORE_CODE_PATTERN, _OTP_CODE_BEFORE_TEXT_PATTERN):
-        if direct_match := pattern.search(stripped_text):
-            return OTPValue(value=direct_match.group(1), type=OTPType.TOTP)
-
-    context_found = assume_otp_context or bool(_OTP_CONTEXT_PATTERN.search(stripped_text))
-    if not context_found:
-        return None
-
-    if action_prompt_match := _OTP_INPUT_ACTION_CODE_PATTERN.search(stripped_text):
-        return OTPValue(value=action_prompt_match.group(1), type=OTPType.TOTP)
-
-    return None
-
-
-def extract_totp_from_navigation_payload(payload: MFANavigationPayload) -> OTPValue | None:
-    """Extract a TOTP code from navigation payload using explicit MFA aliases.
-
-    The extractor is intentionally strict:
-    - only exact alias keys are considered
-    - values must be numeric and between 4 and 10 digits
-    """
-    for candidate_value in _iter_mfa_payload_values(payload):
-        candidate_value = candidate_value.strip()
-        if _OTP_CODE_PATTERN.fullmatch(candidate_value):
-            return OTPValue(value=candidate_value, type=OTPType.TOTP)
-
-        if otp_from_text := extract_totp_from_text(candidate_value, assume_otp_context=True):
-            return otp_from_text
-
-    if isinstance(payload, str):
-        # String payloads are treated as OTP-context text because this input channel
-        # is used specifically for verification-code navigation steps.
-        return extract_totp_from_text(payload, assume_otp_context=True)
-
-    return None
-
-
-def extract_totp_from_navigation_inputs(
-    navigation_payload: MFANavigationPayload, _navigation_goal: object
-) -> OTPValue | None:
-    """Extract TOTP from runtime navigation inputs.
-
-    Runtime inline OTP extraction is intentionally payload-only.
-    `_navigation_goal` is kept for call-site compatibility with existing callers.
-    """
-    return extract_totp_from_navigation_payload(navigation_payload)
 
 
 async def parse_otp_login(

@@ -14,7 +14,11 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
+from skyvern.services.otp_service import (
+    extract_totp_from_navigation_inputs,
+    poll_otp_value,
+    try_generate_totp_from_credential,
+)
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -913,9 +917,12 @@ async def generate_cua_fallback_actions(
             )
 
     elif skyvern_action_type == "get_verification_code":
-        # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
-        otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-        # Fall back to webhook/totp_identifier
+        # 1. Check navigation payload first for inline OTP.
+        otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
+        # 2. Then try to generate TOTP from credential if payload has no OTP.
+        if not otp_value:
+            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+        # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
         if not otp_value and task.organization_id:
             LOG.info(
                 "Getting verification code for CUA",
@@ -940,6 +947,7 @@ async def generate_cua_fallback_actions(
                 reasoning_suffix = f"Failed to get verification code. Reason: {e.reason}"
                 reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
 
+        # OTP value obtained - use it as verification code
         if otp_value and otp_value.get_otp_type() == OTPType.TOTP:
             verification_code = otp_value.value
             reasoning = reasoning or f"Received verification code: {verification_code}"
@@ -948,6 +956,7 @@ async def generate_cua_fallback_actions(
                 reasoning=reasoning,
                 intention=reasoning,
             )
+        # Terminate the task since OTP is necessary but wasn't found/generated
         else:
             action = TerminateAction(
                 reasoning=reasoning,
