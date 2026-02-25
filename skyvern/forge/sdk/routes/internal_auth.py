@@ -139,7 +139,6 @@ async def repair_api_key(request: Request) -> dict[str, object]:
 
 @router.get("/status", include_in_schema=False)
 async def auth_status(request: Request) -> dict[str, object]:
-    _require_local_access(request)
     token_candidate = request.headers.get("x-api-key") or ""
     result = await _evaluate_local_api_key(token_candidate)
     return _emit_diagnostics(result)
