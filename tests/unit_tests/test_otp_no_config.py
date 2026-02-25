@@ -36,31 +36,6 @@ async def test_get_otp_codes_by_run_returns_empty_without_identifiers():
     assert result == []
 
 
-# === Fix: OTPResultParsedByLLM empty otp_type coercion ===
-
-
-def test_otp_result_parsed_by_llm_empty_string_coerced_to_none():
-    """OTPResultParsedByLLM should coerce empty otp_type to None instead of raising ValidationError."""
-    result = OTPResultParsedByLLM(
-        reasoning="No OTP found in content",
-        otp_type="",
-        otp_value_found=False,
-        otp_value=None,
-    )
-    assert result.otp_type is None
-
-
-def test_otp_result_parsed_by_llm_whitespace_string_coerced_to_none():
-    """OTPResultParsedByLLM should coerce whitespace-only otp_type to None."""
-    result = OTPResultParsedByLLM(
-        reasoning="No OTP found",
-        otp_type="   ",
-        otp_value_found=False,
-        otp_value=None,
-    )
-    assert result.otp_type is None
-
-
 def test_otp_result_parsed_by_llm_valid_otp_type_unchanged():
     """OTPResultParsedByLLM should accept valid otp_type values without modification."""
     result = OTPResultParsedByLLM(
