@@ -360,6 +360,7 @@ export type ForLoopBlockYAML = BlockYAMLBase & {
   loop_blocks: Array<BlockYAML>;
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
+  data_schema?: Record<string, unknown> | string | null;
 };
 
 export type BranchCriteriaYAML = {
