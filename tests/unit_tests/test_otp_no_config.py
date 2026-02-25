@@ -13,13 +13,8 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCodeCreate
 from skyvern.schemas.runs import RunEngine
 from skyvern.services.otp_service import (
     OTPValue,
-    _coerce_candidate_code_source,
     _get_otp_value_by_run,
-    _iter_mfa_payload_values,
-    _normalize_payload_key,
     extract_totp_from_navigation_inputs,
-    extract_totp_from_navigation_payload,
-    extract_totp_from_text,
     poll_otp_value,
 )
 
@@ -82,272 +77,6 @@ async def test_get_otp_value_by_run_returns_none_when_no_codes():
     assert result is None
 
 
-# === Task: extract_totp_from_navigation_payload helper ===
-
-
-def test_iter_mfa_payload_values_ignores_plain_strings_in_generic_lists():
-    """Generic list strings should not become OTP candidates without MFA aliases."""
-    payload = {
-        "items": ["520265", {"field": "ignore"}],
-        "otp_code": "654321",
-    }
-
-    assert _iter_mfa_payload_values(payload) == ["654321"]
-
-
-def test_iter_mfa_payload_values_preserves_alias_depth_first_precedence():
-    """Nested alias values should be yielded before later top-level alias values."""
-    payload = {
-        "first": {"otp_code": "111111"},
-        "otp_code": "222222",
-    }
-
-    assert _iter_mfa_payload_values(payload) == ["111111", "222222"]
-
-
-def test_iter_mfa_payload_values_descends_into_alias_container_values():
-    """Alias container values should still be traversed to find nested aliases."""
-    payload = {
-        "otp_code": {
-            "nested": {
-                "mfa_choice": "654321",
-            }
-        }
-    }
-
-    assert _iter_mfa_payload_values(payload) == ["654321"]
-
-
-@pytest.mark.parametrize(
-    ("raw_key", "expected"),
-    [
-        ("MFA Code", "mfacode"),
-        ("mfa-code", "mfacode"),
-        (None, "none"),
-        (12345, "12345"),
-    ],
-)
-def test_normalize_payload_key_handles_strings_and_non_strings(raw_key: object, expected: str):
-    """Payload keys should normalize deterministically across types."""
-    assert _normalize_payload_key(raw_key) == expected
-
-
-@pytest.mark.parametrize(
-    ("raw_value", "expected"),
-    [
-        ("520265", "520265"),
-        (520265, "520265"),
-        (True, None),
-        (False, None),
-        (52.5, None),
-        (None, None),
-        ({"otp_code": "520265"}, None),
-        (["520265"], None),
-    ],
-)
-def test_coerce_candidate_code_source_enforces_type_contract(raw_value: object, expected: str | None):
-    """Only string/int values (excluding bool) should be accepted as candidates."""
-    assert _coerce_candidate_code_source(raw_value) == expected
-
-
-def test_extract_totp_from_navigation_payload_accepts_alias_numeric_code():
-    """Should accept valid numeric code from MFA alias keys."""
-    payload = {"mfaChoice": "520265", "promo_code": "999999"}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "520265"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-def test_extract_totp_from_navigation_payload_accepts_nested_alias_numeric_code():
-    """Should find valid numeric code in nested payload structures."""
-    payload = {"meta": [{"field": "ignore"}, {"otp_code": "654321"}]}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "654321"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-def test_extract_totp_from_navigation_payload_accepts_alias_integer_code():
-    """Should accept integer values for explicit MFA aliases."""
-    payload = {"verification_code": 520265}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "520265"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-def test_extract_totp_from_navigation_payload_rejects_non_alias_key():
-    """Should not treat non-MFA keys as OTP, even with numeric-looking values."""
-    payload = {"promo_code": "520265", "nested": {"coupon": "123456"}}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is None
-
-
-def test_extract_totp_from_navigation_payload_rejects_invalid_alias_value():
-    """Should reject alias values that are not strictly numeric OTP codes."""
-    payload = {"mfaChoice": "AB12CD"}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is None
-
-
-@pytest.mark.parametrize(
-    ("alias_key", "otp_code"),
-    [
-        ("mfa_code", "520265"),
-        ("MFA Code", "520266"),
-        ("mfa-code", "520267"),
-    ],
-)
-def test_extract_totp_from_navigation_payload_normalizes_alias_keys(alias_key: str, otp_code: str):
-    """Alias matching should be robust to separators and casing."""
-    payload = {alias_key: otp_code}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == otp_code
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-@pytest.mark.parametrize(
-    ("otp_code", "should_match"),
-    [
-        ("123", False),
-        ("1234", True),
-        ("1234567890", True),
-        ("12345678901", False),
-    ],
-)
-def test_extract_totp_from_navigation_payload_enforces_digit_length_bounds(otp_code: str, should_match: bool):
-    """Only 4-10 digit OTP values should be accepted for explicit aliases."""
-    payload = {"verification_code": otp_code}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    if should_match:
-        assert otp_value is not None
-        assert otp_value.value == otp_code
-        assert otp_value.get_otp_type() == OTPType.TOTP
-    else:
-        assert otp_value is None
-
-
-def test_extract_totp_from_navigation_payload_rejects_alias_bool_values():
-    """Bool values should not be coerced as OTP integer values."""
-    payload = {"verification_code": True}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is None
-
-
-def test_extract_totp_from_navigation_payload_handles_cyclic_payload():
-    """Self-referential payloads should not recurse forever."""
-    payload: dict = {"mfa_choice": "520265"}
-    payload["self"] = payload
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "520265"
-
-
-def test_extract_totp_from_navigation_payload_handles_very_deep_payloads():
-    """Deep nested payloads should work without recursion depth errors."""
-    payload: dict = {}
-    cursor = payload
-    for _ in range(1500):
-        nested: dict = {}
-        cursor["nested"] = [nested]
-        cursor = nested
-    cursor["otp_code"] = "654321"
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "654321"
-
-
-def test_extract_totp_from_navigation_payload_preserves_recursive_precedence():
-    """Traversal order should continue preferring nested earlier keys before later aliases."""
-    payload = {
-        "first": {"otp_code": "111111"},
-        "otp_code": "222222",
-    }
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "111111"
-
-
-def test_extract_totp_from_navigation_payload_supports_string_payload_with_context():
-    """String payload fallback should extract OTP when context terms are present."""
-    otp_value = extract_totp_from_navigation_payload("Use verification code: 654321")
-
-    assert otp_value is not None
-    assert otp_value.value == "654321"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-def test_extract_totp_from_navigation_payload_rejects_contextless_string_payload_digits():
-    """String payload fallback should stay strict for context-free numeric strings."""
-    otp_value = extract_totp_from_navigation_payload("654321")
-
-    assert otp_value is None
-
-
-def test_extract_totp_from_text_matches_text_before_code():
-    """Context term before a code should be extracted."""
-    otp_value = extract_totp_from_text("Use this verification code: 654321 to continue.")
-
-    assert otp_value is not None
-    assert otp_value.value == "654321"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-def test_extract_totp_from_text_matches_code_before_text():
-    """Code before context term should be extracted."""
-    otp_value = extract_totp_from_text("654321 - authentication code")
-
-    assert otp_value is not None
-    assert otp_value.value == "654321"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-def test_extract_totp_from_text_rejects_code_without_otp_context():
-    """Unrelated numbers should not be treated as OTP values."""
-    otp_value = extract_totp_from_text("Your package 654321 is out for delivery.")
-
-    assert otp_value is None
-
-
-def test_extract_totp_from_text_supports_assumed_context_for_instruction_text():
-    """assume_otp_context should enable instruction-based extraction."""
-    otp_value = extract_totp_from_text("Please enter 739201", assume_otp_context=True)
-
-    assert otp_value is not None
-    assert otp_value.value == "739201"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-@pytest.mark.parametrize("raw_text", [None, "", "   ", 123456, [], {}])
-def test_extract_totp_from_text_rejects_non_string_or_blank_input(raw_text: object):
-    """Invalid/blank values should short-circuit without regex processing."""
-    assert extract_totp_from_text(raw_text) is None
-
-
 def test_extract_totp_from_navigation_inputs_prefers_payload_code_over_goal_text():
     """Payload alias code should be used even if goal text contains another code."""
     otp_value = extract_totp_from_navigation_inputs(
@@ -360,28 +89,24 @@ def test_extract_totp_from_navigation_inputs_prefers_payload_code_over_goal_text
     assert otp_value.get_otp_type() == OTPType.TOTP
 
 
-def test_extract_totp_from_navigation_inputs_falls_back_to_goal_text():
-    """Goal text should produce inline OTP when payload extraction fails."""
+def test_extract_totp_from_navigation_inputs_ignores_navigation_goal_when_payload_missing():
+    """Goal text alone should not produce inline OTP in payload-only mode."""
     otp_value = extract_totp_from_navigation_inputs(
         None,
         "Sign in and use verification code 520265 when prompted.",
     )
 
-    assert otp_value is not None
-    assert otp_value.value == "520265"
-    assert otp_value.get_otp_type() == OTPType.TOTP
+    assert otp_value is None
 
 
-def test_extract_totp_from_navigation_inputs_goal_with_input_action():
-    """Goal text with 'input' action keyword should extract the code."""
+def test_extract_totp_from_navigation_inputs_ignores_goal_input_action_when_payload_missing():
+    """Input-action goal text should be ignored in payload-only mode."""
     otp_value = extract_totp_from_navigation_inputs(
         {},
         "Input 522225",
     )
 
-    assert otp_value is not None
-    assert otp_value.value == "522225"
-    assert otp_value.get_otp_type() == OTPType.TOTP
+    assert otp_value is None
 
 
 def test_extract_totp_from_navigation_inputs_no_code_anywhere():
@@ -523,45 +248,6 @@ async def test_handle_potential_verification_code_uses_navigation_payload_and_sk
     mock_credential_totp.assert_not_called()
     mock_poll.assert_not_called()
     assert mock_context.totp_codes["tsk_payload_code"] == "520265"
-
-
-def test_extract_code_from_navigation_payload_supports_nested_alias_values():
-    """Agent helper should find OTP codes from nested alias keys in payload."""
-    task = MagicMock()
-    task.navigation_payload = {
-        "meta": [{"field": "ignore"}, {"otp_code": "654321"}],
-    }
-    task.navigation_goal = "Use the verification code shown by your provider."
-
-    otp_value = ForgeAgent._extract_code_from_navigation_inputs(task)
-
-    assert otp_value is not None
-    assert otp_value.value == "654321"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-def test_extract_code_from_navigation_payload_supports_normalized_alias_keys():
-    """Agent helper should respect alias normalization rules from OTP service."""
-    task = MagicMock()
-    task.navigation_payload = {"MFA Code": "520266"}
-    task.navigation_goal = "Complete login with the code."
-
-    otp_value = ForgeAgent._extract_code_from_navigation_inputs(task)
-
-    assert otp_value is not None
-    assert otp_value.value == "520266"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-def test_extract_code_from_navigation_payload_rejects_non_alias_numeric_values():
-    """Agent helper should not treat non-MFA payload keys as OTP sources."""
-    task = MagicMock()
-    task.navigation_payload = {"promo_code": "654321"}
-    task.navigation_goal = "Apply your coupon code."
-
-    otp_value = ForgeAgent._extract_code_from_navigation_inputs(task)
-
-    assert otp_value is None
 
 
 @pytest.mark.asyncio
