@@ -130,8 +130,21 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
         return result
     except ValueError:
         # If all else fails, return as-is (custom proxy URL)
+        from urllib.parse import urlparse
+
+        def _sanitize_proxy_url(url: str) -> str:
+            try:
+                p = urlparse(url)
+                if p.username or p.password:
+                    netloc = f"<redacted>@{p.hostname}" + (f":{p.port}" if p.port else "")
+                    return url.replace(p.netloc, netloc)
+            except Exception:
+                pass
+            return url
+
         LOG.warning(
-            "Failed to deserialize proxy_location as enum, assuming it is a custom proxy url string", db_value=value
+            "Failed to deserialize proxy_location as enum, assuming it is a custom proxy url string",
+            db_value=_sanitize_proxy_url(value),
         )
         return value
 

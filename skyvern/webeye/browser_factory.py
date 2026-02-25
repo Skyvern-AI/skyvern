@@ -255,15 +255,18 @@ class BrowserContextFactory:
             args["locale"] = settings.BROWSER_LOCALE
 
         custom_proxy_config = None
-        if proxy_location and isinstance(proxy_location, str) and _is_valid_proxy_url(proxy_location):
-            parsed = urlparse(proxy_location)
-            custom_proxy_config = {
-                "server": f"{parsed.scheme}://{parsed.hostname}" + (f":{parsed.port}" if parsed.port else ""),
-            }
-            if parsed.username:
-                custom_proxy_config["username"] = parsed.username
-            if parsed.password:
-                custom_proxy_config["password"] = parsed.password
+        if proxy_location and isinstance(proxy_location, str):
+            if _is_valid_proxy_url(proxy_location):
+                parsed = urlparse(proxy_location)
+                custom_proxy_config = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}" + (f":{parsed.port}" if parsed.port else ""),
+                }
+                if parsed.username:
+                    custom_proxy_config["username"] = parsed.username
+                if parsed.password:
+                    custom_proxy_config["password"] = parsed.password
+            else:
+                LOG.warning("Invalid custom proxy URL, ignoring", proxy_location=proxy_location)
 
         if custom_proxy_config:
             args["proxy"] = custom_proxy_config
@@ -272,7 +275,7 @@ class BrowserContextFactory:
             if proxy_config:
                 args["proxy"] = proxy_config
 
-        if proxy_location and not custom_proxy_config:
+        if proxy_location and not custom_proxy_config and isinstance(proxy_location, ProxyLocation):
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
                 args["timezone_id"] = tz_info.key
         return args
@@ -313,7 +316,7 @@ class BrowserContextFactory:
             set_download_file_listener(browser_context=browser_context, **kwargs)
 
             proxy_location: ProxyLocation | None = kwargs.get("proxy_location")
-            if proxy_location is not None:
+            if proxy_location is not None and isinstance(proxy_location, ProxyLocation):
                 context = ensure_context()
                 context.tz_info = get_tzinfo_from_proxy(proxy_location)
 
