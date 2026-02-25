@@ -12,9 +12,10 @@ from skyvern.forge.sdk.routes.credentials import send_totp_code
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCodeCreate
 from skyvern.schemas.runs import RunEngine
 from skyvern.services.otp_service import (
+    OTPResultParsedByLLM,
     OTPValue,
     _get_otp_value_by_run,
-    extract_totp_from_navigation_payload,
+    extract_totp_from_navigation_inputs,
     poll_otp_value,
 )
 
@@ -33,6 +34,42 @@ async def test_get_otp_codes_by_run_returns_empty_without_identifiers():
         organization_id="org_1",
     )
     assert result == []
+
+
+# === Fix: OTPResultParsedByLLM empty otp_type coercion ===
+
+
+def test_otp_result_parsed_by_llm_empty_string_coerced_to_none():
+    """OTPResultParsedByLLM should coerce empty otp_type to None instead of raising ValidationError."""
+    result = OTPResultParsedByLLM(
+        reasoning="No OTP found in content",
+        otp_type="",
+        otp_value_found=False,
+        otp_value=None,
+    )
+    assert result.otp_type is None
+
+
+def test_otp_result_parsed_by_llm_whitespace_string_coerced_to_none():
+    """OTPResultParsedByLLM should coerce whitespace-only otp_type to None."""
+    result = OTPResultParsedByLLM(
+        reasoning="No OTP found",
+        otp_type="   ",
+        otp_value_found=False,
+        otp_value=None,
+    )
+    assert result.otp_type is None
+
+
+def test_otp_result_parsed_by_llm_valid_otp_type_unchanged():
+    """OTPResultParsedByLLM should accept valid otp_type values without modification."""
+    result = OTPResultParsedByLLM(
+        reasoning="Found TOTP code",
+        otp_type="totp",
+        otp_value_found=True,
+        otp_value="123456",
+    )
+    assert result.otp_type == OTPType.TOTP
 
 
 # === Task 2: _get_otp_value_by_run OTP service function ===
@@ -77,157 +114,171 @@ async def test_get_otp_value_by_run_returns_none_when_no_codes():
     assert result is None
 
 
-# === Task: extract_totp_from_navigation_payload helper ===
+# === Task: extract_totp_from_navigation_inputs (LLM-based) ===
 
 
-def test_extract_totp_from_navigation_payload_accepts_alias_numeric_code():
-    """Should accept valid numeric code from MFA alias keys."""
-    payload = {"mfaChoice": "520265", "promo_code": "999999"}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "520265"
-    assert otp_value.get_otp_type() == OTPType.TOTP
+@pytest.mark.asyncio
+async def test_extract_totp_returns_none_for_none_payload():
+    """None payload should short-circuit without calling LLM."""
+    result = await extract_totp_from_navigation_inputs(None, "org_1")
+    assert result is None
 
 
-def test_extract_totp_from_navigation_payload_accepts_nested_alias_numeric_code():
-    """Should find valid numeric code in nested payload structures."""
-    payload = {"meta": [{"field": "ignore"}, {"otp_code": "654321"}]}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "654321"
-    assert otp_value.get_otp_type() == OTPType.TOTP
+@pytest.mark.asyncio
+async def test_extract_totp_returns_none_for_empty_string_payload():
+    """Empty string payload should short-circuit without calling LLM."""
+    result = await extract_totp_from_navigation_inputs("", "org_1")
+    assert result is None
 
 
-def test_extract_totp_from_navigation_payload_accepts_alias_integer_code():
-    """Should accept integer values for explicit MFA aliases."""
-    payload = {"verification_code": 520265}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "520265"
-    assert otp_value.get_otp_type() == OTPType.TOTP
+@pytest.mark.asyncio
+async def test_extract_totp_returns_none_without_organization_id():
+    """Missing organization_id should short-circuit without calling LLM."""
+    result = await extract_totp_from_navigation_inputs({"otp": "123456"}, None)
+    assert result is None
 
 
-def test_extract_totp_from_navigation_payload_rejects_non_alias_key():
-    """Should not treat non-MFA keys as OTP, even with numeric-looking values."""
-    payload = {"promo_code": "520265", "nested": {"coupon": "123456"}}
+@pytest.mark.asyncio
+async def test_extract_totp_serializes_dict_to_json_for_llm():
+    """Dict payload should be JSON-serialized and passed to parse_otp_login."""
+    payload = {"mfaChoice": "520265", "other": "data"}
+    expected_otp = OTPValue(value="520265", type=OTPType.TOTP)
 
-    otp_value = extract_totp_from_navigation_payload(payload)
+    with patch(
+        "skyvern.services.otp_service.parse_otp_login",
+        new_callable=AsyncMock,
+        return_value=expected_otp,
+    ) as mock_parse:
+        result = await extract_totp_from_navigation_inputs(payload, "org_1")
 
-    assert otp_value is None
-
-
-def test_extract_totp_from_navigation_payload_rejects_invalid_alias_value():
-    """Should reject alias values that are not strictly numeric OTP codes."""
-    payload = {"mfaChoice": "AB12CD"}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is None
-
-
-@pytest.mark.parametrize(
-    ("alias_key", "otp_code"),
-    [
-        ("mfa_code", "520265"),
-        ("MFA Code", "520266"),
-        ("mfa-code", "520267"),
-    ],
-)
-def test_extract_totp_from_navigation_payload_normalizes_alias_keys(alias_key: str, otp_code: str):
-    """Alias matching should be robust to separators and casing."""
-    payload = {alias_key: otp_code}
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == otp_code
-    assert otp_value.get_otp_type() == OTPType.TOTP
+    assert result == expected_otp
+    mock_parse.assert_called_once()
+    call_args = mock_parse.call_args
+    assert call_args[0][0] == '{"mfaChoice": "520265", "other": "data"}'
+    assert call_args[0][1] == "org_1"
 
 
-@pytest.mark.parametrize(
-    ("otp_code", "should_match"),
-    [
-        ("123", False),
-        ("1234", True),
-        ("1234567890", True),
-        ("12345678901", False),
-    ],
-)
-def test_extract_totp_from_navigation_payload_enforces_digit_length_bounds(otp_code: str, should_match: bool):
-    """Only 4-10 digit OTP values should be accepted for explicit aliases."""
-    payload = {"verification_code": otp_code}
+@pytest.mark.asyncio
+async def test_extract_totp_serializes_list_to_json_for_llm():
+    """List payload should be JSON-serialized and passed to parse_otp_login."""
+    payload = [{"otp": "654321"}]
+    expected_otp = OTPValue(value="654321", type=OTPType.TOTP)
 
-    otp_value = extract_totp_from_navigation_payload(payload)
+    with patch(
+        "skyvern.services.otp_service.parse_otp_login",
+        new_callable=AsyncMock,
+        return_value=expected_otp,
+    ) as mock_parse:
+        result = await extract_totp_from_navigation_inputs(payload, "org_1")
 
-    if should_match:
-        assert otp_value is not None
-        assert otp_value.value == otp_code
-        assert otp_value.get_otp_type() == OTPType.TOTP
-    else:
-        assert otp_value is None
+    assert result == expected_otp
+    mock_parse.assert_called_once()
+    call_args = mock_parse.call_args
+    assert call_args[0][0] == '[{"otp": "654321"}]'
 
 
-def test_extract_totp_from_navigation_payload_rejects_alias_bool_values():
-    """Bool values should not be coerced as OTP integer values."""
-    payload = {"verification_code": True}
+@pytest.mark.asyncio
+async def test_extract_totp_passes_string_payload_directly():
+    """String payload should be passed as-is to parse_otp_login."""
+    payload = "Your verification code is 123456"
+    expected_otp = OTPValue(value="123456", type=OTPType.TOTP)
 
-    otp_value = extract_totp_from_navigation_payload(payload)
+    with patch(
+        "skyvern.services.otp_service.parse_otp_login",
+        new_callable=AsyncMock,
+        return_value=expected_otp,
+    ) as mock_parse:
+        result = await extract_totp_from_navigation_inputs(payload, "org_1")
 
-    assert otp_value is None
-
-
-def test_extract_totp_from_navigation_payload_handles_cyclic_payload():
-    """Self-referential payloads should not recurse forever."""
-    payload: dict = {"mfa_choice": "520265"}
-    payload["self"] = payload
-
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "520265"
+    assert result == expected_otp
+    mock_parse.assert_called_once_with(payload, "org_1")
 
 
-def test_extract_totp_from_navigation_payload_handles_very_deep_payloads():
-    """Deep nested payloads should work without recursion depth errors."""
-    payload: dict = {}
-    cursor = payload
-    for _ in range(1500):
-        nested: dict = {}
-        cursor["nested"] = [nested]
-        cursor = nested
-    cursor["otp_code"] = "654321"
+@pytest.mark.asyncio
+async def test_extract_totp_returns_none_when_llm_finds_nothing():
+    """Should return None when parse_otp_login returns None."""
+    with patch(
+        "skyvern.services.otp_service.parse_otp_login",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        result = await extract_totp_from_navigation_inputs({"data": "no code here"}, "org_1")
 
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "654321"
+    assert result is None
 
 
-def test_extract_totp_from_navigation_payload_preserves_recursive_precedence():
-    """Traversal order should continue preferring nested earlier keys before later aliases."""
-    payload = {
-        "first": {"otp_code": "111111"},
-        "otp_code": "222222",
-    }
+@pytest.mark.asyncio
+async def test_extract_totp_returns_none_on_llm_exception():
+    """Should catch LLM exceptions and return None gracefully."""
+    with patch(
+        "skyvern.services.otp_service.parse_otp_login",
+        new_callable=AsyncMock,
+        side_effect=Exception("LLM unavailable"),
+    ):
+        result = await extract_totp_from_navigation_inputs({"otp": "123456"}, "org_1")
 
-    otp_value = extract_totp_from_navigation_payload(payload)
-
-    assert otp_value is not None
-    assert otp_value.value == "111111"
+    assert result is None
 
 
-def test_payload_extracts_embedded_code_without_keywords():
-    """Payload values should extract any embedded digit sequence — no keyword required."""
-    payload = {"mfaChoice": "code: 520265"}
-    otp_value = extract_totp_from_navigation_payload(payload)
-    assert otp_value is not None
-    assert otp_value.value == "520265"
+# === navigation_goal support ===
+
+
+@pytest.mark.asyncio
+async def test_extract_totp_from_navigation_goal_text():
+    """Should find OTP code embedded in navigation_goal text when payload is empty."""
+    expected_otp = OTPValue(value="522225", type=OTPType.TOTP)
+
+    with patch(
+        "skyvern.services.otp_service.parse_otp_login",
+        new_callable=AsyncMock,
+        return_value=expected_otp,
+    ) as mock_parse:
+        result = await extract_totp_from_navigation_inputs(
+            {}, "org_1", navigation_goal="GOAL: Submit MFA code\n- Input 522225."
+        )
+
+    assert result == expected_otp
+    mock_parse.assert_called_once()
+    content = mock_parse.call_args[0][0]
+    assert "522225" in content
+    assert "GOAL: Submit MFA code" in content
+
+
+@pytest.mark.asyncio
+async def test_extract_totp_goal_only_no_payload():
+    """Should extract OTP from navigation_goal when payload is None."""
+    expected_otp = OTPValue(value="123456", type=OTPType.TOTP)
+
+    with patch(
+        "skyvern.services.otp_service.parse_otp_login",
+        new_callable=AsyncMock,
+        return_value=expected_otp,
+    ) as mock_parse:
+        result = await extract_totp_from_navigation_inputs(None, "org_1", navigation_goal="Enter code 123456")
+
+    assert result == expected_otp
+    mock_parse.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_extract_totp_returns_none_when_both_empty():
+    """Should return None without calling LLM when payload is None and goal is None."""
+    result = await extract_totp_from_navigation_inputs(None, "org_1", navigation_goal=None)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_extract_totp_returns_none_when_payload_empty_dict_and_no_goal():
+    """Should still call LLM for empty dict payload (non-empty JSON string '{}')."""
+    with patch(
+        "skyvern.services.otp_service.parse_otp_login",
+        new_callable=AsyncMock,
+        return_value=None,
+    ) as mock_parse:
+        result = await extract_totp_from_navigation_inputs({}, "org_1", navigation_goal=None)
+
+    assert result is None
+    mock_parse.assert_called_once()
 
 
 # === Task 3: poll_otp_value without identifier ===
@@ -326,7 +377,11 @@ async def test_handle_potential_verification_code_uses_navigation_payload_and_sk
     object.__setattr__(forge_agent_module.app, "_inst", MagicMock(LLM_API_HANDLER=AsyncMock()))
     try:
         with (
-            patch("skyvern.forge.agent.try_generate_totp_from_credential") as mock_credential_totp,
+            patch(
+                "skyvern.forge.agent.extract_totp_from_navigation_inputs",
+                new_callable=AsyncMock,
+                return_value=OTPValue(value="520265", type=OTPType.TOTP),
+            ) as mock_extract,
             patch("skyvern.forge.agent.poll_otp_value", new_callable=AsyncMock) as mock_poll,
             patch("skyvern.forge.agent.skyvern_context") as mock_skyvern_context,
             patch("skyvern.forge.agent.service_utils.is_cua_task", new_callable=AsyncMock, return_value=False),
@@ -356,7 +411,7 @@ async def test_handle_potential_verification_code_uses_navigation_payload_and_sk
     finally:
         object.__setattr__(forge_agent_module.app, "_inst", original_app_inst)
 
-    mock_credential_totp.assert_not_called()
+    mock_extract.assert_called_once_with({"mfaChoice": "520265"}, "org_1", navigation_goal=task.navigation_goal)
     mock_poll.assert_not_called()
     assert mock_context.totp_codes["tsk_payload_code"] == "520265"
 

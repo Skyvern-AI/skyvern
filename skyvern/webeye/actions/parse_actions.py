@@ -15,7 +15,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.services.otp_service import (
-    extract_totp_from_navigation_payload,
+    extract_totp_from_navigation_inputs,
     poll_otp_value,
     try_generate_totp_from_credential,
 )
@@ -918,8 +918,10 @@ async def generate_cua_fallback_actions(
 
     elif skyvern_action_type == "get_verification_code":
         # Prefer explicit payload code when provided at runtime.
-        otp_value = extract_totp_from_navigation_payload(
+        otp_value = await extract_totp_from_navigation_inputs(
             getattr(task, "navigation_payload", None),
+            task.organization_id,
+            navigation_goal=getattr(task, "navigation_goal", None),
         )
         # Fall back to credential TOTP (doesn't need totp_url/totp_identifier).
         if not otp_value:

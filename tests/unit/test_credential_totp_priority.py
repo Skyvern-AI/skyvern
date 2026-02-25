@@ -184,6 +184,7 @@ class TestPollOtpCalledWithoutTotpConfig:
         mock_task.task_id = "task_456"
         mock_task.workflow_run_id = None
         mock_task.navigation_goal = "test goal"
+        mock_task.navigation_payload = None
 
         mock_step = MagicMock()
         mock_step.step_id = "step_789"
@@ -194,6 +195,11 @@ class TestPollOtpCalledWithoutTotpConfig:
         mock_otp_value.value = "123456"
 
         with (
+            patch(
+                "skyvern.webeye.actions.parse_actions.extract_totp_from_navigation_inputs",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
             patch(
                 "skyvern.webeye.actions.parse_actions.try_generate_totp_from_credential",
                 return_value=None,
@@ -247,6 +253,11 @@ class TestPollOtpCalledWithoutTotpConfig:
         # Return None from poll_otp_value so we hit the early return at line 4548
         # (no valid OTP) — this avoids needing to mock the deeper context/LLM calls
         with (
+            patch(
+                "skyvern.forge.agent.extract_totp_from_navigation_inputs",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
             patch(
                 "skyvern.forge.agent.try_generate_totp_from_credential",
                 return_value=None,
@@ -376,6 +387,11 @@ class TestPayloadVerificationCodePriority:
         """When both payload and credential TOTP exist, payload code should win."""
         with (
             patch(
+                "skyvern.forge.agent.extract_totp_from_navigation_inputs",
+                new_callable=AsyncMock,
+                return_value=OTPValue(value="520265", type=OTPType.TOTP),
+            ),
+            patch(
                 "skyvern.forge.agent.try_generate_totp_from_credential",
                 return_value=OTPValue(value="999999", type=OTPType.TOTP),
             ) as mock_credential_totp,
@@ -450,6 +466,11 @@ class TestPayloadVerificationCodePriority:
         mock_step.order = 0
 
         with (
+            patch(
+                "skyvern.webeye.actions.parse_actions.extract_totp_from_navigation_inputs",
+                new_callable=AsyncMock,
+                return_value=OTPValue(value="520265", type=OTPType.TOTP),
+            ),
             patch(
                 "skyvern.webeye.actions.parse_actions.try_generate_totp_from_credential",
                 return_value=OTPValue(value="999999", type=OTPType.TOTP),

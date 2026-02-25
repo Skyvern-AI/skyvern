@@ -105,7 +105,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.otp_service import (
-    extract_totp_from_navigation_payload,
+    extract_totp_from_navigation_inputs,
     poll_otp_value,
     try_generate_totp_from_credential,
 )
@@ -4529,7 +4529,9 @@ class ForgeAgent:
         if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
             LOG.info("Need verification code")
             # Prefer explicit payload code when provided at runtime.
-            otp_value = extract_totp_from_navigation_payload(task.navigation_payload)
+            otp_value = await extract_totp_from_navigation_inputs(
+                task.navigation_payload, task.organization_id, navigation_goal=task.navigation_goal
+            )
             # Fall back to credential TOTP (doesn't need totp_url/totp_identifier).
             if not otp_value:
                 otp_value = try_generate_totp_from_credential(task.workflow_run_id)

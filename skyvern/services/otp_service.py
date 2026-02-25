@@ -1,5 +1,5 @@
 import asyncio
-import re
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -20,25 +20,6 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 LOG = structlog.get_logger()
 
 MFANavigationPayload = dict | list | str | None
-
-_MIN_OTP_DIGITS = 4
-_MAX_OTP_DIGITS = 10
-_MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED = {
-    "verificationcode",
-    "mfachoice",
-    "mfacode",
-    "otp",
-    "otpcode",
-    "twofactorcode",
-    "2facode",
-    "authenticationcode",
-    "authcode",
-}
-_NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
-
-_OTP_DIGITS_PATTERN = rf"\d{{{_MIN_OTP_DIGITS},{_MAX_OTP_DIGITS}}}"
-_OTP_CODE_PATTERN = re.compile(rf"^{_OTP_DIGITS_PATTERN}$")
-_OTP_EMBEDDED_CODE_PATTERN = re.compile(rf"\b(\d{{{_MIN_OTP_DIGITS},{_MAX_OTP_DIGITS}}})\b")
 
 
 @dataclass(slots=True)
@@ -76,75 +57,35 @@ class OTPResultParsedByLLM(BaseModel):
     otp_value: str | None = Field(None, description="The OTP value.")
 
 
-def _iter_mfa_payload_values(payload: MFANavigationPayload) -> list[str]:
-    """Collect candidate MFA values while preserving recursive traversal order.
+async def extract_totp_from_navigation_inputs(
+    payload: MFANavigationPayload,
+    organization_id: str | None,
+    navigation_goal: str | None = None,
+) -> OTPValue | None:
+    """Extract a TOTP code from navigation payload and/or goal text using LLM parsing."""
+    if not organization_id:
+        return None
 
-    Traversal is cycle-safe to avoid recursive blowups for malformed payload objects.
-    """
-    if not isinstance(payload, (dict, list)):
-        return []
+    parts: list[str] = []
 
-    values: list[str] = []
-    traversal_stack: list[dict | list | str] = [payload]
-    visited_container_ids: set[int] = set()
+    if navigation_goal and navigation_goal.strip():
+        parts.append(navigation_goal.strip())
 
-    while traversal_stack:
-        current_item = traversal_stack.pop()
-        if isinstance(current_item, str):
-            values.append(current_item)
-            continue
+    if payload is not None:
+        payload_str = payload if isinstance(payload, str) else json.dumps(payload)
+        if payload_str.strip():
+            parts.append(payload_str.strip())
 
-        current_id = id(current_item)
-        if current_id in visited_container_ids:
-            continue
-        visited_container_ids.add(current_id)
+    if not parts:
+        return None
 
-        if isinstance(current_item, dict):
-            for key, value in reversed(list(current_item.items())):
-                if isinstance(value, (dict, list)):
-                    traversal_stack.append(value)
-                if _normalize_payload_key(key) in _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED:
-                    candidate_value = _coerce_candidate_code_source(value)
-                    if candidate_value is not None:
-                        traversal_stack.append(candidate_value)
-        else:
-            for item in reversed(current_item):
-                if isinstance(item, (dict, list)):
-                    traversal_stack.append(item)
+    content = "\n\n".join(parts)
 
-    return values
-
-
-def _normalize_payload_key(key: object) -> str:
-    """Normalize payload keys for alias matching across separators and casing."""
-    return _NON_ALNUM_PATTERN.sub("", str(key).lower())
-
-
-def _coerce_candidate_code_source(value: object) -> str | None:
-    """Coerce alias values to strings while intentionally rejecting bools."""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, int) and not isinstance(value, bool):
-        return str(value)
-    return None
-
-
-def extract_totp_from_navigation_payload(payload: MFANavigationPayload) -> OTPValue | None:
-    """Extract a TOTP code from navigation payload using explicit MFA aliases."""
-    for value in _iter_mfa_payload_values(payload):
-        stripped_value = value.strip()
-        if _OTP_CODE_PATTERN.fullmatch(stripped_value):
-            return OTPValue(value=stripped_value, type=OTPType.TOTP)
-        match = _OTP_EMBEDDED_CODE_PATTERN.search(stripped_value)
-        if match:
-            return OTPValue(value=match.group(1), type=OTPType.TOTP)
-
-    if isinstance(payload, str):
-        match = _OTP_EMBEDDED_CODE_PATTERN.search(payload.strip())
-        if match:
-            return OTPValue(value=match.group(1), type=OTPType.TOTP)
-
-    return None
+    try:
+        return await parse_otp_login(content, organization_id)
+    except Exception:
+        LOG.warning("Failed to extract OTP from navigation inputs via LLM", exc_info=True)
+        return None
 
 
 async def parse_otp_login(
