@@ -22,7 +22,7 @@ from skyvern.utils.env_paths import resolve_backend_env_path
 # migrated to use _upsert_mcp_config() in a follow-up.
 setup_app = typer.Typer(help="Register Skyvern MCP with AI coding tools.")
 
-_DEFAULT_REMOTE_URL = "https://api.skyvern.com/mcp"
+_DEFAULT_REMOTE_URL = "https://api.skyvern.com/mcp/"
 
 
 # ---------------------------------------------------------------------------
@@ -42,9 +42,9 @@ def _get_env_credentials() -> tuple[str, str]:
 
 
 def _build_remote_mcp_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL) -> dict:
-    """Build a streamable-http MCP entry for remote/cloud hosting."""
+    """Build an HTTP MCP entry for remote/cloud hosting."""
     entry: dict = {
-        "type": "streamable-http",
+        "type": "http",
         "url": url,
     }
     if api_key:
@@ -92,7 +92,7 @@ def _upsert_mcp_config(
     config_path: Path,
     tool_name: str,
     skyvern_entry: dict,
-    server_key: str = "Skyvern",
+    server_key: str = "skyvern",
     dry_run: bool = False,
     yes: bool = False,
 ) -> None:
@@ -207,7 +207,7 @@ _local_opt = typer.Option(False, "--local", help="Use local stdio transport inst
 _python_path_opt = typer.Option(
     False, "--use-python-path", help="(local only) Use python -m skyvern instead of skyvern entrypoint"
 )
-_url_opt = typer.Option(None, "--url", help="Remote MCP endpoint URL (default: https://api.skyvern.com/mcp)")
+_url_opt = typer.Option(None, "--url", help="Remote MCP endpoint URL (default: https://api.skyvern.com/mcp/)")
 
 
 # ---------------------------------------------------------------------------

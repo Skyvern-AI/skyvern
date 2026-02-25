@@ -11,7 +11,12 @@ import pyotp
 import pytest
 
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.services.otp_service import OTPValue, try_generate_totp_from_credential
+from skyvern.services.otp_service import (
+    OTPValue,
+    _get_otp_value_from_url,
+    poll_otp_value,
+    try_generate_totp_from_credential,
+)
 
 # A valid base32 TOTP secret for testing
 TEST_TOTP_SECRET = "JBSWY3DPEHPK3PXP"
@@ -298,3 +303,93 @@ class TestPollOtpCalledWithoutTotpConfig:
 
             # When poll_otp_value returns None, the method returns json_response unchanged
             assert result == json_response
+
+
+class TestWorkflowPermanentIdPassedToWebhook:
+    """Tests that workflow_permanent_id is included in the TOTP webhook POST body."""
+
+    @pytest.mark.asyncio
+    async def test_get_otp_value_from_url_includes_workflow_permanent_id(self) -> None:
+        """_get_otp_value_from_url should include workflow_permanent_id in the request payload."""
+        with (
+            patch("skyvern.services.otp_service.generate_skyvern_webhook_signature") as mock_sign,
+            patch("skyvern.services.otp_service.aiohttp_post", new_callable=AsyncMock) as mock_post,
+        ):
+            mock_sign.return_value = MagicMock(signed_payload="signed", headers={"x-sig": "abc"})
+            mock_post.return_value = {"verification_code": "123456"}
+
+            result = await _get_otp_value_from_url(
+                organization_id="org_1",
+                url="https://example.com/totp",
+                api_key="key_1",
+                task_id="tsk_1",
+                workflow_run_id="wr_1",
+                workflow_permanent_id="wpid_1",
+            )
+
+            # Verify the payload includes workflow_permanent_id
+            mock_sign.assert_called_once()
+            payload = mock_sign.call_args.kwargs["payload"]
+            assert payload == {
+                "task_id": "tsk_1",
+                "workflow_run_id": "wr_1",
+                "workflow_permanent_id": "wpid_1",
+            }
+            assert result is not None
+            assert result.value == "123456"
+
+    @pytest.mark.asyncio
+    async def test_get_otp_value_from_url_omits_workflow_permanent_id_when_none(self) -> None:
+        """When workflow_permanent_id is None, it should not appear in the payload."""
+        with (
+            patch("skyvern.services.otp_service.generate_skyvern_webhook_signature") as mock_sign,
+            patch("skyvern.services.otp_service.aiohttp_post", new_callable=AsyncMock) as mock_post,
+        ):
+            mock_sign.return_value = MagicMock(signed_payload="signed", headers={"x-sig": "abc"})
+            mock_post.return_value = {"verification_code": "123456"}
+
+            await _get_otp_value_from_url(
+                organization_id="org_1",
+                url="https://example.com/totp",
+                api_key="key_1",
+                task_id="tsk_1",
+                workflow_run_id="wr_1",
+            )
+
+            payload = mock_sign.call_args.kwargs["payload"]
+            assert "workflow_permanent_id" not in payload
+
+    @pytest.mark.asyncio
+    async def test_poll_otp_passes_workflow_permanent_id_to_url_handler(self) -> None:
+        """poll_otp_value should forward workflow_permanent_id to _get_otp_value_from_url."""
+        with (
+            patch("skyvern.services.otp_service.app") as mock_app,
+            patch("skyvern.services.otp_service._set_waiting_state", new_callable=AsyncMock),
+            patch("skyvern.services.otp_service._clear_waiting_state", new_callable=AsyncMock),
+            patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock) as mock_url_handler,
+            patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_org_token = MagicMock()
+            mock_org_token.token = "api_key_123"
+            mock_app.DATABASE.get_valid_org_auth_token = AsyncMock(return_value=mock_org_token)
+
+            mock_url_handler.return_value = OTPValue(value="123456", type=OTPType.TOTP)
+
+            result = await poll_otp_value(
+                organization_id="org_1",
+                task_id="tsk_1",
+                workflow_run_id="wr_1",
+                workflow_permanent_id="wpid_1",
+                totp_verification_url="https://example.com/totp",
+            )
+
+            mock_url_handler.assert_called_once_with(
+                "org_1",
+                "https://example.com/totp",
+                "api_key_123",
+                task_id="tsk_1",
+                workflow_run_id="wr_1",
+                workflow_permanent_id="wpid_1",
+            )
+            assert result is not None
+            assert result.value == "123456"

@@ -406,6 +406,26 @@ function FlowRenderer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targettedBlockLabel]);
 
+  // Re-layout when a loop node's header height changes (e.g., data schema toggled)
+  useEffect(() => {
+    const handleLoopHeaderResized = () => {
+      // Delay to let React process the updateNodeData state change
+      setTimeout(() => {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const currentEdges = reactFlowInstance.getEdges();
+        debouncedLayoutForDimensions(currentNodes, currentEdges);
+      }, 10);
+    };
+
+    window.addEventListener("loop-header-resized", handleLoopHeaderResized);
+    return () => {
+      window.removeEventListener(
+        "loop-header-resized",
+        handleLoopHeaderResized,
+      );
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+
   useEffect(() => {
     const topLevelBlocks = getWorkflowBlocks(nodes, edges);
     const debuggable = topLevelBlocks.filter((block) =>

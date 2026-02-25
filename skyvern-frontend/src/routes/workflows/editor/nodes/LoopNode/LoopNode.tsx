@@ -1,10 +1,19 @@
+import { useEffect, useRef } from "react";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
+import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import type { Node } from "@xyflow/react";
-import { Handle, NodeProps, Position, useNodes } from "@xyflow/react";
+import {
+  Handle,
+  NodeProps,
+  Position,
+  useNodes,
+  useReactFlow,
+} from "@xyflow/react";
 import { AppNode } from "..";
 import { helpTooltips } from "../../helpContent";
+import { dataSchemaExampleValue } from "../types";
 import type { LoopNode } from "./types";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -36,6 +45,28 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const children = nodes.filter((node) => node.parentId === id);
   const recordingStore = useRecordingStore();
+  const headerRef = useRef<HTMLDivElement>(null);
+  const { updateNodeData } = useReactFlow();
+  const lastHeaderHeight = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+
+    const observer = new ResizeObserver(() => {
+      // Use offsetHeight to include padding (py-4 = 32px) in the measurement
+      const height = Math.round(el.offsetHeight);
+      if (lastHeaderHeight.current !== height) {
+        lastHeaderHeight.current = height;
+        updateNodeData(id, { _headerHeight: height });
+        // Trigger re-layout after React processes the data update
+        window.dispatchEvent(new Event("loop-header-resized"));
+      }
+    });
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [id, updateNodeData]);
 
   const furthestDownChild: Node | null = children.reduce(
     (acc, child) => {
@@ -84,6 +115,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
       >
         <div className="flex w-full justify-center">
           <div
+            ref={headerRef}
             className={cn(
               "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
               {
@@ -122,6 +154,17 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 }}
               />
             </div>
+            <WorkflowDataSchemaInputGroup
+              value={data.dataSchema}
+              onChange={(value) => {
+                update({ dataSchema: value });
+              }}
+              suggestionContext={{
+                loop_variable_reference: data.loopVariableReference,
+              }}
+              exampleValue={dataSchemaExampleValue}
+              helpTooltip="Specify a format for extracted data in JSON. Only applies when the loop value is natural language — ignored for parameter references."
+            />
             <div className="space-y-2">
               <div className="space-y-2">
                 <div className="flex justify-between">
