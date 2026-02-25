@@ -504,7 +504,7 @@ function WorkflowRunTimelineBlockItem({
               return (
                 <Collapsible
                   key={`${group.index ?? "unknown"}-${groupIndex}`}
-                  defaultOpen={false}
+                  defaultOpen={groupIndex === 0}
                 >
                   <div className="rounded border border-slate-700 bg-slate-elevation4">
                     <CollapsibleTrigger asChild>
