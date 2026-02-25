@@ -15,7 +15,6 @@ from skyvern.services.otp_service import (
     OTPValue,
     _get_otp_value_by_run,
     extract_totp_from_navigation_payload,
-    extract_totp_from_text,
     poll_otp_value,
 )
 
@@ -223,38 +222,12 @@ def test_extract_totp_from_navigation_payload_preserves_recursive_precedence():
     assert otp_value.value == "111111"
 
 
-def test_extract_totp_from_text_matches_text_before_code():
-    """Context term before a code should be extracted."""
-    otp_value = extract_totp_from_text("Use this verification code: 654321 to continue.")
-
+def test_payload_extracts_embedded_code_without_keywords():
+    """Payload values should extract any embedded digit sequence — no keyword required."""
+    payload = {"mfaChoice": "code: 520265"}
+    otp_value = extract_totp_from_navigation_payload(payload)
     assert otp_value is not None
-    assert otp_value.value == "654321"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-def test_extract_totp_from_text_matches_code_before_text():
-    """Code before context term should be extracted."""
-    otp_value = extract_totp_from_text("654321 - authentication code")
-
-    assert otp_value is not None
-    assert otp_value.value == "654321"
-    assert otp_value.get_otp_type() == OTPType.TOTP
-
-
-def test_extract_totp_from_text_rejects_code_without_otp_context():
-    """Unrelated numbers should not be treated as OTP values."""
-    otp_value = extract_totp_from_text("Your package 654321 is out for delivery.")
-
-    assert otp_value is None
-
-
-def test_extract_totp_from_text_supports_assumed_context_for_instruction_text():
-    """assume_otp_context should enable instruction-based extraction."""
-    otp_value = extract_totp_from_text("Please enter 739201", assume_otp_context=True)
-
-    assert otp_value is not None
-    assert otp_value.value == "739201"
-    assert otp_value.get_otp_type() == OTPType.TOTP
+    assert otp_value.value == "520265"
 
 
 # === Task 3: poll_otp_value without identifier ===

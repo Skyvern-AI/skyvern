@@ -23,21 +23,6 @@ MFANavigationPayload = dict | list | str | None
 
 _MIN_OTP_DIGITS = 4
 _MAX_OTP_DIGITS = 10
-_OTP_CONTEXT_TERMS = (
-    "verification code",
-    "authentication code",
-    "security code",
-    "otp",
-    "mfa",
-    "2fa",
-    "two-factor",
-    "two factor",
-    "one-time password",
-    "one time password",
-    "one-time code",
-    "one time code",
-)
-_OTP_INPUT_ACTION_TERMS = ("input", "enter", "type", "fill", "use", "submit")
 _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED = {
     "verificationcode",
     "mfachoice",
@@ -51,32 +36,9 @@ _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED = {
 }
 _NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
 
-
-def _build_regex_alternation(terms: tuple[str, ...]) -> str:
-    """Build a safe regex alternation fragment from plain text terms."""
-    return "|".join(re.escape(term) for term in terms)
-
-
-_OTP_TERM_ALTERNATION = _build_regex_alternation(_OTP_CONTEXT_TERMS)
-_OTP_ACTION_TERM_ALTERNATION = _build_regex_alternation(_OTP_INPUT_ACTION_TERMS)
 _OTP_DIGITS_PATTERN = rf"\d{{{_MIN_OTP_DIGITS},{_MAX_OTP_DIGITS}}}"
 _OTP_CODE_PATTERN = re.compile(rf"^{_OTP_DIGITS_PATTERN}$")
-_OTP_TEXT_BEFORE_CODE_PATTERN = re.compile(
-    rf"\b(?:{_OTP_TERM_ALTERNATION})\b[^\d]{{0,40}}({_OTP_DIGITS_PATTERN})\b",
-    re.IGNORECASE,
-)
-_OTP_CODE_BEFORE_TEXT_PATTERN = re.compile(
-    rf"\b({_OTP_DIGITS_PATTERN})\b[^\w]{{0,20}}(?:{_OTP_TERM_ALTERNATION})\b",
-    re.IGNORECASE,
-)
-_OTP_CONTEXT_PATTERN = re.compile(
-    rf"\b(?:{_OTP_TERM_ALTERNATION})\b",
-    re.IGNORECASE,
-)
-_OTP_INPUT_ACTION_CODE_PATTERN = re.compile(
-    rf"\b(?:{_OTP_ACTION_TERM_ALTERNATION})\b[^\d]{{0,30}}({_OTP_DIGITS_PATTERN})\b",
-    re.IGNORECASE,
-)
+_OTP_EMBEDDED_CODE_PATTERN = re.compile(rf"\b(\d{{{_MIN_OTP_DIGITS},{_MAX_OTP_DIGITS}}})\b")
 
 
 @dataclass(slots=True)
@@ -167,65 +129,22 @@ def _coerce_candidate_code_source(value: object) -> str | None:
     return None
 
 
-def extract_totp_from_text(text: object, *, assume_otp_context: bool = False) -> OTPValue | None:
-    """Extract a numeric OTP from free-form text with optional OTP-context override."""
-    if not isinstance(text, str) or not text:
-        return None
-
-    stripped_text = text.strip()
-    if not stripped_text:
-        return None
-
-    for pattern in (_OTP_TEXT_BEFORE_CODE_PATTERN, _OTP_CODE_BEFORE_TEXT_PATTERN):
-        match = pattern.search(stripped_text)
-        if match:
-            return OTPValue(value=match.group(1), type=OTPType.TOTP)
-
-    context_found = assume_otp_context or bool(_OTP_CONTEXT_PATTERN.search(stripped_text))
-    if not context_found:
-        return None
-
-    input_action_match = _OTP_INPUT_ACTION_CODE_PATTERN.search(stripped_text)
-    if input_action_match:
-        return OTPValue(value=input_action_match.group(1), type=OTPType.TOTP)
-
-    return None
-
-
 def extract_totp_from_navigation_payload(payload: MFANavigationPayload) -> OTPValue | None:
-    """Extract a TOTP code from navigation payload using explicit MFA aliases.
-
-    The extractor is intentionally strict:
-    - only exact alias keys are considered
-    - values must be numeric and between 4 and 10 digits
-    """
+    """Extract a TOTP code from navigation payload using explicit MFA aliases."""
     for value in _iter_mfa_payload_values(payload):
         stripped_value = value.strip()
         if _OTP_CODE_PATTERN.fullmatch(stripped_value):
             return OTPValue(value=stripped_value, type=OTPType.TOTP)
-        otp_from_text = extract_totp_from_text(stripped_value, assume_otp_context=True)
-        if otp_from_text:
-            return otp_from_text
+        match = _OTP_EMBEDDED_CODE_PATTERN.search(stripped_value)
+        if match:
+            return OTPValue(value=match.group(1), type=OTPType.TOTP)
 
     if isinstance(payload, str):
-        return extract_totp_from_text(payload, assume_otp_context=True)
+        match = _OTP_EMBEDDED_CODE_PATTERN.search(payload.strip())
+        if match:
+            return OTPValue(value=match.group(1), type=OTPType.TOTP)
 
     return None
-
-
-def extract_totp_from_navigation_inputs(
-    navigation_payload: MFANavigationPayload, navigation_goal: object
-) -> OTPValue | None:
-    """Extract TOTP from runtime navigation inputs with explicit precedence.
-
-    Priority:
-    1. `navigation_payload` explicit MFA aliases
-    2. `navigation_goal` textual instructions (e.g. "Input 520265")
-    """
-    otp_value = extract_totp_from_navigation_payload(navigation_payload)
-    if otp_value:
-        return otp_value
-    return extract_totp_from_text(navigation_goal)
 
 
 async def parse_otp_login(
