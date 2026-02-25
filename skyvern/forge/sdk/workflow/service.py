@@ -747,7 +747,7 @@ class WorkflowService:
     async def execute_workflow(
         self,
         workflow_run_id: str,
-        api_key: str,
+        api_key: str | None,
         organization: Organization,
         block_labels: list[str] | None = None,
         block_outputs: dict[str, Any] | None = None,
