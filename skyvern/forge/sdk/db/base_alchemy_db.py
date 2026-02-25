@@ -8,7 +8,47 @@ import structlog
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from skyvern.exceptions import SkyvernException
+from skyvern.forge.sdk.db.exceptions import NotFoundError
+
 LOG = structlog.get_logger()
+
+# Application exceptions that should pass through @db_operation without logging.
+# These represent expected control flow, not infrastructure failures.
+_PASSTHROUGH_EXCEPTIONS: tuple[type[Exception], ...] = (
+    NotFoundError,
+    SkyvernException,
+    ValueError,
+)
+
+
+def db_operation(name: str) -> Callable:
+    """Decorator for consistent database operation error handling.
+
+    Wraps async database methods with standardized error handling:
+    - Application exceptions (NotFoundError, SkyvernException, ValueError)
+      pass through without logging.
+    - SQLAlchemyError is logged and re-raised.
+    - Unexpected exceptions are logged and re-raised.
+    """
+
+    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await fn(*args, **kwargs)
+            except _PASSTHROUGH_EXCEPTIONS:
+                raise
+            except SQLAlchemyError:
+                LOG.exception("SQLAlchemyError", operation=name)
+                raise
+            except Exception:
+                LOG.exception("UnexpectedError", operation=name)
+                raise
+
+        return wrapper
+
+    return decorator
 
 
 def read_retry(retries: int = 3) -> Callable:
