@@ -107,6 +107,7 @@ from skyvern.services.action_service import get_action_history
 from skyvern.services.otp_service import (
     OTPValue,
     clear_stale_2fa_waiting_state,
+    extract_totp_from_navigation_inputs,
     poll_otp_value,
     try_generate_totp_from_credential,
 )
@@ -3163,19 +3164,11 @@ class ForgeAgent:
 
     @staticmethod
     def _extract_code_from_navigation_payload(task: Task) -> OTPValue | None:
-        """Extract a pre-provided verification code from task.navigation_payload.
-
-        Checks for known keys like verification_code, mfaChoice, mfa_code, totp_code.
-        Returns OTPValue if found, None otherwise.
-        """
-        payload = task.navigation_payload
-        if not isinstance(payload, dict):
-            return None
-        for key in ("verification_code", "mfaChoice", "mfa_code", "totp_code"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return OTPValue(value=value.strip(), type=OTPType.TOTP)
-        return None
+        """Extract a verification code from navigation payload using OTP service rules."""
+        return extract_totp_from_navigation_inputs(
+            task.navigation_payload,
+            task.navigation_goal,
+        )
 
     def _build_navigation_payload(
         self,
@@ -4480,6 +4473,11 @@ class ForgeAgent:
             # waiting state up front. This avoids a stuck 2FA banner even when we
             # later short-circuit or bypass polling.
             payload_otp = self._extract_code_from_navigation_payload(task)
+            LOG.info(
+                "Navigation payload OTP pre-extraction",
+                task_id=task.task_id,
+                found_payload_otp=bool(payload_otp),
+            )
             if payload_otp and task.workflow_run_id:
                 await clear_stale_2fa_waiting_state(
                     organization_id=task.organization_id,
@@ -4564,10 +4562,19 @@ class ForgeAgent:
             LOG.info("Need verification code")
 
             otp_value = pre_extracted_otp
+            source = "pre_extracted_payload" if otp_value else None
+
+            if not otp_value:
+                otp_value = self._extract_code_from_navigation_payload(task)
+                if otp_value:
+                    source = "navigation_payload"
 
             if not otp_value:
                 # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
                 otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+                if otp_value:
+                    source = "credential_totp"
+
                 # Fall back to webhook/totp_identifier
                 if not otp_value:
                     workflow_id = workflow_permanent_id = None
@@ -4595,6 +4602,14 @@ class ForgeAgent:
                         totp_verification_url=totp_verification_url,
                         totp_identifier=totp_identifier,
                     )
+                    if otp_value:
+                        source = "poll"
+
+            LOG.info(
+                "Verification code source selected",
+                task_id=task.task_id,
+                source=source or "unavailable",
+            )
             if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
                 return json_response
 

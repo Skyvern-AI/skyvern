@@ -484,7 +484,7 @@ async def test_handle_potential_verification_code_uses_navigation_payload_and_sk
             mock_context = MagicMock()
             mock_context.totp_codes = {}
             mock_skyvern_context.ensure_context.return_value = mock_context
-            mock_skyvern_context.current.return_value = None
+            mock_skyvern_context.current.return_value = mock_context
 
             await agent.handle_potential_verification_code(
                 task=task,
@@ -499,6 +499,45 @@ async def test_handle_potential_verification_code_uses_navigation_payload_and_sk
     mock_credential_totp.assert_not_called()
     mock_poll.assert_not_called()
     assert mock_context.totp_codes["tsk_payload_code"] == "520265"
+
+
+def test_extract_code_from_navigation_payload_supports_nested_alias_values():
+    """Agent helper should find OTP codes from nested alias keys in payload."""
+    task = MagicMock()
+    task.navigation_payload = {
+        "meta": [{"field": "ignore"}, {"otp_code": "654321"}],
+    }
+    task.navigation_goal = "Use the verification code shown by your provider."
+
+    otp_value = ForgeAgent._extract_code_from_navigation_payload(task)
+
+    assert otp_value is not None
+    assert otp_value.value == "654321"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_code_from_navigation_payload_supports_normalized_alias_keys():
+    """Agent helper should respect alias normalization rules from OTP service."""
+    task = MagicMock()
+    task.navigation_payload = {"MFA Code": "520266"}
+    task.navigation_goal = "Complete login with the code."
+
+    otp_value = ForgeAgent._extract_code_from_navigation_payload(task)
+
+    assert otp_value is not None
+    assert otp_value.value == "520266"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_code_from_navigation_payload_rejects_non_alias_numeric_values():
+    """Agent helper should not treat non-MFA payload keys as OTP sources."""
+    task = MagicMock()
+    task.navigation_payload = {"promo_code": "654321"}
+    task.navigation_goal = "Apply your coupon code."
+
+    otp_value = ForgeAgent._extract_code_from_navigation_payload(task)
+
+    assert otp_value is None
 
 
 @pytest.mark.asyncio
