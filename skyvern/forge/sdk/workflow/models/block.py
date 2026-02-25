@@ -123,6 +123,9 @@ CURRENT_DATE_FORMAT = "%Y-%m-%d"
 # Sentinel marker for native JSON type injection via | json filter.
 _JSON_TYPE_MARKER = "__SKYVERN_RAW_JSON__"
 
+# Strong references to fire-and-forget asyncio tasks so they are not GC'd mid-execution.
+_background_tasks: set[asyncio.Task[Any]] = set()
+
 
 def _json_type_filter(value: Any) -> str:
     """Jinja filter that marks a value for native JSON type injection.
@@ -320,7 +323,11 @@ class Block(BaseModel, abc.ABC):
             return potential_template
 
         # Security: only allow real secret values for non-LLM blocks (HttpRequestBlock, CodeBlock)
-        is_safe_block_for_secrets = self.block_type in [BlockType.CODE, BlockType.HTTP_REQUEST]
+        is_safe_block_for_secrets = self.block_type in [
+            BlockType.CODE,
+            BlockType.HTTP_REQUEST,
+            BlockType.WORKFLOW_TRIGGER,
+        ]
 
         template = jinja_sandbox_env.from_string(potential_template)
 
@@ -5996,6 +6003,337 @@ class ConditionalBlock(Block):
         return next((branch for branch in self.branch_conditions if branch.is_default), None)
 
 
+class WorkflowTriggerBlock(Block):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.WORKFLOW_TRIGGER] = BlockType.WORKFLOW_TRIGGER  # type: ignore
+
+    # The permanent ID of the target workflow to trigger
+    workflow_permanent_id: str
+    # Parameters/payload to pass to the triggered workflow
+    payload: dict[str, Any] | None = None
+    # Whether to wait for the triggered workflow to complete
+    wait_for_completion: bool = True
+    # Optional browser session ID for the triggered workflow
+    browser_session_id: str | None = None
+    # When True, the child workflow inherits the parent's browser session
+    use_parent_browser_session: bool = False
+    # Parameters for Jinja2 template interpolation
+    parameters: list[PARAMETER_TYPE] = []
+
+    MAX_TRIGGER_DEPTH: ClassVar[int] = 10
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        return self.parameters
+
+    async def _check_trigger_depth(self, workflow_run_id: str) -> int:
+        """Check the nesting depth of workflow triggers to prevent infinite recursion.
+
+        Note: This depth guard walks the parent_workflow_run_id chain, which is only
+        populated for synchronous triggers. For async (fire-and-forget) dispatch, the
+        parent may have already completed before the child runs, so circular async
+        chains (A->B->A) are only blocked while A is still running. A full
+        visited-workflow guard would require persistent state and is left as a future
+        enhancement.
+        """
+        depth = 0
+        current_run_id: str | None = workflow_run_id
+        while current_run_id:
+            if depth >= self.MAX_TRIGGER_DEPTH:
+                raise InvalidWorkflowDefinition(
+                    f"Workflow trigger depth exceeds maximum of {self.MAX_TRIGGER_DEPTH}. "
+                    "This may indicate a circular workflow trigger chain."
+                )
+            run = await app.DATABASE.get_workflow_run(current_run_id)
+            if not run or not run.parent_workflow_run_id:
+                break
+            current_run_id = run.parent_workflow_run_id
+            depth += 1
+        return depth
+
+    def _render_template_value(
+        self,
+        value: str,
+        workflow_run_context: WorkflowRunContext,
+    ) -> Any:
+        """Render a single Jinja2 template string, handling the | json filter marker."""
+        rendered = self.format_block_parameter_template_from_workflow_run_context(
+            value, workflow_run_context, force_include_secrets=True
+        )
+        if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
+            json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                raise FailedToFormatJinjaStyleParameter(value, f"Raw JSON filter produced invalid JSON: {json_str}")
+        elif _JSON_TYPE_MARKER in rendered:
+            raise FailedToFormatJinjaStyleParameter(
+                value,
+                "The '| json' filter can only be used for complete value replacement. "
+                "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
+                "Remove the surrounding text or remove the '| json' filter.",
+            )
+        return rendered
+
+    def _render_templates_in_payload(
+        self,
+        payload: dict[str, Any],
+        workflow_run_context: WorkflowRunContext,
+    ) -> dict[str, Any]:
+        """Recursively render Jinja2 templates in payload values."""
+        resolved: dict[str, Any] = {}
+        for key, value in payload.items():
+            if isinstance(value, str):
+                resolved[key] = self._render_template_value(value, workflow_run_context)
+            elif isinstance(value, dict):
+                resolved[key] = self._render_templates_in_payload(value, workflow_run_context)
+            elif isinstance(value, list):
+                resolved[key] = self._render_templates_in_list(value, workflow_run_context)
+            else:
+                resolved[key] = value
+        return resolved
+
+    def _render_templates_in_list(
+        self,
+        items: list[Any],
+        workflow_run_context: WorkflowRunContext,
+    ) -> list[Any]:
+        """Recursively render Jinja2 templates in list items (strings, nested dicts, and nested lists)."""
+        result: list[Any] = []
+        for item in items:
+            if isinstance(item, str):
+                result.append(self._render_template_value(item, workflow_run_context))
+            elif isinstance(item, dict):
+                result.append(self._render_templates_in_payload(item, workflow_run_context))
+            elif isinstance(item, list):
+                result.append(self._render_templates_in_list(item, workflow_run_context))
+            else:
+                result.append(item)
+        return result
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        self.workflow_permanent_id = self.format_block_parameter_template_from_workflow_run_context(
+            self.workflow_permanent_id, workflow_run_context, force_include_secrets=True
+        )
+        if self.payload:
+            self.payload = self._render_templates_in_payload(self.payload, workflow_run_context)
+        if self.browser_session_id:
+            self.browser_session_id = self.format_block_parameter_template_from_workflow_run_context(
+                self.browser_session_id, workflow_run_context, force_include_secrets=True
+            )
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus  # noqa: PLC0415
+
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        # Helper to record output and build a failed block result in one step.
+        # This ensures downstream blocks referencing block_X_output see the
+        # failure reason instead of "parameter not found".
+        async def _fail(failure_reason: str) -> BlockResult:
+            error_output = {"failure_reason": failure_reason}
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_output)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=failure_reason,
+                output_parameter_value=error_output,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        # 1. Resolve Jinja2 templates
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await _fail(f"Failed to resolve templates: {str(e)}")
+
+        resolved_workflow_permanent_id = self.workflow_permanent_id
+        resolved_payload = self.payload
+        # Browser session priority:
+        # 1. Explicit browser_session_id configured on the block
+        # 2. use_parent_browser_session → inherit parent's session
+        # 3. Neither → None, child creates its own session
+        if self.browser_session_id:
+            resolved_browser_session_id = self.browser_session_id
+        elif self.use_parent_browser_session and browser_session_id:
+            resolved_browser_session_id = browser_session_id
+        else:
+            resolved_browser_session_id = None
+
+        # 2. Check recursion depth
+        try:
+            await self._check_trigger_depth(workflow_run_id)
+        except InvalidWorkflowDefinition as e:
+            return await _fail(str(e))
+
+        # 3. Get the organization
+        if not organization_id:
+            return await _fail("organization_id is required for WorkflowTriggerBlock")
+        organization = await app.DATABASE.get_organization(organization_id)
+        if not organization:
+            return await _fail(f"Organization {organization_id} not found")
+
+        # 4. Create WorkflowRequestBody
+        workflow_request = WorkflowRequestBody(
+            data=resolved_payload,
+            browser_session_id=resolved_browser_session_id,
+        )
+
+        # 5. Setup the workflow run (creates WR with unique ID + parameters)
+        # Save the parent's skyvern_context because setup_workflow_run and
+        # execute_workflow overwrite it with the child's values. We restore
+        # it after the child finishes so subsequent parent blocks get correct
+        # context (logs, observability, workflow_run_id, etc.).
+        from skyvern.forge.sdk.core import skyvern_context  # noqa: PLC0415
+
+        parent_context = skyvern_context.current()
+        try:
+            triggered_workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
+                request_id=None,
+                workflow_request=workflow_request,
+                workflow_permanent_id=resolved_workflow_permanent_id,
+                organization=organization,
+                parent_workflow_run_id=workflow_run_id,
+            )
+        except Exception as e:
+            error_msg = get_user_facing_exception_message(e)
+            if parent_context:
+                skyvern_context.set(parent_context)
+            return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
+
+        triggered_run_id = triggered_workflow_run.workflow_run_id
+
+        LOG.info(
+            "Triggered workflow run",
+            parent_workflow_run_id=workflow_run_id,
+            triggered_workflow_run_id=triggered_run_id,
+            triggered_workflow_permanent_id=resolved_workflow_permanent_id,
+            wait_for_completion=self.wait_for_completion,
+        )
+
+        # 6. Execute based on wait mode
+        output_data: dict[str, Any] = {}
+        success = False
+        if self.wait_for_completion:
+            try:
+                # Pass api_key=None so the child workflow's webhook (if configured)
+                # is intentionally skipped. Webhook dispatch requires the caller's
+                # API key, which is not available in a block execution context.
+                final_run = await app.WORKFLOW_SERVICE.execute_workflow(
+                    workflow_run_id=triggered_run_id,
+                    api_key=None,
+                    organization=organization,
+                    browser_session_id=resolved_browser_session_id,
+                )
+                success = final_run.status == WorkflowRunStatus.completed
+                output_data = {
+                    "workflow_run_id": triggered_run_id,
+                    "workflow_permanent_id": resolved_workflow_permanent_id,
+                    "status": str(final_run.status),
+                    "failure_reason": final_run.failure_reason,
+                }
+                # Include the child workflow's output parameters so downstream
+                # blocks can reference them (e.g. block_3_output.outputs.block_2_output)
+                try:
+                    child_output_params = (
+                        await app.WORKFLOW_SERVICE.get_output_parameter_workflow_run_output_parameter_tuples(
+                            workflow_id=final_run.workflow_id,
+                            workflow_run_id=triggered_run_id,
+                        )
+                    )
+                    child_outputs: dict[str, Any] = {}
+                    for output_param, run_output_param in child_output_params:
+                        child_outputs[output_param.key] = run_output_param.value
+                    output_data["outputs"] = child_outputs
+                except Exception:
+                    LOG.warning(
+                        "Failed to fetch child workflow outputs",
+                        triggered_workflow_run_id=triggered_run_id,
+                        exc_info=True,
+                    )
+            except Exception as e:
+                error_msg = get_user_facing_exception_message(e)
+                output_data = {
+                    "workflow_run_id": triggered_run_id,
+                    "workflow_permanent_id": resolved_workflow_permanent_id,
+                    "status": "failed",
+                    "failure_reason": f"Triggered workflow execution failed: {error_msg}",
+                }
+                success = False
+            finally:
+                # Restore parent context after child execution completes
+                if parent_context:
+                    skyvern_context.set(parent_context)
+        else:
+            # Fire and forget: spawn the child workflow as a concurrent task.
+            # We use asyncio.create_task instead of AsyncExecutorFactory because
+            # block execution runs outside an HTTP request context, so there is
+            # no FastAPI BackgroundTasks instance to schedule on.
+            def _on_child_done(t: asyncio.Task[Any]) -> None:
+                if t.cancelled():
+                    LOG.warning(
+                        "Async child workflow was cancelled",
+                        triggered_workflow_run_id=triggered_run_id,
+                    )
+                    return
+                if exc := t.exception():
+                    LOG.error(
+                        "Async child workflow failed",
+                        triggered_workflow_run_id=triggered_run_id,
+                        exc_info=exc,
+                    )
+
+            task = asyncio.create_task(
+                app.WORKFLOW_SERVICE.execute_workflow(
+                    workflow_run_id=triggered_run_id,
+                    api_key=None,
+                    organization=organization,
+                    browser_session_id=resolved_browser_session_id,
+                )
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+            task.add_done_callback(_on_child_done)
+            # Restore parent context AFTER create_task so the child task
+            # inherits the child's context (ContextVar is copied at task
+            # creation), but subsequent parent blocks see the parent's context.
+            if parent_context:
+                skyvern_context.set(parent_context)
+            LOG.info(
+                "Async workflow dispatch succeeded",
+                triggered_workflow_run_id=triggered_run_id,
+                triggered_workflow_permanent_id=resolved_workflow_permanent_id,
+            )
+            output_data = {
+                "workflow_run_id": triggered_run_id,
+                "workflow_permanent_id": resolved_workflow_permanent_id,
+                "status": "queued",
+            }
+            success = True
+
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_data)
+
+        return await self.build_block_result(
+            success=success,
+            failure_reason=output_data.get("failure_reason") if not success else None,
+            output_parameter_value=output_data,
+            status=BlockStatus.completed if success else BlockStatus.failed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
     """
     Recursively get "all blocks" in a workflow definition.
@@ -6040,6 +6378,7 @@ BlockSubclasses = Union[
     FileUploadBlock,
     HttpRequestBlock,
     PrintPageBlock,
+    WorkflowTriggerBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

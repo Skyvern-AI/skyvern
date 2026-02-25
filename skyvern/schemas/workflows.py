@@ -356,6 +356,7 @@ class BlockType(StrEnum):
     HTTP_REQUEST = "http_request"
     HUMAN_INTERACTION = "human_interaction"
     PRINT_PAGE = "print_page"
+    WORKFLOW_TRIGGER = "workflow_trigger"
 
 
 class BlockStatus(StrEnum):
@@ -912,6 +913,23 @@ class PrintPageBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class WorkflowTriggerBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.WORKFLOW_TRIGGER] = BlockType.WORKFLOW_TRIGGER  # type: ignore
+
+    # The permanent ID of the target workflow to trigger
+    workflow_permanent_id: str
+    # Parameters/payload to pass to the triggered workflow (Jinja2 templates supported in values)
+    payload: dict[str, Any] | None = None
+    # Whether to wait for the triggered workflow to complete before continuing
+    wait_for_completion: bool = True
+    # Optional browser session ID for the triggered workflow
+    browser_session_id: str | None = None
+    # When True, the child workflow inherits the parent's browser session
+    use_parent_browser_session: bool = False
+    # Parameter keys for template interpolation
+    parameter_keys: list[str] | None = None
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -950,6 +968,7 @@ BLOCK_YAML_SUBCLASSES = (
     | HttpRequestBlockYAML
     | ConditionalBlockYAML
     | PrintPageBlockYAML
+    | WorkflowTriggerBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 

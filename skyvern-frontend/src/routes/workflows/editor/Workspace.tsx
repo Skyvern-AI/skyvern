@@ -728,6 +728,28 @@ function Workspace({
     };
   }, [getNodes, getEdges, setNodes, setEdges, blockLabel]);
 
+  // Re-layout when a loop node's header height changes (e.g., data schema toggled)
+  useEffect(() => {
+    const handleLoopHeaderResized = () => {
+      setTimeout(() => {
+        const currentNodes = getNodes() as Array<AppNode>;
+        const currentEdges = getEdges();
+
+        const layoutedElements = layout(currentNodes, currentEdges, blockLabel);
+        setNodes(layoutedElements.nodes);
+        setEdges(layoutedElements.edges);
+      }, 10);
+    };
+
+    window.addEventListener("loop-header-resized", handleLoopHeaderResized);
+    return () => {
+      window.removeEventListener(
+        "loop-header-resized",
+        handleLoopHeaderResized,
+      );
+    };
+  }, [getNodes, getEdges, setNodes, setEdges, blockLabel]);
+
   function addNode({
     nodeType,
     previous,

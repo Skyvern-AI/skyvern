@@ -1787,6 +1787,9 @@ async function buildElementTree(
       let interactable = isInteractable(element, hoverStylesMap);
       let elementObj = null;
       let isParentSVG = null;
+      if (must_included_tags.includes(tagName)) {
+        interactable = true;
+      }
       if (interactable) {
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (
@@ -1843,10 +1846,6 @@ async function buildElementTree(
         );
         if (elementObj.text.length > 0) {
           elementObj.purgeable = false;
-        }
-        if (must_included_tags.includes(tagName)) {
-          elementObj.purgeable = false;
-          elementObj.interactable = true;
         }
       }
 
