@@ -160,6 +160,43 @@ def test_get_skyvern_override_cache_closes_evicted_client(monkeypatch: pytest.Mo
     assert closed_keys == ["sk_key_a"]
 
 
+def test_build_cloud_client_uses_self_url_in_stateless_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """In stateless HTTP mode the SDK client must call back to the same process."""
+    captured_kwargs: list[dict[str, object]] = []
+
+    class FakeSkyvern:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured_kwargs.append(dict(kwargs))
+
+    monkeypatch.setattr(client_mod, "Skyvern", FakeSkyvern)
+    session_manager.set_stateless_http_mode(True)
+
+    client_mod._build_cloud_client("sk_test")
+
+    assert len(captured_kwargs) == 1
+    base_url = captured_kwargs[0]["base_url"]
+    assert isinstance(base_url, str)
+    assert "127.0.0.1" in base_url
+
+
+def test_build_cloud_client_uses_settings_url_in_normal_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Outside stateless HTTP mode the SDK client should use the configured URL."""
+    captured_kwargs: list[dict[str, object]] = []
+
+    class FakeSkyvern:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured_kwargs.append(dict(kwargs))
+
+    monkeypatch.setattr(client_mod, "Skyvern", FakeSkyvern)
+    monkeypatch.setattr(client_mod.settings, "SKYVERN_BASE_URL", "https://api-staging.skyvern.com")
+    session_manager.set_stateless_http_mode(False)
+
+    client_mod._build_cloud_client("sk_test")
+
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["base_url"] == "https://api-staging.skyvern.com"
+
+
 @pytest.mark.asyncio
 async def test_close_skyvern_closes_singleton() -> None:
     fake = MagicMock()
