@@ -1033,6 +1033,19 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
+    LLMConfigRegistry.register_config(
+        "GEMINI_3.1_PRO",
+        LLMConfig(
+            "gemini/gemini-3.1-pro-preview",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+            ),
+        ),
+    )
 
 
 if settings.ENABLE_NOVITA:
@@ -1400,6 +1413,22 @@ if settings.ENABLE_VERTEX_AI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.1_PRO",
+        LLMConfig(
+            "vertex_ai/gemini-3.1-pro-preview",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.1-pro-preview" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_2.5_FLASH_LITE",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-lite",
@@ -1579,6 +1608,25 @@ if settings.ENABLE_MOONSHOT:
             ),
         ),
     )
+
+if settings.ENABLE_INCEPTION:
+    LLMConfigRegistry.register_config(
+        "INCEPTION_MERCURY_2",
+        LLMConfig(
+            "openai/mercury-2",
+            ["INCEPTION_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            litellm_params=LiteLLMParams(
+                api_key=settings.INCEPTION_API_KEY,
+                api_base=settings.INCEPTION_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openai/mercury-2"},
+            ),
+        ),
+    )
+
 # Add support for dynamically configuring OpenAI-compatible LLM models
 # Based on liteLLM's support for OpenAI-compatible APIs
 # See documentation: https://docs.litellm.ai/docs/providers/openai_compatible

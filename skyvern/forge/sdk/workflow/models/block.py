@@ -117,6 +117,9 @@ else:
     jinja_sandbox_env = SandboxedEnvironment()
 
 
+# Date format used for the built-in {{current_date}} reserved parameter.
+CURRENT_DATE_FORMAT = "%Y-%m-%d"
+
 # Sentinel marker for native JSON type injection via | json filter.
 _JSON_TYPE_MARKER = "__SKYVERN_RAW_JSON__"
 
@@ -399,6 +402,8 @@ class Block(BaseModel, abc.ABC):
             template_data["workflow_permanent_id"] = workflow_run_context.workflow_permanent_id
         if "workflow_run_id" not in template_data:
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
+        if "current_date" not in template_data:
+            template_data["current_date"] = datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT)
 
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
         template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
@@ -1213,6 +1218,9 @@ class ForLoopBlock(Block):
     loop_over: PARAMETER_TYPE | None = None
     loop_variable_reference: str | None = None
     complete_if_empty: bool = False
+    # Note: intentionally excludes `list` (unlike BaseTaskBlock.data_schema) because a list schema
+    # does not describe the shape of individual loop items -- only dict schemas are meaningful here.
+    data_schema: dict[str, Any] | str | None = None
 
     def get_all_parameters(
         self,
@@ -1280,7 +1288,9 @@ class ForLoopBlock(Block):
             if parameter_value is None and not is_likely_parameter_path:
                 try:
                     # Create and execute extraction block using the current block's workflow_id
-                    extraction_block = self._create_initial_extraction_block(self.loop_variable_reference)
+                    extraction_block = self._create_initial_extraction_block(
+                        self.loop_variable_reference, workflow_run_context=workflow_run_context
+                    )
 
                     LOG.info(
                         "Processing natural language loop input",
@@ -1470,23 +1480,70 @@ class ForLoopBlock(Block):
         except Exception:
             return None
 
-    def _create_initial_extraction_block(self, natural_language_prompt: str) -> ExtractionBlock:
+    def _create_initial_extraction_block(
+        self,
+        natural_language_prompt: str,
+        workflow_run_context: WorkflowRunContext | None = None,
+    ) -> ExtractionBlock:
         """Create an extraction block to process natural language input."""
 
-        # Create a schema that only extracts loop values
-        data_schema = {
-            "type": "object",
-            "properties": {
-                "loop_values": {
-                    "type": "array",
-                    "description": "Array of values to iterate over. Each value should be the primary data needed for the loop blocks.",
-                    "items": {
-                        "type": "string",
-                        "description": "The primary value to be used in the loop iteration (e.g., URL, text, identifier, etc.)",
-                    },
-                }
-            },
-        }
+        # Determine the items schema for loop_values
+        items_schema: dict[str, Any] | None = None
+        if self.data_schema is not None:
+            if isinstance(self.data_schema, dict):
+                items_schema = self.data_schema
+            elif isinstance(self.data_schema, str):
+                # Interpolate Jinja templates before parsing, matching how BaseTaskBlock.setup_block_v2
+                # handles data_schema strings (see line 652-654)
+                schema_str = self.data_schema
+                if workflow_run_context is not None:
+                    schema_str = self.format_block_parameter_template_from_workflow_run_context(
+                        schema_str, workflow_run_context
+                    )
+                try:
+                    parsed = json.loads(schema_str)
+                    if isinstance(parsed, dict):
+                        items_schema = parsed
+                    else:
+                        LOG.warning(
+                            "Parsed data_schema is not a dict, falling back to default string schema",
+                            block_label=self.label,
+                            data_schema=self.data_schema,
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    LOG.warning(
+                        "Failed to parse data_schema string, falling back to default string schema",
+                        block_label=self.label,
+                        data_schema=self.data_schema,
+                    )
+
+        if items_schema is not None:
+            # User provided a custom schema — each loop iteration will produce a structured object
+            data_schema: dict[str, Any] = {
+                "type": "object",
+                "properties": {
+                    "loop_values": {
+                        "type": "array",
+                        "description": "Array of structured values to iterate over, matching the provided schema.",
+                        "items": items_schema,
+                    }
+                },
+            }
+        else:
+            # Default: extract simple string array
+            data_schema = {
+                "type": "object",
+                "properties": {
+                    "loop_values": {
+                        "type": "array",
+                        "description": "Array of values to iterate over. Each value should be the primary data needed for the loop blocks.",
+                        "items": {
+                            "type": "string",
+                            "description": "The primary value to be used in the loop iteration (e.g., URL, text, identifier, etc.)",
+                        },
+                    }
+                },
+            }
 
         # Create extraction goal that includes the natural language prompt
         extraction_goal = prompt_engine.load_prompt(
@@ -5007,6 +5064,7 @@ class BranchEvaluationContext:
         template_data.setdefault("workflow_id", ctx.workflow_id)
         template_data.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
         template_data.setdefault("workflow_run_id", ctx.workflow_run_id)
+        template_data.setdefault("current_date", datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT))
 
         template_data.setdefault("params", template_data.get("params", {}))
         template_data.setdefault("outputs", template_data.get("outputs", {}))
@@ -5554,81 +5612,70 @@ class ConditionalBlock(Block):
             "required": ["evaluations"],
         }
 
+        # Step 4: Create and execute single ExtractionBlock.
+        # When all expressions have been Jinja-rendered successfully, omit
+        # browser_session_id so the LLM won't reinterpret resolved literal
+        # values as on-screen references (SKY-7985).
+        effective_browser_session_id = browser_session_id if has_any_pure_natlang else None
+
+        output_param = OutputParameter(
+            output_parameter_id=str(uuid.uuid4()),
+            key=f"conditional_branch_eval_{generate_random_string()}",
+            workflow_id=self.output_parameter.workflow_id,
+            created_at=datetime.now(),
+            modified_at=datetime.now(),
+            parameter_type=ParameterType.OUTPUT,
+            description=f"Conditional branch evaluation results ({len(branches)} conditions)",
+        )
+        extraction_block = ExtractionBlock(
+            label=f"conditional_branch_eval_{generate_random_string()}",
+            data_extraction_goal=extraction_goal,
+            data_schema=data_schema,
+            output_parameter=output_param,
+        )
+
+        LOG.info(
+            "Conditional branch ExtractionBlock created (batched)",
+            block_label=self.label,
+            num_conditions=len(branches),
+            extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
+            has_browser_session=effective_browser_session_id is not None,
+            has_any_pure_natlang=has_any_pure_natlang,
+            has_context=context_json is not None,
+        )
+
         try:
-            # Step 4: Evaluate conditions.
-            if has_any_pure_natlang:
-                output_param = OutputParameter(
-                    output_parameter_id=str(uuid.uuid4()),
-                    key=f"conditional_branch_eval_{generate_random_string()}",
-                    workflow_id=self.output_parameter.workflow_id,
-                    created_at=datetime.now(),
-                    modified_at=datetime.now(),
-                    parameter_type=ParameterType.OUTPUT,
-                    description=f"Conditional branch evaluation results ({len(branches)} conditions)",
-                )
-                extraction_block = ExtractionBlock(
-                    label=f"conditional_branch_eval_{generate_random_string()}",
-                    data_extraction_goal=extraction_goal,
-                    data_schema=data_schema,
-                    output_parameter=output_param,
-                )
-                LOG.info(
-                    "Conditional branch ExtractionBlock created (batched)",
-                    block_label=self.label,
-                    num_conditions=len(branches),
-                    extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-                    has_browser_session=browser_session_id is not None,
-                    has_any_pure_natlang=has_any_pure_natlang,
-                    using_browser_session=browser_session_id is not None,
-                    has_context=context_json is not None,
-                )
-                extraction_result = await extraction_block.execute(
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                    browser_session_id=browser_session_id,
-                )
+            extraction_result = await extraction_block.execute(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=effective_browser_session_id,
+            )
 
-                if not extraction_result.success:
-                    LOG.error(
-                        "Conditional branch ExtractionBlock failed",
-                        block_label=self.label,
-                        failure_reason=extraction_result.failure_reason,
+            if not extraction_result.success:
+                LOG.error(
+                    "Conditional branch ExtractionBlock failed",
+                    block_label=self.label,
+                    failure_reason=extraction_result.failure_reason,
+                )
+                raise ValueError(f"Branch evaluation failed: {extraction_result.failure_reason}")
+
+            if workflow_run_context:
+                try:
+                    await extraction_block.record_output_parameter_value(
+                        workflow_run_context=workflow_run_context,
+                        workflow_run_id=workflow_run_id,
+                        value=extraction_result.output_parameter_value,
                     )
-                    raise ValueError(f"Branch evaluation failed: {extraction_result.failure_reason}")
+                except Exception:
+                    LOG.warning(
+                        "Failed to record conditional branch evaluation output",
+                        workflow_run_id=workflow_run_id,
+                        block_label=self.label,
+                        exc_info=True,
+                    )
 
-                if workflow_run_context:
-                    try:
-                        await extraction_block.record_output_parameter_value(
-                            workflow_run_context=workflow_run_context,
-                            workflow_run_id=workflow_run_id,
-                            value=extraction_result.output_parameter_value,
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to record conditional branch evaluation output",
-                            workflow_run_id=workflow_run_id,
-                            block_label=self.label,
-                            exc_info=True,
-                        )
-
-                output_value = extraction_result.output_parameter_value
-            else:
-                # Do not use ExtractionBlock when every expression has already been Jinja-rendered.
-                # ExtractionBlock may still have page/browser context, which can cause the LLM to
-                # reinterpret resolved literals as on-screen references.
-                LOG.info(
-                    "Conditional branch using direct LLM evaluation (no browser context)",
-                    block_label=self.label,
-                    num_conditions=len(branches),
-                    extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-                    has_context=False,
-                )
-                output_value = await app.LLM_API_HANDLER(
-                    prompt=extraction_goal,
-                    prompt_name="conditional-prompt-branch-evaluation",
-                    force_dict=True,
-                )
+            output_value = extraction_result.output_parameter_value
 
             # Step 5: Extract the evaluation results (reasoning + result)
             results_array: list[bool] = []

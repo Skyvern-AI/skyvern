@@ -49,6 +49,9 @@ def _extraction_result(output_parameter: OutputParameter, evaluations: list[dict
 
 @pytest.mark.asyncio
 async def test_jinja_rendered_prompt_condition_omits_browser_session() -> None:
+    """When all expressions are fully Jinja-rendered, ExtractionBlock should be used
+    but with browser_session_id=None to prevent the LLM from reinterpreting resolved
+    literal values as on-screen references (SKY-7985)."""
     block = _conditional_block()
     branch = BranchCondition(
         criteria=PromptBranchCriteria(expression='{{Single_or_Joint__c}} == "Joint"'),
@@ -60,16 +63,20 @@ async def test_jinja_rendered_prompt_condition_omits_browser_session() -> None:
         template_renderer=lambda expr: expr.replace("{{Single_or_Joint__c}}", "Joint"),
     )
     evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={"Single_or_Joint__c": "Joint"})  # type: ignore[method-assign]
-    mock_llm_handler = AsyncMock()
-    mock_llm_handler.return_value = {
-        "evaluations": [{"rendered_condition": 'Joint == "Joint"', "reasoning": "ok", "result": True}]
-    }
 
     with (
-        patch.dict(block_module.app.__dict__, {"LLM_API_HANDLER": mock_llm_handler}),
         patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal") as mock_prompt,
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(
+            return_value=_extraction_result(
+                block.output_parameter,
+                [{"reasoning": "ok", "result": True}],
+            )
+        )
+        mock_extraction_cls.return_value = mock_extraction
+
         results, rendered_expressions, _, llm_response = await block._evaluate_prompt_branches(
             branches=[branch],
             evaluation_context=evaluation_context,
@@ -81,15 +88,10 @@ async def test_jinja_rendered_prompt_condition_omits_browser_session() -> None:
 
     assert results == [True]
     assert rendered_expressions == ['Joint == "Joint"']
-    assert llm_response == {
-        "evaluations": [{"rendered_condition": 'Joint == "Joint"', "reasoning": "ok", "result": True}]
-    }
-    mock_llm_handler.assert_awaited_once_with(
-        prompt="goal",
-        prompt_name="conditional-prompt-branch-evaluation",
-        force_dict=True,
-    )
-    mock_extraction_cls.assert_not_called()
+    # ExtractionBlock should be called with browser_session_id=None (not "bs_test")
+    mock_extraction.execute.assert_awaited_once()
+    assert mock_extraction.execute.call_args.kwargs["browser_session_id"] is None
+    # No context should be passed when all expressions are Jinja-rendered
     evaluation_context.build_llm_safe_context_snapshot.assert_not_called()  # type: ignore[attr-defined]
     assert mock_prompt.call_args.kwargs["context_json"] is None
 

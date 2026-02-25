@@ -35,6 +35,11 @@ const router = createBrowserRouter([
   {
     path: "browser-session/:browserSessionId",
     element: <BrowserSession />,
+    children: [
+      { index: true, element: <Navigate to="stream" replace /> },
+      { path: "stream", element: <></> },
+      { path: "recordings", element: <></> },
+    ],
   },
   {
     path: "/",

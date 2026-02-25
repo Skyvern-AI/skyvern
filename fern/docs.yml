@@ -146,8 +146,10 @@ navigation:
             path: observability/overview.mdx
       - section: Integrations
         contents:
-          - page: Skyvern MCP
+          - page: MCP Server
             path: integrations/mcp.mdx
+          - page: CLI & Skills
+            path: integrations/cli.mdx
           - page: Zapier
             path: integrations/zapier.mdx
           - page: Make

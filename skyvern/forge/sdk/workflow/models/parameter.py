@@ -12,10 +12,13 @@ RESERVED_PARAMETER_KEYS = [
     "current_item",
     "current_value",
     "current_index",
+    "current_date",
     "workflow_title",
     "workflow_id",
     "workflow_permanent_id",
     "workflow_run_id",
+    "workflow_run_outputs",
+    "workflow_run_summary",
 ]
 
 

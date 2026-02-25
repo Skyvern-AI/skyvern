@@ -35,11 +35,11 @@ from .credential import (
 )
 from .prompts import build_workflow, debug_automation, extract_data
 from .session import (
-    skyvern_session_close,
-    skyvern_session_connect,
-    skyvern_session_create,
-    skyvern_session_get,
-    skyvern_session_list,
+    skyvern_browser_session_close,
+    skyvern_browser_session_connect,
+    skyvern_browser_session_create,
+    skyvern_browser_session_get,
+    skyvern_browser_session_list,
 )
 from .workflow import (
     skyvern_workflow_cancel,
@@ -74,9 +74,9 @@ element refs from browser_snapshot; Skyvern accepts natural language intent dire
 
 | Task type | First Skyvern tool | Then |
 |-----------|-------------------|------|
-| Visit / explore a website | skyvern_session_create → skyvern_navigate | skyvern_screenshot to see it |
-| Extract data from a page | skyvern_session_create → skyvern_navigate | skyvern_extract with a prompt |
-| Click / fill / interact | skyvern_session_create → skyvern_navigate | skyvern_act or skyvern_click |
+| Visit / explore a website | skyvern_browser_session_create → skyvern_navigate | skyvern_screenshot to see it |
+| Extract data from a page | skyvern_browser_session_create → skyvern_navigate | skyvern_extract with a prompt |
+| Click / fill / interact | skyvern_browser_session_create → skyvern_navigate | skyvern_act or skyvern_click |
 | Build a reusable automation | skyvern_workflow_create (no session needed) | skyvern_workflow_run to test |
 | Run an existing automation | skyvern_workflow_run (no session needed) | skyvern_workflow_status to check |
 | One-off autonomous task | skyvern_run_task (no session needed) | Check result in response |
@@ -101,7 +101,7 @@ element refs from browser_snapshot; Skyvern accepts natural language intent dire
 
 ## Critical Rules
 1. For tasks that need a real browser, use Skyvern — not WebFetch or Playwright primitives (browser_navigate, browser_click). curl/wget/requests are fine for APIs and file downloads.
-2. Create a session (skyvern_session_create) before browser tools. Workflow tools do NOT need a session.
+2. Create a session (skyvern_browser_session_create) before browser tools. Workflow tools do NOT need a session.
 3. NEVER scrape by guessing API endpoints — use skyvern_navigate + skyvern_extract.
 4. After page-changing actions, use skyvern_screenshot to verify.
 5. NEVER type passwords — use skyvern_login with stored credentials.
@@ -115,7 +115,7 @@ element refs from browser_snapshot; Skyvern accepts natural language intent dire
 - **Natural language actions** — skyvern_act: describe what to do in English ("close the cookie banner and click Sign In").
 - **AI validation** — skyvern_validate checks conditions in natural language ("is the user logged in?").
 - **Reusable workflows** — skyvern_workflow_create saves automations as versioned, parameterized workflows.
-- **Cloud browsers with proxies** — skyvern_session_create launches cloud browsers with geographic proxy support.
+- **Cloud browsers with proxies** — skyvern_browser_session_create launches cloud browsers with geographic proxy support.
 
 ## When to Use Playwright Instead of Skyvern
 For capabilities that Skyvern does not wrap, fall back to Playwright MCP tools. These are the ONLY cases where Playwright tools are appropriate:
@@ -165,7 +165,7 @@ Other engines (`openai-cua`, `anthropic-cua`, `ui-tars`) are available for advan
 
 ## Getting Started
 
-**Exploring a website**: skyvern_session_create → skyvern_navigate → skyvern_screenshot → skyvern_act/skyvern_extract → skyvern_session_close
+**Exploring a website**: skyvern_browser_session_create → skyvern_navigate → skyvern_screenshot → skyvern_act/skyvern_extract → skyvern_browser_session_close
 
 **Automating a multi-page form**: Create a workflow with skyvern_workflow_create — one navigation/extraction block per form page, each with a short prompt (2-3 sentences). All blocks share the same browser. Run with skyvern_workflow_run.
 
@@ -176,7 +176,7 @@ Other engines (`openai-cua`, `anthropic-cua`, `ui-tars`) are available for advan
 **Logging in securely** (credential-based login):
 1. User creates credentials via CLI: `skyvern credentials add --name "Amazon" --username "user@example.com"` (password entered securely via terminal prompt)
 2. Find the credential: skyvern_credential_list
-3. Create a session: skyvern_session_create
+3. Create a session: skyvern_browser_session_create
 4. Navigate to login page: skyvern_navigate
 5. Log in: skyvern_login(credential_id="cred_...") — AI handles the full login flow
 6. Verify: skyvern_screenshot
@@ -241,12 +241,12 @@ gives you the xpath the AI resolved to. Then hardcode that xpath with a prompt f
 """,
 )
 
-# -- Session management --
-mcp.tool()(skyvern_session_create)
-mcp.tool()(skyvern_session_close)
-mcp.tool()(skyvern_session_list)
-mcp.tool()(skyvern_session_get)
-mcp.tool()(skyvern_session_connect)
+# -- Browser session management --
+mcp.tool()(skyvern_browser_session_create)
+mcp.tool()(skyvern_browser_session_close)
+mcp.tool()(skyvern_browser_session_list)
+mcp.tool()(skyvern_browser_session_get)
+mcp.tool()(skyvern_browser_session_connect)
 
 # -- Primary tools (AI-powered exploration + observation) --
 mcp.tool()(skyvern_act)
@@ -302,11 +302,11 @@ mcp.prompt()(extract_data)
 __all__ = [
     "mcp",
     # Session
-    "skyvern_session_create",
-    "skyvern_session_close",
-    "skyvern_session_list",
-    "skyvern_session_get",
-    "skyvern_session_connect",
+    "skyvern_browser_session_create",
+    "skyvern_browser_session_close",
+    "skyvern_browser_session_list",
+    "skyvern_browser_session_get",
+    "skyvern_browser_session_connect",
     # Primary (AI-powered)
     "skyvern_act",
     "skyvern_extract",

@@ -10,11 +10,11 @@
 
 | Tool | Purpose |
 |------|---------|
-| `skyvern_session_create` | Start a new browser session |
-| `skyvern_session_connect` | Attach to an existing session |
-| `skyvern_session_list` | List active sessions |
-| `skyvern_session_get` | Get session details |
-| `skyvern_session_close` | Close a session |
+| `skyvern_browser_session_create` | Start a new browser session |
+| `skyvern_browser_session_connect` | Attach to an existing session |
+| `skyvern_browser_session_list` | List active sessions |
+| `skyvern_browser_session_get` | Get session details |
+| `skyvern_browser_session_close` | Close a session |
 | `skyvern_navigate` | Navigate to a URL |
 | `skyvern_act` | Perform an AI-driven action |
 | `skyvern_extract` | Extract structured data |

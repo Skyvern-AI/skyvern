@@ -6,6 +6,7 @@ import { ProxyLocation } from "@/api/types";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Drawer,
   DrawerContent,
@@ -26,6 +27,13 @@ import {
 } from "@/components/ui/pagination";
 import { ProxySelector } from "@/components/ProxySelector";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Table,
   TableBody,
   TableCell,
@@ -35,7 +43,11 @@ import {
 } from "@/components/ui/table";
 import { useBrowserSessionsQuery } from "@/routes/browserSessions/hooks/useBrowserSessionsQuery";
 import { useCreateBrowserSessionMutation } from "@/routes/browserSessions/hooks/useCreateBrowserSessionMutation";
-import { type BrowserSession } from "@/routes/workflows/types/browserSessionTypes";
+import {
+  type BrowserSession,
+  type BrowserSessionExtension,
+  type BrowserSessionType,
+} from "@/routes/workflows/types/browserSessionTypes";
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { cn, formatMs, toDate } from "@/util/utils";
@@ -58,6 +70,31 @@ const Yes = () => (
   </Badge>
 );
 
+const BROWSER_TYPE_OPTIONS: Array<{
+  value: BrowserSessionType;
+  label: string;
+}> = [
+  { value: "msedge", label: "Microsoft Edge" },
+  { value: "chrome", label: "Google Chrome" },
+];
+
+const EXTENSION_OPTIONS: Array<{
+  value: BrowserSessionExtension;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: "ad-blocker",
+    label: "Ad Blocker",
+    description: "Blocks ads and common trackers in session pages.",
+  },
+  {
+    value: "captcha-solver",
+    label: "Captcha Solver",
+    description: "Enables automated captcha solving when available.",
+  },
+];
+
 function BrowserSessions() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -65,9 +102,13 @@ function BrowserSessions() {
   const [sessionOptions, setSessionOptions] = useState<{
     proxyLocation: ProxyLocation;
     timeoutMinutes: number | null;
+    browserType: BrowserSessionType | null;
+    extensions: BrowserSessionExtension[];
   }>({
     proxyLocation: ProxyLocation.Residential,
     timeoutMinutes: 60,
+    browserType: null,
+    extensions: [],
   });
 
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
@@ -121,6 +162,18 @@ function BrowserSessions() {
     } else {
       navigate(`/browser-session/${browserSessionId}`);
     }
+  }
+
+  function toggleExtension(extension: BrowserSessionExtension) {
+    setSessionOptions((prev) => {
+      const exists = prev.extensions.includes(extension);
+      return {
+        ...prev,
+        extensions: exists
+          ? prev.extensions.filter((item) => item !== extension)
+          : [...prev.extensions, extension],
+      };
+    });
   }
 
   return (
@@ -336,11 +389,13 @@ function BrowserSessions() {
                   </div>
                   <ProxySelector
                     value={sessionOptions.proxyLocation}
+                    allowGranularSearch={false}
+                    modalPopover
                     onChange={(value) => {
-                      setSessionOptions({
-                        ...sessionOptions,
+                      setSessionOptions((prev) => ({
+                        ...prev,
                         proxyLocation: value,
-                      });
+                      }));
                     }}
                   />
                 </div>
@@ -367,6 +422,76 @@ function BrowserSessions() {
                     }}
                   />
                 </div>
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Label>Browser Type</Label>
+                    <HelpTooltip content="Choose the browser engine for this session. Leave default to use server defaults." />
+                  </div>
+                  <Select
+                    value={sessionOptions.browserType ?? "default"}
+                    onValueChange={(value) => {
+                      setSessionOptions((prev) => ({
+                        ...prev,
+                        browserType:
+                          value === "default"
+                            ? null
+                            : (value as BrowserSessionType),
+                      }));
+                    }}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="default">
+                        Default (Microsoft Edge)
+                      </SelectItem>
+                      {BROWSER_TYPE_OPTIONS.map((browserType) => (
+                        <SelectItem
+                          key={browserType.value}
+                          value={browserType.value}
+                        >
+                          {browserType.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Label>Extensions</Label>
+                    <HelpTooltip content="Optional browser extensions to install when the session starts." />
+                  </div>
+                  <div className="space-y-2 rounded-md border p-3">
+                    {EXTENSION_OPTIONS.map((extension) => (
+                      <div
+                        key={extension.value}
+                        className="flex items-start space-x-2"
+                      >
+                        <Checkbox
+                          id={`extension-${extension.value}`}
+                          checked={sessionOptions.extensions.includes(
+                            extension.value,
+                          )}
+                          onCheckedChange={() => {
+                            toggleExtension(extension.value);
+                          }}
+                        />
+                        <div className="grid gap-1">
+                          <Label
+                            htmlFor={`extension-${extension.value}`}
+                            className="font-medium"
+                          >
+                            {extension.label}
+                          </Label>
+                          <p className="text-xs text-muted-foreground">
+                            {extension.description}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
                 <Button
                   disabled={
                     createBrowserSessionMutation.isPending ||
@@ -380,6 +505,8 @@ function BrowserSessions() {
                     createBrowserSessionMutation.mutate({
                       proxyLocation: sessionOptions.proxyLocation,
                       timeout: sessionOptions.timeoutMinutes,
+                      browserType: sessionOptions.browserType,
+                      extensions: sessionOptions.extensions,
                     });
                   }}
                 >

@@ -16,4 +16,9 @@ export interface ForLoopBlock {
     loop_over?: Skyvern.ForLoopBlockLoopOver;
     loop_variable_reference?: string;
     complete_if_empty?: boolean;
+    data_schema?: ForLoopBlock.DataSchema;
+}
+
+export namespace ForLoopBlock {
+    export type DataSchema = Record<string, unknown> | string;
 }

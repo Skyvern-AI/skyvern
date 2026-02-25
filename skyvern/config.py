@@ -356,6 +356,11 @@ class Settings(BaseSettings):
     MOONSHOT_API_KEY: str | None = None
     MOONSHOT_API_BASE: str = "https://api.moonshot.cn/v1"
 
+    # INCEPTION AI
+    ENABLE_INCEPTION: bool = False
+    INCEPTION_API_KEY: str | None = None
+    INCEPTION_API_BASE: str = "https://api.inceptionlabs.ai/v1"
+
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
@@ -466,6 +471,8 @@ class Settings(BaseSettings):
             },
             "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
             "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
+            "gemini-3.1-pro-preview": {"llm_key": "VERTEX_GEMINI_3.1_PRO", "label": "Gemini 3.1 Pro"},
+            "mercury-2": {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"},
             "gemini-2.5-flash-lite": {
                 "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
                 "label": "Gemini 2.5 Flash Lite",
