@@ -81,7 +81,6 @@ def test_extract_totp_from_navigation_inputs_prefers_payload_code_over_goal_text
     """Payload alias code should be used even if goal text contains another code."""
     otp_value = extract_totp_from_navigation_inputs(
         {"mfaChoice": "520265"},
-        "Use verification code 111111",
     )
 
     assert otp_value is not None
@@ -93,7 +92,6 @@ def test_extract_totp_from_navigation_inputs_ignores_navigation_goal_when_payloa
     """Goal text alone should not produce inline OTP in payload-only mode."""
     otp_value = extract_totp_from_navigation_inputs(
         None,
-        "Sign in and use verification code 520265 when prompted.",
     )
 
     assert otp_value is None
@@ -103,7 +101,6 @@ def test_extract_totp_from_navigation_inputs_ignores_goal_input_action_when_payl
     """Input-action goal text should be ignored in payload-only mode."""
     otp_value = extract_totp_from_navigation_inputs(
         {},
-        "Input 522225",
     )
 
     assert otp_value is None
@@ -113,7 +110,6 @@ def test_extract_totp_from_navigation_inputs_no_code_anywhere():
     """No code in payload or goal should return None."""
     otp_value = extract_totp_from_navigation_inputs(
         None,
-        "Navigate to the login page",
     )
 
     assert otp_value is None

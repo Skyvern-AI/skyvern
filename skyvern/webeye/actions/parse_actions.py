@@ -918,7 +918,7 @@ async def generate_cua_fallback_actions(
 
     elif skyvern_action_type == "get_verification_code":
         # 1. Check navigation payload first for parameters
-        otp_value = extract_totp_from_navigation_inputs(task.navigation_payload, task.navigation_goal)
+        otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
         # 2. Then try to generate TOTP from credential if parameters are not in navigation payload
         if not otp_value:
             otp_value = try_generate_totp_from_credential(task.workflow_run_id)

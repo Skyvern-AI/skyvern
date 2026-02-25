@@ -4464,10 +4464,7 @@ class ForgeAgent:
             # If the payload already includes a verification code, clear any stale
             # waiting state up front. This avoids a stuck 2FA banner even when we
             # later short-circuit or bypass polling.
-            payload_otp = extract_totp_from_navigation_inputs(
-                task.navigation_payload,
-                task.navigation_goal,
-            )
+            payload_otp = extract_totp_from_navigation_inputs(task.navigation_payload)
 
             if payload_otp and task.workflow_run_id:
                 await clear_stale_2fa_waiting_state(
@@ -4556,10 +4553,7 @@ class ForgeAgent:
             source = "pre_extracted_payload" if otp_value else None
 
             if not otp_value:
-                otp_value = extract_totp_from_navigation_inputs(
-                    task.navigation_payload,
-                    task.navigation_goal,
-                )
+                otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
                 if otp_value:
                     source = "navigation_payload"
 

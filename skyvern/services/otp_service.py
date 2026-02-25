@@ -65,14 +65,11 @@ def _is_mfa_like_parameter_key(key: object) -> bool:
     return any(hint in normalized_key for hint in _MFA_PARAMETER_KEY_HINTS)
 
 
-def extract_totp_from_navigation_inputs(
-    navigation_payload: MFANavigationPayload, navigation_goal: object
-) -> OTPValue | None:
+def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload) -> OTPValue | None:
     """Extract TOTP from runtime navigation inputs.
 
     Runtime inline OTP extraction is intentionally payload-only.
     """
-    _ = navigation_goal
     if not isinstance(navigation_payload, (dict, list)):
         return None
 
