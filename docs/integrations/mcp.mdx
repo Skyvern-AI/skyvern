@@ -41,7 +41,7 @@ Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboa
 <Tab title="Claude Code">
 
 ```bash
-claude mcp add-json skyvern '{"type":"streamable-http","url":"https://api.skyvern.com/mcp","headers":{"x-api-key":"YOUR_SKYVERN_API_KEY"}}' --scope user
+claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/","headers":{"x-api-key":"YOUR_SKYVERN_API_KEY"}}' --scope user
 ```
 
 </Tab>
@@ -54,7 +54,7 @@ Add to your Claude Desktop config file (`~/Library/Application Support/Claude/cl
   "mcpServers": {
     "Skyvern": {
       "type": "streamable-http",
-      "url": "https://api.skyvern.com/mcp",
+      "url": "https://api.skyvern.com/mcp/",
       "headers": {
         "x-api-key": "YOUR_SKYVERN_API_KEY"
       }
@@ -73,7 +73,7 @@ Add to `~/.cursor/mcp.json`:
   "mcpServers": {
     "Skyvern": {
       "type": "streamable-http",
-      "url": "https://api.skyvern.com/mcp",
+      "url": "https://api.skyvern.com/mcp/",
       "headers": {
         "x-api-key": "YOUR_SKYVERN_API_KEY"
       }
@@ -92,7 +92,7 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
   "mcpServers": {
     "Skyvern": {
       "type": "streamable-http",
-      "url": "https://api.skyvern.com/mcp",
+      "url": "https://api.skyvern.com/mcp/",
       "headers": {
         "x-api-key": "YOUR_SKYVERN_API_KEY"
       }
@@ -108,7 +108,7 @@ Add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.skyvern]
-url = "https://api.skyvern.com/mcp"
+url = "https://api.skyvern.com/mcp/"
 
 [mcp_servers.skyvern.http_headers]
 x-api-key = "YOUR_SKYVERN_API_KEY"
