@@ -3177,27 +3177,6 @@ class ForgeAgent:
                 return OTPValue(value=value.strip(), type=OTPType.TOTP)
         return None
 
-    @staticmethod
-    def _extract_code_from_llm_actions(json_response: dict[str, Any]) -> OTPValue | None:
-        """Extract a verification code from the LLM's existing INPUT_TEXT actions.
-
-        When the navigation goal includes the code directly, the LLM may generate
-        INPUT_TEXT actions that already contain the code. This avoids entering the
-        OTP polling flow unnecessarily.
-        """
-        actions = json_response.get("actions", [])
-        for action in actions:
-            if not isinstance(action, dict):
-                continue
-            if action.get("action_type") != "INPUT_TEXT":
-                continue
-            text = action.get("text", "")
-            if isinstance(text, str):
-                text = text.strip()
-                if re.fullmatch(r"\d{4,8}", text):
-                    return OTPValue(value=text, type=OTPType.TOTP)
-        return None
-
     def _build_navigation_payload(
         self,
         task: Task,
@@ -4508,11 +4487,6 @@ class ForgeAgent:
                     workflow_run_id=task.workflow_run_id,
                 )
 
-            # If LLM already included the code in its actions (e.g., user provided
-            # code directly in navigation goal), skip the verification flow entirely
-            # and let the original actions pass through without re-prompting.
-            if self._extract_code_from_llm_actions(json_response):
-                return json_response, []
             json_response = await self.handle_potential_verification_code(
                 task,
                 step,

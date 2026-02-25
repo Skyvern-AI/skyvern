@@ -118,6 +118,7 @@ def _iter_mfa_payload_values(payload: MFANavigationPayload) -> list[str]:
     """Collect candidate MFA values while preserving recursive traversal order.
 
     Traversal is cycle-safe to avoid recursive blowups for malformed payload objects.
+    Plain strings inside non-alias lists are intentionally ignored.
     """
     if not isinstance(payload, (dict, list)):
         return []
@@ -137,39 +138,46 @@ def _iter_mfa_payload_values(payload: MFANavigationPayload) -> list[str]:
             continue
         visited_container_ids.add(current_id)
 
-        if isinstance(current_item, dict):
-            for key, value in reversed(list(current_item.items())):
-                if isinstance(value, (dict, list)):
-                    traversal_stack.append(value)
-                if _normalize_payload_key(key) in _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED:
-                    candidate_value = _coerce_candidate_code_source(value)
-                    if candidate_value is not None:
-                        traversal_stack.append(candidate_value)
-        else:
+        if isinstance(current_item, list):
             for item in reversed(current_item):
                 if isinstance(item, (dict, list)):
                     traversal_stack.append(item)
+            continue
+
+        for key, value in reversed(list(current_item.items())):
+            if isinstance(value, (dict, list)):
+                traversal_stack.append(value)
+            if _normalize_payload_key(key) not in _MFA_NAVIGATION_PAYLOAD_KEYS_NORMALIZED:
+                continue
+            candidate_value = _coerce_candidate_code_source(value)
+            if candidate_value is not None:
+                traversal_stack.append(candidate_value)
 
     return values
 
 
 def _normalize_payload_key(key: object) -> str:
-    """Normalize payload keys for alias matching across separators and casing."""
+    """Normalize payload keys for alias matching across separators and casing.
+
+    Examples:
+    - "MFA Code" -> "mfacode"
+    - "mfa-code" -> "mfacode"
+    """
     return _NON_ALNUM_PATTERN.sub("", str(key).lower())
 
 
 def _coerce_candidate_code_source(value: object) -> str | None:
-    """Coerce alias values to strings while intentionally rejecting bools."""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, int) and not isinstance(value, bool):
+    """Coerce alias values to a string candidate while rejecting bools."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (str, int)):
         return str(value)
     return None
 
 
 def extract_totp_from_text(text: object, *, assume_otp_context: bool = False) -> OTPValue | None:
     """Extract a numeric OTP from free-form text with optional OTP-context override."""
-    if not isinstance(text, str) or not text:
+    if not isinstance(text, str):
         return None
 
     stripped_text = text.strip()
@@ -177,17 +185,15 @@ def extract_totp_from_text(text: object, *, assume_otp_context: bool = False) ->
         return None
 
     for pattern in (_OTP_TEXT_BEFORE_CODE_PATTERN, _OTP_CODE_BEFORE_TEXT_PATTERN):
-        match = pattern.search(stripped_text)
-        if match:
-            return OTPValue(value=match.group(1), type=OTPType.TOTP)
+        if direct_match := pattern.search(stripped_text):
+            return OTPValue(value=direct_match.group(1), type=OTPType.TOTP)
 
     context_found = assume_otp_context or bool(_OTP_CONTEXT_PATTERN.search(stripped_text))
     if not context_found:
         return None
 
-    input_action_match = _OTP_INPUT_ACTION_CODE_PATTERN.search(stripped_text)
-    if input_action_match:
-        return OTPValue(value=input_action_match.group(1), type=OTPType.TOTP)
+    if action_prompt_match := _OTP_INPUT_ACTION_CODE_PATTERN.search(stripped_text):
+        return OTPValue(value=action_prompt_match.group(1), type=OTPType.TOTP)
 
     return None
 
@@ -199,15 +205,17 @@ def extract_totp_from_navigation_payload(payload: MFANavigationPayload) -> OTPVa
     - only exact alias keys are considered
     - values must be numeric and between 4 and 10 digits
     """
-    for value in _iter_mfa_payload_values(payload):
-        stripped_value = value.strip()
-        if _OTP_CODE_PATTERN.fullmatch(stripped_value):
-            return OTPValue(value=stripped_value, type=OTPType.TOTP)
-        otp_from_text = extract_totp_from_text(stripped_value, assume_otp_context=True)
-        if otp_from_text:
+    for candidate_value in _iter_mfa_payload_values(payload):
+        candidate_value = candidate_value.strip()
+        if _OTP_CODE_PATTERN.fullmatch(candidate_value):
+            return OTPValue(value=candidate_value, type=OTPType.TOTP)
+
+        if otp_from_text := extract_totp_from_text(candidate_value, assume_otp_context=True):
             return otp_from_text
 
     if isinstance(payload, str):
+        # String payloads are treated as OTP-context text because this input channel
+        # is used specifically for verification-code navigation steps.
         return extract_totp_from_text(payload, assume_otp_context=True)
 
     return None
@@ -219,6 +227,7 @@ def extract_totp_from_navigation_inputs(
     """Extract TOTP from runtime navigation inputs.
 
     Runtime inline OTP extraction is intentionally payload-only.
+    `_navigation_goal` is kept for call-site compatibility with existing callers.
     """
     return extract_totp_from_navigation_payload(navigation_payload)
 

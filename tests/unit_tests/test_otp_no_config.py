@@ -13,7 +13,10 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCodeCreate
 from skyvern.schemas.runs import RunEngine
 from skyvern.services.otp_service import (
     OTPValue,
+    _coerce_candidate_code_source,
     _get_otp_value_by_run,
+    _iter_mfa_payload_values,
+    _normalize_payload_key,
     extract_totp_from_navigation_inputs,
     extract_totp_from_navigation_payload,
     extract_totp_from_text,
@@ -80,6 +83,71 @@ async def test_get_otp_value_by_run_returns_none_when_no_codes():
 
 
 # === Task: extract_totp_from_navigation_payload helper ===
+
+
+def test_iter_mfa_payload_values_ignores_plain_strings_in_generic_lists():
+    """Generic list strings should not become OTP candidates without MFA aliases."""
+    payload = {
+        "items": ["520265", {"field": "ignore"}],
+        "otp_code": "654321",
+    }
+
+    assert _iter_mfa_payload_values(payload) == ["654321"]
+
+
+def test_iter_mfa_payload_values_preserves_alias_depth_first_precedence():
+    """Nested alias values should be yielded before later top-level alias values."""
+    payload = {
+        "first": {"otp_code": "111111"},
+        "otp_code": "222222",
+    }
+
+    assert _iter_mfa_payload_values(payload) == ["111111", "222222"]
+
+
+def test_iter_mfa_payload_values_descends_into_alias_container_values():
+    """Alias container values should still be traversed to find nested aliases."""
+    payload = {
+        "otp_code": {
+            "nested": {
+                "mfa_choice": "654321",
+            }
+        }
+    }
+
+    assert _iter_mfa_payload_values(payload) == ["654321"]
+
+
+@pytest.mark.parametrize(
+    ("raw_key", "expected"),
+    [
+        ("MFA Code", "mfacode"),
+        ("mfa-code", "mfacode"),
+        (None, "none"),
+        (12345, "12345"),
+    ],
+)
+def test_normalize_payload_key_handles_strings_and_non_strings(raw_key: object, expected: str):
+    """Payload keys should normalize deterministically across types."""
+    assert _normalize_payload_key(raw_key) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("520265", "520265"),
+        (520265, "520265"),
+        (True, None),
+        (False, None),
+        (52.5, None),
+        (None, None),
+        ({"otp_code": "520265"}, None),
+        (["520265"], None),
+    ],
+)
+def test_coerce_candidate_code_source_enforces_type_contract(raw_value: object, expected: str | None):
+    """Only string/int values (excluding bool) should be accepted as candidates."""
+    assert _coerce_candidate_code_source(raw_value) == expected
 
 
 def test_extract_totp_from_navigation_payload_accepts_alias_numeric_code():
@@ -224,6 +292,22 @@ def test_extract_totp_from_navigation_payload_preserves_recursive_precedence():
     assert otp_value.value == "111111"
 
 
+def test_extract_totp_from_navigation_payload_supports_string_payload_with_context():
+    """String payload fallback should extract OTP when context terms are present."""
+    otp_value = extract_totp_from_navigation_payload("Use verification code: 654321")
+
+    assert otp_value is not None
+    assert otp_value.value == "654321"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_navigation_payload_rejects_contextless_string_payload_digits():
+    """String payload fallback should stay strict for context-free numeric strings."""
+    otp_value = extract_totp_from_navigation_payload("654321")
+
+    assert otp_value is None
+
+
 def test_extract_totp_from_text_matches_text_before_code():
     """Context term before a code should be extracted."""
     otp_value = extract_totp_from_text("Use this verification code: 654321 to continue.")
@@ -256,6 +340,12 @@ def test_extract_totp_from_text_supports_assumed_context_for_instruction_text():
     assert otp_value is not None
     assert otp_value.value == "739201"
     assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+@pytest.mark.parametrize("raw_text", [None, "", "   ", 123456, [], {}])
+def test_extract_totp_from_text_rejects_non_string_or_blank_input(raw_text: object):
+    """Invalid/blank values should short-circuit without regex processing."""
+    assert extract_totp_from_text(raw_text) is None
 
 
 def test_extract_totp_from_navigation_inputs_prefers_payload_code_over_goal_text():
