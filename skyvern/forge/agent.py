@@ -105,8 +105,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.otp_service import (
-    clear_stale_2fa_waiting_state,
-    find_otp_from_actions,
+    extract_totp_from_navigation_inputs,
     poll_otp_value,
     try_generate_totp_from_credential,
 )
@@ -4528,23 +4527,14 @@ class ForgeAgent:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
         if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
-            actions = json_response.get("actions", [])
-            LOG.info("Need verification code", json_response=actions)
-            # 1. Find the MFA action and extract its text value
-            otp_value = find_otp_from_actions(actions)
+            LOG.info("Need verification code")
+            otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
+            if otp_value:
+                return json_response
 
-            if otp_value and task.workflow_run_id:
-                await clear_stale_2fa_waiting_state(
-                    organization_id=task.organization_id,
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-
-            # 2. Then try to generate TOTP from credential when payload has no OTP.
-            if not otp_value:
-                otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-
-            # 3. Lastly, poll for OTP via webhook/totp_identifier if still missing.
+            # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
+            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+            # Fall back to webhook/totp_identifier
             if not otp_value:
                 workflow_id = workflow_permanent_id = None
                 if task.workflow_run_id:
