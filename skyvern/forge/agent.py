@@ -4528,39 +4528,6 @@ class ForgeAgent:
             ),
         ]
 
-    async def _reprompt_with_verification_code(
-        self,
-        task: Task,
-        step: Step,
-        browser_state: BrowserState,
-        scraped_page: ScrapedPage,
-    ) -> dict[str, Any]:
-        """Re-prompt the LLM with verification_code_check=False after storing a TOTP code."""
-        extract_action_prompt, use_caching, prompt_name = await self._build_extract_action_prompt(
-            task,
-            step,
-            browser_state,
-            scraped_page,
-            verification_code_check=False,
-        )
-        llm_key_override = task.llm_key
-        if await service_utils.is_cua_task(task=task):
-            llm_key_override = None
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            llm_key_override, default=app.LLM_API_HANDLER
-        )
-        if use_caching:
-            context = skyvern_context.current()
-            if context:
-                context.use_prompt_caching = True
-
-        return await llm_api_handler(
-            prompt=extract_action_prompt,
-            step=step,
-            screenshots=scraped_page.screenshots,
-            prompt_name=prompt_name,
-        )
-
     async def handle_potential_verification_code(
         self,
         task: Task,
