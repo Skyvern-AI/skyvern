@@ -105,9 +105,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.otp_service import (
-    OTPValue,
     clear_stale_2fa_waiting_state,
-    extract_totp_from_navigation_inputs,
     poll_otp_value,
     try_generate_totp_from_credential,
 )
@@ -4461,24 +4459,8 @@ class ForgeAgent:
             return json_response, []
 
         if place_to_enter_verification_code and should_enter_verification_code:
-            # 0. Pre-extract payload OTP up front so we can clear stale waiting state
-            # and pass the value through to avoid duplicate extraction.
-            payload_otp = extract_totp_from_navigation_inputs(task.navigation_payload)
-
-            if payload_otp and task.workflow_run_id:
-                await clear_stale_2fa_waiting_state(
-                    organization_id=task.organization_id,
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-
             json_response = await self.handle_potential_verification_code(
-                task,
-                step,
-                scraped_page,
-                browser_state,
-                json_response,
-                pre_extracted_otp=payload_otp,
+                task, step, scraped_page, browser_state, json_response
             )
             actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
             return json_response, actions
@@ -4574,76 +4556,45 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         browser_state: BrowserState,
         json_response: dict[str, Any],
-        pre_extracted_otp: OTPValue | None = None,
     ) -> dict[str, Any]:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
         if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
-            LOG.info("Need verification code")
+            LOG.info("Need verification code", json_response=json_response["actions"])
 
-            otp_value = pre_extracted_otp
-            source = "pre_extracted_payload" if otp_value else None
+            # 1. Check navigation payload first for inline OTP
+            otp_value = json_response["actions"][0].get("user_detail_answer")
 
-            # 0. Reuse payload OTP pre-extracted by handle_potential_OTP_actions.
+            LOG.info("Need verification code otp_value", otp_value=otp_value)
+
+            if otp_value and task.workflow_run_id:
+                await clear_stale_2fa_waiting_state(
+                    organization_id=task.organization_id,
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+
+            # 2. Then try to generate TOTP from credential when payload has no OTP.
+            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+
+            # 3. Lastly, poll for OTP via webhook/totp_identifier if still missing.
             if not otp_value:
-                # 1. Check navigation payload first for inline OTP.
-                otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-                if otp_value:
-                    source = "navigation_payload"
+                workflow_id = workflow_permanent_id = None
+                if task.workflow_run_id:
+                    workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
+                    if workflow_run:
+                        workflow_id = workflow_run.workflow_id
+                        workflow_permanent_id = workflow_run.workflow_permanent_id
+                otp_value = await poll_otp_value(
+                    organization_id=task.organization_id,
+                    task_id=task.task_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=task.workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    totp_verification_url=task.totp_verification_url,
+                    totp_identifier=task.totp_identifier,
+                )
 
-            if not otp_value:
-                # 2. Then try to generate TOTP from credential when payload has no OTP.
-                otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-                if otp_value:
-                    source = "credential_totp"
-
-                # 3. Lastly, poll for OTP via webhook/totp_identifier if still missing.
-                if not otp_value:
-                    workflow_id = workflow_permanent_id = None
-                    if task.workflow_run_id:
-                        workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
-                        if workflow_run:
-                            workflow_id = workflow_run.workflow_id
-                            workflow_permanent_id = workflow_run.workflow_permanent_id
-                    otp_value = await poll_otp_value(
-                        organization_id=task.organization_id,
-                        task_id=task.task_id,
-                        workflow_id=workflow_id,
-                        workflow_run_id=task.workflow_run_id,
-                        workflow_permanent_id=workflow_permanent_id,
-                        totp_verification_url=task.totp_verification_url,
-                        totp_identifier=task.totp_identifier,
-                    )
-                    workflow_id = workflow_permanent_id = None
-                    if task.workflow_run_id:
-                        workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
-                        if workflow_run:
-                            workflow_id = workflow_run.workflow_id
-                            workflow_permanent_id = workflow_run.workflow_permanent_id
-                    totp_verification_url = task.totp_verification_url
-                    totp_identifier = task.totp_identifier
-                    if isinstance(task.navigation_payload, dict):
-                        if not totp_verification_url:
-                            totp_verification_url = task.navigation_payload.get("totp_url")
-                        if not totp_identifier:
-                            totp_identifier = task.navigation_payload.get("totp_identifier")
-                    otp_value = await poll_otp_value(
-                        organization_id=task.organization_id,
-                        task_id=task.task_id,
-                        workflow_id=workflow_id,
-                        workflow_run_id=task.workflow_run_id,
-                        workflow_permanent_id=workflow_permanent_id,
-                        totp_verification_url=totp_verification_url,
-                        totp_identifier=totp_identifier,
-                    )
-                    if otp_value:
-                        source = "poll"
-
-            LOG.info(
-                "Verification code source selected",
-                task_id=task.task_id,
-                source=source or "unavailable",
-            )
             if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
                 return json_response
 
