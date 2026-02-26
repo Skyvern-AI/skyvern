@@ -205,6 +205,9 @@ async def test_handle_potential_verification_code_uses_navigation_payload_and_sk
     json_response = {
         "should_enter_verification_code": True,
         "place_to_enter_verification_code": "input#otp-code",
+        "actions": [
+            {"action_type": "INPUT_TEXT", "id": "AAAb", "reasoning": "Enter MFA code", "text": "520265"},
+        ],
     }
 
     original_app_inst = object.__getattribute__(forge_agent_module.app, "_inst")

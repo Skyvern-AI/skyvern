@@ -105,6 +105,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.otp_service import (
+    OTPValue,
     clear_stale_2fa_waiting_state,
     poll_otp_value,
     try_generate_totp_from_credential,
@@ -4571,10 +4572,18 @@ class ForgeAgent:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
         if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
-            # 1. Check navigation payload first for inline OTP
-            otp_value = json_response["actions"][0].get("user_detail_answer")
-
-            LOG.info("Need verification code otp_value", otp_value=otp_value)
+            actions = json_response.get("actions", [])
+            LOG.info("Need verification code", json_response=actions)
+            # 1. Find the MFA action and extract its text value
+            mfa_action = _find_verification_code_action(actions)
+            otp_value: OTPValue | None = None
+            if mfa_action and mfa_action.get("text"):
+                otp_value = OTPValue(value=mfa_action["text"], type=OTPType.TOTP)
+            LOG.info(
+                "Need verification code otp_value",
+                otp_value=otp_value,
+                mfa_action_id=mfa_action.get("id") if mfa_action else None,
+            )
 
             if otp_value and task.workflow_run_id:
                 await clear_stale_2fa_waiting_state(
@@ -4584,7 +4593,8 @@ class ForgeAgent:
                 )
 
             # 2. Then try to generate TOTP from credential when payload has no OTP.
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+            if not otp_value:
+                otp_value = try_generate_totp_from_credential(task.workflow_run_id)
 
             # 3. Lastly, poll for OTP via webhook/totp_identifier if still missing.
             if not otp_value:

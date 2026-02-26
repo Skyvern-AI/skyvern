@@ -452,6 +452,9 @@ class TestPayloadVerificationCodePriority:
                 json_response={
                     "place_to_enter_verification_code": True,
                     "should_enter_verification_code": True,
+                    "actions": [
+                        {"action_type": "INPUT_TEXT", "id": "AAAb", "reasoning": "Enter MFA code", "text": "520265"},
+                    ],
                 },
             )
 
@@ -514,6 +517,7 @@ class TestPayloadVerificationCodePriority:
                 json_response={
                     "place_to_enter_verification_code": True,
                     "should_enter_verification_code": True,
+                    "actions": [],
                 },
             )
 
@@ -585,6 +589,7 @@ class TestPayloadVerificationCodePriority:
                 json_response={
                     "place_to_enter_verification_code": True,
                     "should_enter_verification_code": True,
+                    "actions": [],
                 },
             )
 
