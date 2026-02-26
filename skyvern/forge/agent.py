@@ -4579,8 +4579,8 @@ class ForgeAgent:
             if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
                 return json_response
 
-            context = skyvern_context.ensure_context()
-            context.totp_codes[task.task_id] = otp_value.value
+            current_context = skyvern_context.ensure_context()
+            current_context.totp_codes[task.task_id] = otp_value.value
 
             extract_action_prompt, use_caching, prompt_name = await self._build_extract_action_prompt(
                 task,
