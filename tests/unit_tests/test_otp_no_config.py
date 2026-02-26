@@ -205,6 +205,9 @@ async def test_handle_potential_verification_code_uses_navigation_payload_and_sk
     json_response = {
         "should_enter_verification_code": True,
         "place_to_enter_verification_code": "input#otp-code",
+        "actions": [
+            {"action_type": "INPUT_TEXT", "id": "AAAb", "reasoning": "Enter MFA code", "text": "520265"},
+        ],
     }
 
     original_app_inst = object.__getattribute__(forge_agent_module.app, "_inst")
@@ -612,6 +615,55 @@ async def test_poll_otp_value_publishes_required_event_for_task():
 
     resolved = next(m for m in messages if m["type"] == "verification_code_resolved")
     assert resolved["task_id"] == "tsk_1"
+
+
+@pytest.mark.asyncio
+async def test_reprompt_with_verification_code_calls_llm():
+    """_reprompt_with_verification_code should build prompt and call LLM."""
+    from skyvern.forge import agent as forge_agent_module
+
+    agent = ForgeAgent.__new__(ForgeAgent)
+
+    task = MagicMock()
+    task.llm_key = None
+
+    step = MagicMock()
+    scraped_page = MagicMock()
+    scraped_page.screenshots = []
+    browser_state = MagicMock()
+
+    original_app_inst = object.__getattribute__(forge_agent_module.app, "_inst")
+    object.__setattr__(forge_agent_module.app, "_inst", MagicMock(LLM_API_HANDLER=AsyncMock()))
+    try:
+        with (
+            patch("skyvern.forge.agent.skyvern_context") as mock_skyvern_context,
+            patch("skyvern.forge.agent.service_utils.is_cua_task", new_callable=AsyncMock, return_value=False),
+            patch(
+                "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                return_value=AsyncMock(return_value={"actions": [{"action_type": "input_text"}]}),
+            ),
+            patch.object(
+                agent,
+                "_build_extract_action_prompt",
+                new_callable=AsyncMock,
+                return_value=("prompt", False, "extract-actions"),
+            ) as mock_build,
+        ):
+            mock_skyvern_context.current.return_value = None
+
+            result = await agent._reprompt_with_verification_code(
+                task,
+                step,
+                browser_state,
+                scraped_page,
+            )
+    finally:
+        object.__setattr__(forge_agent_module.app, "_inst", original_app_inst)
+
+    mock_build.assert_called_once()
+    _, kwargs = mock_build.call_args
+    assert kwargs["verification_code_check"] is False
+    assert "actions" in result
 
 
 @pytest.mark.asyncio
