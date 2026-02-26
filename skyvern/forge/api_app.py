@@ -126,6 +126,11 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     if redis_client is not None:
         await redis_client.close()
 
+    # Close all persistent browser sessions
+    from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
+
+    await DefaultPersistentSessionsManager.close()
+
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
         try:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import floor
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import structlog
 from playwright._impl._errors import TargetClosedError
+from playwright.async_api import async_playwright
 
 from skyvern.config import settings
 from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
@@ -21,10 +23,15 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     is_final_status,
 )
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
+from skyvern.webeye.real_browser_state import RealBrowserState
 
 LOG = structlog.get_logger()
+
+_CDP_PORT_RANGE_START = 9223
+_CDP_PORT_RANGE_END = 9322
 
 
 @dataclass
@@ -174,11 +181,23 @@ async def update_status(
     return persistent_browser_session
 
 
+def _allocate_cdp_port() -> int:
+    """Find an available port in the CDP port range for a browser session."""
+    for port in range(_CDP_PORT_RANGE_START, _CDP_PORT_RANGE_END + 1):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", port))
+                return port
+        except OSError:
+            pass
+    raise RuntimeError(f"No available CDP ports in range {_CDP_PORT_RANGE_START}-{_CDP_PORT_RANGE_END}")
+
+
 class DefaultPersistentSessionsManager(PersistentSessionsManager):
     """Default (OSS) implementation of PersistentSessionsManager protocol."""
 
     instance: DefaultPersistentSessionsManager | None = None
-    _browser_sessions: dict[str, BrowserSession] = dict()
+    _browser_sessions: dict[str, BrowserSession] = {}
     database: AgentDB
 
     def __new__(cls, database: AgentDB) -> DefaultPersistentSessionsManager:
@@ -192,7 +211,60 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         return cls.instance
 
     def watch_session_pool(self) -> None:
-        return None
+        pass
+
+    async def _launch_browser_for_session(
+        self,
+        session_id: str,
+        organization_id: str,
+    ) -> None:
+        """Launch a real browser process and wire it to a persistent session record."""
+        cdp_port = _allocate_cdp_port()
+        LOG.info(
+            "Launching browser for persistent session",
+            session_id=session_id,
+            cdp_port=cdp_port,
+        )
+
+        pw = await async_playwright().start()
+        browser_context, browser_artifacts, browser_cleanup = await BrowserContextFactory.create_browser_context(
+            pw,
+            organization_id=organization_id,
+            cdp_port=cdp_port,
+        )
+
+        browser_state = RealBrowserState(
+            pw=pw,
+            browser_context=browser_context,
+            page=None,
+            browser_artifacts=browser_artifacts,
+            browser_cleanup=browser_cleanup,
+        )
+
+        await browser_state.get_or_create_page(organization_id=organization_id)
+
+        self._browser_sessions[session_id] = BrowserSession(browser_state=browser_state)
+
+        browser_address = f"http://127.0.0.1:{cdp_port}"
+        await self.database.set_persistent_browser_session_browser_address(
+            browser_session_id=session_id,
+            browser_address=browser_address,
+            ip_address="127.0.0.1",
+            ecs_task_arn=None,
+            organization_id=organization_id,
+        )
+
+        await self.database.update_persistent_browser_session(
+            session_id,
+            organization_id=organization_id,
+            status=PersistentBrowserSessionStatus.running,
+        )
+
+        LOG.info(
+            "Browser launched for persistent session",
+            session_id=session_id,
+            browser_address=browser_address,
+        )
 
     async def begin_session(
         self,
@@ -275,7 +347,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             "Creating new browser session",
             organization_id=organization_id,
         )
-        return await self.database.create_persistent_browser_session(
+        session = await self.database.create_persistent_browser_session(
             organization_id=organization_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
@@ -284,6 +356,27 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             extensions=extensions,
             browser_type=browser_type,
         )
+
+        try:
+            await self._launch_browser_for_session(
+                session_id=session.persistent_browser_session_id,
+                organization_id=organization_id,
+            )
+            # Re-fetch to get updated browser_address/ip_address/started_at
+            updated = await self.database.get_persistent_browser_session(
+                session_id=session.persistent_browser_session_id,
+                organization_id=organization_id,
+            )
+            if updated:
+                return updated
+        except Exception:
+            LOG.exception(
+                "Failed to launch browser for session, session will have no browser",
+                session_id=session.persistent_browser_session_id,
+                organization_id=organization_id,
+            )
+
+        return session
 
     async def occupy_browser_session(
         self,

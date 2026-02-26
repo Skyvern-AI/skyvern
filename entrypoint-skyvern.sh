@@ -56,6 +56,13 @@ Xvfb :99 -screen 0 1920x1080x16 &
 xvfb=$!
 
 DISPLAY=:99 xterm 2>/dev/null &
+
+echo "Starting x11vnc on display :99..."
+x11vnc -display :99 -forever -nopw -shared -rfbport 5900 -bg -o /dev/null 2>/dev/null
+
+echo "Starting websockify on port 6080 -> localhost:5900..."
+websockify 6080 localhost:5900 --daemon
+
 python run_streaming.py > /dev/null &
 
 # Run the command and pass in all three arguments
