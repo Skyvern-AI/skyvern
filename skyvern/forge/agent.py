@@ -162,6 +162,17 @@ class ActionLinkedNode:
         self.next: ActionLinkedNode | None = None
 
 
+def _find_verification_code_action(actions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Find the INPUT_TEXT action whose reasoning indicates MFA/TOTP/OTP input."""
+    for action in actions:
+        if action.get("action_type") != "INPUT_TEXT":
+            continue
+        reasoning = (action.get("reasoning") or "").lower()
+        if any(kw in reasoning for kw in ("mfa", "totp", "otp")):
+            return action
+    return None
+
+
 class ForgeAgent:
     def __init__(self) -> None:
         self.async_operation_pool = AsyncOperationPool()
@@ -4560,8 +4571,6 @@ class ForgeAgent:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
         if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
-            LOG.info("Need verification code", json_response=json_response["actions"])
-
             # 1. Check navigation payload first for inline OTP
             otp_value = json_response["actions"][0].get("user_detail_answer")
 
