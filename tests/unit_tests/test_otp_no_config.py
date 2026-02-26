@@ -246,7 +246,7 @@ async def test_handle_potential_verification_code_uses_navigation_payload_and_sk
 
     mock_credential_totp.assert_not_called()
     mock_poll.assert_not_called()
-    assert mock_context.totp_codes["tsk_payload_code"] == "520265"
+    # Early return path: code already visible to LLM in payload, no context storage or re-prompt needed
 
 
 @pytest.mark.asyncio
@@ -619,28 +619,53 @@ async def test_poll_otp_value_publishes_required_event_for_task():
 
 @pytest.mark.asyncio
 async def test_reprompt_with_verification_code_calls_llm():
-    """_reprompt_with_verification_code should build prompt and call LLM."""
+    """When poll_otp_value returns a TOTP code, handle_potential_verification_code should
+    store the code in context, re-prompt the LLM with verification_code_check=False, and
+    return the LLM's new response."""
     from skyvern.forge import agent as forge_agent_module
 
     agent = ForgeAgent.__new__(ForgeAgent)
 
     task = MagicMock()
+    task.organization_id = "org_1"
+    task.totp_verification_url = None
+    task.totp_identifier = None
+    task.task_id = "tsk_reprompt"
+    task.workflow_run_id = None
+    task.navigation_payload = None
     task.llm_key = None
 
     step = MagicMock()
+    step.step_id = "step_1"
+    step.order = 0
+
     scraped_page = MagicMock()
     scraped_page.screenshots = []
     browser_state = MagicMock()
+    json_response = {
+        "should_enter_verification_code": True,
+        "place_to_enter_verification_code": "input#otp-code",
+        "actions": [],
+    }
+
+    llm_response = {"actions": [{"action_type": "input_text", "text": "999888"}]}
 
     original_app_inst = object.__getattribute__(forge_agent_module.app, "_inst")
     object.__setattr__(forge_agent_module.app, "_inst", MagicMock(LLM_API_HANDLER=AsyncMock()))
     try:
         with (
+            patch("skyvern.forge.agent.extract_totp_from_navigation_inputs", return_value=None),
+            patch("skyvern.forge.agent.try_generate_totp_from_credential", return_value=None),
+            patch(
+                "skyvern.forge.agent.poll_otp_value",
+                new_callable=AsyncMock,
+                return_value=OTPValue(value="999888", type=OTPType.TOTP),
+            ),
             patch("skyvern.forge.agent.skyvern_context") as mock_skyvern_context,
             patch("skyvern.forge.agent.service_utils.is_cua_task", new_callable=AsyncMock, return_value=False),
             patch(
                 "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
-                return_value=AsyncMock(return_value={"actions": [{"action_type": "input_text"}]}),
+                return_value=AsyncMock(return_value=llm_response),
             ),
             patch.object(
                 agent,
@@ -649,13 +674,17 @@ async def test_reprompt_with_verification_code_calls_llm():
                 return_value=("prompt", False, "extract-actions"),
             ) as mock_build,
         ):
-            mock_skyvern_context.current.return_value = None
+            mock_context = MagicMock()
+            mock_context.totp_codes = {}
+            mock_skyvern_context.ensure_context.return_value = mock_context
+            mock_skyvern_context.current.return_value = mock_context
 
-            result = await agent._reprompt_with_verification_code(
-                task,
-                step,
-                browser_state,
-                scraped_page,
+            result = await agent.handle_potential_verification_code(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                browser_state=browser_state,
+                json_response=json_response,
             )
     finally:
         object.__setattr__(forge_agent_module.app, "_inst", original_app_inst)
@@ -663,7 +692,8 @@ async def test_reprompt_with_verification_code_calls_llm():
     mock_build.assert_called_once()
     _, kwargs = mock_build.call_args
     assert kwargs["verification_code_check"] is False
-    assert "actions" in result
+    assert mock_context.totp_codes["tsk_reprompt"] == "999888"
+    assert result == llm_response
 
 
 @pytest.mark.asyncio
