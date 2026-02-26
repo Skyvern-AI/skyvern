@@ -4534,6 +4534,39 @@ class ForgeAgent:
             ),
         ]
 
+    async def _reprompt_with_verification_code(
+        self,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        scraped_page: ScrapedPage,
+    ) -> dict[str, Any]:
+        """Re-prompt the LLM with verification_code_check=False after storing a TOTP code."""
+        extract_action_prompt, use_caching, prompt_name = await self._build_extract_action_prompt(
+            task,
+            step,
+            browser_state,
+            scraped_page,
+            verification_code_check=False,
+        )
+        llm_key_override = task.llm_key
+        if await service_utils.is_cua_task(task=task):
+            llm_key_override = None
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            llm_key_override, default=app.LLM_API_HANDLER
+        )
+        if use_caching:
+            context = skyvern_context.current()
+            if context:
+                context.use_prompt_caching = True
+
+        return await llm_api_handler(
+            prompt=extract_action_prompt,
+            step=step,
+            screenshots=scraped_page.screenshots,
+            prompt_name=prompt_name,
+        )
+
     async def handle_potential_verification_code(
         self,
         task: Task,
@@ -4572,9 +4605,21 @@ class ForgeAgent:
                         if workflow_run:
                             workflow_id = workflow_run.workflow_id
                             workflow_permanent_id = workflow_run.workflow_permanent_id
-                    # SKY-48 Bug #3: Check navigation_payload for TOTP config that suppresses
-                    # the 2FA banner (by setting totp_verification_url/totp_identifier on the
-                    # poll context, needs_manual_input returns False and banner is skipped).
+                    otp_value = await poll_otp_value(
+                        organization_id=task.organization_id,
+                        task_id=task.task_id,
+                        workflow_id=workflow_id,
+                        workflow_run_id=task.workflow_run_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        totp_verification_url=task.totp_verification_url,
+                        totp_identifier=task.totp_identifier,
+                    )
+                    workflow_id = workflow_permanent_id = None
+                    if task.workflow_run_id:
+                        workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
+                        if workflow_run:
+                            workflow_id = workflow_run.workflow_id
+                            workflow_permanent_id = workflow_run.workflow_permanent_id
                     totp_verification_url = task.totp_verification_url
                     totp_identifier = task.totp_identifier
                     if isinstance(task.navigation_payload, dict):
