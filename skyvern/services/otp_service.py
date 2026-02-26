@@ -2,6 +2,7 @@ import asyncio
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 
 import pyotp
 import structlog
@@ -112,6 +113,19 @@ def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload
             if candidate_value:
                 traversal_stack.append(candidate_value)
     # No OTP code found after traversing the entire payload
+    return None
+
+
+def find_otp_from_actions(actions: list[dict[str, Any]]) -> OTPValue | None:
+    """Find the INPUT_TEXT action whose reasoning mentions MFA/TOTP/OTP and return its text as OTPValue."""
+    for action in actions:
+        if action.get("action_type") != "INPUT_TEXT":
+            continue
+        reasoning = (action.get("reasoning") or "").lower()
+        if any(kw in reasoning for kw in ("mfa", "totp", "otp")):
+            text = action.get("text")
+            if text:
+                return OTPValue(value=text, type=OTPType.TOTP)
     return None
 
 

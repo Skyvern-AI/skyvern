@@ -105,8 +105,8 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.otp_service import (
-    OTPValue,
     clear_stale_2fa_waiting_state,
+    find_otp_from_actions,
     poll_otp_value,
     try_generate_totp_from_credential,
 )
@@ -161,17 +161,6 @@ class ActionLinkedNode:
     def __init__(self, action: Action) -> None:
         self.action = action
         self.next: ActionLinkedNode | None = None
-
-
-def _find_verification_code_action(actions: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Find the INPUT_TEXT action whose reasoning indicates MFA/TOTP/OTP input."""
-    for action in actions:
-        if action.get("action_type") != "INPUT_TEXT":
-            continue
-        reasoning = (action.get("reasoning") or "").lower()
-        if any(kw in reasoning for kw in ("mfa", "totp", "otp")):
-            return action
-    return None
 
 
 class ForgeAgent:
@@ -4542,10 +4531,7 @@ class ForgeAgent:
             actions = json_response.get("actions", [])
             LOG.info("Need verification code", json_response=actions)
             # 1. Find the MFA action and extract its text value
-            mfa_action = _find_verification_code_action(actions)
-            otp_value: OTPValue | None = None
-            if mfa_action and mfa_action.get("text"):
-                otp_value = OTPValue(value=mfa_action["text"], type=OTPType.TOTP)
+            otp_value = find_otp_from_actions(actions)
 
             if otp_value and task.workflow_run_id:
                 await clear_stale_2fa_waiting_state(
