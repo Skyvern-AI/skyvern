@@ -4579,11 +4579,6 @@ class ForgeAgent:
             otp_value: OTPValue | None = None
             if mfa_action and mfa_action.get("text"):
                 otp_value = OTPValue(value=mfa_action["text"], type=OTPType.TOTP)
-            LOG.info(
-                "Need verification code otp_value",
-                otp_value=otp_value,
-                mfa_action_id=mfa_action.get("id") if mfa_action else None,
-            )
 
             if otp_value and task.workflow_run_id:
                 await clear_stale_2fa_waiting_state(
