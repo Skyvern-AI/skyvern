@@ -9,9 +9,14 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.notification.local import LocalNotificationRegistry
 from skyvern.forge.sdk.routes.credentials import send_totp_code
-from skyvern.forge.sdk.schemas.totp_codes import TOTPCodeCreate
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCodeCreate
 from skyvern.schemas.runs import RunEngine
-from skyvern.services.otp_service import OTPValue, _get_otp_value_by_run, poll_otp_value
+from skyvern.services.otp_service import (
+    OTPValue,
+    _get_otp_value_by_run,
+    extract_totp_from_navigation_inputs,
+    poll_otp_value,
+)
 
 
 @pytest.mark.asyncio
@@ -70,6 +75,44 @@ async def test_get_otp_value_by_run_returns_none_when_no_codes():
             task_id="tsk_1",
         )
     assert result is None
+
+
+def test_extract_totp_from_navigation_inputs_prefers_payload_code_over_goal_text():
+    """Payload alias code should be used even if goal text contains another code."""
+    otp_value = extract_totp_from_navigation_inputs(
+        {"mfaChoice": "520265"},
+    )
+
+    assert otp_value is not None
+    assert otp_value.value == "520265"
+    assert otp_value.get_otp_type() == OTPType.TOTP
+
+
+def test_extract_totp_from_navigation_inputs_ignores_navigation_goal_when_payload_missing():
+    """Goal text alone should not produce inline OTP in payload-only mode."""
+    otp_value = extract_totp_from_navigation_inputs(
+        None,
+    )
+
+    assert otp_value is None
+
+
+def test_extract_totp_from_navigation_inputs_ignores_goal_input_action_when_payload_missing():
+    """Input-action goal text should be ignored in payload-only mode."""
+    otp_value = extract_totp_from_navigation_inputs(
+        {},
+    )
+
+    assert otp_value is None
+
+
+def test_extract_totp_from_navigation_inputs_no_code_anywhere():
+    """No code in payload or goal should return None."""
+    otp_value = extract_totp_from_navigation_inputs(
+        None,
+    )
+
+    assert otp_value is None
 
 
 # === Task 3: poll_otp_value without identifier ===
@@ -134,6 +177,76 @@ async def test_handle_potential_OTP_actions_without_totp_config():
                 task, step, scraped_page, browser_state, json_response
             )
         mock_handler.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_potential_verification_code_uses_navigation_payload_and_skips_poll():
+    """When payload includes MFA code, should consume it and skip poll_otp_value."""
+    from skyvern.forge import agent as forge_agent_module
+
+    agent = ForgeAgent.__new__(ForgeAgent)
+
+    task = MagicMock()
+    task.organization_id = "org_1"
+    task.totp_verification_url = None
+    task.totp_identifier = None
+    task.task_id = "tsk_payload_code"
+    task.workflow_run_id = None
+    task.navigation_payload = {"mfaChoice": "520265"}
+    task.llm_key = None
+
+    step = MagicMock()
+    step.step_id = "step_1"
+    step.order = 0
+
+    scraped_page = MagicMock()
+    scraped_page.screenshots = []
+    browser_state = MagicMock()
+    json_response = {
+        "should_enter_verification_code": True,
+        "place_to_enter_verification_code": "input#otp-code",
+        "actions": [
+            {"action_type": "INPUT_TEXT", "id": "AAAb", "reasoning": "Enter MFA code", "text": "520265"},
+        ],
+    }
+
+    original_app_inst = object.__getattribute__(forge_agent_module.app, "_inst")
+    object.__setattr__(forge_agent_module.app, "_inst", MagicMock(LLM_API_HANDLER=AsyncMock()))
+    try:
+        with (
+            patch("skyvern.forge.agent.try_generate_totp_from_credential") as mock_credential_totp,
+            patch("skyvern.forge.agent.poll_otp_value", new_callable=AsyncMock) as mock_poll,
+            patch("skyvern.forge.agent.skyvern_context") as mock_skyvern_context,
+            patch("skyvern.forge.agent.service_utils.is_cua_task", new_callable=AsyncMock, return_value=False),
+            patch(
+                "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                return_value=AsyncMock(return_value={"actions": []}),
+            ),
+            patch.object(
+                agent,
+                "_build_extract_action_prompt",
+                new_callable=AsyncMock,
+                return_value=("prompt", False, "extract-actions"),
+            ),
+        ):
+            mock_context = MagicMock()
+            mock_context.totp_codes = {}
+            mock_skyvern_context.ensure_context.return_value = mock_context
+            mock_skyvern_context.current.return_value = mock_context
+
+            await agent.handle_potential_verification_code(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                browser_state=browser_state,
+                json_response=json_response,
+            )
+    finally:
+        object.__setattr__(forge_agent_module.app, "_inst", original_app_inst)
+
+    mock_credential_totp.assert_not_called()
+    mock_poll.assert_not_called()
+    # Early return path: code already visible to LLM in payload, no context storage or re-prompt needed
 
 
 @pytest.mark.asyncio
@@ -502,6 +615,85 @@ async def test_poll_otp_value_publishes_required_event_for_task():
 
     resolved = next(m for m in messages if m["type"] == "verification_code_resolved")
     assert resolved["task_id"] == "tsk_1"
+
+
+@pytest.mark.asyncio
+async def test_reprompt_with_verification_code_calls_llm():
+    """When poll_otp_value returns a TOTP code, handle_potential_verification_code should
+    store the code in context, re-prompt the LLM with verification_code_check=False, and
+    return the LLM's new response."""
+    from skyvern.forge import agent as forge_agent_module
+
+    agent = ForgeAgent.__new__(ForgeAgent)
+
+    task = MagicMock()
+    task.organization_id = "org_1"
+    task.totp_verification_url = None
+    task.totp_identifier = None
+    task.task_id = "tsk_reprompt"
+    task.workflow_run_id = None
+    task.navigation_payload = None
+    task.llm_key = None
+
+    step = MagicMock()
+    step.step_id = "step_1"
+    step.order = 0
+
+    scraped_page = MagicMock()
+    scraped_page.screenshots = []
+    browser_state = MagicMock()
+    json_response = {
+        "should_enter_verification_code": True,
+        "place_to_enter_verification_code": "input#otp-code",
+        "actions": [],
+    }
+
+    llm_response = {"actions": [{"action_type": "input_text", "text": "999888"}]}
+
+    original_app_inst = object.__getattribute__(forge_agent_module.app, "_inst")
+    object.__setattr__(forge_agent_module.app, "_inst", MagicMock(LLM_API_HANDLER=AsyncMock()))
+    try:
+        with (
+            patch("skyvern.forge.agent.extract_totp_from_navigation_inputs", return_value=None),
+            patch("skyvern.forge.agent.try_generate_totp_from_credential", return_value=None),
+            patch(
+                "skyvern.forge.agent.poll_otp_value",
+                new_callable=AsyncMock,
+                return_value=OTPValue(value="999888", type=OTPType.TOTP),
+            ),
+            patch("skyvern.forge.agent.skyvern_context") as mock_skyvern_context,
+            patch("skyvern.forge.agent.service_utils.is_cua_task", new_callable=AsyncMock, return_value=False),
+            patch(
+                "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                return_value=AsyncMock(return_value=llm_response),
+            ),
+            patch.object(
+                agent,
+                "_build_extract_action_prompt",
+                new_callable=AsyncMock,
+                return_value=("prompt", False, "extract-actions"),
+            ) as mock_build,
+        ):
+            mock_context = MagicMock()
+            mock_context.totp_codes = {}
+            mock_skyvern_context.ensure_context.return_value = mock_context
+            mock_skyvern_context.current.return_value = mock_context
+
+            result = await agent.handle_potential_verification_code(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                browser_state=browser_state,
+                json_response=json_response,
+            )
+    finally:
+        object.__setattr__(forge_agent_module.app, "_inst", original_app_inst)
+
+    mock_build.assert_called_once()
+    _, kwargs = mock_build.call_args
+    assert kwargs["verification_code_check"] is False
+    assert mock_context.totp_codes["tsk_reprompt"] == "999888"
+    assert result == llm_response
 
 
 @pytest.mark.asyncio
