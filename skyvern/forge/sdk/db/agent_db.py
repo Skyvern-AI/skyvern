@@ -20,7 +20,7 @@ from sqlalchemy import (
     tuple_,
     update,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.exc import (
     SQLAlchemyError,
 )
@@ -56,6 +56,8 @@ from skyvern.forge.sdk.db.models import (
     OutputParameterModel,
     PersistentBrowserSessionModel,
     ScriptBlockModel,
+    ScriptBranchHitModel,
+    ScriptFallbackEpisodeModel,
     ScriptFileModel,
     ScriptModel,
     StepModel,
@@ -152,7 +154,15 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
 )
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, RunEngine, RunType
-from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile, ScriptStatus, WorkflowScript
+from skyvern.schemas.scripts import (
+    Script,
+    ScriptBlock,
+    ScriptBranchHit,
+    ScriptFallbackEpisode,
+    ScriptFile,
+    ScriptStatus,
+    WorkflowScript,
+)
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
@@ -1798,6 +1808,8 @@ class AgentDB(BaseAlchemyDB):
         run_with: str | None = None,
         ai_fallback: bool = False,
         cache_key: str | None = None,
+        adaptive_caching: bool = False,
+        generate_script_on_terminal: bool = False,
         run_sequentially: bool = False,
         sequential_key: str | None = None,
         folder_id: str | None = None,
@@ -1821,6 +1833,8 @@ class AgentDB(BaseAlchemyDB):
                 run_with=run_with,
                 ai_fallback=ai_fallback,
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
+                adaptive_caching=adaptive_caching,
+                generate_script_on_terminal=generate_script_on_terminal,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
                 folder_id=folder_id,
@@ -5960,6 +5974,24 @@ class AgentDB(BaseAlchemyDB):
             ).first()
             return convert_to_script(script) if script else None
 
+    async def get_latest_script_version(self, script_id: str, organization_id: str) -> Script | None:
+        """Get the latest version of a script by script_id."""
+        try:
+            async with self.Session() as session:
+                script = (
+                    await session.scalars(
+                        select(ScriptModel)
+                        .filter_by(script_id=script_id, organization_id=organization_id)
+                        .filter(ScriptModel.deleted_at.is_(None))
+                        .order_by(ScriptModel.version.desc())
+                        .limit(1)
+                    )
+                ).first()
+                return convert_to_script(script) if script else None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def create_script_file(
         self,
         script_revision_id: str,
@@ -6005,6 +6037,7 @@ class AgentDB(BaseAlchemyDB):
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
         input_fields: list[str] | None = None,
+        requires_agent: bool = False,
     ) -> ScriptBlock:
         """Create a script block."""
         async with self.Session() as session:
@@ -6018,6 +6051,7 @@ class AgentDB(BaseAlchemyDB):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 input_fields=input_fields,
+                requires_agent=requires_agent,
             )
             session.add(script_block)
             await session.commit()
@@ -6034,6 +6068,7 @@ class AgentDB(BaseAlchemyDB):
         workflow_run_block_id: str | None = None,
         clear_run_signature: bool = False,
         input_fields: list[str] | None = None,
+        requires_agent: bool | None = None,
     ) -> ScriptBlock:
         async with self.Session() as session:
             script_block = (
@@ -6056,6 +6091,8 @@ class AgentDB(BaseAlchemyDB):
                     script_block.workflow_run_block_id = workflow_run_block_id
                 if input_fields is not None:
                     script_block.input_fields = input_fields
+                if requires_agent is not None:
+                    script_block.requires_agent = requires_agent
                 await session.commit()
                 await session.refresh(script_block)
                 return convert_to_script_block(script_block)
@@ -6450,4 +6487,234 @@ class AgentDB(BaseAlchemyDB):
             raise
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    # ── Script Fallback Episode CRUD ──────────────────────────────────
+
+    async def create_fallback_episode(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_run_id: str,
+        block_label: str,
+        fallback_type: str,
+        script_revision_id: str | None = None,
+        error_message: str | None = None,
+        classify_result: str | None = None,
+        agent_actions: list | dict | None = None,
+        page_url: str | None = None,
+        page_text_snapshot: str | None = None,
+    ) -> ScriptFallbackEpisode:
+        try:
+            async with self.Session() as session:
+                episode = ScriptFallbackEpisodeModel(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_run_id=workflow_run_id,
+                    block_label=block_label,
+                    fallback_type=fallback_type,
+                    script_revision_id=script_revision_id,
+                    error_message=sanitize_postgres_text(error_message) if error_message else None,
+                    classify_result=sanitize_postgres_text(classify_result) if classify_result else None,
+                    agent_actions=agent_actions,
+                    page_url=sanitize_postgres_text(page_url) if page_url else None,
+                    page_text_snapshot=sanitize_postgres_text(page_text_snapshot) if page_text_snapshot else None,
+                )
+                session.add(episode)
+                await session.commit()
+                await session.refresh(episode)
+                return ScriptFallbackEpisode.model_validate(episode)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_unreviewed_episodes(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+        limit: int = 100,
+        script_revision_id: str | None = None,
+    ) -> list[ScriptFallbackEpisode]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ScriptFallbackEpisodeModel)
+                    .filter_by(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        reviewed=False,
+                    )
+                    .order_by(ScriptFallbackEpisodeModel.created_at.asc())
+                    .limit(limit)
+                )
+                if script_revision_id:
+                    query = query.filter_by(script_revision_id=script_revision_id)
+                episodes = (await session.scalars(query)).all()
+                return [ScriptFallbackEpisode.model_validate(e) for e in episodes]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def update_fallback_episode(
+        self,
+        episode_id: str,
+        organization_id: str,
+        agent_actions: list | dict | None = None,
+        fallback_succeeded: bool | None = None,
+    ) -> None:
+        try:
+            values: dict = {}
+            if agent_actions is not None:
+                values["agent_actions"] = agent_actions
+            if fallback_succeeded is not None:
+                values["fallback_succeeded"] = fallback_succeeded
+            if not values:
+                return
+            values["modified_at"] = datetime.utcnow()
+            async with self.Session() as session:
+                await session.execute(
+                    update(ScriptFallbackEpisodeModel)
+                    .where(ScriptFallbackEpisodeModel.episode_id == episode_id)
+                    .where(ScriptFallbackEpisodeModel.organization_id == organization_id)
+                    .values(**values)
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def delete_fallback_episode(
+        self,
+        episode_id: str,
+        organization_id: str,
+    ) -> None:
+        try:
+            async with self.Session() as session:
+                await session.execute(
+                    delete(ScriptFallbackEpisodeModel)
+                    .where(ScriptFallbackEpisodeModel.episode_id == episode_id)
+                    .where(ScriptFallbackEpisodeModel.organization_id == organization_id)
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def mark_episode_reviewed(
+        self,
+        episode_id: str,
+        organization_id: str,
+        reviewer_output: str | None = None,
+        new_script_revision_id: str | None = None,
+    ) -> None:
+        try:
+            async with self.Session() as session:
+                await session.execute(
+                    update(ScriptFallbackEpisodeModel)
+                    .where(ScriptFallbackEpisodeModel.episode_id == episode_id)
+                    .where(ScriptFallbackEpisodeModel.organization_id == organization_id)
+                    .values(
+                        reviewed=True,
+                        reviewer_output=sanitize_postgres_text(reviewer_output) if reviewer_output else None,
+                        new_script_revision_id=new_script_revision_id,
+                        modified_at=datetime.utcnow(),
+                    )
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_recent_reviewed_episodes(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+        limit: int = 20,
+    ) -> list[ScriptFallbackEpisode]:
+        """Return recently reviewed episodes for cross-run historical context.
+
+        These give the reviewer visibility into past failures and fixes so it can
+        avoid repeating the same mistakes.
+        """
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ScriptFallbackEpisodeModel)
+                    .filter_by(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        reviewed=True,
+                    )
+                    .order_by(ScriptFallbackEpisodeModel.created_at.desc())
+                    .limit(limit)
+                )
+                episodes = (await session.scalars(query)).all()
+                return [ScriptFallbackEpisode.model_validate(e) for e in episodes]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def record_branch_hit(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        block_label: str,
+        branch_key: str,
+    ) -> None:
+        """Record a classify branch hit, upserting the hit count and last_hit_at."""
+        now = datetime.utcnow()
+        try:
+            async with self.Session() as session:
+                stmt = insert(ScriptBranchHitModel).values(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    block_label=block_label,
+                    branch_key=branch_key,
+                    hit_count=1,
+                    first_hit_at=now,
+                    last_hit_at=now,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[
+                        "organization_id",
+                        "workflow_permanent_id",
+                        "block_label",
+                        "branch_key",
+                    ],
+                    set_={
+                        "hit_count": ScriptBranchHitModel.hit_count + 1,
+                        "last_hit_at": now,
+                    },
+                )
+                await session.execute(stmt)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError recording branch hit", exc_info=True)
+            raise
+
+    async def get_stale_branches(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        stale_days: int = 90,
+        limit: int = 200,
+    ) -> list[ScriptBranchHit]:
+        """Get branches that haven't been accessed in stale_days days."""
+        cutoff = datetime.utcnow() - timedelta(days=stale_days)
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ScriptBranchHitModel)
+                    .filter_by(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                    )
+                    .filter(ScriptBranchHitModel.last_hit_at < cutoff)
+                    .order_by(ScriptBranchHitModel.last_hit_at.asc())
+                    .limit(limit)
+                )
+                results = (await session.scalars(query)).all()
+                return [ScriptBranchHit.model_validate(r) for r in results]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
             raise

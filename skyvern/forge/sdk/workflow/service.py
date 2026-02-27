@@ -2032,6 +2032,8 @@ class WorkflowService:
         run_sequentially: bool = False,
         sequential_key: str | None = None,
         folder_id: str | None = None,
+        adaptive_caching: bool = False,
+        generate_script_on_terminal: bool = False,
     ) -> Workflow:
         try:
             return await app.DATABASE.create_workflow(
@@ -2057,6 +2059,8 @@ class WorkflowService:
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
                 folder_id=folder_id,
+                adaptive_caching=adaptive_caching,
+                generate_script_on_terminal=generate_script_on_terminal,
             )
         except IntegrityError as e:
             if "uc_org_permanent_id_version" in str(e) and workflow_permanent_id:
@@ -3636,6 +3640,7 @@ class WorkflowService:
                     run_sequentially=request.run_sequentially,
                     sequential_key=request.sequential_key,
                     folder_id=existing_latest_workflow.folder_id,
+                    adaptive_caching=request.adaptive_caching,
                 )
             else:
                 # NOTE: it's only potential, as it may be immediately deleted!
@@ -3660,6 +3665,7 @@ class WorkflowService:
                     run_sequentially=request.run_sequentially,
                     sequential_key=request.sequential_key,
                     folder_id=request.folder_id,
+                    adaptive_caching=request.adaptive_caching,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = potential_workflow.workflow_id
