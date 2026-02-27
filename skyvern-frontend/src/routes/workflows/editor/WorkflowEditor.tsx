@@ -42,7 +42,9 @@ function WorkflowEditor() {
   if (isLoading || isGlobalWorkflowsLoading) {
     return (
       <div className="flex h-screen w-full items-center justify-center">
-        <LogoMinimized />
+        <div className="animate-pulse">
+          <LogoMinimized />
+        </div>
       </div>
     );
   }

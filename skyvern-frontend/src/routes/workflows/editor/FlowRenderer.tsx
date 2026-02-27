@@ -1,3 +1,4 @@
+import { LogoMinimized } from "@/components/LogoMinimized";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -860,7 +861,7 @@ function FlowRenderer({
 
   return (
     <div
-      className={cn("h-full w-full", {
+      className={cn("relative h-full w-full", {
         "react-flow--pre-layout": layoutPhase === "pre-layout",
         "react-flow--initial-load":
           layoutPhase === "initial-load" || layoutPhase === "pre-layout",
@@ -868,6 +869,13 @@ function FlowRenderer({
       style={{ zIndex }}
       onMouseDownCapture={() => onMouseDownCapture?.()}
     >
+      {layoutPhase === "pre-layout" && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-950">
+          <div className="animate-pulse">
+            <LogoMinimized />
+          </div>
+        </div>
+      )}
       <Dialog
         open={blocker.state === "blocked"}
         onOpenChange={(open) => {
