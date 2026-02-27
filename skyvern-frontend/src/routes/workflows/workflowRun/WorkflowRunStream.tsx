@@ -1,7 +1,7 @@
 import { Status } from "@/api/types";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { ZoomableImage } from "@/components/ZoomableImage";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useFirstParam } from "@/hooks/useFirstParam";
@@ -10,16 +10,16 @@ import { toast } from "@/components/ui/use-toast";
 import { useQueryClient } from "@tanstack/react-query";
 
 type StreamMessage = {
-  task_id: string;
+  task_id?: string;
+  workflow_run_id?: string;
   status: string;
   screenshot?: string;
+  format?: string;
 };
 
 interface Props {
   alwaysShowStream?: boolean;
 }
-
-let socket: WebSocket | null = null;
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
 
@@ -28,6 +28,7 @@ function WorkflowRunStream(props?: Props) {
   const workflowRunId = useFirstParam("workflowRunId", "runId");
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
+  const [streamFormat, setStreamFormat] = useState<string>("png");
   const showStream =
     alwaysShowStream || (workflowRun && statusIsNotFinalized(workflowRun));
   const credentialGetter = useCredentialGetter();
@@ -35,40 +36,45 @@ function WorkflowRunStream(props?: Props) {
   const workflowPermanentId = workflow?.workflow_permanent_id;
   const queryClient = useQueryClient();
 
+  const socketRef = useRef<WebSocket | null>(null);
+
   useEffect(() => {
     if (!showStream) {
       return;
     }
 
     async function run() {
-      // Create WebSocket connection.
-      let credential = null;
+      let credentialParam: string;
       if (credentialGetter) {
         const token = await credentialGetter();
-        credential = `?token=Bearer ${token}`;
+        credentialParam = `token=Bearer ${token}`;
       } else {
         const apiKey = getRuntimeApiKey();
-        credential = apiKey ? `?apikey=${apiKey}` : "";
+        credentialParam = apiKey ? `apikey=${apiKey}` : "";
       }
-      if (socket) {
-        socket.close();
+
+      if (socketRef.current) {
+        socketRef.current.close();
       }
-      socket = new WebSocket(
-        `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}${credential}`,
+      socketRef.current = new WebSocket(
+        `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}?${credentialParam}`,
       );
-      // Listen for messages
-      socket.addEventListener("message", (event) => {
+
+      socketRef.current.addEventListener("message", (event) => {
         try {
           const message: StreamMessage = JSON.parse(event.data);
           if (message.screenshot) {
             setStreamImgSrc(message.screenshot);
+          }
+          if (message.format) {
+            setStreamFormat(message.format);
           }
           if (
             message.status === "completed" ||
             message.status === "failed" ||
             message.status === "terminated"
           ) {
-            socket?.close();
+            socketRef.current?.close();
             queryClient.invalidateQueries({
               queryKey: ["workflowRuns"],
             });
@@ -109,16 +115,16 @@ function WorkflowRunStream(props?: Props) {
         }
       });
 
-      socket.addEventListener("close", () => {
-        socket = null;
+      socketRef.current.addEventListener("close", () => {
+        socketRef.current = null;
       });
     }
     run();
 
     return () => {
-      if (socket) {
-        socket.close();
-        socket = null;
+      if (socketRef.current) {
+        socketRef.current.close();
+        socketRef.current = null;
       }
     };
   }, [
@@ -158,7 +164,7 @@ function WorkflowRunStream(props?: Props) {
     return (
       <div className="h-full w-full">
         <ZoomableImage
-          src={`data:image/png;base64,${streamImgSrc}`}
+          src={`data:image/${streamFormat};base64,${streamImgSrc}`}
           className="rounded-md"
         />
       </div>
@@ -170,7 +176,7 @@ function WorkflowRunStream(props?: Props) {
       return (
         <div className="h-full w-full">
           <ZoomableImage
-            src={`data:image/png;base64,${streamImgSrc}`}
+            src={`data:image/${streamFormat};base64,${streamImgSrc}`}
             className="rounded-md"
           />
         </div>

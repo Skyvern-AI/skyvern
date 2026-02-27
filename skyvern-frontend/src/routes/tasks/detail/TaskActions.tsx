@@ -13,7 +13,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   statusIsFinalized,
   statusIsNotFinalized,
@@ -33,9 +33,8 @@ type StreamMessage = {
   task_id: string;
   status: string;
   screenshot?: string;
+  format?: string;
 };
-
-let socket: WebSocket | null = null;
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
 
@@ -43,6 +42,8 @@ function TaskActions() {
   const taskId = useFirstParam("taskId", "runId");
   const credentialGetter = useCredentialGetter();
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
+  const [streamFormat, setStreamFormat] = useState<string>("png");
+  const socketRef = useRef<WebSocket | null>(null);
   const [selectedAction, setSelectedAction] = useState<
     number | "stream" | null
   >(null);
@@ -81,34 +82,37 @@ function TaskActions() {
     }
 
     async function run() {
-      // Create WebSocket connection.
-      let credential = null;
+      let credentialParam: string;
       if (credentialGetter) {
         const token = await credentialGetter();
-        credential = `?token=Bearer ${token}`;
+        credentialParam = `token=Bearer ${token}`;
       } else {
         const apiKey = getRuntimeApiKey();
-        credential = apiKey ? `?apikey=${apiKey}` : "";
+        credentialParam = apiKey ? `apikey=${apiKey}` : "";
       }
-      if (socket) {
-        socket.close();
+
+      if (socketRef.current) {
+        socketRef.current.close();
       }
-      socket = new WebSocket(
-        `${wssBaseUrl}/stream/tasks/${taskId}${credential}`,
+      socketRef.current = new WebSocket(
+        `${wssBaseUrl}/stream/tasks/${taskId}?${credentialParam}`,
       );
-      // Listen for messages
-      socket.addEventListener("message", (event) => {
+
+      socketRef.current.addEventListener("message", (event) => {
         try {
           const message: StreamMessage = JSON.parse(event.data);
           if (message.screenshot) {
             setStreamImgSrc(message.screenshot);
+          }
+          if (message.format) {
+            setStreamFormat(message.format);
           }
           if (
             message.status === "completed" ||
             message.status === "failed" ||
             message.status === "terminated"
           ) {
-            socket?.close();
+            socketRef.current?.close();
             queryClient.invalidateQueries({
               queryKey: ["tasks"],
             });
@@ -134,16 +138,16 @@ function TaskActions() {
         }
       });
 
-      socket.addEventListener("close", () => {
-        socket = null;
+      socketRef.current.addEventListener("close", () => {
+        socketRef.current = null;
       });
     }
     run();
 
     return () => {
-      if (socket) {
-        socket.close();
-        socket = null;
+      if (socketRef.current) {
+        socketRef.current.close();
+        socketRef.current = null;
       }
     };
   }, [
@@ -257,7 +261,9 @@ function TaskActions() {
     if (task?.status === Status.Running && streamImgSrc.length > 0) {
       return (
         <div className="h-full w-full">
-          <ZoomableImage src={`data:image/png;base64,${streamImgSrc}`} />
+          <ZoomableImage
+            src={`data:image/${streamFormat};base64,${streamImgSrc}`}
+          />
         </div>
       );
     }

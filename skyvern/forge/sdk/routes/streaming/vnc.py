@@ -96,6 +96,15 @@ async def stream(
         LOG.info("Authentication failed.", task_id=task_id, workflow_run_id=workflow_run_id)
         return
 
+    if settings.ENV == "local":
+        LOG.info(
+            "VNC not available in local mode, closing with 4001.",
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+        )
+        await websocket.close(code=4001, reason="vnc-not-available")
+        return
+
     vnc_channel: VncChannel
     loops: Loops
 

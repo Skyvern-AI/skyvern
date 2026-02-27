@@ -1576,11 +1576,14 @@ function Workspace({
                   </div>
                 )}
 
-                {/* Screenshot browser} */}
+                {/* Screenshot browser (CDP screencast) */}
                 {activeDebugSession &&
                   !activeDebugSession.vnc_streaming_supported && (
                     <div className="skyvern-screenshot-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                      <div className="flex w-full flex-1 items-center justify-center">
+                      <div
+                        key={reloadKey}
+                        className="flex w-full flex-1 items-center justify-center"
+                      >
                         <div className="aspect-video w-full">
                           <WorkflowRunStream alwaysShowStream={true} />
                         </div>
@@ -1591,6 +1594,24 @@ function Workspace({
                           messageCount={copilotMessageCount}
                           onClick={() => setIsCopilotOpen((prev) => !prev)}
                         />
+                        <div className="flex items-center gap-2">
+                          <GlobeIcon /> Live Browser
+                        </div>
+                        <div
+                          className={cn("ml-auto flex items-center gap-2", {
+                            "mr-16": !blockLabel,
+                          })}
+                        >
+                          {!recordingStore.isRecording && showPowerButton && (
+                            <PowerButton onClick={() => cycle()} />
+                          )}
+                          {!recordingStore.isRecording && (
+                            <ReloadButton
+                              isReloading={isReloading}
+                              onClick={() => reload()}
+                            />
+                          )}
+                        </div>
                       </footer>
                     </div>
                   )}

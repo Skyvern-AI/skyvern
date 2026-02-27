@@ -22,7 +22,7 @@ import {
 } from "./workflowTimelineUtils";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 export type ActionItem = {
   block: WorkflowRunBlock;
@@ -40,6 +40,7 @@ function WorkflowRunOverview() {
   const [searchParams] = useSearchParams();
   const active = searchParams.get("active");
   const queryClient = useQueryClient();
+  const [vncFailed, setVncFailed] = useState(false);
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useWorkflowRunWithWorkflowQuery();
 
@@ -49,6 +50,8 @@ function WorkflowRunOverview() {
   const workflowRunId = workflowRun?.workflow_run_id;
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
+
+  const browserSessionId = workflowRun?.browser_session_id;
 
   const invalidateQueries = useCallback(() => {
     if (workflowRunId) {
@@ -62,6 +65,15 @@ function WorkflowRunOverview() {
       queryClient.invalidateQueries({ queryKey: ["runs"] });
     }
   }, [queryClient, workflowPermanentId, workflowRunId]);
+
+  const handleVncClose = useCallback(() => {
+    setVncFailed(true);
+    invalidateQueries();
+  }, [invalidateQueries]);
+
+  useEffect(() => {
+    setVncFailed(false);
+  }, [browserSessionId]);
 
   if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
     return (
@@ -89,19 +101,10 @@ function WorkflowRunOverview() {
     finallyBlockLabel,
   );
 
-  const browserSessionId = workflowRun.browser_session_id;
-
   const isPaused =
     workflowRun && workflowRun.status === WorkflowRunStatus.Paused;
 
-  const showStreamingBrowser =
-    (!workflowRunIsFinalized &&
-      browserSessionId &&
-      isWorkflowRunBlock(selection) &&
-      selection.block_type === "human_interaction") ||
-    selection === "stream";
-
-  const shouldShowBrowserStream = !!(
+  const wantsVncStream = !!(
     browserSessionId &&
     !workflowRunIsFinalized &&
     (selection === "stream" ||
@@ -109,31 +112,38 @@ function WorkflowRunOverview() {
         selection.block_type === "human_interaction"))
   );
 
+  const shouldShowBrowserStream = wantsVncStream && !vncFailed;
+  const shouldShowScreencastFallback = wantsVncStream && vncFailed;
+
+  const isStreamActive =
+    shouldShowBrowserStream ||
+    shouldShowScreencastFallback ||
+    selection === "stream";
+
   return (
     <AspectRatio ratio={16 / 9}>
       {shouldShowBrowserStream && (
         <BrowserStream
           key={browserSessionId}
-          browserSessionId={browserSessionId}
+          browserSessionId={browserSessionId!}
           interactive={isPaused}
           showControlButtons={isPaused}
           workflow={undefined}
-          onClose={invalidateQueries}
+          onClose={handleVncClose}
         />
       )}
-      {!shouldShowBrowserStream && selection === "stream" && (
-        <WorkflowRunStream />
-      )}
-      {selection !== "stream" &&
-        !showStreamingBrowser &&
-        isAction(selection) && (
-          <ActionScreenshot
-            artifactId={selection.screenshot_artifact_id ?? undefined}
-            index={selection.action_order ?? 0}
-            stepId={selection.step_id ?? ""}
-          />
+      {!shouldShowBrowserStream &&
+        (shouldShowScreencastFallback || selection === "stream") && (
+          <WorkflowRunStream />
         )}
-      {isWorkflowRunBlock(selection) && !showStreamingBrowser && (
+      {!isStreamActive && isAction(selection) && (
+        <ActionScreenshot
+          artifactId={selection.screenshot_artifact_id ?? undefined}
+          index={selection.action_order ?? 0}
+          stepId={selection.step_id ?? ""}
+        />
+      )}
+      {isWorkflowRunBlock(selection) && !isStreamActive && (
         <WorkflowRunBlockScreenshot
           workflowRunBlockId={resolveScreenshotBlockId(
             workflowRunTimeline,
