@@ -72,7 +72,10 @@ function WorkflowEditor() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
-    runWith: workflow.run_with,
+    runWith:
+      workflow.adaptive_caching && workflow.run_with === "code"
+        ? "code_v2"
+        : workflow.run_with,
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
     runSequentially: workflow.run_sequentially ?? false,
