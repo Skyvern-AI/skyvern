@@ -573,6 +573,20 @@ async def delete_workflow_cache_key_value(
     if not deleted:
         raise HTTPException(status_code=404, detail="Cache key value not found")
 
+    # Clear in-memory cache so stale entries aren't served after deletion
+    cache_cleared_count = workflow_script_service.clear_workflow_script_cache(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    LOG.info(
+        "Deleted workflow cache key value",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=cache_key_value,
+        cache_cleared_count=cache_cleared_count,
+    )
+
     return {"message": "Cache key value deleted successfully"}
 
 
