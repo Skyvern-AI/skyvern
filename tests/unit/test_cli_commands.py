@@ -403,6 +403,7 @@ class TestWorkflowCommands:
             proxy="RESIDENTIAL",
             wait=True,
             timeout=450,
+            run_with=None,
             json_output=True,
         )
 
@@ -414,6 +415,7 @@ class TestWorkflowCommands:
             "proxy_location": "RESIDENTIAL",
             "wait": True,
             "timeout_seconds": 450,
+            "run_with": None,
         }
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is True
