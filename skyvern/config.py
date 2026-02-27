@@ -427,12 +427,12 @@ class Settings(BaseSettings):
     in minutes.
     """
 
-    DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES: int = 5
+    DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES: int = 10
     """
-    If there are `DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES` or more minutes left
-    in the persistent browser session (`started_at` + `timeout_minutes`), then
-    the `timeout_minutes` of the persistent browser session can be extended.
-    Otherwise we'll consider the persistent browser session to be expired.
+    Threshold for browser session timeout extension.
+    - V1 (OSS): extends when remaining >= threshold, raises if below (expired).
+    - V2 (cloud): extends when remaining <= threshold, no-ops if above (plenty of time).
+    Set to 10 minutes so that a 5-minute renewal loop gets 2+ attempts before expiry.
     """
 
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
