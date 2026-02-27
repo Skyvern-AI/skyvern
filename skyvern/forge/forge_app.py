@@ -71,6 +71,8 @@ class ForgeApp:
     AUTO_COMPLETION_LLM_API_HANDLER: LLMAPIHandler
     SVG_CSS_CONVERTER_LLM_API_HANDLER: LLMAPIHandler | None
     SCRIPT_GENERATION_LLM_API_HANDLER: LLMAPIHandler
+    SCRIPT_REVIEWER_LLM_API_HANDLER: LLMAPIHandler
+    ADAPTIVE_SCRIPT_GEN_LLM_API_HANDLER: LLMAPIHandler
     WORKFLOW_CONTEXT_MANAGER: WorkflowContextManager
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
@@ -198,6 +200,16 @@ def create_forge_app() -> ForgeApp:
         LLMAPIHandlerFactory.get_llm_api_handler(settings.SCRIPT_GENERATION_LLM_KEY)
         if settings.SCRIPT_GENERATION_LLM_KEY
         else app.SECONDARY_LLM_API_HANDLER
+    )
+    app.SCRIPT_REVIEWER_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.SCRIPT_REVIEWER_LLM_KEY)
+        if settings.SCRIPT_REVIEWER_LLM_KEY
+        else app.LLM_API_HANDLER
+    )
+    app.ADAPTIVE_SCRIPT_GEN_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY)
+        if settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY
+        else app.LLM_API_HANDLER
     )
 
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()

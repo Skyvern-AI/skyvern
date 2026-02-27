@@ -181,6 +181,8 @@ class Settings(BaseSettings):
     CHECK_USER_GOAL_LLM_KEY: str | None = None
     AUTO_COMPLETION_LLM_KEY: str | None = None
     SCRIPT_GENERATION_LLM_KEY: str | None = None
+    SCRIPT_REVIEWER_LLM_KEY: str | None = None
+    ADAPTIVE_SCRIPT_GEN_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
