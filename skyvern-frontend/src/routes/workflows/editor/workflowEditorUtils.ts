@@ -47,6 +47,7 @@ import {
   FileUploadBlockYAML,
   HttpRequestBlockYAML,
   PrintPageBlockYAML,
+  WorkflowTriggerBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -131,6 +132,10 @@ import {
   validateJson,
 } from "./nodes/HttpRequestNode/httpValidation";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
+import {
+  isWorkflowTriggerNode,
+  workflowTriggerNodeDefaultData,
+} from "./nodes/WorkflowTriggerNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -915,6 +920,22 @@ function convertToNode(
           format: block.format ?? "A4",
           landscape: block.landscape ?? false,
           printBackground: block.print_background ?? true,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "workflow_trigger": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "workflowTrigger",
+        data: {
+          ...commonData,
+          workflowPermanentId: block.workflow_permanent_id ?? "",
+          payload: JSON.stringify(block.payload || {}, null, 2),
+          waitForCompletion: block.wait_for_completion ?? true,
+          browserSessionId: block.browser_session_id ?? "",
+          useParentBrowserSession: block.use_parent_browser_session ?? false,
           parameterKeys: block.parameters.map((p) => p.key),
         },
       };
@@ -1970,6 +1991,17 @@ function createNode(
         },
       };
     }
+    case "workflowTrigger": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "workflowTrigger",
+        data: {
+          ...workflowTriggerNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "conditional": {
       const branches = createDefaultBranchConditions();
       return {
@@ -2448,6 +2480,25 @@ function getWorkflowBlock(
         format: node.data.format,
         landscape: node.data.landscape,
         print_background: node.data.printBackground,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "workflowTrigger": {
+      const parsedPayload = JSONParseSafe(node.data.payload) as Record<
+        string,
+        unknown
+      > | null;
+      return {
+        ...base,
+        block_type: "workflow_trigger",
+        workflow_permanent_id: node.data.workflowPermanentId,
+        payload:
+          parsedPayload && Object.keys(parsedPayload).length > 0
+            ? parsedPayload
+            : null,
+        wait_for_completion: node.data.waitForCompletion,
+        browser_session_id: node.data.browserSessionId || null,
+        use_parent_browser_session: node.data.useParentBrowserSession,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -3872,6 +3923,19 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "workflow_trigger": {
+        const blockYaml: WorkflowTriggerBlockYAML = {
+          ...base,
+          block_type: "workflow_trigger",
+          workflow_permanent_id: block.workflow_permanent_id,
+          payload: block.payload,
+          wait_for_completion: block.wait_for_completion,
+          browser_session_id: block.browser_session_id,
+          use_parent_browser_session: block.use_parent_browser_session,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
     }
   });
 }
@@ -4094,6 +4158,17 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
         errors.push(`${node.data.label}: ${name} is not valid JSON.`);
       }
     });
+  });
+
+  const workflowTriggerNodes = nodes.filter(isWorkflowTriggerNode);
+  workflowTriggerNodes.forEach((node) => {
+    if (!node.data.workflowPermanentId.trim()) {
+      errors.push(`${node.data.label}: Workflow Permanent ID is required.`);
+    }
+    const payloadResult = validateJson(node.data.payload);
+    if (!payloadResult.valid && payloadResult.message) {
+      errors.push(`${node.data.label}: Payload is not valid JSON.`);
+    }
   });
 
   return errors;
