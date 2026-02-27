@@ -1,3 +1,4 @@
+import { useCallback, useEffect } from "react";
 import {
   Accordion,
   AccordionContent,
@@ -10,19 +11,19 @@ import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { NodeHeader } from "../components/NodeHeader";
 import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import type { WorkflowTriggerNode as WorkflowTriggerNodeType } from "./types";
+import { isConcreteWpid } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowSelector } from "./WorkflowSelector";
+import { PayloadParameterFields } from "./PayloadParameterFields";
+import { useTargetWorkflowParametersQuery } from "./useTargetWorkflowParametersQuery";
 import { AppNode } from "..";
 import {
   getAvailableOutputParameterKeys,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
-import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { JsonValidator } from "@/routes/workflows/editor/nodes/HttpRequestNode/HttpUtils";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
@@ -32,9 +33,9 @@ import { cn } from "@/util/utils";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 
 const workflowPermanentIdTooltip =
-  "The permanent ID (wpid_xxx) of the workflow to trigger. You can use {{ parameter_name }} to reference parameters.";
+  "Select the workflow to trigger when this block runs.";
 const payloadTooltip =
-  'JSON payload to pass as parameters to the triggered workflow. Values support Jinja2 templates. Example: {"url": "{{ some_parameter }}"}';
+  "Parameters to pass to the triggered workflow. Values support Jinja2 templates like {{ some_parameter }}.";
 const waitForCompletionTooltip =
   "If enabled, this block will wait for the triggered workflow to complete before continuing to the next block. If disabled, the workflow is triggered asynchronously and execution continues immediately.";
 const useParentBrowserSessionTooltip =
@@ -44,7 +45,7 @@ const browserSessionIdTooltip =
 
 function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
   const { editable, label } = data;
-  const { blockLabel: urlBlockLabel } = useParams();
+  const { blockLabel: urlBlockLabel, workflowPermanentId } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
@@ -52,8 +53,6 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
-
   const nodes = useNodes<AppNode>();
   const isInsideForLoop = isNodeInsideForLoop(nodes, id);
   const edges = useEdges();
@@ -65,6 +64,28 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
 
   const update = useUpdate<WorkflowTriggerNodeType["data"]>({ id, editable });
   const recordingStore = useRecordingStore();
+
+  const {
+    workflowParameters,
+    isLoading: isLoadingParams,
+    workflowTitle: fetchedTitle,
+  } = useTargetWorkflowParametersQuery(data.workflowPermanentId);
+
+  // Hydrate title from fetched workflow data (single API call, no duplicate)
+  useEffect(() => {
+    if (fetchedTitle && fetchedTitle !== data.workflowTitle) {
+      update({ workflowTitle: fetchedTitle });
+    }
+  }, [fetchedTitle, data.workflowTitle, update]);
+
+  const hasWorkflowSelected = isConcreteWpid(data.workflowPermanentId);
+
+  const handleTitleChange = useCallback(
+    (title: string) => {
+      update({ workflowTitle: title });
+    },
+    [update],
+  );
 
   return (
     <div
@@ -104,45 +125,43 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
         />
         <div className="space-y-4">
           <div className="space-y-2">
-            <div className="flex justify-between">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
-                  Target Workflow
-                </Label>
-                <HelpTooltip content={workflowPermanentIdTooltip} />
-              </div>
-              {isFirstWorkflowBlock ? (
-                <div className="flex justify-end text-xs text-slate-400">
-                  Tip: Use the {"+"} button to add parameters!
-                </div>
-              ) : null}
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">Target Workflow</Label>
+              <HelpTooltip content={workflowPermanentIdTooltip} />
             </div>
             <WorkflowSelector
               nodeId={id}
               value={data.workflowPermanentId}
               onChange={(value) => {
-                update({ workflowPermanentId: value });
+                if (value === data.workflowPermanentId) return;
+                update({ workflowPermanentId: value, payload: "{}" });
               }}
+              workflowTitle={data.workflowTitle}
+              onTitleChange={handleTitleChange}
+              excludeWorkflowPermanentId={workflowPermanentId}
             />
           </div>
           <Separator />
-          <div className="space-y-2">
+          <div className="space-y-4">
             <div className="flex gap-2">
               <Label className="text-xs text-slate-300">Payload</Label>
               <HelpTooltip content={payloadTooltip} />
             </div>
-            <CodeEditor
-              language="json"
-              value={data.payload}
-              onChange={(value) => {
-                update({ payload: value });
-              }}
-              className="nowheel nopan"
-              fontSize={11}
-              minHeight="80px"
-              maxHeight="200px"
-            />
-            <JsonValidator value={data.payload} />
+            {hasWorkflowSelected ? (
+              <PayloadParameterFields
+                parameters={workflowParameters}
+                payload={data.payload}
+                onChange={(value) => {
+                  update({ payload: value });
+                }}
+                nodeId={id}
+                isLoading={isLoadingParams}
+              />
+            ) : (
+              <p className="text-xs text-slate-500">
+                Select a target workflow to configure its input parameters here.
+              </p>
+            )}
           </div>
           <Separator />
           <Accordion type="single" collapsible>
