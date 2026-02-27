@@ -142,7 +142,8 @@ export type BlockYAML =
   | Taskv2BlockYAML
   | URLBlockYAML
   | HttpRequestBlockYAML
-  | PrintPageBlockYAML;
+  | PrintPageBlockYAML
+  | WorkflowTriggerBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -414,5 +415,15 @@ export type PrintPageBlockYAML = BlockYAMLBase & {
   format: string;
   landscape: boolean;
   print_background: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type WorkflowTriggerBlockYAML = BlockYAMLBase & {
+  block_type: "workflow_trigger";
+  workflow_permanent_id: string;
+  payload: Record<string, unknown> | null;
+  wait_for_completion: boolean;
+  browser_session_id?: string | null;
+  use_parent_browser_session?: boolean;
   parameter_keys?: Array<string> | null;
 };

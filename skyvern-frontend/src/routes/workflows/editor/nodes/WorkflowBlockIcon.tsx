@@ -14,6 +14,7 @@ import {
   LockOpen1Icon,
   StopwatchIcon,
   UpdateIcon,
+  Share1Icon,
   UploadIcon,
 } from "@radix-ui/react-icons";
 import { ExtractIcon } from "@/components/icons/ExtractIcon";
@@ -93,6 +94,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "print_page": {
       return <FileTextIcon className={className} />;
+    }
+    case "workflow_trigger": {
+      return <Share1Icon className={className} />;
     }
   }
 }

@@ -224,6 +224,7 @@ def workflow_run(
         max=3600,
         help="Max wait time in seconds when --wait is set.",
     ),
+    run_with: str | None = typer.Option(None, "--run-with", help="Execution mode (e.g., 'code' for cached script)."),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Run a workflow."""
@@ -238,6 +239,7 @@ def workflow_run(
             proxy_location=proxy,
             wait=wait,
             timeout_seconds=timeout,
+            run_with=run_with,
         )
 
     _run_tool(_run, json_output=json_output, hint_on_exception="Check the workflow ID and run parameters.")
