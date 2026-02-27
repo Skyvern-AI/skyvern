@@ -3964,6 +3964,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
     run_with: workflow.run_with,
+    adaptive_caching: workflow.adaptive_caching ?? undefined,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
     run_sequentially: workflow.run_sequentially ?? undefined,

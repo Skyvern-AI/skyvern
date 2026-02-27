@@ -3,14 +3,8 @@ import { useParams } from "react-router-dom";
 
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { type Recording } from "@/routes/workflows/types/browserSessionTypes";
 import { artifactApiBaseUrl } from "@/util/env";
-
-interface Recording {
-  url: string;
-  checksum: string;
-  filename: string;
-  modified_at: string;
-}
 
 function getRecordingUrl(url: string | null | undefined): string | null {
   if (!url) {
