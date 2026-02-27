@@ -41,6 +41,7 @@ from skyvern.forge.sdk.db.id import (
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
     generate_script_block_id,
+    generate_script_fallback_episode_id,
     generate_script_file_id,
     generate_script_id,
     generate_script_revision_id,
@@ -282,6 +283,8 @@ class WorkflowModel(Base):
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     ai_fallback = Column(Boolean, default=False, nullable=False)
     cache_key = Column(String, nullable=True)
+    adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    generate_script_on_terminal = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     run_sequentially = Column(Boolean, nullable=True)
     sequential_key = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("folders.folder_id", ondelete="SET NULL"), nullable=True)
@@ -1094,6 +1097,7 @@ class ScriptBlockModel(Base):
     workflow_run_id = Column(String, nullable=True)
     workflow_run_block_id = Column(String, nullable=True)
     input_fields = Column(JSON, nullable=True)
+    requires_agent = Column(Boolean, nullable=False, server_default=sqlalchemy.false())
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1137,3 +1141,56 @@ class WorkflowCopilotChatMessageModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
+
+
+class ScriptFallbackEpisodeModel(Base):
+    __tablename__ = "script_fallback_episodes"
+    __table_args__ = (
+        Index("sfe_org_wpid_index", "organization_id", "workflow_permanent_id"),
+        Index("sfe_org_created_at_index", "organization_id", "created_at"),
+    )
+
+    episode_id = Column(String, primary_key=True, default=generate_script_fallback_episode_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    script_revision_id = Column(String, nullable=True)
+    block_label = Column(String, nullable=False)
+    fallback_type = Column(String, nullable=False)  # "element", "full_block", or "conditional_agent"
+    error_message = Column(UnicodeText, nullable=True)
+    classify_result = Column(String, nullable=True)
+    agent_actions = Column(JSON, nullable=True)
+    page_url = Column(String, nullable=True)
+    page_text_snapshot = Column(UnicodeText, nullable=True)
+    fallback_succeeded = Column(Boolean, nullable=True)  # None for legacy/element episodes
+    reviewed = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    reviewer_output = Column(UnicodeText, nullable=True)
+    new_script_revision_id = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class ScriptBranchHitModel(Base):
+    """Tracks which classify branches are accessed during cached script execution.
+
+    Used for TTL-based branch pruning — branches not accessed for a long time
+    can be removed by the script reviewer.
+    """
+
+    __tablename__ = "script_branch_hits"
+    __table_args__ = (Index("sbh_org_wpid_index", "organization_id", "workflow_permanent_id"),)
+
+    organization_id = Column(String, primary_key=True)
+    workflow_permanent_id = Column(String, primary_key=True)
+    block_label = Column(String, primary_key=True)
+    branch_key = Column(String, primary_key=True)  # The classify result string (e.g., "success", "error")
+
+    hit_count = Column(Integer, default=1, nullable=False)
+    first_hit_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    last_hit_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

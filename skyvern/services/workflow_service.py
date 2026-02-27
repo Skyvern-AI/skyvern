@@ -24,6 +24,7 @@ async def prepare_workflow(
     request_id: str | None = None,
     debug_session_id: str | None = None,
     code_gen: bool | None = None,
+    parent_workflow_run_id: str | None = None,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -42,6 +43,7 @@ async def prepare_workflow(
         is_template_workflow=template,
         debug_session_id=debug_session_id,
         code_gen=code_gen,
+        parent_workflow_run_id=parent_workflow_run_id,
     )
 
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
@@ -76,6 +78,7 @@ async def run_workflow(
     background_tasks: BackgroundTasks | None = None,
     block_labels: list[str] | None = None,
     block_outputs: dict[str, t.Any] | None = None,
+    parent_workflow_run_id: str | None = None,
 ) -> WorkflowRun:
     workflow_run = await prepare_workflow(
         workflow_id=workflow_id,
@@ -85,6 +88,7 @@ async def run_workflow(
         version=version,
         max_steps=max_steps,
         request_id=request_id,
+        parent_workflow_run_id=parent_workflow_run_id,
     )
 
     await AsyncExecutorFactory.get_executor().execute_workflow(

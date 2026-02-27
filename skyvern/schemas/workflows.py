@@ -1017,6 +1017,8 @@ class WorkflowCreateYAMLRequest(BaseModel):
     run_with: str | None = None
     ai_fallback: bool = False
     cache_key: str | None = "default"
+    adaptive_caching: bool = False
+    generate_script_on_terminal: bool = False
     run_sequentially: bool = False
     sequential_key: str | None = None
     folder_id: str | None = None

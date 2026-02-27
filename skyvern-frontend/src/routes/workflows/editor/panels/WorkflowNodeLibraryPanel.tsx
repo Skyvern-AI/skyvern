@@ -262,6 +262,17 @@ const nodeLibraryItems: Array<{
     title: "Print Page Block",
     description: "Print current page to PDF",
   },
+  {
+    nodeType: "workflowTrigger",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.WorkflowTrigger}
+        className="size-6"
+      />
+    ),
+    title: "Workflow Trigger Block",
+    description: "Trigger another workflow",
+  },
 ];
 
 type Props = {
