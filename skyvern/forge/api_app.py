@@ -91,6 +91,12 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         except Exception:
             LOG.exception("Failed to execute api app startup event")
 
+    # Close browser sessions left active by a previous process
+    try:
+        await forge_app.PERSISTENT_SESSIONS_MANAGER.cleanup_stale_sessions()
+    except Exception:
+        LOG.exception("Failed to clean up stale browser sessions")
+
     # Start cleanup scheduler if enabled
     cleanup_task = start_cleanup_scheduler()
     if cleanup_task:

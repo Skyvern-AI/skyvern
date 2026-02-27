@@ -1,4 +1,5 @@
 import json
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
@@ -5279,6 +5280,7 @@ class AgentDB(BaseAlchemyDB):
                     if persistent_browser_session.completed_at:
                         return PersistentBrowserSession.model_validate(persistent_browser_session)
                     persistent_browser_session.completed_at = datetime.utcnow()
+                    persistent_browser_session.status = "completed"
                     await session.commit()
                     await session.refresh(persistent_browser_session)
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
@@ -5293,11 +5295,54 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def archive_browser_session_address(self, session_id: str, organization_id: str) -> None:
+        """Suffix browser_address with a unique tag so the unique constraint
+        no longer blocks new sessions that reuse the same local address."""
+        try:
+            async with self.Session() as session:
+                row = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+
+                if not row or not row.browser_address:
+                    return
+                if "::closed::" in row.browser_address:
+                    return
+
+                row.browser_address = f"{row.browser_address}::closed::{uuid.uuid4().hex}"
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_all_active_persistent_browser_sessions(self) -> List[PersistentBrowserSessionModel]:
         """Get all active persistent browser sessions across all organizations."""
         try:
             async with self.Session() as session:
                 result = await session.execute(select(PersistentBrowserSessionModel).filter_by(deleted_at=None))
+                return result.scalars().all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_uncompleted_persistent_browser_sessions(self) -> List[PersistentBrowserSessionModel]:
+        """Get all browser sessions that have not been completed or deleted."""
+        try:
+            async with self.Session() as session:
+                result = await session.execute(
+                    select(PersistentBrowserSessionModel).filter_by(deleted_at=None).filter_by(completed_at=None)
+                )
                 return result.scalars().all()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)

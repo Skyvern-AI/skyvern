@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import floor
@@ -25,18 +24,17 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.cdp_ports import _allocate_cdp_port, _release_cdp_port
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_state import RealBrowserState
 
 LOG = structlog.get_logger()
 
-_CDP_PORT_RANGE_START = 9223
-_CDP_PORT_RANGE_END = 9322
-
 
 @dataclass
 class BrowserSession:
     browser_state: BrowserState
+    cdp_port: int | None = None
 
 
 async def validate_session_for_renewal(
@@ -181,18 +179,6 @@ async def update_status(
     return persistent_browser_session
 
 
-def _allocate_cdp_port() -> int:
-    """Find an available port in the CDP port range for a browser session."""
-    for port in range(_CDP_PORT_RANGE_START, _CDP_PORT_RANGE_END + 1):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
-                return port
-        except OSError:
-            pass
-    raise RuntimeError(f"No available CDP ports in range {_CDP_PORT_RANGE_START}-{_CDP_PORT_RANGE_END}")
-
-
 class DefaultPersistentSessionsManager(PersistentSessionsManager):
     """Default (OSS) implementation of PersistentSessionsManager protocol."""
 
@@ -211,60 +197,72 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         return cls.instance
 
     def watch_session_pool(self) -> None:
-        pass
+        """No-op in OSS: browsers run in-process, no external pool to monitor."""
 
     async def _launch_browser_for_session(
         self,
         session_id: str,
         organization_id: str,
     ) -> None:
-        """Launch a real browser process and wire it to a persistent session record."""
+        """Launch a browser process and register it as a persistent session."""
         cdp_port = _allocate_cdp_port()
-        LOG.info(
-            "Launching browser for persistent session",
-            session_id=session_id,
-            cdp_port=cdp_port,
-        )
+        LOG.info("Launching browser for persistent session", session_id=session_id, cdp_port=cdp_port)
 
-        pw = await async_playwright().start()
-        browser_context, browser_artifacts, browser_cleanup = await BrowserContextFactory.create_browser_context(
-            pw,
-            organization_id=organization_id,
-            cdp_port=cdp_port,
-        )
+        pw = None
+        browser_state = None
+        try:
+            pw = await async_playwright().start()
+            browser_context, browser_artifacts, browser_cleanup = await BrowserContextFactory.create_browser_context(
+                pw,
+                organization_id=organization_id,
+                cdp_port=cdp_port,
+            )
 
-        browser_state = RealBrowserState(
-            pw=pw,
-            browser_context=browser_context,
-            page=None,
-            browser_artifacts=browser_artifacts,
-            browser_cleanup=browser_cleanup,
-        )
+            browser_state = RealBrowserState(
+                pw=pw,
+                browser_context=browser_context,
+                page=None,
+                browser_artifacts=browser_artifacts,
+                browser_cleanup=browser_cleanup,
+            )
+            await browser_state.get_or_create_page(organization_id=organization_id)
 
-        await browser_state.get_or_create_page(organization_id=organization_id)
+            self._browser_sessions[session_id] = BrowserSession(
+                browser_state=browser_state,
+                cdp_port=cdp_port,
+            )
 
-        self._browser_sessions[session_id] = BrowserSession(browser_state=browser_state)
+            browser_address = f"http://127.0.0.1:{cdp_port}"
+            await self.database.set_persistent_browser_session_browser_address(
+                browser_session_id=session_id,
+                browser_address=browser_address,
+                ip_address="127.0.0.1",
+                ecs_task_arn=None,
+                organization_id=organization_id,
+            )
+            await self.database.update_persistent_browser_session(
+                session_id,
+                organization_id=organization_id,
+                status=PersistentBrowserSessionStatus.running,
+            )
 
-        browser_address = f"http://127.0.0.1:{cdp_port}"
-        await self.database.set_persistent_browser_session_browser_address(
-            browser_session_id=session_id,
-            browser_address=browser_address,
-            ip_address="127.0.0.1",
-            ecs_task_arn=None,
-            organization_id=organization_id,
-        )
-
-        await self.database.update_persistent_browser_session(
-            session_id,
-            organization_id=organization_id,
-            status=PersistentBrowserSessionStatus.running,
-        )
-
-        LOG.info(
-            "Browser launched for persistent session",
-            session_id=session_id,
-            browser_address=browser_address,
-        )
+            LOG.info("Browser launched for persistent session", session_id=session_id, browser_address=browser_address)
+        except BaseException:
+            _release_cdp_port(cdp_port)
+            # Close whichever resource was successfully created.
+            # browser_state.close() stops playwright internally, so only fall
+            # back to pw.stop() when no browser_state was created.
+            if browser_state is not None:
+                try:
+                    await browser_state.close()
+                except Exception:
+                    LOG.warning("Failed to close browser_state during cleanup", exc_info=True)
+            elif pw is not None:
+                try:
+                    await pw.stop()
+                except Exception:
+                    LOG.warning("Failed to stop playwright during cleanup", exc_info=True)
+            raise
 
     async def begin_session(
         self,
@@ -463,6 +461,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                             )
 
             self._browser_sessions.pop(browser_session_id, None)
+            if browser_session.cdp_port is not None:
+                _release_cdp_port(browser_session.cdp_port)
 
             try:
                 await browser_session.browser_state.close()
@@ -487,12 +487,32 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             )
 
         await self.database.close_persistent_browser_session(browser_session_id, organization_id)
+        if settings.ENV == "local":
+            await self.database.archive_browser_session_address(browser_session_id, organization_id)
 
     async def close_all_sessions(self, organization_id: str) -> None:
         """Close all browser sessions for an organization."""
         browser_sessions = await self.database.get_active_persistent_browser_sessions(organization_id)
         for browser_session in browser_sessions:
             await self.close_session(organization_id, browser_session.persistent_browser_session_id)
+
+    async def cleanup_stale_sessions(self) -> None:
+        """Close sessions left active by a previous process."""
+        if settings.ENV != "local":
+            return
+        stale_sessions = await self.database.get_uncompleted_persistent_browser_sessions()
+        for db_session in stale_sessions:
+            LOG.info(
+                "Closing stale browser session from previous run",
+                session_id=db_session.persistent_browser_session_id,
+                organization_id=db_session.organization_id,
+            )
+            await self.database.close_persistent_browser_session(
+                db_session.persistent_browser_session_id, db_session.organization_id
+            )
+            await self.database.archive_browser_session_address(
+                db_session.persistent_browser_session_id, db_session.organization_id
+            )
 
     @classmethod
     async def close(cls) -> None:
