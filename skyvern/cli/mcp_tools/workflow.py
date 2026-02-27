@@ -570,6 +570,9 @@ async def skyvern_workflow_run(
     timeout_seconds: Annotated[
         int, Field(description="Max wait time in seconds when wait=true (default 300)", ge=10, le=3600)
     ] = 300,
+    run_with: Annotated[
+        str | None, Field(description="Execution mode override (e.g., 'code' for cached script execution)")
+    ] = None,
 ) -> dict[str, Any]:
     """Run a Skyvern workflow with parameters. Use when you need to execute an automation workflow.
     Returns immediately by default (async) — set wait=true to block until completion.
@@ -620,6 +623,7 @@ async def skyvern_workflow_run(
                 proxy_location=proxy,
                 wait_for_completion=wait,
                 timeout=timeout_seconds,
+                run_with=run_with,
             )
             timer.mark("sdk")
         except asyncio.TimeoutError:

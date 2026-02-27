@@ -123,9 +123,6 @@ CURRENT_DATE_FORMAT = "%Y-%m-%d"
 # Sentinel marker for native JSON type injection via | json filter.
 _JSON_TYPE_MARKER = "__SKYVERN_RAW_JSON__"
 
-# Strong references to fire-and-forget asyncio tasks so they are not GC'd mid-execution.
-_background_tasks: set[asyncio.Task[Any]] = set()
-
 
 def _json_type_filter(value: Any) -> str:
     """Jinja filter that marks a value for native JSON type injection.
@@ -6160,16 +6157,6 @@ class WorkflowTriggerBlock(Block):
 
         resolved_workflow_permanent_id = self.workflow_permanent_id
         resolved_payload = self.payload
-        # Browser session priority:
-        # 1. Explicit browser_session_id configured on the block
-        # 2. use_parent_browser_session → inherit parent's session
-        # 3. Neither → None, child creates its own session
-        if self.browser_session_id:
-            resolved_browser_session_id = self.browser_session_id
-        elif self.use_parent_browser_session and browser_session_id:
-            resolved_browser_session_id = browser_session_id
-        else:
-            resolved_browser_session_id = None
 
         # 2. Check recursion depth
         try:
@@ -6184,52 +6171,101 @@ class WorkflowTriggerBlock(Block):
         if not organization:
             return await _fail(f"Organization {organization_id} not found")
 
-        # 4. Create WorkflowRequestBody
-        workflow_request = WorkflowRequestBody(
-            data=resolved_payload,
-            browser_session_id=resolved_browser_session_id,
-        )
+        # 4. Resolve browser session
+        # Browser session priority:
+        # 1. Explicit browser_session_id configured on the block
+        # 2. use_parent_browser_session → inherit parent's session (persistent
+        #    or in-memory via self.pages[parent_workflow_run_id] lookup)
+        # 3. Neither → for sync (wait_for_completion), create a fresh persistent
+        #    session; for async (fire-and-forget), let the child's Temporal worker
+        #    handle its own browser.
+        created_fresh_session = False
+        if self.browser_session_id:
+            resolved_browser_session_id = self.browser_session_id
+        elif self.use_parent_browser_session and browser_session_id:
+            resolved_browser_session_id = browser_session_id
+        elif self.use_parent_browser_session:
+            # Parent uses an in-memory browser (no persistent session).
+            # Pass None so the child inherits via the parent_workflow_run_id
+            # lookup in get_or_create_for_workflow_run.
+            resolved_browser_session_id = None
+        elif self.wait_for_completion:
+            # Sync mode: child runs inline in the same process, so it needs
+            # its own persistent session to avoid sharing the parent's browser.
+            parent_workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id)
+            proxy_location = parent_workflow_run.proxy_location if parent_workflow_run else None
+            try:
+                child_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    organization_id=organization_id,
+                    proxy_location=proxy_location,
+                    timeout_minutes=30,
+                )
+                resolved_browser_session_id = child_browser_session.persistent_browser_session_id
+                created_fresh_session = True
+                LOG.info(
+                    "Created fresh browser session for triggered workflow",
+                    parent_workflow_run_id=workflow_run_id,
+                    child_browser_session_id=resolved_browser_session_id,
+                )
+            except Exception as e:
+                return await _fail(f"Failed to create browser session for triggered workflow: {str(e)}")
+        else:
+            # Async (fire-and-forget): the child runs in its own Temporal worker
+            # and will create its own browser. No pre-creation needed.
+            resolved_browser_session_id = None
 
-        # 5. Setup the workflow run (creates WR with unique ID + parameters)
-        # Save the parent's skyvern_context because setup_workflow_run and
-        # execute_workflow overwrite it with the child's values. We restore
-        # it after the child finishes so subsequent parent blocks get correct
-        # context (logs, observability, workflow_run_id, etc.).
-        from skyvern.forge.sdk.core import skyvern_context  # noqa: PLC0415
-
-        parent_context = skyvern_context.current()
-        try:
-            triggered_workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
-                request_id=None,
-                workflow_request=workflow_request,
-                workflow_permanent_id=resolved_workflow_permanent_id,
-                organization=organization,
-                parent_workflow_run_id=workflow_run_id,
-            )
-        except Exception as e:
-            error_msg = get_user_facing_exception_message(e)
-            if parent_context:
-                skyvern_context.set(parent_context)
-            return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
-
-        triggered_run_id = triggered_workflow_run.workflow_run_id
-
-        LOG.info(
-            "Triggered workflow run",
-            parent_workflow_run_id=workflow_run_id,
-            triggered_workflow_run_id=triggered_run_id,
-            triggered_workflow_permanent_id=resolved_workflow_permanent_id,
-            wait_for_completion=self.wait_for_completion,
-        )
-
-        # 6. Execute based on wait mode
+        # 5. Execute based on wait mode
         output_data: dict[str, Any] = {}
         success = False
         if self.wait_for_completion:
+            # Synchronous: setup + execute inline in the same process.
+            workflow_request = WorkflowRequestBody(
+                data=resolved_payload,
+                browser_session_id=resolved_browser_session_id,
+            )
+
+            # Save the parent's skyvern_context because setup_workflow_run and
+            # execute_workflow overwrite it with the child's values. We restore
+            # it after the child finishes so subsequent parent blocks get correct
+            # context (logs, observability, workflow_run_id, etc.).
+            from skyvern.forge.sdk.core import skyvern_context  # noqa: PLC0415
+
+            parent_context = skyvern_context.current()
             try:
-                # Pass api_key=None so the child workflow's webhook (if configured)
-                # is intentionally skipped. Webhook dispatch requires the caller's
-                # API key, which is not available in a block execution context.
+                triggered_workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
+                    request_id=None,
+                    workflow_request=workflow_request,
+                    workflow_permanent_id=resolved_workflow_permanent_id,
+                    organization=organization,
+                    parent_workflow_run_id=workflow_run_id,
+                )
+            except Exception as e:
+                error_msg = get_user_facing_exception_message(e)
+                if parent_context:
+                    skyvern_context.set(parent_context)
+                if created_fresh_session and resolved_browser_session_id:
+                    try:
+                        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                            organization_id, resolved_browser_session_id
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to close child browser session after setup failure",
+                            child_browser_session_id=resolved_browser_session_id,
+                            exc_info=True,
+                        )
+                return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
+
+            triggered_run_id = triggered_workflow_run.workflow_run_id
+
+            LOG.info(
+                "Triggered workflow run (sync)",
+                parent_workflow_run_id=workflow_run_id,
+                triggered_workflow_run_id=triggered_run_id,
+                triggered_workflow_permanent_id=resolved_workflow_permanent_id,
+            )
+
+            try:
                 final_run = await app.WORKFLOW_SERVICE.execute_workflow(
                     workflow_run_id=triggered_run_id,
                     api_key=None,
@@ -6272,46 +6308,51 @@ class WorkflowTriggerBlock(Block):
                 }
                 success = False
             finally:
-                # Restore parent context after child execution completes
                 if parent_context:
                     skyvern_context.set(parent_context)
+                if created_fresh_session and resolved_browser_session_id:
+                    try:
+                        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                            organization_id, resolved_browser_session_id
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to close child browser session",
+                            child_browser_session_id=resolved_browser_session_id,
+                            triggered_workflow_run_id=triggered_run_id,
+                            exc_info=True,
+                        )
         else:
-            # Fire and forget: spawn the child workflow as a concurrent task.
-            # We use asyncio.create_task instead of AsyncExecutorFactory because
-            # block execution runs outside an HTTP request context, so there is
-            # no FastAPI BackgroundTasks instance to schedule on.
-            def _on_child_done(t: asyncio.Task[Any]) -> None:
-                if t.cancelled():
-                    LOG.warning(
-                        "Async child workflow was cancelled",
-                        triggered_workflow_run_id=triggered_run_id,
-                    )
-                    return
-                if exc := t.exception():
-                    LOG.error(
-                        "Async child workflow failed",
-                        triggered_workflow_run_id=triggered_run_id,
-                        exc_info=exc,
-                    )
+            # Fire and forget: dispatch the child workflow via Temporal so it
+            # gets its own independent worker process. This ensures the child
+            # survives even if the parent workflow finishes first.
+            # NOTE: This path requires Temporal (cloud). On self-hosted
+            # (BackgroundTaskExecutor), the workflow run record is created but
+            # execution is silently skipped because background_tasks=None.
+            from skyvern.services.workflow_service import run_workflow  # noqa: PLC0415
 
-            task = asyncio.create_task(
-                app.WORKFLOW_SERVICE.execute_workflow(
-                    workflow_run_id=triggered_run_id,
-                    api_key=None,
-                    organization=organization,
-                    browser_session_id=resolved_browser_session_id,
-                )
+            workflow_request = WorkflowRequestBody(
+                data=resolved_payload,
+                browser_session_id=resolved_browser_session_id,
             )
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
-            task.add_done_callback(_on_child_done)
-            # Restore parent context AFTER create_task so the child task
-            # inherits the child's context (ContextVar is copied at task
-            # creation), but subsequent parent blocks see the parent's context.
-            if parent_context:
-                skyvern_context.set(parent_context)
+            try:
+                triggered_workflow_run = await run_workflow(
+                    workflow_id=resolved_workflow_permanent_id,
+                    organization=organization,
+                    workflow_request=workflow_request,
+                    request=None,
+                    background_tasks=None,
+                    parent_workflow_run_id=workflow_run_id,
+                )
+            except Exception as e:
+                error_msg = get_user_facing_exception_message(e)
+                return await _fail(f"Failed to dispatch triggered workflow: {error_msg}")
+
+            triggered_run_id = triggered_workflow_run.workflow_run_id
+
             LOG.info(
-                "Async workflow dispatch succeeded",
+                "Async workflow dispatch succeeded (via Temporal)",
+                parent_workflow_run_id=workflow_run_id,
                 triggered_workflow_run_id=triggered_run_id,
                 triggered_workflow_permanent_id=resolved_workflow_permanent_id,
             )
