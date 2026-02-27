@@ -71,6 +71,7 @@ WORKFLOW_TEMPLATE_PREFIX = "wt"
 ORGANIZATION_BILLING_PREFIX = "ob"
 WORKFLOW_COPILOT_CHAT_PREFIX = "wcc"
 WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX = "wccm"
+SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
 
 
 def generate_workflow_id() -> str:
@@ -276,6 +277,11 @@ def generate_workflow_copilot_chat_id() -> str:
 def generate_workflow_copilot_chat_message_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX}_{int_id}"
+
+
+def generate_script_fallback_episode_id() -> str:
+    int_id = generate_id()
+    return f"{SCRIPT_FALLBACK_EPISODE_PREFIX}_{int_id}"
 
 
 ############# Helper functions below ##############
