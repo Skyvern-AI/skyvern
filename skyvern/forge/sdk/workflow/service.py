@@ -35,6 +35,7 @@ from skyvern.exceptions import (
     BlockNotFound,
     BrowserProfileNotFound,
     BrowserSessionNotFound,
+    BrowserSessionNotRenewable,
     FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
@@ -852,6 +853,7 @@ class WorkflowService:
                 browser_session_id=browser_session_id,
             )
 
+        renewal_task: asyncio.Task[None] | None = None
         if browser_session_id:
             try:
                 await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
@@ -879,90 +881,145 @@ class WorkflowService:
                     close_browser_on_completion=close_browser_on_completion,
                 )
                 return workflow_run
-
-        # Check if there's a related workflow script that should be used instead
-        workflow_script, _ = await workflow_script_service.get_workflow_script(workflow, workflow_run, block_labels)
-        current_context = skyvern_context.current()
-        if current_context:
-            if workflow_script:
-                current_context.generate_script = False
-            if workflow_run.code_gen:
-                current_context.generate_script = True
-        workflow_run, blocks_to_update = await self._execute_workflow_blocks(
-            workflow=workflow,
-            workflow_run=workflow_run,
-            organization=organization,
-            browser_session_id=browser_session_id,
-            browser_profile_id=browser_profile_id,
-            block_labels=block_labels,
-            block_outputs=block_outputs,
-            script=workflow_script,
-        )
-
-        # Check if there's a finally block configured
-        finally_block_label = workflow.workflow_definition.finally_block_label
-
-        if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-        ):
-            workflow_run = refreshed_workflow_run
-
-        pre_finally_status = workflow_run.status
-        pre_finally_failure_reason = workflow_run.failure_reason
-
-        if pre_finally_status not in (
-            WorkflowRunStatus.canceled,
-            WorkflowRunStatus.failed,
-            WorkflowRunStatus.terminated,
-            WorkflowRunStatus.timed_out,
-        ):
-            await self.generate_script_if_needed(
-                workflow=workflow,
-                workflow_run=workflow_run,
-                block_labels=block_labels,
-                blocks_to_update=blocks_to_update,
-                finalize=True,  # Force regeneration to ensure field mappings have complete action data
-                has_conditionals=has_conditionals,
+            # Start background task to periodically renew the browser session
+            renewal_task = asyncio.create_task(
+                self._renew_browser_session_loop(browser_session_id, organization.organization_id),
+                name=f"browser_session_renewal_{workflow_run_id}",
             )
 
-        # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
-        should_run_finally = finally_block_label and pre_finally_status != WorkflowRunStatus.canceled
-        if should_run_finally:
-            # Temporarily set to running for terminal workflows (for frontend UX)
-            if pre_finally_status in (
-                WorkflowRunStatus.failed,
-                WorkflowRunStatus.terminated,
-                WorkflowRunStatus.timed_out,
-            ):
-                workflow_run = await self._update_workflow_run_status(
-                    workflow_run_id=workflow_run_id,
-                    status=WorkflowRunStatus.running,
-                    failure_reason=None,
-                )
-            await self._execute_finally_block_if_configured(
+        try:
+            # Check if there's a related workflow script that should be used instead
+            workflow_script, _ = await workflow_script_service.get_workflow_script(workflow, workflow_run, block_labels)
+            current_context = skyvern_context.current()
+            if current_context:
+                if workflow_script:
+                    current_context.generate_script = False
+                if workflow_run.code_gen:
+                    current_context.generate_script = True
+            workflow_run, blocks_to_update = await self._execute_workflow_blocks(
                 workflow=workflow,
                 workflow_run=workflow_run,
                 organization=organization,
                 browser_session_id=browser_session_id,
+                browser_profile_id=browser_profile_id,
+                block_labels=block_labels,
+                block_outputs=block_outputs,
+                script=workflow_script,
             )
 
-        workflow_run = await self._finalize_workflow_run_status(
-            workflow_run_id=workflow_run_id,
-            workflow_run=workflow_run,
-            pre_finally_status=pre_finally_status,
-            pre_finally_failure_reason=pre_finally_failure_reason,
-        )
+            # Check if there's a finally block configured
+            finally_block_label = workflow.workflow_definition.finally_block_label
 
-        await self.clean_up_workflow(
-            workflow=workflow,
-            workflow_run=workflow_run,
-            api_key=api_key,
-            browser_session_id=browser_session_id,
-            close_browser_on_completion=close_browser_on_completion,
-        )
+            if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            ):
+                workflow_run = refreshed_workflow_run
+
+            pre_finally_status = workflow_run.status
+            pre_finally_failure_reason = workflow_run.failure_reason
+
+            if pre_finally_status not in (
+                WorkflowRunStatus.canceled,
+                WorkflowRunStatus.failed,
+                WorkflowRunStatus.terminated,
+                WorkflowRunStatus.timed_out,
+            ):
+                await self.generate_script_if_needed(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    block_labels=block_labels,
+                    blocks_to_update=blocks_to_update,
+                    finalize=True,  # Force regeneration to ensure field mappings have complete action data
+                    has_conditionals=has_conditionals,
+                )
+
+            # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
+            should_run_finally = finally_block_label and pre_finally_status != WorkflowRunStatus.canceled
+            if should_run_finally:
+                # Temporarily set to running for terminal workflows (for frontend UX)
+                if pre_finally_status in (
+                    WorkflowRunStatus.failed,
+                    WorkflowRunStatus.terminated,
+                    WorkflowRunStatus.timed_out,
+                ):
+                    workflow_run = await self._update_workflow_run_status(
+                        workflow_run_id=workflow_run_id,
+                        status=WorkflowRunStatus.running,
+                        failure_reason=None,
+                    )
+                await self._execute_finally_block_if_configured(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    organization=organization,
+                    browser_session_id=browser_session_id,
+                )
+
+            workflow_run = await self._finalize_workflow_run_status(
+                workflow_run_id=workflow_run_id,
+                workflow_run=workflow_run,
+                pre_finally_status=pre_finally_status,
+                pre_finally_failure_reason=pre_finally_failure_reason,
+            )
+        finally:
+            if renewal_task is not None and not renewal_task.done():
+                renewal_task.cancel()
+                try:
+                    await renewal_task
+                except asyncio.CancelledError:
+                    pass
+
+            await self.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=close_browser_on_completion,
+            )
 
         return workflow_run
+
+    async def _renew_browser_session_loop(self, browser_session_id: str, organization_id: str) -> None:
+        """Periodically renew a browser session to prevent timeout during long-running workflows."""
+        max_renewal_seconds = 2 * 60 * 60  # 2 hours
+        start_time = asyncio.get_event_loop().time()
+        while True:
+            try:
+                await asyncio.sleep(300)  # 5 minutes — ensures 2+ attempts within the 10-min renewal threshold
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed >= max_renewal_seconds:
+                    LOG.info(
+                        "Browser session renewal loop reached 2-hour cap, stopping",
+                        browser_session_id=browser_session_id,
+                        organization_id=organization_id,
+                        elapsed_seconds=elapsed,
+                    )
+                    return
+                await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(browser_session_id, organization_id)
+                LOG.debug(
+                    "Browser session renewal check completed",
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                )
+            except asyncio.CancelledError:
+                LOG.info(
+                    "Browser session renewal loop cancelled",
+                    browser_session_id=browser_session_id,
+                )
+                return
+            except BrowserSessionNotRenewable:
+                LOG.warning(
+                    "Browser session is no longer renewable, stopping renewal loop",
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                )
+                return
+            except Exception:
+                LOG.exception(
+                    "Error renewing browser session, will retry",
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                )
 
     async def _execute_workflow_blocks(
         self,
@@ -2601,7 +2658,7 @@ class WorkflowService:
                 browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                     organization_id=organization_id,
                     proxy_location=workflow_request.proxy_location,
-                    timeout_minutes=30,  # 30 minutes default timeout for forced browser sessions
+                    timeout_minutes=60,  # 60 minutes default timeout for forced browser sessions
                 )
                 browser_session_id = browser_session.persistent_browser_session_id
                 LOG.info(
