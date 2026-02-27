@@ -5427,6 +5427,83 @@ def _parse_single_evaluation(
         return (bool_result, rendered_expression)
 
 
+# Pattern to find Jinja template blocks like {{ variable_name }}
+_JINJA_BLOCK_RE = re.compile(r"\{\{(.*?)\}\}")
+# Marker inserted into rendered expressions when a Jinja variable resolved to
+# an empty/whitespace-only value.  The LLM uses this to reason about emptiness.
+_EMPTY_VALUE_MARKER = "(empty value)"
+
+
+def _make_empty_params_explicit(
+    original_expression: str,
+    rendered_expression: str,
+) -> tuple[str, bool]:
+    """
+    Detect Jinja template variables that resolved to empty values and replace
+    the empty gaps with explicit ``(empty value)`` markers.
+
+    When ``{{test_parameter}}`` resolves to ``""``, the rendered expression becomes
+    malformed (e.g., ``"if  is not empty"``).  This function detects such cases by
+    comparing the *original* expression (with ``{{ }}`` blocks) against the
+    *rendered* expression and rebuilds it with clear markers so the LLM can
+    evaluate the condition correctly.
+
+    Returns:
+        ``(patched_expression, was_patched)``
+    """
+    if not original_expression or "{{" not in original_expression:
+        return rendered_expression, False
+
+    # Split the original expression into alternating [static, var, static, var, ...] parts.
+    parts = _JINJA_BLOCK_RE.split(original_expression)
+    if len(parts) <= 1:
+        return rendered_expression, False
+
+    # Extract static parts (even indices) and build a regex that captures what
+    # each Jinja block rendered to by using the static text as anchors.
+    static_parts = [parts[i] for i in range(0, len(parts), 2)]
+    num_vars = len(parts) // 2
+
+    # When two Jinja variables are adjacent (e.g. "{{a}}{{b}}") the interior
+    # static separator is an empty string and the non-greedy regex cannot
+    # reliably attribute rendered text to the correct variable.  Bail out.
+    if num_vars > 1 and any(static == "" for static in static_parts[1:-1]):
+        return rendered_expression, False
+
+    # NOTE: if a rendered value happens to contain the same text as a static
+    # anchor the regex may split on the wrong occurrence.  This is extremely
+    # unlikely in user-authored conditional expressions and the worst-case
+    # outcome is an unnecessary "(empty value)" marker, which still beats the
+    # invisible empty-string that caused SKY-8073.
+
+    regex_fragments: list[str] = []
+    for i, static in enumerate(static_parts):
+        regex_fragments.append(re.escape(static))
+        if i < num_vars:
+            regex_fragments.append("(.*?)")
+
+    match = re.match("^" + "".join(regex_fragments) + "$", rendered_expression, re.DOTALL)
+    if not match:
+        return rendered_expression, False
+
+    rendered_values = match.groups()
+    has_empty = any(not v.strip() for v in rendered_values)
+    if not has_empty:
+        return rendered_expression, False
+
+    # Rebuild the expression, replacing empty rendered values with an explicit marker.
+    result_parts: list[str] = []
+    for i, static in enumerate(static_parts):
+        result_parts.append(static)
+        if i < len(rendered_values):
+            if not rendered_values[i].strip():
+                result_parts.append(_EMPTY_VALUE_MARKER)
+            else:
+                result_parts.append(rendered_values[i])
+
+    return "".join(result_parts), True
+
+
 class BranchCondition(BaseModel):
     """Represents a single conditional branch edge within a ConditionalBlock."""
 
@@ -5557,6 +5634,21 @@ class ConditionalBlock(Block):
                     # Rendering failed, so this expression is effectively unresolved and must
                     # take the ExtractionBlock path (with context) instead of direct LLM mode.
                     has_any_pure_natlang = True
+                else:
+                    # When a Jinja variable resolves to an empty string the rendered
+                    # expression becomes malformed (e.g. "if  is not empty") and the
+                    # LLM cannot reason about emptiness correctly.  Replace empty gaps
+                    # with an explicit "(empty value)" marker so the intent is clear.
+                    rendered_expression, was_patched = _make_empty_params_explicit(expression, rendered_expression)
+                    if was_patched:
+                        LOG.info(
+                            "Conditional branch expression patched for empty parameter(s)",
+                            workflow_run_id=workflow_run_id,
+                            block_label=self.label,
+                            branch_index=idx,
+                            original_expression=expression,
+                            patched_expression=rendered_expression,
+                        )
             else:
                 rendered_expression = expression
                 has_any_pure_natlang = True
