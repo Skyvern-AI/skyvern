@@ -1007,7 +1007,10 @@ function Workspace({
       extraHttpHeaders: workflowData.extra_http_headers
         ? JSON.stringify(workflowData.extra_http_headers)
         : null,
-      runWith: workflowData.run_with ?? null,
+      runWith:
+        workflowData.adaptive_caching && workflowData.run_with === "code"
+          ? "code_v2"
+          : workflowData.run_with ?? null,
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
       runSequentially: workflowData.run_sequentially ?? false,
@@ -1054,7 +1057,10 @@ function Workspace({
       extraHttpHeaders: selectedVersion.extra_http_headers
         ? JSON.stringify(selectedVersion.extra_http_headers)
         : null,
-      runWith: selectedVersion.run_with,
+      runWith:
+        selectedVersion.adaptive_caching && selectedVersion.run_with === "code"
+          ? "code_v2"
+          : selectedVersion.run_with,
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       runSequentially: selectedVersion.run_sequentially ?? false,
@@ -1753,9 +1759,13 @@ function Workspace({
               created_at: new Date().toISOString(),
               modified_at: new Date().toISOString(),
               deleted_at: null,
-              run_with: saveData.settings.runWith,
+              run_with:
+                saveData.settings.runWith === "code_v2"
+                  ? "code"
+                  : saveData.settings.runWith,
               cache_key: saveData.settings.scriptCacheKey,
               ai_fallback: saveData.settings.aiFallback,
+              adaptive_caching: saveData.settings.runWith === "code_v2",
               run_sequentially: saveData.settings.runSequentially,
               sequential_key: saveData.settings.sequentialKey,
               folder_id: null,
