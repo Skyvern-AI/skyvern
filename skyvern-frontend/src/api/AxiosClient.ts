@@ -134,4 +134,9 @@ async function getClient(
 
 export type CredentialGetter = () => Promise<string | null>;
 
+// Interceptor to handle 403/404 responses from internal auth status endpoint
+// This prevents misleading "API key verification failed" errors when running
+// self-hosted Skyvern instances accessed remotely (non-localhost)
+// See: https://github.com/Skyvern-AI/skyvern/issues/3782
+[client, v2Client, clientSansApiV1].forEach((instance) => {
 export { getClient, artifactApiClient };
