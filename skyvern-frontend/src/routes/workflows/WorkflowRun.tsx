@@ -488,10 +488,34 @@ function WorkflowRun() {
               <ScrollArea>
                 <ScrollAreaViewport className="max-h-[250px] space-y-2">
                   {fileUrls.length > 0 ? (
-                    fileUrls.map((url) => {
-                      // Extract filename from URL path, stripping query params from signed URLs
-                      const urlPath = url.split("?")[0] ?? url;
-                      const filename = urlPath.split("/").pop() || "download";
+                    fileUrls.map((url, index) => {
+                      function getFilenameFromUrl(
+                        url: string,
+                        index: number,
+                      ): string {
+                        try {
+                          const urlObj = new URL(url);
+                          const pathname = urlObj.pathname;
+                          const filename = pathname.split("/").pop() || "";
+                          if (filename && filename.includes(".")) {
+                            return decodeURIComponent(filename);
+                          }
+                        } catch {
+                          const parts = url.split("/");
+                          const lastPart = parts[parts.length - 1];
+                          if (lastPart && lastPart.includes(".")) {
+                            const filenamePart =
+                              lastPart.split("?")[0] || lastPart;
+                            try {
+                              return decodeURIComponent(filenamePart);
+                            } catch {
+                              return filenamePart;
+                            }
+                          }
+                        }
+                        return `File ${index + 1}`;
+                      }
+                      const filename = getFilenameFromUrl(url, index);
                       return (
                         <div key={url} title={url} className="flex gap-2">
                           <FileIcon className="size-6" />
