@@ -62,6 +62,9 @@ class RealBrowserManager(BrowserManager):
             browser_cleanup=browser_cleanup,
         )
 
+    def evict_page(self, page_id: str) -> None:
+        self.pages.pop(page_id, None)
+
     def get_for_task(self, task_id: str, workflow_run_id: str | None = None) -> BrowserState | None:
         if task_id in self.pages:
             return self.pages[task_id]
@@ -389,7 +392,12 @@ class RealBrowserManager(BrowserManager):
         organization_id: str | None = None,
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run")
-        browser_state_to_close = self.pages.pop(workflow_run_id, None)
+        browser_state_to_close = self.pages.get(workflow_run_id)
+
+        from skyvern.forge.sdk.routes.streaming.registries import set_deferred_close_params, stream_ref_active
+
+        streams_active = stream_ref_active(workflow_run_id)
+
         if browser_state_to_close:
             # If another workflow run still references this browser state (e.g. a
             # parent whose in-memory browser was shared via use_parent_browser_session),
@@ -414,10 +422,21 @@ class RealBrowserManager(BrowserManager):
                 await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
                 LOG.info("Stopped tracing", trace_path=trace_path)
 
-            await browser_state_to_close.close(close_browser_on_completion=effective_close)
+            if streams_active:
+                # Defer close until the last stream disconnects
+                LOG.info(
+                    "Deferring browser close — active CDP streams",
+                    workflow_run_id=workflow_run_id,
+                )
+                set_deferred_close_params(workflow_run_id, close_browser_on_completion)
+            else:
+                await browser_state_to_close.close(close_browser_on_completion=effective_close)
+
+        if not streams_active:
+            self.pages.pop(workflow_run_id, None)
         for task_id in task_ids:
             task_browser_state = self.pages.pop(task_id, None)
-            if task_browser_state is None:
+            if task_browser_state is None or streams_active:
                 continue
             # Same shared-state check for task-level entries
             shared = any(bs is task_browser_state for bs in self.pages.values())

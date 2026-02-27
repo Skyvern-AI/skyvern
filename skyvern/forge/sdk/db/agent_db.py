@@ -5077,6 +5077,7 @@ class AgentDB(BaseAlchemyDB):
         timeout_minutes: int | None = None,
         organization_id: str | None = None,
         completed_at: datetime | None = None,
+        started_at: datetime | None = None,
     ) -> PersistentBrowserSession:
         try:
             async with self.Session() as session:
@@ -5097,6 +5098,8 @@ class AgentDB(BaseAlchemyDB):
                     persistent_browser_session.timeout_minutes = timeout_minutes
                 if completed_at:
                     persistent_browser_session.completed_at = completed_at
+                if started_at:
+                    persistent_browser_session.started_at = started_at
 
                 await session.commit()
                 await session.refresh(persistent_browser_session)

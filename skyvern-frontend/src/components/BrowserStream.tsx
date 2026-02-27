@@ -255,10 +255,9 @@ function BrowserStream({
   useEffect(() => {
     if (prevMessageConnectedRef.current && !isMessageConnected) {
       setMessagesDisconnectedTrigger((x) => x + 1);
-      onClose?.();
     }
     prevMessageConnectedRef.current = isMessageConnected;
-  }, [isMessageConnected, onClose]);
+  }, [isMessageConnected]);
 
   // vnc socket
   useEffect(
