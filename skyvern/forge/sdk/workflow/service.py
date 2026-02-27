@@ -3397,6 +3397,7 @@ class WorkflowService:
         workflow_run_response = WorkflowRunResponse(
             run_id=workflow_run.workflow_run_id,
             run_type=RunType.workflow_run,
+            run_with=workflow_run.run_with,
             status=RunStatus(workflow_run_status_response.status),
             output=workflow_run_status_response.outputs,
             downloaded_files=workflow_run_status_response.downloaded_files,
