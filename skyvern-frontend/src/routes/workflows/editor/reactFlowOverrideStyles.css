@@ -30,6 +30,45 @@
   transition: transform 0.2s ease-out;
 }
 
+/*
+ * Initial load animation phases:
+ * 1. "pre-layout" - nodes/edges are hidden (opacity: 0) while Dagre computes positions
+ * 2. "initial-load" - nodes/edges fade in at their final positions (opacity transition only)
+ * 3. "ready" (no class) - normal operation with position transitions
+ *
+ * The fade-in duration (300ms) is coupled with the setTimeout in FlowRenderer.tsx (350ms).
+ */
+
+/* Before layout completes, hide everything */
+.react-flow--pre-layout .react-flow__node {
+  opacity: 0;
+}
+
+.react-flow--pre-layout .react-flow__edge path,
+.react-flow--pre-layout .react-flow__edge-path {
+  opacity: 0;
+}
+
+.react-flow--pre-layout .react-flow__edge text,
+.react-flow--pre-layout .react-flow__edge-text {
+  opacity: 0;
+}
+
+/* During initial load, override position transitions with opacity fade-in */
+.react-flow--initial-load .react-flow__node {
+  transition: opacity 0.3s ease-in;
+}
+
+.react-flow--initial-load .react-flow__edge path,
+.react-flow--initial-load .react-flow__edge-path {
+  transition: opacity 0.3s ease-in;
+}
+
+.react-flow--initial-load .react-flow__edge text,
+.react-flow--initial-load .react-flow__edge-text {
+  transition: opacity 0.3s ease-in;
+}
+
 .react-flow__handle-top {
   top: 3px;
 }
