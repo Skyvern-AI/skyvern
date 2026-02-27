@@ -6160,16 +6160,6 @@ class WorkflowTriggerBlock(Block):
 
         resolved_workflow_permanent_id = self.workflow_permanent_id
         resolved_payload = self.payload
-        # Browser session priority:
-        # 1. Explicit browser_session_id configured on the block
-        # 2. use_parent_browser_session → inherit parent's session
-        # 3. Neither → None, child creates its own session
-        if self.browser_session_id:
-            resolved_browser_session_id = self.browser_session_id
-        elif self.use_parent_browser_session and browser_session_id:
-            resolved_browser_session_id = browser_session_id
-        else:
-            resolved_browser_session_id = None
 
         # 2. Check recursion depth
         try:
@@ -6184,13 +6174,53 @@ class WorkflowTriggerBlock(Block):
         if not organization:
             return await _fail(f"Organization {organization_id} not found")
 
-        # 4. Create WorkflowRequestBody
+        # 4. Resolve browser session
+        # Browser session priority:
+        # 1. Explicit browser_session_id configured on the block
+        # 2. use_parent_browser_session → inherit parent's session (persistent
+        #    or in-memory via self.pages[parent_workflow_run_id] lookup)
+        # 3. Neither → create a fresh session so the child gets its own browser
+        created_fresh_session = False
+        if self.browser_session_id:
+            resolved_browser_session_id = self.browser_session_id
+        elif self.use_parent_browser_session and browser_session_id:
+            resolved_browser_session_id = browser_session_id
+        elif self.use_parent_browser_session:
+            # Parent uses an in-memory browser (no persistent session).
+            # Pass None so the child inherits via the parent_workflow_run_id
+            # lookup in get_or_create_for_workflow_run.
+            resolved_browser_session_id = None
+        else:
+            # Create a fresh persistent browser session for the child workflow
+            # so it doesn't inherit the parent's in-memory browser state.
+            parent_workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id)
+            proxy_location = parent_workflow_run.proxy_location if parent_workflow_run else None
+            try:
+                # TODO: 30-min timeout is a safe default but may expire for
+                # long-running child workflows. Consider making this configurable
+                # on the block or correlating with the parent workflow's timeout.
+                child_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    organization_id=organization_id,
+                    proxy_location=proxy_location,
+                    timeout_minutes=30,
+                )
+                resolved_browser_session_id = child_browser_session.persistent_browser_session_id
+                created_fresh_session = True
+                LOG.info(
+                    "Created fresh browser session for triggered workflow",
+                    parent_workflow_run_id=workflow_run_id,
+                    child_browser_session_id=resolved_browser_session_id,
+                )
+            except Exception as e:
+                return await _fail(f"Failed to create browser session for triggered workflow: {str(e)}")
+
+        # 5. Create WorkflowRequestBody
         workflow_request = WorkflowRequestBody(
             data=resolved_payload,
             browser_session_id=resolved_browser_session_id,
         )
 
-        # 5. Setup the workflow run (creates WR with unique ID + parameters)
+        # 6. Setup the workflow run (creates WR with unique ID + parameters)
         # Save the parent's skyvern_context because setup_workflow_run and
         # execute_workflow overwrite it with the child's values. We restore
         # it after the child finishes so subsequent parent blocks get correct
@@ -6210,6 +6240,15 @@ class WorkflowTriggerBlock(Block):
             error_msg = get_user_facing_exception_message(e)
             if parent_context:
                 skyvern_context.set(parent_context)
+            if created_fresh_session and resolved_browser_session_id:
+                try:
+                    await app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, resolved_browser_session_id)
+                except Exception:
+                    LOG.warning(
+                        "Failed to close child browser session after setup failure",
+                        child_browser_session_id=resolved_browser_session_id,
+                        exc_info=True,
+                    )
             return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
 
         triggered_run_id = triggered_workflow_run.workflow_run_id
@@ -6222,7 +6261,7 @@ class WorkflowTriggerBlock(Block):
             wait_for_completion=self.wait_for_completion,
         )
 
-        # 6. Execute based on wait mode
+        # 7. Execute based on wait mode
         output_data: dict[str, Any] = {}
         success = False
         if self.wait_for_completion:
@@ -6275,33 +6314,71 @@ class WorkflowTriggerBlock(Block):
                 # Restore parent context after child execution completes
                 if parent_context:
                     skyvern_context.set(parent_context)
+                # Close the fresh session we created so it doesn't linger
+                # for its full timeout (e.g. in a ForLoop with many children).
+                if created_fresh_session and resolved_browser_session_id:
+                    try:
+                        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                            organization_id, resolved_browser_session_id
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to close child browser session",
+                            child_browser_session_id=resolved_browser_session_id,
+                            triggered_workflow_run_id=triggered_run_id,
+                            exc_info=True,
+                        )
         else:
             # Fire and forget: spawn the child workflow as a concurrent task.
             # We use asyncio.create_task instead of AsyncExecutorFactory because
             # block execution runs outside an HTTP request context, so there is
             # no FastAPI BackgroundTasks instance to schedule on.
+            async def _close_fresh_session() -> None:
+                if not resolved_browser_session_id:
+                    return
+                try:
+                    await app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, resolved_browser_session_id)
+                except Exception:
+                    LOG.warning(
+                        "Failed to close child browser session",
+                        child_browser_session_id=resolved_browser_session_id,
+                        triggered_workflow_run_id=triggered_run_id,
+                        exc_info=True,
+                    )
+
             def _on_child_done(t: asyncio.Task[Any]) -> None:
                 if t.cancelled():
                     LOG.warning(
                         "Async child workflow was cancelled",
                         triggered_workflow_run_id=triggered_run_id,
                     )
-                    return
-                if exc := t.exception():
+                elif exc := t.exception():
                     LOG.error(
                         "Async child workflow failed",
                         triggered_workflow_run_id=triggered_run_id,
                         exc_info=exc,
                     )
+                # Close the fresh session after the child finishes
+                if created_fresh_session:
+                    cleanup_task = asyncio.create_task(_close_fresh_session())
+                    _background_tasks.add(cleanup_task)
+                    cleanup_task.add_done_callback(_background_tasks.discard)
 
-            task = asyncio.create_task(
-                app.WORKFLOW_SERVICE.execute_workflow(
-                    workflow_run_id=triggered_run_id,
-                    api_key=None,
-                    organization=organization,
-                    browser_session_id=resolved_browser_session_id,
+            try:
+                task = asyncio.create_task(
+                    app.WORKFLOW_SERVICE.execute_workflow(
+                        workflow_run_id=triggered_run_id,
+                        api_key=None,
+                        organization=organization,
+                        browser_session_id=resolved_browser_session_id,
+                    )
                 )
-            )
+            except Exception as e:
+                if created_fresh_session:
+                    await _close_fresh_session()
+                if parent_context:
+                    skyvern_context.set(parent_context)
+                return await _fail(f"Failed to dispatch triggered workflow: {str(e)}")
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
             task.add_done_callback(_on_child_done)
