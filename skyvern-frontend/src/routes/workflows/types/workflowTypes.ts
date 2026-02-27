@@ -212,7 +212,8 @@ export type WorkflowBlock =
   | Taskv2Block
   | URLBlock
   | HttpRequestBlock
-  | PrintPageBlock;
+  | PrintPageBlock
+  | WorkflowTriggerBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -238,6 +239,7 @@ export const WorkflowBlockTypes = {
   URL: "goto_url",
   HttpRequest: "http_request",
   PrintPage: "print_page",
+  WorkflowTrigger: "workflow_trigger",
 } as const;
 
 // all of them
@@ -556,6 +558,16 @@ export type PrintPageBlock = WorkflowBlockBase & {
   format: string;
   landscape: boolean;
   print_background: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type WorkflowTriggerBlock = WorkflowBlockBase & {
+  block_type: "workflow_trigger";
+  workflow_permanent_id: string;
+  payload: Record<string, unknown> | null;
+  wait_for_completion: boolean;
+  browser_session_id: string | null;
+  use_parent_browser_session: boolean;
   parameters: Array<WorkflowParameter>;
 };
 

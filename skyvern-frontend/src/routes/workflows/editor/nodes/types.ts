@@ -67,4 +67,5 @@ export const workflowBlockTitle: {
   goto_url: "Go to URL",
   http_request: "HTTP Request",
   print_page: "Print Page",
+  workflow_trigger: "Workflow Trigger",
 };
