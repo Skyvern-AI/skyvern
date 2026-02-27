@@ -932,6 +932,7 @@ function convertToNode(
         data: {
           ...commonData,
           workflowPermanentId: block.workflow_permanent_id ?? "",
+          workflowTitle: "",
           payload: JSON.stringify(block.payload || {}, null, 2),
           waitForCompletion: block.wait_for_completion ?? true,
           browserSessionId: block.browser_session_id ?? "",
