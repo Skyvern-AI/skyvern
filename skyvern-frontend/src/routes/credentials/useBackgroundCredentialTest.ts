@@ -25,7 +25,7 @@ type ActiveTest = {
 /**
  * Hook that manages background credential browser-profile tests.
  *
- * After a credential is saved with "Dedicated browser profile?" checked,
+ * After a credential is saved with "Save browser session" checked,
  * call `startBackgroundTest(credentialId, url)` to kick off an async test.
  * The hook polls the backend, shows toast notifications on completion/failure,
  * and invalidates the credentials query so the list updates.
@@ -102,8 +102,8 @@ function useBackgroundCredentialTest() {
           toast({
             title: "Browser profile test passed",
             description: host
-              ? `Login-free credentials enabled for ${host}`
-              : "Login-free credentials enabled.",
+              ? `Saved browser session enabled for ${host}`
+              : "Saved browser session enabled.",
             variant: "success",
           });
         }
@@ -121,8 +121,8 @@ function useBackgroundCredentialTest() {
         const host = test.url ? getHostname(test.url) : null;
         toast({
           title: host
-            ? `Unable to establish login-free credentials for ${host}`
-            : "Browser profile test failed",
+            ? `Unable to save browser session for ${host}`
+            : "Unable to save browser session",
           description:
             data.failure_reason ??
             "The login test did not succeed. Your credential is saved but without a browser profile.",

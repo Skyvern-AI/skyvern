@@ -275,7 +275,7 @@ function LoginBlockCredentialSelector({
                 {"hasBrowserProfile" in option && option.hasBrowserProfile && (
                   <>
                     <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-[10px] text-green-400">
-                      login-free
+                      saved-profile
                     </span>
                     {option.browserProfileUrl && (
                       <span className="text-[10px] text-muted-foreground">

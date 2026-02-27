@@ -1453,7 +1453,7 @@ class WorkflowService:
                     )
 
                     # Create the browser with the saved profile and navigate
-                    # to the login block's URL.  When a login-free credential
+                    # to the login block's URL.  When a saved-profile credential
                     # is selected, the user is guided to enter the post-login
                     # target URL (e.g. homepage/dashboard) rather than the
                     # login page.  The saved cookies will authenticate the
