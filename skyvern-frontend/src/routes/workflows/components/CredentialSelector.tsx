@@ -66,7 +66,7 @@ function CredentialSelector({ value, onChange }: Props) {
                   {credential.browser_profile_id && (
                     <>
                       <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-[10px] text-green-400">
-                        login-free
+                        saved-profile
                       </span>
                       {credential.tested_url && (
                         <span className="text-[10px] text-muted-foreground">

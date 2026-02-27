@@ -107,7 +107,7 @@ type Props = {
   editingCredential?: CredentialApiResponse;
   /** Override the modal type (used in edit mode to set the correct form) */
   overrideType?: CredentialModalType;
-  /** Called after a credential is saved with "Dedicated browser profile?" to trigger an async test */
+  /** Called after a credential is saved with "Save browser session" checked to trigger an async test */
   onStartBackgroundTest?: (credentialId: string, url: string) => void;
 };
 
@@ -361,8 +361,8 @@ function CredentialsModal({
             title: "Credential test passed",
             description: data.browser_profile_id
               ? profileHost
-                ? `Login successful! Login-free credentials enabled for ${profileHost}`
-                : "Login successful! Login-free credentials enabled."
+                ? `Login successful! Saved browser session enabled for ${profileHost}`
+                : "Login successful! Saved browser session enabled."
               : "Login successful!",
             variant: "success",
           });
@@ -382,8 +382,8 @@ function CredentialsModal({
             testUrl;
           toast({
             title: failedHost
-              ? `Unable to establish login-free credentials for ${failedHost}`
-              : "Unable to establish login-free credentials",
+              ? `Unable to save browser session for ${failedHost}`
+              : "Unable to save browser session",
             description:
               data.failure_reason ?? "The login test did not succeed",
             variant: "destructive",
@@ -804,9 +804,9 @@ function CredentialsModal({
                     htmlFor="test-and-save"
                     className="cursor-pointer text-sm font-medium"
                   >
-                    Dedicated browser profile?
+                    Save browser session for future logins
                   </Label>
-                  <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future workflow runs will reuse this session, speeding up login blocks." />
+                  <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future workflow runs will skip the login form entirely because the saved session is already authenticated." />
                 </div>
 
                 {isTestInProgress && (
@@ -819,7 +819,7 @@ function CredentialsModal({
                   <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
                     <CheckCircledIcon className="size-4" />
                     <span>
-                      {`Login test passed — login-free credentials available for workflows using ${getHostname(testUrl) ?? testUrl}`}
+                      {`Login test passed — saved browser session available for workflows using ${getHostname(testUrl) ?? testUrl}`}
                     </span>
                   </div>
                 )}
@@ -842,8 +842,8 @@ function CredentialsModal({
                       <CrossCircledIcon className="size-4" />
                       <span>
                         {testUrl
-                          ? `Unable to establish login-free credentials for ${getHostname(testUrl) ?? testUrl}`
-                          : "Unable to establish login-free credentials"}
+                          ? `Unable to save browser session for ${getHostname(testUrl) ?? testUrl}`
+                          : "Unable to save browser session"}
                       </span>
                     </div>
                     {testFailureReason && (
