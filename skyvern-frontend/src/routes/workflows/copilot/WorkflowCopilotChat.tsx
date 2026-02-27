@@ -451,9 +451,13 @@ export function WorkflowCopilotChat({
           max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
           totp_verification_url: saveData.workflow.totp_verification_url,
           extra_http_headers: extraHttpHeaders,
-          run_with: saveData.settings.runWith,
+          run_with:
+            saveData.settings.runWith === "code_v2"
+              ? "code"
+              : saveData.settings.runWith,
           cache_key: normalizedKey,
           ai_fallback: saveData.settings.aiFallback ?? true,
+          adaptive_caching: saveData.settings.runWith === "code_v2",
           workflow_definition: {
             version: saveData.workflowDefinitionVersion,
             parameters: saveData.parameters,
