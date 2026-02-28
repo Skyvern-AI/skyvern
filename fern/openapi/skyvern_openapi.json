@@ -5753,7 +5753,8 @@
           "pdf_parser",
           "http_request",
           "human_interaction",
-          "print_page"
+          "print_page",
+          "workflow_trigger"
         ],
         "title": "BlockType"
       },
@@ -9406,6 +9407,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PrintPageBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowTriggerBlock"
                 }
               ],
               "discriminator": {
@@ -9433,7 +9437,8 @@
                   "text_prompt": "#/components/schemas/TextPromptBlock",
                   "upload_to_s3": "#/components/schemas/UploadToS3Block",
                   "validation": "#/components/schemas/ValidationBlock",
-                  "wait": "#/components/schemas/WaitBlock"
+                  "wait": "#/components/schemas/WaitBlock",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlock"
                 }
               }
             },
@@ -9659,6 +9664,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PrintPageBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
                 }
               ]
             },
@@ -17203,6 +17211,16 @@
             ],
             "title": "Cache Key"
           },
+          "adaptive_caching": {
+            "type": "boolean",
+            "title": "Adaptive Caching",
+            "default": false
+          },
+          "generate_script_on_terminal": {
+            "type": "boolean",
+            "title": "Generate Script On Terminal",
+            "default": false
+          },
           "run_sequentially": {
             "anyOf": [
               {
@@ -17434,6 +17452,16 @@
             "title": "Cache Key",
             "default": "default"
           },
+          "adaptive_caching": {
+            "type": "boolean",
+            "title": "Adaptive Caching",
+            "default": false
+          },
+          "generate_script_on_terminal": {
+            "type": "boolean",
+            "title": "Generate Script On Terminal",
+            "default": false
+          },
           "run_sequentially": {
             "type": "boolean",
             "title": "Run Sequentially",
@@ -17604,6 +17632,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PrintPageBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowTriggerBlock"
                 }
               ],
               "discriminator": {
@@ -17631,7 +17662,8 @@
                   "text_prompt": "#/components/schemas/TextPromptBlock",
                   "upload_to_s3": "#/components/schemas/UploadToS3Block",
                   "validation": "#/components/schemas/ValidationBlock",
-                  "wait": "#/components/schemas/WaitBlock"
+                  "wait": "#/components/schemas/WaitBlock",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlock"
                 }
               }
             },
@@ -17788,6 +17820,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PrintPageBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
                 }
               ],
               "discriminator": {
@@ -17815,7 +17850,8 @@
                   "text_prompt": "#/components/schemas/TextPromptBlockYAML",
                   "upload_to_s3": "#/components/schemas/UploadToS3BlockYAML",
                   "validation": "#/components/schemas/ValidationBlockYAML",
-                  "wait": "#/components/schemas/WaitBlockYAML"
+                  "wait": "#/components/schemas/WaitBlockYAML",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlockYAML"
                 }
               }
             },
@@ -19416,6 +19452,271 @@
           "import_failed"
         ],
         "title": "WorkflowStatus"
+      },
+      "WorkflowTriggerBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "workflow_trigger",
+            "title": "Block Type",
+            "default": "workflow_trigger"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "payload": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload"
+          },
+          "wait_for_completion": {
+            "type": "boolean",
+            "title": "Wait For Completion",
+            "default": true
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id"
+          },
+          "use_parent_browser_session": {
+            "type": "boolean",
+            "title": "Use Parent Browser Session",
+            "default": false
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "workflow_permanent_id"
+        ],
+        "title": "WorkflowTriggerBlock"
+      },
+      "WorkflowTriggerBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "workflow_trigger",
+            "title": "Block Type",
+            "default": "workflow_trigger"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "payload": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload"
+          },
+          "wait_for_completion": {
+            "type": "boolean",
+            "title": "Wait For Completion",
+            "default": true
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id"
+          },
+          "use_parent_browser_session": {
+            "type": "boolean",
+            "title": "Use Parent Browser Session",
+            "default": false
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "workflow_permanent_id"
+        ],
+        "title": "WorkflowTriggerBlockYAML"
       },
       "skyvern__forge__sdk__schemas__credentials__CredentialType": {
         "type": "string",
