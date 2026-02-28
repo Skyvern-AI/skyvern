@@ -42,6 +42,7 @@ class ScriptBlockSource:
     workflow_run_id: str | None
     workflow_run_block_id: str | None
     input_fields: list[str] | None
+    requires_agent: bool | None = None
 
 
 def _build_existing_field_assignments(
@@ -180,6 +181,50 @@ ACTIONS_WITH_XPATH = [
     "upload_file",
     "select_option",
 ]
+
+
+def _build_semantic_selector(act: dict[str, Any]) -> str | None:
+    """Build a semantic CSS selector from element data.
+
+    Priority order:
+    1. aria-label (most reliable semantic identifier)
+    2. placeholder (for inputs)
+    3. name attribute (common form field identifier)
+    4. text content (for buttons, links)
+    5. Fall back to None (use ai='fallback' with only prompt=)
+    """
+    element_data = act.get("skyvern_element_data") or {}
+    attrs = element_data.get("attributes", {})
+    tag = element_data.get("tagName", "")
+    text = (element_data.get("text") or "").strip()
+
+    # Try aria-label first
+    aria_label = attrs.get("aria-label", "")
+    if aria_label:
+        escaped = aria_label.replace('"', '\\"')
+        return f'{tag}[aria-label="{escaped}"]' if tag else f'[aria-label="{escaped}"]'
+
+    # Try placeholder (for input/textarea)
+    placeholder = attrs.get("placeholder", "")
+    if placeholder and tag in ("input", "textarea"):
+        escaped = placeholder.replace('"', '\\"')
+        return f'{tag}[placeholder="{escaped}"]'
+
+    # Try name attribute
+    name = attrs.get("name", "")
+    if name and tag in ("input", "textarea", "select"):
+        escaped = name.replace('"', '\\"')
+        return f'{tag}[name="{escaped}"]'
+
+    # Try text content (for buttons, links, labels)
+    if text and tag in ("button", "a"):
+        short_text = text[:50].replace('"', '\\"')
+        return f'{tag}:has-text("{short_text}")'
+
+    # No good semantic selector — return None (caller will use ai-only mode)
+    return None
+
+
 ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT = ["extract"]
 
 INDENT = " " * 4
@@ -562,6 +607,7 @@ def _action_to_stmt(
     task: dict[str, Any],
     assign_to_output: bool = False,
     value_to_param: dict[str, str] | None = None,
+    use_semantic_selectors: bool = False,
 ) -> cst.BaseStatement:
     """
     Turn one Action dict into:
@@ -580,22 +626,41 @@ def _action_to_stmt(
 
     args: list[cst.Arg] = []
     if method in ACTIONS_WITH_XPATH:
-        args.append(
-            cst.Arg(
-                keyword=cst.Name("selector"),
-                value=_value(f"xpath={act['xpath']}"),
-                whitespace_after_arg=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
+        if use_semantic_selectors:
+            semantic = _build_semantic_selector(act)
+            if semantic:
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("selector"),
+                        value=_value(semantic),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+            # If no semantic selector, skip selector arg — ai with prompt= handles it
+        else:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("selector"),
+                    value=_value(f"xpath={act['xpath']}"),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
             )
-        )
 
     if method == "click":
-        ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
-        click_context = act.get("click_context")
-        if click_context and isinstance(click_context, dict) and click_context.get("single_option_click"):
+        if use_semantic_selectors:
+            # With semantic selectors, try selector first, AI only if miss
             ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
+        else:
+            ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
+            click_context = act.get("click_context")
+            if click_context and isinstance(click_context, dict) and click_context.get("single_option_click"):
+                ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
         args.append(
             cst.Arg(
                 keyword=cst.Name("ai"),
@@ -954,11 +1019,139 @@ def _collect_block_input_fields(
     return all_fields
 
 
-def _build_block_fn(
+def _is_form_filling_block(
+    actions: list[dict[str, Any]],
+) -> bool:
+    """Check if a block's actions indicate a form-filling pattern (4+ input/select actions)."""
+    form_action_count = sum(
+        1 for a in actions if a.get("action_type") in (ActionType.INPUT_TEXT, ActionType.SELECT_OPTION)
+    )
+    return form_action_count >= 4
+
+
+def _build_form_filling_block_fn(
     block: dict[str, Any],
     actions: list[dict[str, Any]],
     value_to_param: dict[str, str] | None = None,
 ) -> FunctionDef:
+    """Generate a FIELD_MAP-based block function from V1 actions.
+
+    Instead of procedural page.fill()/page.select_option() calls, produces a
+    FIELD_MAP dictionary + page.fill_form() call for dynamic form filling.
+    """
+    name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
+    cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
+
+    # Build FIELD_MAP entries from actions
+    field_map_lines: list[str] = []
+    seen_keys: set[str] = set()
+
+    navigation_goal = block.get("navigation_goal") or "Fill out the form"
+
+    for act in actions:
+        action_type = act.get("action_type")
+        if action_type not in (ActionType.INPUT_TEXT, ActionType.SELECT_OPTION):
+            continue
+
+        intention = act.get("intention") or act.get("reasoning") or ""
+        # field_name is set by hydrate_input_text_actions_with_field_names()
+        # but may not match actual workflow parameter keys. Use value_to_param
+        # to look up the real parameter key from the literal value.
+        field_name = act.get("field_name")
+
+        # Look up the actual workflow parameter key via the literal action value
+        actual_param: str | None = None
+        if value_to_param:
+            if action_type == ActionType.INPUT_TEXT:
+                literal_value = act.get("text", "")
+            elif action_type == ActionType.SELECT_OPTION:
+                option = act.get("option", {})
+                literal_value = option.get("value") or option.get("label") or ""
+            else:
+                literal_value = ""
+            if literal_value and literal_value in value_to_param:
+                actual_param = value_to_param[literal_value]
+
+        # Determine the snake_case key for this field
+        if field_name:
+            key = sanitize_variable_name(field_name)
+        elif intention:
+            key = sanitize_variable_name(intention[:40])
+        else:
+            continue
+
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        # Determine action type for FIELD_MAP
+        if action_type == ActionType.SELECT_OPTION:
+            fm_action = "select"
+        else:
+            fm_action = "fill"
+
+        # Build the label from intention/reasoning
+        label = intention.lower().strip() if intention else key.replace("_", " ")
+        if len(label) > 60:
+            label = label[:60]
+
+        # Use actual_param (from value_to_param lookup) if found, else fall back to field_name.
+        # If neither exists, this field has no parameter → use ai='proactive'.
+        param = actual_param or field_name
+        param_str = repr(param) if param else "None"
+        ai_str = repr("proactive") if not param else repr("fallback")
+        prompt = intention or f"Fill the {key.replace('_', ' ')} field"
+
+        entry = (
+            f"        {repr(key)}: {{\n"
+            f'            "param": {param_str},\n'
+            f'            "action": {repr(fm_action)},\n'
+            f'            "ai": {ai_str},\n'
+            f'            "labels": [{repr(label)}],\n'
+            f'            "prompt": {repr(prompt)},\n'
+            f"        }},"
+        )
+        field_map_lines.append(entry)
+
+    # Build the function body as a string, then parse it
+    field_map_body = "\n".join(field_map_lines)
+
+    # Include page.goto(url) if the block has a URL, just like _build_block_fn does
+    goto_line = ""
+    if block.get("url"):
+        goto_line = f"    await page.goto({repr(block['url'])})\n"
+
+    func_code = (
+        f"async def {name}(page: SkyvernPage, context: RunContext):\n"
+        f"{goto_line}"
+        f"    FIELD_MAP = {{\n"
+        f"{field_map_body}\n"
+        f"    }}\n"
+        f"    await page.fill_form(FIELD_MAP, context, navigation_goal={repr(navigation_goal)})\n"
+        f"    if not await page.structural_validate():\n"
+        f"        await page.complete()\n"
+    )
+
+    # Parse and add decorator
+    parsed = cst.parse_module(func_code)
+    func_def = parsed.body[0]
+    assert isinstance(func_def, FunctionDef)
+
+    # Add the @skyvern.cached decorator
+    decorated = func_def.with_changes(decorators=[_make_decorator(cache_key, block)])
+    return decorated
+
+
+def _build_block_fn(
+    block: dict[str, Any],
+    actions: list[dict[str, Any]],
+    value_to_param: dict[str, str] | None = None,
+    use_semantic_selectors: bool = False,
+) -> FunctionDef:
+    # Check if this block is form-filling (4+ input_text/select actions)
+    if use_semantic_selectors and _is_form_filling_block(actions):
+        return _build_form_filling_block_fn(block, actions, value_to_param)
+
     name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
     body_stmts: list[cst.BaseStatement] = []
@@ -979,7 +1172,15 @@ def _build_block_fn(
 
         # For extraction blocks, assign extract action results to output variable
         assign_to_output = act["action_type"] == "extract"
-        body_stmts.append(_action_to_stmt(act, block, assign_to_output=assign_to_output, value_to_param=value_to_param))
+        body_stmts.append(
+            _action_to_stmt(
+                act,
+                block,
+                assign_to_output=assign_to_output,
+                value_to_param=value_to_param,
+                use_semantic_selectors=use_semantic_selectors,
+            )
+        )
 
     # add complete action
     block_type = block.get("block_type")
@@ -2325,6 +2526,8 @@ async def generate_workflow_script_python_code(
     pending: bool = False,
     cached_blocks: dict[str, ScriptBlockSource] | None = None,
     updated_block_labels: set[str] | None = None,
+    use_semantic_selectors: bool = False,
+    adaptive_caching: bool = False,
 ) -> str:
     """
     Build a LibCST Module and emit .code (PEP-8-formatted source).
@@ -2436,12 +2639,17 @@ async def generate_workflow_script_python_code(
             block_workflow_run_block_id = cached_source.workflow_run_block_id
         else:
             block_fn_def = _build_block_fn(
-                task, actions_by_task.get(task.get("task_id", ""), []), value_to_param=value_to_param
+                task,
+                actions_by_task.get(task.get("task_id", ""), []),
+                value_to_param=value_to_param,
+                use_semantic_selectors=use_semantic_selectors,
             )
             temp_module = cst.Module(body=[block_fn_def])
             block_code = temp_module.code
 
-            block_stmt = _build_block_statement(task, value_to_param=value_to_param)
+            # run_signature is executed in a scope without `context`, so don't
+            # parameterize the prompt — use literal strings instead.
+            block_stmt = _build_block_statement(task, value_to_param=None)
             run_signature_module = cst.Module(body=[block_stmt])
             run_signature = run_signature_module.code.strip()
 
@@ -2499,6 +2707,7 @@ async def generate_workflow_script_python_code(
                         child_block,
                         actions_by_task.get(child_block.get("task_id", ""), []),
                         value_to_param=value_to_param,
+                        use_semantic_selectors=use_semantic_selectors,
                     )
                     task_v2_block_body.append(cst.EmptyLine())
                     task_v2_block_body.append(cst.EmptyLine())
@@ -2507,7 +2716,7 @@ async def generate_workflow_script_python_code(
             temp_module = cst.Module(body=task_v2_block_body)
             block_code = temp_module.code
 
-            task_v2_stmt = _build_block_statement(task_v2, value_to_param=value_to_param)
+            task_v2_stmt = _build_block_statement(task_v2, value_to_param=None)
             run_signature = cst.Module(body=[task_v2_stmt]).code.strip()
 
         if script_id and script_revision_id and organization_id:
@@ -2577,6 +2786,56 @@ async def generate_workflow_script_python_code(
         # at module level ("async for outside async function"). The for-loop code is
         # already correctly inlined inside run_workflow() via _build_block_statement().
 
+    # --- agent-required blocks (adaptive caching) -----------------------
+    # Structural blocks (conditional, text_prompt, wait) can't be code-generated
+    # initially. Create script_block entries with requires_agent=True so the runtime
+    # knows to execute them via agent even when ai_fallback=False. The script reviewer
+    # can later upgrade these to code by setting requires_agent=False and providing
+    # a run_signature.
+    _AGENT_REQUIRED_BLOCK_TYPES = {"conditional", "text_prompt", "wait"}
+    if adaptive_caching:
+        agent_required_blocks = [b for b in blocks if b["block_type"] in _AGENT_REQUIRED_BLOCK_TYPES]
+        for arb in agent_required_blocks:
+            arb_label = arb.get("label") or f"{arb['block_type']}_{arb.get('workflow_run_block_id')}"
+            # Check if the reviewer has already provided code for this block
+            cached_source = cached_blocks.get(arb_label)
+            if cached_source and cached_source.run_signature and not cached_source.requires_agent:
+                # Reviewer upgraded this block to code — preserve it
+                if script_id and script_revision_id and organization_id:
+                    try:
+                        await create_or_update_script_block(
+                            block_code=cached_source.code,
+                            script_revision_id=script_revision_id,
+                            script_id=script_id,
+                            organization_id=organization_id,
+                            block_label=arb_label,
+                            update=pending,
+                            run_signature=cached_source.run_signature,
+                            workflow_run_id=cached_source.workflow_run_id,
+                            workflow_run_block_id=cached_source.workflow_run_block_id,
+                            requires_agent=False,
+                        )
+                    except Exception as e:
+                        LOG.error("Failed to preserve coded agent block", error=str(e), exc_info=True)
+                    append_block_code(cached_source.code)
+            else:
+                # Create a requires_agent entry (no code, no run_signature)
+                placeholder_code = f"# Block '{arb_label}' ({arb['block_type']}) — executed via agent"
+                if script_id and script_revision_id and organization_id:
+                    try:
+                        await create_or_update_script_block(
+                            block_code=placeholder_code,
+                            script_revision_id=script_revision_id,
+                            script_id=script_id,
+                            organization_id=organization_id,
+                            block_label=arb_label,
+                            update=pending,
+                            run_signature=None,
+                            requires_agent=True,
+                        )
+                    except Exception as e:
+                        LOG.error("Failed to create agent-required script block", error=str(e), exc_info=True)
+
     # --- preserve cached blocks from unexecuted branches ----------------
     # When a workflow has conditional blocks, not all branches execute in a single run.
     # transform_workflow_run_to_code_gen_input() only returns blocks that executed,
@@ -2593,6 +2852,10 @@ async def generate_workflow_script_python_code(
     for flb in for_loop_blocks:
         label = flb.get("label") or f"for_loop_{flb.get('workflow_run_block_id')}"
         processed_labels.add(label)
+    if adaptive_caching:
+        for arb in [b for b in blocks if b["block_type"] in _AGENT_REQUIRED_BLOCK_TYPES]:
+            arb_label = arb.get("label") or f"{arb['block_type']}_{arb.get('workflow_run_block_id')}"
+            processed_labels.add(arb_label)
 
     preserved_count = 0
     for cached_label, cached_source in cached_blocks.items():
@@ -2710,6 +2973,7 @@ async def create_or_update_script_block(
     workflow_run_id: str | None = None,
     workflow_run_block_id: str | None = None,
     input_fields: list[str] | None = None,
+    requires_agent: bool | None = None,
 ) -> None:
     """
     Create a script block in the database and save the block code to a script file.
@@ -2726,6 +2990,7 @@ async def create_or_update_script_block(
         workflow_run_id: The workflow run that generated this cached block
         workflow_run_block_id: The workflow run block that generated this cached block
         input_fields: Workflow parameter field names referenced by this block's cached actions
+        requires_agent: Whether this block must be executed via agent (None = don't change on update)
     """
     block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
     try:
@@ -2745,8 +3010,12 @@ async def create_or_update_script_block(
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 input_fields=input_fields,
+                requires_agent=requires_agent if requires_agent is not None else False,
             )
-        elif any(value is not None for value in [run_signature, workflow_run_id, workflow_run_block_id, input_fields]):
+        elif any(
+            value is not None
+            for value in [run_signature, workflow_run_id, workflow_run_block_id, input_fields, requires_agent]
+        ):
             # Update metadata when new values are provided
             script_block = await app.DATABASE.update_script_block(
                 script_block_id=script_block.script_block_id,
@@ -2755,6 +3024,7 @@ async def create_or_update_script_block(
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 input_fields=input_fields,
+                requires_agent=requires_agent,
             )
 
         # Step 4: Create script file for the block
