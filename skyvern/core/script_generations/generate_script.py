@@ -2786,6 +2786,75 @@ async def generate_workflow_script_python_code(
         # at module level ("async for outside async function"). The for-loop code is
         # already correctly inlined inside run_workflow() via _build_block_statement().
 
+        # Generate cached function bodies for for_loop inner blocks.
+        # Inner blocks (e.g. extraction inside a loop) are nested in loop_blocks and
+        # are NOT in the top-level blocks list, so they need separate processing here.
+        # This follows the same pattern as task_v2 child block handling (lines 2704-2714).
+        for loop_block in for_loop_block.get("loop_blocks", []):
+            if loop_block.get("block_type") not in SCRIPT_TASK_BLOCKS:
+                continue
+
+            inner_label = (
+                loop_block.get("label") or loop_block.get("title") or f"block_{loop_block.get('workflow_run_block_id')}"
+            )
+
+            # Check if already cached (for progressive caching)
+            cached_inner = cached_blocks.get(inner_label)
+            use_inner_cached = cached_inner is not None and inner_label not in updated_block_labels
+
+            if use_inner_cached:
+                assert cached_inner is not None
+                inner_block_code = cached_inner.code
+                inner_run_signature = cached_inner.run_signature
+                inner_wrbi = cached_inner.workflow_run_block_id
+                inner_wri = cached_inner.workflow_run_id
+            else:
+                inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
+                if not inner_actions:
+                    continue  # No actions from agent run = can't generate cached function
+
+                inner_fn_def = _build_block_fn(
+                    loop_block,
+                    inner_actions,
+                    value_to_param=value_to_param,
+                    use_semantic_selectors=use_semantic_selectors,
+                )
+                inner_block_code = cst.Module(body=[inner_fn_def]).code
+
+                inner_stmt = _build_block_statement(loop_block, value_to_param=None)
+                inner_run_signature = cst.Module(body=[inner_stmt]).code.strip()
+
+                inner_wrbi = loop_block.get("workflow_run_block_id")
+                inner_wri = loop_block.get("workflow_run_id") or run_id
+
+            # Create script_block entry for preservation across regenerations
+            if script_id and script_revision_id and organization_id:
+                try:
+                    inner_input_fields = _collect_block_input_fields(loop_block, actions_by_task)
+                    if not inner_input_fields and cached_inner and cached_inner.input_fields:
+                        inner_input_fields = cached_inner.input_fields
+                    await create_or_update_script_block(
+                        block_code=inner_block_code,
+                        script_revision_id=script_revision_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        block_label=inner_label,
+                        update=pending,
+                        run_signature=inner_run_signature,
+                        workflow_run_id=inner_wri,
+                        workflow_run_block_id=inner_wrbi,
+                        input_fields=inner_input_fields,
+                    )
+                except Exception as e:
+                    LOG.error(
+                        "Failed to create for_loop inner block script block",
+                        error=str(e),
+                        block_label=inner_label,
+                        exc_info=True,
+                    )
+
+            append_block_code(inner_block_code)
+
     # --- agent-required blocks (adaptive caching) -----------------------
     # Structural blocks (conditional, text_prompt, wait) can't be code-generated
     # initially. Create script_block entries with requires_agent=True so the runtime
@@ -2852,6 +2921,12 @@ async def generate_workflow_script_python_code(
     for flb in for_loop_blocks:
         label = flb.get("label") or f"for_loop_{flb.get('workflow_run_block_id')}"
         processed_labels.add(label)
+        # Also track inner block labels to prevent duplication in the
+        # "preserve unexecuted branch" section below
+        for lb in flb.get("loop_blocks", []):
+            inner_lbl = lb.get("label") or lb.get("title")
+            if inner_lbl:
+                processed_labels.add(inner_lbl)
     if adaptive_caching:
         for arb in [b for b in blocks if b["block_type"] in _AGENT_REQUIRED_BLOCK_TYPES]:
             arb_label = arb.get("label") or f"{arb['block_type']}_{arb.get('workflow_run_block_id')}"

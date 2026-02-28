@@ -699,6 +699,15 @@ async def _update_workflow_block(
             label,
         )
 
+        # If executing inside a for_loop, collect this block's output for loop aggregation.
+        # Guard: skip if this is the loop block's own _update_workflow_block call.
+        if (
+            context.loop_output_values is not None
+            and context.parent_workflow_run_block_id
+            and workflow_run_block_id != context.parent_workflow_run_block_id
+        ):
+            _append_to_loop_output(final_output, label)
+
     except Exception as e:
         LOG.warning(
             "Failed to update workflow block status",
@@ -712,6 +721,20 @@ async def _update_workflow_block(
 async def _run_cached_function(cached_fn: Callable) -> Any:
     run_context = script_run_context_manager.ensure_run_context()
     return await cached_fn(page=run_context.page, context=run_context)
+
+
+def _append_to_loop_output(output: Any, label: str | None = None) -> None:
+    """If executing inside a for_loop, collect this block's output for loop aggregation."""
+    context = skyvern_context.current()
+    if not context or context.loop_output_values is None or context.loop_metadata is None:
+        return
+    context.loop_output_values.append(
+        {
+            "loop_value": context.loop_metadata.get("current_value"),
+            "output_value": output,
+            "label": label,
+        }
+    )
 
 
 def _determine_action_ai_mode(
@@ -1605,6 +1628,7 @@ async def run_task(
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
+        _append_to_loop_output(block_output.output_parameter_value, label)
         return block_output.output_parameter_value
 
 
@@ -1936,6 +1960,7 @@ async def extract(
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
+        _append_to_loop_output(block_result.output_parameter_value, label)
         return block_result.output_parameter_value
 
 
@@ -2039,6 +2064,7 @@ async def execute_validation(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _append_to_loop_output(result.output_parameter_value, label)
     return result
 
 
@@ -2161,6 +2187,13 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
             template_data.update(workflow_run_context.values)
             if template in template_data:
                 return template_data[template]
+        # Inject for_loop metadata (current_value, current_index, current_item) so
+        # that cached function bodies inside for_loops can resolve {{ current_value }}
+        # in page.goto() and other template-rendered calls.
+        if context.loop_metadata:
+            for key in ("current_value", "current_index", "current_item"):
+                if key in context.loop_metadata:
+                    template_data[key] = context.loop_metadata[key]
     return jinja_template.render(template_data)
 
 
@@ -2258,6 +2291,7 @@ async def run_code(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _append_to_loop_output(block_result.output_parameter_value, label)
     return cast(dict[str, Any], block_result.output_parameter_value)
 
 
@@ -2487,6 +2521,7 @@ async def prompt(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _append_to_loop_output(result.output_parameter_value, label)
     return result.output_parameter_value
 
 
