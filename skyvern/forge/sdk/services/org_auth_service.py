@@ -103,7 +103,13 @@ async def get_current_org_with_authentication(
 
 
 async def _authenticate_helper(authorization: str) -> Organization:
-    token = authorization.split(" ")[1]
+    parts = authorization.split(" ", 1)
+    if len(parts) < 2 or not parts[1]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid credentials",
+        )
+    token = parts[1]
     if not app.authentication_function:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -158,7 +164,13 @@ async def get_current_user_id_with_authentication(
 
 
 async def _authenticate_user_helper(authorization: str) -> str:
-    token = authorization.split(" ")[1]
+    parts = authorization.split(" ", 1)
+    if len(parts) < 2 or not parts[1]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid credentials",
+        )
+    token = parts[1]
     if not app.authenticate_user_function:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from skyvern.forge.sdk.forge_log import setup_logger as _setup_logger
 from skyvern.utils.env_paths import resolve_backend_env_path
 
+from ..auth_command import signup as signup_command
 from ..block import block_app
 from ..credential import credential_app
 from ..credentials import credentials_app
@@ -81,6 +82,8 @@ cli_app.add_typer(init_app, name="init")
 cli_app.add_typer(
     quickstart_app, name="quickstart", help="One-command setup and start for Skyvern (combines init and run)."
 )
+
+cli_app.command(name="signup")(signup_command)
 
 # Browser automation commands
 cli_app.add_typer(browser_app, name="browser", help="Browser automation commands.")
