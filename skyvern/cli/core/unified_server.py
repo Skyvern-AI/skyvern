@@ -10,7 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import httpx
+import structlog
 from aiohttp import WSMsgType, web
+
+LOG = structlog.get_logger()
 
 
 @dataclass
@@ -78,7 +81,7 @@ class UnifiedServer:
     # CDP JSON API handlers
     # -------------------------------------------------------------------------
 
-    async def _proxy_json_endpoint(self, endpoint: str) -> web.Response:
+    async def _proxy_json_endpoint(self, request: web.Request, endpoint: str) -> web.Response:
         """Proxy a request to Chrome's CDP JSON API."""
         url = f"http://127.0.0.1:{self.config.chrome_cdp_port}{endpoint}"
         async with httpx.AsyncClient() as client:
@@ -86,12 +89,16 @@ class UnifiedServer:
                 response = await client.get(url, timeout=10)
                 data = response.json()
 
-                # Rewrite WebSocket URLs to point to our proxy
+                # Get the external host and protocol from the request (e.g., ngrok URL)
+                external_host = request.headers.get("Host", f"127.0.0.1:{self.config.port}")
+                forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
+
+                # Rewrite WebSocket URLs to point to our proxy via the external host
                 if isinstance(data, list):
                     for item in data:
-                        self._rewrite_ws_urls(item)
+                        self._rewrite_ws_urls(item, external_host, forwarded_proto)
                 elif isinstance(data, dict):
-                    self._rewrite_ws_urls(data)
+                    self._rewrite_ws_urls(data, external_host, forwarded_proto)
 
                 return web.json_response(data)
             except httpx.RequestError as e:
@@ -100,31 +107,41 @@ class UnifiedServer:
                     status=502,
                 )
 
-    def _rewrite_ws_urls(self, data: dict) -> None:
-        """Rewrite Chrome's CDP WebSocket URLs to point to our proxy."""
+    def _rewrite_ws_urls(self, data: dict, external_host: str, forwarded_proto: str = "") -> None:
+        """Rewrite Chrome's CDP WebSocket URLs to point to our proxy via external host."""
         for key in ["webSocketDebuggerUrl", "devtoolsFrontendUrl"]:
             if key in data and data[key]:
-                # Replace Chrome's internal port with our proxy port
+                # Determine the WebSocket scheme based on whether we're behind HTTPS
+                # Check X-Forwarded-Proto first (works with any HTTPS-terminating proxy),
+                # then fall back to known tunnel domains (ngrok)
+                if forwarded_proto == "https" or external_host.endswith((".ngrok-free.dev", ".ngrok.io")):
+                    ws_scheme = "wss"
+                else:
+                    ws_scheme = "ws"
+
+                # Replace Chrome's internal URL with our proxy URL
+                # Original: ws://127.0.0.1:{chrome_port}/devtools/...
+                # New: ws(s)://{external_host}/devtools/...
                 data[key] = data[key].replace(
-                    f"127.0.0.1:{self.config.chrome_cdp_port}",
-                    f"127.0.0.1:{self.config.port}",
+                    f"ws://127.0.0.1:{self.config.chrome_cdp_port}",
+                    f"{ws_scheme}://{external_host}",
                 )
 
     async def _handle_json(self, request: web.Request) -> web.Response:
         """Handle /json endpoint."""
-        return await self._proxy_json_endpoint("/json")
+        return await self._proxy_json_endpoint(request, "/json")
 
     async def _handle_json_version(self, request: web.Request) -> web.Response:
         """Handle /json/version endpoint."""
-        return await self._proxy_json_endpoint("/json/version")
+        return await self._proxy_json_endpoint(request, "/json/version")
 
     async def _handle_json_list(self, request: web.Request) -> web.Response:
         """Handle /json/list endpoint."""
-        return await self._proxy_json_endpoint("/json/list")
+        return await self._proxy_json_endpoint(request, "/json/list")
 
     async def _handle_json_protocol(self, request: web.Request) -> web.Response:
         """Handle /json/protocol endpoint."""
-        return await self._proxy_json_endpoint("/json/protocol")
+        return await self._proxy_json_endpoint(request, "/json/protocol")
 
     # -------------------------------------------------------------------------
     # CDP WebSocket proxy handler
@@ -139,14 +156,24 @@ class UnifiedServer:
         path = request.match_info["path"]
         chrome_ws_url = f"ws://127.0.0.1:{self.config.chrome_cdp_port}/devtools/{path}"
 
-        # Set up client-facing WebSocket
-        ws_client = web.WebSocketResponse()
+        LOG.info(
+            "CDP WebSocket connection request",
+            path=path,
+            chrome_ws_url=chrome_ws_url,
+            client_host=request.headers.get("Host", "unknown"),
+        )
+
+        # Set up client-facing WebSocket with heartbeat to keep connection alive
+        ws_client = web.WebSocketResponse(heartbeat=30.0)
         await ws_client.prepare(request)
 
-        # Connect to Chrome's CDP WebSocket
-        async with aiohttp.ClientSession() as session:
+        # Connect to Chrome's CDP WebSocket with timeout and heartbeat
+        timeout = aiohttp.ClientTimeout(total=60, connect=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
-                async with session.ws_connect(chrome_ws_url) as ws_chrome:
+                async with session.ws_connect(chrome_ws_url, heartbeat=30.0) as ws_chrome:
+                    LOG.info("CDP WebSocket connected to Chrome", path=path)
+
                     # Bidirectional message relay
                     async def relay_client_to_chrome() -> None:
                         async for msg in ws_client:
@@ -172,7 +199,9 @@ class UnifiedServer:
                         relay_chrome_to_client(),
                         return_exceptions=True,
                     )
+                    LOG.info("CDP WebSocket connection closed normally", path=path)
             except aiohttp.ClientError as e:
+                LOG.error("CDP WebSocket connection error", path=path, error=str(e))
                 if not ws_client.closed:
                     await ws_client.close(code=1011, message=str(e).encode())
 
