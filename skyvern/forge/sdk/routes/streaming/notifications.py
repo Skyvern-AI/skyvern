@@ -6,12 +6,10 @@ import structlog
 from fastapi import WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming.auth import _auth as local_auth
-from skyvern.forge.sdk.routes.streaming.auth import auth as real_auth
+from skyvern.forge.sdk.routes.streaming.auth import auth
 
 LOG = structlog.get_logger()
 HEARTBEAT_INTERVAL = 60
@@ -40,7 +38,6 @@ async def _notification_stream_handler(
     apikey: str | None = None,
     token: str | None = None,
 ) -> None:
-    auth = local_auth if settings.ENV == "local" else real_auth
     organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
     if not organization_id:
         LOG.info("Notifications: Authentication failed")

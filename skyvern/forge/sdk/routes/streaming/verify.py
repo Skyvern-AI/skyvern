@@ -21,7 +21,6 @@ from datetime import datetime, timedelta
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -45,18 +44,6 @@ async def verify_browser_session(
     """
     Verify the browser session exists, and is usable.
     """
-    if settings.ENV == "local":
-        dummy_browser_session = AddressablePersistentBrowserSession(
-            persistent_browser_session_id=browser_session_id,
-            organization_id=organization_id,
-            browser_address="0.0.0.0:9223",
-            ip_address="localhost",
-            created_at=datetime.now(),
-            modified_at=datetime.now(),
-        )
-
-        return dummy_browser_session
-
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, organization_id)
 
     if not browser_session:
@@ -183,28 +170,6 @@ async def verify_workflow_run(
     Verify the workflow run is running, and that it has a browser session associated
     with it.
     """
-
-    if settings.ENV == "local":
-        dummy_workflow_run = WorkflowRun(
-            workflow_id="123",
-            workflow_permanent_id="wpid_123",
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            status=WorkflowRunStatus.running,
-            created_at=datetime.now(),
-            modified_at=datetime.now(),
-        )
-
-        dummy_browser_session = AddressablePersistentBrowserSession(
-            persistent_browser_session_id=workflow_run_id,
-            organization_id=organization_id,
-            browser_address="0.0.0.0:9223",
-            ip_address="localhost",
-            created_at=datetime.now(),
-            modified_at=datetime.now(),
-        )
-
-        return dummy_workflow_run, dummy_browser_session
 
     workflow_run = await app.DATABASE.get_workflow_run(
         workflow_run_id=workflow_run_id,

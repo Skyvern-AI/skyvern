@@ -104,6 +104,10 @@ class PersistentSessionsManager(Protocol):
         """Close all browser sessions for an organization."""
         ...
 
+    async def cleanup_stale_sessions(self) -> None:
+        """Clean up sessions left active by a previous process."""
+        ...
+
     @classmethod
     async def close(cls) -> None:
         """Close all browser sessions across all organizations."""

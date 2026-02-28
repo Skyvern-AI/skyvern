@@ -221,7 +221,7 @@ class VncChannel:
         except Exception:
             pass
 
-        del_vnc_channel(self.client_id)
+        del_vnc_channel(self.client_id, expected=self)
 
         return self
 

@@ -216,6 +216,7 @@ def create_forge_app() -> ForgeApp:
     app.WORKFLOW_SERVICE = WorkflowService()
     app.AGENT_FUNCTION = AgentFunction()
     app.PERSISTENT_SESSIONS_MANAGER = DefaultPersistentSessionsManager(database=app.DATABASE)
+    app.PERSISTENT_SESSIONS_MANAGER.watch_session_pool()
     app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
