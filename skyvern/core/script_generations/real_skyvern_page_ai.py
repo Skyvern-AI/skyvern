@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -241,6 +242,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
         if intention:
             try:
                 prompt = context.prompt
+                # Merge script_run_parameters into LLM payload (consistency with ai_click/ai_upload_file).
+                # No-op when script_run_parameters is unset (i.e. non-adaptive-caching runs).
+                data = _get_context_data(data)
                 data = data or {}
                 if value and isinstance(data, dict) and "value" not in data:
                     data["value"] = value
@@ -463,7 +467,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if intention and task and step:
                 try:
                     prompt = context.prompt if context else None
-                    # data = _get_context_data(data)
+                    # Merge script_run_parameters into LLM payload (consistency with ai_click/ai_upload_file).
+                    # No-op when script_run_parameters is unset (i.e. non-adaptive-caching runs).
+                    data = _get_context_data(data)
                     data = data or {}
                     if value and isinstance(data, dict) and "value" not in data:
                         data["value"] = value
@@ -513,6 +519,233 @@ class RealSkyvernPageAi(SkyvernPageAi):
             await locator.select_option(option_value, timeout=timeout)
         return option_value
 
+    async def ai_classify(
+        self,
+        options: dict[str, str],
+        url_patterns: dict[str, str] | None = None,
+        text_patterns: dict[str, str | list[str]] | None = None,
+    ) -> str:
+        """Classify the current page state using a tiered cascade.
+
+        Tier 0: URL regex matching (FREE)
+        Tier 1: Text substring check in extracted text (FREE, requires scrape)
+        Tier 2: Mini-LLM classification (~$0.001)
+
+        Returns the matching option key or "UNKNOWN".
+        Also records a branch hit for TTL-based branch pruning.
+        """
+        current_url = self.page.url
+        result = "UNKNOWN"
+
+        # Tier 0: URL pattern matching (FREE)
+        if url_patterns:
+            for key, pattern in url_patterns.items():
+                try:
+                    if key in options and re.search(pattern, current_url):
+                        LOG.info(
+                            "page.classify: matched via URL pattern",
+                            key=key,
+                            pattern=pattern,
+                            url=current_url,
+                        )
+                        result = key
+                        await self._record_branch_hit(result)
+                        self._store_classify_result(result)
+                        return result
+                except re.error:
+                    LOG.warning("page.classify: invalid URL regex pattern", key=key, pattern=pattern)
+
+        # Tier 1: Text presence check (FREE, requires scrape)
+        scraped = False
+        if text_patterns:
+            await self._refresh_scraped_page(take_screenshots=False)
+            scraped = True
+            extracted_text = self.scraped_page.extracted_text or ""
+            extracted_lower = extracted_text.lower()
+            for key, text_pattern in text_patterns.items():
+                if key not in options:
+                    continue
+                # Accept both a single string and a list of strings
+                patterns = text_pattern if isinstance(text_pattern, list) else [text_pattern]
+                if all(p.lower() in extracted_lower for p in patterns):
+                    LOG.info(
+                        "page.classify: matched via text pattern",
+                        key=key,
+                        pattern=text_pattern,
+                    )
+                    result = key
+                    await self._record_branch_hit(result)
+                    self._store_classify_result(result)
+                    return result
+
+        # Tier 2: Mini-LLM classification
+        if not scraped:
+            await self._refresh_scraped_page(take_screenshots=False)
+        extracted_text = (self.scraped_page.extracted_text or "")[:2000]
+
+        classify_prompt = prompt_engine.load_prompt(
+            template="page-classify",
+            current_url=current_url,
+            extracted_text=extracted_text,
+            options=options,
+        )
+
+        context = skyvern_context.current()
+        step = None
+        organization_id = context.organization_id if context else None
+        if context and context.organization_id and context.step_id:
+            step = await app.DATABASE.get_step(
+                step_id=context.step_id,
+                organization_id=context.organization_id,
+            )
+
+        try:
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=classify_prompt,
+                prompt_name="page-classify",
+                step=step,
+                organization_id=organization_id,
+            )
+            classification = json_response.get("classification", "UNKNOWN")
+            confidence = json_response.get("confidence", 0.0)
+            reasoning = json_response.get("reasoning", "")
+
+            LOG.info(
+                "page.classify: LLM classification result",
+                classification=classification,
+                confidence=confidence,
+                reasoning=reasoning,
+            )
+
+            if classification in options or classification == "UNKNOWN":
+                result = classification
+            else:
+                result = "UNKNOWN"
+        except Exception:
+            LOG.exception("page.classify: LLM classification failed")
+            result = "UNKNOWN"
+
+        await self._record_branch_hit(result)
+        self._store_classify_result(result)
+        return result
+
+    @staticmethod
+    def _store_classify_result(result: str) -> None:
+        """Store the classify result on SkyvernContext for fallback episode recording."""
+        try:
+            ctx = skyvern_context.current()
+            if ctx:
+                ctx.last_classify_result = result
+        except Exception:
+            pass
+
+    async def _record_branch_hit(self, branch_key: str) -> None:
+        """Best-effort recording of a classify branch hit for TTL tracking."""
+        try:
+            context = skyvern_context.current()
+            if not context or not context.organization_id or not context.workflow_permanent_id:
+                return
+            block_label = self.current_label or "unknown"
+            await app.DATABASE.record_branch_hit(
+                organization_id=context.organization_id,
+                workflow_permanent_id=context.workflow_permanent_id,
+                block_label=block_label,
+                branch_key=branch_key,
+            )
+        except Exception:
+            LOG.debug("Failed to record branch hit", exc_info=True)
+
+    async def ai_element_fallback(
+        self,
+        navigation_goal: str,
+        max_steps: int = 10,
+    ) -> None:
+        """Activate the AI agent from the CURRENT page position to achieve a navigation goal.
+
+        Uses repeated ai_act calls with ai_validate checks to execute from the
+        current page state. Records all actions taken for later review by the
+        AI Script Reviewer.
+        """
+        context = skyvern_context.current()
+        if not context or not context.organization_id:
+            raise Exception("element_fallback requires an active context with organization_id")
+
+        LOG.info(
+            "page.element_fallback: starting from current page",
+            navigation_goal=navigation_goal,
+            max_steps=max_steps,
+            current_url=self.page.url,
+            workflow_run_id=context.workflow_run_id,
+        )
+
+        # Capture page state before element fallback for episode recording
+        page_url_at_entry = self.page.url
+        page_text_at_entry: str | None = None
+        try:
+            page_text_at_entry = (await self.page.inner_text("body"))[:1500]
+        except Exception:
+            pass
+
+        steps_taken: list[dict] = []
+        completed = False
+
+        for step_num in range(max_steps):
+            # Check if the goal has been achieved
+            is_complete = await self.ai_validate(
+                prompt=f"Has the following goal been achieved? Goal: {navigation_goal}",
+            )
+            if is_complete:
+                LOG.info(
+                    "page.element_fallback: goal achieved",
+                    step_num=step_num,
+                    navigation_goal=navigation_goal,
+                )
+                completed = True
+                break
+
+            LOG.info(
+                "page.element_fallback: executing step",
+                step_num=step_num,
+                current_url=self.page.url,
+            )
+
+            # Let the AI agent take an action toward the goal
+            await self.ai_act(
+                prompt=f"Take the next action to achieve this goal: {navigation_goal}",
+            )
+            steps_taken.append({"step": step_num, "url_after": self.page.url})
+
+        # Record an element fallback episode for the feedback loop
+        if context.workflow_run_id and context.workflow_permanent_id:
+            try:
+                await app.DATABASE.create_fallback_episode(
+                    organization_id=context.organization_id,
+                    workflow_permanent_id=context.workflow_permanent_id,
+                    workflow_run_id=context.workflow_run_id,
+                    block_label=self.current_label or "unknown",
+                    fallback_type="element",
+                    script_revision_id=context.script_revision_id,
+                    error_message=f"classify returned UNKNOWN, element_fallback goal: {navigation_goal}",
+                    page_url=page_url_at_entry,
+                    page_text_snapshot=page_text_at_entry,
+                    agent_actions={
+                        "navigation_goal": navigation_goal,
+                        "completed": completed,
+                        "steps_taken": len(steps_taken),
+                        "steps": steps_taken[:20],
+                    },
+                )
+            except Exception:
+                LOG.debug("Failed to record element fallback episode", exc_info=True)
+
+        if not completed:
+            LOG.warning(
+                "page.element_fallback: reached max steps without completing",
+                max_steps=max_steps,
+                navigation_goal=navigation_goal,
+            )
+            raise Exception(f"Element fallback did not complete within {max_steps} steps")
+
     async def ai_extract(
         self,
         prompt: str,
@@ -553,6 +786,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             step=step,
             screenshots=self.scraped_page.screenshots,
             prompt_name="extract-information",
+            force_dict=False,
         )
 
         # Validate and fill missing fields based on schema
