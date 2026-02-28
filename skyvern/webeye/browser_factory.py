@@ -36,6 +36,8 @@ from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 
 LOG = structlog.get_logger()
 
+
+BrowserCleanupFunc = Callable[[], Awaitable[None]] | None
 # Header to signal fresh browser context creation (stripped before sending to websites)
 # When set to "true", creates a new incognito-like context instead of reusing existing ones
 FRESH_CONTEXT_HEADER = "X-Skyvern-Fresh-Context"
@@ -81,9 +83,6 @@ def parse_extra_headers(extra_http_headers: dict[str, str] | None) -> ParsedBrow
         use_fresh_context=use_fresh_context,
         enable_download=enable_download,
     )
-
-
-BrowserCleanupFunc = Callable[[], None] | None
 
 
 def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
