@@ -18,7 +18,7 @@ block_module = sys.modules["skyvern.forge.sdk.workflow.models.block"]
     ("model_name", "expected_llm_key"),
     [
         ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH"),
-        ("gemini-3-pro-preview", "VERTEX_GEMINI_3.0_PRO"),
+        ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO"),
     ],
 )
 async def test_text_prompt_block_uses_selected_model(monkeypatch, model_name, expected_llm_key):
