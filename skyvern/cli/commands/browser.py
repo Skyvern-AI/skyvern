@@ -6,7 +6,10 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from skyvern.cli.core.browser_launcher import LocalBrowserInfo
 
 import typer
 
@@ -918,3 +921,271 @@ def login(
         output_error(
             str(e), hint="Check credential inputs, active connection, and timeout settings.", json_mode=json_output
         )
+
+
+# ---------------------------------------------------------------------------
+# Browser serve command (POC for local browser + tunnel)
+# ---------------------------------------------------------------------------
+
+
+@browser_app.command("serve")
+def serve(
+    port: int = typer.Option(9222, help="Server port (exposes CDP proxy + file server)."),
+    profile_dir: str | None = typer.Option(
+        None,
+        "--profile-dir",
+        help="Chrome user data directory. Uses existing cookies/auth if specified.",
+    ),
+    download_dir: str | None = typer.Option(
+        None,
+        "--download-dir",
+        help="Directory where browser downloads files. Defaults to ~/.skyvern/downloads/{browser_id}.",
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        envvar="SKYVERN_BROWSER_SERVE_API_KEY",
+        help="API key for authenticating requests. If set, requires x-api-key header.",
+    ),
+    headless: bool = typer.Option(False, "--headless", help="Run Chrome in headless mode."),
+    chrome_path: str | None = typer.Option(
+        None,
+        "--chrome-path",
+        help="Path to Chrome executable. Auto-detects if not specified.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output connection info as JSON."),
+) -> None:
+    """Launch a local Chrome browser with CDP server for Skyvern Cloud.
+
+    This command starts a unified server that provides:
+    - CDP WebSocket proxy at /devtools/* (forwards to Chrome)
+    - CDP JSON API at /json/* (for listing targets)
+
+    \b
+    Downloads are automatically captured by Skyvern via CDP and saved to the
+    Skyvern worker's disk.
+
+    \b
+    Quick start:
+      1. Start the browser serve:
+         skyvern browser serve
+
+      2. In another terminal, set up a single HTTP tunnel:
+         ngrok http 9222
+
+      3. Use the tunnel URL for browser_address in your task:
+         wss://YOUR_TUNNEL_URL/devtools/browser/...
+    """
+    import signal
+
+    from skyvern.cli.core.browser_launcher import (
+        generate_browser_id,
+        get_default_chrome_path,
+        get_default_download_dir,
+        get_default_profile_dir,
+        launch_chrome_with_cdp,
+        terminate_browser,
+    )
+    from skyvern.cli.core.unified_server import UnifiedServer, UnifiedServerConfig
+    from skyvern.cli.run_commands import get_pids_on_port
+
+    # Chrome runs on internal port, unified server on exposed port
+    chrome_internal_port = port + 1000  # e.g., 9222 -> 10222
+
+    # Check for port conflicts
+    for check_port, name in [(port, "unified server"), (chrome_internal_port, "Chrome CDP (internal)")]:
+        existing_pids = get_pids_on_port(check_port)
+        if existing_pids:
+            output_error(
+                f"Port {check_port} ({name}) is already in use by process(es): {existing_pids}",
+                hint="Use a different --port or stop the existing process.",
+                json_mode=json_output,
+            )
+            raise SystemExit(1)
+
+    # Generate unique browser ID for this instance
+    browser_id = generate_browser_id()
+
+    # Resolve paths for display
+    resolved_chrome_path = chrome_path or get_default_chrome_path()
+    resolved_profile_dir = profile_dir or get_default_profile_dir()
+    # Use unique download directory if not specified
+    resolved_download_dir = download_dir or get_default_download_dir(browser_id)
+
+    if not json_output:
+        output(
+            {
+                "status": "starting",
+                "browser_id": browser_id,
+                "chrome_path": resolved_chrome_path,
+                "profile_dir": resolved_profile_dir,
+                "download_dir": resolved_download_dir,
+                "port": port,
+                "headless": headless,
+                "auth_enabled": api_key is not None,
+            },
+            action="serve_starting",
+            json_mode=False,
+        )
+
+    browser_info: LocalBrowserInfo | None = None
+    unified_server: UnifiedServer | None = None
+    shutdown_requested = False
+
+    def signal_handler(signum: int, frame: Any) -> None:
+        nonlocal shutdown_requested
+        shutdown_requested = True
+
+    # Set up signal handlers
+    original_sigint = signal.signal(signal.SIGINT, signal_handler)
+    original_sigterm = signal.signal(signal.SIGTERM, signal_handler)
+
+    async def run_serve() -> None:
+        nonlocal browser_info, unified_server, shutdown_requested
+
+        # Launch Chrome on internal port
+        browser_info = await launch_chrome_with_cdp(
+            port=chrome_internal_port,
+            profile_dir=profile_dir,
+            headless=headless,
+            chrome_path=chrome_path,
+            download_dir=resolved_download_dir,
+        )
+
+        # Start unified server on exposed port
+        config = UnifiedServerConfig(
+            port=port,
+            chrome_cdp_port=chrome_internal_port,
+            api_key=api_key,
+        )
+        unified_server = UnifiedServer(config)
+        await unified_server.start()
+
+        # Extract browser path from Chrome's CDP URL
+        browser_path = browser_info.cdp_ws_url.split("/devtools/browser/")[-1]
+
+        # Output success info
+        result = {
+            "status": "running",
+            "browser_id": browser_id,
+            "server_url": f"http://127.0.0.1:{port}",
+            "cdp_ws_url": f"ws://127.0.0.1:{port}/devtools/browser/{browser_path}",
+            "port": port,
+            "profile_dir": browser_info.profile_dir,
+            "auth_enabled": api_key is not None,
+        }
+
+        if json_output:
+            output(result, action="serve", json_mode=True)
+        else:
+            _print_serve_instructions_unified(result, browser_path)
+
+        # Keep the event loop running while server is active
+        # This is required because aiohttp's TCPSite needs the event loop to accept connections
+        try:
+            while not shutdown_requested:
+                # Check if Chrome process is still alive
+                if browser_info.process.poll() is not None:
+                    if not json_output:
+                        output_error(
+                            "Chrome process exited unexpectedly",
+                            hint="Check Chrome logs or try restarting with a different profile.",
+                            json_mode=False,
+                        )
+                    raise SystemExit(1)
+
+                # Sleep briefly to avoid busy-waiting
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(run_serve())
+    except FileNotFoundError as e:
+        output_error(
+            str(e),
+            hint="Install Chrome or specify the path with --chrome-path.",
+            json_mode=json_output,
+        )
+        raise SystemExit(1)
+    except TimeoutError as e:
+        output_error(
+            str(e),
+            hint="Chrome may have failed to start. Check if the port is available.",
+            json_mode=json_output,
+        )
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        pass  # Normal shutdown via Ctrl+C
+    except Exception as e:
+        output_error(str(e), hint="Failed to launch Chrome or unified server.", json_mode=json_output)
+        raise SystemExit(1)
+    finally:
+        # Restore signal handlers
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+
+        if not json_output:
+            output({"status": "shutting_down"}, action="serve_shutdown", json_mode=False)
+
+        # Stop unified server
+        if unified_server is not None:
+            asyncio.run(unified_server.stop())
+
+        # Clean up browser
+        if browser_info is not None:
+            terminate_browser(browser_info)
+
+        if not json_output:
+            output({"status": "stopped"}, action="serve_stopped", json_mode=False)
+
+
+def _print_serve_instructions_unified(result: dict[str, Any], browser_path: str) -> None:
+    """Print user-friendly instructions for using the unified server."""
+    from rich.panel import Panel
+
+    from skyvern.cli.console import console
+
+    console.print()
+    console.print(
+        Panel(
+            "[bold green]Unified Browser Server Running[/bold green]",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print()
+    console.print(f"  [bold]Browser ID:[/bold]         [cyan]{result['browser_id']}[/cyan]")
+    console.print(f"  [bold]Server URL:[/bold]         [cyan]{result['server_url']}[/cyan]")
+    console.print(f"  [bold]CDP WebSocket URL:[/bold]  [cyan]{result['cdp_ws_url']}[/cyan]")
+    console.print(f"  [bold]Port:[/bold]               [cyan]{result['port']}[/cyan]")
+    console.print(f"  [bold]Profile directory:[/bold]  [cyan]{result['profile_dir']}[/cyan]")
+    console.print(
+        f"  [bold]Authentication:[/bold]     [cyan]{'Enabled' if result['auth_enabled'] else 'Disabled'}[/cyan]"
+    )
+    console.print()
+
+    console.print("[bold yellow]Endpoints:[/bold yellow]")
+    console.print()
+    console.print("  [bold]CDP Proxy:[/bold]")
+    console.print("    GET  /json             - CDP browser info")
+    console.print("    GET  /json/list        - List browser targets")
+    console.print("    WS   /devtools/...     - CDP WebSocket connection")
+    console.print()
+
+    console.print("[bold yellow]Next steps:[/bold yellow]")
+    console.print()
+    console.print(f"  [bold]1.[/bold] Set up a single HTTP tunnel (port {result['port']}):")
+    console.print()
+    console.print(f"     [green]ngrok http {result['port']}[/green]")
+    console.print()
+
+    console.print("  [bold]2.[/bold] Use the tunnel URL for browser_address in your task:")
+    console.print()
+    console.print(f"     [cyan]wss://YOUR_TUNNEL_URL/devtools/browser/{browser_path}[/cyan]")
+    console.print()
+    console.print("     [dim](Replace YOUR_TUNNEL_URL with the ngrok URL)[/dim]")
+    console.print()
+
+    console.print("[bold]Press Ctrl+C to stop.[/bold]")
+    console.print()

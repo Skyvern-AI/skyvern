@@ -19,7 +19,10 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.real_azure import RealAsyncAzureStorageClient
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
-from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
+from skyvern.forge.sdk.artifact.storage.base import (
+    FILE_EXTENTSION_MAP,
+    BaseStorage,
+)
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -351,12 +354,34 @@ class AzureStorage(BaseStorage):
         file_infos.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
         return file_infos
 
-    async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
-        download_dir = get_download_dir(run_id=run_id)
-        files = os.listdir(download_dir)
+    async def save_downloaded_files(
+        self,
+        organization_id: str,
+        run_id: str | None,
+    ) -> None:
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
         base_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
+
+        await self._save_downloaded_files_from_local(
+            organization_id=organization_id,
+            base_uri=base_uri,
+            run_id=run_id,
+            tier=tier,
+            tags=tags,
+        )
+
+    async def _save_downloaded_files_from_local(
+        self,
+        organization_id: str,
+        base_uri: str,
+        run_id: str | None,
+        tier: StandardBlobTier,
+        tags: dict[str, str] | None,
+    ) -> None:
+        """Save files from local download directory to Azure."""
+        download_dir = get_download_dir(run_id=run_id)
+        files = os.listdir(download_dir)
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
