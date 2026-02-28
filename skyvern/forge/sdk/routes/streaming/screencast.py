@@ -110,6 +110,13 @@ async def start_screencast_loop(
     async def _frame_forwarding_loop() -> None:
         while True:
             data = await frame_queue.get()
+            current_url = ""
+            try:
+                page = await browser_state.get_working_page()
+                if page is not None:
+                    current_url = page.url
+            except Exception:
+                pass
             await websocket.send_json(
                 {
                     id_key: entity_id,
@@ -118,6 +125,7 @@ async def start_screencast_loop(
                     "format": "jpeg",
                     "viewport_width": viewport_info["width"],
                     "viewport_height": viewport_info["height"],
+                    "url": current_url,
                 }
             )
 

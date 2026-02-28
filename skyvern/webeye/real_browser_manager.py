@@ -370,7 +370,7 @@ class RealBrowserManager(BrowserManager):
         organization_id: str | None = None,
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run")
-        browser_state_to_close = self.pages.pop(workflow_run_id, None)
+        browser_state_to_close = self.pages.get(workflow_run_id)
         if browser_state_to_close:
             # Stop tracing before closing the browser if tracing is enabled
             if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
@@ -379,6 +379,11 @@ class RealBrowserManager(BrowserManager):
                 LOG.info("Stopped tracing", trace_path=trace_path)
 
             await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
+
+        from skyvern.forge.sdk.routes.streaming.registries import stream_ref_active
+
+        if not stream_ref_active(workflow_run_id):
+            self.pages.pop(workflow_run_id, None)
         for task_id in task_ids:
             task_browser_state = self.pages.pop(task_id, None)
             if task_browser_state is None:

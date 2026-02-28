@@ -33,7 +33,8 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
-import { WorkflowRunStream } from "@/routes/workflows/workflowRun/WorkflowRunStream";
+import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
+import { environment } from "@/util/env";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -1576,17 +1577,22 @@ function Workspace({
                   </div>
                 )}
 
-                {/* Screenshot browser (CDP screencast) */}
+                {/* CDP screencast: only in local mode when VNC is not supported */}
                 {activeDebugSession &&
-                  !activeDebugSession.vnc_streaming_supported && (
+                  !activeDebugSession.vnc_streaming_supported &&
+                  environment === "local" && (
                     <div className="skyvern-screenshot-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
                       <div
                         key={reloadKey}
                         className="flex w-full flex-1 items-center justify-center"
                       >
-                        <div className="aspect-video w-full">
-                          <WorkflowRunStream alwaysShowStream={true} />
-                        </div>
+                        <BrowserSessionStream
+                          browserSessionId={
+                            activeDebugSession.browser_session_id
+                          }
+                          interactive={true}
+                          showControlButtons={true}
+                        />
                       </div>
                       <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
                         <WorkflowCopilotButton
@@ -1613,6 +1619,15 @@ function Workspace({
                           )}
                         </div>
                       </footer>
+                    </div>
+                  )}
+
+                {/* Fallback: non-local without VNC (edge case) */}
+                {activeDebugSession &&
+                  !activeDebugSession.vnc_streaming_supported &&
+                  environment !== "local" && (
+                    <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 items-center justify-center text-muted-foreground">
+                      Browser streaming unavailable
                     </div>
                   )}
 

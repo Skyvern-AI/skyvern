@@ -200,7 +200,14 @@ function BrowserSession() {
               pointerEvents: activeTab === "stream" ? "auto" : "none",
             }}
           >
-            {!vncFailed && (
+            {isLocal && browserSessionId && (
+              <BrowserSessionStream
+                browserSessionId={browserSessionId}
+                interactive={true}
+                showControlButtons={true}
+              />
+            )}
+            {!isLocal && !vncFailed && (
               <BrowserStream
                 browserSessionId={browserSessionId}
                 interactive={false}
@@ -209,7 +216,7 @@ function BrowserSession() {
                 onClose={handleVncClose}
               />
             )}
-            {vncFailed && browserSessionId && (
+            {!isLocal && vncFailed && browserSessionId && (
               <BrowserSessionStream browserSessionId={browserSessionId} />
             )}
           </div>

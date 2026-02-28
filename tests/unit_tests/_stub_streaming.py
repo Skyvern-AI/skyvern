@@ -26,6 +26,7 @@ _BASE_STUB_MODULES: list[str] = [
     "skyvern.forge.sdk.routes.sdk",
     "skyvern.forge.sdk.routes.webhooks",
     "skyvern.forge.sdk.routes.workflow_copilot",
+    "skyvern.forge.sdk.routes.streaming.cdp_input",
     "skyvern.forge.sdk.routes.streaming.messages",
     "skyvern.forge.sdk.routes.streaming.notifications",
     "skyvern.forge.sdk.routes.streaming.vnc",
