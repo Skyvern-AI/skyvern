@@ -161,7 +161,11 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
+    async def save_downloaded_files(
+        self,
+        organization_id: str,
+        run_id: str | None,
+    ) -> None:
         pass
 
     @abstractmethod

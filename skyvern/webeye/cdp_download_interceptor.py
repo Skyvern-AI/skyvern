@@ -243,7 +243,8 @@ class CDPDownloadInterceptor:
         """Async handler for paused requests."""
         request_id = event["requestId"]
         response_status = event.get("responseStatusCode", 0)
-        response_headers = _parse_headers(event.get("responseHeaders", []))
+        raw_response_headers = event.get("responseHeaders", [])
+        response_headers = _parse_headers(raw_response_headers)
         url = event.get("request", {}).get("url", "<unknown>")
         resource_type = event.get("resourceType", "")
 
@@ -257,7 +258,9 @@ class CDPDownloadInterceptor:
                     content_type=response_headers.get("content-type", ""),
                     content_disposition=response_headers.get("content-disposition", ""),
                 )
-                await self._handle_download(cdp_session, request_id, url, response_headers)
+                await self._handle_download(
+                    cdp_session, request_id, url, response_headers, response_status, raw_response_headers
+                )
             else:
                 await self._continue_response(cdp_session, request_id)
         except Exception as e:
@@ -283,8 +286,10 @@ class CDPDownloadInterceptor:
         request_id: str,
         url: str,
         headers: dict[str, str],
+        response_status: int,
+        raw_response_headers: list[dict[str, str]],
     ) -> None:
-        """Extract a download file and save it to disk."""
+        """Extract a download file, save it to disk, and replay the response to the browser."""
         if not self._output_dir:
             LOG.warning("CDP download intercepted but no output_dir set, passing through", url=url)
             await self._continue_response(cdp_session, request_id)
@@ -376,27 +381,33 @@ class CDPDownloadInterceptor:
                 pass
             return
 
-        # Block the browser from saving the file locally by fulfilling with an empty response.
-        # After body extraction (especially via takeResponseBodyAsStream), failRequest may
-        # return "Invalid parameters". fulfillRequest with empty body works reliably.
+        # Replay the original response to the browser so it also gets the download.
+        # After body extraction, we fulfill with the same status, headers, and body.
         try:
-            await self._fulfill_empty(cdp_session, request_id)
+            await self._fulfill_with_body(cdp_session, request_id, response_status, raw_response_headers, data)
         except Exception as e:
             LOG.warning("fulfillRequest failed after download", filename=filename, url=url, error=str(e))
-            try:
-                await self._continue_response(cdp_session, request_id)
-            except Exception:
-                pass
+            # Can't continue response after body extraction, just log the error
 
-    async def _fulfill_empty(self, cdp_session: CDPSession, request_id: str) -> None:
-        """Fulfill a request with an empty response to block browser-side download."""
+    async def _fulfill_with_body(
+        self,
+        cdp_session: CDPSession,
+        request_id: str,
+        response_status: int,
+        raw_response_headers: list[dict[str, str]],
+        body: bytes,
+    ) -> None:
+        """Fulfill a request by replaying the original response with the extracted body.
+
+        This allows both server-side capture AND browser-side download to happen.
+        """
         await cdp_session.send(
             "Fetch.fulfillRequest",
             {
                 "requestId": request_id,
-                "responseCode": 200,
-                "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}],
-                "body": base64.b64encode(b"").decode(),
+                "responseCode": response_status,
+                "responseHeaders": raw_response_headers,
+                "body": base64.b64encode(body).decode(),
             },
         )
 
