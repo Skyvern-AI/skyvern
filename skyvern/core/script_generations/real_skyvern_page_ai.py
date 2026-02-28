@@ -129,6 +129,14 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
         if template in template_data:
             return template_data[template]
 
+    # Inject for_loop metadata (current_value, current_index, current_item) so
+    # that cached function bodies inside for_loops can resolve {{ current_value }}
+    # in page.goto() and other template-rendered calls.
+    if context and context.loop_metadata:
+        for key in ("current_value", "current_index", "current_item"):
+            if key in context.loop_metadata:
+                template_data[key] = context.loop_metadata[key]
+
     return jinja_template.render(template_data)
 
 
