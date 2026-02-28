@@ -961,7 +961,17 @@ async def handle_click_to_download_file_action(
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
-        await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+        try:
+            await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+        except TimeoutError:
+            # TimeoutError from wait_for_load_state is expected for JS redirect downloads.
+            # The page may never reach load state when redirecting to a file download.
+            # Caller monitors download directory to determine if download was triggered.
+            LOG.debug(
+                "wait_for_load_state timed out during download click, continuing",
+                action=action,
+                workflow_run_id=task.workflow_run_id,
+            )
     except Exception as e:
         LOG.exception(
             "ClickAction with download failed",
