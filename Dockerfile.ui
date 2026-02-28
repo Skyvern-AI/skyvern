@@ -1,9 +1,27 @@
 FROM node:20.12-slim
 
-# Install tini for proper signal handling and zombie reaping
-RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
+# Install tini and git for proper signal handling and version info
+RUN apt-get update && apt-get install -y --no-install-recommends tini git && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Copy necessary files for version extraction
+COPY ./skyvern-ts/client/src/version.ts /tmp/sdk-version.ts
+COPY .git /tmp/.git
+
+# Extract version info automatically
+RUN GIT_SHA=$(cd /tmp && git --git-dir=.git rev-parse --short=7 HEAD 2>/dev/null || echo "unknown") && \
+    BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ") && \
+    APP_VERSION=$(grep 'SDK_VERSION' /tmp/sdk-version.ts | sed -n 's/.*"\(.*\)".*/\1/p' || echo "unknown") && \
+    echo "Build version info:" && \
+    echo "  APP_VERSION: $APP_VERSION" && \
+    echo "  GIT_SHA: $GIT_SHA" && \
+    echo "  BUILD_TIME: $BUILD_TIME" && \
+    echo "export VITE_GIT_SHA=\"$GIT_SHA\"" > /tmp/build-env.sh && \
+    echo "export VITE_BUILD_TIME=\"$BUILD_TIME\"" >> /tmp/build-env.sh && \
+    echo "export VITE_APP_VERSION=\"$APP_VERSION\"" >> /tmp/build-env.sh && \
+    rm -rf /tmp/.git /tmp/sdk-version.ts
+
 COPY ./skyvern-frontend /app
 COPY ./entrypoint-skyvernui.sh /app/entrypoint-skyvernui.sh
 RUN npm install
@@ -14,8 +32,8 @@ ENV VITE_WSS_BASE_URL=__VITE_WSS_BASE_URL_PLACEHOLDER__
 ENV VITE_ARTIFACT_API_BASE_URL=__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__
 ENV VITE_SKYVERN_API_KEY=__SKYVERN_API_KEY_PLACEHOLDER__
 
-# Build at image time
-RUN npm run build
+# Build at image time with version info
+RUN . /tmp/build-env.sh && npm run build && rm /tmp/build-env.sh
 
 # Use tini as init for proper signal handling and zombie reaping
 ENTRYPOINT ["/usr/bin/tini", "--"]
