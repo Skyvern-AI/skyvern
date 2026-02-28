@@ -48,7 +48,7 @@
     "@uiw/codemirror-theme-tokyo-night-storm": "^4.23.0",
     "@uiw/react-codemirror": "^4.23.0",
     "@xyflow/react": "^12.1.1",
-    "axios": "^1.8.2",
+    "axios": "^1.13.5",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.0",
     "cmdk": "^1.0.0",
