@@ -11,7 +11,7 @@ from cachetools import TTLCache
 from playwright.async_api import Page
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT
+from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi, render_template
 from skyvern.core.script_generations.skyvern_page import ActionCall, ActionMetadata, RunContext, SkyvernPage
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
@@ -240,7 +240,11 @@ class ScriptSkyvernPage(SkyvernPage):
             # Wait for page to be ready before executing action
             # This helps prevent issues where cached actions execute before the page is fully loaded
             await self._wait_for_page_ready_before_action()
-            await self._ensure_element_ids_on_page()
+            # NOTE: _ensure_element_ids_on_page() removed from here.
+            # unique_id attrs are only needed by the AI fallback path, which
+            # already calls _refresh_scraped_page() → build_tree_from_body()
+            # to inject them.  Skipping the upfront DOM scrape saves ~1-2s
+            # per cached action on pages that don't need AI fallback.
 
             call.result = await fn(self, *args, **kwargs)
 
@@ -456,20 +460,27 @@ class ScriptSkyvernPage(SkyvernPage):
                 )
 
             created_action = await app.DATABASE.create_action(action)
-            # Generate user-facing reasoning using secondary LLM
-            asyncio.create_task(
-                self._update_action_reasoning(
-                    action_id=str(created_action.action_id),
+            # Skip LLM reasoning in script mode — use static string instead
+            if context and context.script_mode:
+                await app.DATABASE.update_action_reasoning(
                     organization_id=str(context.organization_id),
-                    action_type=action_type,
-                    intention=intention,
-                    text=text,
-                    select_option=select_option,
-                    file_url=file_url,
-                    data_extraction_goal=data_extraction_goal,
-                    data_extraction_schema=data_extraction_schema,
+                    action_id=str(created_action.action_id),
+                    reasoning=f"Script execution: {intention[:80]}",
                 )
-            )
+            else:
+                asyncio.create_task(
+                    self._update_action_reasoning(
+                        action_id=str(created_action.action_id),
+                        organization_id=str(context.organization_id),
+                        action_type=action_type,
+                        intention=intention,
+                        text=text,
+                        select_option=select_option,
+                        file_url=file_url,
+                        data_extraction_goal=data_extraction_goal,
+                        data_extraction_schema=data_extraction_schema,
+                    )
+                )
 
             context.action_order += 1
 
@@ -751,20 +762,77 @@ class ScriptSkyvernPage(SkyvernPage):
         )
         return ""
 
+    async def _auto_solve_captchas(self) -> bool:
+        """Proactively detect and solve captchas after page load.
+        Returns True if a captcha was detected and solved."""
+        context = skyvern_context.current()
+        is_script = context and context.script_mode
+        try:
+            from cloud.webeye.utils.captcha import cloudflare_detect_and_wait_for_resolve
+
+            # Wait for CapMonster extension to inject its addon div into the DOM.
+            # The extension needs a moment after page load to detect any Turnstile
+            # widget and inject its overlay. We use wait_for with a short timeout
+            # so non-captcha pages only add ~5s latency (acceptable since code mode
+            # saves minutes vs agent mode).
+            capmonster_div = self.page.locator('div[class~="cm-addon-turnstile"]')
+            try:
+                await capmonster_div.wait_for(state="attached", timeout=5_000)
+            except Exception:
+                # No CapMonster div appeared — no Cloudflare captcha on this page
+                return False
+
+            if is_script:
+                print("  🔓 Cloudflare captcha detected, solving...")
+
+            detected, solved = await cloudflare_detect_and_wait_for_resolve(self.page, timeout=90)
+            if detected and is_script:
+                print(f"  {'✓' if solved else '✗'} Cloudflare captcha {'solved' if solved else 'not solved'}")
+            return detected and solved
+        except ImportError:
+            # cloud module not available (open source)
+            return False
+        except Exception:
+            LOG.warning("Auto captcha solve failed", exc_info=True)
+            return False
+
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)
         url = prepend_scheme_and_validate_url(url)
 
         # Print navigation in script mode
         context = skyvern_context.current()
-        if context and context.script_mode:
+        is_script_mode = context and context.script_mode
+        if is_script_mode:
             print(f"🌐 Navigating to: {url}")
 
         timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
-        await self.page.goto(url, timeout=timeout, **kwargs)
+        max_retries = kwargs.pop("max_retries", NAVIGATION_MAX_RETRY_TIME)
 
-        if context and context.script_mode:
-            print("  ✓ Page loaded")
+        # Retry logic matching agent mode (real_browser_state.navigate_to_url)
+        last_error: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                await self.page.goto(url, timeout=timeout, **kwargs)
+                if is_script_mode:
+                    print("  ✓ Page loaded")
+                return
+            except Exception as e:
+                last_error = e
+                if attempt >= max_retries - 1:
+                    break
+                LOG.warning(
+                    "Navigation attempt failed, retrying",
+                    url=url,
+                    attempt=attempt + 1,
+                    max_retries=max_retries,
+                    error=str(e),
+                )
+                await asyncio.sleep(1)
+
+        if last_error is None:
+            raise RuntimeError("Navigation failed but no error was captured")
+        raise last_error
 
     @action_wrap(ActionType.SOLVE_CAPTCHA)
     async def solve_captcha(
@@ -772,7 +840,8 @@ class ScriptSkyvernPage(SkyvernPage):
     ) -> None:
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.task_id or not context.step_id:
-            await asyncio.sleep(30)
+            # Fallback: solve directly without DB context
+            await self._auto_solve_captchas()
             return None
 
         task = await app.DATABASE.get_task(context.task_id, context.organization_id)
@@ -803,6 +872,10 @@ class ScriptSkyvernPage(SkyvernPage):
             or not context.task_id
             or not context.step_id
         ):
+            return
+        if context.skip_complete_verification:
+            if context.script_mode:
+                print("  ⏭ Skipping complete() verification (--no-verify)")
             return
         task = await app.DATABASE.get_task(context.task_id, context.organization_id)
         step = await app.DATABASE.get_step(context.step_id, context.organization_id)

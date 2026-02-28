@@ -6,7 +6,7 @@ import {
   CubeIcon,
   ExternalLinkIcon,
 } from "@radix-ui/react-icons";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { Status } from "@/api/types";
@@ -122,6 +122,50 @@ function getLoopIterationGroups(
     }
     return right.index - left.index;
   });
+}
+
+/**
+ * Check whether any block, action, or thought within `items` (recursively)
+ * matches the currently-active element.  Uses an iterative stack to avoid
+ * deep nesting — same pattern as `findActiveItem` in workflowTimelineUtils.
+ */
+function timelineItemsContainActiveElement(
+  items: Array<WorkflowRunTimelineItem>,
+  activeItem: WorkflowRunOverviewActiveElement,
+): boolean {
+  if (activeItem === null || activeItem === "stream") return false;
+
+  const stack = [...items];
+  while (stack.length > 0) {
+    const item = stack.pop()!;
+
+    if (
+      isBlockItem(item) &&
+      isWorkflowRunBlock(activeItem) &&
+      item.block.workflow_run_block_id === activeItem.workflow_run_block_id
+    ) {
+      return true;
+    }
+
+    if (
+      isBlockItem(item) &&
+      isAction(activeItem) &&
+      item.block.actions?.some((a) => a.action_id === activeItem.action_id)
+    ) {
+      return true;
+    }
+
+    if (
+      isThoughtItem(item) &&
+      isObserverThought(activeItem) &&
+      item.thought.thought_id === activeItem.thought_id
+    ) {
+      return true;
+    }
+
+    stack.push(...item.children);
+  }
+  return false;
 }
 
 type TimelineSubItemsProps = {
@@ -247,6 +291,63 @@ function WorkflowRunTimelineBlockItem({
     () => getLoopIterationGroups(subItems),
     [subItems],
   );
+
+  // Track which loop iteration groups are expanded (controlled state).
+  // Initialise with the most-recent group (index 0) plus any group that
+  // contains the currently-active element so it is visible on first render.
+  const [openLoopGroups, setOpenLoopGroups] = useState<Set<number>>(() => {
+    const initial = new Set<number>();
+    if (loopIterationGroups.length > 0) {
+      initial.add(0);
+    }
+    loopIterationGroups.forEach((group, idx) => {
+      if (timelineItemsContainActiveElement(group.items, activeItem)) {
+        initial.add(idx);
+      }
+    });
+    return initial;
+  });
+
+  // When the active element changes (or loop groups load for the first time),
+  // auto-expand the group that contains it. Also ensure the most-recent group
+  // (index 0) is open — this covers the edge case where subItems loads after
+  // the initial mount so the useState initializer missed it.
+  useEffect(() => {
+    setOpenLoopGroups((prev) => {
+      let next = prev;
+      // Ensure most-recent group is open (covers late-loading data).
+      if (loopIterationGroups.length > 0 && !prev.has(0)) {
+        next = new Set(next);
+        next.add(0);
+      }
+      // Find and expand the group containing the active item.
+      for (let idx = 0; idx < loopIterationGroups.length; idx++) {
+        const group = loopIterationGroups[idx];
+        if (
+          group &&
+          timelineItemsContainActiveElement(group.items, activeItem)
+        ) {
+          if (!next.has(idx)) {
+            if (next === prev) next = new Set(next);
+            next.add(idx);
+          }
+          break; // active item can only be in one group
+        }
+      }
+      return next;
+    });
+  }, [activeItem, loopIterationGroups]);
+
+  // Auto-expand conditional children when the active element is inside them.
+  useEffect(() => {
+    if (
+      isConditionalBlock &&
+      hasNestedChildren &&
+      timelineItemsContainActiveElement(subItems, activeItem)
+    ) {
+      setChildrenOpen(true);
+    }
+  }, [activeItem, isConditionalBlock, hasNestedChildren, subItems]);
 
   const loopValues = Array.isArray(block.loop_values) ? block.loop_values : [];
 
@@ -504,7 +605,18 @@ function WorkflowRunTimelineBlockItem({
               return (
                 <Collapsible
                   key={`${group.index ?? "unknown"}-${groupIndex}`}
-                  defaultOpen={groupIndex === 0}
+                  open={openLoopGroups.has(groupIndex)}
+                  onOpenChange={(open) => {
+                    setOpenLoopGroups((prev) => {
+                      const next = new Set(prev);
+                      if (open) {
+                        next.add(groupIndex);
+                      } else {
+                        next.delete(groupIndex);
+                      }
+                      return next;
+                    });
+                  }}
                 >
                   <div className="rounded border border-slate-700 bg-slate-elevation4">
                     <CollapsibleTrigger asChild>

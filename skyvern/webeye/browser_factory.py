@@ -31,6 +31,7 @@ from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 
 LOG = structlog.get_logger()
 
@@ -637,6 +638,12 @@ async def _connect_to_cdp_browser(
     extra_http_headers: dict[str, str] | None = None,
     apply_download_behaviour: bool = False,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    # Check if CDP download interception is enabled and remove from headers
+    # so it doesn't get sent as an actual HTTP header
+    enable_download: bool = False
+    if extra_http_headers:
+        enable_download = bool(extra_http_headers.pop("enable_download", None))
+
     browser_args = BrowserContextFactory.build_browser_args(extra_http_headers=extra_http_headers)
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
@@ -662,6 +669,34 @@ async def _connect_to_cdp_browser(
             viewport=browser_args["viewport"],
             extra_http_headers=browser_args["extra_http_headers"],
         )
+
+    # Enable CDPDownloadInterceptor when enable_download is set.
+    # This captures downloads via the Fetch domain and saves them locally.
+    if enable_download:
+        download_dir = initialize_download_dir()
+        interceptor = CDPDownloadInterceptor(output_dir=download_dir)
+
+        # Enable interception on all existing pages
+        for page in browser_context.pages:
+            try:
+                await interceptor.enable_for_page(page)
+            except Exception:
+                LOG.warning("Failed to enable CDP intercept on page", page_url=page.url, exc_info=True)
+
+        # Auto-enable interception on new pages (e.g., target="_blank" links)
+        async def _on_new_page(page: Page) -> None:
+            try:
+                await interceptor.enable_for_page(page)
+            except Exception:
+                LOG.warning("Failed to enable CDP intercept on new page", page_url=page.url, exc_info=True)
+
+        browser_context.on("page", lambda page: asyncio.ensure_future(_on_new_page(page)))
+        LOG.info(
+            "CDP download interceptor enabled",
+            download_dir=download_dir,
+            existing_page_count=len(browser_context.pages),
+        )
+
     LOG.info(
         "Launched browser CDP connection",
         remote_browser_url=remote_browser_url,

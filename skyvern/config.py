@@ -471,9 +471,8 @@ class Settings(BaseSettings):
                 "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                 "label": "Gemini 2.5 Flash",
             },
-            "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
+            "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3_PRO", "label": "Gemini 3 Pro (Latest)"},
             "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
-            "gemini-3.1-pro-preview": {"llm_key": "VERTEX_GEMINI_3.1_PRO", "label": "Gemini 3.1 Pro"},
             "mercury-2": {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"},
             "gemini-2.5-flash-lite": {
                 "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
