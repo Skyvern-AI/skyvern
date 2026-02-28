@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -953,6 +955,7 @@ def serve(
         "--chrome-path",
         help="Path to Chrome executable. Auto-detects if not specified.",
     ),
+    tunnel: bool = typer.Option(False, "--tunnel", help="Set up an ngrok tunnel automatically."),
     json_output: bool = typer.Option(False, "--json", help="Output connection info as JSON."),
 ) -> None:
     """Launch a local Chrome browser with CDP server for Skyvern Cloud.
@@ -970,10 +973,13 @@ def serve(
       1. Start the browser serve:
          skyvern browser serve
 
-      2. In another terminal, set up a single HTTP tunnel:
+      2. (Optional) Auto-tunnel with ngrok:
+         skyvern browser serve --tunnel
+
+      3. Or manually set up a tunnel:
          ngrok http 9222
 
-      3. Use the tunnel URL for browser_address in your task:
+      4. Use the tunnel URL for browser_address in your task:
          wss://YOUR_TUNNEL_URL/devtools/browser/...
     """
     import signal
@@ -1028,8 +1034,12 @@ def serve(
             json_mode=False,
         )
 
+    if tunnel and json_output:
+        raise typer.BadParameter("--tunnel and --json cannot be used together.")
+
     browser_info: LocalBrowserInfo | None = None
     unified_server: UnifiedServer | None = None
+    ngrok_process: subprocess.Popen[bytes] | None = None
     shutdown_requested = False
 
     def signal_handler(signum: int, frame: Any) -> None:
@@ -1080,6 +1090,11 @@ def serve(
         else:
             _print_serve_instructions_unified(result, browser_path)
 
+        # Offer ngrok tunnel
+        nonlocal ngrok_process
+        if not json_output:
+            ngrok_process = await _maybe_start_ngrok_tunnel(port, browser_path, auto=tunnel)
+
         # Keep the event loop running while server is active
         # This is required because aiohttp's TCPSite needs the event loop to accept connections
         try:
@@ -1128,6 +1143,14 @@ def serve(
         if not json_output:
             output({"status": "shutting_down"}, action="serve_shutdown", json_mode=False)
 
+        # Stop ngrok
+        if ngrok_process is not None:
+            ngrok_process.terminate()
+            try:
+                ngrok_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                ngrok_process.kill()
+
         # Stop unified server
         if unified_server is not None:
             asyncio.run(unified_server.stop())
@@ -1138,6 +1161,122 @@ def serve(
 
         if not json_output:
             output({"status": "stopped"}, action="serve_stopped", json_mode=False)
+
+
+async def _maybe_start_ngrok_tunnel(port: int, browser_path: str, *, auto: bool) -> subprocess.Popen[bytes] | None:
+    """Interactively offer an ngrok tunnel, or start one automatically with ``auto=True``.
+
+    When *auto* is ``True`` (i.e. ``--tunnel`` was passed explicitly), missing
+    ngrok is treated as a hard error so scripts don't silently lose tunnel
+    functionality.
+    """
+    import aiohttp
+    from rich.panel import Panel
+    from rich.prompt import Confirm
+
+    from skyvern.cli.console import console
+
+    # Ask unless --tunnel was passed
+    if not auto:
+        want = Confirm.ask(
+            "\nWould you like to set up an [bold yellow]ngrok tunnel[/bold yellow]?",
+            default=False,
+        )
+        if not want:
+            return None
+
+    # Check if ngrok is installed
+    ngrok_path = shutil.which("ngrok")
+    if not ngrok_path:
+        console.print()
+        console.print("  [bold red]ngrok not found.[/bold red]")
+        console.print()
+        console.print("  [bold]1.[/bold] Install ngrok:")
+        console.print("     [green]brew install ngrok[/green]    [dim](macOS)[/dim]")
+        console.print("     [cyan]https://ngrok.com/download[/cyan]  [dim](other platforms)[/dim]")
+        console.print()
+        console.print("  [bold]2.[/bold] Sign up for a free account:")
+        console.print("     [cyan]https://dashboard.ngrok.com/signup[/cyan]")
+        console.print()
+        console.print("  [bold]3.[/bold] Add your authtoken:")
+        console.print("     [green]ngrok config add-authtoken <your-token>[/green]")
+        console.print(
+            "     [dim]Get your token at[/dim] [cyan]https://dashboard.ngrok.com/get-started/your-authtoken[/cyan]"
+        )
+        console.print()
+        console.print("  [bold]4.[/bold] Re-run:")
+        console.print("     [green]skyvern browser serve --tunnel[/green]")
+        console.print()
+        if auto:
+            # --tunnel was explicit — don't silently continue without a tunnel
+            raise SystemExit(1)
+        return None
+
+    console.print()
+    console.print(f"  Starting ngrok tunnel on port [cyan]{port}[/cyan]...")
+
+    # Capture stderr so we can surface ngrok errors (bad auth, port conflict)
+    process = subprocess.Popen(
+        [ngrok_path, "http", str(port)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    # Poll the ngrok local API for the tunnel URL (up to 5 seconds)
+    tunnel_url: str | None = None
+    async with aiohttp.ClientSession() as session:
+        for _ in range(10):
+            # Check if ngrok died (e.g. bad auth token, port conflict)
+            if process.poll() is not None:
+                stderr_output = ""
+                if process.stderr:
+                    stderr_output = process.stderr.read().decode(errors="replace").strip()
+                msg = f"ngrok exited with code {process.returncode}"
+                if stderr_output:
+                    msg += f": {stderr_output}"
+                console.print(f"  [bold red]{msg}[/bold red]")
+                process.wait()  # Reap the dead process to avoid zombie
+                if auto:
+                    raise SystemExit(1)
+                return None
+
+            try:
+                async with session.get("http://127.0.0.1:4040/api/tunnels") as resp:
+                    data = await resp.json()
+                    for t in data.get("tunnels", []):
+                        public_url = t.get("public_url", "")
+                        if public_url.startswith("https://"):
+                            tunnel_url = public_url
+                            break
+                    if tunnel_url:
+                        break
+            except (aiohttp.ClientError, ConnectionError, OSError, ValueError):
+                pass
+            await asyncio.sleep(0.5)
+
+    if tunnel_url:
+        ws_host = tunnel_url.replace("https://", "")
+        cdp_url = f"wss://{ws_host}/devtools/browser/{browser_path}"
+        console.print()
+        console.print(
+            Panel(
+                f"[bold]Tunnel URL:[/bold]  [cyan]{tunnel_url}[/cyan]\n"
+                f"[bold]CDP URL:[/bold]     [cyan]{cdp_url}[/cyan]",
+                title="[bold green]Tunnel Active[/bold green]",
+                border_style="green",
+                expand=False,
+            )
+        )
+        console.print()
+    else:
+        console.print("  [yellow]ngrok started but tunnel URL not available yet.[/yellow]")
+        console.print("  [dim]Check: http://127.0.0.1:4040[/dim]")
+        console.print()
+        if auto:
+            raise SystemExit(1)
+
+    return process
 
 
 def _print_serve_instructions_unified(result: dict[str, Any], browser_path: str) -> None:
