@@ -11,6 +11,7 @@ import socket
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, cast
@@ -34,6 +35,53 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 
 LOG = structlog.get_logger()
+
+# Header to signal fresh browser context creation (stripped before sending to websites)
+# When set to "true", creates a new incognito-like context instead of reusing existing ones
+FRESH_CONTEXT_HEADER = "X-Skyvern-Fresh-Context"
+
+
+@dataclass
+class ParsedBrowserHeaders:
+    """Result of parsing extra HTTP headers for internal Skyvern headers."""
+
+    headers: dict[str, str]  # Headers to pass to browser (internal headers stripped)
+    use_fresh_context: bool  # Whether to create a fresh browser context
+    enable_download: bool  # Whether download interception is enabled
+
+
+def parse_extra_headers(extra_http_headers: dict[str, str] | None) -> ParsedBrowserHeaders:
+    """Parse extra HTTP headers and extract internal Skyvern headers.
+
+    Extracts internal headers (case-insensitive) and returns a copy of headers
+    without them, along with the extracted values.
+
+    Args:
+        extra_http_headers: Original headers dict (not mutated)
+
+    Returns:
+        ParsedBrowserHeaders with stripped headers and extracted values
+    """
+    headers: dict[str, str] = {}
+    use_fresh_context = False
+    enable_download = False
+
+    if extra_http_headers:
+        for key, value in extra_http_headers.items():
+            key_lower = key.lower()
+            if key_lower == FRESH_CONTEXT_HEADER.lower():
+                use_fresh_context = value.lower() == "true"
+            elif key_lower == "enable_download":
+                enable_download = bool(value)
+            else:
+                headers[key] = value
+
+    return ParsedBrowserHeaders(
+        headers=headers,
+        use_fresh_context=use_fresh_context,
+        enable_download=enable_download,
+    )
+
 
 BrowserCleanupFunc = Callable[[], None] | None
 
@@ -638,13 +686,11 @@ async def _connect_to_cdp_browser(
     extra_http_headers: dict[str, str] | None = None,
     apply_download_behaviour: bool = False,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
-    # Check if CDP download interception is enabled and remove from headers
-    # so it doesn't get sent as an actual HTTP header
-    enable_download: bool = False
-    if extra_http_headers:
-        enable_download = bool(extra_http_headers.pop("enable_download", None))
+    parsed_headers = parse_extra_headers(extra_http_headers)
 
-    browser_args = BrowserContextFactory.build_browser_args(extra_http_headers=extra_http_headers)
+    browser_args = BrowserContextFactory.build_browser_args(
+        extra_http_headers=parsed_headers.headers if parsed_headers.headers else None
+    )
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
@@ -656,23 +702,28 @@ async def _connect_to_cdp_browser(
     if apply_download_behaviour:
         await _apply_download_behaviour(browser)
 
+    # Decide whether to create fresh context or reuse existing one
     contexts = browser.contexts
     browser_context = None
 
-    if contexts:
-        # Use the first existing context if available
-        LOG.info("Using existing browser context")
-        browser_context = contexts[0]
-    else:
+    if parsed_headers.use_fresh_context or not contexts:
+        LOG.info(
+            "Creating new browser context",
+            fresh_context_requested=parsed_headers.use_fresh_context,
+            existing_contexts=len(contexts),
+        )
         browser_context = await browser.new_context(
             record_video_dir=browser_args["record_video_dir"],
             viewport=browser_args["viewport"],
             extra_http_headers=browser_args["extra_http_headers"],
         )
+    else:
+        LOG.info("Reusing existing browser context", existing_contexts=len(contexts))
+        browser_context = contexts[0]
 
     # Enable CDPDownloadInterceptor when enable_download is set.
     # This captures downloads via the Fetch domain and saves them locally.
-    if enable_download:
+    if parsed_headers.enable_download:
         download_dir = initialize_download_dir()
         interceptor = CDPDownloadInterceptor(output_dir=download_dir)
 
