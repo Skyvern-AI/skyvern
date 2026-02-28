@@ -9,11 +9,11 @@ logo:
   height: 28
 colors:
   accentPrimary:
-    dark: '#0D9373'
-    light: '#07C983'
+    dark: "#0D9373"
+    light: "#07C983"
   background:
-    dark: '#000000'
-    light: '#FFFFFF'
+    dark: "#000000"
+    light: "#FFFFFF"
 analytics:
   posthog:
     api-key: ${POSTHOG_API_KEY}
@@ -36,6 +36,9 @@ tabs:
   home:
     display-name: Home
     icon: home
+  cloud-ui:
+    display-name: Cloud UI
+    icon: cloud
   api:
     display-name: API Reference
     icon: code
@@ -66,7 +69,9 @@ navigation:
         contents:
           - page: Introduction
             path: introduction.mdx
-          - page: Quickstart
+          - page: Core Concepts
+            path: getting-started/core-concepts.mdx
+          - page: API Quickstart
             path: getting-started/quickstart.mdx
           - page: Skyvern In Action
             path: getting-started/skyvern-in-action.mdx
@@ -160,6 +165,12 @@ navigation:
             path: integrations/workato.mdx
           - page: Ollama + LiteLLM
             path: integrations/ollama-litellm.mdx
+  - tab: cloud-ui
+    layout:
+      - section: Cloud UI
+        contents:
+          - page: Getting Started
+            path: cloud/getting-started.mdx
   - tab: api
     layout:
       - api: API Reference
