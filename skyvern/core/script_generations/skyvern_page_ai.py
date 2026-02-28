@@ -87,6 +87,34 @@ class SkyvernPageAi(Protocol):
         """Locate an element on the page using AI and return its XPath selector."""
         ...
 
+    async def ai_classify(
+        self,
+        options: dict[str, str],
+        url_patterns: dict[str, str] | None = None,
+        text_patterns: dict[str, str | list[str]] | None = None,
+    ) -> str:
+        """Classify the current page state against named options using a tiered cascade.
+
+        Tier 0: URL pattern matching (FREE)
+        Tier 1: Text presence check in extracted text (FREE, requires scrape)
+        Tier 2: Mini-LLM classification (~$0.001)
+
+        Returns the matching option key or "UNKNOWN".
+        """
+        ...
+
+    async def ai_element_fallback(
+        self,
+        navigation_goal: str,
+        max_steps: int = 10,
+    ) -> None:
+        """Activate the AI agent from the CURRENT page position to achieve a navigation goal.
+
+        This is a mid-block fallback that picks up from the current page state
+        instead of re-running the entire block from scratch.
+        """
+        ...
+
     async def ai_prompt(
         self,
         prompt: str,
