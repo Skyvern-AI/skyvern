@@ -241,7 +241,7 @@ class GeoTarget(BaseModel):
 
 
 # Type alias for proxy location that accepts either legacy enum or new GeoTarget
-ProxyLocationInput = ProxyLocation | GeoTarget | dict | None
+ProxyLocationInput = ProxyLocation | str | GeoTarget | dict | None
 
 
 def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
@@ -381,7 +381,7 @@ class TaskRunRequest(BaseModel):
     title: str | None = Field(
         default=None, description="The title for the task", examples=["The title of my first skyvern task"]
     )
-    proxy_location: ProxyLocation | GeoTarget | dict | None = Field(
+    proxy_location: ProxyLocation | str | GeoTarget | dict | None = Field(
         default=ProxyLocation.RESIDENTIAL,
         description=PROXY_LOCATION_DOC_STRING + " Can also be a GeoTarget object for granular city/state targeting: "
         '{"country": "US", "subdivision": "CA", "city": "San Francisco"}',
@@ -475,7 +475,7 @@ class WorkflowRunRequest(BaseModel):
     )
     parameters: dict[str, Any] | None = Field(default=None, description="Parameters to pass to the workflow")
     title: str | None = Field(default=None, description="The title for this workflow run")
-    proxy_location: ProxyLocation | GeoTarget | dict | None = Field(
+    proxy_location: ProxyLocation | str | GeoTarget | dict | None = Field(
         default=ProxyLocation.RESIDENTIAL,
         description=PROXY_LOCATION_DOC_STRING + " Can also be a GeoTarget object for granular city/state targeting: "
         '{"country": "US", "subdivision": "CA", "city": "San Francisco"}',
