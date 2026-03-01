@@ -2909,6 +2909,7 @@ class AgentDB(BaseAlchemyDB):
         verification_code_polling_started_at: datetime | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_address: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -2943,6 +2944,8 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run.browser_session_id = browser_session_id
                 if browser_address:
                     workflow_run.browser_address = browser_address
+                if extra_http_headers is not None:
+                    workflow_run.extra_http_headers = extra_http_headers
                 # 2FA verification code waiting state updates
                 if waiting_for_verification_code is not None:
                     workflow_run.waiting_for_verification_code = waiting_for_verification_code
