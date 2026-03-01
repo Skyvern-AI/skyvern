@@ -1,5 +1,5 @@
 import { ReloadIcon, StopIcon } from "@radix-ui/react-icons";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { Outlet, useLocation, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
@@ -24,9 +24,13 @@ import { useCloseBrowserSessionMutation } from "@/routes/browserSessions/hooks/u
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { type BrowserSession as BrowserSessionType } from "@/routes/workflows/types/browserSessionTypes";
 
+import { environment } from "@/util/env";
+
 import { BrowserSessionDownloads } from "./BrowserSessionDownloads";
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
+import { BrowserSessionStream } from "./BrowserSessionStream";
 
+const isLocal = environment === "local";
 type TabName = "stream" | "recordings" | "downloads";
 
 function BrowserSession() {
@@ -38,6 +42,13 @@ function BrowserSession() {
       ? "downloads"
       : "stream";
   const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const [vncFailed, setVncFailed] = useState(false);
+
+  const handleVncClose = useCallback(() => {
+    if (isLocal) {
+      setVncFailed(true);
+    }
+  }, []);
 
   const credentialGetter = useCredentialGetter();
 
@@ -189,12 +200,25 @@ function BrowserSession() {
               pointerEvents: activeTab === "stream" ? "auto" : "none",
             }}
           >
-            <BrowserStream
-              browserSessionId={browserSessionId}
-              interactive={false}
-              showControlButtons={true}
-              isVisible={activeTab === "stream"}
-            />
+            {isLocal && browserSessionId && (
+              <BrowserSessionStream
+                browserSessionId={browserSessionId}
+                interactive={true}
+                showControlButtons={true}
+              />
+            )}
+            {!isLocal && !vncFailed && (
+              <BrowserStream
+                browserSessionId={browserSessionId}
+                interactive={false}
+                showControlButtons={true}
+                isVisible={activeTab === "stream"}
+                onClose={handleVncClose}
+              />
+            )}
+            {!isLocal && vncFailed && browserSessionId && (
+              <BrowserSessionStream browserSessionId={browserSessionId} />
+            )}
           </div>
           <div
             className="absolute left-0 top-0 h-full w-full"

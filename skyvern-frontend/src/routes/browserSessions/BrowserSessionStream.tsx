@@ -1,34 +1,27 @@
-import { Status } from "@/api/types";
-import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
-import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { statusIsNotFinalized } from "@/routes/tasks/types";
+import { GlobeIcon } from "@radix-ui/react-icons";
+import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useFirstParam } from "@/hooks/useFirstParam";
-import { getRuntimeApiKey } from "@/util/env";
-import { toast } from "@/components/ui/use-toast";
-import { useQueryClient } from "@tanstack/react-query";
+import { newWssBaseUrl, getRuntimeApiKey } from "@/util/env";
+import { useClientIdStore } from "@/store/useClientIdStore";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/util/utils";
-import { useClientIdStore } from "@/store/useClientIdStore";
 
 type StreamMessage = {
-  task_id?: string;
-  workflow_run_id?: string;
+  browser_session_id?: string;
   status: string;
   screenshot?: string;
   format?: string;
   viewport_width?: number;
   viewport_height?: number;
+  url?: string;
 };
 
 interface Props {
-  alwaysShowStream?: boolean;
+  browserSessionId: string;
   interactive?: boolean;
   showControlButtons?: boolean;
 }
-
-const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
 
 function mouseButtonName(button: number): string {
   if (button === 2) return "right";
@@ -82,24 +75,19 @@ function mapCoordinates(
   };
 }
 
-function WorkflowRunStream(props?: Props) {
-  const alwaysShowStream = props?.alwaysShowStream ?? false;
-  const interactive = props?.interactive ?? false;
-  const showControlButtons = props?.showControlButtons ?? false;
-  const workflowRunId = useFirstParam("workflowRunId", "runId");
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
+function BrowserSessionStream({
+  browserSessionId,
+  interactive = false,
+  showControlButtons = false,
+}: Props) {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamFormat, setStreamFormat] = useState<string>("png");
   const [viewportWidth, setViewportWidth] = useState(1280);
   const [viewportHeight, setViewportHeight] = useState(720);
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
-  const showStream =
-    alwaysShowStream || (workflowRun && statusIsNotFinalized(workflowRun));
+  const [currentUrl, setCurrentUrl] = useState("");
   const credentialGetter = useCredentialGetter();
-  const workflow = workflowRun?.workflow;
-  const workflowPermanentId = workflow?.workflow_permanent_id;
-  const queryClient = useQueryClient();
   const clientId = useClientIdStore((s) => s.clientId);
 
   const socketRef = useRef<WebSocket | null>(null);
@@ -115,10 +103,6 @@ function WorkflowRunStream(props?: Props) {
   const inputEventCountRef = useRef(0);
 
   useEffect(() => {
-    if (!showStream) {
-      return;
-    }
-
     inputStoppedRef.current = false;
     inputReconnectAttemptsRef.current = 0;
 
@@ -139,7 +123,7 @@ function WorkflowRunStream(props?: Props) {
         inputSocketRef.current.close();
       }
       const ws = new WebSocket(
-        `${wssBaseUrl}/stream/cdp_input/workflow_run/${workflowRunId}?client_id=${clientId}&${credentialParam}`,
+        `${newWssBaseUrl}/stream/cdp_input/browser_session/${browserSessionId}?client_id=${clientId}&${credentialParam}`,
       );
       inputSocketRef.current = ws;
 
@@ -215,7 +199,7 @@ function WorkflowRunStream(props?: Props) {
         socketRef.current.close();
       }
       socketRef.current = new WebSocket(
-        `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}?${credentialParam}`,
+        `${newWssBaseUrl}/stream/browser_sessions/${browserSessionId}?${credentialParam}`,
       );
 
       socketRef.current.addEventListener("message", (event) => {
@@ -233,46 +217,15 @@ function WorkflowRunStream(props?: Props) {
           if (message.viewport_height) {
             setViewportHeight(message.viewport_height);
           }
+          if (message.url !== undefined) {
+            setCurrentUrl(message.url);
+          }
           if (
             message.status === "completed" ||
             message.status === "failed" ||
-            message.status === "terminated"
+            message.status === "timeout"
           ) {
             socketRef.current?.close();
-            queryClient.invalidateQueries({
-              queryKey: ["workflowRuns"],
-            });
-            queryClient.invalidateQueries({
-              queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
-            });
-            queryClient.invalidateQueries({
-              queryKey: ["workflowRun", workflowRunId],
-            });
-            queryClient.invalidateQueries({
-              queryKey: ["taskWorkflowRun", workflowRunId],
-            });
-            queryClient.invalidateQueries({
-              queryKey: ["workflowTasks", workflowRunId],
-            });
-            queryClient.invalidateQueries({
-              queryKey: ["runs"],
-            });
-            if (
-              message.status === "failed" ||
-              message.status === "terminated"
-            ) {
-              toast({
-                title: "Run Failed",
-                description: "The workflow run has failed.",
-                variant: "destructive",
-              });
-            } else if (message.status === "completed") {
-              toast({
-                title: "Run Completed",
-                description: "The workflow run has been completed.",
-                variant: "success",
-              });
-            }
           }
         } catch (e) {
           console.error("Failed to parse message", e);
@@ -283,7 +236,7 @@ function WorkflowRunStream(props?: Props) {
         socketRef.current = null;
       });
 
-      if (interactive && workflowRunId) {
+      if (interactive && browserSessionId) {
         connectInputWs(credentialParam);
       }
     }
@@ -304,15 +257,7 @@ function WorkflowRunStream(props?: Props) {
         inputSocketRef.current = null;
       }
     };
-  }, [
-    credentialGetter,
-    workflowRunId,
-    showStream,
-    queryClient,
-    workflowPermanentId,
-    interactive,
-    clientId,
-  ]);
+  }, [credentialGetter, browserSessionId, interactive, clientId]);
 
   // Keep ref in sync for use in WS callbacks
   useEffect(() => {
@@ -324,9 +269,6 @@ function WorkflowRunStream(props?: Props) {
     const ws = inputSocketRef.current;
     const kind = userIsControlling ? "take-control" : "cede-control";
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      console.log(
-        `[cdp-input] Cannot send ${kind}: ws=${ws ? "exists" : "null"}, readyState=${ws?.readyState}`,
-      );
       return;
     }
     console.log(`[cdp-input] Sending ${kind}`);
@@ -542,32 +484,7 @@ function WorkflowRunStream(props?: Props) {
     [interactive, userIsControlling, sendInputEvent],
   );
 
-  if (workflowRun?.status === Status.Created) {
-    return (
-      <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-900 py-8 text-lg">
-        <span>Workflow has been created.</span>
-        <span>Stream will start when the workflow is running.</span>
-      </div>
-    );
-  }
-  if (workflowRun?.status === Status.Queued) {
-    return (
-      <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-900 py-8 text-lg">
-        <span>Your workflow run is queued.</span>
-        <span>Stream will start when the workflow is running.</span>
-      </div>
-    );
-  }
-
-  if (workflowRun?.status === Status.Running && streamImgSrc.length === 0) {
-    return (
-      <div className="flex h-full w-full items-center justify-center rounded-md bg-slate-900 py-8 text-lg">
-        Starting the stream...
-      </div>
-    );
-  }
-
-  if (workflowRun?.status === Status.Running && streamImgSrc.length > 0) {
+  if (streamImgSrc.length > 0) {
     if (interactive) {
       return (
         <div
@@ -577,6 +494,12 @@ function WorkflowRunStream(props?: Props) {
           onKeyDown={handleKeyDown}
           onKeyUp={handleKeyUp}
         >
+          {currentUrl && (
+            <div className="flex h-8 w-full items-center gap-2 rounded-t-md bg-slate-800 px-3 text-xs text-slate-300">
+              <GlobeIcon className="h-3 w-3 flex-shrink-0 text-slate-400" />
+              <span className="truncate">{currentUrl}</span>
+            </div>
+          )}
           {showControlButtons && !userIsControlling && inputReady && (
             <div className="absolute inset-0 z-10 flex items-center justify-center">
               <Button onClick={() => setUserIsControlling(true)}>
@@ -594,9 +517,11 @@ function WorkflowRunStream(props?: Props) {
           )}
           <img
             src={`data:image/${streamFormat};base64,${streamImgSrc}`}
-            className={cn("h-full w-full rounded-md object-contain", {
-              "cursor-default": userIsControlling,
-            })}
+            className={cn(
+              "w-full rounded-md object-contain",
+              currentUrl ? "h-[calc(100%-2rem)]" : "h-full",
+              { "cursor-default": userIsControlling },
+            )}
             onMouseDown={handleMouseDown}
             onMouseUp={handleMouseUp}
             onMouseMove={handleMouseMove}
@@ -609,73 +534,27 @@ function WorkflowRunStream(props?: Props) {
 
     return (
       <div className="h-full w-full">
+        {currentUrl && (
+          <div className="flex h-8 w-full items-center gap-2 rounded-t-md bg-slate-800 px-3 text-xs text-slate-300">
+            <GlobeIcon className="h-3 w-3 flex-shrink-0 text-slate-400" />
+            <span className="truncate">{currentUrl}</span>
+          </div>
+        )}
         <ZoomableImage
           src={`data:image/${streamFormat};base64,${streamImgSrc}`}
-          className="rounded-md"
+          className={
+            currentUrl ? "h-[calc(100%-2rem)] rounded-b-md" : "rounded-md"
+          }
         />
       </div>
     );
   }
 
-  if (alwaysShowStream) {
-    if (streamImgSrc?.length > 0) {
-      if (interactive) {
-        return (
-          <div
-            ref={containerRef}
-            className="relative h-full w-full outline-none"
-            tabIndex={0}
-            onKeyDown={handleKeyDown}
-            onKeyUp={handleKeyUp}
-          >
-            {showControlButtons && !userIsControlling && inputReady && (
-              <div className="absolute inset-0 z-10 flex items-center justify-center">
-                <Button onClick={() => setUserIsControlling(true)}>
-                  take control
-                </Button>
-              </div>
-            )}
-            {showControlButtons && userIsControlling && (
-              <Button
-                className="absolute bottom-2 left-1/2 z-10 -translate-x-1/2"
-                onClick={() => setUserIsControlling(false)}
-              >
-                stop controlling
-              </Button>
-            )}
-            <img
-              src={`data:image/${streamFormat};base64,${streamImgSrc}`}
-              className={cn("h-full w-full rounded-md object-contain", {
-                "cursor-default": userIsControlling,
-              })}
-              onMouseDown={handleMouseDown}
-              onMouseUp={handleMouseUp}
-              onMouseMove={handleMouseMove}
-              onContextMenu={(e) => e.preventDefault()}
-              draggable={false}
-            />
-          </div>
-        );
-      }
-
-      return (
-        <div className="h-full w-full">
-          <ZoomableImage
-            src={`data:image/${streamFormat};base64,${streamImgSrc}`}
-            className="rounded-md"
-          />
-        </div>
-      );
-    }
-
-    return (
-      <div className="flex h-full w-full items-center justify-center">
-        Waiting for stream...
-      </div>
-    );
-  }
-
-  return null;
+  return (
+    <div className="flex h-full w-full items-center justify-center text-sm text-slate-400">
+      Starting stream...
+    </div>
+  );
 }
 
-export { WorkflowRunStream };
+export { BrowserSessionStream };

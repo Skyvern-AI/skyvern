@@ -73,6 +73,15 @@ async def messages(
         )
         return
 
+    if settings.ENV == "local":
+        LOG.info(
+            "Messages channel not available in local mode, closing with 4001.",
+            browser_session_id=browser_session_id,
+            workflow_run_id=workflow_run_id,
+        )
+        await websocket.close(code=4001, reason="messages-not-available")
+        return
+
     if not client_id:
         LOG.error(
             "No client ID provided.",

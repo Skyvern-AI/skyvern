@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import floor
@@ -275,7 +276,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             "Creating new browser session",
             organization_id=organization_id,
         )
-        return await self.database.create_persistent_browser_session(
+        session = await self.database.create_persistent_browser_session(
             organization_id=organization_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
@@ -284,6 +285,80 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             extensions=extensions,
             browser_type=browser_type,
         )
+
+        # In local mode, launch the browser immediately for standalone sessions
+        # so the screencast/CDP input endpoints can connect.
+        if settings.ENV == "local" and runnable_id is None:
+            session_id = session.persistent_browser_session_id
+            asyncio.create_task(self._launch_browser_for_session(session_id, organization_id, proxy_location, url))
+
+        return session
+
+    async def _launch_browser_for_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        proxy_location: ProxyLocationInput | None = None,
+        url: str | None = None,
+    ) -> None:
+        """Launch a browser for a standalone session in local mode."""
+        try:
+            browser_state = await app.BROWSER_MANAGER._create_browser_state(
+                proxy_location=proxy_location,
+                url=url,
+                organization_id=organization_id,
+            )
+            await browser_state.get_or_create_page(
+                url=url or "about:blank",
+                proxy_location=proxy_location,
+                organization_id=organization_id,
+            )
+
+            # Guard: check session hasn't been closed while browser was launching
+            session = await self.get_session(session_id, organization_id)
+            if session is None or is_final_status(session.status):
+                LOG.info(
+                    "Session closed during browser launch, discarding browser",
+                    browser_session_id=session_id,
+                )
+                await browser_state.close()
+                return
+
+            # Don't overwrite if another path already set browser state
+            if session_id in self._browser_sessions:
+                LOG.info(
+                    "Session already has browser state, discarding duplicate",
+                    browser_session_id=session_id,
+                )
+                await browser_state.close()
+                return
+
+            self._browser_sessions[session_id] = BrowserSession(browser_state=browser_state)
+
+            # Re-verify after writing: if close_session raced between the
+            # check above and the dict write, undo immediately.
+            session = await self.get_session(session_id, organization_id)
+            if session is None or is_final_status(session.status):
+                LOG.info(
+                    "Session finalized during state write, cleaning up",
+                    browser_session_id=session_id,
+                )
+                self._browser_sessions.pop(session_id, None)
+                await browser_state.close()
+                return
+
+            await self.update_status(session_id, organization_id, PersistentBrowserSessionStatus.running)
+            LOG.info(
+                "Browser launched for standalone session",
+                browser_session_id=session_id,
+                organization_id=organization_id,
+            )
+        except Exception:
+            LOG.exception(
+                "Failed to launch browser for standalone session",
+                browser_session_id=session_id,
+                organization_id=organization_id,
+            )
 
     async def occupy_browser_session(
         self,
