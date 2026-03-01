@@ -36,13 +36,9 @@ MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
 
 # Resource types that should NEVER be treated as downloads.
 # Sub-resources (Font, Stylesheet, etc.) are loaded by the page, not user-initiated.
-# XHR/Fetch are programmatic JS API calls (e.g. Google APIs return Content-Disposition:
-# attachment on JSON responses, which would cause false positives).
 # Real user downloads come through as "Document" (link click / navigation).
 NON_DOWNLOAD_RESOURCE_TYPES = frozenset(
     {
-        "XHR",
-        "Fetch",
         "Font",
         "Stylesheet",
         "Script",
@@ -56,6 +52,14 @@ NON_DOWNLOAD_RESOURCE_TYPES = frozenset(
         "Prefetch",
     }
 )
+
+# XHR/Fetch are programmatic JS API calls that sometimes carry Content-Disposition:
+# attachment (e.g. Google APIs on JSON responses). We don't fully block them —
+# instead, we only allow them through if there's an explicit attachment header,
+# and rely on NON_DOWNLOAD_CONTENT_TYPES to filter out API false-positives.
+# Without an explicit attachment header, we skip XHR/Fetch to avoid MIME-only
+# false positives.
+XHR_FETCH_RESOURCE_TYPES = frozenset({"XHR", "Fetch"})
 
 # Content types that are clearly API / data responses, never user-facing downloads,
 # even if the server includes Content-Disposition: attachment.
@@ -117,10 +121,13 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     Determine if a response is a file download.
 
     Checks:
-    0. Skip sub-resource types (Font, Stylesheet, Script, Image, etc.)
-    1. Skip API content types (application/json, etc.)
-    2. Content-Disposition contains "attachment"
-    3. Content-Type is a known download MIME type
+    0. Skip error responses (status >= 400)
+    1. Skip sub-resource types (Font, Stylesheet, Script, Image, etc.)
+    2. Skip API content types (application/json, etc.)
+    3. For XHR/Fetch: require BOTH attachment header AND download MIME type
+       (prevents false positives like Google's text/plain + attachment XHR responses)
+    4. Content-Disposition contains "attachment"
+    5. Content-Type is a known download MIME type
     """
     if status_code >= 400:
         return False
@@ -134,10 +141,18 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     if content_type in NON_DOWNLOAD_CONTENT_TYPES:
         return False
 
-    if "attachment" in content_disposition.lower():
+    is_attachment = "attachment" in content_disposition.lower()
+    is_download_mime = content_type in DOWNLOAD_MIME_TYPES
+
+    # XHR/Fetch require both signals to avoid false positives
+    # (e.g. Google async requests: text/plain + attachment; filename="f.txt")
+    if resource_type in XHR_FETCH_RESOURCE_TYPES:
+        return is_attachment and is_download_mime
+
+    if is_attachment:
         return True
 
-    if content_type in DOWNLOAD_MIME_TYPES:
+    if is_download_mime:
         return True
 
     return False

@@ -65,14 +65,62 @@ class TestIsDownloadResponse:
     def test_empty_headers_not_download(self) -> None:
         assert is_download_response({}, 200) is False
 
-    # Resource type filtering
-    def test_xhr_resource_type_not_download(self) -> None:
+    # Resource type filtering — XHR/Fetch require BOTH attachment AND download MIME
+    def test_xhr_attachment_and_download_mime_is_download(self) -> None:
+        """XHR with attachment + download MIME type should be treated as download."""
         headers = {"content-disposition": "attachment", "content-type": "application/octet-stream"}
+        assert is_download_response(headers, 200, resource_type="XHR") is True
+
+    def test_fetch_attachment_and_download_mime_is_download(self) -> None:
+        """Fetch with attachment + download MIME type should be treated as download."""
+        headers = {"content-disposition": "attachment", "content-type": "application/pdf"}
+        assert is_download_response(headers, 200, resource_type="Fetch") is True
+
+    def test_xhr_attachment_pdf_is_download(self) -> None:
+        """Real-world case: XHR download with attachment header and PDF content-type."""
+        headers = {
+            "content-disposition": "attachment; filename=Invoice_12345.pdf; filename*=UTF-8''Invoice_12345.pdf",
+            "content-type": "application/pdf",
+        }
+        assert is_download_response(headers, 200, resource_type="XHR") is True
+
+    # XHR/Fetch with attachment but non-download MIME should NOT be download
+    def test_xhr_attachment_text_plain_not_download(self) -> None:
+        """Google-style XHR: text/plain + attachment should NOT be treated as download."""
+        headers = {"content-disposition": 'attachment; filename="f.txt"', "content-type": "text/plain; charset=UTF-8"}
         assert is_download_response(headers, 200, resource_type="XHR") is False
 
-    def test_fetch_resource_type_not_download(self) -> None:
+    def test_xhr_attachment_text_html_not_download(self) -> None:
+        """XHR with text/html + attachment should NOT be treated as download."""
+        headers = {"content-disposition": "attachment", "content-type": "text/html"}
+        assert is_download_response(headers, 200, resource_type="XHR") is False
+
+    def test_fetch_attachment_only_not_download(self) -> None:
+        """Fetch with attachment but no download MIME type should NOT be download."""
         headers = {"content-disposition": "attachment"}
         assert is_download_response(headers, 200, resource_type="Fetch") is False
+
+    def test_xhr_attachment_csv_not_download(self) -> None:
+        """Known limitation: CSV via XHR is not detected because text/csv is not in DOWNLOAD_MIME_TYPES."""
+        headers = {"content-disposition": "attachment", "content-type": "text/csv"}
+        assert is_download_response(headers, 200, resource_type="XHR") is False
+
+    # XHR/Fetch without attachment header should NOT be download (MIME-only false positive)
+    def test_xhr_mime_only_not_download(self) -> None:
+        """XHR with download MIME type but no attachment header should NOT be treated as download."""
+        headers = {"content-type": "application/pdf"}
+        assert is_download_response(headers, 200, resource_type="XHR") is False
+
+    def test_fetch_mime_only_not_download(self) -> None:
+        """Fetch with download MIME type but no attachment header should NOT be treated as download."""
+        headers = {"content-type": "application/octet-stream"}
+        assert is_download_response(headers, 200, resource_type="Fetch") is False
+
+    # XHR/Fetch with attachment but API content-type should still be filtered
+    def test_xhr_json_attachment_not_download(self) -> None:
+        """XHR with JSON content-type and attachment header should NOT be download."""
+        headers = {"content-disposition": "attachment", "content-type": "application/json"}
+        assert is_download_response(headers, 200, resource_type="XHR") is False
 
     def test_font_resource_type_not_download(self) -> None:
         headers = {"content-type": "application/octet-stream"}
