@@ -1,8 +1,11 @@
-"""Unit tests for CDPDownloadInterceptor pure functions (no browser needed)."""
+"""Unit tests for CDPDownloadInterceptor pure functions and proxy auth handling."""
 
 import time
+from unittest.mock import AsyncMock, MagicMock
 
-from skyvern.webeye.cdp_download_interceptor import extract_filename, is_download_response
+import pytest
+
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, extract_filename, is_download_response
 
 
 class TestIsDownloadResponse:
@@ -225,3 +228,234 @@ class TestExtractFilename:
         # extract_filename returns the raw name; sanitization is done in _handle_download.
         # But verify the raw output so tests document the behavior.
         assert result == "../../etc/cron.d/evil"
+
+
+class TestCDPDownloadInterceptorProxyAuth:
+    """Tests for CDP proxy authentication handling (Fetch.authRequired + continueWithAuth)."""
+
+    def _make_interceptor(
+        self,
+        proxy_username: str | None = None,
+        proxy_password: str | None = None,
+    ) -> CDPDownloadInterceptor:
+        return CDPDownloadInterceptor(
+            output_dir="/tmp/test_downloads",
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        )
+
+    def _make_cdp_session(self) -> MagicMock:
+        session = MagicMock()
+        session.send = AsyncMock()
+        return session
+
+    @pytest.mark.asyncio
+    async def test_proxy_auth_provides_credentials(self) -> None:
+        """Proxy 407 challenge should respond with ProvideCredentials when credentials are available."""
+        interceptor = self._make_interceptor(proxy_username="user1", proxy_password="pass1")
+        cdp_session = self._make_cdp_session()
+
+        event = {
+            "requestId": "req-1",
+            "authChallenge": {"source": "Proxy", "origin": "http://proxy.example.com"},
+            "request": {"url": "https://example.com/page"},
+        }
+
+        await interceptor._handle_auth_required(event, cdp_session)
+
+        cdp_session.send.assert_called_once_with(
+            "Fetch.continueWithAuth",
+            {
+                "requestId": "req-1",
+                "authChallengeResponse": {
+                    "response": "ProvideCredentials",
+                    "username": "user1",
+                    "password": "pass1",
+                },
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_proxy_auth_cancels(self) -> None:
+        """Non-proxy auth challenges (e.g., HTTP Basic from origin) should be cancelled."""
+        interceptor = self._make_interceptor(proxy_username="user1", proxy_password="pass1")
+        cdp_session = self._make_cdp_session()
+
+        event = {
+            "requestId": "req-2",
+            "authChallenge": {"source": "Server", "origin": "https://example.com"},
+            "request": {"url": "https://example.com/protected"},
+        }
+
+        await interceptor._handle_auth_required(event, cdp_session)
+
+        cdp_session.send.assert_called_once_with(
+            "Fetch.continueWithAuth",
+            {
+                "requestId": "req-2",
+                "authChallengeResponse": {"response": "CancelAuth"},
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_credentials_cancels_proxy_auth(self) -> None:
+        """Proxy auth challenge without credentials should be cancelled."""
+        interceptor = self._make_interceptor()  # No credentials
+        cdp_session = self._make_cdp_session()
+
+        event = {
+            "requestId": "req-3",
+            "authChallenge": {"source": "Proxy", "origin": "http://proxy.example.com"},
+            "request": {"url": "https://example.com/page"},
+        }
+
+        await interceptor._handle_auth_required(event, cdp_session)
+
+        cdp_session.send.assert_called_once_with(
+            "Fetch.continueWithAuth",
+            {
+                "requestId": "req-3",
+                "authChallengeResponse": {"response": "CancelAuth"},
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_credentials_cancels(self) -> None:
+        """Proxy auth with only username (no password) should cancel."""
+        interceptor = self._make_interceptor(proxy_username="user1")
+        cdp_session = self._make_cdp_session()
+
+        event = {
+            "requestId": "req-4",
+            "authChallenge": {"source": "Proxy", "origin": "http://proxy.example.com"},
+            "request": {"url": "https://example.com/page"},
+        }
+
+        await interceptor._handle_auth_required(event, cdp_session)
+
+        cdp_session.send.assert_called_once_with(
+            "Fetch.continueWithAuth",
+            {
+                "requestId": "req-4",
+                "authChallengeResponse": {"response": "CancelAuth"},
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_auth_error_does_not_raise(self) -> None:
+        """Errors during auth handling should be caught, not raised."""
+        interceptor = self._make_interceptor(proxy_username="user1", proxy_password="pass1")
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("CDP connection lost")
+
+        event = {
+            "requestId": "req-5",
+            "authChallenge": {"source": "Proxy", "origin": "http://proxy.example.com"},
+            "request": {"url": "https://example.com/page"},
+        }
+
+        # Should not raise
+        await interceptor._handle_auth_required(event, cdp_session)
+
+    def test_init_stores_proxy_credentials(self) -> None:
+        """Constructor should store proxy credentials."""
+        interceptor = self._make_interceptor(proxy_username="user", proxy_password="pass")
+        assert interceptor._proxy_username == "user"
+        assert interceptor._proxy_password == "pass"
+
+    def test_init_no_proxy_credentials(self) -> None:
+        """Constructor without credentials should store None."""
+        interceptor = self._make_interceptor()
+        assert interceptor._proxy_username is None
+        assert interceptor._proxy_password is None
+
+    @pytest.mark.asyncio
+    async def test_enable_for_page_with_proxy_auth(self) -> None:
+        """enable_for_page should set handleAuthRequests=True and register authRequired handler."""
+        interceptor = self._make_interceptor(proxy_username="user", proxy_password="pass")
+
+        mock_cdp_session = self._make_cdp_session()
+        mock_page = MagicMock()
+        mock_page.url = "about:blank"
+        mock_page.context.new_cdp_session = AsyncMock(return_value=mock_cdp_session)
+
+        await interceptor.enable_for_page(mock_page)
+
+        # Verify Fetch.enable was called with handleAuthRequests=True
+        mock_cdp_session.send.assert_called_once_with(
+            "Fetch.enable",
+            {
+                "patterns": [{"requestStage": "Response"}],
+                "handleAuthRequests": True,
+            },
+        )
+
+        # Verify both event handlers were registered
+        event_names = [call.args[0] for call in mock_cdp_session.on.call_args_list]
+        assert "Fetch.requestPaused" in event_names
+        assert "Fetch.authRequired" in event_names
+
+    @pytest.mark.asyncio
+    async def test_enable_for_page_without_proxy_auth(self) -> None:
+        """enable_for_page without credentials should set handleAuthRequests=False."""
+        interceptor = self._make_interceptor()
+
+        mock_cdp_session = self._make_cdp_session()
+        mock_page = MagicMock()
+        mock_page.url = "about:blank"
+        mock_page.context.new_cdp_session = AsyncMock(return_value=mock_cdp_session)
+
+        await interceptor.enable_for_page(mock_page)
+
+        # Verify Fetch.enable was called with handleAuthRequests=False
+        mock_cdp_session.send.assert_called_once_with(
+            "Fetch.enable",
+            {
+                "patterns": [{"requestStage": "Response"}],
+                "handleAuthRequests": False,
+            },
+        )
+
+        # Verify only requestPaused handler was registered (not authRequired)
+        event_names = [call.args[0] for call in mock_cdp_session.on.call_args_list]
+        assert "Fetch.requestPaused" in event_names
+        assert "Fetch.authRequired" not in event_names
+
+    @pytest.mark.asyncio
+    async def test_malformed_event_missing_request_id(self) -> None:
+        """Malformed event without requestId should be caught, not raise."""
+        interceptor = self._make_interceptor(proxy_username="user1", proxy_password="pass1")
+        cdp_session = self._make_cdp_session()
+
+        event: dict = {
+            "authChallenge": {"source": "Proxy", "origin": "http://proxy.example.com"},
+            "request": {"url": "https://example.com/page"},
+        }
+
+        # Should not raise — KeyError is caught by the try/except
+        await interceptor._handle_auth_required(event, cdp_session)
+        cdp_session.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_loop_prevention(self) -> None:
+        """Second auth attempt for the same requestId should CancelAuth to prevent infinite loop."""
+        interceptor = self._make_interceptor(proxy_username="user1", proxy_password="pass1")
+        cdp_session = self._make_cdp_session()
+
+        event = {
+            "requestId": "req-retry",
+            "authChallenge": {"source": "Proxy", "origin": "http://proxy.example.com"},
+            "request": {"url": "https://example.com/page"},
+        }
+
+        # First attempt: should provide credentials
+        await interceptor._handle_auth_required(event, cdp_session)
+        first_call = cdp_session.send.call_args
+        assert first_call.args[1]["authChallengeResponse"]["response"] == "ProvideCredentials"
+
+        cdp_session.send.reset_mock()
+
+        # Second attempt (credentials rejected): should cancel
+        await interceptor._handle_auth_required(event, cdp_session)
+        second_call = cdp_session.send.call_args
+        assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
