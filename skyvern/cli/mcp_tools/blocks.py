@@ -42,6 +42,7 @@ from skyvern.schemas.workflows import (
     UrlBlockYAML,
     ValidationBlockYAML,
     WaitBlockYAML,
+    WorkflowTriggerBlockYAML,
 )
 
 from ._common import ErrorCode, make_error, make_result
@@ -76,6 +77,7 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.PDF_PARSER.value: PDFParserBlockYAML,
     BlockType.HUMAN_INTERACTION.value: HumanInteractionBlockYAML,
     BlockType.PRINT_PAGE.value: PrintPageBlockYAML,
+    BlockType.WORKFLOW_TRIGGER.value: WorkflowTriggerBlockYAML,
 }
 
 # ---------------------------------------------------------------------------
@@ -104,6 +106,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "pdf_parser": "Extract structured data from a PDF document",
     "human_interaction": "Pause workflow for human approval via email",
     "print_page": "Print the current page to PDF",
+    "workflow_trigger": "Trigger another workflow by permanent ID, with optional payload and wait-for-completion",
 }
 
 # ---------------------------------------------------------------------------
@@ -188,6 +191,13 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "block_type": "goto_url",
         "label": "open_cart",
         "url": "https://example.com/cart",
+    },
+    "workflow_trigger": {
+        "block_type": "workflow_trigger",
+        "label": "trigger_sub_workflow",
+        "workflow_permanent_id": "wpid_xxx",
+        "payload": {"url": "{{ some_parameter }}"},
+        "wait_for_completion": True,
     },
 }
 

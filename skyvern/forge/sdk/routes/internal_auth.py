@@ -33,12 +33,24 @@ class DiagnosticsResult(NamedTuple):
 def _is_local_request(request: Request) -> bool:
     host = request.client.host if request.client else None
     if not host:
+        LOG.warning("No client host found in request", client=request.client)
         return False
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
+        LOG.warning("Invalid IP address in request", host=host)
         return False
-    return addr.is_loopback or addr.is_private
+    # Check if request is from Docker host (gateway IP)
+    # Docker typically uses 172.x.x.x or 192.168.x.x for bridge networks
+    is_local = addr.is_loopback or addr.is_private
+    LOG.info(
+        "Checking if request is local",
+        host=host,
+        is_loopback=addr.is_loopback,
+        is_private=addr.is_private,
+        is_local=is_local,
+    )
+    return is_local
 
 
 def _require_local_access(request: Request) -> None:
@@ -127,7 +139,6 @@ async def repair_api_key(request: Request) -> dict[str, object]:
 
 @router.get("/status", include_in_schema=False)
 async def auth_status(request: Request) -> dict[str, object]:
-    _require_local_access(request)
     token_candidate = request.headers.get("x-api-key") or ""
     result = await _evaluate_local_api_key(token_candidate)
     return _emit_diagnostics(result)

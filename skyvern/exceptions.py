@@ -1,3 +1,5 @@
+import re
+
 from fastapi import status
 
 
@@ -17,6 +19,12 @@ class SkyvernHTTPException(SkyvernException):
     def __init__(self, message: str | None = None, status_code: int = status.HTTP_400_BAD_REQUEST):
         self.status_code = status_code
         super().__init__(message)
+
+
+def get_user_facing_exception_message(exception: Exception) -> str:
+    if isinstance(exception, SkyvernException):
+        return exception.message or str(exception)
+    return f"Unexpected error: {exception}"
 
 
 class DisabledBlockExecutionError(SkyvernHTTPException):
@@ -277,10 +285,39 @@ class UnknownBrowserType(SkyvernException):
 
 
 class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
+    SUPPORT_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
+
     def __init__(self, browser_type: str, exception: Exception) -> None:
-        super().__init__(
-            f"Unknown error while creating browser context for {browser_type}. Exception type: {type(exception)} Exception message: {str(exception)}"
-        )
+        exception_type = type(exception).__name__
+        detail = self._get_detail(exception)
+        super().__init__(f"Failed to create browser context for {browser_type} ({exception_type}). {detail}")
+
+    @staticmethod
+    def _get_detail(exception: Exception) -> str:
+        raw_message = str(exception).strip()
+        # Patchright timeout errors include a verbose "Call log" section with launch args.
+        trimmed_message = raw_message.split("Call log:")[0].strip()
+        normalized_message = " ".join(trimmed_message.split())
+
+        timeout_match = re.search(r"Timeout\s+(\d+)ms\s+exceeded", normalized_message, flags=re.IGNORECASE)
+        if timeout_match and "launch_persistent_context" in normalized_message:
+            timeout_seconds = int(timeout_match.group(1)) // 1000
+            if timeout_seconds > 0:
+                return (
+                    f"Browser launch timed out after {timeout_seconds} seconds. "
+                    f"This is usually transient. {UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
+                )
+            return (
+                "Browser launch timed out. "
+                f"This is usually transient. {UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
+            )
+
+        if normalized_message:
+            if len(normalized_message) > 280:
+                normalized_message = f"{normalized_message[:277]}..."
+            return f"{normalized_message} {UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
+
+        return f"Unknown browser startup error. {UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
 
 
 class OrganizationNotFound(SkyvernHTTPException):

@@ -47,6 +47,7 @@ import {
   FileUploadBlockYAML,
   HttpRequestBlockYAML,
   PrintPageBlockYAML,
+  WorkflowTriggerBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -131,6 +132,10 @@ import {
   validateJson,
 } from "./nodes/HttpRequestNode/httpValidation";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
+import {
+  isWorkflowTriggerNode,
+  workflowTriggerNodeDefaultData,
+} from "./nodes/WorkflowTriggerNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -297,7 +302,16 @@ function layout(
     const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
     const isTargetted =
       targettedBlockLabel && nodeLabel === targettedBlockLabel;
-    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
+    // Use measured header height when available, fall back to 225 for initial render.
+    // Add 28px to account for outer container (border-2 + p-2 = 10px) + gap (16px) + buffer.
+    const headerHeight = isLoopNode(node) ? node.data._headerHeight : undefined;
+    const baseMargin = headerHeight ? headerHeight + 28 : 225;
+    // Only add extra margin for the status row when using the fallback height,
+    // since the measured height already includes the status row content.
+    const marginy =
+      isTargetted && !headerHeight
+        ? baseMargin + TARGETTED_BLOCK_EXTRA_MARGIN
+        : baseMargin;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
@@ -506,9 +520,11 @@ function convertToNode(
           navigationGoal: block.navigation_goal ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
           dataSchema:
-            typeof block.data_schema === "string"
-              ? block.data_schema
-              : JSON.stringify(block.data_schema, null, 2),
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           allowDownloads: block.complete_on_download ?? false,
           downloadSuffix: block.download_suffix ?? null,
@@ -653,9 +669,11 @@ function convertToNode(
           url: block.url ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
           dataSchema:
-            typeof block.data_schema === "string"
-              ? block.data_schema
-              : JSON.stringify(block.data_schema, null, 2),
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
           parameterKeys: block.parameters.map((p) => p.key),
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
@@ -778,6 +796,12 @@ function convertToNode(
           loopVariableReference: loopVariableReference,
           completeIfEmpty: block.complete_if_empty,
           nextLoopOnFailure: block.next_loop_on_failure,
+          dataSchema:
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
         },
       };
     }
@@ -896,6 +920,23 @@ function convertToNode(
           format: block.format ?? "A4",
           landscape: block.landscape ?? false,
           printBackground: block.print_background ?? true,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "workflow_trigger": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "workflowTrigger",
+        data: {
+          ...commonData,
+          workflowPermanentId: block.workflow_permanent_id ?? "",
+          workflowTitle: "",
+          payload: JSON.stringify(block.payload || {}, null, 2),
+          waitForCompletion: block.wait_for_completion ?? true,
+          browserSessionId: block.browser_session_id ?? "",
+          useParentBrowserSession: block.use_parent_browser_session ?? false,
           parameterKeys: block.parameters.map((p) => p.key),
         },
       };
@@ -1951,6 +1992,17 @@ function createNode(
         },
       };
     }
+    case "workflowTrigger": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "workflowTrigger",
+        data: {
+          ...workflowTriggerNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "conditional": {
       const branches = createDefaultBranchConditions();
       return {
@@ -2432,6 +2484,25 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
       };
     }
+    case "workflowTrigger": {
+      const parsedPayload = JSONParseSafe(node.data.payload) as Record<
+        string,
+        unknown
+      > | null;
+      return {
+        ...base,
+        block_type: "workflow_trigger",
+        workflow_permanent_id: node.data.workflowPermanentId,
+        payload:
+          parsedPayload && Object.keys(parsedPayload).length > 0
+            ? parsedPayload
+            : null,
+        wait_for_completion: node.data.waitForCompletion,
+        browser_session_id: node.data.browserSessionId || null,
+        use_parent_browser_session: node.data.useParentBrowserSession,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
     case "conditional": {
       return serializeConditionalBlock(node as ConditionalNode, nodes, edges);
     }
@@ -2514,6 +2585,7 @@ function getOrderedChildrenBlocks(
         loop_blocks: loopChildren,
         loop_variable_reference: currentNode.data.loopVariableReference,
         complete_if_empty: currentNode.data.completeIfEmpty,
+        data_schema: JSONSafeOrString(currentNode.data.dataSchema),
       });
     } else {
       children.push(getWorkflowBlock(currentNode, nodes, edges));
@@ -2550,6 +2622,7 @@ function getOrderedChildrenBlocks(
         loop_blocks: loopChildren,
         loop_variable_reference: node.data.loopVariableReference,
         complete_if_empty: node.data.completeIfEmpty,
+        data_schema: JSONSafeOrString(node.data.dataSchema),
       });
       includedIds.add(node.id);
       return;
@@ -2615,6 +2688,7 @@ function getWorkflowBlocksUtil(
           loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
           loop_variable_reference: node.data.loopVariableReference,
           complete_if_empty: node.data.completeIfEmpty,
+          data_schema: JSONSafeOrString(node.data.dataSchema),
         },
       ];
     }
@@ -3722,6 +3796,7 @@ function convertBlocksToBlockYAML(
           loop_blocks: convertBlocksToBlockYAML(block.loop_blocks),
           loop_variable_reference: block.loop_variable_reference,
           complete_if_empty: block.complete_if_empty,
+          data_schema: block.data_schema,
         };
         return blockYaml;
       }
@@ -3849,6 +3924,19 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "workflow_trigger": {
+        const blockYaml: WorkflowTriggerBlockYAML = {
+          ...base,
+          block_type: "workflow_trigger",
+          workflow_permanent_id: block.workflow_permanent_id,
+          payload: block.payload,
+          wait_for_completion: block.wait_for_completion,
+          browser_session_id: block.browser_session_id,
+          use_parent_browser_session: block.use_parent_browser_session,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
     }
   });
 }
@@ -3877,6 +3965,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
     run_with: workflow.run_with,
+    adaptive_caching: workflow.adaptive_caching ?? undefined,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
     run_sequentially: workflow.run_sequentially ?? undefined,
@@ -4073,6 +4162,17 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     });
   });
 
+  const workflowTriggerNodes = nodes.filter(isWorkflowTriggerNode);
+  workflowTriggerNodes.forEach((node) => {
+    if (!node.data.workflowPermanentId.trim()) {
+      errors.push(`${node.data.label}: Workflow Permanent ID is required.`);
+    }
+    const payloadResult = validateJson(node.data.payload);
+    if (!payloadResult.valid && payloadResult.message) {
+      errors.push(`${node.data.label}: Payload is not valid JSON.`);
+    }
+  });
+
   return errors;
 }
 
@@ -4112,10 +4212,13 @@ function isNodeInsideForLoop(nodes: Array<AppNode>, nodeId: string): boolean {
   if (!currentNode) {
     return false;
   }
-  const parentNode = currentNode.parentId
-    ? nodes.find((n) => n.id === currentNode.parentId)
-    : null;
-  return parentNode?.type === "loop";
+  let current: AppNode | undefined = currentNode;
+  while (current?.parentId) {
+    const parent = nodes.find((n) => n.id === current!.parentId);
+    if (parent?.type === "loop") return true;
+    current = parent;
+  }
+  return false;
 }
 
 export {

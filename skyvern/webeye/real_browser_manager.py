@@ -152,18 +152,22 @@ class RealBrowserManager(BrowserManager):
         workflow_run_id = workflow_run.workflow_run_id
         if browser_profile_id is None:
             browser_profile_id = workflow_run.browser_profile_id
-        browser_state = self.get_for_workflow_run(
-            workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
-        )
-        if browser_state:
-            # always keep the browser state for the workflow run and the parent workflow run synced
-            self.pages[workflow_run_id] = browser_state
-            if parent_workflow_run_id:
-                self.pages[parent_workflow_run_id] = browser_state
-            return browser_state
+
+        # When an explicit browser_session_id is provided (e.g. from a workflow
+        # trigger block), skip the parent workflow lookup so the child uses the
+        # specified persistent session instead of inheriting the parent's browser.
+        if not browser_session_id:
+            browser_state = self.get_for_workflow_run(
+                workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
+            )
+            if browser_state:
+                # always keep the browser state for the workflow run and the parent workflow run synced
+                self.pages[workflow_run_id] = browser_state
+                if parent_workflow_run_id:
+                    self.pages[parent_workflow_run_id] = browser_state
+                return browser_state
 
         if browser_session_id:
-            # TODO: what if there's a parent workflow run?
             LOG.info(
                 "Getting browser state for workflow run from persistent sessions manager",
                 browser_session_id=browser_session_id,
@@ -206,7 +210,11 @@ class RealBrowserManager(BrowserManager):
                 )
 
         self.pages[workflow_run_id] = browser_state
-        if parent_workflow_run_id:
+        # Only sync the parent's entry when the child is sharing the parent's
+        # browser.  When an explicit browser_session_id is provided the child
+        # has its own browser, and overwriting the parent's entry would break
+        # subsequent parent blocks.
+        if parent_workflow_run_id and not browser_session_id:
             self.pages[parent_workflow_run_id] = browser_state
 
         # The URL here is only used when creating a new page, and not when using an existing page.

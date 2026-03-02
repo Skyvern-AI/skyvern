@@ -114,11 +114,11 @@ export async function getSseClient(
 
   if (authToken) {
     requestHeaders.Authorization = `Bearer ${authToken}`;
-  } else {
-    const apiKey = getRuntimeApiKey();
-    if (apiKey) {
-      requestHeaders["X-API-Key"] = apiKey;
-    }
+  }
+
+  const apiKey = getRuntimeApiKey();
+  if (apiKey) {
+    requestHeaders["X-API-Key"] = apiKey;
   }
 
   return {

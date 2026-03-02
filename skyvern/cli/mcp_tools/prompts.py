@@ -190,7 +190,7 @@ If it succeeds: turn the approach into a multi-block workflow for reuse.
 If it struggles: read the failure_reason, refine the prompt, and try again.  Two or three
 iterations usually reveal whether the site is automatable and what prompt phrasing works.
 
-Do NOT open a manual browser session (skyvern_session_create) to explore the site before
+Do NOT open a manual browser session (skyvern_browser_session_create) to explore the site before
 building a workflow.  That approach bypasses Skyvern's AI and wastes time.  skyvern_run_task
 gives you the same insight faster because Skyvern navigates the site for you.
 
@@ -322,7 +322,7 @@ Not every failure can be fixed by prompt refinement. Know when to escalate.
 **Open a manual session (last resort)** when:
 - You cannot determine from error output what the page looks like
 - The site has unusual UI patterns not described in any error message
-- Use: skyvern_session_create, skyvern_navigate to the failing URL, skyvern_screenshot to see the page
+- Use: skyvern_browser_session_create, skyvern_navigate to the failing URL, skyvern_screenshot to see the page
 
 **Report to the user** when:
 - CAPTCHA blocks persist even with proxy rotation

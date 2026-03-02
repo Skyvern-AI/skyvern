@@ -1,3 +1,4 @@
+import { LogoMinimized } from "@/components/LogoMinimized";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -8,6 +9,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useOnChange } from "@/hooks/useOnChange";
+import { cn } from "@/util/utils";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
@@ -318,6 +320,17 @@ function FlowRenderer({
   const parameters = useWorkflowParametersStore((state) => state.parameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
+
+  // Track layout phase for animation control:
+  // "pre-layout" = nodes hidden while Dagre hasn't computed positions yet
+  // "initial-load" = nodes fading in at their final positions (no position transition)
+  // "ready" = normal operation with position transitions enabled
+  // The 350ms timeout is coupled with the CSS fade-in duration (300ms) in reactFlowOverrideStyles.css
+  const [layoutPhase, setLayoutPhase] = useState<
+    "pre-layout" | "initial-load" | "ready"
+  >("pre-layout");
+  const hasCompletedInitialLoad = useRef(false);
+  const fadeTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const flowIsConstrained = debugStore.isDebugMode;
 
   // Track if this is the initial load to prevent false "unsaved changes" detection
@@ -391,8 +404,22 @@ function FlowRenderer({
   );
 
   useEffect(() => {
-    if (nodesInitialized) {
+    if (nodesInitialized && !hasCompletedInitialLoad.current) {
+      hasCompletedInitialLoad.current = true;
       doLayout(nodes, edges);
+      // After Dagre computes positions, wait one frame for the DOM to update
+      // with new positions, then fade in the nodes/edges at their final positions.
+      const rafId = requestAnimationFrame(() => {
+        setLayoutPhase("initial-load");
+        // After the fade-in animation completes, enable normal transform transitions
+        fadeTimerRef.current = setTimeout(() => {
+          setLayoutPhase("ready");
+        }, 350);
+      });
+      return () => {
+        cancelAnimationFrame(rafId);
+        if (fadeTimerRef.current) clearTimeout(fadeTimerRef.current);
+      };
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodesInitialized]);
@@ -405,6 +432,26 @@ function FlowRenderer({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targettedBlockLabel]);
+
+  // Re-layout when a loop node's header height changes (e.g., data schema toggled)
+  useEffect(() => {
+    const handleLoopHeaderResized = () => {
+      // Delay to let React process the updateNodeData state change
+      setTimeout(() => {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const currentEdges = reactFlowInstance.getEdges();
+        debouncedLayoutForDimensions(currentNodes, currentEdges);
+      }, 10);
+    };
+
+    window.addEventListener("loop-header-resized", handleLoopHeaderResized);
+    return () => {
+      window.removeEventListener(
+        "loop-header-resized",
+        handleLoopHeaderResized,
+      );
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
 
   useEffect(() => {
     const topLevelBlocks = getWorkflowBlocks(nodes, edges);
@@ -814,10 +861,21 @@ function FlowRenderer({
 
   return (
     <div
-      className="h-full w-full"
+      className={cn("relative h-full w-full", {
+        "react-flow--pre-layout": layoutPhase === "pre-layout",
+        "react-flow--initial-load":
+          layoutPhase === "initial-load" || layoutPhase === "pre-layout",
+      })}
       style={{ zIndex }}
       onMouseDownCapture={() => onMouseDownCapture?.()}
     >
+      {layoutPhase === "pre-layout" && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-950">
+          <div className="animate-pulse">
+            <LogoMinimized />
+          </div>
+        </div>
+      )}
       <Dialog
         open={blocker.state === "blocked"}
         onOpenChange={(open) => {
@@ -896,10 +954,11 @@ function FlowRenderer({
                     node.measured?.height !== newHeight
                   ) {
                     hasActualChanges = true;
-                    if (node.measured) {
-                      node.measured.width = newWidth;
-                      node.measured.height = newHeight;
-                    }
+                    node.measured = {
+                      ...node.measured,
+                      width: newWidth,
+                      height: newHeight,
+                    };
                   }
                 }
               });

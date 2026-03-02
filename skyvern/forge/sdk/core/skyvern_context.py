@@ -53,6 +53,9 @@ class SkyvernContext:
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
     script_mode: bool = False
     ai_mode_override: str | None = None
+    script_llm_call_count: int = 0
+    last_classify_result: str | None = None
+    skip_complete_verification: bool = False
 
     # magic link handling
     # task_id is the key, page is the value

@@ -6,9 +6,9 @@ import { DotFilledIcon } from "@radix-ui/react-icons";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
+  countActionsInTimeline,
   isBlockItem,
   isObserverThought,
-  isTaskVariantBlockItem,
   isThoughtItem,
   ObserverThought,
   WorkflowRunBlock,
@@ -56,12 +56,7 @@ function WorkflowRunTimeline({
   const finallyBlockLabel =
     workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
 
-  const numberOfActions = workflowRunTimeline.reduce((total, current) => {
-    if (isTaskVariantBlockItem(current)) {
-      return total + current.block!.actions!.length;
-    }
-    return total + 0;
-  }, 0);
+  const numberOfActions = countActionsInTimeline(workflowRunTimeline);
 
   return (
     <div className="min-w-0 space-y-4 rounded bg-slate-elevation1 p-4">

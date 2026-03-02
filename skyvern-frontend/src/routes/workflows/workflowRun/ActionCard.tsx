@@ -23,8 +23,12 @@ type Props = {
 };
 
 function ActionCard({ action, onClick, active, index }: Props) {
+  // Wait actions always succeed — they intentionally return ActionFailure
+  // from the backend but completing a wait is expected, not a failure.
   const success =
-    action.status === Status.Completed || action.status === Status.Skipped;
+    action.action_type === ActionTypes.wait ||
+    action.status === Status.Completed ||
+    action.status === Status.Skipped;
 
   const refCallback = useCallback((element: HTMLDivElement | null) => {
     if (element && active) {

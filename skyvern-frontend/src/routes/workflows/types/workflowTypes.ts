@@ -212,7 +212,8 @@ export type WorkflowBlock =
   | Taskv2Block
   | URLBlock
   | HttpRequestBlock
-  | PrintPageBlock;
+  | PrintPageBlock
+  | WorkflowTriggerBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -238,6 +239,7 @@ export const WorkflowBlockTypes = {
   URL: "goto_url",
   HttpRequest: "http_request",
   PrintPage: "print_page",
+  WorkflowTrigger: "workflow_trigger",
 } as const;
 
 // all of them
@@ -260,15 +262,7 @@ export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
 export function isTaskVariantBlock(item: {
   block_type: WorkflowBlockType;
 }): boolean {
-  return (
-    item.block_type === "task" ||
-    item.block_type === "navigation" ||
-    item.block_type === "action" ||
-    item.block_type === "extraction" ||
-    item.block_type === "validation" ||
-    item.block_type === "login" ||
-    item.block_type === "file_download"
-  );
+  return scriptableWorkflowBlockTypes.has(item.block_type);
 }
 
 export type WorkflowBlockType =
@@ -360,6 +354,7 @@ export type ForLoopBlock = WorkflowBlockBase & {
   loop_blocks: Array<WorkflowBlock>;
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
+  data_schema?: Record<string, unknown> | string | null;
 };
 
 export type CodeBlock = WorkflowBlockBase & {
@@ -566,6 +561,16 @@ export type PrintPageBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type WorkflowTriggerBlock = WorkflowBlockBase & {
+  block_type: "workflow_trigger";
+  workflow_permanent_id: string;
+  payload: Record<string, unknown> | null;
+  wait_for_completion: boolean;
+  browser_session_id: string | null;
+  use_parent_browser_session: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
 export type WorkflowDefinition = {
   version?: number | null;
   parameters: Array<Parameter>;
@@ -595,9 +600,10 @@ export type WorkflowApiResponse = {
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
-  run_with: string | null; // 'agent' or 'code'
+  run_with: string | null; // 'agent', 'code', or 'code_v2'
   cache_key: string | null;
   ai_fallback: boolean | null;
+  adaptive_caching: boolean | null;
   run_sequentially: boolean | null;
   sequential_key: string | null;
   folder_id: string | null;

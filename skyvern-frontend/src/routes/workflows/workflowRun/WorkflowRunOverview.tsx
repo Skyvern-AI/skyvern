@@ -16,7 +16,10 @@ import { ObserverThoughtScreenshot } from "./ObserverThoughtScreenshot";
 import { WorkflowRunBlockScreenshot } from "./WorkflowRunBlockScreenshot";
 import { WorkflowRunStream } from "./WorkflowRunStream";
 import { useSearchParams } from "react-router-dom";
-import { findActiveItem } from "./workflowTimelineUtils";
+import {
+  findActiveItem,
+  resolveScreenshotBlockId,
+} from "./workflowTimelineUtils";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
@@ -132,7 +135,10 @@ function WorkflowRunOverview() {
         )}
       {isWorkflowRunBlock(selection) && !showStreamingBrowser && (
         <WorkflowRunBlockScreenshot
-          workflowRunBlockId={selection.workflow_run_block_id}
+          workflowRunBlockId={resolveScreenshotBlockId(
+            workflowRunTimeline,
+            selection,
+          )}
         />
       )}
       {isObserverThought(selection) && (

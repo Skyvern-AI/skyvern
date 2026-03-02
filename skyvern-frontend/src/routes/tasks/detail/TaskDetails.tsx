@@ -41,6 +41,7 @@ import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
 import { useFirstParam } from "@/hooks/useFirstParam";
 import * as env from "@/util/env";
+import { TaskRunVerificationCodeForm } from "./TaskRunVerificationCodeForm";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -70,7 +71,9 @@ function TaskDetails() {
 
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useQuery<WorkflowRunStatusApiResponse>({
-      queryKey: ["workflowRun", task?.workflow_run_id],
+      // Keep this cache separate from workflow-run pages, which store
+      // a richer payload under ["workflowRun", workflowRunId].
+      queryKey: ["taskWorkflowRun", task?.workflow_run_id],
       queryFn: async () => {
         const client = await getClient(credentialGetter);
         return client
@@ -109,6 +112,9 @@ function TaskDetails() {
       if (task?.workflow_run_id) {
         queryClient.invalidateQueries({
           queryKey: ["workflowRun", task.workflow_run_id],
+        });
+        queryClient.invalidateQueries({
+          queryKey: ["taskWorkflowRun", task.workflow_run_id],
         });
         queryClient.invalidateQueries({
           queryKey: [
@@ -316,6 +322,8 @@ function TaskDetails() {
           )}
         </div>
       </header>
+      {/* 2FA Verification Code Form - shown when task is waiting for a code */}
+      <TaskRunVerificationCodeForm />
 
       {taskIsLoading ? (
         <Skeleton className="h-32 w-full" />

@@ -46,9 +46,9 @@ from skyvern.exceptions import (
     MissingBrowserState,
     MissingBrowserStatePage,
     PDFParsingError,
-    SkyvernException,
     TaskNotFound,
     UnexpectedTaskStatus,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -76,6 +76,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, validate_pdf_file
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
@@ -115,6 +116,9 @@ if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
 else:
     jinja_sandbox_env = SandboxedEnvironment()
 
+
+# Date format used for the built-in {{current_date}} reserved parameter.
+CURRENT_DATE_FORMAT = "%Y-%m-%d"
 
 # Sentinel marker for native JSON type injection via | json filter.
 _JSON_TYPE_MARKER = "__SKYVERN_RAW_JSON__"
@@ -182,7 +186,7 @@ class Block(BaseModel, abc.ABC):
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
-                mapping = settings.get_model_name_to_llm_key()
+                mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
                 return mapping.get(model_name, {}).get("llm_key")
 
         return None
@@ -316,7 +320,11 @@ class Block(BaseModel, abc.ABC):
             return potential_template
 
         # Security: only allow real secret values for non-LLM blocks (HttpRequestBlock, CodeBlock)
-        is_safe_block_for_secrets = self.block_type in [BlockType.CODE, BlockType.HTTP_REQUEST]
+        is_safe_block_for_secrets = self.block_type in [
+            BlockType.CODE,
+            BlockType.HTTP_REQUEST,
+            BlockType.WORKFLOW_TRIGGER,
+        ]
 
         template = jinja_sandbox_env.from_string(potential_template)
 
@@ -398,6 +406,8 @@ class Block(BaseModel, abc.ABC):
             template_data["workflow_permanent_id"] = workflow_run_context.workflow_permanent_id
         if "workflow_run_id" not in template_data:
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
+        if "current_date" not in template_data:
+            template_data["current_date"] = datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT)
 
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
         template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
@@ -558,9 +568,7 @@ class Block(BaseModel, abc.ABC):
             if not workflow_run_context.has_value(self.output_parameter.key):
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
 
-            failure_reason = f"Unexpected error: {str(e)}"
-            if isinstance(e, SkyvernException):
-                failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+            failure_reason = get_user_facing_exception_message(e)
 
             return await self.build_block_result(
                 success=False,
@@ -815,6 +823,23 @@ class BaseTaskBlock(Block):
                         raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
                     if working_page.url == "about:blank" and self.url:
                         await browser_state.navigate_to_url(page=working_page, url=self.url)
+
+                    # When a browser profile is loaded, wait for the page to fully settle
+                    # so that cookie-based authentication can redirect or restore the session
+                    # BEFORE the agent starts interacting with the page.
+                    if workflow_run.browser_profile_id:
+                        LOG.info(
+                            "Browser profile loaded — waiting for page to settle before agent acts",
+                            browser_profile_id=workflow_run.browser_profile_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                        )
+                        try:
+                            await working_page.wait_for_load_state("networkidle", timeout=10000)
+                        except Exception:
+                            LOG.debug(
+                                "networkidle timeout after browser profile load (non-fatal)",
+                                workflow_run_id=workflow_run.workflow_run_id,
+                            )
 
                 except Exception as e:
                     LOG.exception(
@@ -1197,6 +1222,9 @@ class ForLoopBlock(Block):
     loop_over: PARAMETER_TYPE | None = None
     loop_variable_reference: str | None = None
     complete_if_empty: bool = False
+    # Note: intentionally excludes `list` (unlike BaseTaskBlock.data_schema) because a list schema
+    # does not describe the shape of individual loop items -- only dict schemas are meaningful here.
+    data_schema: dict[str, Any] | str | None = None
 
     def get_all_parameters(
         self,
@@ -1264,7 +1292,9 @@ class ForLoopBlock(Block):
             if parameter_value is None and not is_likely_parameter_path:
                 try:
                     # Create and execute extraction block using the current block's workflow_id
-                    extraction_block = self._create_initial_extraction_block(self.loop_variable_reference)
+                    extraction_block = self._create_initial_extraction_block(
+                        self.loop_variable_reference, workflow_run_context=workflow_run_context
+                    )
 
                     LOG.info(
                         "Processing natural language loop input",
@@ -1454,23 +1484,70 @@ class ForLoopBlock(Block):
         except Exception:
             return None
 
-    def _create_initial_extraction_block(self, natural_language_prompt: str) -> ExtractionBlock:
+    def _create_initial_extraction_block(
+        self,
+        natural_language_prompt: str,
+        workflow_run_context: WorkflowRunContext | None = None,
+    ) -> ExtractionBlock:
         """Create an extraction block to process natural language input."""
 
-        # Create a schema that only extracts loop values
-        data_schema = {
-            "type": "object",
-            "properties": {
-                "loop_values": {
-                    "type": "array",
-                    "description": "Array of values to iterate over. Each value should be the primary data needed for the loop blocks.",
-                    "items": {
-                        "type": "string",
-                        "description": "The primary value to be used in the loop iteration (e.g., URL, text, identifier, etc.)",
-                    },
-                }
-            },
-        }
+        # Determine the items schema for loop_values
+        items_schema: dict[str, Any] | None = None
+        if self.data_schema is not None:
+            if isinstance(self.data_schema, dict):
+                items_schema = self.data_schema
+            elif isinstance(self.data_schema, str):
+                # Interpolate Jinja templates before parsing, matching how BaseTaskBlock.setup_block_v2
+                # handles data_schema strings (see line 652-654)
+                schema_str = self.data_schema
+                if workflow_run_context is not None:
+                    schema_str = self.format_block_parameter_template_from_workflow_run_context(
+                        schema_str, workflow_run_context
+                    )
+                try:
+                    parsed = json.loads(schema_str)
+                    if isinstance(parsed, dict):
+                        items_schema = parsed
+                    else:
+                        LOG.warning(
+                            "Parsed data_schema is not a dict, falling back to default string schema",
+                            block_label=self.label,
+                            data_schema=self.data_schema,
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    LOG.warning(
+                        "Failed to parse data_schema string, falling back to default string schema",
+                        block_label=self.label,
+                        data_schema=self.data_schema,
+                    )
+
+        if items_schema is not None:
+            # User provided a custom schema — each loop iteration will produce a structured object
+            data_schema: dict[str, Any] = {
+                "type": "object",
+                "properties": {
+                    "loop_values": {
+                        "type": "array",
+                        "description": "Array of structured values to iterate over, matching the provided schema.",
+                        "items": items_schema,
+                    }
+                },
+            }
+        else:
+            # Default: extract simple string array
+            data_schema = {
+                "type": "object",
+                "properties": {
+                    "loop_values": {
+                        "type": "array",
+                        "description": "Array of values to iterate over. Each value should be the primary data needed for the loop blocks.",
+                        "items": {
+                            "type": "string",
+                            "description": "The primary value to be used in the loop iteration (e.g., URL, text, identifier, etc.)",
+                        },
+                    }
+                },
+            }
 
         # Create extraction goal that includes the natural language prompt
         extraction_goal = prompt_engine.load_prompt(
@@ -4991,6 +5068,7 @@ class BranchEvaluationContext:
         template_data.setdefault("workflow_id", ctx.workflow_id)
         template_data.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
         template_data.setdefault("workflow_run_id", ctx.workflow_run_id)
+        template_data.setdefault("current_date", datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT))
 
         template_data.setdefault("params", template_data.get("params", {}))
         template_data.setdefault("outputs", template_data.get("outputs", {}))
@@ -5309,22 +5387,23 @@ def _parse_single_evaluation(
     Parse a single evaluation from the LLM response.
 
     Handles two formats:
-    - New format (dict): {result: bool, rendered_condition: str, reasoning: str}
+    - Dict format: {result: bool, reasoning: str}
     - Legacy format: just a boolean value
+
+    The rendered expression always comes from the Jinja pre-rendering step (fallback),
+    not from the LLM response, to avoid the LLM re-interpreting already-resolved values.
 
     Args:
         evaluation: Single evaluation object from LLM (dict or bool)
         idx: Index of this evaluation (for fallback lookup)
-        fallback_rendered_expressions: Pre-rendered expressions to use if LLM didn't provide one
+        fallback_rendered_expressions: Pre-rendered expressions from Jinja rendering
 
     Returns:
-        Tuple of (boolean_result, rendered_condition_string)
+        Tuple of (boolean_result, rendered_expression_string)
     """
-    # Determine fallback rendered expression
-    fallback_rendered = fallback_rendered_expressions[idx] if idx < len(fallback_rendered_expressions) else ""
+    rendered_expression = fallback_rendered_expressions[idx] if idx < len(fallback_rendered_expressions) else ""
 
     if isinstance(evaluation, dict):
-        # New format: {result, rendered_condition, reasoning}
         result = evaluation.get("result")
         if isinstance(result, bool):
             bool_result = result
@@ -5337,13 +5416,6 @@ def _parse_single_evaluation(
                 evaluated_result=bool_result,
             )
 
-        # Get rendered_condition, fallback to pre-rendered expression
-        rendered_cond = evaluation.get("rendered_condition")
-        if rendered_cond and isinstance(rendered_cond, str):
-            rendered_expression = rendered_cond
-        else:
-            rendered_expression = fallback_rendered
-
         return (bool_result, rendered_expression)
     else:
         # Legacy format: just a boolean
@@ -5352,7 +5424,84 @@ def _parse_single_evaluation(
         else:
             bool_result = _evaluate_truthy_string(str(evaluation))
 
-        return (bool_result, fallback_rendered)
+        return (bool_result, rendered_expression)
+
+
+# Pattern to find Jinja template blocks like {{ variable_name }}
+_JINJA_BLOCK_RE = re.compile(r"\{\{(.*?)\}\}")
+# Marker inserted into rendered expressions when a Jinja variable resolved to
+# an empty/whitespace-only value.  The LLM uses this to reason about emptiness.
+_EMPTY_VALUE_MARKER = "(empty value)"
+
+
+def _make_empty_params_explicit(
+    original_expression: str,
+    rendered_expression: str,
+) -> tuple[str, bool]:
+    """
+    Detect Jinja template variables that resolved to empty values and replace
+    the empty gaps with explicit ``(empty value)`` markers.
+
+    When ``{{test_parameter}}`` resolves to ``""``, the rendered expression becomes
+    malformed (e.g., ``"if  is not empty"``).  This function detects such cases by
+    comparing the *original* expression (with ``{{ }}`` blocks) against the
+    *rendered* expression and rebuilds it with clear markers so the LLM can
+    evaluate the condition correctly.
+
+    Returns:
+        ``(patched_expression, was_patched)``
+    """
+    if not original_expression or "{{" not in original_expression:
+        return rendered_expression, False
+
+    # Split the original expression into alternating [static, var, static, var, ...] parts.
+    parts = _JINJA_BLOCK_RE.split(original_expression)
+    if len(parts) <= 1:
+        return rendered_expression, False
+
+    # Extract static parts (even indices) and build a regex that captures what
+    # each Jinja block rendered to by using the static text as anchors.
+    static_parts = [parts[i] for i in range(0, len(parts), 2)]
+    num_vars = len(parts) // 2
+
+    # When two Jinja variables are adjacent (e.g. "{{a}}{{b}}") the interior
+    # static separator is an empty string and the non-greedy regex cannot
+    # reliably attribute rendered text to the correct variable.  Bail out.
+    if num_vars > 1 and any(static == "" for static in static_parts[1:-1]):
+        return rendered_expression, False
+
+    # NOTE: if a rendered value happens to contain the same text as a static
+    # anchor the regex may split on the wrong occurrence.  This is extremely
+    # unlikely in user-authored conditional expressions and the worst-case
+    # outcome is an unnecessary "(empty value)" marker, which still beats the
+    # invisible empty-string that caused SKY-8073.
+
+    regex_fragments: list[str] = []
+    for i, static in enumerate(static_parts):
+        regex_fragments.append(re.escape(static))
+        if i < num_vars:
+            regex_fragments.append("(.*?)")
+
+    match = re.match("^" + "".join(regex_fragments) + "$", rendered_expression, re.DOTALL)
+    if not match:
+        return rendered_expression, False
+
+    rendered_values = match.groups()
+    has_empty = any(not v.strip() for v in rendered_values)
+    if not has_empty:
+        return rendered_expression, False
+
+    # Rebuild the expression, replacing empty rendered values with an explicit marker.
+    result_parts: list[str] = []
+    for i, static in enumerate(static_parts):
+        result_parts.append(static)
+        if i < len(rendered_values):
+            if not rendered_values[i].strip():
+                result_parts.append(_EMPTY_VALUE_MARKER)
+            else:
+                result_parts.append(rendered_values[i])
+
+    return "".join(result_parts), True
 
 
 class BranchCondition(BaseModel):
@@ -5433,15 +5582,14 @@ class ConditionalBlock(Block):
         browser_session_id: str | None = None,
     ) -> tuple[list[bool], list[str], str | None, dict | None]:
         """
-        Evaluate natural language branch conditions using a single ExtractionBlock.
+        Evaluate natural language branch conditions in batch.
 
         All prompt-based conditions are batched into ONE LLM call for performance.
         Jinja parts ({{ }}) are pre-rendered before sending to LLM.
 
-        ExtractionBlock provides:
-        - Browser/page access for expressions like "comment count > 100"
-        - UI visibility (shows up in workflow timeline with prompt/response)
-        - Proper LLM integration with data_schema
+        Evaluation strategy:
+        - If any condition is pure natural language, use ExtractionBlock for browser/page context.
+        - If all conditions contain Jinja and are pre-rendered, use direct LLM call (no browser context).
 
         Returns:
             A tuple of (results, rendered_expressions, extraction_goal, llm_response):
@@ -5483,6 +5631,24 @@ class ConditionalBlock(Block):
                         exc_info=True,
                     )
                     rendered_expression = expression
+                    # Rendering failed, so this expression is effectively unresolved and must
+                    # take the ExtractionBlock path (with context) instead of direct LLM mode.
+                    has_any_pure_natlang = True
+                else:
+                    # When a Jinja variable resolves to an empty string the rendered
+                    # expression becomes malformed (e.g. "if  is not empty") and the
+                    # LLM cannot reason about emptiness correctly.  Replace empty gaps
+                    # with an explicit "(empty value)" marker so the intent is clear.
+                    rendered_expression, was_patched = _make_empty_params_explicit(expression, rendered_expression)
+                    if was_patched:
+                        LOG.info(
+                            "Conditional branch expression patched for empty parameter(s)",
+                            workflow_run_id=workflow_run_id,
+                            block_label=self.label,
+                            branch_index=idx,
+                            original_expression=expression,
+                            patched_expression=rendered_expression,
+                        )
             else:
                 rendered_expression = expression
                 has_any_pure_natlang = True
@@ -5514,7 +5680,7 @@ class ConditionalBlock(Block):
         )
 
         # Step 3: Build schema for array of evaluation results
-        # Order matters: rendered_condition -> reasoning -> result (chain-of-thought)
+        # Order matters: reasoning -> result (chain-of-thought)
         data_schema = {
             "type": "object",
             "properties": {
@@ -5523,22 +5689,16 @@ class ConditionalBlock(Block):
                     "items": {
                         "type": "object",
                         "properties": {
-                            "rendered_condition": {
-                                "type": "string",
-                                "description": (
-                                    "The condition with all variable names and references replaced with actual values."
-                                ),
-                            },
                             "reasoning": {
                                 "type": "string",
-                                "description": "Explanation of the reasoning behind evaluating the rendered condition.",
+                                "description": "Explanation of the reasoning behind evaluating the condition.",
                             },
                             "result": {
                                 "type": "boolean",
-                                "description": "TRUE if the rendered condition is satisfied, FALSE otherwise.",
+                                "description": "TRUE if the condition is satisfied, FALSE otherwise.",
                             },
                         },
-                        "required": ["rendered_condition", "reasoning", "result"],
+                        "required": ["reasoning", "result"],
                     },
                     "description": "Array of evaluation results for each condition in the same order.",
                     "minItems": len(branches),
@@ -5548,7 +5708,12 @@ class ConditionalBlock(Block):
             "required": ["evaluations"],
         }
 
-        # Step 4: Create and execute single ExtractionBlock
+        # Step 4: Create and execute single ExtractionBlock.
+        # When all expressions have been Jinja-rendered successfully, omit
+        # browser_session_id so the LLM won't reinterpret resolved literal
+        # values as on-screen references (SKY-7985).
+        effective_browser_session_id = browser_session_id if has_any_pure_natlang else None
+
         output_param = OutputParameter(
             output_parameter_id=str(uuid.uuid4()),
             key=f"conditional_branch_eval_{generate_random_string()}",
@@ -5558,7 +5723,6 @@ class ConditionalBlock(Block):
             parameter_type=ParameterType.OUTPUT,
             description=f"Conditional branch evaluation results ({len(branches)} conditions)",
         )
-
         extraction_block = ExtractionBlock(
             label=f"conditional_branch_eval_{generate_random_string()}",
             data_extraction_goal=extraction_goal,
@@ -5571,7 +5735,8 @@ class ConditionalBlock(Block):
             block_label=self.label,
             num_conditions=len(branches),
             extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-            has_browser_session=browser_session_id is not None,
+            has_browser_session=effective_browser_session_id is not None,
+            has_any_pure_natlang=has_any_pure_natlang,
             has_context=context_json is not None,
         )
 
@@ -5580,7 +5745,7 @@ class ConditionalBlock(Block):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                browser_session_id=browser_session_id,
+                browser_session_id=effective_browser_session_id,
             )
 
             if not extraction_result.success:
@@ -5591,7 +5756,6 @@ class ConditionalBlock(Block):
                 )
                 raise ValueError(f"Branch evaluation failed: {extraction_result.failure_reason}")
 
-            # Record output parameter value if workflow context available
             if workflow_run_context:
                 try:
                     await extraction_block.record_output_parameter_value(
@@ -5607,10 +5771,14 @@ class ConditionalBlock(Block):
                         exc_info=True,
                     )
 
-            # Step 5: Extract the evaluation results (result + rendered_condition)
             output_value = extraction_result.output_parameter_value
+
+            # Step 5: Extract the evaluation results (reasoning + result)
             results_array: list[bool] = []
             llm_rendered_expressions: list[str] = []
+
+            if isinstance(output_value, list):
+                output_value = {"evaluations": output_value}
 
             if not isinstance(output_value, dict):
                 raise ValueError(f"Unexpected output format: {type(output_value)}")
@@ -5618,7 +5786,7 @@ class ConditionalBlock(Block):
             # Find evaluations array from LLM output (handles ExtractionBlock nesting)
             raw_evaluations = _find_evaluations_array(output_value)
 
-            # Parse each evaluation to extract result and rendered_condition
+            # Parse each evaluation to extract result (rendered expression comes from Jinja pre-rendering)
             for idx, evaluation in enumerate(raw_evaluations):
                 bool_result, rendered_expr = _parse_single_evaluation(
                     evaluation=evaluation,
@@ -5645,7 +5813,7 @@ class ConditionalBlock(Block):
 
         except Exception as exc:
             LOG.error(
-                "Conditional branch ExtractionBlock execution failed",
+                "Conditional branch prompt evaluation failed",
                 block_label=self.label,
                 error=str(exc),
                 exc_info=True,
@@ -5924,6 +6092,381 @@ class ConditionalBlock(Block):
         return next((branch for branch in self.branch_conditions if branch.is_default), None)
 
 
+class WorkflowTriggerBlock(Block):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.WORKFLOW_TRIGGER] = BlockType.WORKFLOW_TRIGGER  # type: ignore
+
+    # The permanent ID of the target workflow to trigger
+    workflow_permanent_id: str
+    # Parameters/payload to pass to the triggered workflow
+    payload: dict[str, Any] | None = None
+    # Whether to wait for the triggered workflow to complete
+    wait_for_completion: bool = True
+    # Optional browser session ID for the triggered workflow
+    browser_session_id: str | None = None
+    # When True, the child workflow inherits the parent's browser session
+    use_parent_browser_session: bool = False
+    # Parameters for Jinja2 template interpolation
+    parameters: list[PARAMETER_TYPE] = []
+
+    MAX_TRIGGER_DEPTH: ClassVar[int] = 10
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        return self.parameters
+
+    async def _check_trigger_depth(self, workflow_run_id: str) -> int:
+        """Check the nesting depth of workflow triggers to prevent infinite recursion.
+
+        Note: This depth guard walks the parent_workflow_run_id chain, which is only
+        populated for synchronous triggers. For async (fire-and-forget) dispatch, the
+        parent may have already completed before the child runs, so circular async
+        chains (A->B->A) are only blocked while A is still running. A full
+        visited-workflow guard would require persistent state and is left as a future
+        enhancement.
+        """
+        depth = 0
+        current_run_id: str | None = workflow_run_id
+        while current_run_id:
+            if depth >= self.MAX_TRIGGER_DEPTH:
+                raise InvalidWorkflowDefinition(
+                    f"Workflow trigger depth exceeds maximum of {self.MAX_TRIGGER_DEPTH}. "
+                    "This may indicate a circular workflow trigger chain."
+                )
+            run = await app.DATABASE.get_workflow_run(current_run_id)
+            if not run or not run.parent_workflow_run_id:
+                break
+            current_run_id = run.parent_workflow_run_id
+            depth += 1
+        return depth
+
+    def _render_template_value(
+        self,
+        value: str,
+        workflow_run_context: WorkflowRunContext,
+    ) -> Any:
+        """Render a single Jinja2 template string, handling the | json filter marker."""
+        rendered = self.format_block_parameter_template_from_workflow_run_context(
+            value, workflow_run_context, force_include_secrets=True
+        )
+        if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
+            json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                raise FailedToFormatJinjaStyleParameter(value, f"Raw JSON filter produced invalid JSON: {json_str}")
+        elif _JSON_TYPE_MARKER in rendered:
+            raise FailedToFormatJinjaStyleParameter(
+                value,
+                "The '| json' filter can only be used for complete value replacement. "
+                "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
+                "Remove the surrounding text or remove the '| json' filter.",
+            )
+        return rendered
+
+    def _render_templates_in_payload(
+        self,
+        payload: dict[str, Any],
+        workflow_run_context: WorkflowRunContext,
+    ) -> dict[str, Any]:
+        """Recursively render Jinja2 templates in payload values."""
+        resolved: dict[str, Any] = {}
+        for key, value in payload.items():
+            if isinstance(value, str):
+                resolved[key] = self._render_template_value(value, workflow_run_context)
+            elif isinstance(value, dict):
+                resolved[key] = self._render_templates_in_payload(value, workflow_run_context)
+            elif isinstance(value, list):
+                resolved[key] = self._render_templates_in_list(value, workflow_run_context)
+            else:
+                resolved[key] = value
+        return resolved
+
+    def _render_templates_in_list(
+        self,
+        items: list[Any],
+        workflow_run_context: WorkflowRunContext,
+    ) -> list[Any]:
+        """Recursively render Jinja2 templates in list items (strings, nested dicts, and nested lists)."""
+        result: list[Any] = []
+        for item in items:
+            if isinstance(item, str):
+                result.append(self._render_template_value(item, workflow_run_context))
+            elif isinstance(item, dict):
+                result.append(self._render_templates_in_payload(item, workflow_run_context))
+            elif isinstance(item, list):
+                result.append(self._render_templates_in_list(item, workflow_run_context))
+            else:
+                result.append(item)
+        return result
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        self.workflow_permanent_id = self.format_block_parameter_template_from_workflow_run_context(
+            self.workflow_permanent_id, workflow_run_context, force_include_secrets=True
+        )
+        if self.payload:
+            self.payload = self._render_templates_in_payload(self.payload, workflow_run_context)
+        if self.browser_session_id:
+            self.browser_session_id = self.format_block_parameter_template_from_workflow_run_context(
+                self.browser_session_id, workflow_run_context, force_include_secrets=True
+            )
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus  # noqa: PLC0415
+
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        # Helper to record output and build a failed block result in one step.
+        # This ensures downstream blocks referencing block_X_output see the
+        # failure reason instead of "parameter not found".
+        async def _fail(failure_reason: str) -> BlockResult:
+            error_output = {"failure_reason": failure_reason}
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_output)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=failure_reason,
+                output_parameter_value=error_output,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        # 1. Resolve Jinja2 templates
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await _fail(f"Failed to resolve templates: {str(e)}")
+
+        resolved_workflow_permanent_id = self.workflow_permanent_id
+        resolved_payload = self.payload
+
+        # 2. Check recursion depth
+        try:
+            await self._check_trigger_depth(workflow_run_id)
+        except InvalidWorkflowDefinition as e:
+            return await _fail(str(e))
+
+        # 3. Get the organization
+        if not organization_id:
+            return await _fail("organization_id is required for WorkflowTriggerBlock")
+        organization = await app.DATABASE.get_organization(organization_id)
+        if not organization:
+            return await _fail(f"Organization {organization_id} not found")
+
+        # 4. Resolve browser session
+        # Browser session priority:
+        # 1. Explicit browser_session_id configured on the block
+        # 2. use_parent_browser_session → inherit parent's session (persistent
+        #    or in-memory via self.pages[parent_workflow_run_id] lookup)
+        # 3. Neither → for sync (wait_for_completion), create a fresh persistent
+        #    session; for async (fire-and-forget), let the child's Temporal worker
+        #    handle its own browser.
+        created_fresh_session = False
+        if self.browser_session_id:
+            resolved_browser_session_id = self.browser_session_id
+        elif self.use_parent_browser_session and browser_session_id:
+            resolved_browser_session_id = browser_session_id
+        elif self.use_parent_browser_session:
+            # Parent uses an in-memory browser (no persistent session).
+            # Pass None so the child inherits via the parent_workflow_run_id
+            # lookup in get_or_create_for_workflow_run.
+            resolved_browser_session_id = None
+        elif self.wait_for_completion:
+            # Sync mode: child runs inline in the same process, so it needs
+            # its own persistent session to avoid sharing the parent's browser.
+            parent_workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id)
+            proxy_location = parent_workflow_run.proxy_location if parent_workflow_run else None
+            try:
+                child_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    organization_id=organization_id,
+                    proxy_location=proxy_location,
+                    timeout_minutes=30,
+                )
+                resolved_browser_session_id = child_browser_session.persistent_browser_session_id
+                created_fresh_session = True
+                LOG.info(
+                    "Created fresh browser session for triggered workflow",
+                    parent_workflow_run_id=workflow_run_id,
+                    child_browser_session_id=resolved_browser_session_id,
+                )
+            except Exception as e:
+                return await _fail(f"Failed to create browser session for triggered workflow: {str(e)}")
+        else:
+            # Async (fire-and-forget): the child runs in its own Temporal worker
+            # and will create its own browser. No pre-creation needed.
+            resolved_browser_session_id = None
+
+        # 5. Execute based on wait mode
+        output_data: dict[str, Any] = {}
+        success = False
+        if self.wait_for_completion:
+            # Synchronous: setup + execute inline in the same process.
+            workflow_request = WorkflowRequestBody(
+                data=resolved_payload,
+                browser_session_id=resolved_browser_session_id,
+            )
+
+            # Save the parent's skyvern_context because setup_workflow_run and
+            # execute_workflow overwrite it with the child's values. We restore
+            # it after the child finishes so subsequent parent blocks get correct
+            # context (logs, observability, workflow_run_id, etc.).
+            from skyvern.forge.sdk.core import skyvern_context  # noqa: PLC0415
+
+            parent_context = skyvern_context.current()
+            try:
+                triggered_workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
+                    request_id=None,
+                    workflow_request=workflow_request,
+                    workflow_permanent_id=resolved_workflow_permanent_id,
+                    organization=organization,
+                    parent_workflow_run_id=workflow_run_id,
+                )
+            except Exception as e:
+                error_msg = get_user_facing_exception_message(e)
+                if parent_context:
+                    skyvern_context.set(parent_context)
+                if created_fresh_session and resolved_browser_session_id:
+                    try:
+                        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                            organization_id, resolved_browser_session_id
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to close child browser session after setup failure",
+                            child_browser_session_id=resolved_browser_session_id,
+                            exc_info=True,
+                        )
+                return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
+
+            triggered_run_id = triggered_workflow_run.workflow_run_id
+
+            LOG.info(
+                "Triggered workflow run (sync)",
+                parent_workflow_run_id=workflow_run_id,
+                triggered_workflow_run_id=triggered_run_id,
+                triggered_workflow_permanent_id=resolved_workflow_permanent_id,
+            )
+
+            try:
+                final_run = await app.WORKFLOW_SERVICE.execute_workflow(
+                    workflow_run_id=triggered_run_id,
+                    api_key=None,
+                    organization=organization,
+                    browser_session_id=resolved_browser_session_id,
+                )
+                success = final_run.status == WorkflowRunStatus.completed
+                output_data = {
+                    "workflow_run_id": triggered_run_id,
+                    "workflow_permanent_id": resolved_workflow_permanent_id,
+                    "status": str(final_run.status),
+                    "failure_reason": final_run.failure_reason,
+                }
+                # Include the child workflow's output parameters so downstream
+                # blocks can reference them (e.g. block_3_output.outputs.block_2_output)
+                try:
+                    child_output_params = (
+                        await app.WORKFLOW_SERVICE.get_output_parameter_workflow_run_output_parameter_tuples(
+                            workflow_id=final_run.workflow_id,
+                            workflow_run_id=triggered_run_id,
+                        )
+                    )
+                    child_outputs: dict[str, Any] = {}
+                    for output_param, run_output_param in child_output_params:
+                        child_outputs[output_param.key] = run_output_param.value
+                    output_data["outputs"] = child_outputs
+                except Exception:
+                    LOG.warning(
+                        "Failed to fetch child workflow outputs",
+                        triggered_workflow_run_id=triggered_run_id,
+                        exc_info=True,
+                    )
+            except Exception as e:
+                error_msg = get_user_facing_exception_message(e)
+                output_data = {
+                    "workflow_run_id": triggered_run_id,
+                    "workflow_permanent_id": resolved_workflow_permanent_id,
+                    "status": "failed",
+                    "failure_reason": f"Triggered workflow execution failed: {error_msg}",
+                }
+                success = False
+            finally:
+                if parent_context:
+                    skyvern_context.set(parent_context)
+                if created_fresh_session and resolved_browser_session_id:
+                    try:
+                        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                            organization_id, resolved_browser_session_id
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to close child browser session",
+                            child_browser_session_id=resolved_browser_session_id,
+                            triggered_workflow_run_id=triggered_run_id,
+                            exc_info=True,
+                        )
+        else:
+            # Fire and forget: dispatch the child workflow via Temporal so it
+            # gets its own independent worker process. This ensures the child
+            # survives even if the parent workflow finishes first.
+            # NOTE: This path requires Temporal (cloud). On self-hosted
+            # (BackgroundTaskExecutor), the workflow run record is created but
+            # execution is silently skipped because background_tasks=None.
+            from skyvern.services.workflow_service import run_workflow  # noqa: PLC0415
+
+            workflow_request = WorkflowRequestBody(
+                data=resolved_payload,
+                browser_session_id=resolved_browser_session_id,
+            )
+            try:
+                triggered_workflow_run = await run_workflow(
+                    workflow_id=resolved_workflow_permanent_id,
+                    organization=organization,
+                    workflow_request=workflow_request,
+                    request=None,
+                    background_tasks=None,
+                    parent_workflow_run_id=workflow_run_id,
+                )
+            except Exception as e:
+                error_msg = get_user_facing_exception_message(e)
+                return await _fail(f"Failed to dispatch triggered workflow: {error_msg}")
+
+            triggered_run_id = triggered_workflow_run.workflow_run_id
+
+            LOG.info(
+                "Async workflow dispatch succeeded (via Temporal)",
+                parent_workflow_run_id=workflow_run_id,
+                triggered_workflow_run_id=triggered_run_id,
+                triggered_workflow_permanent_id=resolved_workflow_permanent_id,
+            )
+            output_data = {
+                "workflow_run_id": triggered_run_id,
+                "workflow_permanent_id": resolved_workflow_permanent_id,
+                "status": "queued",
+            }
+            success = True
+
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_data)
+
+        return await self.build_block_result(
+            success=success,
+            failure_reason=output_data.get("failure_reason") if not success else None,
+            output_parameter_value=output_data,
+            status=BlockStatus.completed if success else BlockStatus.failed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
     """
     Recursively get "all blocks" in a workflow definition.
@@ -5968,6 +6511,7 @@ BlockSubclasses = Union[
     FileUploadBlock,
     HttpRequestBlock,
     PrintPageBlock,
+    WorkflowTriggerBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

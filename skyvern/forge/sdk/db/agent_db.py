@@ -20,7 +20,7 @@ from sqlalchemy import (
     tuple_,
     update,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.exc import (
     SQLAlchemyError,
 )
@@ -56,6 +56,8 @@ from skyvern.forge.sdk.db.models import (
     OutputParameterModel,
     PersistentBrowserSessionModel,
     ScriptBlockModel,
+    ScriptBranchHitModel,
+    ScriptFallbackEpisodeModel,
     ScriptFileModel,
     ScriptModel,
     StepModel,
@@ -152,7 +154,15 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
 )
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, RunEngine, RunType
-from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile, ScriptStatus, WorkflowScript
+from skyvern.schemas.scripts import (
+    Script,
+    ScriptBlock,
+    ScriptBranchHit,
+    ScriptFallbackEpisode,
+    ScriptFile,
+    ScriptStatus,
+    WorkflowScript,
+)
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
@@ -849,6 +859,102 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def update_task_2fa_state(
+        self,
+        task_id: str,
+        organization_id: str,
+        waiting_for_verification_code: bool,
+        verification_code_identifier: str | None = None,
+        verification_code_polling_started_at: datetime | None = None,
+    ) -> Task:
+        """Update task 2FA verification code waiting state."""
+        try:
+            async with self.Session() as session:
+                if task := (
+                    await session.scalars(
+                        select(TaskModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
+                    )
+                ).first():
+                    task.waiting_for_verification_code = waiting_for_verification_code
+                    if verification_code_identifier is not None:
+                        task.verification_code_identifier = verification_code_identifier
+                    if verification_code_polling_started_at is not None:
+                        task.verification_code_polling_started_at = verification_code_polling_started_at
+                    if not waiting_for_verification_code:
+                        # Clear identifiers when no longer waiting
+                        task.verification_code_identifier = None
+                        task.verification_code_polling_started_at = None
+                    await session.commit()
+                    updated_task = await self.get_task(task_id, organization_id=organization_id)
+                    if not updated_task:
+                        raise NotFoundError("Task not found")
+                    return updated_task
+                else:
+                    raise NotFoundError("Task not found")
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    @read_retry()
+    async def get_active_verification_requests(self, organization_id: str) -> list[dict]:
+        """Return active 2FA verification requests for an organization.
+
+        Queries both tasks and workflow runs where waiting_for_verification_code=True.
+        Used to provide initial state when a WebSocket notification client connects.
+        """
+        results: list[dict] = []
+        async with self.Session() as session:
+            # Tasks waiting for verification (exclude finalized tasks)
+            finalized_task_statuses = [s.value for s in TaskStatus if s.is_final()]
+            task_rows = (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(waiting_for_verification_code=True)
+                    .filter_by(workflow_run_id=None)
+                    .filter(TaskModel.status.not_in(finalized_task_statuses))
+                    .filter(TaskModel.created_at > datetime.utcnow() - timedelta(hours=1))
+                )
+            ).all()
+            for t in task_rows:
+                results.append(
+                    {
+                        "task_id": t.task_id,
+                        "workflow_run_id": None,
+                        "verification_code_identifier": t.verification_code_identifier,
+                        "verification_code_polling_started_at": (
+                            t.verification_code_polling_started_at.isoformat()
+                            if t.verification_code_polling_started_at
+                            else None
+                        ),
+                    }
+                )
+            # Workflow runs waiting for verification (exclude finalized runs)
+            finalized_wr_statuses = [s.value for s in WorkflowRunStatus if s.is_final()]
+            wr_rows = (
+                await session.scalars(
+                    select(WorkflowRunModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(waiting_for_verification_code=True)
+                    .filter(WorkflowRunModel.status.not_in(finalized_wr_statuses))
+                    .filter(WorkflowRunModel.created_at > datetime.utcnow() - timedelta(hours=1))
+                )
+            ).all()
+            for wr in wr_rows:
+                results.append(
+                    {
+                        "task_id": None,
+                        "workflow_run_id": wr.workflow_run_id,
+                        "verification_code_identifier": wr.verification_code_identifier,
+                        "verification_code_polling_started_at": (
+                            wr.verification_code_polling_started_at.isoformat()
+                            if wr.verification_code_polling_started_at
+                            else None
+                        ),
+                    }
+                )
+        return results
+
     async def bulk_update_tasks(
         self,
         task_ids: list[str],
@@ -966,6 +1072,99 @@ class AgentDB(BaseAlchemyDB):
             raise
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_running_tasks_info_globally(
+        self,
+        stale_threshold_hours: int = 24,
+    ) -> tuple[int, int]:
+        """
+        Get information about running tasks across all organizations.
+        Used by cleanup service to determine if cleanup should be skipped.
+
+        Args:
+            stale_threshold_hours: Tasks not updated for this many hours are considered stale.
+
+        Returns:
+            Tuple of (active_task_count, stale_task_count).
+            Active tasks are those updated within the threshold.
+            Stale tasks are those not updated within the threshold but still in running status.
+        """
+        try:
+            async with self.Session() as session:
+                running_statuses = [TaskStatus.created, TaskStatus.queued, TaskStatus.running]
+                stale_cutoff = datetime.utcnow() - timedelta(hours=stale_threshold_hours)
+
+                # Count active tasks (recently updated)
+                active_query = (
+                    select(func.count())
+                    .select_from(TaskModel)
+                    .filter(TaskModel.status.in_(running_statuses))
+                    .filter(TaskModel.modified_at >= stale_cutoff)
+                )
+                active_count = (await session.execute(active_query)).scalar_one()
+
+                # Count stale tasks (not updated for a long time)
+                stale_query = (
+                    select(func.count())
+                    .select_from(TaskModel)
+                    .filter(TaskModel.status.in_(running_statuses))
+                    .filter(TaskModel.modified_at < stale_cutoff)
+                )
+                stale_count = (await session.execute(stale_query)).scalar_one()
+
+                return (active_count, stale_count)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_running_tasks_info_globally", exc_info=True)
+            raise
+
+    async def get_running_workflow_runs_info_globally(
+        self,
+        stale_threshold_hours: int = 24,
+    ) -> tuple[int, int]:
+        """
+        Get information about running workflow runs across all organizations.
+        Used by cleanup service to determine if cleanup should be skipped.
+
+        Args:
+            stale_threshold_hours: Workflow runs not updated for this many hours are considered stale.
+
+        Returns:
+            Tuple of (active_workflow_count, stale_workflow_count).
+            Active workflows are those updated within the threshold.
+            Stale workflows are those not updated within the threshold but still in running status.
+        """
+        try:
+            async with self.Session() as session:
+                running_statuses = [
+                    WorkflowRunStatus.created,
+                    WorkflowRunStatus.queued,
+                    WorkflowRunStatus.running,
+                    WorkflowRunStatus.paused,
+                ]
+                stale_cutoff = datetime.utcnow() - timedelta(hours=stale_threshold_hours)
+
+                # Count active workflow runs (recently updated)
+                active_query = (
+                    select(func.count())
+                    .select_from(WorkflowRunModel)
+                    .filter(WorkflowRunModel.status.in_(running_statuses))
+                    .filter(WorkflowRunModel.modified_at >= stale_cutoff)
+                )
+                active_count = (await session.execute(active_query)).scalar_one()
+
+                # Count stale workflow runs (not updated for a long time)
+                stale_query = (
+                    select(func.count())
+                    .select_from(WorkflowRunModel)
+                    .filter(WorkflowRunModel.status.in_(running_statuses))
+                    .filter(WorkflowRunModel.modified_at < stale_cutoff)
+                )
+                stale_count = (await session.execute(stale_query)).scalar_one()
+
+                return (active_count, stale_count)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_running_workflow_runs_info_globally", exc_info=True)
             raise
 
     async def get_all_organizations(self) -> list[Organization]:
@@ -1609,6 +1808,8 @@ class AgentDB(BaseAlchemyDB):
         run_with: str | None = None,
         ai_fallback: bool = False,
         cache_key: str | None = None,
+        adaptive_caching: bool = False,
+        generate_script_on_terminal: bool = False,
         run_sequentially: bool = False,
         sequential_key: str | None = None,
         folder_id: str | None = None,
@@ -1632,6 +1833,8 @@ class AgentDB(BaseAlchemyDB):
                 run_with=run_with,
                 ai_fallback=ai_fallback,
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
+                adaptive_caching=adaptive_caching,
+                generate_script_on_terminal=generate_script_on_terminal,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
                 folder_id=folder_id,
@@ -2701,6 +2904,12 @@ class AgentDB(BaseAlchemyDB):
         ai_fallback: bool | None = None,
         depends_on_workflow_run_id: str | None = None,
         browser_session_id: str | None = None,
+        waiting_for_verification_code: bool | None = None,
+        verification_code_identifier: str | None = None,
+        verification_code_polling_started_at: datetime | None = None,
+        browser_profile_id: str | None | object = _UNSET,
+        browser_address: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -2733,6 +2942,23 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
                 if browser_session_id:
                     workflow_run.browser_session_id = browser_session_id
+                if browser_address:
+                    workflow_run.browser_address = browser_address
+                if extra_http_headers:
+                    workflow_run.extra_http_headers = extra_http_headers
+                # 2FA verification code waiting state updates
+                if waiting_for_verification_code is not None:
+                    workflow_run.waiting_for_verification_code = waiting_for_verification_code
+                if verification_code_identifier is not None:
+                    workflow_run.verification_code_identifier = verification_code_identifier
+                if verification_code_polling_started_at is not None:
+                    workflow_run.verification_code_polling_started_at = verification_code_polling_started_at
+                if waiting_for_verification_code is not None and not waiting_for_verification_code:
+                    # Clear related fields when waiting is set to False
+                    workflow_run.verification_code_identifier = None
+                    workflow_run.verification_code_polling_started_at = None
+                if browser_profile_id is not _UNSET:
+                    workflow_run.browser_profile_id = browser_profile_id
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)
@@ -3224,11 +3450,12 @@ class AgentDB(BaseAlchemyDB):
     ) -> WorkflowParameter:
         try:
             async with self.Session() as session:
-                default_value = (
-                    json.dumps(default_value)
-                    if workflow_parameter_type == WorkflowParameterType.JSON
-                    else default_value
-                )
+                if default_value is None:
+                    pass
+                elif workflow_parameter_type == WorkflowParameterType.JSON:
+                    default_value = json.dumps(default_value)
+                else:
+                    default_value = str(default_value)
                 workflow_parameter = WorkflowParameterModel(
                     workflow_id=workflow_id,
                     workflow_parameter_type=workflow_parameter_type,
@@ -3284,11 +3511,12 @@ class AgentDB(BaseAlchemyDB):
     def _convert_parameter_to_model(parameter: PARAMETER_TYPE) -> Base:
         """Convert a parameter object to its corresponding SQLAlchemy model."""
         if isinstance(parameter, WorkflowParameter):
-            default_value = (
-                json.dumps(parameter.default_value)
-                if parameter.workflow_parameter_type == WorkflowParameterType.JSON
-                else parameter.default_value
-            )
+            if parameter.default_value is None:
+                default_value = None
+            elif parameter.workflow_parameter_type == WorkflowParameterType.JSON:
+                default_value = json.dumps(parameter.default_value)
+            else:
+                default_value = str(parameter.default_value)
             return WorkflowParameterModel(
                 workflow_parameter_id=parameter.workflow_parameter_id,
                 workflow_parameter_type=parameter.workflow_parameter_type.value,
@@ -3902,6 +4130,35 @@ class AgentDB(BaseAlchemyDB):
             totp_code = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
 
+    async def get_otp_codes_by_run(
+        self,
+        organization_id: str,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+        limit: int = 1,
+    ) -> list[TOTPCode]:
+        """Get OTP codes matching a specific task or workflow run (no totp_identifier required).
+
+        Used when the agent detects a 2FA page but no TOTP credentials are pre-configured.
+        The user submits codes manually via the UI, and this method finds them by run context.
+        """
+        if not workflow_run_id and not task_id:
+            return []
+        async with self.Session() as session:
+            query = (
+                select(TOTPCodeModel)
+                .filter_by(organization_id=organization_id)
+                .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
+            )
+            if workflow_run_id:
+                query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
+            elif task_id:
+                query = query.filter(TOTPCodeModel.task_id == task_id)
+            query = query.order_by(TOTPCodeModel.created_at.desc()).limit(limit)
+            results = (await session.scalars(query)).all()
+            return [TOTPCode.model_validate(r) for r in results]
+
     async def get_recent_otp_codes(
         self,
         organization_id: str,
@@ -4440,11 +4697,15 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run_block.task_id = task_id
                 if failure_reason:
                     workflow_run_block.failure_reason = failure_reason
-                if loop_values:
+                # Use `is not None` instead of truthiness checks so that falsy
+                # values like current_index=0, empty loop_values=[], or
+                # current_value="" are correctly persisted. Without this,
+                # the first loop iteration (index 0) loses its metadata.
+                if loop_values is not None:
                     workflow_run_block.loop_values = loop_values
-                if current_value:
+                if current_value is not None:
                     workflow_run_block.current_value = current_value
-                if current_index:
+                if current_index is not None:
                     workflow_run_block.current_index = current_index
                 if recipients:
                     workflow_run_block.recipients = recipients
@@ -5212,7 +5473,12 @@ class AgentDB(BaseAlchemyDB):
             return [Credential.model_validate(credential) for credential in credentials]
 
     async def update_credential(
-        self, credential_id: str, organization_id: str, name: str | None = None, website_url: str | None = None
+        self,
+        credential_id: str,
+        organization_id: str,
+        name: str | None = None,
+        browser_profile_id: str | None | object = _UNSET,
+        tested_url: str | None | object = _UNSET,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -5220,14 +5486,17 @@ class AgentDB(BaseAlchemyDB):
                     select(CredentialModel)
                     .filter_by(credential_id=credential_id)
                     .filter_by(organization_id=organization_id)
+                    .filter(CredentialModel.deleted_at.is_(None))
                 )
             ).first()
             if not credential:
                 raise NotFoundError(f"Credential {credential_id} not found")
-            if name:
+            if name is not None:
                 credential.name = name
-            if website_url:
-                credential.website_url = website_url
+            if browser_profile_id is not _UNSET:
+                credential.browser_profile_id = browser_profile_id
+            if tested_url is not _UNSET:
+                credential.tested_url = tested_url
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
@@ -5711,6 +5980,24 @@ class AgentDB(BaseAlchemyDB):
             ).first()
             return convert_to_script(script) if script else None
 
+    async def get_latest_script_version(self, script_id: str, organization_id: str) -> Script | None:
+        """Get the latest version of a script by script_id."""
+        try:
+            async with self.Session() as session:
+                script = (
+                    await session.scalars(
+                        select(ScriptModel)
+                        .filter_by(script_id=script_id, organization_id=organization_id)
+                        .filter(ScriptModel.deleted_at.is_(None))
+                        .order_by(ScriptModel.version.desc())
+                        .limit(1)
+                    )
+                ).first()
+                return convert_to_script(script) if script else None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def create_script_file(
         self,
         script_revision_id: str,
@@ -5756,6 +6043,7 @@ class AgentDB(BaseAlchemyDB):
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
         input_fields: list[str] | None = None,
+        requires_agent: bool = False,
     ) -> ScriptBlock:
         """Create a script block."""
         async with self.Session() as session:
@@ -5769,6 +6057,7 @@ class AgentDB(BaseAlchemyDB):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 input_fields=input_fields,
+                requires_agent=requires_agent,
             )
             session.add(script_block)
             await session.commit()
@@ -5785,6 +6074,7 @@ class AgentDB(BaseAlchemyDB):
         workflow_run_block_id: str | None = None,
         clear_run_signature: bool = False,
         input_fields: list[str] | None = None,
+        requires_agent: bool | None = None,
     ) -> ScriptBlock:
         async with self.Session() as session:
             script_block = (
@@ -5807,6 +6097,8 @@ class AgentDB(BaseAlchemyDB):
                     script_block.workflow_run_block_id = workflow_run_block_id
                 if input_fields is not None:
                     script_block.input_fields = input_fields
+                if requires_agent is not None:
+                    script_block.requires_agent = requires_agent
                 await session.commit()
                 await session.refresh(script_block)
                 return convert_to_script_block(script_block)
@@ -6201,4 +6493,234 @@ class AgentDB(BaseAlchemyDB):
             raise
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    # ── Script Fallback Episode CRUD ──────────────────────────────────
+
+    async def create_fallback_episode(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_run_id: str,
+        block_label: str,
+        fallback_type: str,
+        script_revision_id: str | None = None,
+        error_message: str | None = None,
+        classify_result: str | None = None,
+        agent_actions: list | dict | None = None,
+        page_url: str | None = None,
+        page_text_snapshot: str | None = None,
+    ) -> ScriptFallbackEpisode:
+        try:
+            async with self.Session() as session:
+                episode = ScriptFallbackEpisodeModel(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_run_id=workflow_run_id,
+                    block_label=block_label,
+                    fallback_type=fallback_type,
+                    script_revision_id=script_revision_id,
+                    error_message=sanitize_postgres_text(error_message) if error_message else None,
+                    classify_result=sanitize_postgres_text(classify_result) if classify_result else None,
+                    agent_actions=agent_actions,
+                    page_url=sanitize_postgres_text(page_url) if page_url else None,
+                    page_text_snapshot=sanitize_postgres_text(page_text_snapshot) if page_text_snapshot else None,
+                )
+                session.add(episode)
+                await session.commit()
+                await session.refresh(episode)
+                return ScriptFallbackEpisode.model_validate(episode)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_unreviewed_episodes(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+        limit: int = 100,
+        script_revision_id: str | None = None,
+    ) -> list[ScriptFallbackEpisode]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ScriptFallbackEpisodeModel)
+                    .filter_by(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        reviewed=False,
+                    )
+                    .order_by(ScriptFallbackEpisodeModel.created_at.asc())
+                    .limit(limit)
+                )
+                if script_revision_id:
+                    query = query.filter_by(script_revision_id=script_revision_id)
+                episodes = (await session.scalars(query)).all()
+                return [ScriptFallbackEpisode.model_validate(e) for e in episodes]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def update_fallback_episode(
+        self,
+        episode_id: str,
+        organization_id: str,
+        agent_actions: list | dict | None = None,
+        fallback_succeeded: bool | None = None,
+    ) -> None:
+        try:
+            values: dict = {}
+            if agent_actions is not None:
+                values["agent_actions"] = agent_actions
+            if fallback_succeeded is not None:
+                values["fallback_succeeded"] = fallback_succeeded
+            if not values:
+                return
+            values["modified_at"] = datetime.utcnow()
+            async with self.Session() as session:
+                await session.execute(
+                    update(ScriptFallbackEpisodeModel)
+                    .where(ScriptFallbackEpisodeModel.episode_id == episode_id)
+                    .where(ScriptFallbackEpisodeModel.organization_id == organization_id)
+                    .values(**values)
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def delete_fallback_episode(
+        self,
+        episode_id: str,
+        organization_id: str,
+    ) -> None:
+        try:
+            async with self.Session() as session:
+                await session.execute(
+                    delete(ScriptFallbackEpisodeModel)
+                    .where(ScriptFallbackEpisodeModel.episode_id == episode_id)
+                    .where(ScriptFallbackEpisodeModel.organization_id == organization_id)
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def mark_episode_reviewed(
+        self,
+        episode_id: str,
+        organization_id: str,
+        reviewer_output: str | None = None,
+        new_script_revision_id: str | None = None,
+    ) -> None:
+        try:
+            async with self.Session() as session:
+                await session.execute(
+                    update(ScriptFallbackEpisodeModel)
+                    .where(ScriptFallbackEpisodeModel.episode_id == episode_id)
+                    .where(ScriptFallbackEpisodeModel.organization_id == organization_id)
+                    .values(
+                        reviewed=True,
+                        reviewer_output=sanitize_postgres_text(reviewer_output) if reviewer_output else None,
+                        new_script_revision_id=new_script_revision_id,
+                        modified_at=datetime.utcnow(),
+                    )
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_recent_reviewed_episodes(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+        limit: int = 20,
+    ) -> list[ScriptFallbackEpisode]:
+        """Return recently reviewed episodes for cross-run historical context.
+
+        These give the reviewer visibility into past failures and fixes so it can
+        avoid repeating the same mistakes.
+        """
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ScriptFallbackEpisodeModel)
+                    .filter_by(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        reviewed=True,
+                    )
+                    .order_by(ScriptFallbackEpisodeModel.created_at.desc())
+                    .limit(limit)
+                )
+                episodes = (await session.scalars(query)).all()
+                return [ScriptFallbackEpisode.model_validate(e) for e in episodes]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def record_branch_hit(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        block_label: str,
+        branch_key: str,
+    ) -> None:
+        """Record a classify branch hit, upserting the hit count and last_hit_at."""
+        now = datetime.utcnow()
+        try:
+            async with self.Session() as session:
+                stmt = insert(ScriptBranchHitModel).values(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    block_label=block_label,
+                    branch_key=branch_key,
+                    hit_count=1,
+                    first_hit_at=now,
+                    last_hit_at=now,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[
+                        "organization_id",
+                        "workflow_permanent_id",
+                        "block_label",
+                        "branch_key",
+                    ],
+                    set_={
+                        "hit_count": ScriptBranchHitModel.hit_count + 1,
+                        "last_hit_at": now,
+                    },
+                )
+                await session.execute(stmt)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError recording branch hit", exc_info=True)
+            raise
+
+    async def get_stale_branches(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        stale_days: int = 90,
+        limit: int = 200,
+    ) -> list[ScriptBranchHit]:
+        """Get branches that haven't been accessed in stale_days days."""
+        cutoff = datetime.utcnow() - timedelta(days=stale_days)
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ScriptBranchHitModel)
+                    .filter_by(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                    )
+                    .filter(ScriptBranchHitModel.last_hit_at < cutoff)
+                    .order_by(ScriptBranchHitModel.last_hit_at.asc())
+                    .limit(limit)
+                )
+                results = (await session.scalars(query)).all()
+                return [ScriptBranchHit.model_validate(r) for r in results]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
             raise

@@ -4,6 +4,7 @@ from dotenv import load_dotenv, set_key
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
+from skyvern.analytics import capture_setup_event
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .console import console
@@ -60,7 +61,9 @@ def setup_llm_providers() -> None:
     """Configure Large Language Model (LLM) Providers."""
     console.print(Panel("[bold magenta]LLM Provider Configuration[/bold magenta]", border_style="purple"))
     console.print("[italic]Note: All information provided here will be stored only on your local machine.[/italic]")
+    capture_setup_event("llm-start")
     model_options: list[str] = []
+    enabled_providers: list[str] = []
 
     console.print("\n[bold blue]--- OpenAI Configuration ---[/bold blue]")
     console.print("To enable OpenAI, you must have an OpenAI API key.")
@@ -72,6 +75,7 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("OPENAI_API_KEY", openai_api_key)
             update_or_add_env_var("ENABLE_OPENAI", "true")
+            enabled_providers.append("openai")
             model_options.extend(
                 [
                     "OPENAI_GPT5",
@@ -95,6 +99,7 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("ANTHROPIC_API_KEY", anthropic_api_key)
             update_or_add_env_var("ENABLE_ANTHROPIC", "true")
+            enabled_providers.append("anthropic")
             model_options.extend(
                 [
                     "ANTHROPIC_CLAUDE4.5_OPUS",
@@ -123,6 +128,7 @@ def setup_llm_providers() -> None:
             update_or_add_env_var("AZURE_API_BASE", azure_api_base)
             update_or_add_env_var("AZURE_API_VERSION", azure_api_version)
             update_or_add_env_var("ENABLE_AZURE", "true")
+            enabled_providers.append("azure")
             model_options.append("AZURE_OPENAI")
     else:
         update_or_add_env_var("ENABLE_AZURE", "false")
@@ -137,6 +143,7 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("GEMINI_API_KEY", gemini_api_key)
             update_or_add_env_var("ENABLE_GEMINI", "true")
+            enabled_providers.append("gemini")
     else:
         update_or_add_env_var("ENABLE_GEMINI", "false")
 
@@ -150,6 +157,7 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("NOVITA_API_KEY", novita_api_key)
             update_or_add_env_var("ENABLE_NOVITA", "true")
+            enabled_providers.append("novita")
             model_options.extend(
                 [
                     "NOVITA_LLAMA_3_2_11B_VISION",
@@ -173,7 +181,7 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("VOLCENGINE_API_KEY", volcengine_api_key)
             update_or_add_env_var("ENABLE_VOLCENGINE", "true")
-
+            enabled_providers.append("volcengine")
             model_options.extend(
                 [
                     "VOLCENGINE_DOUBAO_SEED_1_6",
@@ -211,11 +219,18 @@ def setup_llm_providers() -> None:
                 update_or_add_env_var("OPENAI_COMPATIBLE_API_VERSION", openai_compatible_api_version)
 
             update_or_add_env_var("ENABLE_OPENAI_COMPATIBLE", "true")
+            enabled_providers.append("openai_compatible")
             model_options.append("OPENAI_COMPATIBLE")
     else:
         update_or_add_env_var("ENABLE_OPENAI_COMPATIBLE", "false")
 
     if not model_options:
+        capture_setup_event(
+            "llm-no-provider",
+            success=False,
+            error_type="no_provider_enabled",
+            error_message="No LLM providers were enabled during setup",
+        )
         console.print(
             Panel(
                 "[bold red]No LLM providers enabled.[/bold red]\n"
@@ -237,5 +252,14 @@ def setup_llm_providers() -> None:
         chosen_model = model_options[int(chosen_model_idx) - 1]
         console.print(f"🎉 [bold green]Chosen LLM Model: {chosen_model}[/bold green]")
         update_or_add_env_var("LLM_KEY", chosen_model)
+        capture_setup_event(
+            "llm-complete",
+            success=True,
+            extra_data={
+                "enabled_providers": enabled_providers,
+                "chosen_model": chosen_model,
+                "provider_count": len(enabled_providers),
+            },
+        )
 
     console.print("✅ [green]LLM provider configurations updated in .env.[/green]")

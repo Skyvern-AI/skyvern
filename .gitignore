@@ -188,4 +188,5 @@ tags.temp.tmp
 tmp/user_data_dir
 
 # Claude
-.claude
+.claude/*
+!.claude/skills/

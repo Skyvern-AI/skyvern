@@ -14,7 +14,11 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.services.otp_service import poll_otp_value
+from skyvern.services.otp_service import (
+    extract_totp_from_navigation_inputs,
+    poll_otp_value,
+    try_generate_totp_from_credential,
+)
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -913,7 +917,13 @@ async def generate_cua_fallback_actions(
             )
 
     elif skyvern_action_type == "get_verification_code":
-        if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
+        # 1. Check navigation payload first for inline OTP.
+        otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
+        # 2. Then try to generate TOTP from credential if payload has no OTP.
+        if not otp_value:
+            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+        # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
+        if not otp_value and task.organization_id:
             LOG.info(
                 "Getting verification code for CUA",
                 task_id=task.task_id,
@@ -930,29 +940,23 @@ async def generate_cua_fallback_actions(
                     totp_verification_url=task.totp_verification_url,
                     totp_identifier=task.totp_identifier,
                 )
-                if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
-                    raise NoTOTPVerificationCodeFound()
-                verification_code = otp_value.value
-                reasoning = reasoning or f"Received verification code: {verification_code}"
-                action = VerificationCodeAction(
-                    verification_code=verification_code,
-                    reasoning=reasoning,
-                    intention=reasoning,
-                )
             except NoTOTPVerificationCodeFound:
                 reasoning_suffix = "No verification code found"
                 reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
-                action = TerminateAction(
-                    reasoning=reasoning,
-                    intention=reasoning,
-                )
             except FailedToGetTOTPVerificationCode as e:
                 reasoning_suffix = f"Failed to get verification code. Reason: {e.reason}"
                 reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
-                action = TerminateAction(
-                    reasoning=reasoning,
-                    intention=reasoning,
-                )
+
+        # OTP value obtained - use it as verification code
+        if otp_value and otp_value.get_otp_type() == OTPType.TOTP:
+            verification_code = otp_value.value
+            reasoning = reasoning or f"Received verification code: {verification_code}"
+            action = VerificationCodeAction(
+                verification_code=verification_code,
+                reasoning=reasoning,
+                intention=reasoning,
+            )
+        # Terminate the task since OTP is necessary but wasn't found/generated
         else:
             action = TerminateAction(
                 reasoning=reasoning,

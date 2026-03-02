@@ -1,8 +1,8 @@
 """
-Unit tests for ScriptSkyvernPage, specifically testing _wait_for_page_ready_before_action.
+Unit tests for ScriptSkyvernPage.
 
-This test file exists to prevent regressions like the AttributeError bug where
-self._page was used instead of self.page (see PR #8425, SKY-7676).
+Tests _wait_for_page_ready_before_action (regression test for self._page bug, PR #8425)
+and _ensure_element_ids_on_page (injects unique_id attrs after page navigation).
 """
 
 import inspect
@@ -222,3 +222,130 @@ async def test_wait_for_page_ready_attribute_access_regression():
                     f"Found 'self._page' in code at line {i}: {line.strip()}\n"
                     "This is a regression! SkyvernPage uses self.page, not self._page."
                 )
+
+
+# =============================================================================
+# Tests for _ensure_element_ids_on_page
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_ensure_element_ids_skips_when_ids_exist(mock_scraped_page, mock_ai):
+    """
+    When unique_id attributes already exist on the page, build_tree_from_body
+    should NOT be called (fast path).
+    """
+    mock_page = create_mock_page()
+    # SkyvernPage.__getattribute__ delegates self.page to mock_page.page
+    mock_page.page.evaluate = AsyncMock(return_value=True)  # unique_ids exist
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        with patch(
+            "skyvern.core.script_generations.script_skyvern_page.SkyvernFrame.create_instance",
+            new_callable=AsyncMock,
+        ) as mock_create_instance:
+            await script_page._ensure_element_ids_on_page()
+
+            # Should NOT inject domUtils.js since IDs already exist
+            mock_create_instance.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_element_ids_injects_when_ids_missing(mock_scraped_page, mock_ai):
+    """
+    When no unique_id attributes exist (after page navigation), should inject
+    domUtils.js and call buildTreeFromBody to set them.
+    """
+    mock_page = create_mock_page()
+    # SkyvernPage.__getattribute__ delegates self.page to mock_page.page,
+    # so set evaluate on the delegated object
+    mock_page.page.evaluate = AsyncMock(return_value=False)  # no unique_ids
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        mock_skyvern_frame = MagicMock()
+        mock_skyvern_frame.build_tree_from_body = AsyncMock(return_value=([], []))
+
+        with patch(
+            "skyvern.core.script_generations.script_skyvern_page.SkyvernFrame.create_instance",
+            new_callable=AsyncMock,
+            return_value=mock_skyvern_frame,
+        ) as mock_create_instance:
+            await script_page._ensure_element_ids_on_page()
+
+            # Should inject domUtils.js
+            mock_create_instance.assert_called_once()
+
+            # Should build element tree
+            mock_skyvern_frame.build_tree_from_body.assert_called_once_with(
+                frame_name="main.frame",
+                frame_index=0,
+                timeout_ms=15000,
+            )
+
+
+@pytest.mark.asyncio
+async def test_ensure_element_ids_handles_no_page(mock_scraped_page, mock_ai):
+    """
+    When self.page is None, should return early without error.
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+        script_page.page = None
+
+        with patch(
+            "skyvern.core.script_generations.script_skyvern_page.SkyvernFrame.create_instance",
+            new_callable=AsyncMock,
+        ) as mock_create_instance:
+            await script_page._ensure_element_ids_on_page()
+            mock_create_instance.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_element_ids_catches_exceptions(mock_scraped_page, mock_ai):
+    """
+    Exceptions in _ensure_element_ids_on_page should be caught and not block
+    action execution.
+    """
+    mock_page = create_mock_page()
+    # SkyvernPage.__getattribute__ delegates self.page to mock_page.page
+    mock_page.page.evaluate = AsyncMock(side_effect=Exception("Page crashed"))
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        # Should NOT raise
+        await script_page._ensure_element_ids_on_page()

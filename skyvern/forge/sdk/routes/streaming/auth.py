@@ -73,7 +73,8 @@ async def auth(apikey: str | None, token: str | None, websocket: WebSocket) -> s
 # NOTE(jdo:streaming-local-dev): use this instead of the above `auth`
 async def _auth(apikey: str | None, token: str | None, websocket: WebSocket) -> str | None:
     """
-    Dummy auth for local testing.
+    Local dev auth: extracts org_id from API key without strict validation.
+    Falls back to o_temp123 if no key provided.
     """
 
     try:
@@ -81,5 +82,19 @@ async def _auth(apikey: str | None, token: str | None, websocket: WebSocket) -> 
     except ConnectionClosedOK:
         LOG.info("WebSocket connection closed cleanly.")
         return None
+
+    # Try to extract real org_id from the API key
+    if apikey:
+        try:
+            from jose import jwt
+
+            from skyvern.config import settings
+
+            payload = jwt.decode(apikey, settings.SECRET_KEY, algorithms=["HS256"])
+            org_id = payload.get("sub")
+            if org_id:
+                return org_id
+        except Exception:
+            LOG.warning("Local auth: failed to decode API key, falling back to o_temp123")
 
     return "o_temp123"

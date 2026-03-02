@@ -156,6 +156,12 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                   }
                   update({ parameterKeys: [value] });
                 }}
+                currentUrl={data.url}
+                onUrlAutoFill={(url) => {
+                  if (editable) {
+                    update({ url });
+                  }
+                }}
               />
             </div>
           </div>

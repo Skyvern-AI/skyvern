@@ -98,6 +98,13 @@ class Settings(BaseSettings):
     # Supported storage types: local, s3cloud, azureblob
     SKYVERN_STORAGE_TYPE: str = "local"
 
+    # Shared Redis URL (used by any service that needs Redis)
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    # Notification registry settings ("local" or "redis")
+    NOTIFICATION_REGISTRY_TYPE: str = "local"
+    NOTIFICATION_REDIS_URL: str | None = None  # Deprecated: falls back to REDIS_URL
+
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
@@ -174,6 +181,8 @@ class Settings(BaseSettings):
     CHECK_USER_GOAL_LLM_KEY: str | None = None
     AUTO_COMPLETION_LLM_KEY: str | None = None
     SCRIPT_GENERATION_LLM_KEY: str | None = None
+    SCRIPT_REVIEWER_LLM_KEY: str | None = None
+    ADAPTIVE_SCRIPT_GEN_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -349,6 +358,11 @@ class Settings(BaseSettings):
     MOONSHOT_API_KEY: str | None = None
     MOONSHOT_API_BASE: str = "https://api.moonshot.cn/v1"
 
+    # INCEPTION AI
+    ENABLE_INCEPTION: bool = False
+    INCEPTION_API_KEY: str | None = None
+    INCEPTION_API_BASE: str = "https://api.inceptionlabs.ai/v1"
+
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
@@ -415,17 +429,25 @@ class Settings(BaseSettings):
     in minutes.
     """
 
-    DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES: int = 5
+    DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES: int = 10
     """
-    If there are `DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES` or more minutes left
-    in the persistent browser session (`started_at` + `timeout_minutes`), then
-    the `timeout_minutes` of the persistent browser session can be extended.
-    Otherwise we'll consider the persistent browser session to be expired.
+    Threshold for browser session timeout extension.
+    - V1 (OSS): extends when remaining >= threshold, raises if below (expired).
+    - V2 (cloud): extends when remaining <= threshold, no-ops if above (plenty of time).
+    Set to 10 minutes so that a 5-minute renewal loop gets 2+ attempts before expiry.
     """
 
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
+
+    # Cleanup Cron Settings
+    ENABLE_CLEANUP_CRON: bool = False
+    """Enable periodic cleanup of temporary data (temp files and stale processes)."""
+    CLEANUP_CRON_INTERVAL_MINUTES: int = 10
+    """Interval in minutes for the cleanup cron job."""
+    CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
+    """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
@@ -449,8 +471,9 @@ class Settings(BaseSettings):
                 "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                 "label": "Gemini 2.5 Flash",
             },
-            "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
+            "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3_PRO", "label": "Gemini 3 Pro (Latest)"},
             "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
+            "mercury-2": {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"},
             "gemini-2.5-flash-lite": {
                 "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
                 "label": "Gemini 2.5 Flash Lite",
@@ -498,6 +521,18 @@ class Settings(BaseSettings):
             "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
             "label": "Anthropic Claude 4.5 Haiku",
         }
+
+        # Anthropic Claude 4.6 Opus: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-opus-4-6"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4.6_OPUS_INFERENCE_PROFILE",
+                "label": "Anthropic Claude 4.6 Opus",
+            }
+        else:
+            mapping["claude-opus-4-6"] = {
+                "llm_key": "ANTHROPIC_CLAUDE4.6_OPUS",
+                "label": "Anthropic Claude 4.6 Opus",
+            }
 
         return mapping
 

@@ -1,4 +1,4 @@
-import { ActionsApiResponse, Status } from "@/api/types";
+import { ActionsApiResponse, RunEngine, Status } from "@/api/types";
 import { isTaskVariantBlock, WorkflowBlockType } from "./workflowTypes";
 import { ActionItem } from "../workflowRun/WorkflowRunOverview";
 
@@ -41,6 +41,7 @@ export type WorkflowRunBlock = {
   terminate_criterion: string | null;
   complete_criterion: string | null;
   include_action_history_in_verification: boolean | null;
+  engine: RunEngine | null;
   actions: Array<ActionsApiResponse> | null;
   recipients?: Array<string> | null;
   attachments?: Array<string> | null;
@@ -117,8 +118,23 @@ export function isBlockItem(
   );
 }
 
-export function isTaskVariantBlockItem(item: unknown) {
+function isTaskVariantBlockItem(item: unknown) {
   return isBlockItem(item) && isTaskVariantBlock(item.block);
+}
+
+export function countActionsInTimeline(
+  timelineItems: Array<WorkflowRunTimelineItem>,
+): number {
+  return timelineItems.reduce((total, item) => {
+    let count = 0;
+    if (isTaskVariantBlockItem(item)) {
+      count += item.block?.actions?.length ?? 0;
+    }
+    if (item.children.length > 0) {
+      count += countActionsInTimeline(item.children);
+    }
+    return total + count;
+  }, 0);
 }
 
 export function isWorkflowRunBlock(item: unknown): item is WorkflowRunBlock {

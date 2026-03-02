@@ -51,6 +51,7 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
 import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowRunStatusAlert";
+import { WorkflowRunVerificationCodeForm } from "@/routes/workflows/workflowRun/WorkflowRunVerificationCodeForm";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -349,6 +350,14 @@ function WorkflowRun() {
               ) : null}
             </div>
             <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
+            {workflowRun?.browser_session_id && (
+              <Link
+                className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
+                to={`/browser-session/${workflowRun.browser_session_id}/stream`}
+              >
+                Browser Session: {workflowRun.browser_session_id}
+              </Link>
+            )}
           </div>
 
           <div className="flex gap-2">
@@ -448,6 +457,8 @@ function WorkflowRun() {
           </div>
         </header>
       )}
+      {/* 2FA Verification Code Form - shown when workflow is waiting for a code */}
+      <WorkflowRunVerificationCodeForm />
       {showOutputSection && (
         <div
           className={cn("grid gap-4 rounded-lg bg-slate-elevation1 p-4", {

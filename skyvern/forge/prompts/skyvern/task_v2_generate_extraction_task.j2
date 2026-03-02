@@ -4,7 +4,7 @@ MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing comma
 
 Reply in JSON format with the following keys:
 {
-  "schema": JSON, // the schema of the output data to extract. Use JSON Schema specification style.
+  "schema": JSON, // the schema of the output data to extract. Use JSON Schema specification style. All field names MUST use snake_case (e.g., product_name, order_date).
 }
 
 The URL of the page you're on right now is `{{ current_url }}`.

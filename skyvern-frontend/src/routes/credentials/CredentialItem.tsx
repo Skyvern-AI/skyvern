@@ -4,14 +4,28 @@ import {
   isPasswordCredential,
   isSecretCredential,
 } from "@/api/types";
+import { useState } from "react";
+import { Pencil1Icon } from "@radix-ui/react-icons";
+import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { DeleteCredentialButton } from "./DeleteCredentialButton";
+import { getHostname } from "@/util/getHostname";
+import { CredentialsModal } from "./CredentialsModal";
+import { credentialTypeToModalType } from "./useCredentialModalState";
 
 type Props = {
   credential: CredentialApiResponse;
 };
 
 function CredentialItem({ credential }: Props) {
+  const [editModalOpen, setEditModalOpen] = useState(false);
   const credentialData = credential.credential;
+  const modalType = credentialTypeToModalType(credential.credential_type);
   const getTotpTypeDisplay = (totpType: string) => {
     switch (totpType) {
       case "authenticator":
@@ -96,11 +110,45 @@ function CredentialItem({ credential }: Props) {
           {credential.name}
         </p>
         <p className="text-sm text-slate-400">{credential.credential_id}</p>
+        {credential.browser_profile_id && (
+          <div className="flex items-center gap-1 text-xs">
+            <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-green-400">
+              saved-profile
+            </span>
+            {credential.tested_url && (
+              <span className="text-muted-foreground">
+                {getHostname(credential.tested_url) ?? credential.tested_url}
+              </span>
+            )}
+          </div>
+        )}
       </div>
       {credentialDetails}
-      <div className="ml-auto">
+      <div className="ml-auto flex gap-1">
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon"
+                variant="tertiary"
+                className="h-8 w-9"
+                onClick={() => setEditModalOpen(true)}
+                aria-label="Edit credential"
+              >
+                <Pencil1Icon className="size-5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Edit Credential</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
         <DeleteCredentialButton credential={credential} />
       </div>
+      <CredentialsModal
+        isOpen={editModalOpen}
+        onOpenChange={setEditModalOpen}
+        editingCredential={credential}
+        overrideType={modalType}
+      />
     </div>
   );
 }

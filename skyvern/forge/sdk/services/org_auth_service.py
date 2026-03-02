@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, Sequence
 
 import structlog
 from asyncache import cached
@@ -103,7 +103,13 @@ async def get_current_org_with_authentication(
 
 
 async def _authenticate_helper(authorization: str) -> Organization:
-    token = authorization.split(" ")[1]
+    parts = authorization.split(" ", 1)
+    if len(parts) < 2 or not parts[1]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid credentials",
+        )
+    token = parts[1]
     if not app.authentication_function:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -158,7 +164,13 @@ async def get_current_user_id_with_authentication(
 
 
 async def _authenticate_user_helper(authorization: str) -> str:
-    token = authorization.split(" ")[1]
+    parts = authorization.split(" ", 1)
+    if len(parts) < 2 or not parts[1]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid credentials",
+        )
+    token = parts[1]
     if not app.authenticate_user_function:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -176,6 +188,7 @@ async def _authenticate_user_helper(authorization: str) -> str:
 async def resolve_org_from_api_key(
     x_api_key: str,
     db: AgentDB,
+    token_types: Sequence[OrganizationAuthTokenType] = (OrganizationAuthTokenType.api,),
 ) -> ApiKeyValidationResult:
     """Decode and validate the API key against the database."""
     try:
@@ -202,12 +215,18 @@ async def resolve_org_from_api_key(
         LOG.warning("Organization not found", organization_id=api_key_data.sub, **payload)
         raise HTTPException(status_code=404, detail="Organization not found")
 
-    api_key_db_obj = await db.validate_org_auth_token(
-        organization_id=organization.organization_id,
-        token_type=OrganizationAuthTokenType.api,
-        token=x_api_key,
-        valid=None,
-    )
+    api_key_db_obj: OrganizationAuthToken | None = None
+    # Try token types in priority order and stop at the first valid match.
+    for token_type in token_types:
+        api_key_db_obj = await db.validate_org_auth_token(
+            organization_id=organization.organization_id,
+            token_type=token_type,
+            token=x_api_key,
+            valid=None,
+        )
+        if api_key_db_obj:
+            break
+
     if not api_key_db_obj:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

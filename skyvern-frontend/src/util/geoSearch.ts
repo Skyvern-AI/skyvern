@@ -20,6 +20,10 @@ export type GroupedSearchResults = {
   cities: SearchResultItem[];
 };
 
+type SearchGeoDataOptions = {
+  includeGranularResults?: boolean;
+};
+
 // Store the promise so concurrent calls share one import
 let cscModulePromise: Promise<typeof import("country-state-city")> | null =
   null;
@@ -37,6 +41,7 @@ function loadCsc() {
 
 export async function searchGeoData(
   query: string,
+  { includeGranularResults = true }: SearchGeoDataOptions = {},
 ): Promise<GroupedSearchResults> {
   const normalizedQuery = query.trim().toLowerCase();
   const queryMatchesISP = normalizedQuery.includes("isp");
@@ -82,8 +87,9 @@ export async function searchGeoData(
     }
   }
 
-  // If query is very short, just return countries to save perf
-  if (normalizedQuery.length < 2) {
+  // Browser Sessions create currently supports country-level proxy locations only.
+  // Allow callers to disable subdivisions/cities so the dropdown matches API support.
+  if (!includeGranularResults || normalizedQuery.length < 2) {
     return results;
   }
 

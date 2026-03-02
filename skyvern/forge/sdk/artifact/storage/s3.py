@@ -19,7 +19,10 @@ from skyvern.forge.sdk.api.files import (
     unzip_files,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
-from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
+from skyvern.forge.sdk.artifact.storage.base import (
+    FILE_EXTENTSION_MAP,
+    BaseStorage,
+)
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -117,16 +120,14 @@ class S3Storage(BaseStorage):
             data = cctx.compress(data)
 
         sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket, len(data))
-        tags = await self._get_tags_for_org(artifact.organization_id)
         LOG.debug(
             "Storing artifact",
             artifact_id=artifact.artifact_id,
             organization_id=artifact.organization_id,
             uri=uri,
             storage_class=sc,
-            tags=tags,
         )
-        await self.async_client.upload_file(uri, data, storage_class=sc, tags=tags)
+        await self.async_client.upload_file(uri, data, storage_class=sc)
 
     async def _get_storage_class_for_org(
         self,
@@ -135,9 +136,6 @@ class S3Storage(BaseStorage):
         object_size_bytes: int | None = None,
     ) -> S3StorageClass:
         return S3StorageClass.STANDARD
-
-    async def _get_tags_for_org(self, organization_id: str) -> dict[str, str]:
-        return {}
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         data = await self.async_client.download_file(artifact.uri)
@@ -156,7 +154,6 @@ class S3Storage(BaseStorage):
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket, os.path.getsize(path))
-        tags = await self._get_tags_for_org(artifact.organization_id)
         LOG.debug(
             "Storing artifact from path",
             artifact_id=artifact.artifact_id,
@@ -164,15 +161,13 @@ class S3Storage(BaseStorage):
             uri=artifact.uri,
             storage_class=sc,
             path=path,
-            tags=tags,
         )
-        await self.async_client.upload_file_from_path(artifact.uri, path, storage_class=sc, tags=tags)
+        await self.async_client.upload_file_from_path(artifact.uri, path, storage_class=sc)
 
     async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_SCREENSHOTS)
-        tags = await self._get_tags_for_org(organization_id)
         LOG.debug(
             "Saving streaming file",
             organization_id=organization_id,
@@ -180,9 +175,8 @@ class S3Storage(BaseStorage):
             from_path=from_path,
             to_path=to_path,
             storage_class=sc,
-            tags=tags,
         )
-        await self.async_client.upload_file_from_path(to_path, from_path, storage_class=sc, tags=tags)
+        await self.async_client.upload_file_from_path(to_path, from_path, storage_class=sc)
 
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
         path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
@@ -194,7 +188,6 @@ class S3Storage(BaseStorage):
         zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
         browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_BROWSER_SESSIONS)
-        tags = await self._get_tags_for_org(organization_id)
         LOG.debug(
             "Storing browser session",
             organization_id=organization_id,
@@ -202,9 +195,8 @@ class S3Storage(BaseStorage):
             zip_file_path=zip_file_path,
             browser_session_uri=browser_session_uri,
             storage_class=sc,
-            tags=tags,
         )
-        await self.async_client.upload_file_from_path(browser_session_uri, zip_file_path, storage_class=sc, tags=tags)
+        await self.async_client.upload_file_from_path(browser_session_uri, zip_file_path, storage_class=sc)
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
         browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
@@ -228,7 +220,6 @@ class S3Storage(BaseStorage):
             f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
         )
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_BROWSER_SESSIONS)
-        tags = await self._get_tags_for_org(organization_id)
         LOG.debug(
             "Storing browser profile",
             organization_id=organization_id,
@@ -236,9 +227,8 @@ class S3Storage(BaseStorage):
             zip_file_path=zip_file_path,
             profile_uri=profile_uri,
             storage_class=sc,
-            tags=tags,
         )
-        await self.async_client.upload_file_from_path(profile_uri, zip_file_path, storage_class=sc, tags=tags)
+        await self.async_client.upload_file_from_path(profile_uri, zip_file_path, storage_class=sc)
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve browser profile from S3."""
@@ -376,14 +366,33 @@ class S3Storage(BaseStorage):
         file_infos.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
         return file_infos
 
-    async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
-        download_dir = get_download_dir(run_id=run_id)
-        files = os.listdir(download_dir)
+    async def save_downloaded_files(
+        self,
+        organization_id: str,
+        run_id: str | None,
+    ) -> None:
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_UPLOADS)
-        tags = await self._get_tags_for_org(organization_id)
         base_uri = (
             f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         )
+
+        await self._save_downloaded_files_from_local(
+            organization_id=organization_id,
+            run_id=run_id,
+            base_uri=base_uri,
+            storage_class=sc,
+        )
+
+    async def _save_downloaded_files_from_local(
+        self,
+        organization_id: str,
+        run_id: str | None,
+        base_uri: str,
+        storage_class: S3StorageClass,
+    ) -> None:
+        """Save files from local download directory to S3."""
+        download_dir = get_download_dir(run_id=run_id)
+        files = os.listdir(download_dir)
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -395,15 +404,14 @@ class S3Storage(BaseStorage):
                 file=file,
                 checksum=checksum,
                 organization_id=organization_id,
-                storage_class=sc,
+                storage_class=storage_class,
             )
             # Upload file with checksum metadata
             await self.async_client.upload_file_from_path(
                 uri=uri,
                 file_path=fpath,
                 metadata={"sha256_checksum": checksum, "original_filename": file},
-                storage_class=sc,
-                tags=tags,
+                storage_class=storage_class,
             )
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
@@ -444,12 +452,11 @@ class S3Storage(BaseStorage):
         todays_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
         bucket = settings.AWS_S3_BUCKET_UPLOADS
         sc = await self._get_storage_class_for_org(organization_id, bucket)
-        tags = await self._get_tags_for_org(organization_id)
         # First try uploading with original filename
         try:
             sanitized_filename = os.path.basename(filename)  # Remove any path components
             s3_uri = f"s3://{bucket}/{settings.ENV}/{organization_id}/{todays_date}/{sanitized_filename}"
-            uploaded_s3_uri = await self.async_client.upload_file_stream(s3_uri, fileObj, storage_class=sc, tags=tags)
+            uploaded_s3_uri = await self.async_client.upload_file_stream(s3_uri, fileObj, storage_class=sc)
         except Exception:
             LOG.error("Failed to upload file to S3", exc_info=True)
             uploaded_s3_uri = None
@@ -459,7 +466,7 @@ class S3Storage(BaseStorage):
             uuid_prefixed_filename = f"{str(uuid.uuid4())}_{filename}"
             s3_uri = f"s3://{bucket}/{settings.ENV}/{organization_id}/{todays_date}/{uuid_prefixed_filename}"
             fileObj.seek(0)  # Reset file pointer
-            uploaded_s3_uri = await self.async_client.upload_file_stream(s3_uri, fileObj, storage_class=sc, tags=tags)
+            uploaded_s3_uri = await self.async_client.upload_file_stream(s3_uri, fileObj, storage_class=sc)
 
         if not uploaded_s3_uri:
             LOG.error(
@@ -517,8 +524,7 @@ class S3Storage(BaseStorage):
         """Sync a file from local browser session to S3."""
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
         sc = await self._get_storage_class_for_org(organization_id, self.bucket)
-        tags = await self._get_tags_for_org(organization_id)
-        await self.async_client.upload_file_from_path(uri, local_file_path, storage_class=sc, tags=tags)
+        await self.async_client.upload_file_from_path(uri, local_file_path, storage_class=sc)
         return uri
 
     async def delete_browser_session_file(

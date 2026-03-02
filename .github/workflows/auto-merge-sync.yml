@@ -20,6 +20,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 10
           ignore-checks: auto-merge
+          allowed-conclusions: success, skipped, neutral
       - name: Set token for author
         id: set-token
         run: |

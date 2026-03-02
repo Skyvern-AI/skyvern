@@ -4,13 +4,24 @@ import asyncio
 import base64
 import json
 import logging
-import re
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
 
+from skyvern.cli.core.browser_ops import do_act, do_extract, do_navigate, do_screenshot, parse_extract_schema
+from skyvern.cli.core.guards import (
+    CREDENTIAL_HINT,
+    JS_PASSWORD_PATTERN,
+    PASSWORD_PATTERN,
+    GuardError,
+    check_password_prompt,
+)
+from skyvern.cli.core.guards import resolve_ai_mode as _resolve_ai_mode
+from skyvern.cli.core.guards import (
+    validate_wait_until,
+)
 from skyvern.schemas.run_blocks import CredentialType
 
 from ._common import (
@@ -23,39 +34,6 @@ from ._common import (
 from ._session import BrowserNotAvailableError, get_page, no_browser_error
 
 LOG = logging.getLogger(__name__)
-
-_PASSWORD_PATTERN = re.compile(
-    r"\bpass(?:word|phrase|code)s?\b|\bsecret\b|\bcredential\b|\bpin\s*(?:code)?\b|\bpwd\b|\bpasswd\b",
-    re.IGNORECASE,
-)
-
-_CREDENTIAL_ERROR_HINT = (
-    "Use skyvern_login with a stored credential to authenticate. "
-    "Create credentials via CLI: skyvern credentials add. "
-    "Never pass passwords through tool calls."
-)
-
-_JS_PASSWORD_PATTERN = re.compile(
-    r"""(?:type\s*=\s*['"]?password|\.type\s*===?\s*['"]password|input\[type=password\]).*?\.value\s*=""",
-    re.IGNORECASE,
-)
-
-
-def _resolve_ai_mode(
-    selector: str | None,
-    intent: str | None,
-) -> tuple[str | None, str | None]:
-    """Determine AI mode from selector/intent combination.
-
-    Returns (ai_mode, error_code) — if error_code is set, the call should fail.
-    """
-    if intent and not selector:
-        return "proactive", None
-    if intent and selector:
-        return "fallback", None
-    if selector and not intent:
-        return None, None
-    return None, "INVALID_INPUT"
 
 
 async def skyvern_navigate(
@@ -80,15 +58,13 @@ async def skyvern_navigate(
     Returns the final URL (after redirects) and page title.
     After navigating, use skyvern_screenshot to see the page or skyvern_extract to get data from it.
     """
-    if wait_until is not None and wait_until not in ("load", "domcontentloaded", "networkidle", "commit"):
+    try:
+        validate_wait_until(wait_until)
+    except GuardError as e:
         return make_result(
             "skyvern_navigate",
             ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                f"Invalid wait_until: {wait_until}",
-                "Use load, domcontentloaded, networkidle, or commit",
-            ),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
         )
 
     try:
@@ -98,10 +74,16 @@ async def skyvern_navigate(
 
     with Timer() as timer:
         try:
-            await page.goto(url, timeout=timeout, wait_until=wait_until)
+            result = await do_navigate(page, url, timeout=timeout, wait_until=wait_until)
             timer.mark("sdk")
-            final_url = page.url
-            title = await page.title()
+        except GuardError as e:
+            return make_result(
+                "skyvern_navigate",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            )
         except Exception as e:
             return make_result(
                 "skyvern_navigate",
@@ -114,7 +96,7 @@ async def skyvern_navigate(
     return make_result(
         "skyvern_navigate",
         browser_context=ctx,
-        data={"url": final_url, "title": title, "sdk_equivalent": f'await page.goto("{url}")'},
+        data={"url": result.url, "title": result.title, "sdk_equivalent": f'await page.goto("{url}")'},
         timing_ms=timer.timing_ms,
     )
 
@@ -355,14 +337,14 @@ async def skyvern_type(
     """
     # Block password entry — redirect to skyvern_login
     target_text = f"{intent or ''} {selector or ''}"
-    if _PASSWORD_PATTERN.search(target_text):
+    if PASSWORD_PATTERN.search(target_text):
         return make_result(
             "skyvern_type",
             ok=False,
             error=make_error(
                 ErrorCode.INVALID_INPUT,
                 "Cannot type into password fields — credentials must not be passed through tool calls",
-                _CREDENTIAL_ERROR_HINT,
+                CREDENTIAL_HINT,
             ),
         )
 
@@ -402,7 +384,7 @@ async def skyvern_type(
                 error=make_error(
                     ErrorCode.INVALID_INPUT,
                     "Cannot type into password fields — credentials must not be passed through tool calls",
-                    _CREDENTIAL_ERROR_HINT,
+                    CREDENTIAL_HINT,
                 ),
             )
 
@@ -491,11 +473,7 @@ async def skyvern_screenshot(
 
     with Timer() as timer:
         try:
-            if selector:
-                element = page.locator(selector)
-                screenshot_bytes = await element.screenshot()
-            else:
-                screenshot_bytes = await page.screenshot(full_page=full_page)
+            result = await do_screenshot(page, full_page=full_page, selector=selector)
             timer.mark("sdk")
         except Exception as e:
             return make_result(
@@ -507,7 +485,7 @@ async def skyvern_screenshot(
             )
 
     if inline:
-        data_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        data_b64 = base64.b64encode(result.data).decode("utf-8")
         return make_result(
             "skyvern_screenshot",
             browser_context=ctx,
@@ -515,7 +493,7 @@ async def skyvern_screenshot(
                 "inline": True,
                 "data": data_b64,
                 "mime": "image/png",
-                "bytes": len(screenshot_bytes),
+                "bytes": len(result.data),
                 "sdk_equivalent": "await page.screenshot()",
             },
             timing_ms=timer.timing_ms,
@@ -525,7 +503,7 @@ async def skyvern_screenshot(
     ts = datetime.now(timezone.utc).strftime("%H%M%S_%f")
     filename = f"screenshot_{ts}.png"
     artifact = save_artifact(
-        screenshot_bytes,
+        result.data,
         kind="screenshot",
         filename=filename,
         mime="image/png",
@@ -896,14 +874,14 @@ async def skyvern_evaluate(
     Security: This executes arbitrary JS in the page context. Only use with trusted expressions.
     """
     # Block JS that sets password field values
-    if _JS_PASSWORD_PATTERN.search(expression):
+    if JS_PASSWORD_PATTERN.search(expression):
         return make_result(
             "skyvern_evaluate",
             ok=False,
             error=make_error(
                 ErrorCode.INVALID_INPUT,
                 "Cannot set password field values via JavaScript — credentials must not be passed through tool calls",
-                _CREDENTIAL_ERROR_HINT,
+                CREDENTIAL_HINT,
             ),
         )
 
@@ -947,20 +925,17 @@ async def skyvern_extract(
     For visual inspection instead of structured data, use skyvern_screenshot.
     Optionally provide a JSON `schema` to enforce the output structure (pass as a JSON string).
     """
-    parsed_schema: dict[str, Any] | None = None
     if schema is not None:
         try:
-            parsed_schema = json.loads(schema)
-        except (json.JSONDecodeError, TypeError) as e:
+            parsed_schema = parse_extract_schema(schema)
+        except GuardError as e:
             return make_result(
                 "skyvern_extract",
                 ok=False,
-                error=make_error(
-                    ErrorCode.INVALID_INPUT,
-                    f"Invalid JSON schema: {e}",
-                    "Provide schema as a valid JSON string",
-                ),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
             )
+    else:
+        parsed_schema = None
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -969,8 +944,16 @@ async def skyvern_extract(
 
     with Timer() as timer:
         try:
-            extracted = await page.extract(prompt=prompt, schema=parsed_schema)
+            result = await do_extract(page, prompt, schema=parsed_schema)
             timer.mark("sdk")
+        except GuardError as e:
+            return make_result(
+                "skyvern_extract",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            )
         except Exception as e:
             return make_result(
                 "skyvern_extract",
@@ -983,7 +966,10 @@ async def skyvern_extract(
     return make_result(
         "skyvern_extract",
         browser_context=ctx,
-        data={"extracted": extracted, "sdk_equivalent": f'await page.extract(prompt="{prompt}")'},
+        data={
+            "extracted": result.extracted,
+            "sdk_equivalent": f'await page.extract(prompt="{prompt}")',
+        },
         timing_ms=timer.timing_ms,
     )
 
@@ -1037,16 +1023,13 @@ async def skyvern_act(
     For multi-step automations (4+ pages), use skyvern_workflow_create with one block per step.
     For quick one-off multi-page tasks, use skyvern_run_task.
     """
-    # Block login/password actions — redirect to skyvern_login
-    if _PASSWORD_PATTERN.search(prompt):
+    try:
+        check_password_prompt(prompt)
+    except GuardError as e:
         return make_result(
             "skyvern_act",
             ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "Cannot perform password/credential actions — credentials must not be passed through tool calls",
-                _CREDENTIAL_ERROR_HINT,
-            ),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
         )
 
     try:
@@ -1056,8 +1039,16 @@ async def skyvern_act(
 
     with Timer() as timer:
         try:
-            await page.act(prompt)
+            result = await do_act(page, prompt)
             timer.mark("sdk")
+        except GuardError as e:
+            return make_result(
+                "skyvern_act",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            )
         except Exception as e:
             return make_result(
                 "skyvern_act",
@@ -1070,7 +1061,11 @@ async def skyvern_act(
     return make_result(
         "skyvern_act",
         browser_context=ctx,
-        data={"prompt": prompt, "completed": True, "sdk_equivalent": f'await page.act("{prompt}")'},
+        data={
+            "prompt": result.prompt,
+            "completed": result.completed,
+            "sdk_equivalent": f'await page.act("{prompt}")',
+        },
         timing_ms=timer.timing_ms,
     )
 
@@ -1099,14 +1094,14 @@ async def skyvern_run_task(
     For simple single-step actions on the current page, use skyvern_act instead.
     """
     # Block password/credential actions — redirect to skyvern_login
-    if _PASSWORD_PATTERN.search(prompt):
+    if PASSWORD_PATTERN.search(prompt):
         return make_result(
             "skyvern_run_task",
             ok=False,
             error=make_error(
                 ErrorCode.INVALID_INPUT,
                 "Cannot perform password/credential actions — credentials must not be passed through tool calls",
-                _CREDENTIAL_ERROR_HINT,
+                CREDENTIAL_HINT,
             ),
         )
 

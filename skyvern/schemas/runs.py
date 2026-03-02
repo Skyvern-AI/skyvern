@@ -58,6 +58,7 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_IT = "RESIDENTIAL_IT"
     RESIDENTIAL_NL = "RESIDENTIAL_NL"
     RESIDENTIAL_PH = "RESIDENTIAL_PH"
+    RESIDENTIAL_KR = "RESIDENTIAL_KR"
     RESIDENTIAL_ISP = "RESIDENTIAL_ISP"
     NONE = "NONE"
 
@@ -97,6 +98,7 @@ class ProxyLocation(StrEnum):
             cls.RESIDENTIAL_IT,
             cls.RESIDENTIAL_NL,
             cls.RESIDENTIAL_PH,
+            cls.RESIDENTIAL_KR,
         }
 
     @staticmethod
@@ -121,6 +123,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_IT: 2000,
             ProxyLocation.RESIDENTIAL_NL: 2000,
             ProxyLocation.RESIDENTIAL_PH: 2000,
+            ProxyLocation.RESIDENTIAL_KR: 2000,
         }
         return counts.get(proxy_location, 10000)
 
@@ -146,6 +149,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_IT: "IT",
             ProxyLocation.RESIDENTIAL_NL: "NL",
             ProxyLocation.RESIDENTIAL_PH: "PH",
+            ProxyLocation.RESIDENTIAL_KR: "KR",
         }
         return mapping.get(proxy_location, "US")
 
@@ -170,6 +174,7 @@ SUPPORTED_GEO_COUNTRIES = frozenset(
         "NL",
         "NZ",
         "PH",
+        "KR",
         "TR",
         "ZA",
     }
@@ -314,6 +319,9 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
 
     if proxy_location == ProxyLocation.RESIDENTIAL_PH:
         return ZoneInfo("Asia/Manila")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_KR:
+        return ZoneInfo("Asia/Seoul")
 
     if proxy_location == ProxyLocation.RESIDENTIAL_ISP:
         return ZoneInfo("America/New_York")

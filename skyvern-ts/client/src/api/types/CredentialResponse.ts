@@ -14,6 +14,10 @@ export interface CredentialResponse {
     credential_type: Skyvern.CredentialTypeOutput;
     /** Name of the credential */
     name: string;
+    /** Browser profile ID linked to this credential */
+    browser_profile_id?: string;
+    /** Login page URL used during the credential test */
+    tested_url?: string;
 }
 
 export namespace CredentialResponse {

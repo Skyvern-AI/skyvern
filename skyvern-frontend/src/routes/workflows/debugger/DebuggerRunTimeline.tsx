@@ -1,12 +1,13 @@
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { statusIsFinalized } from "@/routes/tasks/types";
+import { cn } from "@/util/utils";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
+  countActionsInTimeline,
   isBlockItem,
   isObserverThought,
-  isTaskVariantBlockItem,
   isThoughtItem,
   ObserverThought,
   WorkflowRunBlock,
@@ -17,7 +18,6 @@ import {
   WorkflowRunOverviewActiveElement,
 } from "@/routes/workflows/workflowRun/WorkflowRunOverview";
 import { WorkflowRunTimelineBlockItem } from "@/routes/workflows/workflowRun/WorkflowRunTimelineBlockItem";
-import { cn } from "@/util/utils";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -48,12 +48,7 @@ function DebuggerRunTimeline({
 
   const workflowRunIsFinalized = statusIsFinalized(workflowRun);
 
-  const numberOfActions = workflowRunTimeline.reduce((total, current) => {
-    if (isTaskVariantBlockItem(current)) {
-      return total + current.block!.actions!.length;
-    }
-    return total + 0;
-  }, 0);
+  const numberOfActions = countActionsInTimeline(workflowRunTimeline);
 
   const firstActionOrThoughtIsPending =
     !workflowRunIsFinalized && workflowRunTimeline.length === 0;

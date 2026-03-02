@@ -8,7 +8,6 @@ from fastapi import status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing_extensions import Self
 
-from skyvern.config import settings
 from skyvern.exceptions import (
     InvalidTaskStatusTransition,
     SkyvernHTTPException,
@@ -17,6 +16,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.utils.url_validators import validate_url
@@ -288,6 +288,10 @@ class Task(TaskBase):
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    # 2FA verification code waiting state fields
+    waiting_for_verification_code: bool = False
+    verification_code_identifier: str | None = None
+    verification_code_polling_started_at: datetime | None = None
 
     @property
     def llm_key(self) -> str | None:
@@ -299,7 +303,7 @@ class Task(TaskBase):
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
-                mapping = settings.get_model_name_to_llm_key()
+                mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
                 return mapping.get(model_name, {}).get("llm_key")
 
         return None
@@ -365,6 +369,9 @@ class Task(TaskBase):
             max_screenshot_scrolls=self.max_screenshot_scrolls,
             step_count=step_count,
             browser_session_id=self.browser_session_id,
+            waiting_for_verification_code=self.waiting_for_verification_code,
+            verification_code_identifier=self.verification_code_identifier,
+            verification_code_polling_started_at=self.verification_code_polling_started_at,
         )
 
 
@@ -392,6 +399,10 @@ class TaskResponse(BaseModel):
     max_screenshot_scrolls: int | None = None
     step_count: int | None = None
     browser_session_id: str | None = None
+    # 2FA verification code waiting state fields
+    waiting_for_verification_code: bool = False
+    verification_code_identifier: str | None = None
+    verification_code_polling_started_at: datetime | None = None
 
 
 class TaskOutput(BaseModel):

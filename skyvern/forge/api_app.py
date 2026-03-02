@@ -23,6 +23,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes import internal_auth
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
+from skyvern.services.cleanup_service import start_cleanup_scheduler, stop_cleanup_scheduler
 
 try:
     from cloud.observability.otel_setup import OTELSetup
@@ -30,6 +31,27 @@ except ImportError:
     OTELSetup = None  # type: ignore[assignment,misc]
 
 LOG = structlog.get_logger()
+
+
+def format_validation_errors(exc: ValidationError) -> str:
+    """Format a Pydantic ValidationError into a human-readable string.
+
+    Filters out uninformative path segments ('__root__', 'body') and joins
+    multiple errors with '; '.
+    """
+    error_messages = []
+    for error in exc.errors():
+        loc = " -> ".join(str(part) for part in error["loc"] if part not in ("__root__", "body"))
+        msg = error["msg"]
+        if loc:
+            error_messages.append(f"{loc}: {msg}")
+        else:
+            error_messages.append(msg)
+    return (
+        "; ".join(error_messages)
+        if error_messages
+        else "A validation error occurred. Please check your input and try again."
+    )
 
 
 class ExecutionDatePlugin(Plugin):
@@ -68,7 +90,42 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
             await forge_app.api_app_startup_event(fastapi_app)
         except Exception:
             LOG.exception("Failed to execute api app startup event")
-    yield
+
+    # Start cleanup scheduler if enabled
+    cleanup_task = start_cleanup_scheduler()
+    if cleanup_task:
+        LOG.info("Cleanup scheduler started")
+
+    # Start MCP sub-application lifespan if mounted. Starlette Mount does NOT
+    # forward lifespan events to sub-apps, so we must enter the MCP app's
+    # lifespan here. This initializes the streamable-http session manager's
+    # task group which is required for handling MCP requests.
+    mcp_app = getattr(fastapi_app.state, "mcp_starlette_app", None)
+    if mcp_app:
+        async with mcp_app.lifespan(mcp_app):
+            LOG.info("MCP remote server lifespan started")
+            yield
+        LOG.info("MCP remote server lifespan stopped")
+    else:
+        yield
+
+    # Stop cleanup scheduler
+    await stop_cleanup_scheduler()
+
+    # Close notification registry (e.g. cancel Redis listener tasks)
+    from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
+
+    registry = NotificationRegistryFactory.get_registry()
+    if hasattr(registry, "close"):
+        await registry.close()
+
+    # Close shared Redis client (after registry so listener tasks drain first)
+    from skyvern.forge.sdk.redis.factory import RedisClientFactory
+
+    redis_client = RedisClientFactory.get_client()
+    if redis_client is not None:
+        await redis_client.close()
+
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
         try:
@@ -139,9 +196,10 @@ def create_api_app() -> FastAPI:
 
     @fastapi_app.exception_handler(ValidationError)
     async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
+        detail = format_validation_errors(exc)
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"detail": str(exc)},
+            content={"detail": detail},
         )
 
     @fastapi_app.exception_handler(Exception)
