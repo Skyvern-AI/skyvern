@@ -36,13 +36,9 @@ MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
 
 # Resource types that should NEVER be treated as downloads.
 # Sub-resources (Font, Stylesheet, etc.) are loaded by the page, not user-initiated.
-# XHR/Fetch are programmatic JS API calls (e.g. Google APIs return Content-Disposition:
-# attachment on JSON responses, which would cause false positives).
 # Real user downloads come through as "Document" (link click / navigation).
 NON_DOWNLOAD_RESOURCE_TYPES = frozenset(
     {
-        "XHR",
-        "Fetch",
         "Font",
         "Stylesheet",
         "Script",
@@ -56,6 +52,14 @@ NON_DOWNLOAD_RESOURCE_TYPES = frozenset(
         "Prefetch",
     }
 )
+
+# XHR/Fetch are programmatic JS API calls that sometimes carry Content-Disposition:
+# attachment (e.g. Google APIs on JSON responses). We don't fully block them —
+# instead, we only allow them through if there's an explicit attachment header,
+# and rely on NON_DOWNLOAD_CONTENT_TYPES to filter out API false-positives.
+# Without an explicit attachment header, we skip XHR/Fetch to avoid MIME-only
+# false positives.
+XHR_FETCH_RESOURCE_TYPES = frozenset({"XHR", "Fetch"})
 
 # Content types that are clearly API / data responses, never user-facing downloads,
 # even if the server includes Content-Disposition: attachment.
@@ -117,10 +121,13 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     Determine if a response is a file download.
 
     Checks:
-    0. Skip sub-resource types (Font, Stylesheet, Script, Image, etc.)
-    1. Skip API content types (application/json, etc.)
-    2. Content-Disposition contains "attachment"
-    3. Content-Type is a known download MIME type
+    0. Skip error responses (status >= 400)
+    1. Skip sub-resource types (Font, Stylesheet, Script, Image, etc.)
+    2. Skip API content types (application/json, etc.)
+    3. For XHR/Fetch: require BOTH attachment header AND download MIME type
+       (prevents false positives like Google's text/plain + attachment XHR responses)
+    4. Content-Disposition contains "attachment"
+    5. Content-Type is a known download MIME type
     """
     if status_code >= 400:
         return False
@@ -134,10 +141,18 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     if content_type in NON_DOWNLOAD_CONTENT_TYPES:
         return False
 
-    if "attachment" in content_disposition.lower():
+    is_attachment = "attachment" in content_disposition.lower()
+    is_download_mime = content_type in DOWNLOAD_MIME_TYPES
+
+    # XHR/Fetch require both signals to avoid false positives
+    # (e.g. Google async requests: text/plain + attachment; filename="f.txt")
+    if resource_type in XHR_FETCH_RESOURCE_TYPES:
+        return is_attachment and is_download_mime
+
+    if is_attachment:
         return True
 
-    if content_type in DOWNLOAD_MIME_TYPES:
+    if is_download_mime:
         return True
 
     return False
@@ -188,11 +203,21 @@ class CDPDownloadInterceptor:
        - Download → extract body → save to disk → Fetch.fulfillRequest (block browser save)
     """
 
-    def __init__(self, output_dir: str | None = None) -> None:
+    def __init__(
+        self,
+        output_dir: str | None = None,
+        proxy_username: str | None = None,
+        proxy_password: str | None = None,
+    ) -> None:
         self._output_dir: Path | None = Path(output_dir) if output_dir else None
+        self._proxy_username: str | None = proxy_username
+        self._proxy_password: str | None = proxy_password
         self._cdp_sessions: list[CDPSession] = []
         self._enabled = False
         self._download_index = 0
+        # Track auth attempts per requestId to prevent infinite retry loops
+        # when proxy credentials are rejected (407 → ProvideCredentials → 407 → …)
+        self._auth_attempts: dict[str, int] = {}
 
     def set_download_dir(self, download_dir: str) -> None:
         """Set or update the download directory. Can be called after init when run_id becomes available."""
@@ -206,9 +231,22 @@ class CDPDownloadInterceptor:
         # Capture cdp_session in the closure so the handler uses the correct session
         # (requestId is scoped to the session that fired Fetch.requestPaused).
         cdp_session.on("Fetch.requestPaused", lambda event: self._on_request_paused(event, cdp_session))
+
+        # When proxy credentials are provided, also handle Fetch.authRequired events.
+        # This solves the problem where Playwright's new_context(proxy=...) cannot handle
+        # proxy authentication (407) on remote CDP browsers.
+        has_proxy_auth = bool(self._proxy_username and self._proxy_password)
+        if has_proxy_auth:
+            cdp_session.on("Fetch.authRequired", lambda event: self._on_auth_required(event, cdp_session))
+
+        # Note: Fetch.authRequired events are controlled solely by handleAuthRequests,
+        # independent of the patterns array (which only affects Fetch.requestPaused).
         await cdp_session.send(
             "Fetch.enable",
-            {"patterns": [{"requestStage": "Response"}]},
+            {
+                "patterns": [{"requestStage": "Response"}],
+                "handleAuthRequests": has_proxy_auth,
+            },
         )
         self._cdp_sessions.append(cdp_session)
         self._enabled = True
@@ -217,6 +255,7 @@ class CDPDownloadInterceptor:
             page_url=page.url,
             session_count=len(self._cdp_sessions),
             output_dir=str(self._output_dir),
+            proxy_auth_enabled=has_proxy_auth,
         )
 
     async def disable(self) -> None:
@@ -238,6 +277,74 @@ class CDPDownloadInterceptor:
     def _on_request_paused(self, event: dict[str, Any], cdp_session: CDPSession) -> None:
         """Handle Fetch.requestPaused — schedule async handler with the originating session."""
         asyncio.ensure_future(self._handle_request_paused(event, cdp_session))
+
+    def _on_auth_required(self, event: dict[str, Any], cdp_session: CDPSession) -> None:
+        """Handle Fetch.authRequired — schedule async handler with the originating session."""
+        asyncio.ensure_future(self._handle_auth_required(event, cdp_session))
+
+    async def _handle_auth_required(self, event: dict[str, Any], cdp_session: CDPSession) -> None:
+        """Handle proxy 407 auth challenges via CDP Fetch.continueWithAuth.
+
+        Only responds to proxy auth challenges (source == "Proxy") when credentials are available
+        and the request hasn't already been retried (to prevent infinite loops when credentials
+        are rejected). All other auth challenges are cancelled to prevent hanging.
+        """
+        try:
+            request_id = event["requestId"]
+            auth_challenge = event.get("authChallenge", {})
+            source = auth_challenge.get("source", "")
+            url = event.get("request", {}).get("url", "<unknown>")
+
+            # Defensive: this handler is only registered when credentials are present,
+            # but we still check to guard against future refactors.
+            attempts = self._auth_attempts.get(request_id, 0)
+            if source == "Proxy" and self._proxy_username and self._proxy_password and attempts < 1:
+                self._auth_attempts[request_id] = attempts + 1
+                LOG.info(
+                    "CDP proxy auth challenge received, providing credentials",
+                    url=url,
+                    origin=auth_challenge.get("origin", ""),
+                )
+                await cdp_session.send(
+                    "Fetch.continueWithAuth",
+                    {
+                        "requestId": request_id,
+                        "authChallengeResponse": {
+                            "response": "ProvideCredentials",
+                            "username": self._proxy_username,
+                            "password": self._proxy_password,
+                        },
+                    },
+                )
+            else:
+                # Clean up attempt tracking for this request
+                self._auth_attempts.pop(request_id, None)
+                if attempts >= 1:
+                    LOG.warning(
+                        "CDP proxy auth credentials rejected, cancelling to prevent retry loop",
+                        url=url,
+                        source=source,
+                        attempts=attempts,
+                    )
+                else:
+                    LOG.warning(
+                        "CDP auth challenge received, cancelling (non-proxy or no credentials)",
+                        url=url,
+                        source=source,
+                    )
+                await cdp_session.send(
+                    "Fetch.continueWithAuth",
+                    {
+                        "requestId": request_id,
+                        "authChallengeResponse": {"response": "CancelAuth"},
+                    },
+                )
+        except Exception as e:
+            LOG.error(
+                "Error handling CDP auth challenge",
+                error=str(e),
+                exc_info=True,
+            )
 
     async def _handle_request_paused(self, event: dict[str, Any], cdp_session: CDPSession) -> None:
         """Async handler for paused requests."""

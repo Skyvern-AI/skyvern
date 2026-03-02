@@ -167,8 +167,9 @@ class UnifiedServer:
         ws_client = web.WebSocketResponse(heartbeat=30.0)
         await ws_client.prepare(request)
 
-        # Connect to Chrome's CDP WebSocket with timeout and heartbeat
-        timeout = aiohttp.ClientTimeout(total=60, connect=30)
+        # Connect to Chrome's CDP WebSocket with connect timeout and heartbeat
+        # Note: total=None allows long-running CDP sessions; heartbeat handles dead connection detection
+        timeout = aiohttp.ClientTimeout(total=None, connect=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.ws_connect(chrome_ws_url, heartbeat=30.0) as ws_chrome:

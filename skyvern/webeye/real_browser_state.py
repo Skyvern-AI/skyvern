@@ -425,7 +425,7 @@ class RealBrowserState(BrowserState):
                     LOG.info("Main browser context and all its pages are closed")
                     if self.browser_cleanup is not None:
                         try:
-                            self.browser_cleanup()
+                            await self.browser_cleanup()
                             LOG.info("Main browser cleanup is executed")
                         except Exception:
                             LOG.warning("Failed to execute browser cleanup", exc_info=True)
