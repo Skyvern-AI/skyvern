@@ -19,6 +19,7 @@ import { HiddenCopyableInput } from "@/components/ui/hidden-copyable-input";
 import { OnePasswordTokenForm } from "@/components/OnePasswordTokenForm";
 import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
 import { CustomCredentialServiceConfigForm } from "@/components/CustomCredentialServiceConfigForm";
+import { FRONTEND_VERSION } from "@/util/version";
 
 function Settings() {
   const { environment, organization, setEnvironment, setOrganization } =
@@ -70,6 +71,38 @@ function Settings() {
           <HiddenCopyableInput value={apiKey ?? "API key not found"} />
         </CardContent>
       </Card>
+      {FRONTEND_VERSION.isAvailable && (
+        <Card>
+          <CardHeader className="border-b-2">
+            <CardTitle className="text-lg">Version Information</CardTitle>
+            <CardDescription>
+              Frontend build and version details
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="p-8">
+            <div className="flex flex-col gap-4">
+              <div className="flex items-center gap-4">
+                <Label className="w-36 whitespace-nowrap">Version</Label>
+                <span className="font-mono text-sm">
+                  {FRONTEND_VERSION.version}
+                </span>
+              </div>
+              <div className="flex items-center gap-4">
+                <Label className="w-36 whitespace-nowrap">Git SHA</Label>
+                <span className="font-mono text-sm">
+                  {FRONTEND_VERSION.gitSha}
+                </span>
+              </div>
+              <div className="flex items-center gap-4">
+                <Label className="w-36 whitespace-nowrap">Build Time</Label>
+                <span className="font-mono text-sm">
+                  {FRONTEND_VERSION.buildTime}
+                </span>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
       <Card>
         <CardHeader className="border-b-2">
           <CardTitle className="text-lg">1Password Integration</CardTitle>
