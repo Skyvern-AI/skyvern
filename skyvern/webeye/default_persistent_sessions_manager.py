@@ -268,6 +268,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
         is_high_priority: bool = False,
+        browser_profile_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
         LOG.info(
@@ -282,6 +283,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             proxy_location=proxy_location,
             extensions=extensions,
             browser_type=browser_type,
+            browser_profile_id=browser_profile_id,
         )
 
     async def occupy_browser_session(
