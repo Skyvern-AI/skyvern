@@ -145,16 +145,15 @@ async def update_status(
         )
         return None
 
-    if is_final_status(status):
-        if is_final_status(persistent_browser_session.status):
-            LOG.warning(
-                "Attempted to update browser session status to a final status when it is already final",
-                browser_session_id=session_id,
-                organization_id=organization_id,
-                desired_status=status,
-                current_status=persistent_browser_session.status,
-            )
-            return None
+    if is_final_status(persistent_browser_session.status):
+        LOG.warning(
+            "Attempted to update browser session status when it is already final",
+            browser_session_id=session_id,
+            organization_id=organization_id,
+            desired_status=status,
+            current_status=persistent_browser_session.status,
+        )
+        return None
 
     LOG.info(
         "Updating browser session status",
