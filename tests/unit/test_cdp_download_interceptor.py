@@ -371,7 +371,7 @@ class TestCDPDownloadInterceptorProxyAuth:
 
     @pytest.mark.asyncio
     async def test_enable_for_page_with_proxy_auth(self) -> None:
-        """enable_for_page should set handleAuthRequests=True and register authRequired handler."""
+        """enable_for_page with credentials should add Request-stage pattern and authRequired handler."""
         interceptor = self._make_interceptor(proxy_username="user", proxy_password="pass")
 
         mock_cdp_session = self._make_cdp_session()
@@ -381,23 +381,26 @@ class TestCDPDownloadInterceptorProxyAuth:
 
         await interceptor.enable_for_page(mock_page)
 
-        # Verify Fetch.enable was called with handleAuthRequests=True
+        # Verify Fetch.enable with both Response (downloads) and Request (auth) patterns
         mock_cdp_session.send.assert_called_once_with(
             "Fetch.enable",
             {
-                "patterns": [{"requestStage": "Response"}],
+                "patterns": [
+                    {"requestStage": "Response"},
+                    {"urlPattern": "*", "requestStage": "Request"},
+                ],
                 "handleAuthRequests": True,
             },
         )
 
-        # Verify both event handlers were registered
+        # Verify both handlers registered
         event_names = [call.args[0] for call in mock_cdp_session.on.call_args_list]
         assert "Fetch.requestPaused" in event_names
         assert "Fetch.authRequired" in event_names
 
     @pytest.mark.asyncio
     async def test_enable_for_page_without_proxy_auth(self) -> None:
-        """enable_for_page without credentials should set handleAuthRequests=False."""
+        """enable_for_page without credentials should only intercept Response stage."""
         interceptor = self._make_interceptor()
 
         mock_cdp_session = self._make_cdp_session()
@@ -407,7 +410,7 @@ class TestCDPDownloadInterceptorProxyAuth:
 
         await interceptor.enable_for_page(mock_page)
 
-        # Verify Fetch.enable was called with handleAuthRequests=False
+        # Verify Fetch.enable with Response-only pattern, no auth
         mock_cdp_session.send.assert_called_once_with(
             "Fetch.enable",
             {
@@ -416,10 +419,48 @@ class TestCDPDownloadInterceptorProxyAuth:
             },
         )
 
-        # Verify only requestPaused handler was registered (not authRequired)
+        # Verify only requestPaused handler (no authRequired)
         event_names = [call.args[0] for call in mock_cdp_session.on.call_args_list]
         assert "Fetch.requestPaused" in event_names
         assert "Fetch.authRequired" not in event_names
+
+    @pytest.mark.asyncio
+    async def test_request_stage_continues_request(self) -> None:
+        """Request-stage events (no responseStatusCode) should be continued with Fetch.continueRequest."""
+        interceptor = self._make_interceptor(proxy_username="user", proxy_password="pass")
+        cdp_session = self._make_cdp_session()
+
+        event = {
+            "requestId": "req-1",
+            "request": {"url": "https://example.com/page"},
+            "resourceType": "Document",
+            # No responseStatusCode — this is a Request-stage event
+        }
+
+        await interceptor._handle_request_paused(event, cdp_session)
+
+        cdp_session.send.assert_called_once_with("Fetch.continueRequest", {"requestId": "req-1"})
+
+    @pytest.mark.asyncio
+    async def test_request_stage_error_does_not_retry(self) -> None:
+        """Request-stage errors should not attempt recovery (no duplicate continueRequest)."""
+        interceptor = self._make_interceptor(proxy_username="user", proxy_password="pass")
+        cdp_session = self._make_cdp_session()
+
+        cdp_session.send.side_effect = Exception("continueRequest failed")
+
+        event = {
+            "requestId": "req-err",
+            "request": {"url": "https://example.com/page"},
+            "resourceType": "Document",
+            # No responseStatusCode — Request-stage event
+        }
+
+        await interceptor._handle_request_paused(event, cdp_session)
+
+        # Only one call: the original continueRequest that failed. No recovery attempt.
+        assert cdp_session.send.call_count == 1
+        assert cdp_session.send.call_args.args[0] == "Fetch.continueRequest"
 
     @pytest.mark.asyncio
     async def test_malformed_event_missing_request_id(self) -> None:

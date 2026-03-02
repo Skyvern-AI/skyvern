@@ -7,10 +7,13 @@ downloadPath does not work (e.g., Playwright bug #38805 — remote Windows Chrom
 ignoring Linux paths).
 
 Flow:
-1. Enable Fetch interception at Response stage for each page
+1. Enable Fetch interception for each page:
+   - Response stage: detect and intercept downloads
+   - Request stage (when proxy auth configured): enable Fetch.authRequired for proxy 407 challenges
 2. On each paused request:
-   - Non-download → Fetch.continueResponse (pass through)
-   - Download → extract body via stream → save to disk → Fetch.fulfillRequest (empty body blocks browser save)
+   - Request stage → Fetch.continueRequest (pass through to server)
+   - Response non-download → Fetch.continueResponse (pass through)
+   - Response download → extract body via stream → save to disk → Fetch.fulfillRequest
 """
 
 from __future__ import annotations
@@ -194,13 +197,15 @@ def extract_filename(headers: dict[str, str], url: str, index: int) -> str:
 
 class CDPDownloadInterceptor:
     """
-    Intercepts download responses via the CDP Fetch domain.
+    Intercepts download responses via the CDP Fetch domain and optionally handles
+    proxy authentication via Fetch.authRequired.
 
     Flow:
-    1. Enable Fetch interception at Response stage
+    1. Enable Fetch interception (Response stage for downloads; Request stage + handleAuthRequests for proxy auth)
     2. On each paused request:
-       - Non-download → Fetch.continueResponse (pass through)
-       - Download → extract body → save to disk → Fetch.fulfillRequest (block browser save)
+       - Request stage → Fetch.continueRequest (pass through)
+       - Response non-download → Fetch.continueResponse (pass through)
+       - Response download → extract body → save to disk → Fetch.fulfillRequest
     """
 
     def __init__(
@@ -226,25 +231,36 @@ class CDPDownloadInterceptor:
         LOG.info("CDP download interceptor download dir set", download_dir=download_dir)
 
     async def enable_for_page(self, page: Page) -> None:
-        """Create a CDP session for the given page and enable Fetch interception."""
+        """Create a CDP session for the given page and enable Fetch interception.
+
+        When proxy credentials are configured, also enables Fetch.authRequired handling
+        at the page level — matching Playwright's internal approach (CRNetworkManager).
+        Playwright uses Request-stage interception with handleAuthRequests to receive
+        proxy 407 challenges via Fetch.authRequired.
+        """
         cdp_session = await page.context.new_cdp_session(page)
-        # Capture cdp_session in the closure so the handler uses the correct session
-        # (requestId is scoped to the session that fired Fetch.requestPaused).
         cdp_session.on("Fetch.requestPaused", lambda event: self._on_request_paused(event, cdp_session))
 
-        # When proxy credentials are provided, also handle Fetch.authRequired events.
-        # This solves the problem where Playwright's new_context(proxy=...) cannot handle
-        # proxy authentication (407) on remote CDP browsers.
         has_proxy_auth = bool(self._proxy_username and self._proxy_password)
+
         if has_proxy_auth:
             cdp_session.on("Fetch.authRequired", lambda event: self._on_auth_required(event, cdp_session))
 
-        # Note: Fetch.authRequired events are controlled solely by handleAuthRequests,
-        # independent of the patterns array (which only affects Fetch.requestPaused).
+        # Always intercept Response stage for download detection.
+        # When proxy auth is needed, also intercept Request stage (like Playwright's
+        # CRNetworkManager) — Chrome requires Request-stage patterns for
+        # Fetch.authRequired to fire on proxy 407 challenges.
+        patterns: list[dict[str, str]] = [{"requestStage": "Response"}]
+        if has_proxy_auth:
+            # urlPattern "*" intercepts all requests at Request stage, which adds overhead.
+            # This is required: Chrome only fires Fetch.authRequired for proxy 407 challenges
+            # when a Request-stage pattern is registered.
+            patterns.append({"urlPattern": "*", "requestStage": "Request"})
+
         await cdp_session.send(
             "Fetch.enable",
             {
-                "patterns": [{"requestStage": "Response"}],
+                "patterns": patterns,
                 "handleAuthRequests": has_proxy_auth,
             },
         )
@@ -347,15 +363,30 @@ class CDPDownloadInterceptor:
             )
 
     async def _handle_request_paused(self, event: dict[str, Any], cdp_session: CDPSession) -> None:
-        """Async handler for paused requests."""
+        """Async handler for paused requests.
+
+        Handles both Request-stage and Response-stage events:
+        - Request stage (no responseStatusCode): continue the request immediately.
+          We intercept at Request stage only to make Fetch.authRequired fire for proxy auth.
+        - Response stage: check for downloads and intercept if needed.
+        """
         request_id = event["requestId"]
-        response_status = event.get("responseStatusCode", 0)
-        raw_response_headers = event.get("responseHeaders", [])
-        response_headers = _parse_headers(raw_response_headers)
+        response_status = event.get("responseStatusCode")
         url = event.get("request", {}).get("url", "<unknown>")
-        resource_type = event.get("resourceType", "")
 
         try:
+            # Request stage: no response yet (responseStatusCode absent). Continue the request
+            # so it proceeds to the server. We only intercept Request stage to enable
+            # Fetch.authRequired for proxy 407 challenges.
+            if response_status is None:
+                await cdp_session.send("Fetch.continueRequest", {"requestId": request_id})
+                return
+
+            # Response stage: check for downloads
+            raw_response_headers = event.get("responseHeaders", [])
+            response_headers = _parse_headers(raw_response_headers)
+            resource_type = event.get("resourceType", "")
+
             if is_download_response(response_headers, response_status, resource_type):
                 LOG.info(
                     "CDP download response detected",
@@ -378,10 +409,16 @@ class CDPDownloadInterceptor:
                 exc_info=True,
                 error=str(e),
             )
-            try:
-                await self._continue_response(cdp_session, request_id)
-            except Exception:
-                pass
+            # For Response-stage errors (e.g. download handling failed), try to let the
+            # response through so the request doesn't hang indefinitely.
+            # Request-stage errors don't need recovery here — either continueRequest already
+            # succeeded (and retrying would fail on an already-continued request), or it
+            # failed (and retrying the same call won't help).
+            if response_status is not None:
+                try:
+                    await self._continue_response(cdp_session, request_id)
+                except Exception:
+                    pass
 
     async def _continue_response(self, cdp_session: CDPSession, request_id: str) -> None:
         """Let a non-download response pass through to the browser."""
