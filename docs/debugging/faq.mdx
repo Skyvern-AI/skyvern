@@ -88,7 +88,7 @@ result = await client.run_workflow(
 )
 ```
 
-Parameters are available in prompts using `{{ parameter_name }}` syntax. See [Workflow Parameters](/workflows/workflow-parameters) for details.
+Parameters are available in prompts using `{{ parameter_name }}` syntax. See [Workflow Parameters](/multi-step-automations/workflow-parameters) for details.
 </Accordion>
 
 <Accordion title="How do I use credentials in a workflow?">
@@ -106,7 +106,7 @@ Skyvern doesn't have built-in scheduling yet. Use external schedulers like:
 - **Zapier/Make** — Trigger workflows from automation platforms
 - **Your backend** — Integrate scheduling into your application
 
-Set up a [webhook](/running-tasks/webhooks-faq) to get notified when scheduled runs complete.
+Set up a [webhook](/going-to-production/webhooks) to get notified when scheduled runs complete.
 </Accordion>
 
 <Accordion title="Why isn't my workflow using the parameter values I passed?">
@@ -184,7 +184,7 @@ while True:
     await asyncio.sleep(5)
 ```
 
-Or use [webhooks](/running-tasks/webhooks-faq) to get notified when runs complete without polling.
+Or use [webhooks](/going-to-production/webhooks) to get notified when runs complete without polling.
 </Accordion>
 
 <Accordion title="Where can I find extracted data after a run completes?">

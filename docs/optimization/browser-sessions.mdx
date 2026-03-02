@@ -259,7 +259,7 @@ async def main():
 
         # Then run a workflow in the same session (already logged in)
         result = await client.run_workflow(
-            workflow_id="wf_export_monthly_report",
+            workflow_id="wpid_export_monthly_report",
             browser_session_id=session_id,
             wait_for_completion=True,
         )
@@ -295,7 +295,7 @@ async function main() {
     // Then run a workflow in the same session (already logged in)
     const result = await client.runWorkflow({
       body: {
-        workflow_id: "wf_export_monthly_report",
+        workflow_id: "wpid_export_monthly_report",
         browser_session_id: sessionId,
       },
       waitForCompletion: true,
@@ -341,7 +341,7 @@ curl -s -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d "{
-    \"workflow_id\": \"wf_export_monthly_report\",
+    \"workflow_id\": \"wpid_export_monthly_report\",
     \"browser_session_id\": \"$SESSION_ID\"
   }"
 
@@ -583,7 +583,7 @@ await client.run_task(prompt="Step 1", browser_session_id=session.browser_sessio
 await client.run_task(prompt="Step 2", browser_session_id=session.browser_session_id, wait_for_completion=True)
 
 # More efficient: single workflow (blocks share one browser, no inter-task overhead)
-await client.run_workflow(workflow_id="wf_abc", wait_for_completion=True)
+await client.run_workflow(workflow_id="wpid_abc", wait_for_completion=True)
 ```
 
 ```typescript TypeScript
@@ -593,7 +593,7 @@ await client.runTask({ body: { prompt: "Step 1", browser_session_id: session.bro
 await client.runTask({ body: { prompt: "Step 2", browser_session_id: session.browser_session_id }, waitForCompletion: true });
 
 // More efficient: single workflow (blocks share one browser, no inter-task overhead)
-await client.runWorkflow({ body: { workflow_id: "wf_abc" }, waitForCompletion: true });
+await client.runWorkflow({ body: { workflow_id: "wpid_abc" }, waitForCompletion: true });
 ```
 </CodeGroup>
 

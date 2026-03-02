@@ -6,7 +6,7 @@ slug: getting-started/quickstart
 Run your first browser automation in 5 minutes. By the end of this guide, you'll scrape the top post from Hacker News using Skyvern's AI agent.
 
 <Note>
-Prefer a visual interface? Try the [Cloud UI](/cloud/overview) instead — no code required.
+Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started/overview) instead — no code required.
 </Note>
 
 ## Step 1: Get your API key
@@ -108,7 +108,7 @@ The response includes a `run_id` you'll use to check status and fetch results.
 Since tasks run asynchronously, you have two options:
 
 1. **Polling** — Periodically check the task status (shown below)
-2. **Webhooks** — Get notified when the task completes ([see webhooks guide](/running-tasks/webhooks-faq))
+2. **Webhooks** — Get notified when the task completes ([see webhooks guide](/going-to-production/webhooks))
 
 The code below polls every 5 seconds until the task reaches a terminal state. Once complete, `run.output` contains the extracted data as a dictionary.
 
@@ -365,7 +365,7 @@ A browser window will open on your machine (if you chose headful mode). Recordin
   <Card
     title="Extract Structured Data"
     icon="database"
-    href="/running-tasks/run-tasks"
+    href="/running-automations/extract-structured-data"
   >
     Define a schema to get typed JSON output from your automations
   </Card>
@@ -379,14 +379,14 @@ A browser window will open on your machine (if you chose headful mode). Recordin
   <Card
     title="Build Workflows"
     icon="diagram-project"
-    href="/workflows/manage-workflows"
+    href="/multi-step-automations/build-a-workflow"
   >
     Chain multiple steps together for complex automations
   </Card>
   <Card
     title="Use Webhooks"
     icon="webhook"
-    href="/running-tasks/webhooks-faq"
+    href="/going-to-production/webhooks"
   >
     Get notified when tasks complete instead of polling
   </Card>
