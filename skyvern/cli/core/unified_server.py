@@ -41,6 +41,12 @@ class UnifiedServer:
         if self.config.api_key:
             provided_key = request.headers.get("x-api-key")
             if provided_key != self.config.api_key:
+                LOG.warning(
+                    "Unauthorized request: invalid or missing API key",
+                    method=request.method,
+                    path=request.path,
+                    remote=request.remote,
+                )
                 return web.json_response(
                     {"error": "Unauthorized", "message": "Invalid or missing x-api-key"},
                     status=401,
