@@ -1,0 +1,127 @@
+---
+title: "Changelog"
+description: "New features, improvements, and fixes in Skyvern"
+---
+
+<Update label="v1.0.22 — February 26, 2026" description="Adaptive caching, Workflow Trigger block, CLI signup, and more">
+
+## New features
+
+- **Adaptive Caching (Script Generation)** — Skyvern can now learn from repeated workflow runs and generate cached scripts that speed up future executions. When a block runs successfully, Skyvern records a reusable script and replays it on subsequent runs, falling back to the AI agent only if the script fails. ([#4908](https://github.com/Skyvern-AI/skyvern/pull/4908), [#4916](https://github.com/Skyvern-AI/skyvern/pull/4916), [#4917](https://github.com/Skyvern-AI/skyvern/pull/4917), [#4920](https://github.com/Skyvern-AI/skyvern/pull/4920), [#4922](https://github.com/Skyvern-AI/skyvern/pull/4922), [#4931](https://github.com/Skyvern-AI/skyvern/pull/4931))
+
+- **Workflow Trigger Block** — A new block type that lets one workflow trigger another from within the workflow editor. Chain workflows together as building blocks for complex automations. ([#4885](https://github.com/Skyvern-AI/skyvern/pull/4885))
+
+- **Browser-based CLI Signup** — New users can sign up for Skyvern Cloud directly from the CLI. Running `skyvern signup` opens a browser flow that creates your account and stores your API key locally. ([#4925](https://github.com/Skyvern-AI/skyvern/pull/4925))
+
+- **Interactive ngrok Tunnel** — `skyvern browser serve` can now create an ngrok tunnel automatically, making it easy to expose your local browser to Skyvern Cloud without manual network configuration. ([#4924](https://github.com/Skyvern-AI/skyvern/pull/4924))
+
+- **South Korea Proxy Location** — Added `RESIDENTIAL_KR` as a proxy geolocation option for automations targeting South Korean websites. ([#4918](https://github.com/Skyvern-AI/skyvern/pull/4918))
+
+- **Downloaded Files Tab** — Browser session detail pages now include a Downloaded Files tab for viewing and accessing files captured during a session. ([#4911](https://github.com/Skyvern-AI/skyvern/pull/4911))
+
+- **CDP Proxy Authentication** — Remote browser connections now support authenticated proxies via the CDP `Fetch.authRequired` protocol. ([#4936](https://github.com/Skyvern-AI/skyvern/pull/4936))
+
+- **Remote Browser Download Interception** — File downloads triggered by XHR requests and other non-navigation events are now captured when using remote CDP browser connections. ([#4906](https://github.com/Skyvern-AI/skyvern/pull/4906), [#4921](https://github.com/Skyvern-AI/skyvern/pull/4921), [#4934](https://github.com/Skyvern-AI/skyvern/pull/4934))
+
+## Improvements
+
+- **Renamed "Login-Free" to "Saved Profile"** — Clearer terminology throughout the UI. Browser session checkbox wording has also been improved. ([#4914](https://github.com/Skyvern-AI/skyvern/pull/4914))
+
+- **TOTP Verification Improvements** — Better timer handling, expired code retry, 2FA banner suppression, and more reliable goal-text extraction during TOTP flows. ([#4860](https://github.com/Skyvern-AI/skyvern/pull/4860))
+
+- **TOTP Webhook includes `workflow_permanent_id`** — Easier to identify which workflow is requesting a 2FA code. ([#4871](https://github.com/Skyvern-AI/skyvern/pull/4871))
+
+- **Consolidated Gemini 3 Pro Model Key** — `VERTEX_GEMINI_3_PRO` now auto-resolves to the latest version, so you no longer need to update config when Google releases point versions. ([#4926](https://github.com/Skyvern-AI/skyvern/pull/4926))
+
+- **Browser Rotation for Remote Connections** — Remote browser environments now support context rotation, improving reliability for long-running automations. ([#4929](https://github.com/Skyvern-AI/skyvern/pull/4929))
+
+## Bug fixes
+
+- Fixed a race condition where final task status could be overwritten by a late-arriving non-final status. ([#4928](https://github.com/Skyvern-AI/skyvern/pull/4928))
+- Conditional blocks no longer crash when evaluating empty or null parameters. ([#4907](https://github.com/Skyvern-AI/skyvern/pull/4907))
+- Browser sessions using `FORCE_BROWSER_SESSION` no longer time out prematurely. ([#4903](https://github.com/Skyvern-AI/skyvern/pull/4903))
+- SVG-based captcha text is now correctly extracted during DOM scraping. ([#4880](https://github.com/Skyvern-AI/skyvern/pull/4880))
+- MCP remote tool handlers now route to the correct API environment. ([#4869](https://github.com/Skyvern-AI/skyvern/pull/4869))
+- MCP remote auth token comparison no longer fails on encrypted tokens. ([#4863](https://github.com/Skyvern-AI/skyvern/pull/4863))
+- `skyvern quickstart` now handles local PostgreSQL without a pre-existing `skyvern` role. ([#4878](https://github.com/Skyvern-AI/skyvern/pull/4878))
+- WebSocket URLs through ngrok tunnels now rewrite correctly for live browser streaming. ([#4927](https://github.com/Skyvern-AI/skyvern/pull/4927))
+
+</Update>
+
+<Update label="v1.0.21 — February 24, 2026" description="Reserved parameters, data_schema for loops, new LLM models">
+
+## New features
+
+- **`current_date` Reserved Parameter** — Workflows now have a built-in `current_date` parameter that resolves to today's date automatically. ([#4854](https://github.com/Skyvern-AI/skyvern/pull/4854))
+
+- **Reserved Parameters in Block Editor** — The workflow block parameter picker now shows reserved system parameters, making them discoverable without memorizing names. ([#4857](https://github.com/Skyvern-AI/skyvern/pull/4857))
+
+- **Natural Language Loop `data_schema`** — Loop blocks driven by natural language extraction now support a `data_schema` field for consistent output structure. ([#4851](https://github.com/Skyvern-AI/skyvern/pull/4851))
+
+- **Gemini 3.1 Pro and Inception Mercury-2** — Two new LLM engine options for your automations. ([#4847](https://github.com/Skyvern-AI/skyvern/pull/4847))
+
+- **MCP Server on API Service** — The MCP remote server is now mounted at `/mcp` on the existing API, eliminating the need for a separate process. ([#4843](https://github.com/Skyvern-AI/skyvern/pull/4843))
+
+## Improvements
+
+- Workflow save validation (HTTP 422) now returns clear, field-level error messages. ([#4852](https://github.com/Skyvern-AI/skyvern/pull/4852))
+- Browser launch errors now show actionable messages instead of raw exceptions. ([#4844](https://github.com/Skyvern-AI/skyvern/pull/4844))
+- Cloud LLM fallback overrides are now properly applied when selecting models. ([#4839](https://github.com/Skyvern-AI/skyvern/pull/4839))
+
+## Bug fixes
+
+- Conditional blocks no longer crash when all branches use Jinja templates. ([#4849](https://github.com/Skyvern-AI/skyvern/pull/4849))
+- Conditional blocks no longer misinterpret resolved Jinja template variables. ([#4841](https://github.com/Skyvern-AI/skyvern/pull/4841))
+
+</Update>
+
+<Update label="v1.0.18 — February 19, 2026" description="Browser profile testing and saved-profile workflows">
+
+## New features
+
+- **Browser Profile Testing** — Test browser profiles directly from the UI to verify that saved login sessions are still valid. Workflows can also run with a saved browser profile, enabling login-free automations that reuse authenticated sessions. ([#4818](https://github.com/Skyvern-AI/skyvern/pull/4818))
+
+## Bug fixes
+
+- When both a TOTP credential and a webhook are configured for 2FA, the credential is now correctly prioritized. ([#4811](https://github.com/Skyvern-AI/skyvern/pull/4811))
+
+</Update>
+
+<Update label="v1.0.17 — February 19, 2026" description="Skills package and cached script management">
+
+## New features
+
+- **Skyvern Skills Package** — The new `skyvern skill` CLI command provides pre-built workflow templates and reference documentation for common automation patterns. ([#4817](https://github.com/Skyvern-AI/skyvern/pull/4817))
+
+- **Clear Cached Scripts API** — A new endpoint lets you clear cached automation scripts for a workflow when a target website changes and you want to force Skyvern to re-learn. ([#4809](https://github.com/Skyvern-AI/skyvern/pull/4809))
+
+</Update>
+
+<Update label="v1.0.16 — February 19, 2026" description="2FA detection, full CLI parity, Claude Opus 4.6 CUA">
+
+## New features
+
+- **Automatic 2FA Detection Without TOTP Credentials** — Skyvern now detects when a website asks for a 2FA code even without pre-configured TOTP credentials. The system pauses and waits for you to provide the code via the UI or webhook. ([#4786](https://github.com/Skyvern-AI/skyvern/pull/4786))
+
+- **Full CLI Parity with MCP** — The CLI now supports browser session management, credential management, block operations, and enhanced workflow commands. Everything available through MCP is now accessible from the command line. ([#4789](https://github.com/Skyvern-AI/skyvern/pull/4789), [#4792](https://github.com/Skyvern-AI/skyvern/pull/4792), [#4793](https://github.com/Skyvern-AI/skyvern/pull/4793))
+
+- **Claude Opus 4.6 CUA Support** — Anthropic's Claude Opus 4.6 is now available as a Computer Use Agent model for driving browser interactions. ([#4780](https://github.com/Skyvern-AI/skyvern/pull/4780))
+
+## Improvements
+
+- The workflow run timeline now properly displays loop iterations and conditional branches, making complex runs easier to debug. ([#4782](https://github.com/Skyvern-AI/skyvern/pull/4782))
+
+## Bug fixes
+
+- Fixed conditional blocks evaluating the wrong value after Jinja template rendering. ([#4801](https://github.com/Skyvern-AI/skyvern/pull/4801))
+- Fixed MFA resolution priority when both TOTP credentials and webhooks are configured. ([#4800](https://github.com/Skyvern-AI/skyvern/pull/4800))
+
+</Update>
+
+<Update label="v1.0.15 — February 17, 2026" description="Claude Opus 4.6 model support">
+
+## New features
+
+- **Anthropic Claude Opus 4.6** — Added Claude Opus 4.6 as an available LLM engine for web automation tasks. ([#4777](https://github.com/Skyvern-AI/skyvern/pull/4777), [#4778](https://github.com/Skyvern-AI/skyvern/pull/4778))
+
+</Update>

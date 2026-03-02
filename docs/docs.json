@@ -189,6 +189,12 @@
         ]
       },
       {
+        "tab": "Changelog",
+        "pages": [
+          "changelog"
+        ]
+      },
+      {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
       },
