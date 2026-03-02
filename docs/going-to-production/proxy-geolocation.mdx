@@ -221,6 +221,11 @@ export const COUNTRY_PATHS = {
 export const PROXY_LOCATIONS = [
   { code: "US", name: "United States", value: "RESIDENTIAL", timezone: "America/New_York", flag: "🇺🇸" },
   { code: "US_ISP", name: "United States (ISP)", value: "RESIDENTIAL_ISP", timezone: "America/New_York", flag: "🇺🇸" },
+  { code: "US_CA", name: "California", value: "US-CA", timezone: "America/Los_Angeles", flag: "🇺🇸" },
+  { code: "US_NY", name: "New York", value: "US-NY", timezone: "America/New_York", flag: "🇺🇸" },
+  { code: "US_TX", name: "Texas", value: "US-TX", timezone: "America/Chicago", flag: "🇺🇸" },
+  { code: "US_FL", name: "Florida", value: "US-FL", timezone: "America/New_York", flag: "🇺🇸" },
+  { code: "US_WA", name: "Washington", value: "US-WA", timezone: "America/Los_Angeles", flag: "🇺🇸" },
   { code: "CA", name: "Canada", value: "RESIDENTIAL_CA", timezone: "America/Toronto", flag: "🇨🇦" },
   { code: "MX", name: "Mexico", value: "RESIDENTIAL_MX", timezone: "America/Mexico_City", flag: "🇲🇽" },
   { code: "AR", name: "Argentina", value: "RESIDENTIAL_AR", timezone: "America/Argentina/Buenos_Aires", flag: "🇦🇷" },
@@ -560,6 +565,11 @@ Use these enum values for country-level targeting. Each routes through a residen
 |-------|---------|----------|
 | `RESIDENTIAL` | United States | America/New_York |
 | `RESIDENTIAL_ISP` | United States | America/New_York |
+| `US-CA` | California, US | America/Los_Angeles |
+| `US-NY` | New York, US | America/New_York |
+| `US-TX` | Texas, US | America/Chicago |
+| `US-FL` | Florida, US | America/New_York |
+| `US-WA` | Washington, US | America/Los_Angeles |
 | `RESIDENTIAL_AR` | Argentina | America/Argentina/Buenos_Aires |
 | `RESIDENTIAL_AU` | Australia | Australia/Sydney |
 | `RESIDENTIAL_BR` | Brazil | America/Sao_Paulo |
@@ -722,7 +732,7 @@ Need a location that's not available? Get help in the [Skyvern Discord community
   <Card
     title="Browser Sessions"
     icon="window"
-    href="/browser-sessions/introduction"
+    href="/optimization/browser-sessions"
   >
     Maintain IP consistency across multi-step tasks
   </Card>

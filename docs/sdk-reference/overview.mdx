@@ -54,7 +54,7 @@ If you're inside a framework that already runs an event loop (FastAPI, Django AS
 
 ## Environments
 
-The SDK ships with two built-in environment URLs:
+The SDK ships with three built-in environment URLs:
 
 ```python
 from skyvern.client import SkyvernEnvironment
@@ -63,6 +63,7 @@ from skyvern.client import SkyvernEnvironment
 | Environment | URL | When to use |
 |-------------|-----|-------------|
 | `SkyvernEnvironment.CLOUD` | `https://api.skyvern.com` | Skyvern Cloud (default) |
+| `SkyvernEnvironment.STAGING` | `https://api.staging.skyvern.com` | Staging environment for testing |
 | `SkyvernEnvironment.LOCAL` | `http://localhost:8000` | Local server started with `skyvern run server` |
 
 For a self-hosted instance at a custom URL, pass `base_url` instead:
