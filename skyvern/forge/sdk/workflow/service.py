@@ -2036,6 +2036,12 @@ class WorkflowService:
                 and block.label not in script_blocks_by_label
                 and workflow_run_block_result.status in cacheable_statuses
                 and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                # For traditional caching (adaptive_caching=False), only track blocks
+                # for regeneration when actually running with code. Agent-mode runs
+                # should not trigger regeneration — doing so creates an infinite loop
+                # where every run deletes and regenerates the script because blocks
+                # always execute via agent and are never in script_blocks_by_label.
+                and (workflow.adaptive_caching or is_script_run)
             ):
                 blocks_to_update.add(block.label)
 
