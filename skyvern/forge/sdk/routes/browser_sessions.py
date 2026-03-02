@@ -78,6 +78,7 @@ async def get_browser_sessions_all(
     responses={
         200: {"description": "Successfully created browser session"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
+        404: {"description": "Browser profile not found"},
     },
 )
 @base_router.post(
@@ -89,12 +90,24 @@ async def create_browser_session(
     browser_session_request: CreateBrowserSessionRequest = CreateBrowserSessionRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
+    if browser_session_request.browser_profile_id:
+        profile = await app.DATABASE.get_browser_profile(
+            browser_session_request.browser_profile_id,
+            current_org.organization_id,
+        )
+        if not profile:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Browser profile {browser_session_request.browser_profile_id} not found",
+            )
+
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         timeout_minutes=browser_session_request.timeout,
         proxy_location=browser_session_request.proxy_location,
         extensions=browser_session_request.extensions,
         browser_type=browser_session_request.browser_type,
+        browser_profile_id=browser_session_request.browser_profile_id,
     )
     return await BrowserSessionResponse.from_browser_session(browser_session)
 

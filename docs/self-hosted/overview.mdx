@@ -13,26 +13,23 @@ Self-hosted Skyvern has four components running on your infrastructure:
 ```mermaid
 flowchart LR
     subgraph Your Infrastructure
-        API[Skyvern API Server]
+        API[Skyvern API Server<br/>+ Embedded Browser]
         DB[(PostgreSQL)]
-        Browser[Browser Container]
     end
 
     LLM[LLM Provider]
     Sites[Target Websites]
 
     API <--> DB
-    API <--> Browser
     API <--> LLM
-    Browser <--> Sites
+    API <--> Sites
 ```
 
 | Component | Role |
 |-----------|------|
-| **Skyvern API Server** | Orchestrates tasks, processes LLM responses, stores results |
+| **Skyvern API Server** | Orchestrates tasks, processes LLM responses, stores results. Includes an embedded Playwright-managed Chromium browser that executes web automation. |
 | **PostgreSQL** | Stores task history, workflows, credentials, and organization data |
-| **Browser Container** | Playwright-managed Chromium that executes the actual web automation |
-| **LLM Provider** | Analyzes screenshots and determines actions. You provide the API key (OpenAI, Anthropic, Azure, or local via Ollama) |
+| **LLM Provider** | Analyzes screenshots and determines actions. You provide the API key (OpenAI, Anthropic, Azure OpenAI, Google Vertex AI, Amazon Bedrock, Groq, OpenRouter, or local via Ollama) |
 
 ### How a task executes
 

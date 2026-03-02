@@ -79,6 +79,7 @@ class ScriptReviewer:
         episodes: list[ScriptFallbackEpisode],
         stale_branches: list[ScriptBranchHit] | None = None,
         historical_episodes: list[ScriptFallbackEpisode] | None = None,
+        run_parameter_values: dict[str, str] | None = None,
     ) -> dict[str, str] | None:
         """Review fallback episodes and generate updated code for affected blocks.
 
@@ -149,6 +150,7 @@ class ScriptReviewer:
                     stale_branches=stale_by_block.get(block_label),
                     all_parameter_keys=all_parameter_keys,
                     historical_episodes=history_by_block.get(block_label),
+                    run_parameter_values=run_parameter_values,
                 )
                 if updated_code:
                     updated_blocks[block_label] = updated_code
@@ -169,6 +171,7 @@ class ScriptReviewer:
         organization_id: str,
         workflow_permanent_id: str,
         conditional_episodes: list[ScriptFallbackEpisode],
+        run_parameter_values: dict[str, str] | None = None,
     ) -> dict[str, str] | None:
         """Review conditional blocks that ran via agent and generate Python code if possible.
 
@@ -195,6 +198,7 @@ class ScriptReviewer:
                     block_label=block_label,
                     episode=episode,
                     organization_id=organization_id,
+                    run_parameter_values=run_parameter_values,
                 )
                 if code:
                     updated_blocks[block_label] = code
@@ -211,6 +215,7 @@ class ScriptReviewer:
         block_label: str,
         episode: ScriptFallbackEpisode,
         organization_id: str,
+        run_parameter_values: dict[str, str] | None = None,
     ) -> str | None:
         """Generate Python code for a conditional block based on its expression patterns.
 
@@ -301,6 +306,16 @@ class ScriptReviewer:
                 )
                 return None
 
+            # Validate no hardcoded parameter values
+            hardcoded_error = self._validate_no_hardcoded_values(code, run_parameter_values)
+            if hardcoded_error is not None:
+                LOG.warning(
+                    "ScriptReviewer: conditional code has hardcoded parameter values",
+                    block_label=block_label,
+                    error=hardcoded_error,
+                )
+                return None
+
             LOG.info(
                 "ScriptReviewer: generated conditional code",
                 block_label=block_label,
@@ -383,6 +398,7 @@ class ScriptReviewer:
         stale_branches: list[ScriptBranchHit] | None = None,
         all_parameter_keys: list[str] | None = None,
         historical_episodes: list[ScriptFallbackEpisode] | None = None,
+        run_parameter_values: dict[str, str] | None = None,
     ) -> str | None:
         """Review a single block's fallback episodes and generate updated code."""
         LOG.info(
@@ -642,6 +658,19 @@ class ScriptReviewer:
                     )
                     if attempt < max_attempts:
                         current_prompt = self._build_retry_prompt(updated_code, regression_error, function_signature)
+                    continue
+
+                # Validate no hardcoded parameter values (catch leaked run-specific data)
+                hardcoded_error = self._validate_no_hardcoded_values(updated_code, run_parameter_values)
+                if hardcoded_error is not None:
+                    LOG.warning(
+                        "ScriptReviewer: hardcoded parameter value detected, retrying",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=hardcoded_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(updated_code, hardcoded_error, function_signature)
                     continue
 
                 LOG.info(
@@ -1311,6 +1340,57 @@ class ScriptReviewer:
             )
 
         return None
+
+    # Regex to extract string literals (single or double quoted, excluding escaped quotes)
+    _STRING_LITERAL_RE: re.Pattern[str] = re.compile(r"""(?<![\\])(['"])((?:(?!\1)[^\\]|\\.)*)(\1)""")
+
+    def _validate_no_hardcoded_values(
+        self,
+        code: str,
+        run_parameter_values: dict[str, str] | None,
+    ) -> str | None:
+        """Detect hardcoded parameter values in generated code.
+
+        Checks if any workflow parameter value from the current run appears as a
+        string literal in the code. This catches cases where the LLM copies a
+        run-specific value (e.g., a customer email) instead of referencing
+        context.parameters['key'].
+
+        Returns an error message or None if no hardcoded values are found.
+        """
+        if not run_parameter_values:
+            return None
+
+        # Extract all string literals from non-comment lines
+        code_literals: set[str] = set()
+        for line in code.split("\n"):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            for match in self._STRING_LITERAL_RE.finditer(line):
+                literal_value = match.group(2)
+                if literal_value:
+                    code_literals.add(literal_value)
+
+        hardcoded: list[tuple[str, str]] = []
+        for param_key, param_value in run_parameter_values.items():
+            # Skip short values to avoid false positives (e.g., "yes", "true", "1")
+            if len(param_value) < 5:
+                continue
+            # Check if the parameter value appears as a string literal
+            if param_value in code_literals:
+                hardcoded.append((param_key, param_value))
+
+        if not hardcoded:
+            return None
+
+        examples = "; ".join(f"'{value[:50]}' should be context.parameters['{key}']" for key, value in hardcoded[:3])
+        return (
+            f"CRITICAL: Generated code contains hardcoded parameter values that are specific to this run. "
+            f"These values will break when the workflow runs with different parameters. "
+            f"Found {len(hardcoded)} hardcoded value(s): {examples}. "
+            f"Replace ALL hardcoded parameter values with context.parameters['key'] references."
+        )
 
     def _auto_fix_missing_else(self, code: str, navigation_goal: str) -> str | None:
         """Auto-inject missing `else` branches after page.classify() if/elif chains.

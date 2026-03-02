@@ -108,7 +108,21 @@ The `AZURE_DEPLOYMENT` is the name you chose when deploying the model, not the m
 
 ## Google Gemini
 
-Gemini models through [Vertex AI](https://cloud.google.com/vertex-ai). Requires a GCP project with Vertex AI enabled.
+Skyvern supports Gemini through two paths: the **Gemini API** (simpler, uses an API key) and **Vertex AI** (enterprise, uses a GCP service account).
+
+### Gemini API
+
+The quickest way to use Gemini. Get an API key from [Google AI Studio](https://aistudio.google.com/).
+
+```bash .env
+ENABLE_GEMINI=true
+GEMINI_API_KEY=your-gemini-api-key
+LLM_KEY=VERTEX_GEMINI_2.5_FLASH
+```
+
+### Vertex AI
+
+For enterprise deployments through [Vertex AI](https://cloud.google.com/vertex-ai). Requires a GCP project with Vertex AI enabled.
 
 ```bash .env
 ENABLE_VERTEX_AI=true
@@ -118,7 +132,7 @@ GCP_PROJECT_ID=your-gcp-project-id
 GCP_REGION=us-central1
 ```
 
-### Setup steps
+**Vertex AI setup steps:**
 
 1. Create a [GCP project](https://console.cloud.google.com/) with billing enabled
 2. Enable the **Vertex AI API** in your project

@@ -153,9 +153,19 @@ class RealBrowserManager(BrowserManager):
         if browser_profile_id is None:
             browser_profile_id = workflow_run.browser_profile_id
 
+        # Check own cache entry first so navigate_to_url is only called on the first step.
+        # Don't pass parent_workflow_run_id here — that lookup is deferred to the block
+        # below so PBS runs don't accidentally inherit the parent's browser.
+        browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run_id)
+        if browser_state:
+            LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
+            return browser_state
+
         # When an explicit browser_session_id is provided (e.g. from a workflow
         # trigger block), skip the parent workflow lookup so the child uses the
         # specified persistent session instead of inheriting the parent's browser.
+        # Note: at this point workflow_run_id is guaranteed not in self.pages (caught above),
+        # so the call below can only match via parent_workflow_run_id.
         if not browser_session_id:
             browser_state = self.get_for_workflow_run(
                 workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
@@ -233,6 +243,9 @@ class RealBrowserManager(BrowserManager):
     def get_for_workflow_run(
         self, workflow_run_id: str, parent_workflow_run_id: str | None = None
     ) -> BrowserState | None:
+        # Priority: parent first, then own entry.
+        # Callers that need to avoid parent inheritance must omit parent_workflow_run_id.
+        # See get_or_create_for_workflow_run() for the two-phase lookup pattern.
         if parent_workflow_run_id and parent_workflow_run_id in self.pages:
             return self.pages[parent_workflow_run_id]
 

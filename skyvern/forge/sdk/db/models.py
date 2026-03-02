@@ -865,6 +865,7 @@ class PersistentBrowserSessionModel(Base):
     proxy_location = Column(String, nullable=True)
     extensions = Column(JSON, nullable=True)
     browser_type = Column(String, nullable=True)
+    browser_profile_id = Column(String, nullable=True, index=True)
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)

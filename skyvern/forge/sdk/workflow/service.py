@@ -1334,12 +1334,18 @@ class WorkflowService:
             except Exception:
                 LOG.debug("Failed to extract form field metadata for fallback episode", exc_info=True)
 
+            # Conditional blocks must use "conditional_agent" fallback type so the
+            # script reviewer routes them to the simpler conditional-specific prompt
+            # instead of the general reviewer (which would generate inappropriate
+            # browser-automation code like page.classify for pure-Python conditionals).
+            fallback_type = "conditional_agent" if isinstance(block, ConditionalBlock) else "full_block"
+
             episode = await app.DATABASE.create_fallback_episode(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 workflow_run_id=workflow_run_id,
                 block_label=block.label,
-                fallback_type="full_block",
+                fallback_type=fallback_type,
                 script_revision_id=script_revision_id,
                 error_message=error_message[:2000],
                 classify_result=classify_result,
@@ -1952,9 +1958,12 @@ class WorkflowService:
 
                 # Record conditional episode so the script reviewer can learn the
                 # expression→result mapping and potentially convert it to Python code.
+                # This fires both when the block requires_agent (first run) and when
+                # cached code failed and agent fallback re-ran the conditional
+                # (fallback_episode_id is set when the script path failed).
                 if (
                     is_script_run
-                    and block_requires_agent
+                    and (block_requires_agent or fallback_episode_id)
                     and workflow_run_block_result.status == BlockStatus.completed
                     and branch_metadata
                     and workflow.adaptive_caching
@@ -2027,6 +2036,12 @@ class WorkflowService:
                 and block.label not in script_blocks_by_label
                 and workflow_run_block_result.status in cacheable_statuses
                 and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                # For traditional caching (adaptive_caching=False), only track blocks
+                # for regeneration when actually running with code. Agent-mode runs
+                # should not trigger regeneration — doing so creates an infinite loop
+                # where every run deletes and regenerates the script because blocks
+                # always execute via agent and are never in script_blocks_by_label.
+                and (workflow.adaptive_caching or is_script_run)
             ):
                 blocks_to_update.add(block.label)
 
@@ -4610,6 +4625,20 @@ class WorkflowService:
         try:
             reviewer = ScriptReviewer()
 
+            # Load the workflow run's parameter values so the reviewer can detect
+            # hardcoded values in generated code (e.g., a customer email that should
+            # use context.parameters['recipient'] instead of a literal string).
+            run_parameter_values: dict[str, str] = {}
+            try:
+                run_param_tuples = await app.DATABASE.get_workflow_run_parameters(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                for wf_param, run_param in run_param_tuples:
+                    if isinstance(run_param.value, str) and run_param.value:
+                        run_parameter_values[wf_param.key] = run_param.value
+            except Exception:
+                LOG.debug("Failed to load run parameter values for hardcoded-value check", exc_info=True)
+
             # Split episodes by type: regular fallback vs conditional_agent
             regular_episodes = [ep for ep in episodes if ep.fallback_type != "conditional_agent"]
             conditional_episodes = [ep for ep in episodes if ep.fallback_type == "conditional_agent"]
@@ -4626,6 +4655,7 @@ class WorkflowService:
                     episodes=regular_episodes,
                     stale_branches=stale_branches,
                     historical_episodes=historical_episodes,
+                    run_parameter_values=run_parameter_values,
                 )
                 if regular_updates:
                     updated_blocks.update(regular_updates)
@@ -4636,6 +4666,7 @@ class WorkflowService:
                     organization_id=workflow.organization_id,
                     workflow_permanent_id=workflow.workflow_permanent_id,
                     conditional_episodes=conditional_episodes,
+                    run_parameter_values=run_parameter_values,
                 )
                 if conditional_updates:
                     conditional_blocks.update(conditional_updates)
