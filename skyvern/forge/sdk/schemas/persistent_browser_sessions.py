@@ -61,6 +61,7 @@ class PersistentBrowserSession(BaseModel):
     deleted_at: datetime | None = None
     extensions: list[Extensions] | None = None
     browser_type: PersistentBrowserType | None = None
+    browser_profile_id: str | None = None
 
 
 class AddressablePersistentBrowserSession(PersistentBrowserSession):
