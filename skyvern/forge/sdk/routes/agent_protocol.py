@@ -541,7 +541,22 @@ async def create_workflow_legacy(
     try:
         workflow_yaml = yaml.safe_load(raw_yaml)
     except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+        raw_str = raw_yaml.decode("utf-8") if isinstance(raw_yaml, bytes) else raw_yaml
+        stripped = raw_str.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                json.loads(raw_str)
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid JSON. JSON files should be properly formatted. If you're importing a JSON file, ensure it's valid JSON.",
+                )
+            except (json.JSONDecodeError, ValueError):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid JSON format. Please check your JSON file syntax.",
+                )
+        else:
+            raise HTTPException(status_code=422, detail="Invalid YAML format. Please check your YAML file syntax.")
 
     # Auto-sanitize block labels and update references for imports
     workflow_yaml = sanitize_workflow_yaml_with_references(workflow_yaml)
@@ -616,7 +631,7 @@ async def create_workflow(
             request=workflow_definition,
         )
     except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+        raise HTTPException(status_code=422, detail="Invalid YAML format. Please check your YAML file syntax.")
     except WorkflowDefinitionValidationException as e:
         raise e
     except Exception as e:
