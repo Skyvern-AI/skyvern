@@ -1,4 +1,4 @@
-"""MCP prompt skills for Skyvern workflow design, debugging, and data extraction.
+"""MCP prompt skills for Skyvern workflow design, debugging, data extraction, and QA testing.
 
 These prompts are registered with @mcp.prompt() and injected into LLM conversations
 to guide Claude through Skyvern automation tasks. Each prompt teaches Claude to act
@@ -452,3 +452,316 @@ def extract_data(
             "and validate the results."
         )
     return EXTRACT_DATA_CONTENT + suffix
+
+
+# ---------------------------------------------------------------------------
+# qa_test
+# ---------------------------------------------------------------------------
+
+# NOTE: This content is also maintained in .claude/skills/qa/SKILL.md
+# for the /qa Claude Code skill. Keep both in sync when updating.
+QA_TEST_CONTENT = """\
+# QA — Test Frontend Changes in a Real Browser
+
+You read the developer's code diff, understand what UI was affected, open a real browser
+against their running dev server, and test that the changes actually work.
+
+This is NOT a generic website crawler. It tests what CHANGED based on the code diff.
+
+---
+
+## Step 1: Understand the Changes
+
+### Get the diff
+
+```bash
+# What files changed?
+git diff --name-only HEAD~1     # vs last commit (if changes are committed)
+git diff --name-only             # vs working tree (if uncommitted)
+
+# Full diff for context
+git diff HEAD~1                  # or git diff for uncommitted
+```
+
+Pick whichever diff has content. If both are empty, there's nothing to QA.
+
+### Read the changed files
+
+For every changed frontend file (`.tsx`, `.jsx`, `.ts`, `.js`, `.css`, `.html`):
+- Read the FULL file (not just the diff) to understand the component
+- Look for: route paths, component names, text labels, form fields, button labels,
+  API endpoints called, conditional rendering, error states
+
+### Classify the changes
+
+| Change Type | What to Test |
+|-------------|-------------|
+| New component/page | Navigate to it, verify it renders, interact with its elements |
+| Modified component | Navigate to it, verify the specific change works (new button, new text, new behavior) |
+| Styling changes | Navigate, screenshot, verify layout isn't broken |
+| API integration | Navigate, trigger the action, verify the API call works (check network, verify UI updates) |
+| Form changes | Fill the form, submit, verify validation and success states |
+| Route changes | Navigate to old and new routes, verify routing works |
+| Shared component (used in many places) | Test 2-3 pages that use it |
+| Bug fix | Reproduce the original bug scenario, verify it's fixed |
+
+### Generate test cases
+
+For each changed file, write specific test cases. Example:
+
+If the diff shows changes to `LoginForm.tsx` adding a "Forgot password" link:
+```
+Test 1: Login page renders the new "Forgot password" link
+  - Navigate to /login
+  - Assert: link with text "Forgot password" exists
+  - Click it
+  - Assert: navigated to /forgot-password (or modal appeared)
+
+Test 2: Login form still works (regression)
+  - Navigate to /login
+  - Verify email and password inputs exist
+  - Submit empty form, verify validation errors appear
+```
+
+**Be specific.** Don't write "verify the page works." Write "verify the 'Forgot password'
+link navigates to /forgot-password."
+
+---
+
+## Step 2: Find the Dev Server
+
+If a URL was provided, use it. Otherwise, auto-detect:
+
+```
+# Try common dev server ports
+# 5173 (Vite), 3000 (Next/CRA), 3001, 8080, 8000, 4200 (Angular)
+```
+
+Navigate to each until one responds. If none respond, tell the user:
+"Start your dev server first, then try again."
+
+---
+
+## Step 3: Connect to a Browser
+
+Try these in order:
+
+### Option A: Local browser (fastest — works when MCP server runs locally)
+```
+skyvern_browser_session_create(local=true, headless=false, timeout=15)
+```
+Use `local=true` so the browser can reach `localhost`. Use `headless=false` so the user can watch.
+
+### Option B: Local browser via tunnel (for remote/cloud-hosted MCP + localhost dev server)
+
+If local session creation fails — typically because the MCP server is running remotely
+(e.g., api.skyvern.com) — the cloud browser cannot reach `localhost`. The user needs to
+run a local browser and tunnel it.
+
+Tell the user to run these in separate terminals:
+
+```bash
+# Terminal 1: Launch a local browser with CDP exposed
+skyvern browser serve --port 9222
+
+# Terminal 2: Tunnel it to the internet (install: brew install ngrok)
+ngrok http 9222
+```
+
+Then connect to the ngrok URL:
+```
+skyvern_browser_session_connect(cdp_url="wss://<ngrok-subdomain>.ngrok-free.app/devtools/browser/<id>")
+```
+
+The user can get the browser ID from the `skyvern browser serve` output or by calling
+the ngrok URL's `/json` endpoint.
+
+### Option C: Cloud browser (for publicly accessible URLs only)
+```
+skyvern_browser_session_create(timeout=15)
+```
+Only works if the dev server URL is publicly accessible. Warn the user that `localhost`
+URLs will not work with cloud browsers.
+
+---
+
+## Step 4: Run the Tests
+
+For each test case generated in Step 1:
+
+### Navigate
+```
+skyvern_navigate(url="http://localhost:<port>/<route>")
+```
+
+### Health gate (after every navigate, ~10ms)
+```
+skyvern_evaluate(expression="(() => {
+  const errors = [];
+  const body = document.body?.innerText || '';
+  if (body.includes('Something went wrong')) errors.push('error_message');
+  if (body.includes('Cannot read properties')) errors.push('js_error_in_ui');
+  if (/\\bundefined\\b/.test(body) && !/\\bif\\b|\\btypeof\\b|\\bdocument|tutorial|example/i.test(body) \
+&& body.length < 5000) errors.push('undefined_text');
+  if (body.includes('connection refused')) errors.push('connection_refused');
+  if (/sign.?in|log.?in|auth/i.test(window.location.pathname)) errors.push('auth_redirect');
+  if (document.querySelector('[role=\"alert\"]')) errors.push('alert_element');
+  if (!document.querySelector('main, [role=\"main\"], nav, header, h1, h2, \
+[class*=\"layout\" i], [class*=\"page\" i], [class*=\"app\" i]'))
+    errors.push('blank_page');
+  return JSON.stringify({ pass: errors.length === 0, errors });
+})()")
+```
+
+### Assert with DOM queries (prefer `skyvern_evaluate` — fast, deterministic)
+```
+# Element exists
+skyvern_evaluate(expression="!!document.querySelector('a[href=\"/forgot-password\"]')")
+
+# Text content
+skyvern_evaluate(expression="document.querySelector('h1')?.textContent?.trim()")
+
+# Element count
+skyvern_evaluate(expression="document.querySelectorAll('.card').length")
+
+# URL after navigation
+skyvern_evaluate(expression="window.location.pathname")
+```
+
+### Interact (use `skyvern_act` for natural language actions)
+```
+skyvern_act(prompt="Click the 'Forgot password' link")
+skyvern_act(prompt="Fill the email field with 'test@example.com' and click Submit")
+skyvern_act(prompt="Open the dropdown menu and select 'Settings'")
+```
+
+### Visual checks (use `skyvern_validate` only when DOM queries aren't enough)
+```
+skyvern_validate(prompt="The login form shows email and password fields with a blue Submit button")
+```
+
+### Screenshot (after every significant action)
+```
+skyvern_screenshot()
+```
+
+### Failed network requests (once per page)
+```
+skyvern_evaluate(expression="(() => {
+  const entries = performance.getEntriesByType('resource').filter(e => e.responseStatus >= 400);
+  return JSON.stringify({ failed: entries.map(e => ({ url: e.name, status: e.responseStatus })).slice(0, 5) });
+})()")
+```
+
+---
+
+## Step 5: Report Results
+
+```markdown
+## QA Report
+
+### Changes Tested
+Files: `LoginForm.tsx`, `ForgotPassword.tsx`
+Diff summary: Added "Forgot password" link to login form, new /forgot-password page
+
+### Results
+| # | Test | Result | Screenshot |
+|---|------|--------|------------|
+| 1 | Login page renders "Forgot password" link | PASS | screenshot_1 |
+| 2 | Clicking link navigates to /forgot-password | PASS | screenshot_2 |
+| 3 | Forgot password page renders form | PASS | screenshot_3 |
+| 4 | Login form still works (regression) | PASS | screenshot_4 |
+| 5 | Empty form shows validation errors | FAIL | screenshot_5 |
+
+### Issues Found
+1. **Empty login form submits without validation** — Submitting with no email/password
+   doesn't show error messages. The form submits and the page reloads.
+   Expected: validation errors. Screenshot: screenshot_5
+
+### Network
+- No failed requests detected
+
+### Verdict
+4/5 tests passed. 1 issue found: missing form validation on empty submit.
+```
+
+---
+
+## Tool Selection
+
+| What you need | Tool | Speed |
+|---------------|------|-------|
+| Check element exists, text, count, URL | `skyvern_evaluate` | ~10ms |
+| Click, type, fill forms, multi-step interaction | `skyvern_act` | 5-30s |
+| "Does this look right?" visual check | `skyvern_validate` | 15-50s |
+| Get structured data from a page | `skyvern_extract` | 15-50s |
+| Screenshot | `skyvern_screenshot` | ~1s |
+| Wait for async content | `skyvern_wait` | varies |
+
+**Default to `skyvern_evaluate` for assertions.** Only use `skyvern_validate` when you
+can't express the check as a DOM query (visual layout, "does this look like a dashboard").
+
+---
+
+## Error Handling
+
+| Problem | Action |
+|---------|--------|
+| No git diff found | Ask the user what they want to test, fall back to explore mode |
+| Dev server not running | Tell user to start it. Suggest common commands (npm run dev, etc.) |
+| Auth redirect on page | Report it. Ask if they want to provide credentials or skip that route. |
+| Component doesn't render | Screenshot + check console. Report with the specific error. |
+| Session create fails | Try cloud fallback. Warn about URL accessibility. |
+
+## Session Cleanup
+
+ALWAYS close the session when done, even if errors occurred:
+```
+skyvern_browser_session_close()
+```
+
+---
+
+## Fallback: Explore Mode
+
+If there's no git diff (user just wants a general QA pass), fall back to exploring:
+
+1. Navigate to the root URL
+2. Extract nav links and page structure with `skyvern_extract`
+3. Visit each major route, health gate + screenshot
+4. Test interactive elements (forms, buttons, links)
+5. Report findings
+
+But the primary mode is **diff-driven**. Always try to read the code changes first.
+"""
+
+
+def qa_test(
+    url: Annotated[
+        str,
+        Field(description="Dev server URL to test against, e.g. 'http://localhost:3000'"),
+    ] = "",
+    context: Annotated[
+        str,
+        Field(description="What to focus on, e.g. 'test the checkout flow' or 'verify the login page'"),
+    ] = "",
+) -> str:
+    """QA test frontend changes in a real browser.
+
+    Reads the developer's git diff to understand what code changed, generates targeted
+    browser tests, runs them against a local dev server using Skyvern's browser tools,
+    and reports pass/fail with screenshots. Invoke this when a developer wants to verify
+    their UI changes work correctly.
+    """
+    parts = [QA_TEST_CONTENT]
+    if url or context:
+        parts.append("\n---\n")
+    if url:
+        parts.append(f"Dev server URL: `{url}`\n")
+    if context:
+        parts.append(
+            f"Focus area: {context}\n\n"
+            "Start at Step 1: run `git diff` to understand the changes, then generate test cases "
+            "focused on the area described above."
+        )
+    return "\n".join(parts)
