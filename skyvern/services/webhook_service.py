@@ -428,6 +428,9 @@ async def _build_workflow_payload(
         script_run=status_response.script_run,
         created_at=status_response.created_at,
         modified_at=status_response.modified_at,
+        queued_at=status_response.queued_at,
+        started_at=status_response.started_at,
+        finished_at=status_response.finished_at,
         errors=status_response.errors,
     )
 

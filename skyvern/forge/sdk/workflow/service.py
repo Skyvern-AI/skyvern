@@ -3834,6 +3834,9 @@ class WorkflowService:
             script_run=workflow_run_status_response.script_run,
             created_at=workflow_run_status_response.created_at,
             modified_at=workflow_run_status_response.modified_at,
+            queued_at=workflow_run_status_response.queued_at,
+            started_at=workflow_run_status_response.started_at,
+            finished_at=workflow_run_status_response.finished_at,
             run_request=WorkflowRunRequest(
                 workflow_id=workflow_run.workflow_permanent_id,
                 title=workflow_run_status_response.workflow_title,
