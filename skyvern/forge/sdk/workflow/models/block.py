@@ -288,6 +288,7 @@ class Block(BaseModel, abc.ABC):
                     url=None,
                     proxy_location=workflow_run.proxy_location,
                     workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
                     organization_id=workflow_run.organization_id,
                     extra_http_headers=workflow_run.extra_http_headers,
                     browser_address=workflow_run.browser_address,
