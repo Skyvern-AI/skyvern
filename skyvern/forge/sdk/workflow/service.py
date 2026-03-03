@@ -918,6 +918,13 @@ class WorkflowService:
                 browser_session_id=browser_session_id,
             )
 
+        # Make browser_session_id available in Jinja templates via {{ browser_session_id }}.
+        # IMPORTANT: This must happen before _execute_workflow_blocks, which is where
+        # template rendering occurs. If this assignment moves after block execution,
+        # browser_session_id will silently resolve to empty string in templates.
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+        workflow_run_context.browser_session_id = browser_session_id
+
         renewal_task: asyncio.Task[None] | None = None
         if browser_session_id:
             try:
@@ -3050,6 +3057,7 @@ class WorkflowService:
         code_gen: bool | None = None,
     ) -> WorkflowRun:
         # validate the browser session or profile id
+        browser_profile_id = workflow_request.browser_profile_id
         if workflow_request.browser_session_id:
             browser_session = await app.DATABASE.get_persistent_browser_session(
                 session_id=workflow_request.browser_session_id,
@@ -3057,17 +3065,34 @@ class WorkflowService:
             )
             if not browser_session:
                 raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
+            # Auto-propagate profile from session when not explicitly provided
+            if not browser_profile_id and browser_session.browser_profile_id:
+                browser_profile_id = browser_session.browser_profile_id
+                LOG.info(
+                    "Auto-propagated browser_profile_id from browser session",
+                    browser_session_id=workflow_request.browser_session_id,
+                    browser_profile_id=browser_profile_id,
+                )
 
-        if workflow_request.browser_profile_id:
+        if browser_profile_id:
             browser_profile = await app.DATABASE.get_browser_profile(
-                workflow_request.browser_profile_id,
+                browser_profile_id,
                 organization_id=organization_id,
             )
             if not browser_profile:
-                raise BrowserProfileNotFound(
-                    profile_id=workflow_request.browser_profile_id,
-                    organization_id=organization_id,
-                )
+                # If the profile was auto-propagated from session but has been deleted, skip it
+                if browser_profile_id != workflow_request.browser_profile_id:
+                    LOG.warning(
+                        "Browser session has browser_profile_id but profile not found, ignoring",
+                        browser_session_id=workflow_request.browser_session_id,
+                        browser_profile_id=browser_profile_id,
+                    )
+                    browser_profile_id = None
+                else:
+                    raise BrowserProfileNotFound(
+                        profile_id=browser_profile_id,
+                        organization_id=organization_id,
+                    )
 
         # Check if this workflow/org should use browser sessions (anti-bot detection mitigation)
         browser_session_id = workflow_request.browser_session_id
@@ -3103,7 +3128,7 @@ class WorkflowService:
             workflow_id=workflow_id,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
-            browser_profile_id=workflow_request.browser_profile_id,
+            browser_profile_id=browser_profile_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
