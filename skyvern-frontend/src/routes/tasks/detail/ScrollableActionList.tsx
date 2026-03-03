@@ -1,5 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { Action, ActionTypes } from "@/api/types";
+import { StatusPill } from "@/components/ui/status-pill";
 import {
   Tooltip,
   TooltipContent,
@@ -91,9 +92,11 @@ function ScrollableActionList({
                   <TooltipProvider>
                     <Tooltip delayDuration={300}>
                       <TooltipTrigger asChild>
-                        <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                          <LightningBoltIcon className="h-4 w-4 text-[gold]" />
-                        </div>
+                        <StatusPill
+                          icon={
+                            <LightningBoltIcon className="h-4 w-4 text-[gold]" />
+                          }
+                        />
                       </TooltipTrigger>
                       <TooltipContent className="max-w-[250px]">
                         Code Execution
@@ -102,13 +105,15 @@ function ScrollableActionList({
                   </TooltipProvider>
                 )}
                 {action.success ? (
-                  <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                    <CheckCircledIcon className="h-4 w-4 text-success" />
-                  </div>
+                  <StatusPill
+                    icon={<CheckCircledIcon className="h-4 w-4 text-success" />}
+                  />
                 ) : (
-                  <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                    <CrossCircledIcon className="h-4 w-4 text-destructive" />
-                  </div>
+                  <StatusPill
+                    icon={
+                      <CrossCircledIcon className="h-4 w-4 text-destructive" />
+                    }
+                  />
                 )}
               </div>
             </div>
