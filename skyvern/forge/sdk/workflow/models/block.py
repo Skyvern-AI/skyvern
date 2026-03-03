@@ -409,6 +409,8 @@ class Block(BaseModel, abc.ABC):
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
         if "current_date" not in template_data:
             template_data["current_date"] = datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT)
+        if "browser_session_id" not in template_data:
+            template_data["browser_session_id"] = workflow_run_context.browser_session_id or ""
 
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
         template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()

@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.schemas.docs.doc_examples import (
@@ -530,12 +530,6 @@ class WorkflowRunRequest(BaseModel):
         if not url:
             return url
         return validate_url(url)
-
-    @model_validator(mode="after")
-    def validate_browser_reference(cls, values: WorkflowRunRequest) -> WorkflowRunRequest:
-        if values.browser_session_id and values.browser_profile_id:
-            raise ValueError("Cannot specify both browser_session_id and browser_profile_id")
-        return values
 
 
 class BlockRunRequest(WorkflowRunRequest):
