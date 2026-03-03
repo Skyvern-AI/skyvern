@@ -230,7 +230,7 @@ Once you've confirmed each step works, compose them into a workflow with skyvern
 ## Writing Scripts (ONLY when user explicitly asks)
 Use the Skyvern Python SDK: `from skyvern import Skyvern`
 NEVER import from skyvern.cli.mcp_tools — those are internal server modules.
-Every tool response includes an `sdk_equivalent` field for script conversion.
+In verbose mode (`--verbose`), every tool response includes an `sdk_equivalent` field for script conversion.
 
 **Hybrid xpath+prompt pattern** — the recommended approach for production scripts:
     await page.click("xpath=//button[@id='submit']", prompt="the Submit button")
