@@ -536,8 +536,29 @@ class Settings(BaseSettings):
 
         return mapping
 
+    # Ordered mapping from ENABLE_* flag names to their default LLM key.
+    # Used by model_post_init to auto-resolve LLM_KEY when the default
+    # "OPENAI_GPT4O" is active but the corresponding provider is disabled.
+    _PROVIDER_DEFAULT_LLM_KEYS: list[tuple[str, str]] = [
+        ("ENABLE_OPENAI", "OPENAI_GPT4O"),
+        ("ENABLE_ANTHROPIC", "ANTHROPIC_CLAUDE3"),
+        ("ENABLE_GEMINI", "GEMINI_FLASH_2_0"),
+        ("ENABLE_AZURE", "AZURE_OPENAI"),
+        ("ENABLE_BEDROCK", "BEDROCK_ANTHROPIC_CLAUDE3_OPUS"),
+        ("ENABLE_VERTEX_AI", "VERTEX_GEMINI_2.5_PRO"),
+        ("ENABLE_OLLAMA", "OLLAMA"),
+        ("ENABLE_OPENROUTER", "OPENROUTER"),
+        ("ENABLE_GROQ", "GROQ"),
+        ("ENABLE_VOLCENGINE", "VOLCENGINE_DOUBAO_SEED_1_6"),
+        ("ENABLE_NOVITA", "NOVITA_DEEPSEEK_R1"),
+        ("ENABLE_MOONSHOT", "MOONSHOT_KIMI_K2"),
+    ]
+
     def model_post_init(self, __context: Any) -> None:  # type: ignore[override]
         super().model_post_init(__context)
+
+        self._resolve_llm_key_default()
+
         if platform.system() != "Windows":
             return
 
@@ -558,6 +579,28 @@ class Settings(BaseSettings):
             "for compatibility with the Proactor event loop policy."
         )
         object.__setattr__(self, "DATABASE_STRING", updated_string)
+
+    def _resolve_llm_key_default(self) -> None:
+        """Auto-resolve LLM_KEY when it is still the hardcoded default but its provider is disabled.
+
+        When a user configures a non-OpenAI provider (e.g. ENABLE_GEMINI=true) without
+        explicitly setting LLM_KEY, the default "OPENAI_GPT4O" would cause runtime failures
+        because that key is only registered when ENABLE_OPENAI=true. This method detects the
+        mismatch and selects the first enabled provider's default key instead.
+        """
+        if "LLM_KEY" in self.model_fields_set or self.ENABLE_OPENAI:
+            return
+
+        for flag_name, default_key in self._PROVIDER_DEFAULT_LLM_KEYS:
+            if getattr(self, flag_name, False):
+                LOG.info(
+                    "LLM_KEY was not explicitly set and ENABLE_OPENAI is disabled. "
+                    "Auto-selecting LLM_KEY='%s' based on %s=true.",
+                    default_key,
+                    flag_name,
+                )
+                object.__setattr__(self, "LLM_KEY", default_key)
+                return
 
     def is_cloud_environment(self) -> bool:
         """
