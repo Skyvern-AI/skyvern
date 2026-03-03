@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 import typer
 
-from skyvern.cli.commands._output import output, output_error
+from skyvern.cli.commands._output import console, output, output_error
 from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_state
 from skyvern.cli.core.artifacts import save_artifact
 from skyvern.cli.core.browser_ops import do_act, do_extract, do_navigate, do_screenshot
@@ -938,6 +938,16 @@ def serve(
         "--profile-dir",
         help="Chrome user data directory. Uses existing cookies/auth if specified.",
     ),
+    use_local_profile: bool = typer.Option(
+        False,
+        "--use-local-profile",
+        help="Copy cookies/logins from your local Chrome profile so Skyvern can reuse existing sessions.",
+    ),
+    chrome_profile_name: str = typer.Option(
+        "Default",
+        "--chrome-profile-name",
+        help="Chrome profile subdirectory to copy from (e.g. 'Default', 'Profile 1'). Only used with --use-local-profile.",
+    ),
     download_dir: str | None = typer.Option(
         None,
         "--download-dir",
@@ -950,6 +960,11 @@ def serve(
         help="API key for authenticating requests. If set, requires x-api-key header.",
     ),
     headless: bool = typer.Option(False, "--headless", help="Run Chrome in headless mode."),
+    full_profile_copy: bool = typer.Option(
+        False,
+        "--full-profile-copy",
+        help="Copy the entire Chrome user data directory instead of just auth-relevant files. Requires Chrome to be closed.",
+    ),
     chrome_path: str | None = typer.Option(
         None,
         "--chrome-path",
@@ -985,15 +1000,34 @@ def serve(
     import signal
 
     from skyvern.cli.core.browser_launcher import (
+        clone_local_chrome_profile,
         generate_browser_id,
         get_default_chrome_path,
         get_default_download_dir,
         get_default_profile_dir,
+        is_chrome_running,
         launch_chrome_with_cdp,
         terminate_browser,
     )
     from skyvern.cli.core.unified_server import UnifiedServer, UnifiedServerConfig
     from skyvern.cli.run_commands import get_pids_on_port
+
+    if use_local_profile and profile_dir:
+        raise typer.BadParameter("--use-local-profile and --profile-dir are mutually exclusive.")
+
+    if full_profile_copy and not use_local_profile:
+        raise typer.BadParameter("--full-profile-copy requires --use-local-profile.")
+
+    # Full copy needs Chrome closed; selective copy works while Chrome is open
+    if use_local_profile and full_profile_copy and is_chrome_running():
+        output_error(
+            "Chrome is currently running. Please close all Chrome windows first.",
+            hint="--full-profile-copy needs to copy your entire Chrome profile, which requires Chrome to be closed. "
+            "Close Chrome, then re-run this command. "
+            "Or omit --full-profile-copy for a fast selective copy that works while Chrome is open.",
+            json_mode=json_output,
+        )
+        raise SystemExit(1)
 
     # Chrome runs on internal port, unified server on exposed port
     chrome_internal_port = port + 1000  # e.g., 9222 -> 10222
@@ -1017,6 +1051,29 @@ def serve(
     resolved_profile_dir = profile_dir or get_default_profile_dir()
     # Use unique download directory if not specified
     resolved_download_dir = download_dir or get_default_download_dir(browser_id)
+
+    if use_local_profile:
+        try:
+            if full_profile_copy and not json_output:
+                with console.status("Copying full Chrome profile — this may take 10-20 seconds..."):
+                    clone_local_chrome_profile(chrome_profile_name, Path(resolved_profile_dir), full=True)
+            else:
+                clone_local_chrome_profile(chrome_profile_name, Path(resolved_profile_dir), full=full_profile_copy)
+        except (FileNotFoundError, ValueError, PermissionError) as e:
+            output_error(str(e), json_mode=json_output)
+            raise SystemExit(1)
+        if not json_output:
+            copy_mode = "full" if full_profile_copy else "selective"
+            output(
+                {
+                    "status": "profile_cloned",
+                    "profile_name": chrome_profile_name,
+                    "dest": resolved_profile_dir,
+                    "copy_mode": copy_mode,
+                },
+                action="profile_clone",
+                json_mode=False,
+            )
 
     if not json_output:
         output(
@@ -1056,10 +1113,11 @@ def serve(
         # Launch Chrome on internal port
         browser_info = await launch_chrome_with_cdp(
             port=chrome_internal_port,
-            profile_dir=profile_dir,
+            profile_dir=resolved_profile_dir,
             headless=headless,
             chrome_path=chrome_path,
             download_dir=resolved_download_dir,
+            profile_name=chrome_profile_name if use_local_profile else None,
         )
 
         # Start unified server on exposed port
