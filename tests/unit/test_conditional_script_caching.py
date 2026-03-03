@@ -809,3 +809,125 @@ class TestRegenerationLoopPrevention:
         # (execution tracking only adds blocks that DON'T have cached code)
         should_regenerate_run3 = bool(blocks_to_update_run3)
         assert should_regenerate_run3 is False, "No regeneration needed on Run 3 - the loop is broken"
+
+
+class TestAdaptiveCachingRegenerationLoopPrevention:
+    """
+    Tests for regeneration loop prevention in NON-conditional workflows.
+
+    The loop occurs when a workflow consistently terminates early (e.g., first
+    navigation block hits a 404 or Cloudflare block):
+    1. Run terminates early → only first block executes → script generated with only that block
+    2. Next run: missing_labels check detects blocks from the workflow definition that aren't cached
+    3. Those missing labels are added to blocks_to_update, triggering regeneration
+    4. But transform_workflow_run_to_code_gen_input skips blocks that didn't execute (no run_block data)
+    5. generate_workflow_script_python_code can only generate code for blocks with action data
+    6. Result: regeneration produces the same incomplete script → infinite loop
+
+    Fix: Only add missing labels that also appear in blocks_to_update (i.e., blocks that
+    actually executed in the current run). Missing blocks that didn't execute can't be
+    generated anyway.
+    """
+
+    def test_missing_labels_only_added_if_executed(self) -> None:
+        """
+        Missing labels NOT in blocks_to_update (unexecuted) should be skipped.
+
+        Simulates a 4-block workflow where only block_1 executes — the other 3
+        missing blocks should NOT trigger regeneration.
+        """
+        should_cache_block_labels = {"block_1", "block_2", "block_3", "block_4", "__start_block__"}
+        cached_block_labels = {"block_1", "__start_block__"}
+
+        missing_labels = should_cache_block_labels - cached_block_labels
+        assert missing_labels == {"block_2", "block_3", "block_4"}
+
+        has_conditionals = False
+        # blocks_to_update comes from execution tracking — only block_1 executed
+        blocks_to_update: set[str] = {"block_1"}
+
+        if missing_labels and not has_conditionals:
+            executable_missing = missing_labels & blocks_to_update
+            if executable_missing:
+                blocks_to_update.add("__start_block__")
+            else:
+                blocks_to_update -= missing_labels
+
+        # None of the missing blocks executed, so they should NOT be in blocks_to_update
+        assert "block_2" not in blocks_to_update
+        assert "block_3" not in blocks_to_update
+        assert "block_4" not in blocks_to_update
+        # block_1 should still be there (it executed)
+        assert "block_1" in blocks_to_update
+        # __start_block__ should NOT be added (no executable missing blocks)
+        assert "__start_block__" not in blocks_to_update
+
+    def test_executed_missing_labels_still_trigger_regeneration(self) -> None:
+        """
+        Missing labels that DID execute should still be added to blocks_to_update
+        and trigger regeneration with the start block.
+        """
+        should_cache_block_labels = {"block_1", "block_2", "block_3", "__start_block__"}
+        cached_block_labels = {"block_1", "__start_block__"}
+
+        missing_labels = should_cache_block_labels - cached_block_labels
+        assert missing_labels == {"block_2", "block_3"}
+
+        has_conditionals = False
+        # This run executed block_1 and block_2, but not block_3
+        blocks_to_update: set[str] = {"block_1", "block_2"}
+
+        if missing_labels and not has_conditionals:
+            executable_missing = missing_labels & blocks_to_update
+            if executable_missing:
+                blocks_to_update.add("__start_block__")
+            else:
+                blocks_to_update -= missing_labels
+
+        # block_2 is both missing AND executed — it should stay in blocks_to_update
+        assert "block_2" in blocks_to_update
+        # __start_block__ should be added because there ARE executable missing blocks
+        assert "__start_block__" in blocks_to_update
+        # block_3 is missing but didn't execute — it should NOT be added
+        assert "block_3" not in blocks_to_update
+
+    def test_early_termination_no_regeneration(self) -> None:
+        """
+        Simulates an early-termination scenario: a 4-block workflow where runs consistently
+        terminate after the first block (e.g., 404 or Cloudflare block).
+
+        Without the fix: every run detects 3 missing blocks → triggers regeneration
+        → produces same incomplete script → infinite loop (88 regenerations in 2 hours).
+
+        With the fix: unexecuted missing blocks are skipped → no regeneration → loop broken.
+        """
+        # Workflow has 4 blocks: nav_1, nav_2, extract_1, extract_2
+        should_cache_block_labels = {"nav_1", "nav_2", "extract_1", "extract_2", "__start_block__"}
+
+        # After first generation: only nav_1 was cached (workflow terminated early)
+        cached_block_labels = {"nav_1", "__start_block__"}
+
+        # Simulate multiple consecutive runs that all terminate after nav_1
+        for run_number in range(1, 6):
+            missing_labels = should_cache_block_labels - cached_block_labels
+            assert missing_labels == {"nav_2", "extract_1", "extract_2"}, f"Run {run_number}: wrong missing labels"
+
+            has_conditionals = False
+            # Only nav_1 executed this run (early termination)
+            blocks_to_update: set[str] = set()  # nav_1 already cached, so not in blocks_to_update
+
+            if missing_labels and not has_conditionals:
+                executable_missing = missing_labels & blocks_to_update
+                if executable_missing:
+                    blocks_to_update.add("__start_block__")
+                else:
+                    blocks_to_update -= missing_labels
+
+            should_regenerate = bool(blocks_to_update)
+            assert should_regenerate is False, (
+                f"Run {run_number}: should NOT trigger regeneration — "
+                f"missing blocks didn't execute and can't be generated"
+            )
+
+            # cached_block_labels stays the same — no new blocks were cached
+            assert cached_block_labels == {"nav_1", "__start_block__"}

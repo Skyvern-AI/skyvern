@@ -4327,11 +4327,23 @@ class WorkflowService:
             if cached_block_labels != should_cache_block_labels:
                 missing_labels = should_cache_block_labels - cached_block_labels
                 if missing_labels and not has_conditionals:
-                    # Only add missing labels for workflows WITHOUT conditionals.
-                    # For workflows WITH conditionals, missing labels are expected (unexecuted branches).
-                    blocks_to_update.update(missing_labels)
-                    # Always rebuild the orchestrator if the definition changed
-                    blocks_to_update.add(settings.WORKFLOW_START_BLOCK_LABEL)
+                    # Only add missing labels that actually executed in this run.
+                    # Unexecuted missing blocks have no action data and can't be generated —
+                    # adding them causes an infinite regeneration loop when runs terminate early.
+                    executable_missing = missing_labels & blocks_to_update
+                    if executable_missing:
+                        blocks_to_update.add(settings.WORKFLOW_START_BLOCK_LABEL)
+                    else:
+                        # All missing blocks are unexecuted — don't regenerate
+                        blocks_to_update -= missing_labels  # no-op but defensive
+                    if missing_labels - executable_missing:
+                        LOG.info(
+                            "Skipping unexecuted missing labels to avoid regeneration loop",
+                            workflow_id=workflow.workflow_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            skipped_labels=list(missing_labels - executable_missing),
+                            executed_labels=list(executable_missing),
+                        )
                 elif missing_labels and has_conditionals:
                     LOG.debug(
                         "Skipping regeneration for missing labels in workflow with conditionals",
