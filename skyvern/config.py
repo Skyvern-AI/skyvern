@@ -389,6 +389,9 @@ class Settings(BaseSettings):
     CUSTOM_CREDENTIAL_API_BASE_URL: str | None = None
     CUSTOM_CREDENTIAL_API_TOKEN: str | None = None
 
+    # Local Credential Storage Settings (for dev/testing/hobby self-hosting)
+    LOCAL_CREDENTIAL_FILE: str = ".skyvern_credentials.json"
+
     # Skyvern Auth Bitwarden Settings
     SKYVERN_AUTH_BITWARDEN_CLIENT_ID: str | None = None
     SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET: str | None = None
