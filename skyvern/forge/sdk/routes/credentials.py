@@ -287,11 +287,17 @@ async def create_credential(
     data: CreateCredentialRequest = Body(
         ...,
         description="The credential data to create",
-        example={
-            "name": "My Credential",
-            "credential_type": "PASSWORD",
-            "credential": {"username": "user@example.com", "password": "securepassword123", "totp": "JBSWY3DPEHPK3PXP"},
-        },
+        examples=[
+            {
+                "name": "My Credential",
+                "credential_type": "PASSWORD",
+                "credential": {
+                    "username": "user@example.com",
+                    "password": "securepassword123",
+                    "totp": "JBSWY3DPEHPK3PXP",
+                },
+            }
+        ],
         openapi_extra={"x-fern-sdk-parameter-name": "data"},
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1206,11 +1212,13 @@ async def update_credential(
     data: CreateCredentialRequest = Body(
         ...,
         description="The new credential data to store",
-        example={
-            "name": "My Credential",
-            "credential_type": "PASSWORD",
-            "credential": {"username": "user@example.com", "password": "newpassword123"},
-        },
+        examples=[
+            {
+                "name": "My Credential",
+                "credential_type": "PASSWORD",
+                "credential": {"username": "user@example.com", "password": "newpassword123"},
+            }
+        ],
         openapi_extra={"x-fern-sdk-parameter-name": "data"},
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
