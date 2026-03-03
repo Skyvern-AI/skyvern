@@ -1,4 +1,3 @@
-{/* This file (fern/) and docs/integrations/mcp.mdx must stay in sync. fern/ is for Fern, docs/ is for Mintlify. Minor formatting differences (Tip vs inline text, CardGroup) are OK since the platforms support different components. */}
 ---
 title: MCP Server
 subtitle: Connect AI assistants to browser automation via Model Context Protocol
@@ -9,16 +8,16 @@ The Skyvern MCP server lets AI assistants like Claude Desktop, Claude Code, Code
 
 ## What you can do
 
-The MCP server exposes 33 tools across 6 categories:
+The MCP server exposes 35 tools across 6 categories:
 
 | Category | Key tools | What they do |
 |----------|-----------|--------------|
-| **Browser session management** | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_connect` | Open, manage, and reuse browser sessions |
-| **Browser actions** | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait` | Control the browser with natural language or CSS/XPath selectors |
-| **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured data from pages, capture screenshots, run JavaScript |
-| **Validation** | `skyvern_validate` | Check page conditions using AI (returns true/false) |
-| **Credentials** | `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete` | Look up stored credentials for login flows |
-| **Workflows** | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete` | Build and execute multi-step automations |
+| **Browser session management** | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_get`, `skyvern_browser_session_connect` | Open, manage, and reuse browser sessions — including connecting to a local browser via CDP |
+| **Browser actions** | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_hover`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait` | Control the browser with natural language, CSS/XPath selectors, or both (hybrid mode) |
+| **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured JSON from pages, capture screenshots, run JavaScript |
+| **Validation** | `skyvern_validate` | Assert page conditions in natural language (returns true/false with reasoning) |
+| **Credentials & login** | `skyvern_login`, `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete` | Log in with stored credentials (supports Skyvern vault, Bitwarden, 1Password, Azure Key Vault) with automatic 2FA/TOTP |
+| **Workflows** | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete`, `skyvern_workflow_cancel` | Build, run, and manage multi-step automations with 23 block types |
 
 Your AI assistant decides which tools to call based on your instructions. For example, asking "go to Hacker News and get the top post title" triggers `skyvern_browser_session_create`, `skyvern_navigate`, `skyvern_extract`, and `skyvern_browser_session_close` automatically.
 
@@ -235,6 +234,30 @@ You can also run `skyvern init` to auto-detect installed clients and write confi
 <video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
   <source src="https://github.com/user-attachments/assets/70cfe310-24dc-431a-adde-e72691f198a7" type="video/mp4" />
 </video>
+
+## Connect to your local browser
+
+You can point your AI assistant at a browser running on your machine instead of a cloud browser. This lets you automate internal tools on localhost, reuse existing login sessions, and verify local dev changes — all through the same MCP tools.
+
+Start a local browser with a tunnel so Skyvern Cloud can reach it:
+
+```bash
+skyvern browser serve --tunnel --use-local-profile
+```
+
+This launches Chrome with your existing cookies and logins, and creates an ngrok tunnel. Your AI assistant can then connect to it:
+
+> "Connect to my local browser and check if the dashboard at localhost:3000 renders correctly"
+
+The `--use-local-profile` flag clones auth-relevant data from your default Chrome profile (cookies, saved passwords, local storage) so the browser starts pre-authenticated. Your original profile is never modified.
+
+<Tip>
+This is especially powerful during development: make a code change, then ask your AI assistant to navigate to `localhost:3000` and verify it works — fix code and validate in the same prompt.
+</Tip>
+
+<Warning>
+Always use `--api-key` when exposing your browser via tunnel. Without it, anyone with the ngrok URL has full browser control.
+</Warning>
 
 ## Troubleshooting
 

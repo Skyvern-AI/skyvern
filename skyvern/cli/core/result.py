@@ -7,6 +7,35 @@ from typing import Any
 
 from skyvern import analytics
 
+# Module-level flag: when True, make_result() strips fields that waste AI context
+# tokens (echoed inputs, sdk_equivalent, browser_context, timing, empty collections).
+# Set once at MCP server startup; CLI paths leave it False.
+_concise_responses: bool = False
+
+# Fields inside data{} that are debug/scripting aids, not decision-relevant for AI.
+_DATA_STRIP_KEYS = frozenset(
+    {
+        "sdk_equivalent",
+        "ai_mode",
+        "selector",
+        "intent",
+    }
+)
+
+# Keys whose None value is meaningful (e.g. JS eval returning null).
+# These survive the concise filter even when None.
+_DATA_KEEP_NONE_KEYS = frozenset(
+    {
+        "result",
+        "extracted",
+    }
+)
+
+
+def set_concise_responses(enabled: bool) -> None:
+    global _concise_responses  # noqa: PLW0603
+    _concise_responses = enabled
+
 
 class ErrorCode:
     NO_ACTIVE_BROWSER = "NO_ACTIVE_BROWSER"
@@ -78,6 +107,25 @@ def make_result(
             "session_id": browser_context.session_id if browser_context else None,
         },
     )
+
+    if _concise_responses:
+        result: dict[str, Any] = {"ok": ok}
+        if error:
+            result["error"] = error
+        if warnings:
+            result["warnings"] = warnings
+        if data:
+            concise_data = {
+                k: v
+                for k, v in data.items()
+                if k not in _DATA_STRIP_KEYS and (v is not None or k in _DATA_KEEP_NONE_KEYS)
+            }
+            if concise_data:
+                result["data"] = concise_data
+        if artifacts:
+            result["artifacts"] = [a.to_dict() for a in artifacts]
+        return result
+
     return {
         "ok": ok,
         "action": action,

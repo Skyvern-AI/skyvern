@@ -217,12 +217,7 @@ function WorkflowRun() {
     finallyBlockInTimeline;
 
   const workflowFailureReason = workflowRun?.failure_reason ? (
-    <div
-      className="space-y-2 rounded-md border border-red-600 p-4"
-      style={{
-        backgroundColor: "rgba(220, 38, 38, 0.10)",
-      }}
-    >
+    <div className="bg-error-light space-y-2 rounded-md border border-red-600 p-4">
       <div className="font-bold">{failureReasonTitle}</div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
       {matchedTips}

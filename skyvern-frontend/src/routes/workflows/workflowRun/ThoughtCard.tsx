@@ -1,3 +1,4 @@
+import { StatusPill } from "@/components/ui/status-pill";
 import { QuestionMarkIcon } from "@radix-ui/react-icons";
 import { ObserverThought } from "../types/workflowRunTypes";
 import { cn } from "@/util/utils";
@@ -41,10 +42,9 @@ function ThoughtCard({ thought, onClick, active }: Props) {
           {(thought.answer || thought.thought) && <span>Thought</span>}
           {!thought.answer && !thought.thought && <span>Thinking</span>}
         </div>
-        <div className="flex items-center gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-          <QuestionMarkIcon className="size-4" />
-          <span className="text-xs">Decision</span>
-        </div>
+        <StatusPill icon={<QuestionMarkIcon className="size-4" />}>
+          Decision
+        </StatusPill>
       </div>
       {(thought.answer || thought.thought) && (
         <div className="text-xs text-slate-400">
