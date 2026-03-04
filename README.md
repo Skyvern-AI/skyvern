@@ -281,6 +281,42 @@ task = await skyvern.run_task(
 )
 ```
 
+### Use your local browser with Skyvern Cloud (Browser Tunneling)
+
+Let Skyvern Cloud control a Chrome browser running on your machine — with all your existing cookies, logins, and extensions already in place. This is useful when you need to automate sites where you're already logged in, or sites behind a VPN.
+
+```bash
+# One command to start Chrome + create a tunnel
+skyvern browser serve --tunnel
+```
+
+Then use the tunnel URL in your Skyvern task:
+
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your-api-key")
+task = await skyvern.run_task(
+    prompt="Download the latest invoice from my account",
+    browser_address="wss://abc123.ngrok-free.dev",
+)
+```
+
+Or set up the tunnel manually:
+
+```bash
+# Terminal 1: Start the browser server
+skyvern browser serve
+
+# Terminal 2: Create a tunnel with ngrok
+ngrok http 9222
+```
+
+> [!WARNING]
+> Always use `--api-key` when exposing your browser via a tunnel. Without it, anyone with the URL has full control of your browser. See the [security docs](https://www.skyvern.com/docs/optimization/browser-tunneling#security).
+
+See the [full Browser Tunneling documentation](https://www.skyvern.com/docs/optimization/browser-tunneling) for all options.
+
 ### Get consistent output schema from your run
 You can do this by adding the `data_extraction_schema` parameter:
 ```python

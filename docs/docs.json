@@ -46,6 +46,7 @@
             "group": "Optimization",
             "pages": [
               "optimization/browser-sessions",
+              "optimization/browser-tunneling",
               "optimization/browser-profiles",
               "optimization/cost-control"
             ]
