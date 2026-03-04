@@ -71,6 +71,7 @@ from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
+from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
@@ -102,6 +103,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
+from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.token_counter import count_tokens
@@ -705,6 +707,49 @@ class BaseTaskBlock(Block):
 
         return order, retry + 1
 
+    async def _handle_task_failure_with_error_detection(
+        self,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState | None,
+        failure_reason: str,
+        organization_id: str,
+    ) -> None:
+        """
+        Handle task failure by updating the task status and detecting user-defined errors.
+
+        This helper method consolidates the error detection logic that was previously
+        duplicated across multiple exception handlers in the execute method.
+        """
+        await app.DATABASE.update_task(
+            task.task_id,
+            status=TaskStatus.failed,
+            organization_id=organization_id,
+            failure_reason=failure_reason,
+        )
+        # Detect user-defined errors if error_code_mapping is provided
+        if self.error_code_mapping:
+            try:
+                detected_errors = await detect_user_defined_errors_for_task(
+                    task=task,
+                    step=step,
+                    browser_state=browser_state,
+                    failure_reason=failure_reason,
+                )
+                if detected_errors:
+                    # Only pass new errors — update_task() appends to existing errors
+                    new_errors = [error.model_dump() for error in detected_errors]
+                    await app.DATABASE.update_task(
+                        task_id=task.task_id,
+                        organization_id=organization_id,
+                        errors=new_errors,
+                    )
+            except Exception:
+                LOG.exception(
+                    "Failed to detect or store user-defined errors during task failure",
+                    task_id=task.task_id,
+                )
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -850,12 +895,12 @@ class BaseTaskBlock(Block):
                         task_id=task.task_id,
                         workflow_run_id=workflow_run_id,
                     )
-                    # Make sure the task is marked as failed in the database before raising the exception
-                    await app.DATABASE.update_task(
-                        task.task_id,
-                        status=TaskStatus.failed,
-                        organization_id=workflow_run.organization_id,
+                    await self._handle_task_failure_with_error_detection(
+                        task=task,
+                        step=step,
+                        browser_state=browser_state,
                         failure_reason=str(e),
+                        organization_id=workflow_run.organization_id,
                     )
                     raise e
 
@@ -902,11 +947,12 @@ class BaseTaskBlock(Block):
                     try:
                         await browser_state.navigate_to_url(page=working_page, url=self.url)
                     except Exception as e:
-                        await app.DATABASE.update_task(
-                            task.task_id,
-                            status=TaskStatus.failed,
-                            organization_id=workflow_run.organization_id,
+                        await self._handle_task_failure_with_error_detection(
+                            task=task,
+                            step=step,
+                            browser_state=browser_state,
                             failure_reason=str(e),
+                            organization_id=workflow_run.organization_id,
                         )
                         raise e
 
@@ -926,11 +972,12 @@ class BaseTaskBlock(Block):
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception
-                await app.DATABASE.update_task(
-                    task.task_id,
-                    status=TaskStatus.failed,
-                    organization_id=workflow_run.organization_id,
+                await self._handle_task_failure_with_error_detection(
+                    task=task,
+                    step=step,
+                    browser_state=browser_state,
                     failure_reason=str(e),
+                    organization_id=workflow_run.organization_id,
                 )
                 raise e
             finally:

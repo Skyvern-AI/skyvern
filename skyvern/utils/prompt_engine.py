@@ -34,7 +34,7 @@ HTMLTreeStr = str
 class MaxStepsReasonResponse(BaseModel):
     page_info: str
     reasoning: str
-    errors: list[UserDefinedError]
+    errors: list[UserDefinedError] = []
 
 
 def load_prompt_with_elements(
