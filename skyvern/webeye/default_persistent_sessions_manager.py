@@ -150,16 +150,15 @@ async def update_status(
         )
         return None
 
-    if is_final_status(status):
-        if is_final_status(persistent_browser_session.status):
-            LOG.warning(
-                "Attempted to update browser session status to a final status when it is already final",
-                browser_session_id=session_id,
-                organization_id=organization_id,
-                desired_status=status,
-                current_status=persistent_browser_session.status,
-            )
-            return None
+    if is_final_status(persistent_browser_session.status):
+        LOG.warning(
+            "Attempted to update browser session status when it is already final",
+            browser_session_id=session_id,
+            organization_id=organization_id,
+            desired_status=status,
+            current_status=persistent_browser_session.status,
+        )
+        return None
 
     LOG.info(
         "Updating browser session status",
@@ -339,6 +338,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
         is_high_priority: bool = False,
+        browser_profile_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
         LOG.info(
@@ -353,6 +353,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             proxy_location=proxy_location,
             extensions=extensions,
             browser_type=browser_type,
+            browser_profile_id=browser_profile_id,
         )
 
         try:

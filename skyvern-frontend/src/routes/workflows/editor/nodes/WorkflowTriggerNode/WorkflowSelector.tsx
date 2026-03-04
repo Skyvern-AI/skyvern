@@ -1,72 +1,115 @@
-import { useState, useRef } from "react";
-import { PlusIcon } from "@radix-ui/react-icons";
+import { useState, useRef, useEffect, useMemo } from "react";
+import { ChevronDownIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { Skeleton } from "@/components/ui/skeleton";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { useDebounce } from "use-debounce";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
+import { isConcreteWpid } from "./types";
+import { handleInfiniteScroll } from "@/util/utils";
+
+const PAGE_SIZE = 10;
 
 interface WorkflowSelectorProps {
   nodeId: string;
   value: string;
   onChange: (value: string) => void;
+  workflowTitle: string;
+  onTitleChange: (title: string) => void;
+  excludeWorkflowPermanentId?: string;
 }
 
-function WorkflowSelector({ nodeId, value, onChange }: WorkflowSelectorProps) {
-  const [focused, setFocused] = useState(false);
-  const [debouncedValue] = useDebounce(value, 300);
+function WorkflowSelector({
+  nodeId,
+  value,
+  onChange,
+  workflowTitle,
+  onTitleChange,
+  excludeWorkflowPermanentId,
+}: WorkflowSelectorProps) {
+  const [open, setOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearch] = useDebounce(searchQuery, 300);
   const credentialGetter = useCredentialGetter();
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const isTyping = value !== debouncedValue;
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const isTyping = searchQuery !== debouncedSearch;
 
-  const { data: workflows = [], isFetching } = useQuery<
-    Array<WorkflowApiResponse>
-  >({
-    queryKey: ["workflows", "selector", debouncedValue],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-      const params = new URLSearchParams();
-      params.append("page", "1");
-      params.append("page_size", "10");
-      params.append("only_workflows", "true");
-      if (debouncedValue) {
-        params.append("search_key", debouncedValue);
-      }
-      return client
-        .get("/workflows", { params })
-        .then((response) => response.data);
-    },
-    enabled: focused,
-  });
+  // Attach native wheel listener to stop propagation to React Flow canvas
+  useEffect(() => {
+    const el = dropdownRef.current;
+    if (!el) return;
+    const handler = (e: WheelEvent) => {
+      e.stopPropagation();
+    };
+    el.addEventListener("wheel", handler, { passive: false });
+    return () => el.removeEventListener("wheel", handler);
+  }, [open]);
 
-  const showDropdown =
-    focused && (workflows.length > 0 || isFetching || isTyping);
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isFetching } =
+    useInfiniteQuery<Array<WorkflowApiResponse>>({
+      queryKey: ["workflows", "selector", debouncedSearch],
+      queryFn: async ({ pageParam = 1 }) => {
+        const client = await getClient(credentialGetter);
+        const params = new URLSearchParams();
+        params.append("page", String(pageParam));
+        params.append("page_size", String(PAGE_SIZE));
+        params.append("only_workflows", "true");
+        if (debouncedSearch) {
+          params.append("search_key", debouncedSearch);
+        }
+        return client
+          .get("/workflows", { params })
+          .then((response) => response.data);
+      },
+      getNextPageParam: (lastPage, allPages) => {
+        if (lastPage.length === PAGE_SIZE) {
+          return allPages.length + 1;
+        }
+        return undefined;
+      },
+      initialPageParam: 1,
+      enabled: open,
+    });
 
-  const insertParameter = (parameterKey: string) => {
-    const parameterText = `{{${parameterKey}}}`;
-    const input = inputRef.current;
-    if (input) {
-      const start = input.selectionStart ?? value.length;
-      const end = input.selectionEnd ?? value.length;
-      const newValue =
-        value.substring(0, start) + parameterText + value.substring(end);
-      onChange(newValue);
-      setTimeout(() => {
-        const newPosition = start + parameterText.length;
-        input.focus();
-        input.setSelectionRange(newPosition, newPosition);
-      }, 0);
-    } else {
-      onChange(`${value}${parameterText}`);
+  const workflows = useMemo(() => {
+    const all = data?.pages.flatMap((page) => page) ?? [];
+    if (excludeWorkflowPermanentId) {
+      return all.filter(
+        (w) => w.workflow_permanent_id !== excludeWorkflowPermanentId,
+      );
     }
+    return all;
+  }, [data, excludeWorkflowPermanentId]);
+
+  const hasSelection = isConcreteWpid(value) && workflowTitle.length > 0;
+
+  const handleToggle = () => {
+    if (open) {
+      setOpen(false);
+      setSearchQuery("");
+    } else {
+      setOpen(true);
+      setSearchQuery("");
+      setTimeout(() => inputRef.current?.focus(), 0);
+    }
+  };
+
+  const handleSelect = (workflow: WorkflowApiResponse) => {
+    onChange(workflow.workflow_permanent_id);
+    onTitleChange(workflow.title);
+    setOpen(false);
+    setSearchQuery("");
+  };
+
+  const handleClear = () => {
+    onChange("");
+    onTitleChange("");
+    setOpen(true);
+    setSearchQuery("");
+    setTimeout(() => inputRef.current?.focus(), 0);
   };
 
   return (
@@ -75,41 +118,96 @@ function WorkflowSelector({ nodeId, value, onChange }: WorkflowSelectorProps) {
       className="nopan relative"
       onBlur={(e) => {
         if (!containerRef.current?.contains(e.relatedTarget as Node)) {
-          setFocused(false);
+          setOpen(false);
+          setSearchQuery("");
         }
       }}
     >
-      <input
-        ref={inputRef}
-        id={`workflow-selector-${nodeId}`}
-        type="text"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        onFocus={() => setFocused(true)}
-        placeholder="Search by title or enter wpid_xxx / {{ parameter }}"
-        className="w-full rounded-md border border-input bg-transparent px-3 py-2 pr-9 text-xs text-slate-300 shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-      />
-      <div className="absolute right-1 top-0 flex size-9 items-center justify-end">
-        <Popover>
-          <PopoverTrigger asChild>
-            <div className="cursor-pointer rounded p-1 hover:bg-muted">
-              <PlusIcon className="size-4" />
-            </div>
-          </PopoverTrigger>
-          <PopoverContent className="w-[22rem]">
-            <WorkflowBlockParameterSelect
-              nodeId={nodeId}
-              onAdd={insertParameter}
-            />
-          </PopoverContent>
-        </Popover>
+      {/* Display area: always shows title + wpid or placeholder */}
+      <div
+        className="flex w-full cursor-pointer items-center rounded-md border border-input bg-transparent text-xs shadow-sm"
+        onClick={handleToggle}
+      >
+        <div className="min-w-0 flex-1 truncate px-3 py-2">
+          {hasSelection ? (
+            <>
+              <span className="text-slate-300">{workflowTitle}</span>
+              <span className="ml-1.5 text-slate-500">[{value}]</span>
+            </>
+          ) : value ? (
+            <span className="text-slate-300">{value}</span>
+          ) : (
+            <span className="text-muted-foreground">
+              Select a workflow to trigger...
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-1 pr-2">
+          {hasSelection && (
+            <button
+              type="button"
+              className="rounded p-0.5 text-slate-500 hover:bg-muted hover:text-slate-300"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleClear();
+              }}
+            >
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 15 15"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <path
+                  d="M11.7816 4.03157C12.0062 3.80702 12.0062 3.44295 11.7816 3.2184C11.5571 2.99385 11.193 2.99385 10.9685 3.2184L7.50005 6.68682L4.03164 3.2184C3.80708 2.99385 3.44301 2.99385 3.21846 3.2184C2.99391 3.44295 2.99391 3.80702 3.21846 4.03157L6.68688 7.49999L3.21846 10.9684C2.99391 11.193 2.99391 11.557 3.21846 11.7816C3.44301 12.0061 3.80708 12.0061 4.03164 11.7816L7.50005 8.31316L10.9685 11.7816C11.193 12.0061 11.5571 12.0061 11.7816 11.7816C12.0062 11.557 12.0062 11.193 11.7816 10.9684L8.31322 7.49999L11.7816 4.03157Z"
+                  fill="currentColor"
+                  fillRule="evenodd"
+                  clipRule="evenodd"
+                />
+              </svg>
+            </button>
+          )}
+          <ChevronDownIcon
+            className={`size-4 text-slate-500 transition-transform ${open ? "rotate-180" : ""}`}
+          />
+        </div>
       </div>
-      {showDropdown && (
-        <div className="absolute z-50 mt-1 w-full overflow-hidden rounded-md border border-slate-600 bg-slate-800 shadow-lg">
-          <div className="max-h-[200px] overflow-y-auto">
+
+      {/* Dropdown */}
+      {open && (
+        <div
+          ref={dropdownRef}
+          className="absolute z-50 mt-1 w-full overflow-hidden rounded-md border border-slate-600 bg-slate-800 shadow-lg"
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          {/* Search input */}
+          <div className="border-b border-slate-600 px-3 py-2">
+            <input
+              ref={inputRef}
+              id={`workflow-selector-${nodeId}`}
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search workflows..."
+              className="w-full bg-transparent text-xs text-slate-300 placeholder:text-muted-foreground focus-visible:outline-none"
+            />
+          </div>
+          {/* Results */}
+          <div
+            className="max-h-[300px] overflow-y-auto"
+            onScroll={(e) =>
+              handleInfiniteScroll(
+                e,
+                fetchNextPage,
+                hasNextPage,
+                isFetchingNextPage,
+              )
+            }
+          >
             {(isFetching || isTyping) && workflows.length === 0 ? (
               <>
-                {Array.from({ length: 3 }).map((_, index) => (
+                {Array.from({ length: 5 }).map((_, index) => (
                   <div
                     key={`skeleton-${index}`}
                     className="flex w-full flex-col gap-1 px-3 py-2"
@@ -119,31 +217,39 @@ function WorkflowSelector({ nodeId, value, onChange }: WorkflowSelectorProps) {
                   </div>
                 ))}
               </>
+            ) : workflows.length === 0 ? (
+              <div className="px-3 py-3 text-xs text-slate-500">
+                No workflows found.
+              </div>
             ) : (
-              workflows.map((workflow) => {
-                const isSelected = value === workflow.workflow_permanent_id;
-                return (
-                  <button
-                    key={workflow.workflow_permanent_id}
-                    type="button"
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => {
-                      onChange(workflow.workflow_permanent_id);
-                      setFocused(false);
-                    }}
-                    className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left text-xs transition-colors hover:bg-slate-700 ${
-                      isSelected ? "bg-slate-700" : ""
-                    }`}
-                  >
-                    <span className="font-medium text-slate-200">
-                      {workflow.title}
-                    </span>
-                    <span className="text-slate-500">
-                      {workflow.workflow_permanent_id}
-                    </span>
-                  </button>
-                );
-              })
+              <>
+                {workflows.map((workflow) => {
+                  const isSelected = value === workflow.workflow_permanent_id;
+                  return (
+                    <button
+                      key={workflow.workflow_permanent_id}
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleSelect(workflow)}
+                      className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left text-xs transition-colors hover:bg-slate-700 ${
+                        isSelected ? "bg-slate-700" : ""
+                      }`}
+                    >
+                      <span className="font-medium text-slate-200">
+                        {workflow.title}
+                      </span>
+                      <span className="text-slate-500">
+                        {workflow.workflow_permanent_id}
+                      </span>
+                    </button>
+                  );
+                })}
+                {isFetchingNextPage && (
+                  <div className="flex items-center justify-center py-2">
+                    <ReloadIcon className="h-3 w-3 animate-spin text-slate-400" />
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>

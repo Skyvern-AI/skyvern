@@ -679,7 +679,9 @@ async def _update_workflow_block(
                     failure_reason = str(billing_error)
                     final_output = None
         else:
-            final_output = None
+            # Non-task blocks (conditionals, etc.) — preserve the output as-is.
+            # final_output is already set to `output` at line 596.
+            pass
 
         await app.DATABASE.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
@@ -697,6 +699,15 @@ async def _update_workflow_block(
             label,
         )
 
+        # If executing inside a for_loop, collect this block's output for loop aggregation.
+        # Guard: skip if this is the loop block's own _update_workflow_block call.
+        if (
+            context.loop_output_values is not None
+            and context.parent_workflow_run_block_id
+            and workflow_run_block_id != context.parent_workflow_run_block_id
+        ):
+            _append_to_loop_output(final_output, label)
+
     except Exception as e:
         LOG.warning(
             "Failed to update workflow block status",
@@ -710,6 +721,20 @@ async def _update_workflow_block(
 async def _run_cached_function(cached_fn: Callable) -> Any:
     run_context = script_run_context_manager.ensure_run_context()
     return await cached_fn(page=run_context.page, context=run_context)
+
+
+def _append_to_loop_output(output: Any, label: str | None = None) -> None:
+    """If executing inside a for_loop, collect this block's output for loop aggregation."""
+    context = skyvern_context.current()
+    if not context or context.loop_output_values is None or context.loop_metadata is None:
+        return
+    context.loop_output_values.append(
+        {
+            "loop_value": context.loop_metadata.get("current_value"),
+            "output_value": output,
+            "label": label,
+        }
+    )
 
 
 def _determine_action_ai_mode(
@@ -1244,6 +1269,9 @@ async def _regenerate_script_block_after_ai_fallback(
     2. create a completely new script, with only the current block's script being different as it's newly generated.
       -
     """
+    # TODO: Re-enable inline script regeneration after the script reviewer (workflow_script_service)
+    # handles post-run review. This code path is intentionally disabled — the reviewer-based approach
+    # in workflow_script_service.py is the preferred mechanism for script improvement.
     LOG.info("skipping script regeneration after AI fallback")
     return None
     try:
@@ -1540,6 +1568,12 @@ async def run_task(
         context = skyvern_context.ensure_context()
         context.prompt = prompt
         try:
+            # Navigate to the target URL before running cached code, just like
+            # NavigationBlock does in the non-cached path.
+            if url:
+                run_context = script_run_context_manager.ensure_run_context()
+                await run_context.page.goto(url)
+
             await _prepare_cached_block_inputs(cache_key, prompt)
             output = await _run_cached_function(cached_fn)
 
@@ -1594,6 +1628,7 @@ async def run_task(
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
+        _append_to_loop_output(block_output.output_parameter_value, label)
         return block_output.output_parameter_value
 
 
@@ -1925,7 +1960,68 @@ async def extract(
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
+        _append_to_loop_output(block_result.output_parameter_value, label)
         return block_result.output_parameter_value
+
+
+async def conditional(
+    label: str,
+) -> dict[str, Any]:
+    """Evaluate a conditional block using cached Python code instead of an LLM call.
+
+    The cached function (registered via @skyvern.cached) evaluates the branch condition
+    in pure Python and returns {"next_block_label": "...", "branch_index": N}.
+    """
+    cached_fn = script_run_context_manager.get_cached_fn(label)
+    if not cached_fn:
+        raise Exception(f"No cached function for conditional block '{label}'")
+
+    # Create workflow run block entry (no task needed for conditional blocks)
+    workflow_run_block_id, _, _ = await _create_workflow_block_run_and_task(
+        block_type=BlockType.CONDITIONAL,
+        label=label,
+    )
+
+    # Inject upstream block outputs into run_context.parameters so the cached
+    # function can access them (e.g., context.parameters["extract_docs_output"])
+    run_context = script_run_context_manager.ensure_run_context()
+    context = skyvern_context.current()
+    if context and context.workflow_run_id:
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+        for key, value in workflow_run_context.values.items():
+            if key not in run_context.parameters:
+                run_context.parameters[key] = value
+
+    try:
+        result = await cached_fn(page=run_context.page, context=run_context)
+        if not isinstance(result, dict) or "next_block_label" not in result:
+            raise Exception(f"Conditional function '{label}' must return dict with 'next_block_label', got: {result}")
+
+        # Build branch_metadata in the format ConditionalBlock.execute() produces
+        branch_metadata: dict[str, Any] = {
+            "branch_taken": result.get("next_block_label"),
+            "branch_index": result.get("branch_index"),
+            "next_block_label": result.get("next_block_label"),
+        }
+
+        if workflow_run_block_id:
+            await _update_workflow_block(
+                workflow_run_block_id,
+                BlockStatus.completed,
+                output=branch_metadata,
+                label=label,
+            )
+        return branch_metadata
+
+    except Exception:
+        if workflow_run_block_id:
+            await _update_workflow_block(
+                workflow_run_block_id,
+                BlockStatus.failed,
+                failure_reason="Conditional code evaluation failed",
+                label=label,
+            )
+        raise
 
 
 async def validate(
@@ -1968,6 +2064,7 @@ async def execute_validation(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _append_to_loop_output(result.output_parameter_value, label)
     return result
 
 
@@ -2090,6 +2187,13 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
             template_data.update(workflow_run_context.values)
             if template in template_data:
                 return template_data[template]
+        # Inject for_loop metadata (current_value, current_index, current_item) so
+        # that cached function bodies inside for_loops can resolve {{ current_value }}
+        # in page.goto() and other template-rendered calls.
+        if context.loop_metadata:
+            for key in ("current_value", "current_index", "current_item"):
+                if key in context.loop_metadata:
+                    template_data[key] = context.loop_metadata[key]
     return jinja_template.render(template_data)
 
 
@@ -2187,6 +2291,7 @@ async def run_code(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _append_to_loop_output(block_result.output_parameter_value, label)
     return cast(dict[str, Any], block_result.output_parameter_value)
 
 
@@ -2416,6 +2521,7 @@ async def prompt(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _append_to_loop_output(result.output_parameter_value, label)
     return result.output_parameter_value
 
 

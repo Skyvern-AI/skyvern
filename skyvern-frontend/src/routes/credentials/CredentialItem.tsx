@@ -113,7 +113,7 @@ function CredentialItem({ credential }: Props) {
         {credential.browser_profile_id && (
           <div className="flex items-center gap-1 text-xs">
             <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-green-400">
-              login-free
+              saved-profile
             </span>
             {credential.tested_url && (
               <span className="text-muted-foreground">

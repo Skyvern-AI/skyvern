@@ -24,14 +24,19 @@ import { useCloseBrowserSessionMutation } from "@/routes/browserSessions/hooks/u
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { type BrowserSession as BrowserSessionType } from "@/routes/workflows/types/browserSessionTypes";
 
+import { BrowserSessionDownloads } from "./BrowserSessionDownloads";
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
+
+type TabName = "stream" | "recordings" | "downloads";
 
 function BrowserSession() {
   const { browserSessionId } = useParams();
   const location = useLocation();
-  const activeTab = location.pathname.endsWith("/recordings")
+  const activeTab: TabName = location.pathname.endsWith("/recordings")
     ? "recordings"
-    : "stream";
+    : location.pathname.endsWith("/downloads")
+      ? "downloads"
+      : "stream";
   const [isDialogOpen, setIsDialogOpen] = useState(false);
 
   const credentialGetter = useCredentialGetter();
@@ -133,6 +138,7 @@ function BrowserSession() {
             options={[
               { label: "Stream", to: "stream" },
               { label: "Recordings", to: "recordings" },
+              { label: "Downloads", to: "downloads" },
             ]}
           />
 
@@ -191,13 +197,22 @@ function BrowserSession() {
             />
           </div>
           <div
-            className="h-full w-full"
+            className="absolute left-0 top-0 h-full w-full"
             style={{
               visibility: activeTab === "recordings" ? "visible" : "hidden",
               pointerEvents: activeTab === "recordings" ? "auto" : "none",
             }}
           >
             <BrowserSessionVideo />
+          </div>
+          <div
+            className="absolute left-0 top-0 h-full w-full"
+            style={{
+              visibility: activeTab === "downloads" ? "visible" : "hidden",
+              pointerEvents: activeTab === "downloads" ? "auto" : "none",
+            }}
+          >
+            <BrowserSessionDownloads />
           </div>
         </div>
       </div>

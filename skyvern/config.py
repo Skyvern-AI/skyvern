@@ -181,6 +181,8 @@ class Settings(BaseSettings):
     CHECK_USER_GOAL_LLM_KEY: str | None = None
     AUTO_COMPLETION_LLM_KEY: str | None = None
     SCRIPT_GENERATION_LLM_KEY: str | None = None
+    SCRIPT_REVIEWER_LLM_KEY: str | None = None
+    ADAPTIVE_SCRIPT_GEN_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -450,7 +452,7 @@ class Settings(BaseSettings):
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "skyvern"
-    OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://localhost:4317"
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = ""
     OTEL_METRICS_ENABLED: bool = True
     OTEL_LOGS_ENABLED: bool = True
     OTEL_EXPORTER_INSECURE: bool = True
@@ -469,9 +471,8 @@ class Settings(BaseSettings):
                 "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                 "label": "Gemini 2.5 Flash",
             },
-            "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
+            "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3_PRO", "label": "Gemini 3 Pro (Latest)"},
             "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
-            "gemini-3.1-pro-preview": {"llm_key": "VERTEX_GEMINI_3.1_PRO", "label": "Gemini 3.1 Pro"},
             "mercury-2": {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"},
             "gemini-2.5-flash-lite": {
                 "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",

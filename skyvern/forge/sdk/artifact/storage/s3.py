@@ -19,7 +19,10 @@ from skyvern.forge.sdk.api.files import (
     unzip_files,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
-from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
+from skyvern.forge.sdk.artifact.storage.base import (
+    FILE_EXTENTSION_MAP,
+    BaseStorage,
+)
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -363,13 +366,33 @@ class S3Storage(BaseStorage):
         file_infos.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
         return file_infos
 
-    async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
-        download_dir = get_download_dir(run_id=run_id)
-        files = os.listdir(download_dir)
+    async def save_downloaded_files(
+        self,
+        organization_id: str,
+        run_id: str | None,
+    ) -> None:
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_UPLOADS)
         base_uri = (
             f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         )
+
+        await self._save_downloaded_files_from_local(
+            organization_id=organization_id,
+            run_id=run_id,
+            base_uri=base_uri,
+            storage_class=sc,
+        )
+
+    async def _save_downloaded_files_from_local(
+        self,
+        organization_id: str,
+        run_id: str | None,
+        base_uri: str,
+        storage_class: S3StorageClass,
+    ) -> None:
+        """Save files from local download directory to S3."""
+        download_dir = get_download_dir(run_id=run_id)
+        files = os.listdir(download_dir)
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -381,14 +404,14 @@ class S3Storage(BaseStorage):
                 file=file,
                 checksum=checksum,
                 organization_id=organization_id,
-                storage_class=sc,
+                storage_class=storage_class,
             )
             # Upload file with checksum metadata
             await self.async_client.upload_file_from_path(
                 uri=uri,
                 file_path=fpath,
                 metadata={"sha256_checksum": checksum, "original_filename": file},
-                storage_class=sc,
+                storage_class=storage_class,
             )
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:

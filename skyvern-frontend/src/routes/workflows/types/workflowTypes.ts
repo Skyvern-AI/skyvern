@@ -600,9 +600,10 @@ export type WorkflowApiResponse = {
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
-  run_with: string | null; // 'agent' or 'code'
+  run_with: string | null; // 'agent', 'code', or 'code_v2'
   cache_key: string | null;
   ai_fallback: boolean | null;
+  adaptive_caching: boolean | null;
   run_sequentially: boolean | null;
   sequential_key: string | null;
   folder_id: string | null;

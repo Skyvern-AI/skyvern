@@ -63,6 +63,10 @@ class BrowserSessionResponse(BaseModel):
         default=None,
         description="The type of browser used for the session.",
     )
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`.",
+    )
     vnc_streaming_supported: bool = Field(False, description="Whether the browser session supports VNC streaming")
     download_path: str | None = Field(None, description="The path where the browser session downloads files")
     downloaded_files: list[FileInfo] | None = Field(
@@ -148,4 +152,5 @@ class BrowserSessionResponse(BaseModel):
             recordings=recordings,
             extensions=browser_session.extensions,
             browser_type=browser_session.browser_type,
+            browser_profile_id=browser_session.browser_profile_id,
         )

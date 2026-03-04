@@ -39,6 +39,7 @@ const router = createBrowserRouter([
       { index: true, element: <Navigate to="stream" replace /> },
       { path: "stream", element: <></> },
       { path: "recordings", element: <></> },
+      { path: "downloads", element: <></> },
     ],
   },
   {

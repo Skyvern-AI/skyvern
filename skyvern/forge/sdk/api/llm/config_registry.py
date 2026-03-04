@@ -1034,7 +1034,7 @@ if settings.ENABLE_GEMINI:
         ),
     )
     LLMConfigRegistry.register_config(
-        "GEMINI_3.1_PRO",
+        "GEMINI_3_PRO",
         LLMConfig(
             "gemini/gemini-3.1-pro-preview",
             ["GEMINI_API_KEY"],
@@ -1045,6 +1045,11 @@ if settings.ENABLE_GEMINI:
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
             ),
         ),
+    )
+    # Backward compat alias for non-Vertex Gemini 3 Pro
+    LLMConfigRegistry.register_config(
+        "GEMINI_3.1_PRO",
+        LLMConfigRegistry.get_config("GEMINI_3_PRO"),
     )
 
 
@@ -1381,15 +1386,15 @@ if settings.ENABLE_VERTEX_AI:
         ),
     )
     LLMConfigRegistry.register_config(
-        "VERTEX_GEMINI_3.0_PRO",
+        "VERTEX_GEMINI_3_PRO",
         LLMConfig(
-            "vertex_ai/gemini-3-pro-preview",
+            "vertex_ai/gemini-3.1-pro-preview",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3-pro-preview" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-pro-preview" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1412,21 +1417,15 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
+    # Backward compat aliases — both resolve to the canonical VERTEX_GEMINI_3_PRO.
+    # Bump VERTEX_GEMINI_3_PRO above when Google ships a newer version.
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.0_PRO",
+        LLMConfigRegistry.get_config("VERTEX_GEMINI_3_PRO"),
+    )
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_PRO",
-        LLMConfig(
-            "vertex_ai/gemini-3.1-pro-preview",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65536,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-pro-preview" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
+        LLMConfigRegistry.get_config("VERTEX_GEMINI_3_PRO"),
     )
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_2.5_FLASH_LITE",

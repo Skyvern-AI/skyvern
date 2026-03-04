@@ -121,7 +121,8 @@
               "cloud/managing-credentials/credentials-overview",
               "cloud/managing-credentials/password-credentials",
               "cloud/managing-credentials/credit-card-credentials",
-              "cloud/managing-credentials/totp-setup"
+              "cloud/managing-credentials/totp-setup",
+              "cloud/managing-credentials/external-providers"
             ]
           },
           {
@@ -188,17 +189,15 @@
         ]
       },
       {
+        "tab": "Changelog",
+        "pages": [
+          "changelog"
+        ]
+      },
+      {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
       },
-      {
-        "tab": "Cookbooks",
-        "pages": [
-          "cookbooks/overview",
-          "cookbooks/bulk-invoice-downloader",
-          "cookbooks/job-application-filler"
-        ]
-      }
     ]
   },
   "navbar": {

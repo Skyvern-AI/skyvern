@@ -5,6 +5,7 @@ interface BrowserSession {
   browser_address: string | null;
   browser_session_id: string;
   completed_at: string | null;
+  downloaded_files: DownloadedFile[] | null;
   recordings: Recording[];
   runnable_id: string | null;
   runnable_type: string | null;
@@ -23,9 +24,17 @@ interface Recording {
   modified_at: string;
 }
 
+interface DownloadedFile {
+  url: string;
+  checksum: string | null;
+  filename: string | null;
+  modified_at: string | null;
+}
+
 export {
   type BrowserSession,
   type BrowserSessionExtension,
   type BrowserSessionType,
+  type DownloadedFile,
   type Recording,
 };

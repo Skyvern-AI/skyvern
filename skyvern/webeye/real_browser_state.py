@@ -71,6 +71,7 @@ class RealBrowserState(BrowserState):
         proxy_location: ProxyLocationInput = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        workflow_permanent_id: str | None = None,
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
@@ -89,6 +90,7 @@ class RealBrowserState(BrowserState):
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
@@ -278,6 +280,7 @@ class RealBrowserState(BrowserState):
         proxy_location: ProxyLocationInput = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        workflow_permanent_id: str | None = None,
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
@@ -294,6 +297,7 @@ class RealBrowserState(BrowserState):
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
@@ -312,6 +316,7 @@ class RealBrowserState(BrowserState):
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
@@ -329,6 +334,7 @@ class RealBrowserState(BrowserState):
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
@@ -425,7 +431,7 @@ class RealBrowserState(BrowserState):
                     LOG.info("Main browser context and all its pages are closed")
                     if self.browser_cleanup is not None:
                         try:
-                            self.browser_cleanup()
+                            await self.browser_cleanup()
                             LOG.info("Main browser cleanup is executed")
                         except Exception:
                             LOG.warning("Failed to execute browser cleanup", exc_info=True)

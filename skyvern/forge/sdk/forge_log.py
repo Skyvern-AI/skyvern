@@ -1,4 +1,6 @@
 import logging
+import sys
+from pathlib import Path
 from types import TracebackType
 
 import structlog
@@ -15,6 +17,50 @@ LOGGING_LEVEL_MAP: dict[str, int] = {
     "ERROR": logging.ERROR,
     "CRITICAL": logging.CRITICAL,
 }
+
+# Resolved once at setup time and injected into every log event.
+_entrypoint: str = "unknown"
+
+
+def _get_entrypoint() -> str:
+    """Derive a human-readable entrypoint name for the current process.
+
+    For ``python -m skyvern.forge`` → ``skyvern.forge``
+    For ``python scripts/take_screenshot_worker.py`` → ``take_screenshot_worker``
+    """
+    # For -m invocations, __spec__ gives the clean module name.
+    main_mod = sys.modules.get("__main__")
+    spec = getattr(main_mod, "__spec__", None) if main_mod else None
+    spec_name = getattr(spec, "name", None) if spec else None
+    if spec_name and spec_name != "__main__":
+        if spec_name.endswith(".__main__"):
+            spec_name = spec_name[: -len(".__main__")]
+        return spec_name
+
+    # For direct script / uvicorn-reload invocations, use sys.argv[0].
+    if sys.argv and sys.argv[0] not in ("-c", "-m"):
+        argv0 = Path(sys.argv[0])
+        # Handle __main__.py paths (e.g. /path/to/skyvern/forge/__main__.py → skyvern.forge)
+        if argv0.name == "__main__.py":
+            # Walk up through Python packages (directories with __init__.py)
+            parts: list[str] = []
+            current = argv0.parent
+            while (current / "__init__.py").exists():
+                parts.append(current.name)
+                current = current.parent
+            if parts:
+                return ".".join(reversed(parts))
+            # Namespace package (no __init__.py) — use the directory name
+            return argv0.parent.name
+        return argv0.stem
+
+    return "unknown"
+
+
+def _add_entrypoint(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Inject the process entrypoint into every log event (runs for both JSON and console)."""
+    event_dict["entrypoint"] = _entrypoint
+    return event_dict
 
 
 def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
@@ -51,7 +97,7 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
         if context.browser_container_task_arn:
             event_dict["browser_container_task_arn"] = context.browser_container_task_arn
 
-    # Add env to the log
+    # Add process-level context to the log
     event_dict["env"] = settings.ENV
     event_dict["version"] = __version__
 
@@ -126,8 +172,6 @@ def add_error_processor(logger: logging.Logger, method_name: str, event_dict: Ev
     """
     A custom processor extending error logs with additional info
     """
-    import sys  # noqa: PLC0415
-
     exc_info = event_dict.get("exc_info")
 
     if exc_info:
@@ -169,7 +213,6 @@ def _generate_exception_hash(exc_type: type, tb: TracebackType) -> str:
     error from the same location always produces the same hash.
     """
     import hashlib  # noqa: PLC0415
-    from pathlib import Path  # noqa: PLC0415
 
     hasher = hashlib.sha256()
 
@@ -274,6 +317,9 @@ def setup_logger() -> None:
     """
     Setup the logger with the specified format
     """
+    global _entrypoint  # noqa: PLW0603
+    _entrypoint = _get_entrypoint()
+
     # logging.config.dictConfig(logging_config)
     renderer = structlog.processors.JSONRenderer() if settings.JSON_LOGGING else CustomConsoleRenderer()
     additional_processors = (
@@ -309,6 +355,7 @@ def setup_logger() -> None:
         processors=[
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
+            _add_entrypoint,
             add_error_processor,
             structlog.processors.format_exc_info,
         ]

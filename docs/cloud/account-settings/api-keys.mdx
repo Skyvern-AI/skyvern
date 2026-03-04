@@ -24,7 +24,7 @@ Every Skyvern API request requires the `x-api-key` header:
 curl -X POST "https://api.skyvern.com/v1/runs" \
   -H "x-api-key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{ "url": "https://example.com", "goal": "Extract the pricing table" }'
+  -d '{ "url": "https://example.com", "prompt": "Extract the pricing table" }'
 ```
 
 With the Python SDK:

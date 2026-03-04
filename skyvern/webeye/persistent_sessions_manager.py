@@ -68,6 +68,7 @@ class PersistentSessionsManager(Protocol):
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
         is_high_priority: bool = False,
+        browser_profile_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...

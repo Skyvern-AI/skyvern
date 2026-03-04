@@ -102,27 +102,47 @@ def init_env(
         )
     else:
         console.print(Panel("[bold purple]Cloud Deployment Setup[/bold purple]", border_style="purple"))
-        base_url = Prompt.ask("Enter Skyvern base URL", default="https://api.skyvern.com", show_default=True)
-        if not base_url:
-            base_url = "https://api.skyvern.com"
+        api_key = None
 
-        console.print("\n[bold]To get your API key:[/bold]")
-        console.print("1. Create an account at [link]https://app.skyvern.com[/link]")
-        console.print("2. Go to [bold cyan]Settings[/bold cyan]")
-        console.print("3. [bold green]Copy your API key[/bold green]")
-        api_key = Prompt.ask("Enter your Skyvern API key", password=True)
-        if not api_key:
-            console.print("[red]API key is required.[/red]")
-            api_key = Prompt.ask("Please re-enter your Skyvern API key", password=True)
+        auth_method = Prompt.ask(
+            "Authenticate via [bold blue]browser[/bold blue] (recommended) or paste an [bold yellow]api-key[/bold yellow] manually?",
+            choices=["browser", "api-key"],
+            default="browser",
+        )
+
+        if auth_method == "browser":
+            from .auth_command import run_signup
+
+            frontend_url = Prompt.ask(
+                "Frontend URL",
+                default="https://app.skyvern.com",
+                show_default=True,
+            )
+            run_signup(base_url=frontend_url)
+            api_key = None  # already saved by browser_auth
+        else:
+            base_url = Prompt.ask("Enter Skyvern base URL", default="https://api.skyvern.com", show_default=True)
+            if not base_url:
+                base_url = "https://api.skyvern.com"
+
+            console.print("\n[bold]To get your API key:[/bold]")
+            console.print("1. Create an account at [link]https://app.skyvern.com[/link]")
+            console.print("2. Go to [bold cyan]Settings[/bold cyan]")
+            console.print("3. [bold green]Copy your API key[/bold green]")
+            api_key = Prompt.ask("Enter your Skyvern API key", password=True)
             if not api_key:
-                console.print("[bold red]Error: API key cannot be empty. Aborting initialization.[/bold red]")
-                return False
-        update_or_add_env_var("SKYVERN_BASE_URL", base_url)
+                console.print("[red]API key is required.[/red]")
+                api_key = Prompt.ask("Please re-enter your Skyvern API key", password=True)
+                if not api_key:
+                    console.print("[bold red]Error: API key cannot be empty. Aborting initialization.[/bold red]")
+                    return False
+            update_or_add_env_var("SKYVERN_BASE_URL", base_url)
 
     analytics_id_input = Prompt.ask("Please enter your email for analytics (press enter to skip)", default="")
     analytics_id = analytics_id_input if analytics_id_input else str(uuid.uuid4())
     update_or_add_env_var("ANALYTICS_ID", analytics_id)
-    update_or_add_env_var("SKYVERN_API_KEY", api_key)
+    if api_key:
+        update_or_add_env_var("SKYVERN_API_KEY", api_key)
     console.print(f"✅ [green]{resolve_backend_env_path()} file has been initialized.[/green]")
 
     if Confirm.ask("\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?", default=True):

@@ -52,6 +52,17 @@ def _build_remote_mcp_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL) -> dic
     return entry
 
 
+def _build_mcp_remote_bridge_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL) -> dict:
+    """Build an npx mcp-remote entry for clients that only support stdio (e.g. Claude Desktop)."""
+    args = ["mcp-remote", url]
+    if api_key:
+        args.extend(["--header", f"x-api-key:{api_key}"])
+    return {
+        "command": "npx",
+        "args": args,
+    }
+
+
 def _build_local_mcp_entry(
     api_key: str,
     base_url: str,
@@ -78,14 +89,16 @@ def _build_local_mcp_entry(
 
 
 def _has_api_key(entry: dict | None) -> bool:
-    """Check whether an MCP config entry carries an API key (remote or local format)."""
+    """Check whether an MCP config entry carries an API key (remote, local, or mcp-remote bridge format)."""
     if not entry:
         return False
     if entry.get("headers", {}).get("x-api-key"):
         return True
     if entry.get("env", {}).get("SKYVERN_API_KEY"):
         return True
-    return False
+    # mcp-remote bridge: API key is in args as "--header", "x-api-key:..."
+    args = entry.get("args", [])
+    return any(isinstance(a, str) and a.startswith("x-api-key:") for a in args)
 
 
 def _upsert_mcp_config(
@@ -152,6 +165,7 @@ def _build_entry(
     local: bool,
     use_python_path: bool,
     url: str | None,
+    use_mcp_remote_bridge: bool = False,
 ) -> dict:
     if local:
         return _build_local_mcp_entry(api_key, base_url, use_python_path=use_python_path)
@@ -160,6 +174,8 @@ def _build_entry(
     if parsed.scheme not in ("http", "https"):
         console.print(f"[red]Invalid URL: {remote_url} (must start with http:// or https://)[/red]")
         raise typer.Exit(code=1)
+    if use_mcp_remote_bridge:
+        return _build_mcp_remote_bridge_entry(api_key, url=remote_url)
     return _build_remote_mcp_entry(api_key, url=remote_url)
 
 
@@ -224,10 +240,14 @@ def _run_setup(
     local: bool,
     use_python_path: bool,
     url: str | None,
+    *,
+    use_mcp_remote_bridge: bool = False,
 ) -> None:
     env_key, env_url = _get_env_credentials()
     key = api_key or env_key
-    entry = _build_entry(key, env_url, local=local, use_python_path=use_python_path, url=url)
+    entry = _build_entry(
+        key, env_url, local=local, use_python_path=use_python_path, url=url, use_mcp_remote_bridge=use_mcp_remote_bridge
+    )
     _upsert_mcp_config(config_path, tool_name, entry, dry_run=dry_run, yes=yes)
 
 
@@ -245,8 +265,18 @@ def setup_claude(
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
 ) -> None:
-    """Register Skyvern MCP with Claude Desktop (remote by default)."""
-    _run_setup("Claude Desktop", _claude_desktop_config_path(), api_key, dry_run, yes, local, use_python_path, url)
+    """Register Skyvern MCP with Claude Desktop (uses mcp-remote bridge for remote mode)."""
+    _run_setup(
+        "Claude Desktop",
+        _claude_desktop_config_path(),
+        api_key,
+        dry_run,
+        yes,
+        local,
+        use_python_path,
+        url,
+        use_mcp_remote_bridge=not local,
+    )
 
 
 @setup_app.command("claude-code")

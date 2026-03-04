@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.schemas.docs.doc_examples import (
@@ -58,6 +58,7 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_IT = "RESIDENTIAL_IT"
     RESIDENTIAL_NL = "RESIDENTIAL_NL"
     RESIDENTIAL_PH = "RESIDENTIAL_PH"
+    RESIDENTIAL_KR = "RESIDENTIAL_KR"
     RESIDENTIAL_ISP = "RESIDENTIAL_ISP"
     NONE = "NONE"
 
@@ -97,6 +98,7 @@ class ProxyLocation(StrEnum):
             cls.RESIDENTIAL_IT,
             cls.RESIDENTIAL_NL,
             cls.RESIDENTIAL_PH,
+            cls.RESIDENTIAL_KR,
         }
 
     @staticmethod
@@ -121,6 +123,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_IT: 2000,
             ProxyLocation.RESIDENTIAL_NL: 2000,
             ProxyLocation.RESIDENTIAL_PH: 2000,
+            ProxyLocation.RESIDENTIAL_KR: 2000,
         }
         return counts.get(proxy_location, 10000)
 
@@ -146,6 +149,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_IT: "IT",
             ProxyLocation.RESIDENTIAL_NL: "NL",
             ProxyLocation.RESIDENTIAL_PH: "PH",
+            ProxyLocation.RESIDENTIAL_KR: "KR",
         }
         return mapping.get(proxy_location, "US")
 
@@ -170,6 +174,7 @@ SUPPORTED_GEO_COUNTRIES = frozenset(
         "NL",
         "NZ",
         "PH",
+        "KR",
         "TR",
         "ZA",
     }
@@ -314,6 +319,9 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
 
     if proxy_location == ProxyLocation.RESIDENTIAL_PH:
         return ZoneInfo("Asia/Manila")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_KR:
+        return ZoneInfo("Asia/Seoul")
 
     if proxy_location == ProxyLocation.RESIDENTIAL_ISP:
         return ZoneInfo("America/New_York")
@@ -522,12 +530,6 @@ class WorkflowRunRequest(BaseModel):
         if not url:
             return url
         return validate_url(url)
-
-    @model_validator(mode="after")
-    def validate_browser_reference(cls, values: WorkflowRunRequest) -> WorkflowRunRequest:
-        if values.browser_session_id and values.browser_profile_id:
-            raise ValueError("Cannot specify both browser_session_id and browser_profile_id")
-        return values
 
 
 class BlockRunRequest(WorkflowRunRequest):
