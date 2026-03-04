@@ -197,8 +197,12 @@ export function descendants(nodes: Array<AppNode>, id: string): Array<AppNode> {
 }
 
 /**
- * Updates visibility for a node and all its descendants recursively.
- * For nested conditionals, respects their active branch settings.
+ * Updates visibility for a node and all its descendants.
+ * When hiding, hides everything in a single pass.
+ * When showing, processes top-down (parents before children) so that each
+ * node's visibility decision can read its parent conditional's already-resolved
+ * visibility. This is critical for deeply nested conditionals: a child should
+ * only be shown if its parent conditional is visible AND its branch is active.
  */
 export function updateNodeAndDescendantsVisibility(
   nodes: Array<AppNode>,
@@ -208,43 +212,73 @@ export function updateNodeAndDescendantsVisibility(
   const nodeDescendants = descendants(nodes, nodeId);
   const descendantIds = new Set([nodeId, ...nodeDescendants.map((n) => n.id)]);
 
-  return nodes.map((node) => {
-    if (!descendantIds.has(node.id)) {
-      return node;
-    }
-
-    // If we're hiding, hide everything
-    if (shouldHide) {
+  // When hiding, all descendants are hidden — single pass is fine
+  if (shouldHide) {
+    return nodes.map((node) => {
+      if (!descendantIds.has(node.id)) return node;
       return { ...node, hidden: true };
-    }
+    });
+  }
 
-    // If we're showing, need to respect nested conditional logic
-    if (node.id === nodeId) {
-      return { ...node, hidden: false };
-    }
+  // When showing, process top-down so parent visibility is resolved before
+  // children. descendants() returns in parent-first order (parents appear
+  // before their children in the array).
+  const result = [...nodes];
+  const indexById = new Map(result.map((n, i) => [n.id, i]));
 
-    // For descendants, check if they're in a nested conditional
+  // Show the root node
+  const rootIdx = indexById.get(nodeId);
+  if (rootIdx !== undefined) {
+    result[rootIdx] = { ...result[rootIdx]!, hidden: false };
+  }
+
+  // Process descendants in parent-first order, reading from `result`
+  // which reflects visibility decisions made for earlier (parent) nodes.
+  for (const desc of nodeDescendants) {
+    const idx = indexById.get(desc.id);
+    if (idx === undefined) continue;
+
+    const node = result[idx]!;
+
+    // Workflow block nodes inside a conditional: check parent conditional
     if (isWorkflowBlockNode(node) && node.data.conditionalNodeId) {
-      // This node is inside a conditional - find that conditional
-      const conditionalNode = nodes.find(
-        (n) => n.id === node.data.conditionalNodeId,
-      );
+      const conditionalIdx = indexById.get(node.data.conditionalNodeId);
+      const conditionalNode =
+        conditionalIdx !== undefined ? result[conditionalIdx] : undefined;
 
       if (conditionalNode && isWorkflowBlockNode(conditionalNode)) {
+        // If parent conditional is hidden, hide this node too
+        if (conditionalNode.hidden) {
+          result[idx] = { ...node, hidden: true };
+          continue;
+        }
+
         const conditionalData = conditionalNode.data as {
           activeBranchId?: string | null;
         };
         const activeBranchId = conditionalData.activeBranchId;
-
-        // Show only if this node belongs to the active branch
         const shouldShow = node.data.conditionalBranchId === activeBranchId;
-        return { ...node, hidden: !shouldShow };
+        result[idx] = { ...node, hidden: !shouldShow };
+        continue;
       }
     }
 
-    // Otherwise, show the node
-    return { ...node, hidden: false };
-  });
+    // Non-workflow-block nodes (start, adder): inherit parent's visibility
+    if (node.parentId) {
+      const parentIdx = indexById.get(node.parentId);
+      const parentNode =
+        parentIdx !== undefined ? result[parentIdx] : undefined;
+      if (parentNode) {
+        result[idx] = { ...node, hidden: parentNode.hidden ?? false };
+        continue;
+      }
+    }
+
+    // Default: show the node
+    result[idx] = { ...node, hidden: false };
+  }
+
+  return result;
 }
 
 export function getLoopNodeWidth(node: AppNode, nodes: Array<AppNode>): number {
@@ -1315,7 +1349,9 @@ function getConditionalBranchNodeIds(
       .filter(
         (node) =>
           isWorkflowBlockNode(node) &&
-          !node.hidden &&
+          // Do NOT filter by !node.hidden here. Hidden is a UI-only concept
+          // for branch tab visibility. Serialization must consider all branch
+          // nodes to correctly identify merge targets.
           node.data.conditionalNodeId === conditionalNodeId &&
           Boolean(node.data.conditionalBranchId),
       )
