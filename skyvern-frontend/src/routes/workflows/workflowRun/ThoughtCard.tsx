@@ -1,9 +1,8 @@
 import { StatusPill } from "@/components/ui/status-pill";
 import { QuestionMarkIcon } from "@radix-ui/react-icons";
 import { ObserverThought } from "../types/workflowRunTypes";
-import { cn } from "@/util/utils";
 import { BrainIcon } from "@/components/icons/BrainIcon";
-import { useCallback } from "react";
+import { RunCard } from "./RunCard";
 
 type Props = {
   active: boolean;
@@ -12,29 +11,11 @@ type Props = {
 };
 
 function ThoughtCard({ thought, onClick, active }: Props) {
-  const refCallback = useCallback((element: HTMLDivElement | null) => {
-    if (element && active) {
-      element.scrollIntoView({
-        behavior: "smooth",
-        block: "start",
-      });
-    }
-    // this should only run once at mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   return (
-    <div
-      className={cn(
-        "space-y-3 rounded-md border bg-slate-elevation3 p-4 hover:border-slate-50",
-        {
-          "border-slate-50": active,
-        },
-      )}
-      onClick={() => {
-        onClick(thought);
-      }}
-      ref={refCallback}
+    <RunCard
+      active={active}
+      onClick={() => onClick(thought)}
+      className="space-y-3 p-4"
     >
       <div className="flex justify-between">
         <div className="flex gap-3">
@@ -51,7 +32,7 @@ function ThoughtCard({ thought, onClick, active }: Props) {
           {thought.answer || thought.thought}
         </div>
       )}
-    </div>
+    </RunCard>
   );
 }
 
