@@ -26,6 +26,7 @@ class FakeWorkflowRunContext:
         self.workflow_id = "wf-id"
         self.workflow_permanent_id = "wf-perm-id"
         self.workflow_run_id = "wf-run-id"
+        self.browser_session_id: str | None = None
 
     def get_block_metadata(self, label: str) -> dict:
         return dict(self._block_metadata.get(label, {}))

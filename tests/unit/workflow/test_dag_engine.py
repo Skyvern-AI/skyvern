@@ -74,6 +74,7 @@ class DummyContext:
         self.workflow_id = "wf"
         self.workflow_permanent_id = "wf-perm"
         self.workflow_run_id = workflow_run_id
+        self.browser_session_id: str | None = None
 
     def update_block_metadata(self, label: str, metadata: dict) -> None:
         self.blocks_metadata[label] = metadata
