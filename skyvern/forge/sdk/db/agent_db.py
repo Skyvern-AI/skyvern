@@ -5091,11 +5091,11 @@ class AgentDB(BaseAlchemyDB):
                 if not persistent_browser_session:
                     raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
 
-                if status:
+                if status is not None:
                     persistent_browser_session.status = status
-                if timeout_minutes:
+                if timeout_minutes is not None:
                     persistent_browser_session.timeout_minutes = timeout_minutes
-                if completed_at:
+                if completed_at is not None:
                     persistent_browser_session.completed_at = completed_at
 
                 await session.commit()
