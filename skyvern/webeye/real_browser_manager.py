@@ -29,6 +29,7 @@ class RealBrowserManager(BrowserManager):
         url: str | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        workflow_permanent_id: str | None = None,
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
@@ -46,6 +47,7 @@ class RealBrowserManager(BrowserManager):
             url=url,
             task_id=task_id,
             workflow_run_id=workflow_run_id,
+            workflow_permanent_id=workflow_permanent_id,
             script_id=script_id,
             organization_id=organization_id,
             extra_http_headers=extra_http_headers,
@@ -114,6 +116,7 @@ class RealBrowserManager(BrowserManager):
                 proxy_location=task.proxy_location,
                 url=task.url,
                 task_id=task.task_id,
+                workflow_permanent_id=task.workflow_permanent_id,
                 organization_id=task.organization_id,
                 extra_http_headers=task.extra_http_headers,
                 browser_address=task.browser_address,
@@ -135,6 +138,7 @@ class RealBrowserManager(BrowserManager):
             url=task.url,
             proxy_location=task.proxy_location,
             task_id=task.task_id,
+            workflow_permanent_id=task.workflow_permanent_id,
             organization_id=task.organization_id,
             extra_http_headers=task.extra_http_headers,
             browser_address=task.browser_address,
@@ -153,9 +157,19 @@ class RealBrowserManager(BrowserManager):
         if browser_profile_id is None:
             browser_profile_id = workflow_run.browser_profile_id
 
+        # Check own cache entry first so navigate_to_url is only called on the first step.
+        # Don't pass parent_workflow_run_id here — that lookup is deferred to the block
+        # below so PBS runs don't accidentally inherit the parent's browser.
+        browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run_id)
+        if browser_state:
+            LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
+            return browser_state
+
         # When an explicit browser_session_id is provided (e.g. from a workflow
         # trigger block), skip the parent workflow lookup so the child uses the
         # specified persistent session instead of inheriting the parent's browser.
+        # Note: at this point workflow_run_id is guaranteed not in self.pages (caught above),
+        # so the call below can only match via parent_workflow_run_id.
         if not browser_session_id:
             browser_state = self.get_for_workflow_run(
                 workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
@@ -197,6 +211,7 @@ class RealBrowserManager(BrowserManager):
                 proxy_location=workflow_run.proxy_location,
                 url=url,
                 workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
                 organization_id=workflow_run.organization_id,
                 extra_http_headers=workflow_run.extra_http_headers,
                 browser_address=workflow_run.browser_address,
@@ -223,6 +238,7 @@ class RealBrowserManager(BrowserManager):
             url=url,
             proxy_location=workflow_run.proxy_location,
             workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id,
             organization_id=workflow_run.organization_id,
             extra_http_headers=workflow_run.extra_http_headers,
             browser_address=workflow_run.browser_address,
@@ -233,6 +249,9 @@ class RealBrowserManager(BrowserManager):
     def get_for_workflow_run(
         self, workflow_run_id: str, parent_workflow_run_id: str | None = None
     ) -> BrowserState | None:
+        # Priority: parent first, then own entry.
+        # Callers that need to avoid parent inheritance must omit parent_workflow_run_id.
+        # See get_or_create_for_workflow_run() for the two-phase lookup pattern.
         if parent_workflow_run_id and parent_workflow_run_id in self.pages:
             return self.pages[parent_workflow_run_id]
 
@@ -372,19 +391,45 @@ class RealBrowserManager(BrowserManager):
         LOG.info("Cleaning up for workflow run")
         browser_state_to_close = self.pages.pop(workflow_run_id, None)
         if browser_state_to_close:
-            # Stop tracing before closing the browser if tracing is enabled
-            if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
+            # If another workflow run still references this browser state (e.g. a
+            # parent whose in-memory browser was shared via use_parent_browser_session),
+            # skip closing the browser so the parent can continue using it.
+            shared = any(bs is browser_state_to_close for bs in self.pages.values())
+            effective_close = close_browser_on_completion and not shared
+            if shared:
+                LOG.info(
+                    "Browser state is shared with another workflow run, skipping browser close",
+                    workflow_run_id=workflow_run_id,
+                )
+
+            # Stop tracing before closing the browser if tracing is enabled.
+            # Skip when the browser is shared — Playwright supports only one active
+            # tracing session per context, so stopping here would kill the parent's trace.
+            if (
+                browser_state_to_close.browser_context
+                and browser_state_to_close.browser_artifacts.traces_dir
+                and not shared
+            ):
                 trace_path = f"{browser_state_to_close.browser_artifacts.traces_dir}/{workflow_run_id}.zip"
                 await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
                 LOG.info("Stopped tracing", trace_path=trace_path)
 
-            await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
+            await browser_state_to_close.close(close_browser_on_completion=effective_close)
         for task_id in task_ids:
             task_browser_state = self.pages.pop(task_id, None)
             if task_browser_state is None:
                 continue
+            # Same shared-state check for task-level entries
+            shared = any(bs is task_browser_state for bs in self.pages.values())
+            effective_close = close_browser_on_completion and not shared
+            if shared:
+                LOG.info(
+                    "Browser state is shared with another workflow run, skipping browser close",
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                )
             try:
-                await task_browser_state.close(close_browser_on_completion=close_browser_on_completion)
+                await task_browser_state.close(close_browser_on_completion=effective_close)
             except Exception:
                 LOG.info(
                     "Failed to close the browser state from the task block, might because it's already closed.",

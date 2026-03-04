@@ -33,7 +33,7 @@ from .credential import (
     skyvern_credential_get,
     skyvern_credential_list,
 )
-from .prompts import build_workflow, debug_automation, extract_data
+from .prompts import build_workflow, debug_automation, extract_data, qa_test
 from .session import (
     skyvern_browser_session_close,
     skyvern_browser_session_connect,
@@ -230,7 +230,7 @@ Once you've confirmed each step works, compose them into a workflow with skyvern
 ## Writing Scripts (ONLY when user explicitly asks)
 Use the Skyvern Python SDK: `from skyvern import Skyvern`
 NEVER import from skyvern.cli.mcp_tools — those are internal server modules.
-Every tool response includes an `sdk_equivalent` field for script conversion.
+In verbose mode (`--verbose`), every tool response includes an `sdk_equivalent` field for script conversion.
 
 **Hybrid xpath+prompt pattern** — the recommended approach for production scripts:
     await page.click("xpath=//button[@id='submit']", prompt="the Submit button")
@@ -290,6 +290,7 @@ mcp.tool()(skyvern_workflow_cancel)
 mcp.prompt()(build_workflow)
 mcp.prompt()(debug_automation)
 mcp.prompt()(extract_data)
+mcp.prompt()(qa_test)
 
 __all__ = [
     "mcp",
@@ -336,4 +337,5 @@ __all__ = [
     "build_workflow",
     "debug_automation",
     "extract_data",
+    "qa_test",
 ]

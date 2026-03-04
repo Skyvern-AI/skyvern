@@ -104,6 +104,7 @@ from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import (
     extract_totp_from_navigation_inputs,
     poll_otp_value,
@@ -419,6 +420,7 @@ class ForgeAgent:
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
         list_files_before: list[str] = []
+        browser_state: BrowserState | None = None
         try:
             if task.workflow_run_id:
                 list_files_before = list_files_in_directory(
@@ -727,7 +729,7 @@ class ForgeAgent:
                 "Step cannot be executed, marking task as failed",
                 exc_info=True,
             )
-            is_task_marked_as_failed = await self.fail_task(task, step, e.message)
+            is_task_marked_as_failed = await self.fail_task(task, step, e.message, browser_state)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -753,7 +755,7 @@ class ForgeAgent:
                 url=e.url,
             )
             failure_reason = f"Failed to navigate to URL. URL:{e.url}, Error:{e.error_message}"
-            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason)
+            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -798,7 +800,7 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
-            await self.fail_task(task, step, e.message)
+            await self.fail_task(task, step, e.message, browser_state)
             await self.clean_up_task(
                 task=task,
                 last_step=step,
@@ -819,6 +821,7 @@ class ForgeAgent:
                 step,
                 sfe.reason
                 or "Skyvern failed to load the website. This usually happens when the website is not properly designed, and crashes the browser as a result.",
+                browser_state,
             )
             await self.clean_up_task(
                 task=task,
@@ -834,6 +837,7 @@ class ForgeAgent:
                 task,
                 step,
                 "The browser does not have a valid page for skyvern to operate. This may be due to the website being empty or the browser crashing.",
+                browser_state,
             )
             await self.clean_up_task(
                 task=task,
@@ -848,7 +852,7 @@ class ForgeAgent:
 
             failure_reason = get_user_facing_exception_message(e)
 
-            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason)
+            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -866,7 +870,9 @@ class ForgeAgent:
             context.step_id = None
             context.task_id = None
 
-    async def fail_task(self, task: Task, step: Step | None, reason: str | None) -> bool:
+    async def fail_task(
+        self, task: Task, step: Step | None, reason: str | None, browser_state: BrowserState | None = None
+    ) -> bool:
         try:
             if step is not None:
                 await self.update_step(
@@ -874,11 +880,50 @@ class ForgeAgent:
                     status=StepStatus.failed,
                 )
 
+            # Update task status first
             await self.update_task(
                 task,
                 status=TaskStatus.failed,
                 failure_reason=reason,
             )
+
+            # Detect user-defined errors if error_code_mapping is provided
+            if task.error_code_mapping and step is not None:
+                LOG.info(
+                    "Task has error_code_mapping, attempting to detect user-defined errors",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    error_code_mapping=task.error_code_mapping,
+                )
+
+                try:
+                    detected_errors = await detect_user_defined_errors_for_task(
+                        task=task,
+                        step=step,
+                        browser_state=browser_state,
+                        failure_reason=reason,
+                    )
+
+                    # Update task errors if any were detected
+                    # Only pass new errors — update_task() appends to existing errors
+                    if detected_errors:
+                        new_errors = [error.model_dump() for error in detected_errors]
+                        await app.DATABASE.update_task(
+                            task_id=task.task_id,
+                            organization_id=task.organization_id,
+                            errors=new_errors,
+                        )
+                        LOG.info(
+                            "Updated task with detected user-defined errors",
+                            task_id=task.task_id,
+                            error_codes=[e.error_code for e in detected_errors],
+                        )
+                except Exception:
+                    LOG.exception(
+                        "Failed to detect or store user-defined errors during task failure",
+                        task_id=task.task_id,
+                    )
+
             return True
         except TaskAlreadyCanceled:
             LOG.info(
@@ -4028,7 +4073,7 @@ class ForgeAgent:
             if browser_state is not None:
                 page = await browser_state.get_working_page()
 
-            failure_reason = await self.summary_failure_reason_for_max_retries(
+            failure_response = await self.summary_failure_reason_for_max_retries(
                 organization=organization,
                 task=task,
                 step=step,
@@ -4036,13 +4081,23 @@ class ForgeAgent:
                 max_retries=max_retries_per_step,
             )
 
+            # Only pass new errors — update_task() appends to existing errors in the DB
+            new_errors: list[dict[str, Any]] = [ReachMaxRetriesError().model_dump()]
+            if failure_response.errors:
+                new_errors.extend([error.model_dump() for error in failure_response.errors])
+                LOG.info(
+                    "Detected user-defined errors for max retries failure",
+                    task_id=task.task_id,
+                    error_codes=[e.error_code for e in failure_response.errors],
+                )
+
             await self.update_task(
                 task,
                 TaskStatus.failed,
                 failure_reason=(
-                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_reason}"
+                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_response.reasoning}"
                 ),
-                errors=[ReachMaxRetriesError().model_dump()],
+                errors=new_errors,
             )
             return None
         else:
@@ -4180,7 +4235,7 @@ class ForgeAgent:
         step: Step,
         page: Page | None,
         max_retries: int,
-    ) -> str:
+    ) -> MaxStepsReasonResponse:
         html = ""
         screenshots: list[bytes] = []
         steps_results = []
@@ -4231,18 +4286,26 @@ class ForgeAgent:
             # If we detected LLM errors, return a clear message without calling the LLM
             if llm_errors:
                 llm_error_details = "; ".join(llm_errors)
-                return (
-                    f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
-                    f"This is typically caused by rate limiting, service outages, or resource exhaustion from the LLM provider. "
-                    f"Error details: {llm_error_details}"
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                        f"This is typically caused by rate limiting, service outages, or resource exhaustion from the LLM provider. "
+                        f"Error details: {llm_error_details}"
+                    ),
+                    errors=[],
                 )
 
             # If multiple steps failed without producing any actions, it's likely an LLM error during action extraction
             if steps_without_actions >= max_retries:
-                return (
-                    f"The task failed because all {max_retries} retry attempts failed to generate actions. "
-                    f"This is typically caused by LLM service errors during action extraction, such as rate limiting, "
-                    f"service outages, or resource exhaustion from the LLM provider. Please check the LLM service status and try again."
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed because all {max_retries} retry attempts failed to generate actions. "
+                        f"This is typically caused by LLM service errors during action extraction, such as rate limiting, "
+                        f"service outages, or resource exhaustion from the LLM provider. Please check the LLM service status and try again."
+                    ),
+                    errors=[],
                 )
 
             if page is not None:
@@ -4257,6 +4320,7 @@ class ForgeAgent:
                 steps=steps_results,
                 page_html=html,
                 max_retries=max_retries,
+                error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await app.SECONDARY_LLM_API_HANDLER(
@@ -4265,26 +4329,42 @@ class ForgeAgent:
                 step=step,
                 prompt_name="summarize-max-retries-reason",
             )
-            return json_response.get("reasoning", "")
+            return MaxStepsReasonResponse.model_validate(json_response)
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")
             # Check if we have LLM errors even if the summarization failed
             if llm_errors:
                 llm_error_details = "; ".join(llm_errors)
-                return (
-                    f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
-                    f"Error details: {llm_error_details}"
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                        f"Error details: {llm_error_details}"
+                    ),
+                    errors=[],
                 )
             # If multiple steps failed without actions during summarization failure, still report it
             if steps_without_actions >= max_retries:
-                return (
-                    f"The task failed because all {max_retries} retry attempts failed to generate actions. "
-                    f"This is typically caused by LLM service errors during action extraction."
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed because all {max_retries} retry attempts failed to generate actions. "
+                        f"This is typically caused by LLM service errors during action extraction."
+                    ),
+                    errors=[],
                 )
             if steps_results:
                 last_step_result = steps_results[-1]
-                return f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}"
-            return ""
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}",
+                    errors=[],
+                )
+            return MaxStepsReasonResponse(
+                page_info="",
+                reasoning="",
+                errors=[],
+            )
 
     async def handle_completed_step(
         self,

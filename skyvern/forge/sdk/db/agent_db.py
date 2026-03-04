@@ -1,4 +1,5 @@
 import json
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
@@ -2909,6 +2910,7 @@ class AgentDB(BaseAlchemyDB):
         verification_code_polling_started_at: datetime | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_address: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -2943,6 +2945,8 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run.browser_session_id = browser_session_id
                 if browser_address:
                     workflow_run.browser_address = browser_address
+                if extra_http_headers:
+                    workflow_run.extra_http_headers = extra_http_headers
                 # 2FA verification code waiting state updates
                 if waiting_for_verification_code is not None:
                     workflow_run.waiting_for_verification_code = waiting_for_verification_code
@@ -5036,6 +5040,7 @@ class AgentDB(BaseAlchemyDB):
         proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
+        browser_profile_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         extensions_str: list[str] | None = (
@@ -5051,6 +5056,7 @@ class AgentDB(BaseAlchemyDB):
                     proxy_location=_serialize_proxy_location(proxy_location),
                     extensions=extensions_str,
                     browser_type=browser_type.value if browser_type else None,
+                    browser_profile_id=browser_profile_id,
                 )
                 session.add(browser_session)
                 await session.commit()
@@ -5296,6 +5302,7 @@ class AgentDB(BaseAlchemyDB):
                     if persistent_browser_session.completed_at:
                         return PersistentBrowserSession.model_validate(persistent_browser_session)
                     persistent_browser_session.completed_at = datetime.utcnow()
+                    persistent_browser_session.status = "completed"
                     await session.commit()
                     await session.refresh(persistent_browser_session)
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
@@ -5310,11 +5317,54 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def archive_browser_session_address(self, session_id: str, organization_id: str) -> None:
+        """Suffix browser_address with a unique tag so the unique constraint
+        no longer blocks new sessions that reuse the same local address."""
+        try:
+            async with self.Session() as session:
+                row = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+
+                if not row or not row.browser_address:
+                    return
+                if "::closed::" in row.browser_address:
+                    return
+
+                row.browser_address = f"{row.browser_address}::closed::{uuid.uuid4().hex}"
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_all_active_persistent_browser_sessions(self) -> List[PersistentBrowserSessionModel]:
         """Get all active persistent browser sessions across all organizations."""
         try:
             async with self.Session() as session:
                 result = await session.execute(select(PersistentBrowserSessionModel).filter_by(deleted_at=None))
+                return result.scalars().all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_uncompleted_persistent_browser_sessions(self) -> List[PersistentBrowserSessionModel]:
+        """Get all browser sessions that have not been completed or deleted."""
+        try:
+            async with self.Session() as session:
+                result = await session.execute(
+                    select(PersistentBrowserSessionModel).filter_by(deleted_at=None).filter_by(completed_at=None)
+                )
                 return result.scalars().all()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)

@@ -397,3 +397,83 @@ async def test_empty_param_produces_explicit_marker_in_prompt_evaluation() -> No
     assert rendered_expressions == ["if (empty value) is not empty"]
     # The prompt should be loaded with the patched expression
     assert mock_prompt.call_args.kwargs["conditions"] == ["if (empty value) is not empty"]
+
+
+# ---------------------------------------------------------------------------
+# Tests for None failure_reason guard in _evaluate_prompt_branches (SKY-8026)
+# ---------------------------------------------------------------------------
+
+
+def _failed_extraction_result(output_parameter: OutputParameter, failure_reason: str | None = None) -> BlockResult:
+    return BlockResult(
+        success=False,
+        output_parameter=output_parameter,
+        output_parameter_value=None,
+        failure_reason=failure_reason,
+    )
+
+
+@pytest.mark.asyncio
+async def test_extraction_failure_with_none_reason_produces_informative_error() -> None:
+    """When ExtractionBlock fails with failure_reason=None, the raised ValueError
+    should NOT contain the literal string 'None' (SKY-8026)."""
+    block = _conditional_block()
+    branch = BranchCondition(
+        criteria=PromptBranchCriteria(expression="user selected premium plan"),
+        next_block_label="premium",
+    )
+
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(
+            return_value=_failed_extraction_result(block.output_parameter, failure_reason=None)
+        )
+        mock_extraction_cls.return_value = mock_extraction
+
+        with pytest.raises(ValueError, match="Unknown error"):
+            await block._evaluate_prompt_branches(
+                branches=[branch],
+                evaluation_context=evaluation_context,
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_test",
+                organization_id="org_test",
+            )
+
+
+@pytest.mark.asyncio
+async def test_extraction_failure_with_reason_preserves_original_message() -> None:
+    """When ExtractionBlock fails with a real failure_reason, that reason should
+    appear verbatim in the raised ValueError."""
+    block = _conditional_block()
+    branch = BranchCondition(
+        criteria=PromptBranchCriteria(expression="user selected premium plan"),
+        next_block_label="premium",
+    )
+
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(
+            return_value=_failed_extraction_result(block.output_parameter, failure_reason="LLM rate limited")
+        )
+        mock_extraction_cls.return_value = mock_extraction
+
+        with pytest.raises(ValueError, match="LLM rate limited"):
+            await block._evaluate_prompt_branches(
+                branches=[branch],
+                evaluation_context=evaluation_context,
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_test",
+                organization_id="org_test",
+            )

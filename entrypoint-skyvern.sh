@@ -56,6 +56,16 @@ Xvfb :99 -screen 0 1920x1080x16 &
 xvfb=$!
 
 DISPLAY=:99 xterm 2>/dev/null &
+
+echo "Starting x11vnc on display :99..."
+# VNC runs without a password (-nopw) because port 5900 is not exposed outside
+# the container. Browser streaming reaches users via websockify on port 6080.
+mkdir -p /data/log
+x11vnc -display :99 -forever -nopw -shared -rfbport 5900 -bg -o /dev/null 2>/data/log/x11vnc.err
+
+echo "Starting websockify on port 6080 -> localhost:5900..."
+websockify 6080 localhost:5900 --daemon
+
 python run_streaming.py > /dev/null &
 
 # Run the command and pass in all three arguments

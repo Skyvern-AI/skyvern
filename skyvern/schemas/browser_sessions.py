@@ -33,6 +33,12 @@ class CreateBrowserSessionRequest(BaseModel):
         description="The type of browser to use for the session.",
     )
 
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`.",
+        pattern=r"^bp_",
+    )
+
 
 class ProcessBrowserSessionRecordingRequest(BaseModel):
     compressed_chunks: list[str] = Field(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import platform
+import shutil
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
+import psutil
 
 if TYPE_CHECKING:
     from subprocess import Popen
@@ -85,12 +87,145 @@ def get_default_download_dir(browser_id: str) -> str:
     return str(download_dir)
 
 
+def get_local_chrome_profile_dir() -> Path:
+    """Return the platform-specific Chrome user data directory."""
+    system = platform.system()
+    if system == "Darwin":
+        return Path.home() / "Library/Application Support/Google/Chrome"
+    elif system == "Windows":
+        local_app = Path.home() / "AppData" / "Local"
+        return local_app / "Google" / "Chrome" / "User Data"
+    else:
+        return Path.home() / ".config" / "google-chrome"
+
+
+_CHROME_MAIN_NAMES = {"chrome", "google-chrome", "google-chrome-stable", "google chrome", "chromium"}
+_CHROME_SKIP_NAMES = {"chrome_crashpad_handler", "chromedriver", "chrome helper", "google chrome helper"}
+
+
+def is_chrome_running() -> bool:
+    """Check if Chrome is already running (main browser process only).
+
+    Uses exact name matching to avoid false positives from helper processes
+    (renderer, GPU, utility) and unrelated tools like chromedriver.
+    """
+    for proc in psutil.process_iter(["name"]):
+        try:
+            name = (proc.info["name"] or "").lower()
+            if name in _CHROME_SKIP_NAMES:
+                continue
+            if name in _CHROME_MAIN_NAMES:
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return False
+
+
+_PROFILE_COPY_IGNORE = {
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "Service Worker",
+    "blob_storage",
+    "BudgetDatabase",
+    "coupon_db",
+    "Download Service",
+    "GCM Store",
+    "optimization_guide_model_metadata",
+    "optimization_guide_prediction_model_downloads",
+    "Extensions",
+    "IndexedDB",
+    "File System",
+    "Session Storage",
+}
+
+_LOCK_FILES = {"SingletonLock", "SingletonSocket", "SingletonCookie"}
+
+
+def clone_local_chrome_profile(chrome_profile_name: str, dest_user_data_dir: Path, *, full: bool = False) -> None:
+    """Copy the user's local Chrome profile into *dest_user_data_dir*.
+
+    Args:
+        chrome_profile_name: Profile subdirectory name (e.g. ``"Default"``).
+        dest_user_data_dir: Destination path that will be used as ``--user-data-dir``.
+        full: When ``True``, copy the **entire** Chrome user-data directory
+              (requires Chrome to be closed). When ``False`` (default), copy
+              only the target profile subdir (skipping caches) plus ``Local State``,
+              which is much faster (~50-200 MB vs 2-10+ GB).
+    """
+    source_user_data_dir = get_local_chrome_profile_dir()
+    if not source_user_data_dir.is_dir():
+        raise FileNotFoundError(
+            f"Chrome user data directory not found at {source_user_data_dir}. Is Google Chrome installed?"
+        )
+
+    source_profile = source_user_data_dir / chrome_profile_name
+    if not source_profile.resolve().is_relative_to(source_user_data_dir.resolve()):
+        raise ValueError(f"Profile name '{chrome_profile_name}' resolves outside the Chrome data directory.")
+
+    if not source_profile.is_dir():
+        available = [d.name for d in source_user_data_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        raise FileNotFoundError(
+            f"Chrome profile '{chrome_profile_name}' not found in {source_user_data_dir}. "
+            f"Available profiles: {', '.join(sorted(available)[:10])}"
+        )
+
+    resolved_dest = dest_user_data_dir.resolve()
+    skyvern_data = SKYVERN_DATA_DIR.resolve()
+    if not resolved_dest.is_relative_to(skyvern_data):
+        raise ValueError(
+            f"Refusing to overwrite {dest_user_data_dir} — it is outside Skyvern's data directory ({SKYVERN_DATA_DIR}). "
+            "Remove it manually or use the default profile directory."
+        )
+
+    if dest_user_data_dir.exists():
+        shutil.rmtree(dest_user_data_dir)
+
+    if full:
+        shutil.copytree(source_user_data_dir, dest_user_data_dir, ignore_dangling_symlinks=True)
+    else:
+        _selective_copy(source_user_data_dir, source_profile, chrome_profile_name, dest_user_data_dir)
+
+    # Remove lock files so Chrome can open the copied profile
+    for lock_name in _LOCK_FILES:
+        lock_file = dest_user_data_dir / lock_name
+        if lock_file.exists():
+            lock_file.unlink()
+
+
+def _selective_copy(
+    source_user_data_dir: Path,
+    source_profile: Path,
+    chrome_profile_name: str,
+    dest_user_data_dir: Path,
+) -> None:
+    """Copy only auth-relevant files from the Chrome profile."""
+    dest_user_data_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Copy the profile subdir, skipping cache directories
+    def _ignore(directory: str, contents: list[str]) -> set[str]:
+        return {c for c in contents if c in _PROFILE_COPY_IGNORE}
+
+    shutil.copytree(
+        source_profile,
+        dest_user_data_dir / chrome_profile_name,
+        ignore=_ignore,
+        ignore_dangling_symlinks=True,
+    )
+
+    # 2. Copy Local State (needed for cookie decryption on macOS/Linux)
+    local_state = source_user_data_dir / "Local State"
+    if local_state.is_file():
+        shutil.copy2(local_state, dest_user_data_dir / "Local State")
+
+
 async def launch_chrome_with_cdp(
     port: int,
     profile_dir: str | None = None,
     headless: bool = False,
     chrome_path: str | None = None,
     download_dir: str | None = None,
+    profile_name: str | None = None,
 ) -> LocalBrowserInfo:
     """Launch Chrome with CDP enabled and wait for it to be ready.
 
@@ -100,6 +235,9 @@ async def launch_chrome_with_cdp(
         headless: Whether to run in headless mode.
         chrome_path: Path to Chrome executable. Auto-detects if not specified.
         download_dir: Directory for downloads. Uses default if not specified.
+        profile_name: Chrome profile subdirectory name (e.g. "Profile 1").
+            When set, passes ``--profile-directory`` so Chrome loads the
+            correct profile instead of defaulting to ``Default/``.
 
     Returns:
         LocalBrowserInfo with connection details.
@@ -122,7 +260,11 @@ async def launch_chrome_with_cdp(
         "--disable-sync",
         "--disable-translate",
         "--metrics-recording-only",
+        "--hide-crash-restore-bubble",
     ]
+
+    if profile_name:
+        args.append(f"--profile-directory={profile_name}")
 
     if headless:
         args.append("--headless=new")

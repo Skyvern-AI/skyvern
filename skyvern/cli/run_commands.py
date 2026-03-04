@@ -18,6 +18,7 @@ from starlette.middleware import Middleware
 from skyvern.cli.console import console
 from skyvern.cli.core.client import close_skyvern
 from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware, close_auth_db
+from skyvern.cli.core.result import set_concise_responses
 from skyvern.cli.core.session_manager import close_current_session, set_stateless_http_mode
 from skyvern.cli.mcp_tools import mcp  # Uses standalone fastmcp (v2.x)
 from skyvern.cli.utils import start_services
@@ -283,6 +284,13 @@ def run_mcp(
             help="Use stateless HTTP semantics for HTTP transports (ignored for stdio).",
         ),
     ] = True,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose/--no-verbose",
+            help="Return full tool responses including sdk_equivalent, browser_context, and timing.",
+        ),
+    ] = False,
 ) -> None:
     """Run the MCP server with configurable transport for local or remote hosting."""
     path = _normalize_mcp_path(path)
@@ -292,6 +300,7 @@ def run_mcp(
     # atexit doesn't fire on normal return and finally doesn't fire on signals.
     atexit.register(_cleanup_mcp_resources_sync)
     set_stateless_http_mode(stateless_http_enabled)
+    set_concise_responses(not verbose)
     try:
         if transport == "stdio":
             mcp.run(transport="stdio")
@@ -308,6 +317,7 @@ def run_mcp(
         )
     finally:
         set_stateless_http_mode(False)
+        set_concise_responses(False)
         _cleanup_mcp_resources_blocking()
 
 

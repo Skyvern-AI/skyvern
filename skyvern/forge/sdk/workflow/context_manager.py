@@ -181,6 +181,7 @@ class WorkflowRunContext:
         self.workflow_run_outputs: dict[str, Any] = {}
         self._aws_client = aws_client
         self.organization_id: str | None = None
+        self.browser_session_id: str | None = None
         self.include_secrets_in_templates: bool = False
         self.credential_totp_identifiers: dict[str, str] = {}
 
