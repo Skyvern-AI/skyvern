@@ -1,4 +1,3 @@
-{/* This file (fern/) and docs/integrations/cli.mdx must stay in sync. fern/ is for Fern, docs/ is for Mintlify. */}
 ---
 title: CLI & Skills
 subtitle: Automate browsers and manage workflows from the command line
@@ -13,19 +12,35 @@ The `skyvern` CLI gives you direct access to browser automation, workflow manage
 pip install skyvern
 ```
 
-Set your API key:
+Sign up and get your API key in one step:
 
 ```bash
-export SKYVERN_API_KEY="YOUR_KEY"  # get one at https://app.skyvern.com
+skyvern signup
 ```
 
-Optionally run the interactive setup wizard to configure your environment:
+This opens a browser, walks you through account creation (or login), and saves your API key locally. No manual copy-paste needed.
+
+Already have an API key? Set it directly:
+
+```bash
+export SKYVERN_API_KEY="YOUR_KEY"
+```
+
+Optionally run the interactive setup wizard to configure your full environment (LLM provider, database, browser mode):
 
 ```bash
 skyvern init
 ```
 
 ## Command reference
+
+### Onboarding
+
+```bash
+skyvern signup                # Sign up / login via browser — saves API key automatically
+skyvern init                  # Interactive setup wizard (LLM, database, browser)
+skyvern quickstart            # One-command setup + start
+```
 
 ### Services
 
@@ -84,6 +99,27 @@ skyvern browser login --url https://app.example.com --credential-id cred_xxx
 Every browser command supports `--json` for machine-readable output, and `--session` / `--cdp` to target a specific session. If omitted, the CLI uses the last active session automatically.
 </Tip>
 
+### Local browser serve
+
+Expose your local Chrome to Skyvern Cloud so tasks can access localhost, internal tools, and your existing login sessions.
+
+```bash
+# Launch with ngrok tunnel and your Chrome profile's cookies/logins
+skyvern browser serve --tunnel --use-local-profile
+
+# Use a specific Chrome profile
+skyvern browser serve --tunnel --use-local-profile --chrome-profile-name "Profile 2"
+
+# Headless mode with JSON output (for scripting)
+skyvern browser serve --tunnel --headless --json
+```
+
+The `--use-local-profile` flag clones cookies and saved passwords from your Chrome profile into the served browser. Your original profile is never modified, and it works while Chrome is open.
+
+<Warning>
+Always pass `--api-key` when using `--tunnel`. Without it, anyone with the ngrok URL has full browser control.
+</Warning>
+
 ### Workflows
 
 ```bash
@@ -135,7 +171,6 @@ skyvern setup codex              # Register with Codex
 
 ```bash
 skyvern docs                     # Open documentation in your browser
-skyvern quickstart               # One-command setup + start
 skyvern init browser             # Initialize browser configuration only
 ```
 

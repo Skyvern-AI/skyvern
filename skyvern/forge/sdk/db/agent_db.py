@@ -5039,6 +5039,7 @@ class AgentDB(BaseAlchemyDB):
         proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
+        browser_profile_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         extensions_str: list[str] | None = (
@@ -5054,6 +5055,7 @@ class AgentDB(BaseAlchemyDB):
                     proxy_location=_serialize_proxy_location(proxy_location),
                     extensions=extensions_str,
                     browser_type=browser_type.value if browser_type else None,
+                    browser_profile_id=browser_profile_id,
                 )
                 session.add(browser_session)
                 await session.commit()

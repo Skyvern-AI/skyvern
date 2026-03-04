@@ -288,6 +288,7 @@ class Block(BaseModel, abc.ABC):
                     url=None,
                     proxy_location=workflow_run.proxy_location,
                     workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
                     organization_id=workflow_run.organization_id,
                     extra_http_headers=workflow_run.extra_http_headers,
                     browser_address=workflow_run.browser_address,
@@ -408,6 +409,8 @@ class Block(BaseModel, abc.ABC):
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
         if "current_date" not in template_data:
             template_data["current_date"] = datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT)
+        if "browser_session_id" not in template_data:
+            template_data["browser_session_id"] = workflow_run_context.browser_session_id or ""
 
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
         template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
@@ -992,7 +995,14 @@ class BaseTaskBlock(Block):
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
                 return await self.build_block_result(
                     success=success,
-                    failure_reason=updated_task.failure_reason,
+                    failure_reason=(
+                        updated_task.failure_reason
+                        if success
+                        else (
+                            updated_task.failure_reason
+                            or f"Task {updated_task.task_id} finished with status {updated_task.status}"
+                        )
+                    ),
                     output_parameter_value=output_parameter_value,
                     status=block_status_mapping[updated_task.status],
                     workflow_run_block_id=workflow_run_block_id,
@@ -1009,7 +1019,7 @@ class BaseTaskBlock(Block):
                 )
                 return await self.build_block_result(
                     success=False,
-                    failure_reason=updated_task.failure_reason,
+                    failure_reason=updated_task.failure_reason or f"Task {updated_task.task_id} was canceled",
                     output_parameter_value=None,
                     status=block_status_mapping[updated_task.status],
                     workflow_run_block_id=workflow_run_block_id,
@@ -1026,7 +1036,7 @@ class BaseTaskBlock(Block):
                 )
                 return await self.build_block_result(
                     success=False,
-                    failure_reason=updated_task.failure_reason,
+                    failure_reason=updated_task.failure_reason or f"Task {updated_task.task_id} timed out",
                     output_parameter_value=None,
                     status=block_status_mapping[updated_task.status],
                     workflow_run_block_id=workflow_run_block_id,
@@ -1082,7 +1092,10 @@ class BaseTaskBlock(Block):
                     )
                     return await self.build_block_result(
                         success=False,
-                        failure_reason=updated_task.failure_reason,
+                        failure_reason=(
+                            updated_task.failure_reason
+                            or f"Task {updated_task.task_id} failed with status {updated_task.status}"
+                        ),
                         output_parameter_value=output_parameter_value,
                         status=block_status_mapping[updated_task.status],
                         workflow_run_block_id=workflow_run_block_id,
@@ -1093,7 +1106,11 @@ class BaseTaskBlock(Block):
         return await self.build_block_result(
             success=False,
             status=BlockStatus.failed,
-            failure_reason=current_running_task.failure_reason if current_running_task else None,
+            failure_reason=(
+                (current_running_task.failure_reason or f"Task {current_running_task.task_id} failed")
+                if current_running_task
+                else "Task failed (no task reference available)"
+            ),
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
@@ -1310,7 +1327,10 @@ class ForLoopBlock(Block):
 
                     if not extraction_result.success:
                         LOG.error("Extraction block failed", failure_reason=extraction_result.failure_reason)
-                        raise ValueError(f"Extraction block failed: {extraction_result.failure_reason}")
+                        raise ValueError(
+                            f"Extraction block failed: "
+                            f"{extraction_result.failure_reason or 'Unknown error (no failure reason provided)'}"
+                        )
 
                     LOG.debug("Extraction block succeeded", output=extraction_result.output_parameter_value)
 
@@ -5754,7 +5774,10 @@ class ConditionalBlock(Block):
                     block_label=self.label,
                     failure_reason=extraction_result.failure_reason,
                 )
-                raise ValueError(f"Branch evaluation failed: {extraction_result.failure_reason}")
+                raise ValueError(
+                    f"Branch evaluation failed: "
+                    f"{extraction_result.failure_reason or 'Unknown error (no failure reason provided)'}"
+                )
 
             if workflow_run_context:
                 try:

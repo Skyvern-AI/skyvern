@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, field_validator
 from typing_extensions import deprecated
 
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -40,12 +40,6 @@ class WorkflowRequestBody(BaseModel):
         if not url:
             return url
         return validate_url(url)
-
-    @model_validator(mode="after")
-    def validate_browser_reference(cls, values: "WorkflowRequestBody") -> "WorkflowRequestBody":
-        if values.browser_session_id and values.browser_profile_id:
-            raise ValueError("Cannot specify both browser_session_id and browser_profile_id")
-        return values
 
 
 @deprecated("Use WorkflowRunResponse instead")

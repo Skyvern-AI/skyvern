@@ -433,6 +433,8 @@ async def run_workflow(
         downloaded_files=None,
         recording_url=None,
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
+        browser_session_id=workflow_run.browser_session_id,
+        browser_profile_id=workflow_run.browser_profile_id,
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )
