@@ -32,6 +32,21 @@ _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", de
 _global_session: SessionState | None = None
 _stateless_http_mode = False
 
+# Process-wide registry for copilot browser sessions. Keyed by browser_session_id.
+# This bypasses ContextVar propagation issues when FastMCP runs tool handlers
+# in a separate task whose context snapshot predates scoped_session().
+_copilot_sessions: dict[str, SessionState] = {}
+
+
+def register_copilot_session(session_id: str, state: SessionState) -> None:
+    """Register a pre-configured browser session for cross-task lookup."""
+    _copilot_sessions[session_id] = state
+
+
+def unregister_copilot_session(session_id: str) -> None:
+    """Remove a copilot browser session from the registry."""
+    _copilot_sessions.pop(session_id, None)
+
 
 def get_current_session() -> SessionState:
     global _global_session
@@ -59,6 +74,20 @@ def set_current_session(state: SessionState) -> None:
     if not _stateless_http_mode:
         _global_session = state
     _current_session.set(state)
+
+
+@asynccontextmanager
+async def scoped_session(state: SessionState) -> AsyncIterator[None]:
+    """Temporarily push a SessionState into ContextVar scope.
+
+    Restores the previous value on exit. Does NOT touch _global_session,
+    so it is safe for concurrent API-server requests.
+    """
+    token = _current_session.set(state)
+    try:
+        yield
+    finally:
+        _current_session.reset(token)
 
 
 def set_stateless_http_mode(enabled: bool) -> None:
@@ -123,6 +152,19 @@ async def resolve_browser(
         return current.browser, current.context
 
     active_api_key_hash = _api_key_hash(get_active_api_key())
+
+    # Check copilot session registry (cross-task fallback when ContextVar
+    # does not propagate through FastMCP in-process transport).
+    if session_id and session_id in _copilot_sessions:
+        registered = _copilot_sessions[session_id]
+        if (
+            registered.browser is not None
+            and registered.context is not None
+            and registered.api_key_hash == active_api_key_hash
+        ):
+            _current_session.set(registered)
+            return registered.browser, registered.context
+
     browser: SkyvernBrowser | None = None
     try:
         if session_id:
