@@ -83,6 +83,29 @@ skyvern browser login --url https://app.example.com --credential-id cred_xxx
 Every browser command supports `--json` for machine-readable output, and `--session` / `--cdp` to target a specific session. If omitted, the CLI uses the last active session automatically.
 </Tip>
 
+### Connect your local browser to Skyvern Cloud
+
+Expose your local Chrome to Skyvern Cloud so tasks can access localhost, internal tools, and your existing login sessions.
+
+```bash
+# Launch with ngrok tunnel and your Chrome profile's cookies/logins
+skyvern browser serve --tunnel --use-local-profile
+
+# Use a specific Chrome profile
+skyvern browser serve --tunnel --use-local-profile --chrome-profile-name "Profile 2"
+
+# Headless mode with JSON output (for scripting)
+skyvern browser serve --tunnel --headless --json
+```
+
+The `--use-local-profile` flag clones cookies and saved passwords from your Chrome profile into the served browser. Your original profile is never modified, and it works while Chrome is open.
+
+<Warning>
+Always pass `--api-key` when using `--tunnel`. Without it, anyone with the ngrok URL has full browser control.
+</Warning>
+
+See the [full guide](/optimization/browser-tunneling) for all options, manual tunnel setup, and security details.
+
 ### Workflows
 
 ```bash
