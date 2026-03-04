@@ -269,28 +269,16 @@ BROWSER_TYPE=cdp-connect
 
 Restart Skyvern service `skyvern run all` and run the task through UI or code
 
-### Run Skyvern with any remote browser
-Grab the cdp connection url and pass it to Skyvern
+### Connect Skyvern Cloud to your local browser
 
-```python
-from skyvern import Skyvern
-
-skyvern = Skyvern(cdp_url="your cdp connection url")
-task = await skyvern.run_task(
-    prompt="Find the top post on hackernews today",
-)
-```
-
-### Use your local browser with Skyvern Cloud (Browser Tunneling)
-
-Let Skyvern Cloud control a Chrome browser running on your machine — with all your existing cookies, logins, and extensions already in place. This is useful when you need to automate sites where you're already logged in, or sites behind a VPN.
+Let Skyvern Cloud control a Chrome browser running on your machine — with all your existing cookies, logins, and extensions. Useful for automating sites where you're already logged in or behind a VPN.
 
 ```bash
-# One command to start Chrome + create a tunnel
+# One command to start Chrome + create a tunnel to Skyvern Cloud
 skyvern browser serve --tunnel
 ```
 
-Then use the tunnel URL in your Skyvern task:
+Then use the tunnel URL in your task:
 
 ```python
 from skyvern import Skyvern
@@ -302,20 +290,10 @@ task = await skyvern.run_task(
 )
 ```
 
-Or set up the tunnel manually:
-
-```bash
-# Terminal 1: Start the browser server
-skyvern browser serve
-
-# Terminal 2: Create a tunnel with ngrok
-ngrok http 9222
-```
-
 > [!WARNING]
 > Always use `--api-key` when exposing your browser via a tunnel. Without it, anyone with the URL has full control of your browser. See the [security docs](https://www.skyvern.com/docs/optimization/browser-tunneling#security).
 
-See the [full Browser Tunneling documentation](https://www.skyvern.com/docs/optimization/browser-tunneling) for all options.
+See the [full documentation](https://www.skyvern.com/docs/optimization/browser-tunneling) for all options, manual tunnel setup, and troubleshooting.
 
 ### Get consistent output schema from your run
 You can do this by adding the `data_extraction_schema` parameter:
