@@ -820,7 +820,7 @@ class ForgeAgent:
                 task,
                 step,
                 sfe.reason
-                or "Skyvern failed to load the website. This usually happens when the website is not properly designed, and crashes the browser as a result.",
+                or "Skyvern failed to load the website. The page may have navigated unexpectedly or become unresponsive during analysis.",
                 browser_state,
             )
             await self.clean_up_task(
