@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Literal, Protocol
 
 from playwright.async_api import BrowserContext, Page, Playwright
 
@@ -43,7 +43,7 @@ class BrowserState(Protocol):
         page: Page,
         url: str,
         retry_times: int = NAVIGATION_MAX_RETRY_TIME,
-        wait_until: str = "load",
+        wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     ) -> None: ...
 
     async def get_or_create_page(
