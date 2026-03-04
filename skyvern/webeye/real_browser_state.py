@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from typing import Literal
 from urllib.parse import urlparse
 
 import structlog
@@ -21,6 +22,7 @@ from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
@@ -135,71 +137,15 @@ class RealBrowserState(BrowserState):
         page: Page,
         url: str,
         retry_times: int = NAVIGATION_MAX_RETRY_TIME,
-        wait_until: str = "load",
+        wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     ) -> None:
-        # SKY-8818: progressive wait_until degradation. Many pages never fire
-        # `load` because a subresource stalls; degrading to `domcontentloaded` and
-        # then `commit` lets navigation succeed once the DOM or response is ready.
-        # Monotonic: a retry never upgrades to a STRONGER wait state than the caller asked for.
-        _degradation_map: dict[str, list[str]] = {
-            "load": ["load", "domcontentloaded", "commit"],
-            "domcontentloaded": ["domcontentloaded", "commit"],
-            "commit": ["commit"],
-        }
-        degradation = _degradation_map.get(wait_until, [wait_until])
-
-        try:
-            for retry_time in range(retry_times):
-                strategy = degradation[min(retry_time, len(degradation) - 1)]
-                LOG.info(
-                    "Trying to navigate to url",
-                    url=url,
-                    retry_time=retry_time,
-                    wait_until=strategy,
-                )
-                try:
-                    start_time = time.time()
-                    await page.goto(
-                        url,
-                        timeout=settings.BROWSER_LOADING_TIMEOUT_MS,
-                        wait_until=strategy,
-                    )
-                    end_time = time.time()
-                    LOG.info(
-                        "Page loading time",
-                        loading_time=end_time - start_time,
-                        url=url,
-                        wait_until=strategy,
-                    )
-                    await self._wait_for_settle()
-                    LOG.info(
-                        "Successfully navigated to url",
-                        url=url,
-                        retry_time=retry_time,
-                        wait_until=strategy,
-                    )
-                    return
-
-                except Exception as e:
-                    if retry_time >= retry_times - 1:
-                        raise FailedToNavigateToUrl(url=url, error_message=str(e))
-
-                    LOG.warning(
-                        f"Error while navigating to url: {str(e)}",
-                        exc_info=True,
-                        url=url,
-                        retry_time=retry_time,
-                        wait_until=strategy,
-                    )
-                    # Wait for 1 seconds before retrying
-                    await asyncio.sleep(1)
-
-        except Exception as e:
-            LOG.exception(
-                f"Failed to navigate to {url} after {retry_times} retries: {str(e)}",
-                url=url,
-            )
-            raise e
+        await navigate_with_retry(
+            navigate=lambda strategy: page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy),
+            url=url,
+            retry_times=retry_times,
+            settle=self._wait_for_settle,
+            wait_until=wait_until,
+        )
 
     async def get_working_page(self) -> Page | None:
         # HACK: currently, assuming the last page is always the working page.
@@ -348,12 +294,14 @@ class RealBrowserState(BrowserState):
                 browser_profile_id=browser_profile_id,
             )
         except Exception as e:
-            error_message = str(e)
+            error_message = e.error_message if isinstance(e, FailedToNavigateToUrl) else str(e)
+            if is_permanent_navigation_error(error_message):
+                raise
             if "net::ERR" not in error_message:
-                raise e
+                raise
             if not await self.close_current_open_page():
                 LOG.warning("Failed to close the current open page")
-                raise e
+                raise
             await self.check_and_fix_state(
                 url=url,
                 proxy_location=proxy_location,
