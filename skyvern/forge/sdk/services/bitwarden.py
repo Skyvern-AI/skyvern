@@ -23,7 +23,7 @@ from skyvern.exceptions import (
     BitwardenSyncError,
     BitwardenUnlockError,
 )
-from skyvern.forge.sdk.api.aws import aws_client
+from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
 from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
@@ -902,7 +902,8 @@ class BitwardenService:
     async def _get_skyvern_auth_master_password() -> str:
         master_password = settings.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD
         if not master_password:
-            master_password = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD)
+            secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD
+            master_password = await get_aws_client().get_secret(secret_key)
         if not master_password:
             raise BitwardenSecretError("Skyvern auth master password is not set")
         return master_password
@@ -911,7 +912,8 @@ class BitwardenService:
     async def _get_skyvern_auth_organization_id() -> str:
         bw_organization_id = settings.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID
         if not bw_organization_id:
-            bw_organization_id = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID)
+            secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID
+            bw_organization_id = await get_aws_client().get_secret(secret_key)
         if not bw_organization_id:
             raise BitwardenSecretError("Skyvern auth organization ID is not set")
         return bw_organization_id
@@ -920,7 +922,8 @@ class BitwardenService:
     async def _get_skyvern_auth_client_id() -> str:
         client_id = settings.SKYVERN_AUTH_BITWARDEN_CLIENT_ID
         if not client_id:
-            client_id = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_ID)
+            secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_ID
+            client_id = await get_aws_client().get_secret(secret_key)
         if not client_id:
             raise BitwardenSecretError("Skyvern auth client ID is not set")
         return client_id
@@ -929,7 +932,8 @@ class BitwardenService:
     async def _get_skyvern_auth_client_secret() -> str:
         client_secret = settings.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET
         if not client_secret:
-            client_secret = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET)
+            secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET
+            client_secret = await get_aws_client().get_secret(secret_key)
         if not client_secret:
             raise BitwardenSecretError("Skyvern auth client secret is not set")
         return client_secret

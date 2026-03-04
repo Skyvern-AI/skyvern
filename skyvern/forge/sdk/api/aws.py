@@ -522,4 +522,11 @@ def tag_set_to_dict(tag_set: list[dict[str, str]]) -> dict[str, str]:
     return {tag["Key"]: tag["Value"] for tag in tag_set}
 
 
-aws_client = AsyncAWSClient()
+_aws_client: AsyncAWSClient | None = None
+
+
+def get_aws_client() -> AsyncAWSClient:
+    global _aws_client
+    if _aws_client is None:
+        _aws_client = AsyncAWSClient()
+    return _aws_client

@@ -67,7 +67,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.aws import aws_client
+from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_downloading_files_in_directory,
@@ -552,7 +552,7 @@ class ForgeAgent:
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
                     for file in files_to_rename:
                         if file.startswith("s3://"):
-                            file_data = await aws_client.download_file(file, log_exception=False)
+                            file_data = await get_aws_client().download_file(file, log_exception=False)
                             if not file_data:
                                 continue
                             file = file.split("/")[-1]  # Extract filename from the end of S3 URI
