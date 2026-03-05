@@ -159,13 +159,16 @@ skyvern block validate --file block.json   # Validate a block definition
 Register Skyvern's MCP server with your AI coding tool in one command:
 
 ```bash
-skyvern setup claude-code        # Register with Claude Code (global)
+skyvern setup claude-code        # Register with Claude Code + install skills (/qa, etc.)
 skyvern setup claude-code --project  # Register with Claude Code (project-level)
+skyvern setup claude-code --skip-skills  # MCP only, no skills
 skyvern setup claude-desktop     # Register with Claude Desktop
 skyvern setup cursor             # Register with Cursor
 skyvern setup windsurf           # Register with Windsurf
 skyvern setup codex              # Register with Codex
 ```
+
+`skyvern setup claude-code` writes the MCP config **and** copies bundled skills (including `/qa`) into your project's `.claude/skills/` directory. Use `--skip-skills` to opt out.
 
 ### Other
 
@@ -190,30 +193,34 @@ The CLI and MCP server share the same underlying logic. The CLI is for humans an
 
 ## Skills
 
-Skills are bundled reference markdown files that teach AI coding tools how to use Skyvern. They are **not** the same as MCP tools — they are documentation that an AI agent can load to learn the CLI and API.
+Skills are bundled markdown files that teach AI coding tools how to use Skyvern. They ship with `pip install skyvern` and are **automatically installed** when you run `skyvern setup claude-code`.
+
+| Skill | What it does |
+|-------|-------------|
+| **qa** | Reads your `git diff`, generates browser tests, runs them against your dev server, reports pass/fail with screenshots. Invoke with `/qa` in Claude Code. |
+| **skyvern** | CLI reference covering all browser automation, workflow, and credential commands. |
+| **testing** | Smoke tests for verifying Skyvern deployments. |
 
 ```bash
 skyvern skill list                  # List available skills
-skyvern skill show skyvern          # Render a skill in the terminal
-skyvern skill path skyvern          # Print the absolute path to a skill file
-skyvern skill path                  # Print the skills directory
-skyvern skill copy --output ./docs  # Copy all skills to a local directory
-skyvern skill copy skyvern -o .     # Copy a single skill
+skyvern skill show qa               # Render a skill in the terminal
+skyvern skill copy --output .claude/skills  # Copy all skills manually
+skyvern skill copy qa -o .claude/skills     # Copy a single skill
 ```
 
 <Accordion title="Loading skills into AI tools">
 
-Skills are plain markdown files. You can load them into any AI coding tool that supports custom instructions:
+Skills are plain markdown files. Load them into any AI coding tool that supports custom instructions:
 
-**Claude Code** — add the skill path as a custom instructions file or use `skyvern setup claude-code` which configures MCP (the richer integration path).
+**Claude Code** — run `skyvern setup claude-code`, which registers the MCP server **and** installs skills into `.claude/skills/`. The `/qa` skill is immediately available.
 
-**Codex** — copy the skill into your project's `.codex/skills/` directory:
+**Codex** — copy skills into your project's `.codex/skills/` directory:
 
 ```bash
-skyvern skill copy skyvern -o .codex/skills/
+skyvern skill copy -o .codex/skills/
 ```
 
-**Any tool** — point your tool at the file path returned by `skyvern skill path skyvern`.
+**Any tool** — point your tool at the file path returned by `skyvern skill path qa`.
 
 </Accordion>
 

@@ -267,6 +267,33 @@ This is especially powerful during development: make a code change, then ask you
 Always use `--api-key` when exposing your browser via tunnel. Without it, anyone with the ngrok URL has full browser control.
 </Warning>
 
+## QA your frontend changes
+
+If you install the Skyvern CLI, `skyvern setup claude-code` registers the MCP server **and** installs Claude Code skills — including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
+
+```bash
+pip install skyvern
+skyvern setup claude-code
+```
+
+Then make a frontend change and type `/qa` in Claude Code. It will:
+
+1. Read your `git diff` and the full source of each changed file
+2. Generate targeted test cases (plus regression tests for adjacent behavior)
+3. Open a browser against your running dev server
+4. Run the tests — navigate, click, fill forms, check the DOM
+5. Report pass/fail with screenshots
+
+For localhost testing, start a local browser first:
+
+```bash
+skyvern browser serve --tunnel
+```
+
+<Tip>
+The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each) and `skyvern_act` for natural-language interactions. Tests are generated fresh from each diff — no test files to maintain.
+</Tip>
+
 ## Troubleshooting
 
 <Accordion title="Invalid API key or 401 errors">
