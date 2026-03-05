@@ -23,7 +23,9 @@ describe("basicLocalTimeFormat", () => {
   test("trims microseconds to milliseconds before parsing", () => {
     const withMicros = "2026-03-04T18:30:00.123456";
     const withMillis = "2026-03-04T18:30:00.123";
-    expect(basicLocalTimeFormat(withMicros)).toBe(basicLocalTimeFormat(withMillis));
+    expect(basicLocalTimeFormat(withMicros)).toBe(
+      basicLocalTimeFormat(withMillis),
+    );
   });
 });
 
