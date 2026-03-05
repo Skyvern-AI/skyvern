@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import platform
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 import typer
 from dotenv import load_dotenv
+from rich.panel import Panel
 from rich.syntax import Syntax
+from rich.table import Table
 
+from skyvern.analytics import capture_setup_event
+from skyvern.cli.auth_command import run_signup
 from skyvern.cli.console import console
 from skyvern.cli.skill_commands import get_skill_dirs
 from skyvern.utils.env_paths import resolve_backend_env_path
@@ -22,7 +29,10 @@ from skyvern.utils.env_paths import resolve_backend_env_path
 # `skyvern init`. This module supersedes them with remote-first defaults,
 # dry-run support, and API key protection. The init-path helpers should be
 # migrated to use _upsert_mcp_config() in a follow-up.
-setup_app = typer.Typer(help="Register Skyvern MCP with AI coding tools.")
+setup_app = typer.Typer(
+    help="Register Skyvern MCP with AI coding tools.",
+    invoke_without_command=True,
+)
 
 _DEFAULT_REMOTE_URL = "https://api.skyvern.com/mcp/"
 
@@ -103,6 +113,43 @@ def _has_api_key(entry: dict | None) -> bool:
     return any(isinstance(a, str) and a.startswith("x-api-key:") for a in args)
 
 
+def _mask_key(key: str) -> str:
+    """Mask an API key for display. Always masks, even short keys."""
+    if len(key) > 8:
+        return key[:4] + "****" + key[-4:]
+    if len(key) > 2:
+        return key[:2] + "****"
+    return "****"
+
+
+def _mask_secrets(entry: dict) -> dict:
+    """Return a copy of an MCP config entry with API keys masked for display."""
+    masked = copy.deepcopy(entry)
+
+    # Remote HTTP format: headers.x-api-key
+    if "headers" in masked and "x-api-key" in masked["headers"]:
+        key = masked["headers"]["x-api-key"]
+        masked["headers"]["x-api-key"] = _mask_key(key)
+
+    # Local stdio format: env.SKYVERN_API_KEY
+    if "env" in masked and "SKYVERN_API_KEY" in masked["env"]:
+        key = masked["env"]["SKYVERN_API_KEY"]
+        masked["env"]["SKYVERN_API_KEY"] = _mask_key(key)
+
+    # mcp-remote bridge format: args contain "x-api-key:..."
+    if "args" in masked:
+        masked["args"] = [
+            (
+                "x-api-key:" + _mask_key(a[len("x-api-key:") :])
+                if isinstance(a, str) and a.startswith("x-api-key:")
+                else a
+            )
+            for a in masked["args"]
+        ]
+
+    return masked
+
+
 def _upsert_mcp_config(
     config_path: Path,
     tool_name: str,
@@ -139,12 +186,12 @@ def _upsert_mcp_config(
     if current is not None:
         console.print(f"[yellow]Config differs from expected for {tool_name}[/yellow]")
         console.print("\n[bold]Current:[/bold]")
-        console.print(Syntax(json.dumps(current, indent=2), "json"))
+        console.print(Syntax(json.dumps(_mask_secrets(current), indent=2), "json"))
     else:
         console.print(f"[bold]Adding Skyvern MCP config for {tool_name}:[/bold]")
 
     console.print("\n[bold]New:[/bold]")
-    console.print(Syntax(json.dumps(skyvern_entry, indent=2), "json"))
+    console.print(Syntax(json.dumps(_mask_secrets(skyvern_entry), indent=2), "json"))
 
     if dry_run:
         console.print(f"\n[yellow]Dry run -- no changes written to {config_path}[/yellow]")
@@ -179,6 +226,121 @@ def _build_entry(
     if use_mcp_remote_bridge:
         return _build_mcp_remote_bridge_entry(api_key, url=remote_url)
     return _build_remote_mcp_entry(api_key, url=remote_url)
+
+
+# ---------------------------------------------------------------------------
+# Tool detection
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DetectedTool:
+    """Describes an AI coding tool that can be auto-detected and configured."""
+
+    name: str
+    config_path_fn: Callable[[], Path]
+    is_installed_fn: Callable[[], bool]
+    use_mcp_remote_bridge: bool = False
+
+
+def _is_claude_code_installed() -> bool:
+    return shutil.which("claude") is not None
+
+
+def _is_cursor_installed() -> bool:
+    return (Path.home() / ".cursor").is_dir()
+
+
+def _is_windsurf_installed() -> bool:
+    return (Path.home() / ".codeium" / "windsurf").is_dir()
+
+
+def _is_claude_desktop_installed() -> bool:
+    system = platform.system()
+    if system == "Darwin":
+        return (Path.home() / "Library" / "Application Support" / "Claude").is_dir()
+    if system == "Linux":
+        return (Path.home() / ".config" / "Claude").is_dir()
+    if system == "Windows":
+        appdata = os.environ.get("APPDATA", "")
+        return bool(appdata) and (Path(appdata) / "Claude").is_dir()
+    return False
+
+
+def _get_known_tools() -> list[DetectedTool]:
+    """Return all known AI coding tools in detection order.
+
+    Note: Codex is not included — it has no stable local config path to detect.
+    Users can configure it manually via `skyvern setup codex` if/when that subcommand is added.
+    """
+    return [
+        DetectedTool(
+            name="Claude Code",
+            config_path_fn=_claude_code_global_config_path,
+            is_installed_fn=_is_claude_code_installed,
+        ),
+        DetectedTool(
+            name="Cursor",
+            config_path_fn=_cursor_config_path,
+            is_installed_fn=_is_cursor_installed,
+        ),
+        DetectedTool(
+            name="Windsurf",
+            config_path_fn=_windsurf_config_path,
+            is_installed_fn=_is_windsurf_installed,
+        ),
+        DetectedTool(
+            name="Claude Desktop",
+            config_path_fn=_claude_desktop_config_path,
+            is_installed_fn=_is_claude_desktop_installed,
+            use_mcp_remote_bridge=True,
+        ),
+    ]
+
+
+def _detect_installed_tools() -> tuple[list[DetectedTool], list[DetectedTool]]:
+    """Detect which AI coding tools are installed.
+
+    Returns (detected, not_detected) lists.
+    """
+    detected: list[DetectedTool] = []
+    not_detected: list[DetectedTool] = []
+    for tool in _get_known_tools():
+        try:
+            if tool.is_installed_fn():
+                detected.append(tool)
+            else:
+                not_detected.append(tool)
+        except Exception:
+            not_detected.append(tool)
+    return detected, not_detected
+
+
+def _acquire_api_key(api_key_flag: str | None, yes: bool) -> str:
+    """Resolve an API key from flag, environment, or interactive login.
+
+    Priority: --api-key flag > env/dotenv > interactive browser login.
+    """
+    if api_key_flag:
+        return api_key_flag
+
+    env_key, _ = _get_env_credentials()
+    if env_key:
+        return env_key
+
+    if yes:
+        console.print(
+            "[red bold]Error:[/red bold] No API key found. Use --api-key to provide one, or run `skyvern login` first."
+        )
+        raise typer.Exit(code=1)
+
+    console.print("No API key found. Opening browser to log in...")
+    key = run_signup()
+    if not key:
+        console.print("[red]Login did not return an API key.[/red]")
+        raise typer.Exit(code=1)
+
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -245,10 +407,15 @@ def _run_setup(
     *,
     use_mcp_remote_bridge: bool = False,
 ) -> None:
-    env_key, env_url = _get_env_credentials()
-    key = api_key or env_key
+    resolved_key = _acquire_api_key(api_key, yes)
+    _, env_url = _get_env_credentials()
     entry = _build_entry(
-        key, env_url, local=local, use_python_path=use_python_path, url=url, use_mcp_remote_bridge=use_mcp_remote_bridge
+        resolved_key,
+        env_url,
+        local=local,
+        use_python_path=use_python_path,
+        url=url,
+        use_mcp_remote_bridge=use_mcp_remote_bridge,
     )
     _upsert_mcp_config(config_path, tool_name, entry, dry_run=dry_run, yes=yes)
 
@@ -292,6 +459,149 @@ def _install_skills(project_dir: Path, dry_run: bool = False) -> None:
                 console.print("[bold]Tip:[/bold] Make a frontend change and type /qa to test it in a real browser.")
     if skipped:
         console.print(f"[dim]Skills already installed: {', '.join(skipped)}[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Guided quickstart (bare `skyvern setup`)
+# ---------------------------------------------------------------------------
+
+
+@setup_app.callback(invoke_without_command=True)
+def setup_guided(
+    ctx: typer.Context,
+    api_key: str | None = _api_key_opt,
+    dry_run: bool = _dry_run_opt,
+    yes: bool = _yes_opt,
+    local: bool = _local_opt,
+    use_python_path: bool = _python_path_opt,
+    url: str | None = _url_opt,
+) -> None:
+    """Guided quickstart: detect installed AI tools and configure MCP for all of them."""
+    if ctx.invoked_subcommand is not None:
+        return
+
+    console.print(
+        Panel(
+            "[bold]Skyvern MCP Setup[/bold]\n\n"
+            "This wizard will:\n"
+            "  1. Find or create your Skyvern API key\n"
+            "  2. Detect installed AI coding tools\n"
+            "  3. Configure MCP for each detected tool",
+            border_style="blue",
+        )
+    )
+
+    # Step 1: API key
+    console.print("[bold]Step 1: API Key[/bold]")
+    resolved_key = _acquire_api_key(api_key, yes)
+    _, env_url = _get_env_credentials()
+    console.print("[green]API key ready.[/green]\n")
+    capture_setup_event("quickstart-api-key", success=True)
+
+    # Step 2: Detect tools
+    console.print("[bold]Step 2: Detecting installed AI tools...[/bold]")
+    detected, not_detected = _detect_installed_tools()
+
+    if detected:
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Tool")
+        table.add_column("Config Path")
+        table.add_column("Status")
+
+        for tool in detected:
+            try:
+                path = str(tool.config_path_fn())
+            except (typer.Exit, SystemExit):
+                path = "?"
+            table.add_row(tool.name, path, "[green]Detected[/green]")
+
+        console.print(table)
+
+    if not_detected:
+        names = ", ".join(t.name for t in not_detected)
+        console.print(f"Not detected: {names}\n")
+    else:
+        console.print()
+
+    capture_setup_event(
+        "quickstart-detect",
+        success=True,
+        extra_data={
+            "detected": [t.name for t in detected],
+            "not_detected": [t.name for t in not_detected],
+        },
+    )
+
+    if not detected:
+        console.print(
+            "[yellow]No supported AI tools detected.[/yellow]\n"
+            "You can configure a specific tool manually:\n"
+            "  skyvern setup claude-code\n"
+            "  skyvern setup cursor\n"
+            "  skyvern setup windsurf\n"
+            "  skyvern setup claude"
+        )
+        capture_setup_event("quickstart-no-tools", success=True)
+        return
+
+    # Step 3: Configure detected tools
+    tool_names = ", ".join(t.name for t in detected)
+    console.print(f"[bold]Step 3: Configuring {len(detected)} tool(s)...[/bold]")
+
+    if not yes and not dry_run:
+        if not typer.confirm(f"Configure Skyvern MCP for: {tool_names}?", default=True):
+            console.print("[yellow]Setup cancelled.[/yellow]")
+            raise typer.Abort()
+
+    configured: list[str] = []
+    failed: list[str] = []
+
+    for tool in detected:
+        try:
+            config_path = tool.config_path_fn()
+            use_bridge = tool.use_mcp_remote_bridge and not local
+            entry = _build_entry(
+                resolved_key,
+                env_url,
+                local=local,
+                use_python_path=use_python_path,
+                url=url,
+                use_mcp_remote_bridge=use_bridge,
+            )
+            _upsert_mcp_config(config_path, tool.name, entry, dry_run=dry_run, yes=True)
+            configured.append(tool.name)
+        except (typer.Exit, SystemExit):
+            failed.append(tool.name)
+            console.print(f"[red]Failed to configure {tool.name}[/red]")
+        except Exception as exc:
+            failed.append(tool.name)
+            console.print(f"[red]Failed to configure {tool.name}: {exc}[/red]")
+
+    console.print()
+
+    if configured:
+        configured_str = ", ".join(configured)
+        console.print(
+            Panel(
+                f"[bold green]Setup complete![/bold green]\n\n"
+                f"Configured {len(configured)} tool(s): {configured_str}\n\n"
+                f'Try asking your AI assistant:\n"Use Skyvern to navigate to example.com"',
+                border_style="green",
+            )
+        )
+        capture_setup_event(
+            "quickstart-complete",
+            success=True,
+            extra_data={"configured": configured, "failed": failed},
+        )
+    else:
+        console.print("[red]No tools were configured.[/red]")
+        capture_setup_event(
+            "quickstart-complete",
+            success=False,
+            error_type="all_tools_failed",
+            extra_data={"failed": failed},
+        )
 
 
 # ---------------------------------------------------------------------------
