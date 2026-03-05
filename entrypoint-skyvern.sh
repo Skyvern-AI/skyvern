@@ -63,6 +63,10 @@ for i in $(seq 1 10); do
   echo "Waiting for Xvfb to start (attempt $i/10)..."
   sleep 1
 done
+if ! xdpyinfo -display :99 >/dev/null 2>&1; then
+  echo "ERROR: Xvfb failed to start on display :99 after 10 attempts"
+  exit 1
+fi
 
 echo "Starting x11vnc on display :99..."
 # VNC runs without a password (-nopw) because port 5900 is not exposed outside
