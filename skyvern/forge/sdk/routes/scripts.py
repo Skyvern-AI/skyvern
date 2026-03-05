@@ -599,6 +599,7 @@ async def delete_workflow_cache_key_value(
     openapi_extra={
         "x-fern-sdk-method-name": "clear_workflow_cache",
     },
+    include_in_schema=False,
 )
 @base_router.delete(
     "/scripts/{workflow_permanent_id}/cache/",
