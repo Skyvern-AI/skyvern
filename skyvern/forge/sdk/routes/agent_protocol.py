@@ -24,6 +24,7 @@ from pydantic import ValidationError
 
 from skyvern import analytics
 from skyvern._version import __version__
+from skyvern.analytics import get_oss_version
 from skyvern.config import settings
 from skyvern.exceptions import (
     MissingBrowserAddressError,
@@ -1690,6 +1691,19 @@ async def heartbeat() -> Response:
     Check if the server is running.
     """
     return Response(content="Server is running.", status_code=200, headers={"X-Skyvern-API-Version": __version__})
+
+
+@legacy_base_router.get(
+    "/version",
+    tags=["server"],
+    include_in_schema=False,
+)
+@legacy_base_router.get("/version/", include_in_schema=False)
+async def get_version() -> dict[str, str]:
+    """
+    Get the current server version.
+    """
+    return {"version": get_oss_version()}
 
 
 @legacy_base_router.get(
