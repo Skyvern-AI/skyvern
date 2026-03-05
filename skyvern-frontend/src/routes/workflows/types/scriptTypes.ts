@@ -1,5 +1,6 @@
 export type ScriptBlocksResponse = {
   blocks: { [blockName: string]: string };
+  main_script: string | null;
 };
 
 export type CacheKeyValuesResponse = {

@@ -397,10 +397,14 @@ function Workspace({
     status: "published",
   });
 
-  const publishedLabelCount = Object.keys(blockScriptsPublished ?? {}).length;
+  const publishedLabelCount = Object.keys(
+    blockScriptsPublished?.blocks ?? {},
+  ).length;
+  const hasPublishedScript =
+    publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
 
   const isGeneratingCode =
-    publishedLabelCount === 0 && !isFinalized && Boolean(workflowRun);
+    !hasPublishedScript && !isFinalized && Boolean(workflowRun);
 
   const { data: blockScriptsPending } = useBlockScriptsQuery({
     cacheKey,
@@ -560,7 +564,7 @@ function Workspace({
   }, [isFinalized, queryClient, workflowRun]);
 
   useEffect(() => {
-    blockScriptStore.setScripts(blockScriptsPublished ?? {});
+    blockScriptStore.setScripts(blockScriptsPublished?.blocks ?? {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [blockScriptsPublished]);
 
@@ -966,8 +970,13 @@ function Workspace({
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
-  const code = getCode(orderedBlockLabels, blockScriptsPublished).join("");
-  const codePending = getCode(orderedBlockLabels, blockScriptsPending).join("");
+  const code = getCode(orderedBlockLabels, blockScriptsPublished?.blocks).join(
+    "",
+  );
+  const codePending = getCode(
+    orderedBlockLabels,
+    blockScriptsPending?.blocks,
+  ).join("");
 
   const handleCompareVersions = (
     version1: WorkflowVersion,

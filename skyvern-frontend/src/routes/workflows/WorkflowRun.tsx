@@ -108,8 +108,10 @@ function WorkflowRun() {
   });
 
   useEffect(() => {
-    const keys = Object.keys(blockScriptsPublished ?? {});
-    setHasPublishedCode(keys.length > 0);
+    const keys = Object.keys(blockScriptsPublished?.blocks ?? {});
+    setHasPublishedCode(
+      keys.length > 0 || Boolean(blockScriptsPublished?.main_script),
+    );
   }, [blockScriptsPublished, setHasPublishedCode]);
 
   const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();

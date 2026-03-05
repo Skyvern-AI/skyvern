@@ -155,6 +155,7 @@ class ScriptCacheKeyValuesResponse(BaseModel):
 
 class ScriptBlocksResponse(BaseModel):
     blocks: dict[str, str]
+    main_script: str | None = None
 
 
 class ScriptBlocksRequest(BaseModel):

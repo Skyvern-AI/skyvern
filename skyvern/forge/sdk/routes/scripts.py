@@ -25,10 +25,37 @@ from skyvern.services import script_service, workflow_script_service
 LOG = structlog.get_logger()
 
 
+async def _load_main_script_content(
+    organization_id: str,
+    script_revision_id: str,
+) -> str | None:
+    """Load the main.py content from a script revision, if it exists."""
+    script_files = await app.DATABASE.get_script_files(
+        script_revision_id=script_revision_id,
+        organization_id=organization_id,
+    )
+    for f in script_files:
+        if f.file_path == "main.py" and f.artifact_id:
+            artifact = await app.DATABASE.get_artifact_by_id(f.artifact_id, organization_id)
+            if artifact:
+                data = await app.STORAGE.retrieve_artifact(artifact)
+                if data:
+                    try:
+                        return data.decode("utf-8") if isinstance(data, bytes) else data
+                    except UnicodeDecodeError:
+                        LOG.error(
+                            "main.py content is not valid UTF-8",
+                            script_revision_id=script_revision_id,
+                            organization_id=organization_id,
+                        )
+    return None
+
+
 async def get_script_blocks_response(
     organization_id: str,
     workflow_permanent_id: str,
     script_revision_id: str,
+    include_main_script: bool = False,
 ) -> ScriptBlocksResponse:
     script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
         script_revision_id=script_revision_id,
@@ -42,7 +69,13 @@ async def get_script_blocks_response(
             organization_id=organization_id,
             script_revision_id=script_revision_id,
         )
-        return ScriptBlocksResponse(blocks={})
+        main_script = None
+        if include_main_script:
+            main_script = await _load_main_script_content(
+                organization_id=organization_id,
+                script_revision_id=script_revision_id,
+            )
+        return ScriptBlocksResponse(blocks={}, main_script=main_script)
 
     result: dict[str, str] = {}
 
@@ -135,7 +168,15 @@ async def get_script_blocks_response(
                 artifact_id=artifact_id,
             )
             continue
-    return ScriptBlocksResponse(blocks=result)
+
+    main_script = None
+    if include_main_script:
+        main_script = await _load_main_script_content(
+            organization_id=organization_id,
+            script_revision_id=script_revision_id,
+        )
+
+    return ScriptBlocksResponse(blocks=result, main_script=main_script)
 
 
 @base_router.post(
@@ -417,6 +458,8 @@ async def get_workflow_script_blocks(
 
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
+
+    include_main_script = bool(workflow.adaptive_caching)
     workflow_run_id = block_script_request.workflow_run_id
     if workflow_run_id:
         workflow_run = await app.DATABASE.get_workflow_run(
@@ -437,6 +480,7 @@ async def get_workflow_script_blocks(
                     script_revision_id=published_script.script_revision_id,
                     organization_id=current_org.organization_id,
                     workflow_permanent_id=workflow_permanent_id,
+                    include_main_script=include_main_script,
                 )
 
     cache_key = block_script_request.cache_key or workflow.cache_key or ""
@@ -465,6 +509,7 @@ async def get_workflow_script_blocks(
         script_revision_id=script.script_revision_id,
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
+        include_main_script=include_main_script,
     )
 
 

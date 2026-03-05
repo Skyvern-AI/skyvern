@@ -22,7 +22,10 @@ function useBlockScriptsQuery({
 }: Props) {
   const credentialGetter = useCredentialGetter();
 
-  return useQuery<{ [blockName: string]: string }>({
+  return useQuery<{
+    blocks: { [blockName: string]: string };
+    main_script: string | null;
+  }>({
     queryKey: [
       "block-scripts",
       workflowPermanentId,
@@ -43,7 +46,7 @@ function useBlockScriptsQuery({
         })
         .then((response) => response.data);
 
-      return result.blocks;
+      return { blocks: result.blocks, main_script: result.main_script };
     },
     refetchInterval: () => {
       if (!pollIntervalMs || pollIntervalMs === 0) {
