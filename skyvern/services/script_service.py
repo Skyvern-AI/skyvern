@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import base64
 import hashlib
@@ -2199,7 +2200,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
 
 def render_list(template: str, data: dict[str, Any] | None = None) -> list[str]:
     rendered_value = render_template(template, data)
-    list_value = eval(rendered_value)
+    list_value = ast.literal_eval(rendered_value)
     if isinstance(list_value, list):
         return list_value
     else:
