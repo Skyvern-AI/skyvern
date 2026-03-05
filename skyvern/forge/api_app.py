@@ -118,20 +118,6 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     # Stop cleanup scheduler
     await stop_cleanup_scheduler()
 
-    # Close notification registry (e.g. cancel Redis listener tasks)
-    from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
-
-    registry = NotificationRegistryFactory.get_registry()
-    if hasattr(registry, "close"):
-        await registry.close()
-
-    # Close shared Redis client (after registry so listener tasks drain first)
-    from skyvern.forge.sdk.redis.factory import RedisClientFactory
-
-    redis_client = RedisClientFactory.get_client()
-    if redis_client is not None:
-        await redis_client.close()
-
     # Close all persistent browser sessions
     from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 
