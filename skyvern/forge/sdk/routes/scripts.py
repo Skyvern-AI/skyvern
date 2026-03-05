@@ -14,11 +14,15 @@ from skyvern.schemas.scripts import (
     CreateScriptRequest,
     CreateScriptResponse,
     DeployScriptRequest,
+    FallbackEpisodeListResponse,
     Script,
     ScriptBlocksRequest,
     ScriptBlocksResponse,
     ScriptCacheKeyValuesResponse,
+    ScriptFallbackEpisode,
     ScriptStatus,
+    ScriptVersionListResponse,
+    ScriptVersionSummary,
 )
 from skyvern.services import script_service, workflow_script_service
 
@@ -246,6 +250,69 @@ async def get_script(
         raise HTTPException(status_code=404, detail="Script not found")
 
     return script
+
+
+@base_router.get(
+    "/scripts/{script_id}/versions",
+    include_in_schema=False,
+    response_model=ScriptVersionListResponse,
+)
+@base_router.get(
+    "/scripts/{script_id}/versions/",
+    include_in_schema=False,
+    response_model=ScriptVersionListResponse,
+)
+async def get_script_versions(
+    script_id: str = Path(..., description="The script ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptVersionListResponse:
+    """List all versions of a script."""
+    scripts = await app.DATABASE.get_script_versions(
+        script_id=script_id,
+        organization_id=current_org.organization_id,
+    )
+    versions = [
+        ScriptVersionSummary(
+            version=s.version,
+            script_revision_id=s.script_revision_id,
+            created_at=s.created_at,
+            run_id=s.run_id,
+        )
+        for s in scripts
+    ]
+    return ScriptVersionListResponse(versions=versions)
+
+
+@base_router.get(
+    "/scripts/{script_id}/versions/{version}",
+    include_in_schema=False,
+    response_model=ScriptBlocksResponse,
+)
+@base_router.get(
+    "/scripts/{script_id}/versions/{version}/",
+    include_in_schema=False,
+    response_model=ScriptBlocksResponse,
+)
+async def get_script_version_code(
+    script_id: str = Path(..., description="The script ID"),
+    version: int = Path(..., description="The version number"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptBlocksResponse:
+    """Get a specific version's code blocks."""
+    script = await app.DATABASE.get_script(
+        script_id=script_id,
+        organization_id=current_org.organization_id,
+        version=version,
+    )
+    if not script:
+        raise HTTPException(status_code=404, detail="Script version not found")
+
+    return await get_script_blocks_response(
+        script_revision_id=script.script_revision_id,
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=script_id,
+        include_main_script=True,
+    )
 
 
 @base_router.get(
@@ -699,3 +766,91 @@ async def clear_workflow_cache(
         deleted_count=deleted_count,
         message=f"Successfully cleared {deleted_count} database record(s) and {cache_cleared_count} in-memory cache entry(s) for workflow {workflow_permanent_id}",
     )
+
+
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/fallback-episodes",
+    include_in_schema=False,
+    response_model=FallbackEpisodeListResponse,
+)
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/fallback-episodes/",
+    include_in_schema=False,
+    response_model=FallbackEpisodeListResponse,
+)
+async def get_fallback_episodes(
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Page size"),
+    workflow_run_id: str | None = Query(None, description="Filter by workflow run ID"),
+    block_label: str | None = Query(None, description="Filter by block label"),
+    reviewed: bool | None = Query(None, description="Filter by reviewed status"),
+    fallback_type: str | None = Query(None, description="Filter by fallback type"),
+) -> FallbackEpisodeListResponse:
+    # Verify workflow exists
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    episodes = await app.DATABASE.get_fallback_episodes(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        page=page,
+        page_size=page_size,
+        workflow_run_id=workflow_run_id,
+        block_label=block_label,
+        reviewed=reviewed,
+        fallback_type=fallback_type,
+    )
+    total_count = await app.DATABASE.get_fallback_episodes_count(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_run_id=workflow_run_id,
+        block_label=block_label,
+        reviewed=reviewed,
+        fallback_type=fallback_type,
+    )
+    return FallbackEpisodeListResponse(
+        episodes=episodes,
+        page=page,
+        page_size=page_size,
+        total_count=total_count,
+    )
+
+
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/fallback-episodes/{episode_id}",
+    include_in_schema=False,
+    response_model=ScriptFallbackEpisode,
+)
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/fallback-episodes/{episode_id}/",
+    include_in_schema=False,
+    response_model=ScriptFallbackEpisode,
+)
+async def get_fallback_episode(
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    episode_id: str = Path(..., description="The episode ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptFallbackEpisode:
+    # Verify workflow exists
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    episode = await app.DATABASE.get_fallback_episode(
+        episode_id=episode_id,
+        organization_id=current_org.organization_id,
+    )
+    if not episode:
+        raise HTTPException(status_code=404, detail="Fallback episode not found")
+    if episode.workflow_permanent_id != workflow_permanent_id:
+        raise HTTPException(status_code=404, detail="Fallback episode not found")
+    return episode
