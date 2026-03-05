@@ -3200,18 +3200,22 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def get_last_workflow_run_for_browser_session(
+    async def _get_last_workflow_run_by_filter(
         self,
-        browser_session_id: str,
         organization_id: str | None = None,
+        **filters: str,
     ) -> WorkflowRun | None:
+        """Get the last queued or running workflow run matching the given column filters.
+
+        Used for browser_session_id and browser_address sequential execution.
+        """
         try:
             async with self.Session() as session:
-                # check if there's a queued run
-                query = select(WorkflowRunModel).filter_by(browser_session_id=browser_session_id)
+                query = select(WorkflowRunModel).filter_by(**filters)
                 if organization_id:
                     query = query.filter_by(organization_id=organization_id)
 
+                # check if there's a queued run
                 queue_query = query.filter_by(status=WorkflowRunStatus.queued)
                 queue_query = queue_query.order_by(WorkflowRunModel.modified_at.desc())
                 workflow_run = (await session.scalars(queue_query)).first()
@@ -3229,6 +3233,26 @@ class AgentDB(BaseAlchemyDB):
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
+
+    async def get_last_workflow_run_for_browser_session(
+        self,
+        browser_session_id: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRun | None:
+        return await self._get_last_workflow_run_by_filter(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
+
+    async def get_last_workflow_run_for_browser_address(
+        self,
+        browser_address: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRun | None:
+        return await self._get_last_workflow_run_by_filter(
+            organization_id=organization_id,
+            browser_address=browser_address,
+        )
 
     async def get_workflows_depending_on(
         self,
