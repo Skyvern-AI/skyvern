@@ -458,8 +458,10 @@ def extract_data(
 # qa_test
 # ---------------------------------------------------------------------------
 
-# NOTE: This content is also maintained in .claude/skills/qa/SKILL.md
-# for the /qa Claude Code skill. Keep both in sync when updating.
+# NOTE: This content is maintained in three places — keep all in sync:
+# 1. skyvern/cli/skills/qa/SKILL.md         (bundled with pip package — canonical)
+# 2. .claude/skills/qa/SKILL.md              (project-local copy for this repo)
+# 3. skyvern/cli/mcp_tools/prompts.py        (QA_TEST_CONTENT — this file)
 QA_TEST_CONTENT = """\
 # QA — Test Frontend Changes in a Real Browser
 
