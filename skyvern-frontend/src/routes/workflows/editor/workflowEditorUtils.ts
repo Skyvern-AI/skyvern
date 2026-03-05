@@ -4193,7 +4193,7 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     jsonFields.forEach(({ value, name }) => {
       const result = validateJson(value);
       if (!result.valid && result.message) {
-        errors.push(`${node.data.label}: ${name} is not valid JSON.`);
+        errors.push(`${node.data.label}: ${name} - ${result.message}`);
       }
     });
   });
@@ -4205,7 +4205,7 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
     const payloadResult = validateJson(node.data.payload);
     if (!payloadResult.valid && payloadResult.message) {
-      errors.push(`${node.data.label}: Payload is not valid JSON.`);
+      errors.push(`${node.data.label}: Payload - ${payloadResult.message}`);
     }
   });
 
