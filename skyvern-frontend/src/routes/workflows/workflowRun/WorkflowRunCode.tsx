@@ -65,19 +65,28 @@ function WorkflowRunCode(props?: Props) {
     workflowRunId: workflowRun?.workflow_run_id,
   });
 
+  const isAdaptiveCaching =
+    workflow?.adaptive_caching && workflow?.run_with === "code";
+
   useEffect(() => {
-    const keys = Object.keys(blockScriptsPublished ?? {});
-    setHasPublishedCode(keys.length > 0);
+    const keys = Object.keys(blockScriptsPublished?.blocks ?? {});
+    setHasPublishedCode(
+      keys.length > 0 || Boolean(blockScriptsPublished?.main_script),
+    );
   }, [blockScriptsPublished, setHasPublishedCode]);
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
 
-  const code = getCode(
-    orderedBlockLabels,
-    hasPublishedCode ? blockScriptsPublished : blockScriptsPending,
-  )
-    .join("")
-    .trim();
+  const activeScripts = hasPublishedCode
+    ? blockScriptsPublished
+    : blockScriptsPending;
+
+  // For adaptive caching, prefer the full main.py script over stitched blocks
+  const code = (
+    isAdaptiveCaching && activeScripts?.main_script
+      ? activeScripts.main_script
+      : getCode(orderedBlockLabels, activeScripts?.blocks).join("")
+  ).trim();
 
   const isGeneratingCode = !isFinalized && !hasPublishedCode;
 

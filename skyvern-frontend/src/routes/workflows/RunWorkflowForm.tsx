@@ -400,7 +400,10 @@ function RunWorkflowForm({
   const [hasCode, setHasCode] = useState(false);
 
   useEffect(() => {
-    setHasCode(Object.keys(blockScripts ?? {}).length > 0);
+    setHasCode(
+      Object.keys(blockScripts?.blocks ?? {}).length > 0 ||
+        Boolean(blockScripts?.main_script),
+    );
   }, [blockScripts]);
 
   // Watch form changes and update run parameters without triggering validation
