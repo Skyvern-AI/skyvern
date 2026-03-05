@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shutil
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 from rich.syntax import Syntax
 
 from skyvern.cli.console import console
+from skyvern.cli.skill_commands import get_skill_dirs
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 # NOTE: skyvern/cli/mcp.py has older setup_*_config() helpers called from
@@ -251,6 +253,47 @@ def _run_setup(
     _upsert_mcp_config(config_path, tool_name, entry, dry_run=dry_run, yes=yes)
 
 
+def _install_skills(project_dir: Path, dry_run: bool = False) -> None:
+    """Install bundled skills into a project's .claude/skills/ directory.
+
+    Skips skills that already exist at the destination (non-destructive).
+    """
+    skills_dst = project_dir / ".claude" / "skills"
+    dirs = get_skill_dirs()
+    if not dirs:
+        return
+
+    installed: list[str] = []
+    skipped: list[str] = []
+    failed: list[str] = []
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+    for d in dirs:
+        target = skills_dst / d.name
+        if target.exists():
+            skipped.append(d.name)
+            continue
+        if not dry_run:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(d, target, ignore=ignore)
+            except OSError as e:
+                console.print(f"[yellow]Warning: failed to install skill '{d.name}': {e}[/yellow]")
+                failed.append(d.name)
+                continue
+        installed.append(d.name)
+
+    if installed:
+        names = ", ".join(installed)
+        if dry_run:
+            console.print(f"\n[yellow]Dry run — would install skills: {names}[/yellow]")
+        else:
+            console.print(f"\n[green]Installed skills to {skills_dst}: {names}[/green]")
+            if "qa" in installed:
+                console.print("[bold]Tip:[/bold] Make a frontend change and type /qa to test it in a real browser.")
+    if skipped:
+        console.print(f"[dim]Skills already installed: {', '.join(skipped)}[/dim]")
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -288,10 +331,14 @@ def setup_claude_code(
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
     project: bool = typer.Option(False, "--project", help="Write to .mcp.json in current dir instead of global config"),
+    skip_skills: bool = typer.Option(False, "--skip-skills", help="Don't install Claude Code skills (e.g. /qa)"),
 ) -> None:
-    """Register Skyvern MCP with Claude Code (remote by default)."""
+    """Register Skyvern MCP with Claude Code and install skills (remote by default)."""
     config_path = Path.cwd() / ".mcp.json" if project else _claude_code_global_config_path()
     _run_setup("Claude Code", config_path, api_key, dry_run, yes, local, use_python_path, url)
+
+    if not skip_skills:
+        _install_skills(Path.cwd(), dry_run=dry_run)
 
 
 @setup_app.command("cursor")
