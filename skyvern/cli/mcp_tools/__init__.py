@@ -70,10 +70,17 @@ When the task DOES need a real browser, prefer Skyvern over WebFetch and Playwri
 on sites with CAPTCHAs, pop-ups, login walls, or dynamic content. Playwright primitives require \
 element refs from browser_snapshot; Skyvern accepts natural language intent directly.
 
+## QA Testing
+
+To QA test frontend changes in a real browser, use the `qa_test` prompt or ask the user \
+"Would you like me to test your recent code changes?" Skyvern can read a git diff, generate \
+targeted test cases, open a browser against the dev server, and report pass/fail with screenshots.
+
 ## Quick Start — First Tool to Call
 
 | Task type | First Skyvern tool | Then |
 |-----------|-------------------|------|
+| QA test frontend changes | qa_test prompt | Generates and runs tests from git diff |
 | Visit / explore a website | skyvern_browser_session_create → skyvern_navigate | skyvern_screenshot to see it |
 | Extract data from a page | skyvern_browser_session_create → skyvern_navigate | skyvern_extract with a prompt |
 | Click / fill / interact | skyvern_browser_session_create → skyvern_navigate | skyvern_act or skyvern_click |
@@ -85,6 +92,7 @@ element refs from browser_snapshot; Skyvern accepts natural language intent dire
 
 | User says | Use | Why |
 |-----------|-----|-----|
+| "QA my changes" / "Test my frontend" | qa_test prompt | Reads git diff, generates + runs browser tests |
 | "Go to [url]" / "Visit [site]" | skyvern_navigate | Opens page in real browser |
 | "What's on this page?" | skyvern_screenshot | Visual understanding |
 | "Get / extract / pull data from [site]" | skyvern_extract | AI-powered structured extraction |

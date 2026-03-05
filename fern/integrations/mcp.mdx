@@ -133,6 +133,10 @@ x-api-key = "SKYVERN_API_KEY"
 
 That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the connection (requires Node.js >= 20).
 
+<Tip>
+Prefer a CLI? `pip install skyvern` then run `skyvern setup` — it auto-detects your AI tools and configures MCP for all of them at once.
+</Tip>
+
 ## Alternative: Local mode (self-hosted)
 
 Use this if you are self-hosting Skyvern and want the MCP server to talk to your own instance instead of Skyvern Cloud. This runs a lightweight Python process on your machine that connects to your local Skyvern server.
@@ -205,7 +209,7 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 </Tabs>
 
 <Tip>
-You can also run `skyvern init` to auto-detect installed clients and write configs automatically.
+You can also run `skyvern setup` to auto-detect installed clients and write configs automatically.
 </Tip>
 
 <Accordion title="Config file locations by client">
@@ -266,6 +270,33 @@ This is especially powerful during development: make a code change, then ask you
 <Warning>
 Always use `--api-key` when exposing your browser via tunnel. Without it, anyone with the ngrok URL has full browser control.
 </Warning>
+
+## QA your frontend changes
+
+If you install the Skyvern CLI, `skyvern setup claude-code` registers the MCP server **and** installs Claude Code skills — including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
+
+```bash
+pip install skyvern
+skyvern setup claude-code
+```
+
+Then make a frontend change and type `/qa` in Claude Code. It will:
+
+1. Read your `git diff` and the full source of each changed file
+2. Generate targeted test cases (plus regression tests for adjacent behavior)
+3. Open a browser against your running dev server
+4. Run the tests — navigate, click, fill forms, check the DOM
+5. Report pass/fail with screenshots
+
+For localhost testing, start a local browser first:
+
+```bash
+skyvern browser serve --tunnel
+```
+
+<Tip>
+The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each) and `skyvern_act` for natural-language interactions. Tests are generated fresh from each diff — no test files to maintain.
+</Tip>
 
 ## Troubleshooting
 

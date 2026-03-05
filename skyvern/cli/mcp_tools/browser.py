@@ -31,6 +31,7 @@ from ._common import (
     make_result,
     save_artifact,
 )
+from ._localhost import is_localhost_url
 from ._session import BrowserNotAvailableError, get_page, no_browser_error
 
 LOG = logging.getLogger(__name__)
@@ -71,6 +72,20 @@ async def skyvern_navigate(
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_navigate", ok=False, error=no_browser_error())
+
+    if ctx.mode == "cloud_session" and is_localhost_url(url):
+        return make_result(
+            "skyvern_navigate",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cloud browsers cannot reach localhost URLs",
+                "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
+                "your local dev server to a cloud browser via ngrok. "
+                "Or use `local=true` in skyvern_browser_session_create for a local browser.",
+            ),
+        )
 
     with Timer() as timer:
         try:
@@ -1109,6 +1124,20 @@ async def skyvern_run_task(
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_run_task", ok=False, error=no_browser_error())
+
+    if url and ctx.mode == "cloud_session" and is_localhost_url(url):
+        return make_result(
+            "skyvern_run_task",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cloud browsers cannot reach localhost URLs",
+                "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
+                "your local dev server to a cloud browser via ngrok. "
+                "Or use `local=true` in skyvern_browser_session_create for a local browser.",
+            ),
+        )
 
     parsed_schema: dict[str, Any] | str | None = None
     if data_extraction_schema is not None:

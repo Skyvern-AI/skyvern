@@ -521,7 +521,8 @@ class WorkflowRunRequest(BaseModel):
     )
     run_with: str | None = Field(
         default=None,
-        description="Whether to run the workflow with agent or code.",
+        description="Whether to run the workflow with agent, code, or code_v2 (adaptive caching).",
+        examples=["agent", "code", "code_v2"],
     )
 
     @field_validator("webhook_url", "totp_url")
@@ -633,8 +634,8 @@ class WorkflowRunResponse(BaseRunResponse):
     run_type: Literal[RunType.workflow_run] = Field(description="Type of run - always workflow_run for workflow runs")
     run_with: str | None = Field(
         default=None,
-        description="Whether the workflow run was executed with agent or code",
-        examples=["agent", "code"],
+        description="Whether the workflow run was executed with agent, code, or code_v2 (adaptive caching)",
+        examples=["agent", "code", "code_v2"],
     )
     ai_fallback: bool | None = Field(
         default=None,
