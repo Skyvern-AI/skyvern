@@ -14,7 +14,7 @@ from skyvern.core.script_generations.transform_workflow_run import transform_wor
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.block import get_all_blocks
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, is_adaptive_caching
 from skyvern.schemas.scripts import FileEncoding, Script, ScriptFileCreate, ScriptStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import script_service
@@ -200,6 +200,11 @@ async def get_workflow_script(
                     f"{rendered_cache_key_value}:{domain}" if rendered_cache_key_value else domain
                 )
 
+        # Namespace adaptive caching (Code 2.0) scripts with :v2 suffix so they
+        # don't collide with traditional (Code 1.0) cached scripts.
+        if is_adaptive_caching(workflow, workflow_run):
+            rendered_cache_key_value = f"{rendered_cache_key_value}:v2" if rendered_cache_key_value else "v2"
+
         if block_labels:
             # Do not generate script or run script if block_labels is provided
             return None, rendered_cache_key_value
@@ -358,6 +363,7 @@ async def generate_workflow_script(
         if cached_script:
             cached_block_sources = await _load_cached_script_block_sources(cached_script, workflow.organization_id)
 
+        adaptive = is_adaptive_caching(workflow, workflow_run)
         codegen_input = await transform_workflow_run_to_code_gen_input(
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow.organization_id,
@@ -387,8 +393,8 @@ async def generate_workflow_script(
             pending=pending,
             cached_blocks=cached_block_sources,
             updated_block_labels=updated_block_labels,
-            use_semantic_selectors=workflow.adaptive_caching,
-            adaptive_caching=workflow.adaptive_caching,
+            use_semantic_selectors=adaptive,
+            adaptive_caching=adaptive,
         )
     except Exception:
         LOG.error("Failed to generate workflow script source", exc_info=True)
