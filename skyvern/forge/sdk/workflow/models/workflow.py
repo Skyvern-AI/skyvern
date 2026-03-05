@@ -180,6 +180,15 @@ class WorkflowRun(BaseModel):
     modified_at: datetime
 
 
+def is_adaptive_caching(workflow: Workflow, workflow_run: WorkflowRun) -> bool:
+    """Compute effective adaptive caching mode from run-level override or workflow setting."""
+    if workflow_run.run_with == "code_v2":
+        return True
+    if workflow_run.run_with in ("code", "agent"):
+        return False
+    return workflow.adaptive_caching
+
+
 class WorkflowRunParameter(BaseModel):
     workflow_run_id: str
     workflow_parameter_id: str

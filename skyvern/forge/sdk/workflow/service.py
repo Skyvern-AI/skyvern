@@ -98,6 +98,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunResponseBase,
     WorkflowRunStatus,
+    is_adaptive_caching,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.runs import (
@@ -1010,7 +1011,7 @@ class WorkflowService:
             # Trigger AI Script Reviewer for adaptive caching workflows
             # Include terminated and failed runs (triage will filter non-code-fixable failures)
             # Skip canceled (user stopped) and timed_out (infrastructure issue)
-            if workflow.adaptive_caching and pre_finally_status not in (
+            if is_adaptive_caching(workflow, workflow_run) and pre_finally_status not in (
                 WorkflowRunStatus.canceled,
                 WorkflowRunStatus.timed_out,
             ):
@@ -1199,7 +1200,12 @@ class WorkflowService:
                 loaded_script_module = None
 
         # Mark workflow as running with appropriate engine
-        run_with = "code" if script and is_script_run and script_blocks_by_label else "agent"
+        # Preserve "code_v2" when that was the original request so the DB value
+        # stays accurate for API responses and downstream queries.
+        if script and is_script_run and script_blocks_by_label:
+            run_with = workflow_run.run_with if workflow_run.run_with == "code_v2" else "code"
+        else:
+            run_with = "agent"
         await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id, run_with=run_with)
 
         # Set script_mode on context so downstream code can skip expensive LLM calls
@@ -1800,7 +1806,7 @@ class WorkflowService:
                             workflow_run_block_result = None
 
                             # Record fallback episode for adaptive caching
-                            if workflow.adaptive_caching and block.label:
+                            if is_adaptive_caching(workflow, workflow_run) and block.label:
                                 context = skyvern_context.current()
                                 fallback_episode_id, form_fields_for_episode = await self._record_fallback_episode(
                                     workflow_run=workflow_run,
@@ -1828,7 +1834,7 @@ class WorkflowService:
                     block_executed_with_code = False
 
                     # Record fallback episode for the script reviewer (adaptive caching)
-                    if workflow.adaptive_caching and block.label:
+                    if is_adaptive_caching(workflow, workflow_run) and block.label:
                         context = skyvern_context.current()
                         fallback_episode_id, form_fields_for_episode = await self._record_fallback_episode(
                             workflow_run=workflow_run,
@@ -1981,7 +1987,7 @@ class WorkflowService:
                     and (block_requires_agent or fallback_episode_id)
                     and workflow_run_block_result.status == BlockStatus.completed
                     and branch_metadata
-                    and workflow.adaptive_caching
+                    and is_adaptive_caching(workflow, workflow_run)
                 ):
                     try:
                         # Extract the branch expressions and results for the reviewer.
@@ -2056,7 +2062,7 @@ class WorkflowService:
                 # should not trigger regeneration — doing so creates an infinite loop
                 # where every run deletes and regenerates the script because blocks
                 # always execute via agent and are never in script_blocks_by_label.
-                and (workflow.adaptive_caching or is_script_run)
+                and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
             ):
                 blocks_to_update.add(block.label)
 
@@ -4782,7 +4788,14 @@ class WorkflowService:
         workflow: Workflow,
         workflow_run: WorkflowRun,
     ) -> bool:
-        if workflow_run.run_with == "code":
+        """Determine whether this run should attempt to execute cached scripts.
+
+        Note: This intentionally does NOT consult workflow.adaptive_caching.
+        Adaptive caching workflows (is_adaptive_caching=True) gather training
+        data on agent runs before any script exists. The script-recording and
+        fallback-episode logic uses is_adaptive_caching() separately.
+        """
+        if workflow_run.run_with in ("code", "code_v2"):
             return True
         if workflow_run.run_with == "agent":
             return False
