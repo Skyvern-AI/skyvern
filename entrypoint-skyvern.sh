@@ -57,6 +57,17 @@ xvfb=$!
 
 DISPLAY=:99 xterm 2>/dev/null &
 
+# Wait for Xvfb to be ready before starting x11vnc
+for i in $(seq 1 10); do
+  xdpyinfo -display :99 >/dev/null 2>&1 && break
+  echo "Waiting for Xvfb to start (attempt $i/10)..."
+  sleep 1
+done
+if ! xdpyinfo -display :99 >/dev/null 2>&1; then
+  echo "ERROR: Xvfb failed to start on display :99 after 10 attempts"
+  exit 1
+fi
+
 echo "Starting x11vnc on display :99..."
 # VNC runs without a password (-nopw) because port 5900 is not exposed outside
 # the container. Browser streaming reaches users via websockify on port 6080.
