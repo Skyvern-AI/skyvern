@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -31,6 +30,7 @@ from skyvern.cli.core.guards import (
     validate_button,
     validate_wait_until,
 )
+from skyvern.cli.core.ngrok import check_ngrok_auth, detect_ngrok, offer_install_ngrok, offer_setup_auth
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
 from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
 from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
@@ -1244,31 +1244,23 @@ async def _maybe_start_ngrok_tunnel(port: int, browser_path: str, *, auto: bool)
             return None
 
     # Check if ngrok is installed
-    ngrok_path = shutil.which("ngrok")
+    ngrok_path = detect_ngrok()
     if not ngrok_path:
-        console.print()
-        console.print("  [bold red]ngrok not found.[/bold red]")
-        console.print()
-        console.print("  [bold]1.[/bold] Install ngrok:")
-        console.print("     [green]brew install ngrok[/green]    [dim](macOS)[/dim]")
-        console.print("     [cyan]https://ngrok.com/download[/cyan]  [dim](other platforms)[/dim]")
-        console.print()
-        console.print("  [bold]2.[/bold] Sign up for a free account:")
-        console.print("     [cyan]https://dashboard.ngrok.com/signup[/cyan]")
-        console.print()
-        console.print("  [bold]3.[/bold] Add your authtoken:")
-        console.print("     [green]ngrok config add-authtoken <your-token>[/green]")
-        console.print(
-            "     [dim]Get your token at[/dim] [cyan]https://dashboard.ngrok.com/get-started/your-authtoken[/cyan]"
-        )
-        console.print()
-        console.print("  [bold]4.[/bold] Re-run:")
-        console.print("     [green]skyvern browser serve --tunnel[/green]")
-        console.print()
-        if auto:
-            # --tunnel was explicit — don't silently continue without a tunnel
-            raise SystemExit(1)
-        return None
+        # When auto=True (--tunnel in CI), skip interactive prompts and fail fast
+        ngrok_path = offer_install_ngrok(interactive=not auto)
+        if not ngrok_path:
+            if auto:
+                raise SystemExit(1)
+            return None
+
+    # Check if ngrok auth token is configured
+    # Note: check_ngrok_auth is best-effort (validates config syntax, not token
+    # validity). The real validation happens when ngrok tries to start a tunnel.
+    if not check_ngrok_auth(ngrok_path):
+        if not offer_setup_auth(ngrok_path, interactive=not auto):
+            if auto:
+                raise SystemExit(1)
+            return None
 
     console.print()
     console.print(f"  Starting ngrok tunnel on port [cyan]{port}[/cyan]...")

@@ -1850,21 +1850,27 @@ class WorkflowService:
                     and script_blocks_by_label[block.label].requires_agent
                 )
                 # Check if this block has never been cached (e.g. from an unexecuted
-                # conditional branch). Uncached blocks must run via agent to build
-                # initial cache, even when ai_fallback=False.
+                # conditional branch) or is a non-cacheable block type (goto_url,
+                # for_loop, conditional, code, wait, etc.). These blocks must run
+                # via agent even when ai_fallback=False.
                 block_is_uncached = bool(
                     is_script_run
                     and block.label
                     and block.label not in script_blocks_by_label
                     and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
                 )
+                block_is_non_cacheable = bool(
+                    is_script_run and block.block_type not in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                )
                 # If ai_fallback is explicitly disabled, skip the agent fallback entirely —
-                # UNLESS this block requires_agent OR has never been cached.
+                # UNLESS this block requires_agent, has never been cached, or is a
+                # non-cacheable block type that must always run via agent.
                 if (
                     is_script_run
                     and workflow_run.ai_fallback is False
                     and not block_requires_agent
                     and not block_is_uncached
+                    and not block_is_non_cacheable
                 ):
                     LOG.info(
                         "ai_fallback disabled: skipping agent fallback, keeping script failure",
@@ -1879,6 +1885,8 @@ class WorkflowService:
                         if block_requires_agent
                         else "uncached_block"
                         if block_is_uncached
+                        else "non_cacheable_block_type"
+                        if block_is_non_cacheable
                         else "normal"
                     )
                     LOG.info(

@@ -956,22 +956,17 @@ async def handle_click_to_download_file_action(
 ) -> list[ActionResult]:
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
-    locator = skyvern_element.locator
 
+    results = await chain_click(task, scraped_page, page, action, skyvern_element)
     try:
-        if not await skyvern_element.navigate_to_a_href(page=page):
-            await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
         await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-    except Exception as e:
-        LOG.exception(
-            "ClickAction with download failed",
-            exc_info=True,
+    except Exception:
+        LOG.warning(
+            "wait_for_load_state timed out after download click",
             action=action,
             workflow_run_id=task.workflow_run_id,
         )
-        return [ActionFailure(e, download_triggered=False)]
-
-    return [ActionSuccess()]
+    return results
 
 
 # TOTP timing constants

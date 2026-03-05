@@ -145,6 +145,18 @@ function CredentialsModal({
   const [secretCredentialValues, setSecretCredentialValues] = useState(
     SECRET_CREDENTIAL_INITIAL_VALUES,
   );
+  const [editingGroups, setEditingGroups] = useState({
+    name: false,
+    values: false,
+  });
+
+  const handleEnableEditName = useCallback(() => {
+    setEditingGroups((prev) => ({ ...prev, name: true }));
+  }, []);
+
+  const handleEnableEditValues = useCallback(() => {
+    setEditingGroups((prev) => ({ ...prev, values: true }));
+  }, []);
 
   // Test & Save Browser Profile state
   const [testAndSave, setTestAndSave] = useState(false);
@@ -276,6 +288,7 @@ function CredentialsModal({
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
     setCreditCardCredentialValues(CREDIT_CARD_CREDENTIAL_INITIAL_VALUES);
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
+    setEditingGroups({ name: false, values: false });
     setTestAndSave(false);
     setTestUrl("");
     setTestStatus("idle");
@@ -616,6 +629,20 @@ function CredentialsModal({
     ? updateCredentialMutation
     : createCredentialMutation;
 
+  const handleRenameOnly = (name: string) => {
+    if (!editingCredential) return;
+    // Skip the API call if the name hasn't actually changed
+    if (name === editingCredential.name) {
+      reset();
+      setIsOpen(false);
+      return;
+    }
+    renameCredentialMutation.mutate({
+      id: editingCredential.credential_id,
+      name,
+    });
+  };
+
   const handleSave = () => {
     const name =
       type === CredentialModalTypes.PASSWORD
@@ -630,6 +657,20 @@ function CredentialsModal({
         variant: "destructive",
       });
       return;
+    }
+
+    // In edit mode, use editingGroups to determine what changed (type-agnostic)
+    if (isEditMode && editingCredential) {
+      if (!editingGroups.name && !editingGroups.values) {
+        // Nothing was edited — close silently
+        reset();
+        setIsOpen(false);
+        return;
+      }
+      if (editingGroups.name && !editingGroups.values) {
+        handleRenameOnly(name);
+        return;
+      }
     }
 
     if (type === CredentialModalTypes.PASSWORD) {
@@ -788,6 +829,10 @@ function CredentialsModal({
           onUrlChange={!isEditMode ? setTestUrl : undefined}
           urlRequired={testAndSave}
           urlDisabled={isTestInProgress}
+          editMode={isEditMode}
+          editingGroups={editingGroups}
+          onEnableEditName={handleEnableEditName}
+          onEnableEditValues={handleEnableEditValues}
           afterUrl={
             !isEditMode ? (
               <div className="space-y-3">
@@ -864,6 +909,10 @@ function CredentialsModal({
         <CreditCardCredentialContent
           values={creditCardCredentialValues}
           onChange={setCreditCardCredentialValues}
+          editMode={isEditMode}
+          editingGroups={editingGroups}
+          onEnableEditName={handleEnableEditName}
+          onEnableEditValues={handleEnableEditValues}
         />
       );
     }
@@ -871,6 +920,10 @@ function CredentialsModal({
       <SecretCredentialContent
         values={secretCredentialValues}
         onChange={setSecretCredentialValues}
+        editMode={isEditMode}
+        editingGroups={editingGroups}
+        onEnableEditName={handleEnableEditName}
+        onEnableEditValues={handleEnableEditValues}
       />
     );
   })();
@@ -999,12 +1052,12 @@ function CredentialsModal({
             {isEditMode ? "Edit Credential" : "Add Credential"}
           </DialogTitle>
         </DialogHeader>
-        {isEditMode && (
+        {isEditMode && editingGroups.values && (
           <Alert>
             <InfoCircledIcon className="size-4" />
             <AlertDescription>
-              For security, saved passwords and secrets are never retrieved.
-              Please re-enter all fields to update this credential.
+              For security, saved values are never retrieved. All credential
+              fields must be filled in to save your changes.
             </AlertDescription>
           </Alert>
         )}
