@@ -10,6 +10,9 @@ if (!environment) {
   console.warn("environment environment variable was not set");
 }
 
+const browserStreamingMode =
+  (import.meta.env.VITE_BROWSER_STREAMING_MODE as string) ?? "vnc";
+
 const buildTimeApiKey: string | null =
   typeof import.meta.env.VITE_SKYVERN_API_KEY === "string"
     ? import.meta.env.VITE_SKYVERN_API_KEY
@@ -94,6 +97,19 @@ function clearRuntimeApiKey(): void {
   }
 }
 
+async function getCredentialParam(
+  credentialGetter: (() => Promise<string | null>) | null,
+): Promise<string> {
+  if (credentialGetter) {
+    const token = await credentialGetter();
+    if (token) {
+      return `token=Bearer ${token}`;
+    }
+  }
+  const apiKey = getRuntimeApiKey();
+  return apiKey ? `apikey=${apiKey}` : "";
+}
+
 const useNewRunsUrl = true as const;
 
 const enable2faNotifications =
@@ -103,11 +119,13 @@ export {
   apiBaseUrl,
   runsApiBaseUrl,
   environment,
+  browserStreamingMode,
   artifactApiBaseUrl,
   apiPathPrefix,
   lsKeys,
   wssBaseUrl,
   newWssBaseUrl,
+  getCredentialParam,
   getRuntimeApiKey,
   persistRuntimeApiKey,
   clearRuntimeApiKey,

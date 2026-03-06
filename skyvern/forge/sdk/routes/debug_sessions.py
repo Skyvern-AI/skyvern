@@ -70,6 +70,19 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
     )
 
+    # Skip renewal for sessions that haven't started yet (browser still launching)
+    session = await app.DATABASE.get_persistent_browser_session(
+        debug_session.browser_session_id,
+        current_org.organization_id,
+    )
+    if session and session.started_at is None and session.completed_at is None:
+        created_at_utc = (
+            session.created_at.replace(tzinfo=timezone.utc) if session.created_at.tzinfo is None else session.created_at
+        )
+        age_seconds = (datetime.now(timezone.utc) - created_at_utc).total_seconds()
+        if age_seconds < 120:
+            return debug_session
+
     try:
         await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(
             debug_session.browser_session_id,
