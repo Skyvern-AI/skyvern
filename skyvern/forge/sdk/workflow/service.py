@@ -673,7 +673,9 @@ class WorkflowService:
                         missing_parameters.append(workflow_parameter.key)
                         continue
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
-                        await self._validate_credential_id(str(request_body_value), organization)
+                        if not isinstance(request_body_value, str):
+                            raise InvalidCredentialId(f"<non-string value of type {type(request_body_value).__name__}>")
+                        await self._validate_credential_id(request_body_value, organization)
                     try:
                         await self.create_workflow_run_parameter(
                             workflow_run_id=workflow_run.workflow_run_id,
@@ -689,7 +691,11 @@ class WorkflowService:
                         ) from parameter_error
                 elif workflow_parameter.default_value is not None:
                     if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
-                        await self._validate_credential_id(str(workflow_parameter.default_value), organization)
+                        if not isinstance(workflow_parameter.default_value, str):
+                            raise InvalidCredentialId(
+                                f"<non-string value of type {type(workflow_parameter.default_value).__name__}>"
+                            )
+                        await self._validate_credential_id(workflow_parameter.default_value, organization)
                     try:
                         await self.create_workflow_run_parameter(
                             workflow_run_id=workflow_run.workflow_run_id,

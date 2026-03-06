@@ -222,10 +222,34 @@ class WorkflowRunParameterPersistenceError(SkyvernException):
         )
 
 
+# Covers the credential dict fields from SKY-8222 (password, username, secret_value, totp).
+# Not exhaustive — this is defense-in-depth; the root cause is fixed in the frontend.
+_SENSITIVE_CREDENTIAL_KEYS = ("password", "username", "secret", "totp", "secret_value")
+
+
+def sanitize_credential_for_error(credential_id: object) -> str:
+    """Prevent credential values from leaking into error messages.
+
+    When a credential dict is accidentally stringified and passed as a credential ID,
+    this ensures the raw values (passwords, usernames, etc.) are never included in
+    user-facing error messages, failure reasons, or logs.
+    """
+    if not isinstance(credential_id, str):
+        return f"<redacted - non-string type: {type(credential_id).__name__}>"
+    lower = credential_id.lower()
+    for key in _SENSITIVE_CREDENTIAL_KEYS:
+        if key in lower:
+            return "<redacted - contains credential data>"
+    if len(credential_id) > 200:
+        return "<redacted - value too long>"
+    return credential_id
+
+
 class InvalidCredentialId(SkyvernHTTPException):
     def __init__(self, credential_id: str) -> None:
         super().__init__(
-            f"Invalid credential ID: {credential_id}. Failed to resolve to a valid credential.",
+            f"Invalid credential ID: {sanitize_credential_for_error(credential_id)}."
+            " Failed to resolve to a valid credential.",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -459,8 +483,10 @@ class CredentialParameterParsingError(SkyvernException):
 
 
 class CredentialParameterNotFoundError(SkyvernException):
-    def __init__(self, credential_parameter_id: str) -> None:
-        super().__init__(f"Could not find credential parameter: {credential_parameter_id}")
+    def __init__(self, credential_parameter_id: str | None) -> None:
+        super().__init__(
+            f"Could not find credential parameter: {sanitize_credential_for_error(credential_parameter_id)}"
+        )
 
 
 class CredentialVaultNotConfiguredError(SkyvernException):
