@@ -1456,7 +1456,15 @@ class WorkflowService:
         try:
             start_label, label_to_block, default_next_map = self._build_workflow_graph(dag_blocks)
         except InvalidWorkflowDefinition as exc:
-            LOG.error("Workflow graph validation failed", error=str(exc), workflow_id=workflow.workflow_id)
+            LOG.error(
+                "DAG execution failed: workflow graph validation error",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=organization.organization_id,
+                workflow_id=workflow.workflow_id,
+                error=str(exc),
+                exc_info=True,
+            )
             workflow_run = await self.mark_workflow_run_as_failed(
                 workflow_run_id=workflow_run.workflow_run_id,
                 failure_reason=str(exc),
@@ -1475,8 +1483,10 @@ class WorkflowService:
             block = label_to_block.get(current_label)
             if not block:
                 LOG.error(
-                    "Unable to find block with label in workflow graph",
+                    "DAG execution failed: block label not found in workflow graph",
                     workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=organization.organization_id,
                     current_label=current_label,
                 )
                 workflow_run = await self.mark_workflow_run_as_failed(
@@ -1540,6 +1550,14 @@ class WorkflowService:
                 break
 
             if next_label not in label_to_block:
+                LOG.error(
+                    "DAG execution failed: next block label not found in workflow definition",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=organization.organization_id,
+                    current_block_label=block.label,
+                    missing_block_label=next_label,
+                )
                 workflow_run = await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run.workflow_run_id,
                     failure_reason=f"Next block label {next_label} not found in workflow definition",
@@ -1547,6 +1565,14 @@ class WorkflowService:
                 break
 
             if next_label in visited_labels:
+                LOG.error(
+                    "DAG execution failed: cycle detected during traversal",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=organization.organization_id,
+                    current_block_label=block.label,
+                    cycle_block_label=next_label,
+                )
                 workflow_run = await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run.workflow_run_id,
                     failure_reason=f"Cycle detected while traversing workflow definition at block {next_label}",
