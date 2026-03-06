@@ -29,6 +29,7 @@ import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 
@@ -64,6 +65,8 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
 
   const update = useUpdate<WorkflowTriggerNodeType["data"]>({ id, editable });
   const recordingStore = useRecordingStore();
+  const { beginInternalUpdate, endInternalUpdate } =
+    useWorkflowHasChangesStore();
 
   const {
     workflowParameters,
@@ -72,11 +75,30 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
   } = useTargetWorkflowParametersQuery(data.workflowPermanentId);
 
   // Hydrate title from fetched workflow data (single API call, no duplicate)
+  // Mark as internal update to prevent triggering "unsaved changes" dialog
   useEffect(() => {
     if (fetchedTitle && fetchedTitle !== data.workflowTitle) {
+      beginInternalUpdate();
       update({ workflowTitle: fetchedTitle });
+      let ended = false;
+      const timer = setTimeout(() => {
+        ended = true;
+        endInternalUpdate();
+      }, 50);
+      return () => {
+        clearTimeout(timer);
+        if (!ended) {
+          endInternalUpdate();
+        }
+      };
     }
-  }, [fetchedTitle, data.workflowTitle, update]);
+  }, [
+    fetchedTitle,
+    data.workflowTitle,
+    update,
+    beginInternalUpdate,
+    endInternalUpdate,
+  ]);
 
   const hasWorkflowSelected = isConcreteWpid(data.workflowPermanentId);
 
