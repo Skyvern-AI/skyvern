@@ -326,7 +326,6 @@ class Block(BaseModel, abc.ABC):
         is_safe_block_for_secrets = self.block_type in [
             BlockType.CODE,
             BlockType.HTTP_REQUEST,
-            BlockType.WORKFLOW_TRIGGER,
         ]
 
         template = jinja_sandbox_env.from_string(potential_template)
@@ -6219,9 +6218,7 @@ class WorkflowTriggerBlock(Block):
         workflow_run_context: WorkflowRunContext,
     ) -> Any:
         """Render a single Jinja2 template string, handling the | json filter marker."""
-        rendered = self.format_block_parameter_template_from_workflow_run_context(
-            value, workflow_run_context, force_include_secrets=True
-        )
+        rendered = self.format_block_parameter_template_from_workflow_run_context(value, workflow_run_context)
         if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
             json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
             try:
@@ -6275,13 +6272,13 @@ class WorkflowTriggerBlock(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.workflow_permanent_id = self.format_block_parameter_template_from_workflow_run_context(
-            self.workflow_permanent_id, workflow_run_context, force_include_secrets=True
+            self.workflow_permanent_id, workflow_run_context
         )
         if self.payload:
             self.payload = self._render_templates_in_payload(self.payload, workflow_run_context)
         if self.browser_session_id:
             self.browser_session_id = self.format_block_parameter_template_from_workflow_run_context(
-                self.browser_session_id, workflow_run_context, force_include_secrets=True
+                self.browser_session_id, workflow_run_context
             )
 
     async def execute(
