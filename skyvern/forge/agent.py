@@ -105,11 +105,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
-from skyvern.services.otp_service import (
-    extract_totp_from_navigation_inputs,
-    poll_otp_value,
-    try_generate_totp_from_credential,
-)
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
@@ -2591,7 +2587,7 @@ class ForgeAgent:
                 step,
                 browser_state,
                 scraped_page,
-                verification_code_check=True,
+                verification_code_check=bool(task.totp_verification_url or task.totp_identifier),
                 expire_verification_code=True,
             )
 
@@ -4526,6 +4522,9 @@ class ForgeAgent:
         if not task.organization_id:
             return json_response, []
 
+        if not task.totp_verification_url and not task.totp_identifier:
+            return json_response, []
+
         should_verify_by_magic_link = json_response.get("should_verify_by_magic_link")
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
@@ -4546,10 +4545,8 @@ class ForgeAgent:
             return json_response, actions
 
         if should_verify_by_magic_link:
-            # Magic links still require TOTP config (need a source to poll the link from)
-            if task.totp_verification_url or task.totp_identifier:
-                actions = await self.handle_potential_magic_link(task, step, scraped_page, browser_state, json_response)
-                return json_response, actions
+            actions = await self.handle_potential_magic_link(task, step, scraped_page, browser_state, json_response)
+            return json_response, actions
 
         return json_response, []
 
@@ -4606,40 +4603,31 @@ class ForgeAgent:
     ) -> dict[str, Any]:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
-        if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
+        if (
+            place_to_enter_verification_code
+            and should_enter_verification_code
+            and (task.totp_verification_url or task.totp_identifier)
+            and task.organization_id
+        ):
             LOG.info("Need verification code")
-            # 1. Check navigation payload first for inline OTP.
-            otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-            if otp_value:
-                # Code was already in the payload the LLM saw, so its actions are already correct.
-                # No need to re-prompt, generate from credentials, or poll.
-                return json_response
-
-            # 2. Then try to generate TOTP from credential if payload has no OTP.
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-            # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
-            if not otp_value:
-                workflow_id = workflow_permanent_id = None
-                if task.workflow_run_id:
-                    workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
-                    if workflow_run:
-                        workflow_id = workflow_run.workflow_id
-                        workflow_permanent_id = workflow_run.workflow_permanent_id
-                otp_value = await poll_otp_value(
-                    organization_id=task.organization_id,
-                    task_id=task.task_id,
-                    workflow_id=workflow_id,
-                    workflow_run_id=task.workflow_run_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                    totp_verification_url=task.totp_verification_url,
-                    totp_identifier=task.totp_identifier,
-                )
-
+            workflow_id = workflow_permanent_id = None
+            if task.workflow_run_id:
+                workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
+                if workflow_run:
+                    workflow_id = workflow_run.workflow_id
+                    workflow_permanent_id = workflow_run.workflow_permanent_id
+            otp_value = await poll_otp_value(
+                organization_id=task.organization_id,
+                task_id=task.task_id,
+                workflow_id=workflow_id,
+                workflow_run_id=task.workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                totp_verification_url=task.totp_verification_url,
+                totp_identifier=task.totp_identifier,
+            )
             if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
                 return json_response
 
-            # Store the code so _build_navigation_payload injects it, then re-prompt
-            # the LLM so it generates actions that type the real code.
             current_context = skyvern_context.ensure_context()
             current_context.totp_codes[task.task_id] = otp_value.value
 
