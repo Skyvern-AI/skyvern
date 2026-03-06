@@ -138,6 +138,14 @@ def init_env(
                     return False
             update_or_add_env_var("SKYVERN_BASE_URL", base_url)
 
+        console.print(
+            "\n[bold yellow]Tip:[/bold yellow] Want Skyvern Cloud to use your local browser "
+            "(with your existing cookies, logins, and extensions)?"
+        )
+        console.print("  Run: [reverse green] skyvern browser serve --tunnel [/reverse green]")
+        console.print("  This starts Chrome on your machine and creates a tunnel so Skyvern Cloud can control it.")
+        console.print("  Learn more: [link]https://www.skyvern.com/docs/optimization/browser-tunneling[/link]")
+
     analytics_id_input = Prompt.ask("Please enter your email for analytics (press enter to skip)", default="")
     analytics_id = analytics_id_input if analytics_id_input else str(uuid.uuid4())
     update_or_add_env_var("ANALYTICS_ID", analytics_id)
