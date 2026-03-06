@@ -3303,73 +3303,6 @@
         }
       }
     },
-    "/v1/scripts/{workflow_permanent_id}/cache": {
-      "delete": {
-        "tags": [
-          "Scripts"
-        ],
-        "summary": "Clear cached scripts for workflow",
-        "description": "Clear all cached scripts for a specific workflow. This will trigger script regeneration on subsequent runs.",
-        "operationId": "clear_workflow_cache_v1_scripts__workflow_permanent_id__cache_delete",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "The workflow permanent ID to clear cache for",
-              "examples": [
-                "wpid_abc123"
-              ],
-              "title": "Workflow Permanent Id"
-            },
-            "description": "The workflow permanent ID to clear cache for"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ClearCacheResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "clear_workflow_cache"
-      }
-    },
     "/v1/sdk/run_action": {
       "post": {
         "tags": [
@@ -3431,46 +3364,6 @@
           }
         },
         "x-fern-sdk-method-name": "run_sdk_action"
-      }
-    },
-    "/api/v1/auth/api-key": {
-      "post": {
-        "summary": "Get Api Key",
-        "description": "Exchange a Clerk JWT for an API key.\n\nRequires Authorization: Bearer <clerk_jwt> header.\nAuto-creates org + billing + API key on first login (handled by Clerk auth dependency).\nReturns the user's email from the JWT for CLI display.",
-        "operationId": "get_api_key_api_v1_auth_api_key_post",
-        "parameters": [
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiKeyResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
       }
     },
     "/api/v1/billing/checkout": {
@@ -4774,29 +4667,6 @@
           "left_mouse"
         ],
         "title": "ActionType"
-      },
-      "ApiKeyResponse": {
-        "properties": {
-          "organization_id": {
-            "type": "string",
-            "title": "Organization Id"
-          },
-          "api_key": {
-            "type": "string",
-            "title": "Api Key"
-          },
-          "email": {
-            "type": "string",
-            "title": "Email"
-          }
-        },
-        "type": "object",
-        "required": [
-          "organization_id",
-          "api_key",
-          "email"
-        ],
-        "title": "ApiKeyResponse"
       },
       "Artifact": {
         "properties": {
@@ -6366,27 +6236,6 @@
           "tier"
         ],
         "title": "CheckoutSubscriptionRequest"
-      },
-      "ClearCacheResponse": {
-        "properties": {
-          "deleted_count": {
-            "type": "integer",
-            "title": "Deleted Count",
-            "description": "Number of cached entries deleted"
-          },
-          "message": {
-            "type": "string",
-            "title": "Message",
-            "description": "Status message"
-          }
-        },
-        "type": "object",
-        "required": [
-          "deleted_count",
-          "message"
-        ],
-        "title": "ClearCacheResponse",
-        "description": "Response model for cache clearing operations."
       },
       "ClickAction": {
         "properties": {
@@ -18430,34 +18279,6 @@
             ],
             "title": "Code Gen"
           },
-          "waiting_for_verification_code": {
-            "type": "boolean",
-            "title": "Waiting For Verification Code",
-            "default": false
-          },
-          "verification_code_identifier": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Verification Code Identifier"
-          },
-          "verification_code_polling_started_at": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "date-time"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Verification Code Polling Started At"
-          },
           "queued_at": {
             "anyOf": [
               {
@@ -19140,7 +18961,12 @@
               }
             ],
             "title": "Run With",
-            "description": "Whether to run the workflow with agent or code."
+            "description": "Whether to run the workflow with agent, code, or code_v2 (adaptive caching).",
+            "examples": [
+              "agent",
+              "code",
+              "code_v2"
+            ]
           }
         },
         "type": "object",
@@ -19419,10 +19245,11 @@
               }
             ],
             "title": "Run With",
-            "description": "Whether the workflow run was executed with agent or code",
+            "description": "Whether the workflow run was executed with agent, code, or code_v2 (adaptive caching)",
             "examples": [
               "agent",
-              "code"
+              "code",
+              "code_v2"
             ]
           },
           "ai_fallback": {
