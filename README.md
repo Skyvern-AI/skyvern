@@ -269,17 +269,31 @@ BROWSER_TYPE=cdp-connect
 
 Restart Skyvern service `skyvern run all` and run the task through UI or code
 
-### Run Skyvern with any remote browser
-Grab the cdp connection url and pass it to Skyvern
+### Connect Skyvern Cloud to your local browser
+
+Let Skyvern Cloud control a Chrome browser running on your machine — with all your existing cookies, logins, and extensions. Useful for automating sites where you're already logged in or behind a VPN.
+
+```bash
+# One command to start Chrome + create a tunnel to Skyvern Cloud
+skyvern browser serve --tunnel
+```
+
+Then use the tunnel URL in your task:
 
 ```python
 from skyvern import Skyvern
 
-skyvern = Skyvern(cdp_url="your cdp connection url")
+skyvern = Skyvern(api_key="your-api-key")
 task = await skyvern.run_task(
-    prompt="Find the top post on hackernews today",
+    prompt="Download the latest invoice from my account",
+    browser_address="https://abc123.ngrok-free.dev",
 )
 ```
+
+> [!WARNING]
+> Always use `--api-key` when exposing your browser via a tunnel. Without it, anyone with the URL has full control of your browser. See the [security docs](https://www.skyvern.com/docs/optimization/browser-tunneling#security).
+
+See the [full documentation](https://www.skyvern.com/docs/optimization/browser-tunneling) for all options, manual tunnel setup, and troubleshooting.
 
 ### Get consistent output schema from your run
 You can do this by adding the `data_extraction_schema` parameter:
