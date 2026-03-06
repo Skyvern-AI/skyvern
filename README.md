@@ -286,7 +286,7 @@ from skyvern import Skyvern
 skyvern = Skyvern(api_key="your-api-key")
 task = await skyvern.run_task(
     prompt="Download the latest invoice from my account",
-    browser_address="wss://abc123.ngrok-free.dev",
+    browser_address="https://abc123.ngrok-free.dev",
 )
 ```
 
