@@ -100,6 +100,13 @@ import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
 
+// Grace period after nodesInitialized before we start tracking changes.
+// Allows mount-time effects (ResizeObserver, visibility toggling) to settle.
+// Async API calls (e.g. WorkflowTriggerNode title hydration) are separately
+// protected by beginInternalUpdate/endInternalUpdate guards, so this timeout
+// only needs to cover synchronous mount-time effects.
+const INITIAL_LOAD_SETTLE_MS = 500;
+
 function convertToParametersYAML(
   parameters: ParametersState,
 ): Array<
@@ -342,8 +349,14 @@ function FlowRenderer({
   useEffect(() => {
     if (nodesInitialized) {
       setShouldConstrainPan(true);
-      // Mark initial load as complete after nodes are initialized
-      isInitialLoadRef.current = false;
+      // Delay marking initial load as complete to allow mount-time effects
+      // (ResizeObserver, async data fetches, visibility toggling) to settle
+      // before we start tracking changes. Must be long enough for async
+      // effects but short enough that users won't notice.
+      const timer = setTimeout(() => {
+        isInitialLoadRef.current = false;
+      }, INITIAL_LOAD_SETTLE_MS);
+      return () => clearTimeout(timer);
     }
   }, [nodesInitialized]);
 
@@ -972,11 +985,11 @@ function FlowRenderer({
             // Only track changes after initial load is complete and not during internal updates
             // (e.g., switching conditional branches which is UI state, not workflow data)
             // Use getState() to get real-time value (not stale closure from render time)
-            const isInternalUpdate =
-              useWorkflowHasChangesStore.getState().isInternalUpdate;
+            const internalUpdateCount =
+              useWorkflowHasChangesStore.getState().internalUpdateCount;
             if (
               !isInitialLoadRef.current &&
-              !isInternalUpdate &&
+              internalUpdateCount === 0 &&
               changes.some((change) => {
                 return (
                   change.type === "add" ||

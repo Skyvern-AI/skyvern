@@ -47,7 +47,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const recordingStore = useRecordingStore();
   const headerRef = useRef<HTMLDivElement>(null);
   const { updateNodeData } = useReactFlow();
-  const lastHeaderHeight = useRef<number | undefined>(undefined);
+  const lastHeaderHeight = useRef<number | undefined>(data._headerHeight);
 
   useEffect(() => {
     const el = headerRef.current;

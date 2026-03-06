@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, createElement } from "react";
 import { toast } from "@/components/ui/use-toast";
 import { VerificationToastContent } from "@/components/VerificationToast";
+import { enable2faNotifications } from "@/util/env";
 
 /** How long (minutes) before we consider the 2FA request timed out */
 const VERIFICATION_TIMEOUT_MINS = 15;
@@ -81,6 +82,7 @@ function useVerificationCodeAlert({
 
   // Browser notification + in-app toast (fire once per waiting transition)
   useEffect(() => {
+    if (!enable2faNotifications) return;
     if (!isWaitingForCode || notifiedTags.has(notificationTag)) return;
     notifiedTags.add(notificationTag);
 
