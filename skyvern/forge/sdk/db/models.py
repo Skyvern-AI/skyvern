@@ -15,6 +15,7 @@ from sqlalchemy import (
     UnicodeText,
     UniqueConstraint,
     desc,
+    text,
 )
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
@@ -205,6 +206,26 @@ class ArtifactModel(Base):
     __table_args__ = (
         Index("org_task_step_index", "organization_id", "task_id", "step_id"),
         Index("artifacts_org_created_at_index", "organization_id", "created_at"),
+        Index(
+            "ix_artifacts_workflow_run_block_id_partial",
+            "workflow_run_block_id",
+            postgresql_where=text("workflow_run_block_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_observer_thought_id_partial",
+            "observer_thought_id",
+            postgresql_where=text("observer_thought_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_observer_cruise_id_partial",
+            "observer_cruise_id",
+            postgresql_where=text("observer_cruise_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_run_id_partial",
+            "run_id",
+            postgresql_where=text("run_id IS NOT NULL"),
+        ),
     )
 
     artifact_id = Column(String, primary_key=True, default=generate_artifact_id)
