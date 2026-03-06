@@ -254,6 +254,12 @@ class BrowserContextFactory:
         if settings.BROWSER_LOCALE:
             args["locale"] = settings.BROWSER_LOCALE
 
+        # Custom proxy URL handling: when a user provides a raw proxy URL string,
+        # it takes precedence over the ENABLE_PROXY / hosted proxy pool settings.
+        # This is intentional — custom proxy users explicitly opt out of the hosted pool.
+        # Note: we don't reuse _get_proxy_server_creds() here because Playwright's proxy API
+        # requires "server" to be scheme://host:port only (no credentials), while
+        # _get_proxy_server_creds returns the full URL as "server".
         custom_proxy_config = None
         if proxy_location and isinstance(proxy_location, str):
             if _is_valid_proxy_url(proxy_location):
