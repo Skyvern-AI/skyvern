@@ -84,8 +84,7 @@ class DummyContext:
             return {}
         return self.blocks_metadata.get(label, {})
 
-    def mask_secrets_in_data(self, data: object) -> object:
-        """Mock method - returns data as-is since no secrets in tests."""
+    def mask_secrets_in_data(self, data: object, mask: str = "*****") -> object:
         return data
 
     async def register_output_parameter_value_post_execution(self, parameter: OutputParameter, value: object) -> None:  # noqa: ARG002

@@ -1,8 +1,12 @@
 import { useCallback, useRef } from "react";
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { WorkflowParameter } from "@/routes/workflows/types/workflowTypes";
+import {
+  WorkflowParameter,
+  WorkflowParameterValueType,
+} from "@/routes/workflows/types/workflowTypes";
 import { Skeleton } from "@/components/ui/skeleton";
+import { CredentialSelector } from "../../../components/CredentialSelector";
 
 interface PayloadParameterFieldsProps {
   parameters: Array<WorkflowParameter>;
@@ -89,17 +93,30 @@ function PayloadParameterFields({
           {param.description && (
             <p className="text-[10px] text-slate-500">{param.description}</p>
           )}
-          <WorkflowBlockInputTextarea
-            nodeId={nodeId}
-            onChange={(val) => handleFieldChange(param.key, val)}
-            value={payloadValues[param.key] ?? ""}
-            placeholder={
-              param.default_value != null
-                ? `Default: ${String(param.default_value)}`
-                : `Enter ${param.key}...`
-            }
-            className="nopan text-xs"
-          />
+          {param.workflow_parameter_type ===
+          WorkflowParameterValueType.CredentialId ? (
+            <CredentialSelector
+              value={payloadValues[param.key] ?? ""}
+              onChange={(val) => handleFieldChange(param.key, val)}
+              placeholder={
+                param.default_value != null
+                  ? `Default: ${String(param.default_value)}`
+                  : "Select a credential"
+              }
+            />
+          ) : (
+            <WorkflowBlockInputTextarea
+              nodeId={nodeId}
+              onChange={(val) => handleFieldChange(param.key, val)}
+              value={payloadValues[param.key] ?? ""}
+              placeholder={
+                param.default_value != null
+                  ? `Default: ${String(param.default_value)}`
+                  : `Enter ${param.key}...`
+              }
+              className="nopan text-xs"
+            />
+          )}
         </div>
       ))}
     </div>
