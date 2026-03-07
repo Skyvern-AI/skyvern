@@ -151,6 +151,18 @@ if settings.ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_4",
+        LLMConfig(
+            "gpt-5.4",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",
         LLMConfig(
             "gpt-4-turbo",
@@ -799,6 +811,31 @@ if settings.ENABLE_AZURE_GPT5_2:
                 api_key=settings.AZURE_GPT5_2_API_KEY,
                 api_version=settings.AZURE_GPT5_2_API_VERSION,
                 model_info={"model_name": "azure/gpt-5.2"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_4:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_4",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_4_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_4_DEPLOYMENT",
+                "AZURE_GPT5_4_API_KEY",
+                "AZURE_GPT5_4_API_BASE",
+                "AZURE_GPT5_4_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_4_API_BASE,
+                api_key=settings.AZURE_GPT5_4_API_KEY,
+                api_version=settings.AZURE_GPT5_4_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.4"},
             ),
             supports_vision=True,
             add_assistant_prefix=False,

@@ -315,6 +315,13 @@ class Settings(BaseSettings):
     AZURE_GPT5_2_API_BASE: str | None = None
     AZURE_GPT5_2_API_VERSION: str = "2025-04-01-preview"
 
+    # AZURE gpt-5.4
+    ENABLE_AZURE_GPT5_4: bool = False
+    AZURE_GPT5_4_DEPLOYMENT: str = "gpt-5.4"
+    AZURE_GPT5_4_API_KEY: str | None = None
+    AZURE_GPT5_4_API_BASE: str | None = None
+    AZURE_GPT5_4_API_VERSION: str = "2025-04-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
@@ -489,6 +496,7 @@ class Settings(BaseSettings):
                 "GPT 5 Mini",
             ),
             ("azure/gpt-5.2", self.ENABLE_AZURE_GPT5_2, "AZURE_OPENAI_GPT5_2", "OPENAI_GPT5_2", "GPT 5.2"),
+            ("azure/gpt-5.4", self.ENABLE_AZURE_GPT5_4, "AZURE_OPENAI_GPT5_4", "OPENAI_GPT5_4", "GPT 5.4"),
             ("azure/o3", self.ENABLE_AZURE_O3, "AZURE_OPENAI_O3", "OPENAI_O3", "GPT O3"),
         ]
         for model_name, azure_enabled, azure_key, openai_key, label in gpt_models:
