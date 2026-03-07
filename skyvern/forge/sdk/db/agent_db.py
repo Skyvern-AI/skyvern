@@ -630,6 +630,34 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_recent_actions_for_tasks(
+        self,
+        task_ids: list[str],
+        organization_id: str | None = None,
+        per_task_limit: int = 15,
+    ) -> list[ActionModel]:
+        """Return the most recent N actions per task as raw models (no hydration)."""
+        try:
+            async with self.Session() as session:
+                results: list[ActionModel] = []
+                for tid in task_ids:
+                    query = (
+                        select(ActionModel)
+                        .filter(ActionModel.organization_id == organization_id)
+                        .filter(ActionModel.task_id == tid)
+                        .order_by(ActionModel.created_at.desc())
+                        .limit(per_task_limit)
+                    )
+                    rows = (await session.scalars(query)).all()
+                    results.extend(rows)
+                return results
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_action_count_for_step(self, step_id: str, task_id: str, organization_id: str) -> int:
         """Get count of actions for a step. Uses composite index for efficiency."""
         try:
@@ -5101,6 +5129,7 @@ class AgentDB(BaseAlchemyDB):
         timeout_minutes: int | None = None,
         organization_id: str | None = None,
         completed_at: datetime | None = None,
+        started_at: datetime | None = None,
     ) -> PersistentBrowserSession:
         try:
             async with self.Session() as session:
@@ -5117,10 +5146,12 @@ class AgentDB(BaseAlchemyDB):
 
                 if status:
                     persistent_browser_session.status = status
-                if timeout_minutes:
+                if timeout_minutes is not None:
                     persistent_browser_session.timeout_minutes = timeout_minutes
-                if completed_at:
+                if completed_at is not None:
                     persistent_browser_session.completed_at = completed_at
+                if started_at is not None:
+                    persistent_browser_session.started_at = started_at
 
                 await session.commit()
                 await session.refresh(persistent_browser_session)
