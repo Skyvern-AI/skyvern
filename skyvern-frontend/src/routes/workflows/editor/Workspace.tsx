@@ -305,6 +305,17 @@ function Workspace({
         : constructCacheKeyValue({ codeKey: cacheKey, workflow }),
   );
 
+  // Track whether the cache-key-value was explicitly provided in URL or user-selected.
+  // When false, the auto-computed value should NOT appear in the URL.
+  const cacheKeyValueIsExplicitRef = useRef(!!cacheKeyValueParam);
+
+  // Helper that marks the cache key value as explicitly user-selected before updating state.
+  // Centralizes the ref+state pair so future handlers can't forget to set the ref.
+  const setExplicitCacheKeyValue = useCallback((v: string) => {
+    cacheKeyValueIsExplicitRef.current = true;
+    setCacheKeyValue(v);
+  }, []);
+
   const [showAllCode, setShowAllCode] = useState(false);
   const [leftSideLayoutMode, setLeftSideLayoutMode] = useState<
     "single" | "side-by-side"
@@ -372,6 +383,22 @@ function Workspace({
 
   useEffect(() => {
     const currentUrlValue = searchParams.get("cache-key-value");
+
+    if (!cacheKeyValueIsExplicitRef.current) {
+      // Auto-computed value: remove param from URL if present
+      if (currentUrlValue !== null) {
+        setSearchParams(
+          (prev) => {
+            const newParams = new URLSearchParams(prev);
+            newParams.delete("cache-key-value");
+            return newParams;
+          },
+          { replace: true },
+        );
+      }
+      return;
+    }
+
     const targetValue = cacheKeyValue === "" ? null : cacheKeyValue;
 
     if (currentUrlValue !== targetValue) {
@@ -1191,12 +1218,12 @@ function Workspace({
           }
           showAllCode={showAllCode}
           onCacheKeyValueAccept={(v) => {
-            setCacheKeyValue(v ?? "");
+            setExplicitCacheKeyValue(v ?? "");
             setCacheKeyValueFilter("");
             closeWorkflowPanel();
           }}
           onCacheKeyValuesBlurred={(v) => {
-            setCacheKeyValue(v ?? "");
+            setExplicitCacheKeyValue(v ?? "");
           }}
           onCacheKeyValuesKeydown={(e) => {
             if (e.key === "Enter") {
@@ -1289,7 +1316,7 @@ function Workspace({
                     setPage(page);
                   }}
                   onSelect={(cacheKeyValue) => {
-                    setCacheKeyValue(cacheKeyValue);
+                    setExplicitCacheKeyValue(cacheKeyValue);
                     setCacheKeyValueFilter("");
                     closeWorkflowPanel();
                   }}
@@ -1364,7 +1391,7 @@ function Workspace({
                         setPage(page);
                       }}
                       onSelect={(cacheKeyValue) => {
-                        setCacheKeyValue(cacheKeyValue);
+                        setExplicitCacheKeyValue(cacheKeyValue);
                         setCacheKeyValueFilter("");
                         closeWorkflowPanel();
                       }}
@@ -1420,7 +1447,7 @@ function Workspace({
                   setPage(page);
                 }}
                 onSelect={(cacheKeyValue) => {
-                  setCacheKeyValue(cacheKeyValue);
+                  setExplicitCacheKeyValue(cacheKeyValue);
                   setCacheKeyValueFilter("");
                   closeWorkflowPanel();
                 }}
