@@ -67,6 +67,7 @@
             "pages": [
               "debugging/using-artifacts",
               "debugging/troubleshooting-guide",
+              "debugging/observability-with-laminar",
               "debugging/faq"
             ]
           },
@@ -197,7 +198,7 @@
       {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
-      },
+      }
     ]
   },
   "navbar": {

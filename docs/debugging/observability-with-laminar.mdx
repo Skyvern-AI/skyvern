@@ -1,0 +1,121 @@
+---
+title: Observability with Laminar
+subtitle: Trace LLM calls, browser sessions, and workflow execution with Laminar
+slug: debugging/observability-with-laminar
+---
+
+[Laminar](https://www.lmnr.ai/) is an observability and evaluations platform for AI applications. It automatically instruments Skyvern, giving you full traces of every LLM call, browser interaction, and workflow step — along with synchronized session recordings. 
+
+This makes it straightforward to debug failed runs, track performance, and evaluate automation quality.
+
+<Tip>
+Laminar traces complement [artifacts](/debugging/using-artifacts). Use artifacts for per-run debugging and Laminar for cross-run observability, performance tracking, and cost monitoring.
+</Tip>
+
+<Note>
+This guide is also available in the [Laminar documentation](https://docs.lmnr.ai/tracing/integrations/skyvern).
+</Note>
+
+---
+
+## Prerequisites
+
+Laminar integration requires the [Skyvern Python SDK](/sdk-reference/overview) and the Laminar SDK:
+
+```bash
+pip install skyvern 'lmnr[all]'
+```
+
+You will also need a Skyvern API key. 
+
+---
+
+## 1. Get a Laminar API Key
+
+Sign up at [laminar.ai](https://www.lmnr.ai/) and create a project to get your API key.
+
+Set the following environment variable:
+
+```bash .env
+LMNR_PROJECT_API_KEY=your-laminar-api-key
+```
+
+<Frame>
+    <video
+    autoPlay
+    controls
+    muted
+    playsInline
+    className="w-full aspect-video rounded-xl"
+    src="/images/laminar-keys.mp4"
+    ></video>
+</Frame>
+
+---
+
+## 2. Initialize Laminar
+
+Call `Laminar.initialize()` at the top of your project, before any Skyvern calls. 
+
+```python {6-7}
+from skyvern import Skyvern
+import asyncio
+from dotenv import load_dotenv
+load_dotenv()
+
+from lmnr import Laminar
+Laminar.initialize()
+
+skyvern = Skyvern(api_key="your-skyvern-API-key")
+
+async def main():
+    task = await skyvern.run_task(
+        prompt="go to lmnr.ai, summarize the pricing page."
+    )
+    print(task)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+<Warning>
+`LaminarLiteLLMCallback` is deprecated and unnecessary. Laminar instruments LiteLLM directly — no callback setup is needed.
+</Warning>
+
+---
+
+## What traces capture
+
+Open the **Traces** tab in your Laminar project to inspect any run. Each trace includes:
+
+| Trace data | What it shows |
+|------------|---------------|
+| Browser session recording | Full video of the browser window, synchronized with execution steps |
+| LLM interactions | Every prompt sent to the model and its response |
+| Workflow steps | Sequential execution of tasks and their outcomes |
+| Performance metrics | Latency, token usage, and cost per call |
+| Image tracing | Browser screenshots sent to the LLM for analysis |
+| Errors | Exceptions and failures that occurred during execution |
+
+**Debugging tip:** The trace timeline synchronizes browser recordings with execution steps. When a run fails, find the failed step in the timeline and watch the recording at that exact point to see what the browser showed.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Using Artifacts"
+    icon="file-lines"
+    href="/debugging/using-artifacts"
+  >
+    Per-run recordings, screenshots, logs, and network data
+  </Card>
+  <Card
+    title="Troubleshooting Guide"
+    icon="wrench"
+    href="/debugging/troubleshooting-guide"
+  >
+    Common issues and how to fix them
+  </Card>
+</CardGroup>
