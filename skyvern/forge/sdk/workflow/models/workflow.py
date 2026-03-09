@@ -94,7 +94,7 @@ class Workflow(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     run_with: str | None = None
-    ai_fallback: bool = False
+    ai_fallback: bool = True
     cache_key: str | None = None
     adaptive_caching: bool = False
     generate_script_on_terminal: bool = False

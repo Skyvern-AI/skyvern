@@ -2543,7 +2543,7 @@ class WorkflowService:
                 extra_http_headers=extra_http_headers,
                 run_with=run_with,
                 cache_key=cache_key,
-                ai_fallback=False if ai_fallback is None else ai_fallback,
+                ai_fallback=True if ai_fallback is None else ai_fallback,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
                 folder_id=folder_id,

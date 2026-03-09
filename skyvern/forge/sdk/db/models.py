@@ -302,7 +302,7 @@ class WorkflowModel(Base):
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
-    ai_fallback = Column(Boolean, default=False, nullable=False)
+    ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
     adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     generate_script_on_terminal = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())

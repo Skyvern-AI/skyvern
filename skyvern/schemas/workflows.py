@@ -1015,7 +1015,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str | None = None
-    ai_fallback: bool = False
+    ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
     generate_script_on_terminal: bool = False
