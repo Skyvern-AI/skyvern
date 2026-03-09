@@ -108,6 +108,8 @@ def test_subcommand_still_works(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     config = tmp_path / ".claude.json"
     _patch_env(monkeypatch)
     monkeypatch.setattr("skyvern.cli.setup_commands._claude_code_global_config_path", lambda: config)
+    # Prevent _install_skills from writing into the repo's .claude/skills/ during CI
+    monkeypatch.setattr("skyvern.cli.setup_commands._install_skills", lambda *a, **kw: None)
 
     result = CliRunner().invoke(setup_app, ["claude-code", "--yes"])
     assert result.exit_code == 0
