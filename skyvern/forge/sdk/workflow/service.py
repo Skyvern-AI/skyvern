@@ -989,11 +989,19 @@ class WorkflowService:
             # Check if there's a finally block configured
             finally_block_label = workflow.workflow_definition.finally_block_label
 
+            # Refresh workflow_run from DB to pick up status/failure_reason
+            # set by _execute_workflow_blocks. Preserve the original run_with
+            # because the DB may now say "agent" for a code_v2 run that fell
+            # back to agent (no cached script yet). Downstream code like
+            # generate_script_if_needed and _trigger_script_reviewer need the
+            # original intent to generate v2 scripts with the :v2 cache key.
+            original_run_with = workflow_run.run_with
             if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             ):
                 workflow_run = refreshed_workflow_run
+                workflow_run.run_with = original_run_with
 
             pre_finally_status = workflow_run.status
             pre_finally_failure_reason = workflow_run.failure_reason
@@ -1215,7 +1223,7 @@ class WorkflowService:
         await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id, run_with=run_with)
 
         # Set script_mode on context so downstream code can skip expensive LLM calls
-        if run_with == "code":
+        if run_with in ("code", "code_v2"):
             ctx = skyvern_context.current()
             if ctx:
                 ctx.script_mode = True
