@@ -990,18 +990,12 @@ class WorkflowService:
             finally_block_label = workflow.workflow_definition.finally_block_label
 
             # Refresh workflow_run from DB to pick up status/failure_reason
-            # set by _execute_workflow_blocks. Preserve the original run_with
-            # because the DB may now say "agent" for a code_v2 run that fell
-            # back to agent (no cached script yet). Downstream code like
-            # generate_script_if_needed and _trigger_script_reviewer need the
-            # original intent to generate v2 scripts with the :v2 cache key.
-            original_run_with = workflow_run.run_with
+            # set by _execute_workflow_blocks.
             if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             ):
                 workflow_run = refreshed_workflow_run
-                workflow_run.run_with = original_run_with
 
             pre_finally_status = workflow_run.status
             pre_finally_failure_reason = workflow_run.failure_reason
@@ -1213,17 +1207,15 @@ class WorkflowService:
                 script_blocks_by_label = {}
                 loaded_script_module = None
 
-        # Mark workflow as running with appropriate engine
-        # Preserve "code_v2" when that was the original request so the DB value
-        # stays accurate for API responses and downstream queries.
-        if script and is_script_run and script_blocks_by_label:
-            run_with = workflow_run.run_with if workflow_run.run_with == "code_v2" else "code"
-        else:
-            run_with = "agent"
-        await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id, run_with=run_with)
+        # Mark workflow as running, preserving the user's original run_with intent.
+        # The run_with field records what the user requested (e.g. "code_v2"),
+        # not whether a script was actually found. Execution mode is determined
+        # separately by is_script_run and script_mode below.
+        await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id, run_with=workflow_run.run_with)
 
         # Set script_mode on context so downstream code can skip expensive LLM calls
-        if run_with in ("code", "code_v2"):
+        # Only enable when we actually have a script to run
+        if script and is_script_run and script_blocks_by_label:
             ctx = skyvern_context.current()
             if ctx:
                 ctx.script_mode = True
