@@ -1807,7 +1807,7 @@ class AgentDB(BaseAlchemyDB):
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         run_with: str | None = None,
-        ai_fallback: bool = False,
+        ai_fallback: bool = True,
         cache_key: str | None = None,
         adaptive_caching: bool = False,
         generate_script_on_terminal: bool = False,
