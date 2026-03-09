@@ -60,6 +60,8 @@ async def get_script_blocks_response(
     workflow_permanent_id: str,
     script_revision_id: str,
     include_main_script: bool = False,
+    script_id: str | None = None,
+    version: int | None = None,
 ) -> ScriptBlocksResponse:
     script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
         script_revision_id=script_revision_id,
@@ -79,7 +81,7 @@ async def get_script_blocks_response(
                 organization_id=organization_id,
                 script_revision_id=script_revision_id,
             )
-        return ScriptBlocksResponse(blocks={}, main_script=main_script)
+        return ScriptBlocksResponse(blocks={}, main_script=main_script, script_id=script_id, version=version)
 
     result: dict[str, str] = {}
 
@@ -180,7 +182,7 @@ async def get_script_blocks_response(
             script_revision_id=script_revision_id,
         )
 
-    return ScriptBlocksResponse(blocks=result, main_script=main_script)
+    return ScriptBlocksResponse(blocks=result, main_script=main_script, script_id=script_id, version=version)
 
 
 @base_router.post(
@@ -312,6 +314,8 @@ async def get_script_version_code(
         organization_id=current_org.organization_id,
         workflow_permanent_id=script_id,
         include_main_script=True,
+        script_id=script.script_id,
+        version=script.version,
     )
 
 
@@ -548,6 +552,8 @@ async def get_workflow_script_blocks(
                     organization_id=current_org.organization_id,
                     workflow_permanent_id=workflow_permanent_id,
                     include_main_script=include_main_script,
+                    script_id=published_script.script_id,
+                    version=published_script.version,
                 )
 
     cache_key = block_script_request.cache_key or workflow.cache_key or ""
@@ -577,6 +583,8 @@ async def get_workflow_script_blocks(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         include_main_script=include_main_script,
+        script_id=script.script_id,
+        version=script.version,
     )
 
 
