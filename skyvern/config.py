@@ -121,6 +121,11 @@ class Settings(BaseSettings):
 
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
+    ANALYTICS_TEST_ID: str | None = None
+    POSTHOG_PROJECT_API_KEY: str = "phc_bVT2ugnZhMHRWqMvSRHPdeTjaPxQqT3QSsI3r5FlQR5"
+    POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
+    MCP_POSTHOG_PROJECT_API_KEY: str | None = "phc_m4epBbGS1Hf4NPRFNpR4WQ9Ob6yGy6SLbQckBxp3n0P"
+    MCP_POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
 
     # email settings
     SMTP_HOST: str = "localhost"
