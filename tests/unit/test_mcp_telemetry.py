@@ -141,14 +141,8 @@ async def test_list_tools_emits_protocol_request_telemetry() -> None:
             tools = await client.list_tools()
 
     assert tools
-    assert any(
-        event == "mcp_request" and payload and payload["operation"] == "initialize"
-        for event, payload, _, _, _ in events
-    )
-    assert any(
-        event == "mcp_request" and payload and payload["operation"] == "tools/list"
-        for event, payload, _, _, _ in events
-    )
+    assert any(event == "mcp_request" and payload and payload["operation"] == "initialize" for event, payload, _, _, _ in events)
+    assert any(event == "mcp_request" and payload and payload["operation"] == "tools/list" for event, payload, _, _, _ in events)
 
 
 @pytest.mark.asyncio
