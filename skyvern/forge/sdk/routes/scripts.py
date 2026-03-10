@@ -397,11 +397,10 @@ async def deploy_script(
         script_id=script_id,
         file_count=len(data.files) if data.files else 0,
     )
-    raise HTTPException(status_code=400, detail="Not implemented")
 
     try:
         # Get the latest version of the script
-        latest_script = await app.DATABASE.get_script(
+        latest_script = await app.DATABASE.get_latest_script_version(
             script_id=script_id,
             organization_id=current_org.organization_id,
         )
@@ -411,55 +410,104 @@ async def deploy_script(
 
         # Create a new version of the script
         new_version = latest_script.version + 1
-        new_script_revision = await app.DATABASE.create_script(
+        new_script = await app.DATABASE.create_script(
             organization_id=current_org.organization_id,
             run_id=latest_script.run_id,
-            script_id=script_id,  # Use the same script_id for versioning
+            script_id=script_id,
             version=new_version,
         )
 
-        # Process files if provided
-        file_tree = {}
-        file_count = 0
-        if data.files:
-            file_tree = await script_service.build_file_tree(
-                data.files,
-                organization_id=current_org.organization_id,
-                script_id=new_script_revision.script_id,
-                script_version=new_script_revision.version,
-                script_revision_id=new_script_revision.script_revision_id,
-            )
-            file_count = len(data.files)
+        # Fetch source files from the base revision to build the old->new ID mapping
+        source_files = await app.DATABASE.get_script_files(
+            script_revision_id=latest_script.script_revision_id,
+            organization_id=current_org.organization_id,
+        )
+        source_file_by_path = {f.file_path: f for f in source_files}
 
-            # Create script file records
+        # Track old file_id -> new file_id so blocks can be re-pointed
+        old_to_new_file_id: dict[str, str] = {}
+
+        # Process uploaded files — upload to artifact storage and create DB records
+        file_count = 0
+        deployed_file_paths: set[str] = set()
+        if data.files:
+            file_count = len(data.files)
             for file in data.files:
                 content_bytes = base64.b64decode(file.content)
                 content_hash = hashlib.sha256(content_bytes).hexdigest()
-                file_size = len(content_bytes)
-
-                # Extract file name from path
                 file_name = file.path.split("/")[-1]
+                deployed_file_paths.add(file.path)
 
-                await app.DATABASE.create_script_file(
-                    script_revision_id=new_script_revision.script_revision_id,
-                    script_id=new_script_revision.script_id,
-                    organization_id=new_script_revision.organization_id,
+                artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                    organization_id=current_org.organization_id,
+                    script_id=new_script.script_id,
+                    script_version=new_script.version,
+                    file_path=file.path,
+                    data=content_bytes,
+                )
+                new_file = await app.DATABASE.create_script_file(
+                    script_revision_id=new_script.script_revision_id,
+                    script_id=new_script.script_id,
+                    organization_id=current_org.organization_id,
                     file_path=file.path,
                     file_name=file_name,
                     file_type="file",
                     content_hash=f"sha256:{content_hash}",
-                    file_size=file_size,
-                    mime_type=file.mime_type,
-                    encoding=file.encoding,
+                    file_size=len(content_bytes),
+                    mime_type=file.mime_type or "text/x-python",
+                    artifact_id=artifact_id,
                 )
+                # Map old file ID to new so blocks referencing replaced files get updated
+                old_source = source_file_by_path.get(file.path)
+                if old_source:
+                    old_to_new_file_id[old_source.file_id] = new_file.file_id
+
+        # Copy files from the base revision that weren't replaced by the deploy
+        for f in source_files:
+            if f.file_path in deployed_file_paths:
+                continue
+            new_file = await app.DATABASE.create_script_file(
+                script_revision_id=new_script.script_revision_id,
+                script_id=new_script.script_id,
+                organization_id=current_org.organization_id,
+                file_path=f.file_path,
+                file_name=f.file_name,
+                file_type=f.file_type,
+                content_hash=f.content_hash,
+                file_size=f.file_size,
+                mime_type=f.mime_type,
+                encoding=f.encoding,
+                artifact_id=f.artifact_id,
+            )
+            old_to_new_file_id[f.file_id] = new_file.file_id
+
+        # Copy existing script blocks, re-pointing file IDs to the new revision's files
+        existing_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+            script_revision_id=latest_script.script_revision_id,
+            organization_id=current_org.organization_id,
+        )
+        for sb in existing_blocks:
+            new_file_id = old_to_new_file_id.get(sb.script_file_id, sb.script_file_id) if sb.script_file_id else None
+            await app.DATABASE.create_script_block(
+                organization_id=current_org.organization_id,
+                script_id=new_script.script_id,
+                script_revision_id=new_script.script_revision_id,
+                script_block_label=sb.script_block_label,
+                script_file_id=new_file_id,
+                run_signature=sb.run_signature,
+                workflow_run_id=sb.workflow_run_id,
+                workflow_run_block_id=sb.workflow_run_block_id,
+                input_fields=sb.input_fields,
+                requires_agent=sb.requires_agent,
+            )
 
         return CreateScriptResponse(
-            script_id=new_script_revision.script_id,
-            version=new_script_revision.version,
-            run_id=new_script_revision.run_id,
+            script_id=new_script.script_id,
+            version=new_script.version,
+            run_id=new_script.run_id,
             file_count=file_count,
-            created_at=new_script_revision.created_at,
-            file_tree=file_tree,
+            created_at=new_script.created_at,
+            file_tree={},
         )
 
     except HTTPException:
