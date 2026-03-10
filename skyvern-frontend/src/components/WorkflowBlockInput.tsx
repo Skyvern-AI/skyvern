@@ -8,10 +8,12 @@ import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/Wo
 type Props = Omit<React.ComponentProps<typeof Input>, "onChange"> & {
   onChange: (value: string) => void;
   nodeId: string;
+  hideParameterSelect?: boolean;
 };
 
 function WorkflowBlockInput(props: Props) {
-  const { nodeId, onChange, type, value, ...inputProps } = props;
+  const { nodeId, onChange, type, value, hideParameterSelect, ...inputProps } =
+    props;
   const [showPassword, setShowPassword] = useState(false);
 
   // Buffer input value locally so keystrokes update the DOM immediately
@@ -37,49 +39,56 @@ function WorkflowBlockInput(props: Props) {
         {...inputProps}
         value={localValue}
         type={actualType}
-        className={cn(isPasswordField ? "pr-18" : "pr-9", props.className)}
+        className={cn(
+          isPasswordField ? "pr-18" : hideParameterSelect ? "" : "pr-9",
+          props.className,
+        )}
         onChange={(event) => {
           isLocalChangeRef.current = true;
           setLocalValue(event.target.value);
           onChange(event.target.value);
         }}
       />
-      <div className="absolute right-0 top-0 flex cursor-pointer items-center justify-center">
-        {isPasswordField && (
-          <div className="flex size-9 items-center justify-center">
-            <div
-              className="rounded p-1 hover:bg-muted"
-              onClick={() => setShowPassword(!showPassword)}
-            >
-              {showPassword ? (
-                <EyeClosedIcon className="size-4" />
-              ) : (
-                <EyeOpenIcon className="size-4" />
-              )}
-            </div>
-          </div>
-        )}
-        <div className="flex size-9 items-center justify-center">
-          <Popover>
-            <PopoverTrigger asChild>
-              <div className="rounded p-1 hover:bg-muted">
-                <PlusIcon className="size-4" />
+      {(isPasswordField || !hideParameterSelect) && (
+        <div className="absolute right-0 top-0 flex cursor-pointer items-center justify-center">
+          {isPasswordField && (
+            <div className="flex size-9 items-center justify-center">
+              <div
+                className="rounded p-1 hover:bg-muted"
+                onClick={() => setShowPassword(!showPassword)}
+              >
+                {showPassword ? (
+                  <EyeClosedIcon className="size-4" />
+                ) : (
+                  <EyeOpenIcon className="size-4" />
+                )}
               </div>
-            </PopoverTrigger>
-            <PopoverContent className="w-[19rem]">
-              <WorkflowBlockParameterSelect
-                nodeId={nodeId}
-                onAdd={(parameterKey) => {
-                  const newValue = `${localValue}{{${parameterKey}}}`;
-                  isLocalChangeRef.current = true;
-                  setLocalValue(newValue);
-                  onChange(newValue);
-                }}
-              />
-            </PopoverContent>
-          </Popover>
+            </div>
+          )}
+          {!hideParameterSelect && (
+            <div className="flex size-9 items-center justify-center">
+              <Popover>
+                <PopoverTrigger asChild>
+                  <div className="rounded p-1 hover:bg-muted">
+                    <PlusIcon className="size-4" />
+                  </div>
+                </PopoverTrigger>
+                <PopoverContent className="w-[19rem]">
+                  <WorkflowBlockParameterSelect
+                    nodeId={nodeId}
+                    onAdd={(parameterKey) => {
+                      const newValue = `${localValue}{{${parameterKey}}}`;
+                      isLocalChangeRef.current = true;
+                      setLocalValue(newValue);
+                      onChange(newValue);
+                    }}
+                  />
+                </PopoverContent>
+              </Popover>
+            </div>
+          )}
         </div>
-      </div>
+      )}
     </div>
   );
 }
