@@ -222,7 +222,7 @@ class MessageChannel:
         except Exception:
             pass
 
-        del_message_channel(self.client_id, expected=self)
+        del_message_channel(self.client_id)
 
         return self
 
