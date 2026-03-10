@@ -35,6 +35,9 @@ setup_app = typer.Typer(
 )
 
 _DEFAULT_REMOTE_URL = "https://api.skyvern.com/mcp/"
+_DEFAULT_CLAUDE_DESKTOP_BUNDLE_URL = (
+    "https://github.com/Skyvern-AI/skyvern/raw/main/skyvern/cli/mcpb/releases/skyvern-claude-desktop.mcpb"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +76,24 @@ def _build_mcp_remote_bridge_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL)
         "command": "npx",
         "args": args,
     }
+
+
+def _has_node_runtime() -> bool:
+    return shutil.which("node") is not None and shutil.which("npx") is not None
+
+
+def _supports_claude_desktop_bundle() -> bool:
+    return platform.system() in {"Darwin", "Windows"}
+
+
+def _claude_desktop_bundle_message() -> str:
+    if not _supports_claude_desktop_bundle():
+        return "Claude Desktop remote setup on this platform still requires Node.js because the one-click `.mcpb` installer is only available in Claude Desktop for macOS and Windows."
+    return (
+        "Claude Desktop remote setup via JSON still uses `mcp-remote`, which requires Node.js.\n"
+        f"Download the latest one-click Skyvern bundle (`skyvern-claude-desktop.mcpb`) from: {_DEFAULT_CLAUDE_DESKTOP_BUNDLE_URL}\n"
+        "Then double-click the downloaded `.mcpb`, click Install in Claude Desktop, paste your API key, and click Save."
+    )
 
 
 def _build_local_mcp_entry(
@@ -407,6 +428,10 @@ def _run_setup(
     *,
     use_mcp_remote_bridge: bool = False,
 ) -> None:
+    if tool_name == "Claude Desktop" and not local and use_mcp_remote_bridge and not _has_node_runtime():
+        console.print(f"[yellow]{_claude_desktop_bundle_message()}[/yellow]")
+        raise typer.Exit(code=1)
+
     resolved_key = _acquire_api_key(api_key, yes)
     _, env_url = _get_env_credentials()
     entry = _build_entry(
@@ -555,11 +580,16 @@ def setup_guided(
 
     configured: list[str] = []
     failed: list[str] = []
+    bundle_recommended: list[str] = []
 
     for tool in detected:
         try:
             config_path = tool.config_path_fn()
             use_bridge = tool.use_mcp_remote_bridge and not local
+            if tool.name == "Claude Desktop" and use_bridge and not _has_node_runtime():
+                bundle_recommended.append(tool.name)
+                console.print(f"[yellow]Skipping Claude Desktop JSON setup.[/yellow] {_claude_desktop_bundle_message()}")
+                continue
             entry = _build_entry(
                 resolved_key,
                 env_url,
@@ -589,18 +619,29 @@ def setup_guided(
                 border_style="green",
             )
         )
+        if bundle_recommended:
+            console.print(f"[yellow]Claude Desktop:[/yellow] {_claude_desktop_bundle_message()}")
         capture_setup_event(
             "quickstart-complete",
             success=True,
-            extra_data={"configured": configured, "failed": failed},
+            extra_data={"configured": configured, "failed": failed, "bundle_recommended": bundle_recommended},
         )
     else:
-        console.print("[red]No tools were configured.[/red]")
+        if bundle_recommended and not failed:
+            console.print(
+                Panel(
+                    "[bold yellow]Claude Desktop detected[/bold yellow]\n\n"
+                    f"{_claude_desktop_bundle_message()}",
+                    border_style="yellow",
+                )
+            )
+        else:
+            console.print("[red]No tools were configured.[/red]")
         capture_setup_event(
             "quickstart-complete",
-            success=False,
-            error_type="all_tools_failed",
-            extra_data={"failed": failed},
+            success=not failed and bool(bundle_recommended),
+            error_type="all_tools_failed" if failed else None,
+            extra_data={"failed": failed, "bundle_recommended": bundle_recommended},
         )
 
 
@@ -618,7 +659,7 @@ def setup_claude(
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
 ) -> None:
-    """Register Skyvern MCP with Claude Desktop (uses mcp-remote bridge for remote mode)."""
+    """Register Skyvern MCP with Claude Desktop (remote mode requires Node.js; bundle is recommended otherwise)."""
     _run_setup(
         "Claude Desktop",
         _claude_desktop_config_path(),
@@ -630,6 +671,19 @@ def setup_claude(
         url,
         use_mcp_remote_bridge=not local,
     )
+
+
+@setup_app.command("claude-desktop", hidden=True)
+def setup_claude_desktop_alias(
+    api_key: str | None = _api_key_opt,
+    dry_run: bool = _dry_run_opt,
+    yes: bool = _yes_opt,
+    local: bool = _local_opt,
+    use_python_path: bool = _python_path_opt,
+    url: str | None = _url_opt,
+) -> None:
+    """Backward-compatible alias for `skyvern setup claude`."""
+    setup_claude(api_key, dry_run, yes, local, use_python_path, url)
 
 
 @setup_app.command("claude-code")
