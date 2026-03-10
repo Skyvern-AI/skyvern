@@ -56,6 +56,18 @@ class Settings(BaseSettings):
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 10
     MAX_NUM_SCREENSHOTS: int = 10
+    # Vision mode: "always" (default), "auto" (only when needed), "never" (no screenshots)
+    # "auto" can reduce LLM costs by 50-70% on text-heavy pages
+    VISION_MODE: str = "always"
+    # Token threshold for auto vision mode: screenshots are included when DOM tokens exceed this
+    VISION_AUTO_TOKEN_THRESHOLD: int = 5000
+    # Paint-order filtering uses CDP DOMSnapshot to detect elements hidden behind
+    # modals, overlays, and z-index stacking that JS-based detection misses
+    ENABLE_PAINT_ORDER_FILTERING: bool = False
+    # JS event listener detection uses CDP to find non-semantic elements with click handlers
+    ENABLE_JS_LISTENER_DETECTION: bool = False
+    # Accessibility tree augmentation adds semantic role/name data from the browser's a11y tree
+    ENABLE_ACCESSIBILITY_TREE: bool = False
     # Ratio should be between 0 and 1.
     # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95

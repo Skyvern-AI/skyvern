@@ -1676,8 +1676,139 @@ async function buildElementObject(
     elementObj.attributes["selected"] = selectedValue;
   }
 
+  // Compound control normalization: normalize complex native controls into
+  // simple representations that reduce LLM confusion.
+  // Inspired by Browser-use's compound control enhancement.
+  normalizeCompoundControl(element, elementObj);
+  annotateDetailsElement(element, elementObj);
+  annotateMediaElement(element, elementObj);
+
   return elementObj;
 }
+
+/**
+ * Normalize complex native HTML controls into simple metadata.
+ * Native date pickers, range sliders, color pickers, file inputs, and media
+ * players have complex internal DOM structures that confuse LLMs.
+ * This function adds descriptive metadata so the LLM understands the control.
+ */
+function normalizeCompoundControl(element, elementObj) {
+  const tagName = elementObj.tagName;
+  const type = (element.type || "").toLowerCase();
+  const attrs = elementObj.attributes;
+
+  if (tagName !== "input") return;
+
+  switch (type) {
+    case "date":
+    case "datetime-local":
+    case "month":
+    case "week":
+    case "time": {
+      const format = {
+        date: "YYYY-MM-DD",
+        "datetime-local": "YYYY-MM-DDTHH:MM",
+        month: "YYYY-MM",
+        week: "YYYY-Www",
+        time: "HH:MM",
+      }[type];
+      attrs["data-ui"] = `${type}-picker (format=${format}`;
+      if (element.min) attrs["data-ui"] += `, min=${element.min}`;
+      if (element.max) attrs["data-ui"] += `, max=${element.max}`;
+      if (element.step && element.step !== "1")
+        attrs["data-ui"] += `, step=${element.step}`;
+      attrs["data-ui"] += ")";
+      break;
+    }
+
+    case "range": {
+      const min = element.min || "0";
+      const max = element.max || "100";
+      const step = element.step || "1";
+      const current = element.value || min;
+      attrs["data-ui"] =
+        `range-slider (min=${min}, max=${max}, current=${current}, step=${step})`;
+      break;
+    }
+
+    case "color": {
+      const current = element.value || "#000000";
+      attrs["data-ui"] = `color-picker (current=${current})`;
+      break;
+    }
+
+    case "file": {
+      const accept = element.accept || "*";
+      const multiple = element.multiple ? ", multiple" : "";
+      attrs["data-ui"] = `file-input (accept=${accept}${multiple})`;
+      break;
+    }
+
+    case "number": {
+      let desc = "number-input";
+      const parts = [];
+      if (element.min !== "") parts.push(`min=${element.min}`);
+      if (element.max !== "") parts.push(`max=${element.max}`);
+      if (element.step && element.step !== "1")
+        parts.push(`step=${element.step}`);
+      if (parts.length > 0) {
+        attrs["data-ui"] = `${desc} (${parts.join(", ")})`;
+      }
+      break;
+    }
+  }
+}
+
+/**
+ * Detect if an element is a <details>/<summary> disclosure widget and
+ * annotate its state.
+ */
+function annotateDetailsElement(element, elementObj) {
+  if (elementObj.tagName === "details") {
+    elementObj.attributes["data-ui"] = element.open
+      ? "disclosure (open)"
+      : "disclosure (closed)";
+  }
+}
+
+/**
+ * Detect audio/video media elements and annotate their state.
+ */
+function annotateMediaElement(element, elementObj) {
+  if (elementObj.tagName === "audio" || elementObj.tagName === "video") {
+    const duration = element.duration
+      ? Math.round(element.duration) + "s"
+      : "unknown";
+    const current = Math.round(element.currentTime || 0) + "s";
+    const playing = !element.paused ? "playing" : "paused";
+    elementObj.attributes["data-ui"] =
+      `${elementObj.tagName} (duration=${duration}, current=${current}, ${playing})`;
+  }
+}
+
+// Measure DOM depth and node count for fallback decisions
+function measureDOMComplexity(root) {
+  let maxDepth = 0;
+  let nodeCount = 0;
+  const queue = [{ node: root, depth: 0 }];
+  while (queue.length > 0) {
+    const { node, depth } = queue.shift();
+    nodeCount++;
+    if (depth > maxDepth) maxDepth = depth;
+    const children = node.children || [];
+    for (let i = 0; i < children.length; i++) {
+      queue.push({ node: children[i], depth: depth + 1 });
+    }
+    // Early exit if we know it's complex enough to need fallback
+    if (nodeCount > 20000) break;
+  }
+  return { maxDepth, nodeCount };
+}
+
+// Progressive depth attempts for pathologically complex DOMs (inspired by Stagehand CBOR approach).
+// When full-depth traversal fails or produces too many elements, we progressively reduce
+// the max depth to prevent crashes on enterprise SaaS pages (Salesforce, SAP, etc.).
+const DOM_DEPTH_ATTEMPTS = [-1, 256, 128, 64, 32, 16, 8, 4, 2, 1];
 
 // build the element tree for the body
 async function buildTreeFromBody(
@@ -1692,6 +1823,50 @@ async function buildTreeFromBody(
     window.GlobalSkyvernFrameIndex = frame_index;
   }
   const maxElementNumber = 15000;
+
+  // Check DOM complexity to decide if depth limiting is needed
+  const complexity = measureDOMComplexity(document.documentElement);
+  let maxDepth = -1; // -1 means unlimited
+
+  if (complexity.nodeCount > 10000 || complexity.maxDepth > 100) {
+    _jsConsoleWarn(
+      "Complex DOM detected, using progressive depth fallback",
+      "nodeCount:", complexity.nodeCount,
+      "maxDepth:", complexity.maxDepth,
+    );
+
+    // Try progressively shallower depths until we get a manageable result
+    for (const depthAttempt of DOM_DEPTH_ATTEMPTS) {
+      try {
+        const elementsAndResultArray = await buildElementTree(
+          document.documentElement,
+          frame,
+          false,
+          undefined,
+          maxElementNumber,
+          must_included_tags,
+          depthAttempt,
+        );
+
+        const elementCount = elementsAndResultArray[0].length;
+        if (elementCount <= maxElementNumber) {
+          _jsConsoleLog(
+            "Depth fallback succeeded at depth:", depthAttempt,
+            "elements:", elementCount,
+          );
+          DomUtils.elementListCache = elementsAndResultArray[0];
+          return elementsAndResultArray;
+        }
+        _jsConsoleWarn(
+          "Depth", depthAttempt, "produced", elementCount, "elements, trying shallower",
+        );
+      } catch (e) {
+        _jsConsoleWarn("Depth", depthAttempt, "failed:", e.message, "trying shallower");
+      }
+    }
+  }
+
+  // Standard path: no depth limiting needed
   const elementsAndResultArray = await buildElementTree(
     document.documentElement,
     frame,
@@ -1699,6 +1874,7 @@ async function buildTreeFromBody(
     undefined,
     maxElementNumber,
     must_included_tags,
+    maxDepth,
   );
   DomUtils.elementListCache = elementsAndResultArray[0];
   return elementsAndResultArray;
@@ -1711,6 +1887,7 @@ async function buildElementTree(
   hoverStylesMap = undefined,
   maxElementNumber = 0,
   must_included_tags = [],
+  maxDepth = -1, // -1 means unlimited depth
 ) {
   // Generate hover styles map at the start
   if (hoverStylesMap === undefined) {
@@ -1735,6 +1912,7 @@ async function buildElementTree(
     parentId,
     parent_xpath,
     current_node_index,
+    currentDepth = 0,
   ) {
     if (element === null) {
       _jsConsoleLog("get a null element");
@@ -1745,6 +1923,11 @@ async function buildElementTree(
       _jsConsoleWarn(
         "Max element number reached, aborting the element tree building",
       );
+      return;
+    }
+
+    // Depth limiting: skip children beyond maxDepth (for complex DOMs)
+    if (maxDepth > 0 && currentDepth > maxDepth) {
       return;
     }
 
@@ -1893,13 +2076,14 @@ async function buildElementTree(
         parentId,
         current_xpath,
         current_node_index,
+        currentDepth + 1,
       );
     }
 
     // FIXME: xpath won't work when the element is in shadow DOM
     for (let i = 0; i < shadowDOMchildren.length; i++) {
       const childElement = shadowDOMchildren[i];
-      await processElement(childElement, parentId, null, 0);
+      await processElement(childElement, parentId, null, 0, currentDepth + 1);
     }
     return;
   }

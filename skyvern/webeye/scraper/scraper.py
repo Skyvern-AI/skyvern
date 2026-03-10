@@ -8,7 +8,7 @@ from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.config import settings
-from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR, VisionMode
 from skyvern.exceptions import (
     FailedToTakeScreenshot,
     NoElementFound,
@@ -32,6 +32,11 @@ from skyvern.webeye.scraper.scraped_page import (
     ScrapeExcludeFunc,
     json_to_html,
 )
+from skyvern.webeye.scraper.cdp_accessibility import (
+    augment_elements_with_accessibility,
+    get_accessibility_tree_data,
+)
+from skyvern.webeye.scraper.cdp_dom_utils import get_js_event_listeners, get_paint_order_occluded_backend_ids
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -313,15 +318,50 @@ async def scrape_web_unsafe(
         await empty_page_retry_wait()
         elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
 
+    # Paint-order filtering: mark elements that are visually occluded by other elements.
+    # This uses CDP DOMSnapshot to detect elements hidden behind modals, overlays, etc.
+    # that JS-based visibility detection misses.
+    if settings.ENABLE_PAINT_ORDER_FILTERING:
+        elements, element_tree = await _apply_paint_order_filtering(page, elements, element_tree)
+
+    # JS listener detection: find non-semantic elements with click handlers
+    # that attribute-based detection misses (React/Vue/Angular synthetic events).
+    if settings.ENABLE_JS_LISTENER_DETECTION:
+        elements = await _apply_js_listener_detection(page, elements)
+
+    # Accessibility tree augmentation: add semantic role/name data from the
+    # browser's accessibility tree to enrich element descriptions for the LLM.
+    if settings.ENABLE_ACCESSIBILITY_TREE:
+        elements = await _apply_accessibility_augmentation(page, elements)
+
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
     element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
 
     screenshots = []
-    if take_screenshots:
-        element_tree_trimmed_html_str = "".join(
-            json_to_html(element, need_skyvern_attrs=False) for element in element_tree_trimmed
-        )
-        token_count = count_tokens(element_tree_trimmed_html_str)
+    element_tree_trimmed_html_str = "".join(
+        json_to_html(element, need_skyvern_attrs=False) for element in element_tree_trimmed
+    )
+    token_count = count_tokens(element_tree_trimmed_html_str)
+
+    # Determine whether to take screenshots based on vision mode
+    vision_mode = VisionMode(settings.VISION_MODE)
+    should_take_screenshots = take_screenshots
+    if should_take_screenshots:
+        if vision_mode == VisionMode.NEVER:
+            should_take_screenshots = False
+            LOG.debug("Vision mode is NEVER, skipping screenshots")
+        elif vision_mode == VisionMode.AUTO:
+            # In auto mode, only take screenshots when DOM is complex enough
+            # that visual context would help the LLM understand the page
+            if token_count < settings.VISION_AUTO_TOKEN_THRESHOLD:
+                should_take_screenshots = False
+                LOG.debug(
+                    "Vision mode is AUTO, DOM tokens below threshold, skipping screenshots",
+                    token_count=token_count,
+                    threshold=settings.VISION_AUTO_TOKEN_THRESHOLD,
+                )
+
+    if should_take_screenshots:
         if token_count > DEFAULT_MAX_TOKENS:
             max_screenshot_number = min(max_screenshot_number, 1)
 
@@ -779,6 +819,170 @@ def _remove_unique_id(element: dict) -> None:
         return
     if SKYVERN_ID_ATTR in element["attributes"]:
         del element["attributes"][SKYVERN_ID_ATTR]
+
+
+async def _apply_paint_order_filtering(
+    page: Page,
+    elements: list[dict],
+    element_tree: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Apply CDP paint-order filtering to mark occluded elements as non-interactable.
+
+    This uses the browser's actual compositing data to detect elements that are
+    visually hidden behind overlays, modals, or other z-index stacking.
+    """
+    try:
+        occluded_ids = await get_paint_order_occluded_backend_ids(page)
+        if not occluded_ids:
+            return elements, element_tree
+
+        # Map occluded backend IDs to skyvern element IDs using CDP DOM.getDocument
+        id_to_backend = await _get_element_backend_node_ids(page)
+        if id_to_backend:
+            occluded_count = 0
+            for element in elements:
+                eid = element.get("id", "")
+                backend_id = id_to_backend.get(eid)
+                if backend_id is not None and backend_id in occluded_ids:
+                    if element.get("interactable", False):
+                        element["interactable"] = False
+                        element["isDropped"] = True
+                        occluded_count += 1
+
+            if occluded_count > 0:
+                LOG.info(
+                    "Paint-order filtering marked occluded elements as non-interactable",
+                    occluded_count=occluded_count,
+                    total_occluded_backend_ids=len(occluded_ids),
+                )
+        else:
+            LOG.debug("Could not map element IDs to backend node IDs for paint-order filtering")
+    except Exception:
+        LOG.warning("Paint-order filtering failed, continuing without it", exc_info=True)
+
+    return elements, element_tree
+
+
+async def _apply_accessibility_augmentation(
+    page: Page,
+    elements: list[dict],
+) -> list[dict]:
+    """Augment elements with accessibility tree data (roles, names, states).
+
+    The accessibility tree provides semantic information about element purpose
+    that raw DOM attributes don't capture, especially for custom components
+    and complex form widgets.
+    """
+    try:
+        ax_tree = await get_accessibility_tree_data(page)
+        if not ax_tree:
+            return elements
+
+        id_to_backend = await _get_element_backend_node_ids(page)
+        if not id_to_backend:
+            return elements
+
+        elements = augment_elements_with_accessibility(elements, id_to_backend, ax_tree)
+    except Exception:
+        LOG.warning("Accessibility tree augmentation failed, continuing without it", exc_info=True)
+
+    return elements
+
+
+async def _apply_js_listener_detection(
+    page: Page,
+    elements: list[dict],
+) -> list[dict]:
+    """Use CDP to detect non-semantic elements with JS event listeners.
+
+    Modern frameworks (React, Vue, Angular) use synthetic event systems where
+    interactive elements may have no semantic HTML attributes indicating interactivity.
+    This catches those elements by querying the browser's actual event listener registry.
+    """
+    try:
+        # Get backend node IDs for non-interactable elements
+        id_to_backend = await _get_element_backend_node_ids(page)
+        if not id_to_backend:
+            return elements
+
+        # Find elements that are currently non-interactable
+        non_interactive_backend_ids = []
+        non_interactive_id_map: dict[int, str] = {}
+        for element in elements:
+            if element.get("interactable", False):
+                continue
+            eid = element.get("id", "")
+            if eid in id_to_backend:
+                backend_id = id_to_backend[eid]
+                non_interactive_backend_ids.append(backend_id)
+                non_interactive_id_map[backend_id] = eid
+
+        if not non_interactive_backend_ids:
+            return elements
+
+        # Check which of these have click-like event listeners
+        interactive_backend_ids = await get_js_event_listeners(page, non_interactive_backend_ids)
+
+        # Mark detected elements as interactable
+        promoted_count = 0
+        interactive_element_ids = {
+            non_interactive_id_map[bid] for bid in interactive_backend_ids if bid in non_interactive_id_map
+        }
+
+        for element in elements:
+            if element.get("id", "") in interactive_element_ids:
+                element["interactable"] = True
+                promoted_count += 1
+
+        if promoted_count > 0:
+            LOG.info(
+                "JS listener detection promoted elements to interactable",
+                promoted_count=promoted_count,
+            )
+    except Exception:
+        LOG.warning("JS listener detection failed, continuing without it", exc_info=True)
+
+    return elements
+
+
+async def _get_element_backend_node_ids(page: Page) -> dict[str, int]:
+    """Get a mapping of skyvern element IDs to CDP backend node IDs."""
+    try:
+        cdp_session = await page.context.new_cdp_session(page)
+        try:
+            # Query all elements with the skyvern unique_id attribute
+            result = await cdp_session.send("DOM.getDocument", {"depth": 0})
+            root_id = result["root"]["nodeId"]
+
+            # Search for elements with unique_id attribute
+            search_result = await cdp_session.send(
+                "DOM.querySelectorAll",
+                {"nodeId": root_id, "selector": f"[{SKYVERN_ID_ATTR}]"},
+            )
+
+            mapping: dict[str, int] = {}
+            for node_id in search_result.get("nodeIds", []):
+                try:
+                    attrs_result = await cdp_session.send("DOM.getAttributes", {"nodeId": node_id})
+                    attrs = attrs_result.get("attributes", [])
+                    # Attributes come as flat list: [name, value, name, value, ...]
+                    for i in range(0, len(attrs) - 1, 2):
+                        if attrs[i] == SKYVERN_ID_ATTR:
+                            # Get backendNodeId
+                            node_desc = await cdp_session.send("DOM.describeNode", {"nodeId": node_id})
+                            backend_id = node_desc.get("node", {}).get("backendNodeId")
+                            if backend_id:
+                                mapping[attrs[i + 1]] = backend_id
+                            break
+                except Exception:
+                    continue
+
+            return mapping
+        finally:
+            await cdp_session.detach()
+    except Exception:
+        LOG.warning("Failed to get element backend node IDs", exc_info=True)
+        return {}
 
 
 def _build_element_links(elements: list[dict]) -> None:

@@ -6,6 +6,21 @@ SKYVERN_ID_ATTR: str = "unique_id"
 SKYVERN_DIR = Path(__file__).parent
 REPO_ROOT_DIR = SKYVERN_DIR.parent
 
+
+class VisionMode(StrEnum):
+    """Controls when screenshots are included in LLM prompts.
+
+    ALWAYS: Always include screenshots (current default behavior).
+    AUTO: Only include screenshots when DOM tokens exceed a threshold or when
+          the LLM requests visual context. Most cost-efficient for text-heavy pages.
+    NEVER: Never include screenshots. Useful for purely text-based automation.
+    """
+
+    ALWAYS = "always"
+    AUTO = "auto"
+    NEVER = "never"
+
+
 INPUT_TEXT_TIMEOUT = 120000  # 2 minutes
 PAGE_CONTENT_TIMEOUT = 300  # 5 mins
 BROWSER_PAGE_CLOSE_TIMEOUT = 5  # 5 seconds

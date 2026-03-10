@@ -321,3 +321,122 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
 
     async def generate_scraped_page_without_screenshots(self, max_retries: int = 0) -> Self:
         return await self.generate_scraped_page(take_screenshots=False, max_retries=max_retries)
+
+    def compute_dom_diff(self, other: "ScrapedPage") -> "DomDiff":
+        """Compute the difference between this page state and another.
+
+        Used for self-healing: after an action changes the page unexpectedly,
+        the diff tells the LLM what actually changed so it can adapt its strategy.
+        Inspired by Stagehand's DOM-diff self-healing approach.
+        """
+        old_hashes = self.id_to_element_hash
+        new_hashes = other.id_to_element_hash
+
+        old_ids = set(old_hashes.keys())
+        new_ids = set(new_hashes.keys())
+
+        added_ids = new_ids - old_ids
+        removed_ids = old_ids - new_ids
+        common_ids = old_ids & new_ids
+
+        modified_ids: set[str] = set()
+        for eid in common_ids:
+            if old_hashes[eid] != new_hashes[eid]:
+                modified_ids.add(eid)
+
+        added_elements = [other.id_to_element_dict.get(eid, {}) for eid in added_ids]
+        removed_elements = [self.id_to_element_dict.get(eid, {}) for eid in removed_ids]
+        modified_elements = []
+        for eid in modified_ids:
+            modified_elements.append(
+                {
+                    "id": eid,
+                    "before": self.id_to_element_dict.get(eid, {}),
+                    "after": other.id_to_element_dict.get(eid, {}),
+                }
+            )
+
+        return DomDiff(
+            added=added_elements,
+            removed=removed_elements,
+            modified=modified_elements,
+            url_changed=self.url != other.url,
+            old_url=self.url,
+            new_url=other.url,
+        )
+
+
+class DomDiff(BaseModel):
+    """Represents the difference between two DOM states.
+
+    Used for self-healing retries: instead of blindly retrying, the LLM
+    receives information about what changed, enabling it to adapt its strategy.
+    """
+
+    added: list[dict] = []
+    removed: list[dict] = []
+    modified: list[dict] = []
+    url_changed: bool = False
+    old_url: str = ""
+    new_url: str = ""
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(self.added or self.removed or self.modified or self.url_changed)
+
+    def summary(self, max_elements: int = 10) -> str:
+        """Generate a concise text summary of the DOM changes for LLM consumption."""
+        parts: list[str] = []
+
+        if self.url_changed:
+            parts.append(f"Page URL changed: {self.old_url} -> {self.new_url}")
+
+        if self.added:
+            count = len(self.added)
+            sample = self.added[:max_elements]
+            descs = []
+            for el in sample:
+                tag = el.get("tagName", "?")
+                text = (el.get("text", "") or "")[:80]
+                el_id = el.get("id", "")
+                desc = f"  - <{tag}> id={el_id}"
+                if text:
+                    desc += f' text="{text}"'
+                descs.append(desc)
+            parts.append(f"{count} elements appeared:\n" + "\n".join(descs))
+
+        if self.removed:
+            count = len(self.removed)
+            sample = self.removed[:max_elements]
+            descs = []
+            for el in sample:
+                tag = el.get("tagName", "?")
+                text = (el.get("text", "") or "")[:80]
+                el_id = el.get("id", "")
+                desc = f"  - <{tag}> id={el_id}"
+                if text:
+                    desc += f' text="{text}"'
+                descs.append(desc)
+            parts.append(f"{count} elements disappeared:\n" + "\n".join(descs))
+
+        if self.modified:
+            count = len(self.modified)
+            sample = self.modified[:max_elements]
+            descs = []
+            for el in sample:
+                el_id = el.get("id", "")
+                before = el.get("before", {})
+                after = el.get("after", {})
+                tag = after.get("tagName", before.get("tagName", "?"))
+                old_text = (before.get("text", "") or "")[:40]
+                new_text = (after.get("text", "") or "")[:40]
+                desc = f"  - <{tag}> id={el_id}"
+                if old_text != new_text:
+                    desc += f' text: "{old_text}" -> "{new_text}"'
+                descs.append(desc)
+            parts.append(f"{count} elements changed:\n" + "\n".join(descs))
+
+        if not parts:
+            return "No DOM changes detected."
+
+        return "\n".join(parts)
