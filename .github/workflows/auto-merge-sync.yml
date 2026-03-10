@@ -9,7 +9,7 @@ permissions:
 jobs:
   auto-merge:
     if: >
-      contains(join(github.event.pull_request.labels.*.name, ','), 'sync') && contains('suchintan,wintonzheng,LawyZheng,pedrohsdb,marcmuon,celalzamanoglu', github.event.pull_request.user.login)
+      contains(join(github.event.pull_request.labels.*.name, ','), 'sync') && contains('suchintan,wintonzheng,LawyZheng,pedrohsdb,marcmuon,celalzamanoglu,AronPerez', github.event.pull_request.user.login)
 
     runs-on: ubuntu-latest
     steps:
