@@ -35,22 +35,15 @@ def add_vnc_channel(vnc_channel: VncChannel) -> None:
     vnc_channels[vnc_channel.client_id] = vnc_channel
 
 
-def get_vnc_channel(client_id: str) -> VncChannel | None:
-    return vnc_channels.get(client_id)
+def get_vnc_channel(client_id: str) -> t.Union[VncChannel, None]:
+    return vnc_channels.get(client_id, None)
 
 
-def del_vnc_channel(client_id: str, *, expected: VncChannel | None = None) -> None:
-    candidate = vnc_channels.get(client_id)
-
-    if candidate is None:
-        return
-
-    # Prevent stale channel shutdown from deleting a newer channel that reused
-    # the same client_id during route transitions/reconnects.
-    if expected is not None and candidate is not expected:
-        return
-
-    del vnc_channels[client_id]
+def del_vnc_channel(client_id: str) -> None:
+    try:
+        del vnc_channels[client_id]
+    except KeyError:
+        pass
 
 
 # a registry for message channels, keyed by `client_id`
@@ -61,32 +54,25 @@ def add_message_channel(message_channel: MessageChannel) -> None:
     message_channels[message_channel.client_id] = message_channel
 
 
-def get_message_channel(client_id: str) -> MessageChannel | None:
-    candidate = message_channels.get(client_id)
+def get_message_channel(client_id: str) -> t.Union[MessageChannel, None]:
+    candidate = message_channels.get(client_id, None)
 
-    if candidate is None:
-        return None
-
-    if candidate.is_open:
+    if candidate and candidate.is_open:
         return candidate
 
-    LOG.info(
-        "MessageChannel: message channel is not open; deleting it",
-        client_id=candidate.client_id,
-    )
-    del_message_channel(candidate.client_id, expected=candidate)
+    if candidate:
+        LOG.info(
+            "MessageChannel: message channel is not open; deleting it",
+            client_id=candidate.client_id,
+        )
+
+        del_message_channel(candidate.client_id)
+
     return None
 
 
-def del_message_channel(client_id: str, *, expected: MessageChannel | None = None) -> None:
-    candidate = message_channels.get(client_id)
-
-    if candidate is None:
-        return
-
-    # Prevent stale channel shutdown from deleting a newer channel that reused
-    # the same client_id during route transitions/reconnects.
-    if expected is not None and candidate is not expected:
-        return
-
-    del message_channels[client_id]
+def del_message_channel(client_id: str) -> None:
+    try:
+        del message_channels[client_id]
+    except KeyError:
+        pass

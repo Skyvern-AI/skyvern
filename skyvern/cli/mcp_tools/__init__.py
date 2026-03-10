@@ -41,6 +41,7 @@ from .session import (
     skyvern_browser_session_get,
     skyvern_browser_session_list,
 )
+from .telemetry import MCPTelemetryMiddleware
 from .workflow import (
     skyvern_workflow_cancel,
     skyvern_workflow_create,
@@ -248,6 +249,7 @@ To get xpaths, use skyvern_click during MCP exploration — its `resolved_select
 gives you the xpath the AI resolved to. Then hardcode that xpath with a prompt fallback in your script.
 """,
 )
+mcp.add_middleware(MCPTelemetryMiddleware())
 
 # -- Browser session management --
 mcp.tool()(skyvern_browser_session_create)
