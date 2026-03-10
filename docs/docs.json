@@ -21,6 +21,7 @@
           {
             "group": "Getting Started",
             "pages": [
+              "getting-started/introduction",
               "getting-started/quickstart",
               "getting-started/core-concepts"
             ]
@@ -190,14 +191,12 @@
       },
       {
         "tab": "Changelog",
-        "pages": [
-          "changelog"
-        ]
+        "pages": ["changelog"]
       },
       {
         "tab": "API Reference",
         "openapi": "api-reference/openapi.json"
-      },
+      }
     ]
   },
   "navbar": {

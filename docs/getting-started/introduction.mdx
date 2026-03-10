@@ -1,0 +1,197 @@
+---
+title: Introduction
+subtitle: Automate any browser workflow with AI
+slug: getting-started/introduction
+---
+
+Skyvern is an [open-source](https://github.com/Skyvern-AI/skyvern) browser automation platform that uses LLMs and computer vision to interact with websites. Give it a natural language prompt — Skyvern opens a cloud browser, reads the page visually, and completes the task.
+
+No selectors. No scripts. No maintenance when the website changes.
+
+Choose: 
+- **No-Code UI** if you want to automate browsers for personal productivity, or
+- **API / SDK** if you're a developer looking to integrate Skyvern into your product.
+
+---
+
+## How it works
+
+<Tabs>
+  <Tab title="No-Code UI">
+    <Steps>
+      <Step title="Describe what you want">
+        Type a prompt into the Discover page or build a multi-step workflow in the visual editor.
+
+        <img src="/images/cloud/discover-page-overview.png" alt="Skyvern Discover page where you type a prompt and run it" />
+      </Step>
+      <Step title="Skyvern runs it in a cloud browser">
+        A real browser spins up. Skyvern screenshots the page, understands what's on screen, and navigates step by step.
+
+        <img src="/images/cloud/live-execution-overview.png" alt="Live browser view showing Skyvern executing a task" />
+      </Step>
+      <Step title="Review results">
+        View extracted data, downloaded files, and a full browser recording from the Run History page.
+
+        <img src="/images/cloud/task-run-results.png" alt="Run results showing extracted data" />
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="API / SDK">
+    <Steps>
+      <Step title="Send a prompt and URL">
+        Describe the goal in plain English. Skyvern handles the navigation.
+
+        <CodeGroup>
+        ```python Python
+        result = await client.run_task(
+            url="https://example.com",
+            prompt="Extract the pricing table",
+        )
+        ```
+        ```typescript TypeScript
+        const result = await client.runTask({
+            url: "https://example.com",
+            prompt: "Extract the pricing table",
+        });
+        ```
+        ```bash cURL
+        curl -X POST https://api.skyvern.com/api/v1/tasks \
+          -H "x-api-key: YOUR_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "url": "https://example.com",
+            "prompt": "Extract the pricing table"
+          }'
+        ```
+        </CodeGroup>
+      </Step>
+      <Step title="Skyvern runs it in a cloud browser">
+        A real browser spins up. Skyvern screenshots the page, uses an LLM to understand what's on screen, and executes actions step by step.
+      </Step>
+      <Step title="Get structured results">
+        Receive extracted data as JSON, downloaded files, a recording URL, and step-by-step screenshots.
+
+        <CodeGroup>
+        ```python Python
+        print(result.output)         # {"pricing": [...]}
+        print(result.recording_url)  # Full video of execution
+        ```
+        ```typescript TypeScript
+        console.log(result.output);        // {"pricing": [...]}
+        console.log(result.recordingUrl);  // Full video of execution
+        ```
+        ```bash cURL
+        # Response JSON includes:
+        # "output": {"pricing": [...]},
+        # "recording_url": "https://..."
+        ```
+        </CodeGroup>
+      </Step>
+    </Steps>
+    
+    Get full code snippet in the [quickstart](/getting-started/quickstart).
+  </Tab>
+</Tabs>
+
+---
+
+## What makes Skyvern different
+
+<Tabs>
+  <Tab title="No-Code UI">
+    <CardGroup cols={2}>
+      <Card title="Automate any task on any website" icon="globe" href="/cloud/getting-started/overview">
+        Skyvern can fill forms, log in with your password and OTP, download files, send emails, and more. If you can do it in a browser, Skyvern can do it on its own.
+      </Card>
+      <Card title="Just give a prompt and a link" icon="wand-magic-sparkles" href="/cloud/building-workflows/workflow-editor">
+         Skyvern figures out how to do your task like a human would. Or use the drag-and-drop **Workflow Editor** to build complex automations.
+      </Card>
+      <Card title="Works with your favorite tools" icon="plug" href="/integrations/zapier">
+        Use Skyvern in **Zapier**, **n8n**, **Make.com**, **Workato**, or add its **MCP server** to your favourite AI assistant.
+      </Card>
+      <Card title="Advanced features, no setup" icon="shield" href="/going-to-production/proxy-geolocation">
+        VPN routing, automatic CAPTCHA solving, OTP handling, and cookie management — all accessible through the UI.
+      </Card>
+    </CardGroup>
+  </Tab>
+  <Tab title="API / SDK">
+    <CardGroup cols={2}>
+      <Card title="Works on any website, no selectors" icon="globe" href="/getting-started/core-concepts">
+        Skyvern reads pages visually — no XPaths or CSS selectors to maintain. Point it at any site with a **prompt and URL**. Build multi-step **Workflows** with 15+ block types — navigation, extraction, loops, conditionals, file downloads, email, and more.
+      </Card>
+      <Card title="Handles logins, 2FA, and credentials securely" icon="key" href="/sdk-reference/credentials">
+        Store passwords, credit cards, and TOTP secrets via the **Credentials API**. Encrypted at rest, injected directly into the browser — the AI never sees them. Supports authenticator apps and push-based 2FA.
+      </Card>
+      <Card title="Save and restore browser state" icon="window-restore" href="/optimization/browser-sessions">
+        **Browser Sessions** keep a live browser open across multiple API calls. **Browser Profiles** save cookies, auth tokens, local storage, and cache as reusable snapshots — skip login on repeated runs.
+      </Card>
+      <Card title="VPN routing and automatic CAPTCHA solving" icon="shield" href="/going-to-production/proxy-geolocation">
+        **Residential proxies** route browsers through real IPs across multiple countries. Skyvern automatically detects and solves CAPTCHAs during execution.
+      </Card>
+    </CardGroup>
+  </Tab>
+</Tabs>
+
+---
+
+## Get started
+
+<Tabs>
+  <Tab title="No-Code UI">
+    <CardGroup cols={2}>
+      <Card title="Create your first workflow" icon="rocket" href="/cloud/building-workflows/workflow-editor">
+        Open the Workflow Editor and build your first automation in minutes
+      </Card>
+      <Card title="Integrate with Zapier" icon="plug" href="/integrations/zapier">
+        Trigger Skyvern automations from your existing no-code tools
+      </Card>
+    </CardGroup>
+  </Tab>
+  <Tab title="API / SDK">
+    <CardGroup cols={2}>
+      <Card title="Quickstart" icon="rocket" href="/getting-started/quickstart">
+        Run your first automation in 5 minutes with Python, TypeScript, or cURL
+      </Card>
+      <Card title="API Reference" icon="book" href="/api-reference">
+        Full reference for every endpoint, parameter, and response
+      </Card>
+    </CardGroup>
+  </Tab>
+</Tabs>
+
+### See Skyvern in Action
+
+Cookbooks show end-to-end workflow examples you can run today.
+
+<CardGroup cols={3}>
+  <Card title="Bulk Invoice Downloader" icon="file-invoice-dollar" href="/cookbooks/bulk-invoice-downloader">
+    Download invoices, parse PDFs, and email a summary
+  </Card>
+  <Card title="Job Applications Pipeline" icon="briefcase" href="/cookbooks/job-application-filler">
+    Search for jobs, generate tailored answers, and apply automatically
+  </Card>
+  <Card title="Healthcare Data Extraction" icon="hospital-user" href="/cookbooks/healthcare-portal-data">
+    Extract patient demographics and billing data from EHR portals
+  </Card>
+</CardGroup>
+
+### Give Skyvern to your AI agent
+
+Let your favourite AI tool use Skyvern.
+
+<CardGroup cols={2}>
+  <Card title="MCP Server" icon="robot" href="/going-to-production/mcp">
+    Connect Claude, Cursor, Windsurf, or any MCP-compatible AI to browser automation
+  </Card>
+  <Card title="CLI & Skills" icon="terminal" href="/going-to-production/cli">
+    Run browser automations and manage workflows from the command line
+  </Card>
+</CardGroup>
+
+### Self-hosted deployment
+
+Need full data privacy? Skyvern is [open-source](https://github.com/Skyvern-AI/skyvern) — run it on your own infrastructure with your own LLM keys.
+
+<Card title="Self-Hosted Guide" icon="server" href="/self-hosted/overview">
+  Full data privacy — deploy on your own infrastructure with your own LLM keys
+</Card>
