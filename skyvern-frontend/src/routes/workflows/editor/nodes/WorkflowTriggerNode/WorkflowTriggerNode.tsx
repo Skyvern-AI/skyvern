@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Accordion,
   AccordionContent,
@@ -141,6 +141,16 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
     beginInternalUpdate,
     endInternalUpdate,
   ]);
+
+  // Signal FlowRenderer to re-layout after async parameters load,
+  // because the skeleton → actual fields transition changes node dimensions
+  const prevIsLoadingRef = useRef(isLoadingParams);
+  useEffect(() => {
+    if (prevIsLoadingRef.current && !isLoadingParams) {
+      window.dispatchEvent(new Event("workflow-trigger-content-changed"));
+    }
+    prevIsLoadingRef.current = isLoadingParams;
+  }, [isLoadingParams]);
 
   const hasWorkflowSelected = isConcreteWpid(data.workflowPermanentId);
 
