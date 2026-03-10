@@ -405,15 +405,18 @@ function WorkflowPostRunParameters() {
               <Input value={workflowRun.browser_session_id} readOnly />
             </div>
           ) : null}
-          {workflow?.run_with ? (
+          {workflowRun.run_with ?? workflow?.run_with ? (
             <div className="flex gap-16">
               <div className="w-80">
                 <h1 className="text-lg">Run With</h1>
                 <h2 className="text-base text-slate-400">
-                  Execution mode for this workflow
+                  Execution mode for this run
                 </h2>
               </div>
-              <Input value={workflow.run_with} readOnly />
+              <Input
+                value={workflowRun.run_with ?? workflow?.run_with ?? ""}
+                readOnly
+              />
             </div>
           ) : null}
           {workflowRun.max_screenshot_scrolls != null ? (
