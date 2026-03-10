@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import {
   Select,
@@ -8,7 +8,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -20,7 +20,12 @@ import { useWorkflowRunWithWorkflowQuery } from "@/routes/workflows/hooks/useWor
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
+import { getClient } from "@/api/AxiosClient";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useToast } from "@/components/ui/use-toast";
+import { Pencil1Icon } from "@radix-ui/react-icons";
 
+import { useFeatureFlag } from "@cloud/hooks/useFeatureFlag";
 import { CopyAndExplainCode } from "../editor/Workspace";
 
 interface Props {
@@ -29,7 +34,10 @@ interface Props {
 
 function WorkflowRunCode(props?: Props) {
   const showCacheKeyValueSelector = props?.showCacheKeyValueSelector ?? false;
+  const codeBlockEnabled = useFeatureFlag("CODE_BLOCK_ENABLED");
   const queryClient = useQueryClient();
+  const credentialGetter = useCredentialGetter();
+  const { toast } = useToast();
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
@@ -88,9 +96,11 @@ function WorkflowRunCode(props?: Props) {
   const currentVersion = activeScripts?.version ?? null;
   const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
 
-  // Reset selected version when the active script changes
+  // Reset selected version and exit edit mode when the active script changes
   useEffect(() => {
     setSelectedVersion(null);
+    setIsEditing(false);
+    setEditedCode("");
   }, [scriptId, currentVersion]);
 
   // Fetch available versions for this script
@@ -129,6 +139,94 @@ function WorkflowRunCode(props?: Props) {
   ).trim();
 
   const isGeneratingCode = !isFinalized && !hasPublishedCode;
+
+  // --- Edit mode state ---
+  const [isEditing, setIsEditing] = useState(false);
+  const [editedCode, setEditedCode] = useState("");
+  const originalCodeRef = useRef("");
+
+  const canEdit =
+    scriptId && code.length > 0 && !isGeneratingCode && !isViewingOtherVersion;
+
+  const handleStartEditing = useCallback(() => {
+    originalCodeRef.current = code;
+    setEditedCode(code);
+    setIsEditing(true);
+  }, [code]);
+
+  const handleCancelEditing = useCallback(() => {
+    setIsEditing(false);
+    setEditedCode("");
+    originalCodeRef.current = "";
+  }, []);
+
+  const deployMutation = useMutation({
+    mutationFn: async ({
+      scriptId,
+      mainPyContent,
+    }: {
+      scriptId: string;
+      mainPyContent: string;
+    }) => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const bytes = new TextEncoder().encode(mainPyContent);
+      const encoded = btoa(
+        Array.from(bytes, (b) => String.fromCharCode(b)).join(""),
+      );
+      return client.post(`/scripts/${scriptId}/deploy`, {
+        files: [
+          {
+            path: "main.py",
+            content: encoded,
+            encoding: "base64",
+            mime_type: "text/x-python",
+          },
+        ],
+      });
+    },
+    onSuccess: (response) => {
+      setIsEditing(false);
+      setEditedCode("");
+      // Auto-select the newly created version so the editor doesn't revert
+      if (response.data.version != null) {
+        setSelectedVersion(response.data.version);
+      }
+      toast({
+        title: "Script saved",
+        description: `Version ${response.data.version} created.`,
+      });
+      // Invalidate script queries so the new version shows up
+      queryClient.invalidateQueries({ queryKey: ["block-scripts"] });
+      queryClient.invalidateQueries({ queryKey: ["script-versions"] });
+    },
+    onError: () => {
+      toast({
+        variant: "destructive",
+        title: "Failed to save",
+        description: "Could not save the script. Please try again.",
+      });
+    },
+  });
+
+  const handleSave = useCallback(() => {
+    if (!scriptId) return;
+    // Prevent saving empty scripts
+    if (editedCode.trim() === "") {
+      toast({
+        variant: "destructive",
+        title: "Cannot save empty script",
+        description: "The script must contain code.",
+      });
+      return;
+    }
+    // No changes — just exit edit mode
+    if (editedCode === originalCodeRef.current) {
+      setIsEditing(false);
+      setEditedCode("");
+      return;
+    }
+    deployMutation.mutate({ scriptId, mainPyContent: editedCode });
+  }, [scriptId, editedCode, deployMutation, toast]);
 
   useEffect(() => {
     setCacheKeyValue(
@@ -175,77 +273,110 @@ function WorkflowRunCode(props?: Props) {
 
   const hasVersions = versions.length > 1;
 
-  // Version selector component (shared between both render paths)
-  // Wait for the versions query to settle before rendering to avoid a flash
-  // from static label to dropdown when the query resolves.
-  const versionSelector = !versionsFetched ? null : hasVersions ? (
-    <div className="flex items-center gap-2">
-      <Label className="whitespace-nowrap text-xs text-slate-400">
-        Version
-      </Label>
-      <Select
-        value={String(selectedVersion ?? currentVersion ?? "")}
-        onValueChange={(v: string) => setSelectedVersion(Number(v))}
+  // Edit button shown when not in edit mode and there's a script to edit
+  const editButton =
+    codeBlockEnabled && canEdit && !isEditing ? (
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-7 gap-1.5 px-2.5 text-xs"
+        onClick={handleStartEditing}
       >
-        <SelectTrigger className="h-7 w-auto min-w-[7rem] gap-1.5 px-2 text-xs">
-          <SelectValue placeholder="Version" />
-        </SelectTrigger>
-        <SelectContent>
-          {versions.map((v) => {
-            const isRunVersion = v.version === currentVersion;
-            const isLatest = v.version === versions[0]?.version;
-            return (
-              <SelectItem key={v.version} value={String(v.version)}>
-                <span className="flex items-center gap-1.5">
-                  <span
-                    className={cn({
-                      "font-semibold text-emerald-400": isRunVersion,
-                    })}
-                  >
-                    v{v.version}
-                  </span>
-                  {isRunVersion && (
-                    <span className="rounded-sm bg-emerald-900/50 px-1 py-0.5 text-[10px] leading-none text-emerald-300">
-                      this run
-                    </span>
-                  )}
-                  {isLatest && !isRunVersion && (
-                    <span className="rounded-sm bg-blue-900/50 px-1 py-0.5 text-[10px] leading-none text-blue-300">
-                      latest
-                    </span>
-                  )}
+        <Pencil1Icon className="size-3" />
+        Edit
+      </Button>
+    ) : null;
+
+  // Save / Cancel buttons shown during edit mode
+  const editActions =
+    codeBlockEnabled && isEditing ? (
+      <div className="flex items-center gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2.5 text-xs"
+          onClick={handleCancelEditing}
+          disabled={deployMutation.isPending}
+        >
+          Cancel
+        </Button>
+        <Button
+          size="sm"
+          className="h-7 px-2.5 text-xs"
+          onClick={handleSave}
+          disabled={deployMutation.isPending}
+        >
+          {deployMutation.isPending ? "Saving..." : "Save"}
+        </Button>
+      </div>
+    ) : null;
+
+  // Version selector — badge when single version, dropdown when multiple
+  const versionSelector = !versionsFetched ? null : hasVersions ? (
+    <Select
+      value={String(selectedVersion ?? currentVersion ?? "")}
+      onValueChange={(v: string) => setSelectedVersion(Number(v))}
+      disabled={isEditing}
+    >
+      <SelectTrigger className="h-7 w-auto min-w-[5rem] gap-1.5 rounded-full border-slate-700 px-2.5 text-xs">
+        <SelectValue placeholder="Version" />
+      </SelectTrigger>
+      <SelectContent>
+        {versions.map((v) => {
+          const isRunVersion = v.version === currentVersion;
+          const isLatest = v.version === versions[0]?.version;
+          return (
+            <SelectItem key={v.version} value={String(v.version)}>
+              <span className="flex items-center gap-1.5">
+                <span
+                  className={cn({
+                    "font-semibold text-emerald-400": isRunVersion,
+                  })}
+                >
+                  v{v.version}
                 </span>
-              </SelectItem>
-            );
-          })}
-        </SelectContent>
-      </Select>
-    </div>
+                {isRunVersion && (
+                  <span className="rounded-sm bg-emerald-900/50 px-1 py-0.5 text-[10px] leading-none text-emerald-300">
+                    this run
+                  </span>
+                )}
+                {isLatest && !isRunVersion && (
+                  <span className="rounded-sm bg-blue-900/50 px-1 py-0.5 text-[10px] leading-none text-blue-300">
+                    latest
+                  </span>
+                )}
+              </span>
+            </SelectItem>
+          );
+        })}
+      </SelectContent>
+    </Select>
   ) : currentVersion != null ? (
-    <span className="text-xs text-slate-500">v{currentVersion}</span>
+    <span className="rounded-full border border-slate-700 px-2.5 py-1 text-xs text-slate-400">
+      v{currentVersion}
+    </span>
   ) : null;
 
   if (!showCacheKeyValueSelector || !cacheKey || cacheKey === "") {
     return (
-      <div className="relative flex h-full w-full flex-col gap-2">
-        {versionSelector && (
-          <div className="flex justify-end">{versionSelector}</div>
-        )}
+      <div className="flex h-full w-full flex-col gap-2">
+        <div className="flex items-center justify-end gap-2">
+          {editButton}
+          {editActions}
+          {versionSelector}
+          {!isEditing && code.length > 0 && <CopyAndExplainCode code={code} />}
+        </div>
         <CodeEditor
           className={cn("h-full overflow-y-scroll", {
             "animate-pulse": isGeneratingCode || isLoadingVersion,
           })}
           language="python"
-          value={code}
+          value={isEditing ? editedCode : code}
+          onChange={isEditing ? setEditedCode : undefined}
           lineWrap={false}
-          readOnly
+          readOnly={!isEditing}
           fontSize={10}
         />
-        {code.length > 0 && (
-          <div className="absolute bottom-2 right-3 flex items-center justify-end">
-            <CopyAndExplainCode code={code} />
-          </div>
-        )}
       </div>
     );
   }
@@ -263,26 +394,27 @@ function WorkflowRunCode(props?: Props) {
   }
 
   return (
-    <div className="relative flex h-full w-full flex-col items-end justify-center gap-2">
-      <div className="flex w-full items-center justify-end gap-4">
+    <div className="flex h-full w-full flex-col items-end justify-center gap-2">
+      <div className="flex w-full items-center justify-end gap-2">
+        {editButton}
+        {editActions}
         {versionSelector}
         {cacheKeyValueSet.size > 0 ? (
-          <div className="flex items-center gap-2">
-            <Label className="w-[7rem]">Code Key Value</Label>
+          <div className="flex items-center gap-1.5">
             <HelpTooltip
               content={
                 !isFinalized
-                  ? "The code key value the generated code is being stored under."
-                  : "Which generated (& cached) code to view."
+                  ? "The cached variant the generated code is stored under."
+                  : "Which cached code variant to view."
               }
             />
             <Select
-              disabled={!isFinalized}
+              disabled={!isFinalized || isEditing}
               value={cacheKeyValue}
               onValueChange={(v: string) => setCacheKeyValue(v)}
             >
-              <SelectTrigger className="max-w-[15rem] [&>span]:text-ellipsis">
-                <SelectValue placeholder="Code Key Value" />
+              <SelectTrigger className="h-7 max-w-[15rem] gap-1.5 rounded-full border-slate-700 px-2.5 text-xs [&>span]:text-ellipsis">
+                <SelectValue placeholder="Variant" />
               </SelectTrigger>
               <SelectContent>
                 {Array.from(cacheKeyValueSet)
@@ -309,20 +441,19 @@ function WorkflowRunCode(props?: Props) {
             </Select>
           </div>
         ) : null}
+        {!isEditing && code.length > 0 && <CopyAndExplainCode code={code} />}
       </div>
       <CodeEditor
         className={cn("h-full w-full overflow-y-scroll", {
           "animate-pulse": isGeneratingCode || isLoadingVersion,
         })}
         language="python"
-        value={code}
+        value={isEditing ? editedCode : code}
+        onChange={isEditing ? setEditedCode : undefined}
         lineWrap={false}
-        readOnly
+        readOnly={!isEditing}
         fontSize={10}
       />
-      <div className="absolute bottom-2 right-3 flex items-center justify-end">
-        <CopyAndExplainCode code={code} />
-      </div>
     </div>
   );
 }
