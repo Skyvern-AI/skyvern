@@ -50,7 +50,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter, ParameterType
-from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, is_adaptive_caching
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import (
     CreateScriptResponse,
@@ -1109,6 +1109,80 @@ async def _fallback_to_ai_run(
                 )
             return
 
+        # Record a fallback episode for adaptive caching (code_v2).
+        # This must happen BEFORE the AI step runs so we capture the page state
+        # at the moment of failure, not after the AI agent has modified the page.
+        # NOTE: This mirrors _record_fallback_episode() in workflow/service.py.
+        # The two implementations should be kept in sync if the episode schema changes.
+        fallback_episode_id: str | None = None
+        form_fields_snapshot: list | None = None
+        if workflow_permanent_id and is_adaptive_caching(workflow, workflow_run):
+            try:
+                # Capture page state at the moment of script failure
+                page_url = None
+                page_text_snapshot = None
+                working_page = None
+                try:
+                    browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                        workflow_run=workflow_run,
+                    )
+                    working_page = await browser_state.get_working_page()
+                    if working_page:
+                        page_url = working_page.url
+                        page_text_snapshot = (await working_page.inner_text("body", timeout=5000))[:5000]
+                except Exception:
+                    LOG.debug("Failed to capture page state for fallback episode", exc_info=True)
+
+                # Extract structured form field metadata from the DOM
+                try:
+                    if working_page:
+                        form_fields_snapshot = await working_page.evaluate("""() => {
+                            const fields = [];
+                            for (const el of document.querySelectorAll('input, select, textarea')) {
+                                if (el.type === 'hidden') continue;
+                                const labelEl = el.closest('label')
+                                    || (el.id && document.querySelector('label[for="' + el.id + '"]'));
+                                const label = labelEl ? labelEl.textContent.trim().substring(0, 100) : '';
+                                const ariaLabel = el.getAttribute('aria-label') || '';
+                                const placeholder = el.getAttribute('placeholder') || '';
+                                if (!label && !ariaLabel && !placeholder && !el.name) continue;
+                                fields.push({
+                                    tag: el.tagName.toLowerCase(),
+                                    type: el.getAttribute('type') || el.tagName.toLowerCase(),
+                                    label: label,
+                                    name: el.getAttribute('name') || '',
+                                    required: el.required || el.getAttribute('aria-required') === 'true',
+                                    placeholder: placeholder,
+                                });
+                            }
+                            return fields.slice(0, 50);
+                        }""")
+                except Exception:
+                    LOG.debug("Failed to extract form field metadata for fallback episode", exc_info=True)
+
+                # _fallback_to_ai_run is only called for TaskBlock-style blocks (navigation,
+                # extraction, action, login, download), never for ConditionalBlock, so
+                # fallback_type is always "full_block" here.
+                episode = await app.DATABASE.create_fallback_episode(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_run_id=workflow_run_id,
+                    block_label=cache_key,
+                    fallback_type="full_block",
+                    script_revision_id=context.script_revision_id,
+                    classify_result=context.last_classify_result,
+                    error_message=str(error)[:2000] if error else None,
+                    page_url=page_url,
+                    page_text_snapshot=page_text_snapshot,
+                )
+                fallback_episode_id = episode.episode_id
+            except Exception:
+                LOG.warning(
+                    "Failed to record fallback episode in _fallback_to_ai_run",
+                    block_label=cache_key,
+                    exc_info=True,
+                )
+
         # 2. create a new step for ai run
         ai_step = await app.DATABASE.create_step(
             task_id=task_id,
@@ -1222,6 +1296,51 @@ async def _fallback_to_ai_run(
         except Exception as e:
             LOG.warning("Failed to regenerate script block after AI fallback", error=str(e), exc_info=True)
             # Don't fail the entire fallback process if script regeneration fails
+
+        # Update fallback episode with AI execution results
+        if fallback_episode_id:
+            try:
+                fallback_succeeded = task.status not in [TaskStatus.terminated, TaskStatus.failed]
+                agent_actions_summary: dict[str, Any] = {
+                    "block_status": str(task.status),
+                }
+                if form_fields_snapshot:
+                    agent_actions_summary["form_fields"] = form_fields_snapshot
+                if not fallback_succeeded and task.failure_reason:
+                    agent_actions_summary["failure_reason"] = str(task.failure_reason)[:2000]
+                # Fetch actions from the AI step.
+                # NOTE: service.py uses _build_action_summary() which includes element
+                # attributes and CSS selectors. We can't import it here (circular import:
+                # service.py imports script_service). Core fields suffice for now.
+                try:
+                    actions = await app.DATABASE.get_task_actions(
+                        task_id=task_id,
+                        organization_id=organization_id,
+                    )
+                    agent_actions_summary["actions"] = [
+                        {
+                            "action_type": a.action_type,
+                            "intention": a.intention,
+                            "reasoning": a.reasoning,
+                            "status": a.status,
+                        }
+                        for a in actions[:20]
+                    ]
+                except Exception:
+                    LOG.debug("Could not fetch actions for fallback episode", exc_info=True)
+
+                await app.DATABASE.update_fallback_episode(
+                    episode_id=fallback_episode_id,
+                    organization_id=organization_id,
+                    agent_actions=agent_actions_summary,
+                    fallback_succeeded=fallback_succeeded,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to update fallback episode with agent actions",
+                    episode_id=fallback_episode_id,
+                    exc_info=True,
+                )
     except Exception as e:
         LOG.warning("Failed to fallback to AI run", cache_key=cache_key, exc_info=True)
         # Update block status to failed if workflow block was created
