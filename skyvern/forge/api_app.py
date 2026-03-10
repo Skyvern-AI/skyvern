@@ -91,6 +91,12 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         except Exception:
             LOG.exception("Failed to execute api app startup event")
 
+    # Close browser sessions left active by a previous process
+    try:
+        await forge_app.PERSISTENT_SESSIONS_MANAGER.cleanup_stale_sessions()
+    except Exception:
+        LOG.exception("Failed to clean up stale browser sessions")
+
     # Start cleanup scheduler if enabled
     cleanup_task = start_cleanup_scheduler()
     if cleanup_task:
@@ -111,6 +117,11 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
 
     # Stop cleanup scheduler
     await stop_cleanup_scheduler()
+
+    # Close all persistent browser sessions
+    from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
+
+    await DefaultPersistentSessionsManager.close()
 
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
