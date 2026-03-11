@@ -87,13 +87,6 @@ pip install skyvern
 skyvern quickstart
 ```
 
-If you already have a database you want to use, pass a custom connection string to skip the
-local Docker PostgreSQL setup:
-
-```bash
-skyvern quickstart --database-string "postgresql+psycopg://user:password@localhost:5432/skyvern"
-```
-
 ### Option B: Docker Compose
 
 1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
