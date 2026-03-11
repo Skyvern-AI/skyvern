@@ -249,3 +249,27 @@ class ScriptBranchHit(BaseModel):
     hit_count: int = 1
     first_hit_at: datetime
     last_hit_at: datetime
+
+
+class ReviewScriptRequest(BaseModel):
+    """Request body for user-initiated script review."""
+
+    user_instructions: str = Field(
+        ...,
+        min_length=1,
+        max_length=5000,
+        description="Instructions for how to fix the script",
+    )
+    workflow_run_id: str | None = Field(
+        None,
+        description="Workflow run ID to pull fallback episodes from (optional)",
+    )
+
+
+class ReviewScriptResponse(BaseModel):
+    """Response from a user-initiated script review."""
+
+    script_id: str
+    version: int
+    updated_blocks: list[str]
+    message: str | None = None

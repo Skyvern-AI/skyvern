@@ -79,7 +79,7 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, validate_pdf_file
+from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -3283,10 +3283,9 @@ class FileParserBlock(Block):
             self.file_url, workflow_run_context
         )
 
-    def _detect_file_type_from_url(self, file_url: str) -> FileType:
-        """Detect file type based on file extension in the URL."""
+    def _detect_file_type_from_url(self, file_url: str, file_path: str | None = None) -> FileType:
+        """Detect file type based on file extension in the URL, with magic-byte fallback."""
         url_parsed = urlparse(file_url)
-        # TODO: use filetype.guess(file_path) to make the detection more robust
         suffix = Path(url_parsed.path).suffix.lower()
         if suffix in (".xlsx", ".xls", ".xlsm"):
             return FileType.EXCEL
@@ -3304,8 +3303,41 @@ class FileParserBlock(Block):
                 file_type=FileType.DOCX,
                 error="Legacy .doc format (Word 97-2003) is not supported. Please convert the file to .docx format.",
             )
-        else:
-            return FileType.CSV  # Default to CSV for .csv and any other extensions
+        elif suffix == ".csv":
+            return FileType.CSV
+
+        # URL extension is missing or unrecognized — try magic-byte detection on the downloaded file
+        if file_path:
+            detected = self._detect_file_type_from_magic_bytes(file_path)
+            if detected is not None:
+                LOG.info(
+                    "FileParserBlock: Detected file type from magic bytes (URL had no recognizable extension)",
+                    file_url=file_url,
+                    detected_file_type=detected,
+                )
+                return detected
+
+        return FileType.CSV  # Final fallback for truly unknown files
+
+    def _detect_file_type_from_magic_bytes(self, file_path: str) -> FileType | None:
+        """Detect file type from magic bytes using the filetype library. Returns None if unrecognized."""
+        kind = filetype.guess(file_path)
+        if kind is None:
+            return None
+
+        mime = kind.mime
+        if mime == "application/pdf":
+            return FileType.PDF
+        elif mime in (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        ):
+            return FileType.EXCEL
+        elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            return FileType.DOCX
+        elif mime.startswith("image/"):
+            return FileType.IMAGE
+        return None
 
     def _detect_file_encoding(self, file_path: str) -> str:
         """Detect the encoding of a file using charset-normalizer with fallbacks.
@@ -3432,12 +3464,46 @@ class FileParserBlock(Block):
         """Parse PDF file and return extracted text.
 
         Uses the shared PDF parsing utility that tries pypdf first,
-        then falls back to pdfplumber if pypdf fails.
+        then falls back to pdfplumber if pypdf fails. If text extraction
+        yields empty/minimal content (e.g. scanned or image-based PDFs),
+        renders pages as images and sends them to a vision LLM for OCR.
         """
         try:
-            return extract_pdf_file(file_path, file_identifier=self.file_url)
+            extracted_text = extract_pdf_file(file_path, file_identifier=self.file_url)
         except PDFParsingError as e:
             raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
+
+        # If text extraction returned meaningful content, use it directly
+        if extracted_text.strip():
+            return extracted_text
+
+        # Scanned / image-based PDF — render pages as images and use vision LLM
+        LOG.info(
+            "PDF text extraction returned empty content, falling back to vision LLM OCR",
+            file_url=self.file_url,
+        )
+        try:
+            page_images = render_pdf_pages_as_images(file_path, file_identifier=self.file_url)
+            if not page_images:
+                return extracted_text
+
+            llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                self.override_llm_key, default=app.LLM_API_HANDLER
+            )
+            llm_response = await llm_api_handler(
+                prompt=llm_prompt,
+                prompt_name="extract-text-from-image",
+                screenshots=page_images,
+                force_dict=True,
+            )
+            return llm_response.get("extracted_text", "")
+        except Exception:
+            LOG.exception(
+                "Failed to extract text from PDF via vision LLM fallback",
+                file_url=self.file_url,
+            )
+            raise
 
     async def _parse_image_file(self, file_path: str) -> str:
         """Parse image file using vision LLM for OCR."""
@@ -3608,7 +3674,7 @@ class FileParserBlock(Block):
 
         # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
         if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
-            self.file_type = self._detect_file_type_from_url(self.file_url)
+            self.file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
 
         # Validate the file type
         self.validate_file_type(self.file_url, file_path)
