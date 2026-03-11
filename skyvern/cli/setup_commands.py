@@ -9,6 +9,7 @@ import platform
 import shutil
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
@@ -23,12 +24,14 @@ from skyvern.analytics import capture_setup_event
 from skyvern.cli.auth_command import run_signup
 from skyvern.cli.console import console
 from skyvern.cli.skill_commands import get_skill_dirs
+from skyvern.utils import detect_os, get_windows_appdata_roaming
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 # NOTE: These helpers back both `skyvern setup ...` commands and the
-# interactive MCP step used by `skyvern init` / `skyvern quickstart`.
-# Keep local stdio setup and Claude Code skill installation behavior here so
-# the standalone and wizard flows stay aligned.
+# interactive MCP step used by `skyvern init` / `skyvern quickstart`, plus
+# the MCP switcher in `skyvern/cli/mcp_commands.py`.
+# Keep shared config parsing/writes, local stdio setup, and Claude Code skill
+# installation behavior here so the standalone and wizard flows stay aligned.
 setup_app = typer.Typer(
     help="Register Skyvern MCP with AI coding tools.",
     invoke_without_command=True,
@@ -111,6 +114,7 @@ def _build_local_mcp_entry(
     api_key: str,
     base_url: str,
     use_python_path: bool = False,
+    command: str | None = None,
 ) -> dict:
     """Build a stdio MCP entry for local self-hosted mode.
 
@@ -125,8 +129,16 @@ def _build_local_mcp_entry(
 
     _ = use_python_path
 
+    command_name = command or sys.executable
+    if command_name == "skyvern":
+        return {
+            "command": command_name,
+            "args": ["run", "mcp"],
+            "env": env_block,
+        }
+
     return {
-        "command": sys.executable,
+        "command": command_name,
         "args": ["-m", "skyvern", "run", "mcp"],
         "env": env_block,
     }
@@ -137,6 +149,8 @@ def _has_api_key(entry: dict | None) -> bool:
     if not entry:
         return False
     if entry.get("headers", {}).get("x-api-key"):
+        return True
+    if entry.get("http_headers", {}).get("x-api-key"):
         return True
     if entry.get("env", {}).get("SKYVERN_API_KEY"):
         return True
@@ -163,6 +177,10 @@ def _mask_secrets(entry: dict) -> dict:
         key = masked["headers"]["x-api-key"]
         masked["headers"]["x-api-key"] = _mask_key(key)
 
+    if "http_headers" in masked and "x-api-key" in masked["http_headers"]:
+        key = masked["http_headers"]["x-api-key"]
+        masked["http_headers"]["x-api-key"] = _mask_key(key)
+
     # Local stdio format: env.SKYVERN_API_KEY
     if "env" in masked and "SKYVERN_API_KEY" in masked["env"]:
         key = masked["env"]["SKYVERN_API_KEY"]
@@ -182,6 +200,60 @@ def _mask_secrets(entry: dict) -> dict:
     return masked
 
 
+def _load_mcp_config(config_path: Path) -> tuple[dict | None, str | None]:
+    """Load and validate an MCP config file, returning (config, error)."""
+    if not config_path.exists():
+        return {}, None
+
+    try:
+        existing = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None, f"Cannot parse {config_path}. Fix the JSON and re-run."
+
+    if not isinstance(existing, dict):
+        return None, f"{config_path} must contain a top-level JSON object."
+
+    servers = existing.get("mcpServers")
+    if servers is not None and not isinstance(servers, dict):
+        return None, f"{config_path} has invalid `mcpServers`; expected a JSON object."
+
+    return existing, None
+
+
+def _read_mcp_config(config_path: Path) -> dict:
+    """Load an MCP config or exit with a user-friendly message."""
+    existing, error = _load_mcp_config(config_path)
+    if error:
+        console.print(f"[red]{error}[/red]")
+        raise typer.Exit(code=1)
+    return existing or {}
+
+
+def _find_server_key(servers: dict[str, object], preferred: str = "skyvern") -> str | None:
+    """Find an existing server key case-insensitively."""
+    for key in servers:
+        if key.lower() == preferred.lower():
+            return key
+    return None
+
+
+def _backup_config_path(config_path: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return config_path.with_name(f"{config_path.name}.bak-{timestamp}")
+
+
+def _write_mcp_config(config_path: Path, config: dict, create_backup: bool = True) -> Path | None:
+    """Write an MCP config, creating a backup of the prior file when overwriting."""
+    backup_path: Path | None = None
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if create_backup and config_path.exists():
+        backup_path = _backup_config_path(config_path)
+        shutil.copy2(config_path, backup_path)
+
+    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return backup_path
+
+
 def _upsert_mcp_config(
     config_path: Path,
     tool_name: str,
@@ -191,17 +263,10 @@ def _upsert_mcp_config(
     yes: bool = False,
 ) -> None:
     """Read config, diff, prompt, and write. Idempotent."""
-    if config_path.exists():
-        try:
-            existing = json.loads(config_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            console.print(f"[red]Cannot parse {config_path}. Fix the JSON and re-run.[/red]")
-            raise typer.Exit(code=1)
-    else:
-        existing = {}
-
+    existing = _read_mcp_config(config_path)
     servers = existing.setdefault("mcpServers", {})
-    current = servers.get(server_key)
+    resolved_server_key = _find_server_key(servers, preferred=server_key) or server_key
+    current = servers.get(resolved_server_key)
 
     if current == skyvern_entry:
         console.print(f"[green]Already configured for {tool_name} (no changes)[/green]")
@@ -233,10 +298,11 @@ def _upsert_mcp_config(
         if not typer.confirm("\nApply changes?"):
             raise typer.Abort()
 
-    servers[server_key] = skyvern_entry
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    servers[resolved_server_key] = skyvern_entry
+    backup_path = _write_mcp_config(config_path, existing, create_backup=True)
     console.print(f"[green]Configured {tool_name} at {config_path}[/green]")
+    if backup_path is not None:
+        console.print(f"[dim]Backup saved to {backup_path}[/dim]")
 
 
 def _build_entry(
@@ -280,30 +346,31 @@ def _is_claude_code_installed() -> bool:
 
 
 def _is_cursor_installed() -> bool:
-    return (Path.home() / ".cursor").is_dir()
+    try:
+        return _cursor_config_path().parent.is_dir()
+    except typer.Exit:
+        return False
 
 
 def _is_windsurf_installed() -> bool:
-    return (Path.home() / ".codeium" / "windsurf").is_dir()
+    try:
+        return _windsurf_config_path().parent.is_dir()
+    except typer.Exit:
+        return False
 
 
 def _is_claude_desktop_installed() -> bool:
-    system = platform.system()
-    if system == "Darwin":
-        return (Path.home() / "Library" / "Application Support" / "Claude").is_dir()
-    if system == "Linux":
-        return (Path.home() / ".config" / "Claude").is_dir()
-    if system == "Windows":
-        appdata = os.environ.get("APPDATA", "")
-        return bool(appdata) and (Path(appdata) / "Claude").is_dir()
-    return False
+    try:
+        return _claude_desktop_config_path().parent.is_dir()
+    except typer.Exit:
+        return False
 
 
 def _get_known_tools() -> list[DetectedTool]:
     """Return all known AI coding tools in detection order.
 
-    Note: Codex is not included — it has no stable local config path to detect.
-    Users can configure it manually via `skyvern setup codex` if/when that subcommand is added.
+    Note: Codex is not included in the guided setup flow yet.
+    Its config is TOML rather than the JSON shape used by the current setup commands.
     """
     return [
         DetectedTool(
@@ -399,12 +466,26 @@ def _resolve_setup_credentials(*, api_key_flag: str | None, yes: bool, local: bo
 
 
 def _claude_desktop_config_path() -> Path:
-    system = platform.system()
-    if system == "Darwin":
+    system = detect_os()
+    if system == "wsl":
+        roaming_path = get_windows_appdata_roaming()
+        if roaming_path is None:
+            console.print("[red]Could not locate Windows AppData\\\\Roaming from WSL.[/red]")
+            raise typer.Exit(code=1)
+        return Path(roaming_path) / "Claude" / "claude_desktop_config.json"
+    if system == "darwin":
         return Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
-    if system == "Linux":
-        return Path.home() / ".config" / "Claude" / "claude_desktop_config.json"
-    if system == "Windows":
+    if system == "linux":
+        candidates = [
+            Path.home() / ".config" / "Claude",
+            Path.home() / ".local" / "share" / "Claude",
+            Path.home() / "Claude",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate / "claude_desktop_config.json"
+        return candidates[0] / "claude_desktop_config.json"
+    if system == "windows":
         appdata = os.environ.get("APPDATA")
         if not appdata:
             console.print("[red]APPDATA environment variable not set on Windows.[/red]")
@@ -414,16 +495,36 @@ def _claude_desktop_config_path() -> Path:
     raise typer.Exit(code=1)
 
 
+def _wsl_windows_user_home() -> Path:
+    roaming_path = get_windows_appdata_roaming()
+    if roaming_path is None:
+        console.print("[red]Could not locate Windows AppData\\\\Roaming from WSL.[/red]")
+        raise typer.Exit(code=1)
+    return roaming_path.parent.parent
+
+
 def _cursor_config_path() -> Path:
+    if detect_os() == "wsl":
+        return _wsl_windows_user_home() / ".cursor" / "mcp.json"
     return Path.home() / ".cursor" / "mcp.json"
 
 
 def _windsurf_config_path() -> Path:
+    if detect_os() == "wsl":
+        return _wsl_windows_user_home() / ".codeium" / "windsurf" / "mcp_config.json"
     return Path.home() / ".codeium" / "windsurf" / "mcp_config.json"
 
 
 def _claude_code_global_config_path() -> Path:
     return Path.home() / ".claude.json"
+
+
+def _claude_code_project_config_path() -> Path:
+    return Path.cwd() / ".mcp.json"
+
+
+def _codex_config_path() -> Path:
+    return Path.home() / ".codex" / "config.toml"
 
 
 _PROJECT_MARKERS = (
