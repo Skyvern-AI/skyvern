@@ -850,7 +850,7 @@ function BrowserStream({
           </>
         )}
         {isExecuting && !recordingStore.isRecording && (
-          <div className="pointer-events-none absolute flex aspect-video w-full animate-glow items-center justify-center rounded-xl p-2 outline outline-8 outline-offset-[-2px] outline-yellow-500">
+          <div className="animate-glow pointer-events-none absolute flex aspect-video w-full items-center justify-center rounded-xl p-2 outline outline-8 outline-offset-[-2px] outline-yellow-500">
             <div className="relative h-full w-full">
               <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2 text-yellow-500">
                 <div className="truncate">Agent is working</div>
