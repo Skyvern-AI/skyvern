@@ -1,29 +1,490 @@
 /* ============================================
-   Skyvern Docs — Brand-Aligned Custom Styles
-   Matches skyvern.com warm editorial aesthetic
+   Skyvern Docs — Editorial Bento Grid
+   Warm brand + structured grid aesthetic
    ============================================ */
 
-/* --- Brand Tokens --- */
+/* --- Brand Tokens (navy product palette + warm landing page) --- */
 :root {
-  --sk-cream: #FAF6F1;
-  --sk-cream-dark: #F2EBE3;
-  --sk-teal: #5B8A8C;
-  --sk-teal-light: #7BA3A5;
-  --sk-teal-faint: #F0FAFA;
-  --sk-orange: #D4733B;
-  --sk-orange-light: #FFF4ED;
-  --sk-charcoal: #2C2C2C;
-  --sk-text-muted: #6B6560;
-  --sk-border: #E5DDD4;
-  --sk-border-hover: #7BA3A5;
+  --sk-cream: #F8F5EF;
+  --sk-cream-dark: #EFEBE4;
+  --sk-navy: #1B2559;
+  --sk-navy-light: #2B3674;
+  --sk-navy-faint: #EEF0F8;
+  --sk-blue: #4A6CF7;
+  --sk-blue-light: #7B93FA;
+  --sk-dark: #1B2559;
+  --sk-dark-hover: #2B3674;
+  --sk-charcoal: #1B2038;
+  --sk-text-muted: #68697B;
+  --sk-border: #D6CEC4;
+  --sk-border-hover: #4A6CF7;
   --sk-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.03);
-  --sk-shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.06), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --sk-shadow-hover: 0 4px 12px rgba(27, 37, 89, 0.1), 0 2px 4px rgba(0, 0, 0, 0.04);
   --sk-radius: 10px;
+  --sk-mono: "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code", monospace;
 }
 
 
 /* =============================================
-   1. CARDS — Softer, warmer, website-aligned
+   HOMEPAGE — Page wrapper (horizontal padding)
+   ============================================= */
+
+.sk-page {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 40px;
+}
+
+@media (max-width: 600px) {
+  .sk-page {
+    padding: 0 20px;
+  }
+}
+
+
+/* =============================================
+   HOMEPAGE — Hero
+   ============================================= */
+
+.sk-hero {
+  border: 1px solid var(--sk-border);
+  border-radius: 2px;
+  margin-bottom: 1px;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Version badge */
+.sk-version-badge {
+  font-family: var(--sk-mono) !important;
+  font-size: 10px !important;
+  letter-spacing: 0.04em !important;
+  padding: 3px 8px !important;
+  border-radius: 3px !important;
+  border: 1px solid var(--sk-border) !important;
+  color: var(--sk-blue) !important;
+  text-decoration: none !important;
+  transition: border-color 0.15s ease !important;
+}
+
+.sk-version-badge:hover {
+  border-color: var(--sk-blue) !important;
+}
+
+.sk-hero-inner {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  min-height: 380px;
+}
+
+.sk-hero-left {
+  padding: 48px 40px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.sk-hero-right {
+  padding: 32px 40px 32px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-left: 1px solid var(--sk-border);
+}
+
+.sk-hero-title {
+  font-size: 38px;
+  font-weight: 700;
+  line-height: 1.12;
+  letter-spacing: -0.03em;
+  margin: 0 0 16px 0;
+  color: var(--sk-charcoal);
+}
+
+.sk-hero-accent {
+  color: var(--sk-blue);
+  font-style: italic;
+}
+
+.sk-hero-sub {
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--sk-text-muted);
+  margin: 0 0 28px 0;
+  max-width: 440px;
+}
+
+.sk-hero-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* --- Monospace utility --- */
+.sk-mono {
+  font-family: var(--sk-mono) !important;
+  font-size: 11px !important;
+  letter-spacing: 0.04em !important;
+}
+
+/* --- Label (section markers like "01 — NO CODE") --- */
+.sk-label {
+  font-family: var(--sk-mono) !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0.08em !important;
+  text-transform: uppercase !important;
+  color: var(--sk-text-muted) !important;
+  margin: 0 0 12px 0 !important;
+}
+
+/* --- Terminal block --- */
+.sk-terminal {
+  width: 100%;
+  max-width: 360px;
+  border: 1px solid var(--sk-border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--sk-charcoal);
+}
+
+.sk-terminal-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+}
+
+.sk-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+.sk-dot-red { background: #ff5f56; }
+.sk-dot-yellow { background: #ffbd2e; }
+.sk-dot-green { background: #27c93f; }
+
+.sk-terminal-title {
+  font-family: var(--sk-mono);
+  font-size: 11px;
+  color: #888;
+  margin-left: 8px;
+}
+
+.sk-terminal-body {
+  padding: 14px 16px;
+}
+
+.sk-terminal-body p {
+  margin: 0 0 4px 0 !important;
+  font-size: 11.5px !important;
+  line-height: 1.6 !important;
+  color: #ccc;
+}
+
+.sk-t-teal { color: #7B93FA !important; }
+.sk-t-orange { color: #F7C948 !important; }
+.sk-t-muted { color: #555 !important; }
+
+/* Blinking cursor */
+.sk-cursor {
+  animation: sk-blink 1s step-end infinite;
+  color: #7B93FA;
+}
+
+@keyframes sk-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+
+/* =============================================
+   HOMEPAGE — Bento Grid System
+   ============================================= */
+
+.sk-bento-row {
+  display: grid;
+  gap: 1px;
+  margin-bottom: 1px;
+}
+
+.sk-bento-3col { grid-template-columns: repeat(3, 1fr); }
+.sk-bento-2col { grid-template-columns: repeat(2, 1fr); }
+.sk-bento-4col { grid-template-columns: repeat(4, 1fr); }
+
+.sk-bento-cell {
+  border: 1px solid var(--sk-border);
+  border-radius: 2px;
+  padding: 28px 24px;
+  background: transparent;
+  position: relative;
+  transition: background-color 0.15s ease;
+}
+
+.sk-bento-cell:hover {
+  background-color: rgba(74, 108, 247, 0.03);
+}
+
+/* Linked cells */
+a.sk-bento-cell-link {
+  text-decoration: none !important;
+  color: inherit !important;
+  display: block;
+}
+
+a.sk-bento-cell-link:hover {
+  background-color: rgba(74, 108, 247, 0.04);
+}
+
+a.sk-bento-cell-link:hover .sk-arrow-lg,
+a.sk-bento-cell-link:hover .sk-arrow-sm {
+  color: var(--sk-blue) !important;
+}
+
+/* --- Cell typography --- */
+
+.sk-cell-title {
+  font-size: 17px;
+  font-weight: 600;
+  margin: 0 0 6px 0;
+  color: var(--sk-charcoal);
+}
+
+.sk-cell-desc {
+  font-size: 14px;
+  color: var(--sk-text-muted);
+  margin: 0 0 20px 0;
+  line-height: 1.5;
+}
+
+.sk-cell-title-sm {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 4px 0;
+  color: var(--sk-charcoal);
+}
+
+.sk-cell-desc-sm {
+  font-size: 13px;
+  color: var(--sk-text-muted);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.sk-bento-cell-sm {
+  padding: 20px;
+}
+
+/* --- Links inside cells --- */
+
+.sk-cell-links {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sk-cell-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--sk-charcoal) !important;
+  text-decoration: none !important;
+  border-radius: 3px;
+  transition: background-color 0.12s ease, color 0.12s ease;
+  border-bottom: none !important;
+}
+
+.sk-cell-link:hover {
+  background-color: rgba(74, 108, 247, 0.06);
+  color: var(--sk-blue) !important;
+}
+
+/* --- Arrows --- */
+
+.sk-arrow {
+  font-family: var(--sk-mono);
+  font-size: 12px;
+  opacity: 0.35;
+  transition: opacity 0.12s ease, color 0.12s ease;
+}
+
+.sk-cell-link:hover .sk-arrow {
+  opacity: 1;
+  color: var(--sk-blue);
+}
+
+.sk-arrow-lg {
+  font-family: var(--sk-mono) !important;
+  font-size: 18px !important;
+  position: absolute;
+  top: 24px;
+  right: 24px;
+  opacity: 0.25;
+  transition: opacity 0.15s ease;
+  color: var(--sk-text-muted) !important;
+}
+
+.sk-arrow-sm {
+  font-family: var(--sk-mono) !important;
+  font-size: 14px !important;
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  opacity: 0.25;
+  transition: opacity 0.15s ease;
+  color: var(--sk-text-muted) !important;
+}
+
+
+/* =============================================
+   HOMEPAGE — Buttons
+   ============================================= */
+
+.sk-btn-primary {
+  display: inline-flex !important;
+  align-items: center !important;
+  padding: 11px 22px !important;
+  border-radius: 6px !important;
+  background-color: var(--sk-dark) !important;
+  color: #fff !important;
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  text-decoration: none !important;
+  transition: background-color 0.15s ease !important;
+  border: none !important;
+}
+
+.sk-btn-primary:hover {
+  background-color: var(--sk-dark-hover) !important;
+}
+
+.sk-btn-secondary {
+  display: inline-flex !important;
+  align-items: center !important;
+  padding: 11px 22px !important;
+  border-radius: 4px !important;
+  background-color: transparent !important;
+  color: var(--sk-charcoal) !important;
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  text-decoration: none !important;
+  border: 1px solid var(--sk-border) !important;
+  transition: border-color 0.15s ease, color 0.15s ease !important;
+}
+
+.sk-btn-secondary:hover {
+  border-color: var(--sk-blue) !important;
+  color: var(--sk-charcoal) !important;
+}
+
+
+/* --- Use case left-border accents --- */
+
+.sk-usecase-teal {
+  border-left: 3px solid var(--sk-blue) !important;
+}
+
+.sk-usecase-orange {
+  border-left: 3px solid var(--sk-dark) !important;
+}
+
+
+/* =============================================
+   HOMEPAGE — Footer CTA
+   ============================================= */
+
+.sk-footer-cta {
+  border: 1px solid var(--sk-border);
+  border-radius: 2px;
+  margin-top: 1px;
+  padding: 20px 24px;
+}
+
+.sk-footer-cta-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sk-footer-cta-text {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--sk-charcoal);
+  margin: 0;
+}
+
+.sk-footer-cta-links {
+  display: flex;
+  gap: 16px;
+}
+
+.sk-footer-link {
+  font-family: var(--sk-mono) !important;
+  font-size: 12px !important;
+  letter-spacing: 0.04em !important;
+  color: var(--sk-text-muted) !important;
+  text-decoration: none !important;
+  transition: color 0.15s ease !important;
+  border-bottom: none !important;
+}
+
+.sk-footer-link:hover {
+  color: var(--sk-blue) !important;
+}
+
+@media (max-width: 600px) {
+  .sk-footer-cta-inner {
+    flex-direction: column;
+    gap: 12px;
+    text-align: center;
+  }
+}
+
+
+/* =============================================
+   RESPONSIVE
+   ============================================= */
+
+@media (max-width: 900px) {
+  .sk-hero-inner {
+    grid-template-columns: 1fr;
+  }
+  .sk-hero-right {
+    border-left: none;
+    border-top: 1px solid var(--sk-border);
+    padding: 24px;
+  }
+  .sk-bento-3col {
+    grid-template-columns: 1fr;
+  }
+  .sk-bento-4col {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 600px) {
+  .sk-bento-2col,
+  .sk-bento-4col {
+    grid-template-columns: 1fr;
+  }
+  .sk-hero-left {
+    padding: 32px 24px;
+  }
+  .sk-hero-title {
+    font-size: 28px;
+  }
+}
+
+
+/* =============================================
+   EXISTING — Cards, Tables, Links, etc.
+   (non-homepage styles)
    ============================================= */
 
 [class*="Card"],
@@ -40,24 +501,11 @@
   border-color: var(--sk-border-hover) !important;
 }
 
-
-
-
-
-/* =============================================
-   3. IMAGES & SCREENSHOTS — Browser-frame feel
-   ============================================= */
-
 article img {
   border: 1px solid var(--sk-border) !important;
   border-radius: var(--sk-radius) !important;
   box-shadow: var(--sk-shadow) !important;
 }
-
-
-/* =============================================
-   4. TABLES — Warm headers, alternating rows
-   ============================================= */
 
 table {
   border-color: var(--sk-border) !important;
@@ -80,49 +528,32 @@ tr:nth-child(even) td {
   background-color: rgba(250, 246, 241, 0.5) !important;
 }
 
-
-/* =============================================
-   5. LINKS — Teal default, orange on hover
-   ============================================= */
-
 article a:not([class]) {
-  color: var(--sk-teal) !important;
+  color: var(--sk-blue) !important;
   text-decoration: none !important;
   border-bottom: 1px solid transparent !important;
   transition: color 0.15s ease, border-color 0.15s ease !important;
 }
 
 article a:not([class]):hover {
-  color: var(--sk-orange) !important;
-  border-bottom-color: var(--sk-orange) !important;
+  color: var(--sk-dark) !important;
+  border-bottom-color: var(--sk-dark) !important;
 }
 
-
-/* =============================================
-   6. CALLOUTS & WARNINGS — Brand-colored
-   ============================================= */
-
-/* Note/Info callouts — teal accent */
 [class*="callout"],
 [class*="Callout"],
 [class*="note"],
 [class*="Note"] {
-  border-left-color: var(--sk-teal) !important;
+  border-left-color: var(--sk-blue) !important;
   border-radius: 0 var(--sk-radius) var(--sk-radius) 0 !important;
-  background-color: var(--sk-teal-faint) !important;
+  background-color: var(--sk-navy-faint) !important;
 }
 
-/* Warning callouts — orange accent */
 [class*="warning"],
 [class*="Warning"] {
-  border-left-color: var(--sk-orange) !important;
-  background-color: var(--sk-orange-light) !important;
+  border-left-color: #E5A236 !important;
+  background-color: #FEF9EE !important;
 }
-
-
-/* =============================================
-   7. ACCORDIONS — Warm border
-   ============================================= */
 
 [class*="Accordion"],
 [class*="accordion"],
@@ -131,52 +562,25 @@ details {
   border-radius: var(--sk-radius) !important;
 }
 
-
-/* =============================================
-   8. HR / SECTION DIVIDERS — Teal gradient
-   ============================================= */
-
 hr {
   border: none !important;
   height: 1px !important;
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    var(--sk-teal-light) 20%,
-    var(--sk-teal) 50%,
-    var(--sk-teal-light) 80%,
-    transparent 100%
-  ) !important;
+  background: linear-gradient(90deg, transparent 0%, var(--sk-blue-light) 20%, var(--sk-blue) 50%, var(--sk-blue-light) 80%, transparent 100%) !important;
   opacity: 0.3 !important;
   margin: 2rem 0 !important;
 }
 
-
-/* =============================================
-   9. STEPS COMPONENT — Teal accent
-   ============================================= */
-
 [class*="Step"] [class*="number"],
 [class*="step"] [class*="number"],
 [class*="Steps"] [class*="indicator"] {
-  background-color: var(--sk-teal) !important;
+  background-color: var(--sk-blue) !important;
   color: white !important;
 }
 
-
-/* =============================================
-   10. SIDEBAR — Active item teal
-   ============================================= */
-
 [data-active="true"],
 [aria-current="page"] {
-  color: var(--sk-teal) !important;
+  color: var(--sk-blue) !important;
 }
-
-
-/* =============================================
-   11. NAVBAR — Warm bottom border
-   ============================================= */
 
 #navbar,
 nav[class*="Navbar"],
@@ -184,19 +588,9 @@ header[class*="header"] {
   border-bottom: 1px solid var(--sk-border) !important;
 }
 
-
-/* =============================================
-   12. TEXT SELECTION — Teal tint
-   ============================================= */
-
 ::selection {
-  background-color: rgba(91, 138, 140, 0.15);
+  background-color: rgba(74, 108, 247, 0.15);
 }
-
-
-/* =============================================
-   13. SCROLLBAR — Subtle warm styling
-   ============================================= */
 
 ::-webkit-scrollbar {
   width: 6px;
@@ -213,35 +607,44 @@ header[class*="header"] {
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--sk-teal-light);
+  background: var(--sk-blue-light);
 }
 
 
 /* =============================================
-   14. DARK MODE OVERRIDES
+   DARK MODE
    ============================================= */
 
 .dark,
 [data-theme="dark"] {
   --sk-cream: #1C1917;
   --sk-cream-dark: #252220;
-  --sk-teal-faint: rgba(91, 138, 140, 0.08);
-  --sk-orange-light: rgba(212, 115, 59, 0.08);
+  --sk-navy-faint: rgba(74, 108, 247, 0.08);
+  --sk-dark: #7B93FA;
+  --sk-dark-hover: #93A7FB;
   --sk-charcoal: #F5F0EB;
   --sk-text-muted: #A8A29E;
   --sk-border: #2E2A26;
-  --sk-border-hover: #5B8A8C;
+  --sk-border-hover: #4A6CF7;
   --sk-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
   --sk-shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 
-/* Dark mode alternating rows */
+.dark .sk-terminal,
+[data-theme="dark"] .sk-terminal {
+  border-color: #333;
+}
+
+.dark .sk-cell-link:hover,
+[data-theme="dark"] .sk-cell-link:hover {
+  background-color: rgba(74, 108, 247, 0.1);
+}
+
 .dark tr:nth-child(even) td,
 [data-theme="dark"] tr:nth-child(even) td {
   background-color: rgba(28, 25, 23, 0.5) !important;
 }
 
-/* Dark mode scrollbar */
 .dark ::-webkit-scrollbar-track,
 [data-theme="dark"] ::-webkit-scrollbar-track {
   background: #1C1917;

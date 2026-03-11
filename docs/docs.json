@@ -3,16 +3,16 @@
   "theme": "palm",
   "name": "Skyvern",
   "colors": {
-    "primary": "#5B8A8C",
-    "light": "#7BA3A5",
-    "dark": "#D4733B"
+    "primary": "#4A6CF7",
+    "light": "#7B93FA",
+    "dark": "#1B2559"
   },
   "appearance": {
     "default": "light"
   },
   "background": {
     "color": {
-      "light": "#FAF6F1",
+      "light": "#F8F5EF",
       "dark": "#1C1917"
     }
   },
@@ -37,6 +37,10 @@
   },
   "navigation": {
     "tabs": [
+      {
+        "tab": "Home",
+        "pages": ["index"]
+      },
       {
         "tab": "Documentation",
         "groups": [
@@ -242,6 +246,7 @@
       "twitter": "https://twitter.com/skyvernai"
     }
   },
+  "css": "/style.css",
   "api": {
     "baseUrl": "https://api.skyvern.com",
     "auth": {
