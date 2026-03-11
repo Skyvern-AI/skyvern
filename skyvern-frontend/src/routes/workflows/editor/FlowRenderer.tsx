@@ -466,6 +466,29 @@ function FlowRenderer({
     };
   }, [reactFlowInstance, debouncedLayoutForDimensions]);
 
+  // Re-layout when a workflow trigger node's async content changes
+  // (e.g., target workflow parameters finish loading, skeleton → actual fields)
+  useEffect(() => {
+    const handleTriggerContentChanged = () => {
+      setTimeout(() => {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const currentEdges = reactFlowInstance.getEdges();
+        debouncedLayoutForDimensions(currentNodes, currentEdges);
+      }, 10);
+    };
+
+    window.addEventListener(
+      "workflow-trigger-content-changed",
+      handleTriggerContentChanged,
+    );
+    return () => {
+      window.removeEventListener(
+        "workflow-trigger-content-changed",
+        handleTriggerContentChanged,
+      );
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+
   useEffect(() => {
     const topLevelBlocks = getWorkflowBlocks(nodes, edges);
     const debuggable = topLevelBlocks.filter((block) =>

@@ -112,9 +112,15 @@ function Settings() {
           <CustomCredentialServiceConfigForm />
         </CardContent>
       </Card>
-      {versionData?.version && (
+      {(__APP_VERSION__ !== "development" || versionData?.version) && (
         <p className="text-center text-xs text-muted-foreground/50">
-          v{formatVersion(versionData.version)}
+          {__APP_VERSION__ !== "development" && (
+            <>UI: {formatVersion(__APP_VERSION__)}</>
+          )}
+          {__APP_VERSION__ !== "development" && versionData?.version && " | "}
+          {versionData?.version && (
+            <>API: {formatVersion(versionData.version)}</>
+          )}
         </p>
       )}
     </div>
