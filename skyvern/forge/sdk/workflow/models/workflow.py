@@ -229,6 +229,7 @@ class WorkflowRunResponseBase(BaseModel):
     browser_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
+    run_with: str | None = None
     script_run: ScriptRunResponse | None = None
     errors: list[dict[str, Any]] | None = None
 
