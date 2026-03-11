@@ -1,5 +1,4 @@
 import json
-import uuid
 from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
@@ -199,25 +198,48 @@ def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     return result
 
 
-DB_CONNECT_ARGS: dict[str, Any] = {}
+def _build_engine(database_string: str) -> Any:
+    """
+    Build a SQLAlchemy async engine.
 
-if "postgresql+psycopg" in settings.DATABASE_STRING:
-    DB_CONNECT_ARGS = {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"}
-elif "postgresql+asyncpg" in settings.DATABASE_STRING:
-    DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
+    When DISABLE_CONNECTION_POOL=True (NullPool): enforce statement_timeout
+    and allow prepared statements.
+
+    When DISABLE_CONNECTION_POOL=False (QueuePool): disable prepared statements
+    and do not set statement_timeout - set at role level in the database,
+    since the transaction pooler does not maintain session-level settings.
+    """
+    connect_args: dict[str, Any] = {}
+    if settings.DISABLE_CONNECTION_POOL:
+        if "postgresql+psycopg" in database_string:
+            connect_args["options"] = f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"
+        if "postgresql+asyncpg" in database_string:
+            connect_args["server_settings"] = {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}
+        return create_async_engine(
+            database_string,
+            json_serializer=_custom_json_serializer,
+            connect_args=connect_args,
+            poolclass=pool.NullPool,
+        )
+
+    else:
+        if "postgresql+psycopg" in database_string:
+            connect_args["prepare_threshold"] = None
+        if "postgresql+asyncpg" in database_string:
+            connect_args["statement_cache_size"] = 0
+        return create_async_engine(
+            database_string,
+            json_serializer=_custom_json_serializer,
+            connect_args=connect_args,
+            pool_pre_ping=True,
+            pool_size=settings.DATABASE_POOL_SIZE,
+            max_overflow=settings.DATABASE_POOL_MAX_OVERFLOW,
+        )
 
 
 class AgentDB(BaseAlchemyDB):
     def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
-        super().__init__(
-            db_engine
-            or create_async_engine(
-                database_string,
-                json_serializer=_custom_json_serializer,
-                connect_args=DB_CONNECT_ARGS,
-                poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
-            )
-        )
+        super().__init__(db_engine or _build_engine(database_string))
         self.debug_enabled = debug_enabled
 
     def is_retryable_error(self, error: SQLAlchemyError) -> bool:
@@ -5326,7 +5348,6 @@ class AgentDB(BaseAlchemyDB):
                     if persistent_browser_session.completed_at:
                         return PersistentBrowserSession.model_validate(persistent_browser_session)
                     persistent_browser_session.completed_at = datetime.utcnow()
-                    persistent_browser_session.status = "completed"
                     await session.commit()
                     await session.refresh(persistent_browser_session)
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
@@ -5341,54 +5362,11 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def archive_browser_session_address(self, session_id: str, organization_id: str) -> None:
-        """Suffix browser_address with a unique tag so the unique constraint
-        no longer blocks new sessions that reuse the same local address."""
-        try:
-            async with self.Session() as session:
-                row = (
-                    await session.scalars(
-                        select(PersistentBrowserSessionModel)
-                        .filter_by(persistent_browser_session_id=session_id)
-                        .filter_by(organization_id=organization_id)
-                        .filter_by(deleted_at=None)
-                    )
-                ).first()
-
-                if not row or not row.browser_address:
-                    return
-                if "::closed::" in row.browser_address:
-                    return
-
-                row.browser_address = f"{row.browser_address}::closed::{uuid.uuid4().hex}"
-                await session.commit()
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
-        except Exception:
-            LOG.error("UnexpectedError", exc_info=True)
-            raise
-
     async def get_all_active_persistent_browser_sessions(self) -> List[PersistentBrowserSessionModel]:
         """Get all active persistent browser sessions across all organizations."""
         try:
             async with self.Session() as session:
                 result = await session.execute(select(PersistentBrowserSessionModel).filter_by(deleted_at=None))
-                return result.scalars().all()
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
-        except Exception:
-            LOG.error("UnexpectedError", exc_info=True)
-            raise
-
-    async def get_uncompleted_persistent_browser_sessions(self) -> List[PersistentBrowserSessionModel]:
-        """Get all browser sessions that have not been completed or deleted."""
-        try:
-            async with self.Session() as session:
-                result = await session.execute(
-                    select(PersistentBrowserSessionModel).filter_by(deleted_at=None).filter_by(completed_at=None)
-                )
                 return result.scalars().all()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)

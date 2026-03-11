@@ -3787,6 +3787,7 @@ class WorkflowService:
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             task_v2=task_v2,
             browser_address=workflow_run.browser_address,
+            run_with=workflow_run.run_with,
             script_run=workflow_run.script_run,
             errors=errors,
         )

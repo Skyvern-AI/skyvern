@@ -6,14 +6,20 @@ AI-powered browser automation skills for coding agents. Bundled with `pip instal
 
 ```bash
 pip install skyvern
-export SKYVERN_API_KEY="YOUR_KEY"   # get one at https://app.skyvern.com
 
-# Set up MCP + install skills in one step:
+# Recommended local self-hosted path:
+skyvern quickstart   # or: skyvern init
+# choose local
+# choose Claude Code during the MCP step
+
+# You can also configure Claude Code later:
 skyvern setup claude-code
 ```
 
-`skyvern setup claude-code` registers the Skyvern MCP server and installs these
-skills into your project's `.claude/skills/` directory automatically.
+The local wizard path writes project-local `.mcp.json`, pins the MCP command to
+your active Python interpreter, and installs these skills into
+`.claude/skills/` automatically. `skyvern setup claude-code` does the same
+setup later if you skipped it during `quickstart` / `init`.
 
 ## What's Included
 
