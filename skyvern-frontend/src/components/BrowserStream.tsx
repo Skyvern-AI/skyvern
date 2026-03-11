@@ -108,6 +108,7 @@ type Props = {
   };
   resizeTrigger?: number;
   isVisible?: boolean;
+  isExecuting?: boolean;
   // --
   onClose?: () => void;
 };
@@ -121,6 +122,7 @@ function BrowserStream({
   workflow = undefined,
   resizeTrigger,
   isVisible = true,
+  isExecuting = false,
   // --
   onClose,
 }: Props) {
@@ -846,6 +848,15 @@ function BrowserStream({
               </div>
             </div>
           </>
+        )}
+        {isExecuting && !recordingStore.isRecording && (
+          <div className="animate-glow pointer-events-none absolute flex aspect-video w-full items-center justify-center rounded-xl p-2 outline outline-8 outline-offset-[-2px] outline-yellow-500">
+            <div className="relative h-full w-full">
+              <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2 text-yellow-500">
+                <div className="truncate">Agent is working</div>
+              </div>
+            </div>
+          </div>
         )}
         {!isReady && (
           <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">

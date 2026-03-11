@@ -1579,6 +1579,7 @@ function Workspace({
                         }
                         showControlButtons={true}
                         resizeTrigger={windowResizeTrigger}
+                        isExecuting={!!workflowRun && !isFinalized}
                       />
                     </div>
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
