@@ -198,6 +198,7 @@ Validate blocks with skyvern_block_validate() before submitting.
 Split workflows into multiple blocks — one block per logical step — rather than cramming everything into a single block.
 Use **navigation** blocks for actions (filling forms, clicking buttons) and **extraction** blocks for pulling data.
 Do NOT use the deprecated "task" or "task_v2" block types — use "navigation" for actions and "extraction" for data extraction. These replacements give clearer semantics and are what the Skyvern UI uses. Existing workflows with task/task_v2 blocks will continue to work — do not convert them unless the user asks. New workflows must use navigation/extraction.
+For **text_prompt** blocks, default to Skyvern Optimized by omitting both `model` and `llm_key`. If an explicit model is required, use `model: {"model_name": "<value from /models>"}`. Do not invent internal `llm_key` strings.
 
 GOOD (4 blocks, each with clear single responsibility):
   Block 1 (navigation): "Select Sole Proprietor and click Continue"

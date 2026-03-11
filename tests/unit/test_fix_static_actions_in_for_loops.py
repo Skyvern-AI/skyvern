@@ -378,3 +378,31 @@ class TestFixStaticActionsInForLoops:
                 break
         else:
             raise AssertionError("Expected a prompt=f line with current_value")
+
+    def test_prompt_with_curly_braces_are_escaped(self) -> None:
+        """Existing braces in prompt text must be escaped to avoid f-string evaluation."""
+        body = textwrap.dedent("""\
+            await page.click(
+                selector='a.download-link',
+                ai='fallback',
+                prompt='Extract items matching {pattern}',
+            )""")
+        result = _patch_static_clicks_in_block(body)
+        assert "ai='proactive'" in result
+        # Original braces must be doubled so they're literal in the f-string
+        assert "{{pattern}}" in result
+        # The injected Target should still reference current_value
+        assert "{current_value}" in result
+
+    def test_two_level_nested_selector_is_matched(self) -> None:
+        """Selectors like tr:has(td:has-text("Report")) must not break the regex."""
+        body = textwrap.dedent("""\
+            await page.click(
+                selector='tr:has(td:has-text("Report"))',
+                ai='fallback',
+                prompt='Click row',
+            )""")
+        result = _patch_static_clicks_in_block(body)
+        assert "ai='proactive'" in result
+        assert "ai='fallback'" not in result
+        assert "current_value" in result

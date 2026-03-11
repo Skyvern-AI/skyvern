@@ -495,7 +495,8 @@ _FOR_LOOP_RE = re.compile(
 # nested quantifiers would cause exponential backtracking.
 _PAGE_CLICK_START_RE = re.compile(r"await page\.click\(")
 # Matches a prompt='...' or prompt="..." keyword argument inside a function call.
-_PROMPT_KWARG_RE = re.compile(r"""prompt\s*=\s*(['"])(.*?)\1""", re.DOTALL)
+# Uses (?:\\.|…) to skip backslash-escaped quotes so apostrophes don't truncate the match.
+_PROMPT_KWARG_RE = re.compile(r"""prompt\s*=\s*(['"])((?:\\.|(?!\1).)*?)\1""", re.DOTALL)
 
 
 def _find_click_calls(text: str) -> list[tuple[int, int, str]]:
@@ -622,8 +623,10 @@ def _patch_static_clicks_in_block(body: str) -> str:
         if prompt_match:
             quote = prompt_match.group(1)
             original_prompt = prompt_match.group(2)
-            # Use an f-string so current_value is evaluated at runtime
-            new_prompt = f"prompt=f{quote}{original_prompt} Target: {{current_value}}{quote}"
+            # Use an f-string so current_value is evaluated at runtime.
+            # Escape existing braces so they are literal in the f-string.
+            escaped_prompt = original_prompt.replace("{", "{{").replace("}", "}}")
+            new_prompt = f"prompt=f{quote}{escaped_prompt} Target: {{current_value}}{quote}"
             patched = patched[: prompt_match.start()] + new_prompt + patched[prompt_match.end() :]
         else:
             # No prompt= kwarg — add one with current_value context

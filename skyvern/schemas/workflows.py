@@ -1,4 +1,5 @@
 import abc
+import functools
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -7,6 +8,8 @@ import structlog
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from skyvern.config import settings
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
 from skyvern.utils.strings import sanitize_identifier
@@ -42,6 +45,26 @@ def sanitize_parameter_key(value: str) -> str:
         A sanitized key that is a valid Python identifier
     """
     return sanitize_identifier(value, default="parameter")
+
+
+def _has_jinja_syntax(value: str) -> bool:
+    return "{{" in value or "{%" in value
+
+
+@functools.lru_cache(maxsize=1)
+def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
+    """Build a reverse mapping from internal llm_key to public model_name.
+
+    Cached because settings don't change at runtime.  Tests that monkeypatch
+    settings must call ``_get_text_prompt_model_name_by_llm_key.cache_clear()``
+    to avoid cross-test pollution.
+    """
+    reverse_mapping: dict[str, str] = {}
+    for model_name, metadata in SettingsManager.get_settings().get_model_name_to_llm_key().items():
+        llm_key = metadata.get("llm_key")
+        if llm_key and llm_key not in reverse_mapping:
+            reverse_mapping[llm_key] = model_name
+    return reverse_mapping
 
 
 def _replace_references_in_value(value: Any, old_key: str, new_key: str) -> Any:
@@ -678,6 +701,42 @@ class TextPromptBlockYAML(BlockYAML):
     prompt: str
     parameter_keys: list[str] | None = None
     json_schema: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def normalize_llm_selection(self) -> "TextPromptBlockYAML":
+        raw_llm_key = self.llm_key.strip() if self.llm_key else None
+
+        if self.model:
+            # `model` is the stable public contract; ignore any raw llm_key override
+            # once a model has been selected.
+            self.llm_key = None
+            return self
+
+        if not raw_llm_key:
+            self.llm_key = None
+            return self
+
+        if _has_jinja_syntax(raw_llm_key):
+            self.llm_key = raw_llm_key
+            return self
+
+        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
+        if model_name:
+            self.model = {"model_name": model_name}
+            self.llm_key = None
+            return self
+
+        if raw_llm_key in LLMConfigRegistry.get_model_names():
+            self.llm_key = raw_llm_key
+            return self
+
+        LOG.warning(
+            "Unrecognized text prompt llm_key; defaulting to Skyvern Optimized/default model path",
+            label=self.label,
+            llm_key=raw_llm_key,
+        )
+        self.llm_key = None
+        return self
 
 
 class DownloadToS3BlockYAML(BlockYAML):

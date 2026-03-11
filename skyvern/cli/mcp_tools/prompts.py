@@ -90,6 +90,16 @@ Keep engine 1.0 (default, omit field) when:
 When in doubt, split into multiple 1.0 blocks rather than using one 2.0 block — it's cheaper and
 gives you per-block observability.  Only navigation blocks support engine 2.0.
 
+### Model selection for text_prompt blocks
+
+Default to Skyvern Optimized for text_prompt blocks by omitting both `model` and `llm_key`.
+
+If the user explicitly asks for a specific model, use the public `model` field:
+  `"model": {"model_name": "<one of the values returned by /models>"}`
+
+Do NOT invent internal `llm_key` strings like `ANTHROPIC_CLAUDE_3_5_SONNET`.
+Only use `llm_key` when the user explicitly provides an exact internal key and wants that advanced override.
+
 ### One block per logical step
 
 Split workflows into small, focused blocks.  Each block should do ONE thing.
