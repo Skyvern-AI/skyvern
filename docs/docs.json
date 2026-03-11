@@ -1,26 +1,53 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
+  "theme": "palm",
   "name": "Skyvern",
   "colors": {
-    "primary": "#6366F1",
-    "light": "#818CF8",
-    "dark": "#4F46E5"
+    "primary": "#4A6CF7",
+    "light": "#7B93FA",
+    "dark": "#1B2559"
+  },
+  "appearance": {
+    "default": "light"
+  },
+  "background": {
+    "color": {
+      "light": "#F8F5EF",
+      "dark": "#1C1917"
+    }
+  },
+  "fonts": {
+    "heading": {
+      "family": "Inter",
+      "weight": 600
+    },
+    "body": {
+      "family": "Inter",
+      "weight": 400
+    }
   },
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg",
+    "light": "/logo/light.png",
+    "dark": "/logo/dark.png",
     "href": "https://skyvern.com"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "/favicon.png",
+  "search": {
+    "prompt": "Search Skyvern docs..."
+  },
   "navigation": {
     "tabs": [
+      {
+        "tab": "Home",
+        "pages": ["index"]
+      },
       {
         "tab": "Documentation",
         "groups": [
           {
             "group": "Getting Started",
             "pages": [
+              "getting-started/introduction",
               "getting-started/quickstart",
               "getting-started/core-concepts"
             ]
@@ -46,7 +73,6 @@
             "group": "Optimization",
             "pages": [
               "optimization/browser-sessions",
-              "optimization/browser-tunneling",
               "optimization/browser-profiles",
               "optimization/cost-control"
             ]
@@ -68,6 +94,7 @@
             "pages": [
               "debugging/using-artifacts",
               "debugging/troubleshooting-guide",
+              "debugging/observability-with-laminar",
               "debugging/faq"
             ]
           },
@@ -191,9 +218,7 @@
       },
       {
         "tab": "Changelog",
-        "pages": [
-          "changelog"
-        ]
+        "pages": ["changelog"]
       },
       {
         "tab": "API Reference",
@@ -221,6 +246,7 @@
       "twitter": "https://twitter.com/skyvernai"
     }
   },
+  "css": "/style.css",
   "api": {
     "baseUrl": "https://api.skyvern.com",
     "auth": {
