@@ -161,6 +161,10 @@ skyvern setup claude-code --skip-skills  # MCP only, no skills
 skyvern setup claude                 # Configure Claude Desktop only
 skyvern setup cursor                 # Configure Cursor only
 skyvern setup windsurf               # Configure Windsurf only
+skyvern mcp switch                   # Interactively switch existing Skyvern MCP configs
+skyvern mcp switch --dry-run         # Preview changes without writing files
+skyvern mcp profile list             # List saved switch sources
+skyvern mcp profile save work-prod --api-key YOUR_KEY --base-url https://api.skyvern.com
 ```
 
 Use bare `skyvern setup` to configure everything at once. The per-tool subcommands are for when you only want to target one tool.
@@ -168,6 +172,8 @@ Use bare `skyvern setup` to configure everything at once. The per-tool subcomman
 `skyvern setup claude-code` writes the MCP config **and** copies bundled skills (including `/qa`) into your project's `.claude/skills/` directory. In a project, the default target is `.mcp.json`; use `--global` to override. Use `--skip-skills` to opt out.
 
 For Claude Desktop on macOS or Windows, the recommended no-Node path is the downloadable `.mcpb` bundle in [MCP Server](/integrations/mcp). `skyvern setup claude` still writes the manual `mcp-remote` JSON bridge, so remote mode requires Node.js unless you use the bundle.
+
+`skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, and Codex configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
 
 ### Self-hosted setup
 
