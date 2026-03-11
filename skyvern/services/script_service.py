@@ -429,12 +429,21 @@ async def _create_workflow_block_run_and_task(
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
         workflow_run_context.update_block_metadata(label, context.loop_metadata)
 
+    current_value_str = None
+    current_index_val = None
+    if context.loop_metadata:
+        cv = context.loop_metadata.get("current_value")
+        current_value_str = str(cv) if cv is not None else None
+        current_index_val = context.loop_metadata.get("current_index")
+
     workflow_run_block = await app.DATABASE.create_workflow_run_block(
         workflow_run_id=workflow_run_id,
         parent_workflow_run_block_id=context.parent_workflow_run_block_id,
         organization_id=organization_id,
         block_type=block_type,
         label=label,
+        current_value=current_value_str,
+        current_index=current_index_val,
     )
 
     workflow_run_block_id = workflow_run_block.workflow_run_block_id
