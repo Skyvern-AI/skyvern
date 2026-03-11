@@ -10,4 +10,10 @@ describe("formatVersion", () => {
   test("passes through arbitrary strings as-is", () => {
     expect(formatVersion("custom-build")).toBe("custom-build");
   });
+
+  test("truncates full git SHAs to 7 characters", () => {
+    expect(formatVersion("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")).toBe(
+      "a1b2c3d",
+    );
+  });
 });
