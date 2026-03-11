@@ -800,6 +800,68 @@ Use the evidence that actually matters:
 
 ---
 
+## Step 5: Post Evidence to PR
+
+After generating the QA report, persist it to the pull request as a sticky comment so the
+evidence survives beyond the conversation.
+
+### Check for an open PR
+
+```bash
+PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null)
+```
+
+If no PR exists for the current branch:
+1. Save the full report markdown to `.qa/latest-report.md` in the project root (create the directory if needed).
+2. Tell the user: "No open PR found for this branch. QA report saved to `.qa/latest-report.md`. Run /qa again after creating a PR to post it."
+3. Stop here — do not attempt to create a PR.
+
+### Post or update the sticky comment
+
+Use a hidden HTML marker to make the comment idempotent across multiple runs:
+
+```bash
+# Prepare the comment body with the hidden marker
+COMMENT_BODY="<!-- skyvern-qa-report -->
+## QA Report — $(git rev-parse --short HEAD) — $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+<the full report markdown from Step 4>
+"
+
+# Find an existing QA comment on the PR
+EXISTING_COMMENT_ID=$(gh api "repos/{owner}/{repo}/issues/${PR_NUMBER}/comments" \\
+  --jq '.[] | select(.body | test("skyvern-qa-report")) | .id' \\
+  2>/dev/null | head -1)
+
+if [ -n "$EXISTING_COMMENT_ID" ]; then
+  # Update the existing comment in place
+  gh api "repos/{owner}/{repo}/issues/comments/${EXISTING_COMMENT_ID}" \\
+    -X PATCH -f body="$COMMENT_BODY"
+else
+  # Create a new comment
+  gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
+fi
+```
+
+### Screenshot handling
+
+Screenshots taken during QA (via `skyvern_screenshot()`) are saved locally for the agent's
+verification. They are not uploaded to the PR comment because GitHub's API does not support
+image uploads in issue comments. The text report describes what was observed.
+
+If the user asks to preserve screenshots, save them to `.qa/screenshots/` and tell the user
+the local path. Do not include local file paths in the PR comment — they are meaningless to
+other reviewers.
+
+### Rules
+
+- Always include the `<!-- skyvern-qa-report -->` marker so repeated runs update the same comment instead of creating duplicates.
+- Include the short commit hash and UTC timestamp in the comment header.
+- Do not create a PR just to post a QA report — that is the user's decision.
+- If `gh` is not available or not authenticated, fall back to saving the report locally and tell the user.
+
+---
+
 ## Tool Selection
 
 | What you need | Tool | Speed |

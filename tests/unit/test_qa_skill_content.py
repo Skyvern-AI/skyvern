@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from skyvern.cli.mcp_tools.prompts import QA_TEST_CONTENT, qa_test
 
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLED_QA_SKILL = ROOT / "skyvern" / "cli" / "skills" / "qa" / "SKILL.md"
+CLAUDE_QA_SKILL = ROOT / ".claude" / "skills" / "qa" / "SKILL.md"
+
+_needs_cloud_repo = pytest.mark.skipif(
+    not CLAUDE_QA_SKILL.exists(),
+    reason=".claude/skills/qa/SKILL.md not present (OSS checkout)",
+)
 
 
 def _first_nonempty_line_after_h1(text: str) -> str:
@@ -19,6 +29,11 @@ def _first_nonempty_line_after_h1(text: str) -> str:
             continue
         return line
     return ""
+
+
+@_needs_cloud_repo
+def test_bundled_and_claude_qa_skill_match_exactly() -> None:
+    assert BUNDLED_QA_SKILL.read_text(encoding="utf-8") == CLAUDE_QA_SKILL.read_text(encoding="utf-8")
 
 
 def test_qa_skill_has_summary_line_before_note_comment() -> None:
@@ -78,3 +93,32 @@ def test_qa_test_prompt_includes_target_url_and_focus_area() -> None:
     assert "Target URL: `http://localhost:8000`" in rendered
     assert "Focus area: validate the workflow filters API" in rendered
     assert "choose the correct validation mode" in rendered
+
+
+def test_qa_pr_evidence_markers_present() -> None:
+    """Assert the PR evidence posting instructions are present in all /qa surfaces."""
+    skill_text = BUNDLED_QA_SKILL.read_text(encoding="utf-8")
+
+    # Check SKILL.md
+    assert "<!-- skyvern-qa-report -->" in skill_text
+    assert "Post Evidence to PR" in skill_text
+    assert ".qa/latest-report.md" in skill_text
+    assert "gh pr comment" in skill_text
+
+    # Check QA_TEST_CONTENT (MCP prompt)
+    assert "<!-- skyvern-qa-report -->" in QA_TEST_CONTENT
+    assert "Post Evidence to PR" in QA_TEST_CONTENT
+    assert ".qa/latest-report.md" in QA_TEST_CONTENT
+    assert "gh pr comment" in QA_TEST_CONTENT
+
+
+@_needs_cloud_repo
+def test_validate_skills_package_script_passes() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "validate_skills_package.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
