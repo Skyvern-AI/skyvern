@@ -1091,12 +1091,16 @@ function collectLabelsForBranch(
   startLabel: string | null,
   stopLabel: string | null,
   blocksByLabel: Map<string, WorkflowBlock>,
+  excludeLabels?: Set<string>,
 ): Array<string> {
   const labels: Array<string> = [];
   const visited = new Set<string>();
   let current = startLabel ?? null;
 
   while (current && current !== stopLabel && !visited.has(current)) {
+    if (excludeLabels?.has(current)) {
+      break;
+    }
     visited.add(current);
     labels.push(current);
     const block = blocksByLabel.get(current);
@@ -1142,7 +1146,7 @@ function reconstructConditionalStructure(
   });
 
   // Process each conditional block
-  blocks.forEach((block) => {
+  blocks.forEach((block, blockIndex) => {
     if (block.block_type !== "conditional") {
       if (block.block_type === "for_loop") {
         // Recursively handle conditionals inside loops
@@ -1169,6 +1173,16 @@ function reconstructConditionalStructure(
     const conditionalNode = labelToNodeMap.get(block.label);
     if (!conditionalNode) {
       return;
+    }
+
+    // Blocks at or before this conditional must not be collected as branch
+    // children. Without this guard, next_block_label chains that loop back
+    // to earlier blocks (e.g. reporting → fetch_token) would pull the
+    // conditional itself into its own branch, setting parentId to its own id
+    // and crashing React Flow with a stack overflow.
+    const excludeLabels = new Set<string>();
+    for (let i = 0; i <= blockIndex; i++) {
+      excludeLabels.add(blocks[i]!.label);
     }
 
     // Create START and NodeAdder nodes for this conditional
@@ -1201,6 +1215,7 @@ function reconstructConditionalStructure(
         branch.next_block_label,
         block.next_block_label ?? null,
         blocksByLabel,
+        excludeLabels,
       );
 
       // Set metadata and parentId for all nodes in this branch
@@ -1558,13 +1573,20 @@ function getElements(
     // conditional's own edges).
     const branchLabels = new Set<string>();
     const collectBranchLabels = (loopChildren: Array<WorkflowBlock>) => {
-      loopChildren.forEach((child) => {
+      loopChildren.forEach((child, childIndex) => {
         if (child.block_type === "conditional") {
+          // Exclude labels at or before this conditional to prevent
+          // back-reference chains from pulling in earlier blocks
+          const loopExclude = new Set<string>();
+          for (let i = 0; i <= childIndex; i++) {
+            loopExclude.add(loopChildren[i]!.label);
+          }
           child.branch_conditions.forEach((branch) => {
             collectLabelsForBranch(
               branch.next_block_label,
               child.next_block_label ?? null,
               blocksByLabel,
+              loopExclude,
             ).forEach((label) => branchLabels.add(label));
           });
         }
@@ -2090,9 +2112,14 @@ function findNextBlockLabel(
       return null;
     }
 
-    // If this node itself is a conditional, prefer its own merge label
+    // If this node itself is a conditional, compute merge label from edges
+    // (not node.data.mergeLabel which may be stale from deserialization)
     if (currentNode.type === "conditional") {
-      return currentNode.data.mergeLabel ?? null;
+      return findConditionalMergeLabel(
+        currentNode as ConditionalNode,
+        nodes,
+        edges,
+      );
     }
 
     const conditionalNodeId = currentNode.data.conditionalNodeId;

@@ -25,9 +25,11 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useToast } from "@/components/ui/use-toast";
 import { Pencil1Icon } from "@radix-ui/react-icons";
 
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { CopyAndExplainCode } from "../editor/Workspace";
 import { ScriptFixInput } from "./ScriptFixInput";
+
+const enableCodeBlock =
+  import.meta.env.VITE_ENABLE_CODE_BLOCK?.toLowerCase() === "true";
 
 interface Props {
   showCacheKeyValueSelector?: boolean;
@@ -35,7 +37,6 @@ interface Props {
 
 function WorkflowRunCode(props?: Props) {
   const showCacheKeyValueSelector = props?.showCacheKeyValueSelector ?? false;
-  const codeBlockEnabled = useFeatureFlag("CODE_BLOCK_ENABLED");
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const { toast } = useToast();
@@ -285,7 +286,7 @@ function WorkflowRunCode(props?: Props) {
 
   // Edit button shown when not in edit mode and there's a script to edit
   const editButton =
-    codeBlockEnabled && canEdit && !isEditing ? (
+    enableCodeBlock && canEdit && !isEditing ? (
       <Button
         variant="outline"
         size="sm"
@@ -299,7 +300,7 @@ function WorkflowRunCode(props?: Props) {
 
   // Save / Cancel buttons shown during edit mode
   const editActions =
-    codeBlockEnabled && isEditing ? (
+    enableCodeBlock && isEditing ? (
       <div className="flex items-center gap-2">
         <Button
           variant="ghost"
@@ -376,7 +377,7 @@ function WorkflowRunCode(props?: Props) {
           {versionSelector}
           {!isEditing && code.length > 0 && <CopyAndExplainCode code={code} />}
         </div>
-        {codeBlockEnabled &&
+        {enableCodeBlock &&
           code.length > 0 &&
           isFinalized &&
           workflowPermanentId && (
@@ -463,7 +464,7 @@ function WorkflowRunCode(props?: Props) {
         ) : null}
         {!isEditing && code.length > 0 && <CopyAndExplainCode code={code} />}
       </div>
-      {codeBlockEnabled &&
+      {enableCodeBlock &&
         code.length > 0 &&
         isFinalized &&
         workflowPermanentId && (
