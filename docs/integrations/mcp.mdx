@@ -141,24 +141,58 @@ Use this if you are self-hosting Skyvern and want the MCP server to talk to your
 pip install skyvern
 ```
 
-Before using MCP, start your local Skyvern server:
+### Recommended local Claude Code flow
+
+Run the setup wizard from your project or repo root:
+
+```bash
+skyvern quickstart
+# or: skyvern init
+```
+
+Choose:
+
+1. `local`
+2. `Claude Code` during the MCP setup step
+
+When you do that, Skyvern will:
+
+- generate local `SKYVERN_BASE_URL` and `SKYVERN_API_KEY`
+- write `.mcp.json` in the current project when you run inside a repo or app directory
+- pin the MCP command to the active Python interpreter with `python -m skyvern run mcp`
+- install bundled Claude Code skills into `.claude/skills/`, including `/qa`
+
+This path stays fully local. Claude Code talks to your local Skyvern server over stdio, so `localhost` targets work directly and you do **not** need Skyvern Cloud, `mcp-remote`, or browser tunneling.
+
+Before using MCP, start your local Skyvern server if `skyvern init` did not already do it:
 
 ```bash
 skyvern run server
 ```
 
-Then configure your AI client to use stdio transport:
+### Manual local MCP config
+
+If you want to configure your client manually instead of using the wizard, use stdio transport:
 
 <Tabs>
 <Tab title="Claude Code">
 
-```bash
-# For Skyvern Cloud, use https://api.skyvern.com instead of localhost
-claude mcp add --transport stdio skyvern \
-  --env SKYVERN_BASE_URL=http://localhost:8000 \
-  --env SKYVERN_API_KEY=YOUR_SKYVERN_API_KEY \
-  -- python3 -m skyvern run mcp
+```json
+{
+  "mcpServers": {
+    "skyvern": {
+      "command": "/usr/bin/python3",
+      "args": ["-m", "skyvern", "run", "mcp"],
+      "env": {
+        "SKYVERN_BASE_URL": "http://localhost:8000",
+        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
 ```
+
+Write this to `.mcp.json` in your project root, or to `~/.claude.json` for a user-level config. Replace `/usr/bin/python3` with the Python interpreter from the environment where you installed Skyvern.
 
 </Tab>
 <Tab title="Claude Desktop / Cursor / Windsurf">
@@ -201,7 +235,7 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 </Tabs>
 
 <Tip>
-You can also run `skyvern init` to auto-detect installed clients and write configs automatically.
+`skyvern init` and `skyvern quickstart` can write the local MCP config for you. In a project directory, choosing Claude Code defaults to project-local `.mcp.json` and installs `.claude/skills/qa`.
 </Tip>
 
 <Accordion title="Config file locations by client">
@@ -254,7 +288,7 @@ If timeouts persist, check that your Skyvern account is active and has available
 </Accordion>
 
 <Accordion title="Python version errors (local mode only)">
-The Skyvern MCP server requires Python 3.11, 3.12, or 3.13. Check your version with `python3 --version`. If you have multiple Python versions installed, make sure the `command` in your MCP config points to a supported version:
+The Skyvern MCP server requires Python 3.11, 3.12, or 3.13. Check your version with `python3 --version`. Skyvern's generated local config already pins the active interpreter path automatically. If you are editing the config manually, make sure the `command` points to a supported version:
 
 ```bash
 which python3.11
@@ -276,6 +310,8 @@ skyvern run server
 ```
 
 Confirm the server is reachable at `http://localhost:8000`. If you changed the port, update `SKYVERN_BASE_URL` in your MCP config to match.
+
+You do not need Skyvern Cloud or browser tunneling for this path. Claude Code talks to the local MCP process over stdio, and that process talks to your local Skyvern server.
 </Accordion>
 
 <Accordion title="MCP client doesn't detect Skyvern">
@@ -286,5 +322,6 @@ which python3
 ```
 
 Use the full absolute path (e.g., `/usr/bin/python3` or `/Users/you/.pyenv/shims/python3`), not just `python3`. Restart your MCP client after editing the config file.
-</Accordion>
 
+If you used the wizard, re-run `skyvern init` or `skyvern setup claude-code --local` from the same Python environment to regenerate the config with the correct interpreter path.
+</Accordion>
