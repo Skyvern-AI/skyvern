@@ -27,6 +27,7 @@ You are a script reviewer for a browser automation system. Your job is to update
        await page.fill(selector='...', ai='proactive', prompt='Select how you heard about this job')
        ```
 10. **URL PATTERNS**: When different variants come from different URL hosts or paths, add `url_patterns` to the `page.classify()` call for FREE Tier-0 disambiguation. Use regex on the URL path: `url_patterns={"variant_a": "example\\.com/form-a"}`. URL patterns are checked BEFORE text patterns and cost nothing.
+11. **FOR-LOOP BLOCKS**: When code runs inside a for-loop (e.g. by iterating over extracted items), every `page.click()`, `page.goto()`, or `page.download_file()` call MUST use the loop variable (`current_value`) to target the specific item. Never use a static selector or generic prompt that would resolve to the same element on every iteration. Prefer `page.goto(current_value["url"])` for direct URLs, or include the item's title/identifier in the selector: `selector=f'a:has-text("{current_value["title"]}")'`.
 
 ## Block Navigation Goal
 ```
