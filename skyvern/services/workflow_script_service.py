@@ -489,16 +489,37 @@ async def generate_workflow_script(
 _FOR_LOOP_RE = re.compile(
     r"^(?P<indent> *)async for current_value in skyvern\.loop\(.*\):\s*$",
 )
-# Matches `await page.click(` with its arguments spanning multiple lines.
-# We look for click calls that use ai='fallback' but don't reference current_value.
-# The args group supports one level of nested parens so CSS pseudo-selectors
-# like `:has-text(...)` or `:nth-child(2)` don't truncate the match.
-_PAGE_CLICK_CALL_RE = re.compile(
-    r"(?P<full>await page\.click\((?P<args>(?:[^()]*|\([^()]*\))*)\))",
-    re.DOTALL,
-)
+# Matches the start of an `await page.click(` call.  We find the balanced
+# closing paren programmatically so CSS pseudo-selectors like `:has-text(...)`
+# or `:nth-child(2)` don't truncate the match — and we avoid a regex whose
+# nested quantifiers would cause exponential backtracking.
+_PAGE_CLICK_START_RE = re.compile(r"await page\.click\(")
 # Matches a prompt='...' or prompt="..." keyword argument inside a function call.
 _PROMPT_KWARG_RE = re.compile(r"""prompt\s*=\s*(['"])(.*?)\1""", re.DOTALL)
+
+
+def _find_click_calls(text: str) -> list[tuple[int, int, str]]:
+    """Find all ``await page.click(...)`` calls with balanced parentheses.
+
+    Returns a list of (start, end, args) tuples where *start*/*end* are byte
+    offsets into *text* spanning the full call and *args* is the text between
+    the outer parentheses.
+    """
+    results: list[tuple[int, int, str]] = []
+    for m in _PAGE_CLICK_START_RE.finditer(text):
+        start = m.start()
+        pos = m.end()
+        depth = 1
+        while pos < len(text) and depth > 0:
+            ch = text[pos]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            pos += 1
+        if depth == 0:
+            results.append((start, pos, text[m.end() : pos - 1]))
+    return results
 
 
 def _fix_static_actions_in_for_loops(code: str) -> str:
@@ -556,23 +577,26 @@ def _fix_static_actions_in_for_loops(code: str) -> str:
 
 def _patch_static_clicks_in_block(body: str) -> str:
     """Patch page.click() calls that don't reference current_value."""
+    calls = _find_click_calls(body)
+    if not calls:
+        return body
 
-    def _replace_click(match: re.Match[str]) -> str:
-        full = match.group("full")
-        args = match.group("args")
+    # Process matches in reverse order so earlier offsets stay valid.
+    for call_start, call_end, args in reversed(calls):
+        full = body[call_start:call_end]
 
         # If the call already references current_value, leave it alone
         if "current_value" in args:
-            return full
+            continue
 
         # Only patch clicks that explicitly use ai='fallback'.  Proactive
         # clicks already use the LLM, and clicks with no ai= kwarg are not
         # part of the AI-fallback system so should be left alone.
         if "ai='proactive'" in args or 'ai="proactive"' in args:
-            return full
+            continue
         has_fallback = "ai='fallback'" in args or 'ai="fallback"' in args
         if not has_fallback:
-            return full
+            continue
 
         # Upgrade ai='fallback' to ai='proactive'
         patched = full
@@ -584,12 +608,11 @@ def _patch_static_clicks_in_block(body: str) -> str:
         # Derive indentation from the position of the match in the body text
         # so injected code is correctly aligned regardless of nesting level.
         # Walk backwards from the match start to find the beginning of the line.
-        match_start = match.start()
-        line_start = body.rfind("\n", 0, match_start)
+        line_start = body.rfind("\n", 0, call_start)
         if line_start == -1:
-            leading_text = body[:match_start]
+            leading_text = body[:call_start]
         else:
-            leading_text = body[line_start + 1 : match_start]
+            leading_text = body[line_start + 1 : call_start]
         base_indent = leading_text if leading_text.isspace() or leading_text == "" else ""
         kwarg_indent = base_indent + "    "
 
@@ -614,9 +637,9 @@ def _patch_static_clicks_in_block(body: str) -> str:
                     + patched[close_paren_idx:]
                 )
 
-        return patched
+        body = body[:call_start] + patched + body[call_end:]
 
-    return _PAGE_CLICK_CALL_RE.sub(_replace_click, body)
+    return body
 
 
 _IMPORT_RE = re.compile(r"^(?:import |from \S+ import )")
