@@ -13,6 +13,7 @@ from ..credential import credential_app
 from ..credentials import credentials_app
 from ..docs import docs_app
 from ..init_command import init_browser, init_env
+from ..mcp_commands import mcp_app
 from ..quickstart import quickstart_app
 from ..run_commands import run_app
 from ..setup_commands import setup_app
@@ -89,6 +90,7 @@ cli_app.command(name="signup", hidden=True)(signup_command)  # backwards compat
 
 # Browser automation commands
 cli_app.add_typer(browser_app, name="browser", help="Browser automation commands.")
+cli_app.add_typer(mcp_app, name="mcp", help="Switch local MCP client configs and manage optional saved profiles.")
 cli_app.add_typer(skill_app, name="skill", help="Manage bundled skill reference files.")
 cli_app.add_typer(setup_app, name="setup", help="Register Skyvern MCP with AI coding tools.")
 
