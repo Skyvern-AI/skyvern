@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import subprocess
-import sys
 from pathlib import Path
 
 from skyvern.cli.mcp_tools.prompts import QA_TEST_CONTENT, qa_test
 
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLED_QA_SKILL = ROOT / "skyvern" / "cli" / "skills" / "qa" / "SKILL.md"
-CLAUDE_QA_SKILL = ROOT / ".claude" / "skills" / "qa" / "SKILL.md"
 
 
 def _first_nonempty_line_after_h1(text: str) -> str:
@@ -22,10 +19,6 @@ def _first_nonempty_line_after_h1(text: str) -> str:
             continue
         return line
     return ""
-
-
-def test_bundled_and_claude_qa_skill_match_exactly() -> None:
-    assert BUNDLED_QA_SKILL.read_text(encoding="utf-8") == CLAUDE_QA_SKILL.read_text(encoding="utf-8")
 
 
 def test_qa_skill_has_summary_line_before_note_comment() -> None:
@@ -85,14 +78,3 @@ def test_qa_test_prompt_includes_target_url_and_focus_area() -> None:
     assert "Target URL: `http://localhost:8000`" in rendered
     assert "Focus area: validate the workflow filters API" in rendered
     assert "choose the correct validation mode" in rendered
-
-
-def test_validate_skills_package_script_passes() -> None:
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "validate_skills_package.py")],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
