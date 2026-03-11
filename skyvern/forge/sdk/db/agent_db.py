@@ -198,25 +198,48 @@ def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     return result
 
 
-DB_CONNECT_ARGS: dict[str, Any] = {}
+def _build_engine(database_string: str) -> Any:
+    """
+    Build a SQLAlchemy async engine.
 
-if "postgresql+psycopg" in settings.DATABASE_STRING:
-    DB_CONNECT_ARGS = {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"}
-elif "postgresql+asyncpg" in settings.DATABASE_STRING:
-    DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
+    When DISABLE_CONNECTION_POOL=True (NullPool): enforce statement_timeout
+    and allow prepared statements.
+
+    When DISABLE_CONNECTION_POOL=False (QueuePool): disable prepared statements
+    and do not set statement_timeout - set at role level in the database,
+    since the transaction pooler does not maintain session-level settings.
+    """
+    connect_args: dict[str, Any] = {}
+    if settings.DISABLE_CONNECTION_POOL:
+        if "postgresql+psycopg" in database_string:
+            connect_args["options"] = f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"
+        if "postgresql+asyncpg" in database_string:
+            connect_args["server_settings"] = {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}
+        return create_async_engine(
+            database_string,
+            json_serializer=_custom_json_serializer,
+            connect_args=connect_args,
+            poolclass=pool.NullPool,
+        )
+
+    else:
+        if "postgresql+psycopg" in database_string:
+            connect_args["prepare_threshold"] = None
+        if "postgresql+asyncpg" in database_string:
+            connect_args["statement_cache_size"] = 0
+        return create_async_engine(
+            database_string,
+            json_serializer=_custom_json_serializer,
+            connect_args=connect_args,
+            pool_pre_ping=True,
+            pool_size=settings.DATABASE_POOL_SIZE,
+            max_overflow=settings.DATABASE_POOL_MAX_OVERFLOW,
+        )
 
 
 class AgentDB(BaseAlchemyDB):
     def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
-        super().__init__(
-            db_engine
-            or create_async_engine(
-                database_string,
-                json_serializer=_custom_json_serializer,
-                connect_args=DB_CONNECT_ARGS,
-                poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
-            )
-        )
+        super().__init__(db_engine or _build_engine(database_string))
         self.debug_enabled = debug_enabled
 
     def is_retryable_error(self, error: SQLAlchemyError) -> bool:

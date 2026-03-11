@@ -97,10 +97,15 @@ cli_app.add_typer(setup_app, name="setup", help="Register Skyvern MCP with AI co
 def init_callback(
     ctx: typer.Context,
     no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
+    database_string: str = typer.Option(
+        "",
+        "--database-string",
+        help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
+    ),
 ) -> None:
     """Run full initialization when no subcommand is provided."""
     if ctx.invoked_subcommand is None:
-        init_env(no_postgres=no_postgres)
+        init_env(no_postgres=no_postgres, database_string=database_string)
 
 
 @init_app.command(name="browser")

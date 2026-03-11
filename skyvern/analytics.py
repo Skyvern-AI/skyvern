@@ -8,6 +8,7 @@ import structlog
 import typer
 from posthog import Posthog
 
+from skyvern._version import __version__ as _build_version
 from skyvern.config import settings
 
 LOG = structlog.get_logger(__name__)
@@ -27,6 +28,10 @@ DISTINCT_ID = "oss"
 
 
 def get_oss_version() -> str:
+    # CI builds stamp skyvern/_version.py with the git SHA; prefer that.
+    if _build_version and _build_version != "development":
+        return _build_version
+    # Fallback for pip-installed environments (e.g. OSS users)
     try:
         return importlib.metadata.version("skyvern")
     except Exception:
