@@ -1,0 +1,248 @@
+/* ============================================
+   Skyvern Docs — Brand-Aligned Custom Styles
+   Matches skyvern.com warm editorial aesthetic
+   ============================================ */
+
+/* --- Brand Tokens --- */
+:root {
+  --sk-cream: #FAF6F1;
+  --sk-cream-dark: #F2EBE3;
+  --sk-teal: #5B8A8C;
+  --sk-teal-light: #7BA3A5;
+  --sk-teal-faint: #F0FAFA;
+  --sk-orange: #D4733B;
+  --sk-orange-light: #FFF4ED;
+  --sk-charcoal: #2C2C2C;
+  --sk-text-muted: #6B6560;
+  --sk-border: #E5DDD4;
+  --sk-border-hover: #7BA3A5;
+  --sk-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.03);
+  --sk-shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.06), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --sk-radius: 10px;
+}
+
+
+/* =============================================
+   1. CARDS — Softer, warmer, website-aligned
+   ============================================= */
+
+[class*="Card"],
+.card {
+  border: 1px solid var(--sk-border) !important;
+  border-radius: 12px !important;
+  box-shadow: var(--sk-shadow) !important;
+  transition: box-shadow 0.2s ease, border-color 0.2s ease !important;
+}
+
+[class*="Card"]:hover,
+.card:hover {
+  box-shadow: var(--sk-shadow-hover) !important;
+  border-color: var(--sk-border-hover) !important;
+}
+
+
+
+
+
+/* =============================================
+   3. IMAGES & SCREENSHOTS — Browser-frame feel
+   ============================================= */
+
+article img {
+  border: 1px solid var(--sk-border) !important;
+  border-radius: var(--sk-radius) !important;
+  box-shadow: var(--sk-shadow) !important;
+}
+
+
+/* =============================================
+   4. TABLES — Warm headers, alternating rows
+   ============================================= */
+
+table {
+  border-color: var(--sk-border) !important;
+  border-radius: var(--sk-radius) !important;
+  overflow: hidden;
+}
+
+th {
+  background-color: var(--sk-cream-dark) !important;
+  border-color: var(--sk-border) !important;
+  color: var(--sk-charcoal) !important;
+  font-weight: 600 !important;
+}
+
+td {
+  border-color: var(--sk-border) !important;
+}
+
+tr:nth-child(even) td {
+  background-color: rgba(250, 246, 241, 0.5) !important;
+}
+
+
+/* =============================================
+   5. LINKS — Teal default, orange on hover
+   ============================================= */
+
+article a:not([class]) {
+  color: var(--sk-teal) !important;
+  text-decoration: none !important;
+  border-bottom: 1px solid transparent !important;
+  transition: color 0.15s ease, border-color 0.15s ease !important;
+}
+
+article a:not([class]):hover {
+  color: var(--sk-orange) !important;
+  border-bottom-color: var(--sk-orange) !important;
+}
+
+
+/* =============================================
+   6. CALLOUTS & WARNINGS — Brand-colored
+   ============================================= */
+
+/* Note/Info callouts — teal accent */
+[class*="callout"],
+[class*="Callout"],
+[class*="note"],
+[class*="Note"] {
+  border-left-color: var(--sk-teal) !important;
+  border-radius: 0 var(--sk-radius) var(--sk-radius) 0 !important;
+  background-color: var(--sk-teal-faint) !important;
+}
+
+/* Warning callouts — orange accent */
+[class*="warning"],
+[class*="Warning"] {
+  border-left-color: var(--sk-orange) !important;
+  background-color: var(--sk-orange-light) !important;
+}
+
+
+/* =============================================
+   7. ACCORDIONS — Warm border
+   ============================================= */
+
+[class*="Accordion"],
+[class*="accordion"],
+details {
+  border-color: var(--sk-border) !important;
+  border-radius: var(--sk-radius) !important;
+}
+
+
+/* =============================================
+   8. HR / SECTION DIVIDERS — Teal gradient
+   ============================================= */
+
+hr {
+  border: none !important;
+  height: 1px !important;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--sk-teal-light) 20%,
+    var(--sk-teal) 50%,
+    var(--sk-teal-light) 80%,
+    transparent 100%
+  ) !important;
+  opacity: 0.3 !important;
+  margin: 2rem 0 !important;
+}
+
+
+/* =============================================
+   9. STEPS COMPONENT — Teal accent
+   ============================================= */
+
+[class*="Step"] [class*="number"],
+[class*="step"] [class*="number"],
+[class*="Steps"] [class*="indicator"] {
+  background-color: var(--sk-teal) !important;
+  color: white !important;
+}
+
+
+/* =============================================
+   10. SIDEBAR — Active item teal
+   ============================================= */
+
+[data-active="true"],
+[aria-current="page"] {
+  color: var(--sk-teal) !important;
+}
+
+
+/* =============================================
+   11. NAVBAR — Warm bottom border
+   ============================================= */
+
+#navbar,
+nav[class*="Navbar"],
+header[class*="header"] {
+  border-bottom: 1px solid var(--sk-border) !important;
+}
+
+
+/* =============================================
+   12. TEXT SELECTION — Teal tint
+   ============================================= */
+
+::selection {
+  background-color: rgba(91, 138, 140, 0.15);
+}
+
+
+/* =============================================
+   13. SCROLLBAR — Subtle warm styling
+   ============================================= */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--sk-cream);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--sk-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--sk-teal-light);
+}
+
+
+/* =============================================
+   14. DARK MODE OVERRIDES
+   ============================================= */
+
+.dark,
+[data-theme="dark"] {
+  --sk-cream: #1C1917;
+  --sk-cream-dark: #252220;
+  --sk-teal-faint: rgba(91, 138, 140, 0.08);
+  --sk-orange-light: rgba(212, 115, 59, 0.08);
+  --sk-charcoal: #F5F0EB;
+  --sk-text-muted: #A8A29E;
+  --sk-border: #2E2A26;
+  --sk-border-hover: #5B8A8C;
+  --sk-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  --sk-shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+/* Dark mode alternating rows */
+.dark tr:nth-child(even) td,
+[data-theme="dark"] tr:nth-child(even) td {
+  background-color: rgba(28, 25, 23, 0.5) !important;
+}
+
+/* Dark mode scrollbar */
+.dark ::-webkit-scrollbar-track,
+[data-theme="dark"] ::-webkit-scrollbar-track {
+  background: #1C1917;
+}

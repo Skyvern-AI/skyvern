@@ -1,18 +1,40 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
+  "theme": "palm",
   "name": "Skyvern",
   "colors": {
-    "primary": "#6366F1",
-    "light": "#818CF8",
-    "dark": "#4F46E5"
+    "primary": "#5B8A8C",
+    "light": "#7BA3A5",
+    "dark": "#D4733B"
+  },
+  "appearance": {
+    "default": "light"
+  },
+  "background": {
+    "color": {
+      "light": "#FAF6F1",
+      "dark": "#1C1917"
+    }
+  },
+  "fonts": {
+    "heading": {
+      "family": "Inter",
+      "weight": 600
+    },
+    "body": {
+      "family": "Inter",
+      "weight": 400
+    }
   },
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg",
+    "light": "/logo/light.png",
+    "dark": "/logo/dark.png",
     "href": "https://skyvern.com"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "/favicon.png",
+  "search": {
+    "prompt": "Search Skyvern docs..."
+  },
   "navigation": {
     "tabs": [
       {
