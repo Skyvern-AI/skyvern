@@ -130,10 +130,14 @@ jobs:
           steps.check-migrations.outputs.has_migrations == 'true' && steps.file-sync.outputs.pull_request_urls
 
         uses: actions/github-script@v6
+        env:
+          PR_URLS_RAW: ${{ steps.file-sync.outputs.pull_request_urls }}
+          SOURCE_PR_URL: ${{ steps.pr_details.outputs.PR_URL }}
         with:
           github-token: ${{ steps.git-creds.outputs.GH_PAT }}
           script: |
-            const urlsRaw = `${{ steps.file-sync.outputs.pull_request_urls }}`;
+            const urlsRaw = process.env.PR_URLS_RAW;
+            const sourcePrUrl = process.env.SOURCE_PR_URL;
             let urls;
             try {
               urls = JSON.parse(urlsRaw);
@@ -156,7 +160,7 @@ jobs:
                     '',
                     'Please check if corresponding migrations need to be created in the cloud repo.',
                     '',
-                    `Source PR: ${{ steps.pr_details.outputs.PR_URL }}`
+                    `Source PR: ${sourcePrUrl}`
                   ].join('\n')
                 });
               }
