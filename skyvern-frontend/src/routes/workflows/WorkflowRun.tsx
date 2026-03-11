@@ -452,6 +452,7 @@ function WorkflowRun() {
                     proxyLocation,
                     webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
                     maxScreenshotScrolls,
+                    runWith: workflowRun?.run_with,
                   }}
                 >
                   <PlayIcon className="mr-2 h-4 w-4" />
