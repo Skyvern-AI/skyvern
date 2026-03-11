@@ -600,11 +600,8 @@ def _patch_static_clicks_in_block(body: str) -> str:
             quote = prompt_match.group(1)
             original_prompt = prompt_match.group(2)
             # Use an f-string so current_value is evaluated at runtime
-            new_prompt = (
-                f'prompt=f{quote}{original_prompt} '
-                f'Target: {{current_value}}{quote}'
-            )
-            patched = patched[:prompt_match.start()] + new_prompt + patched[prompt_match.end():]
+            new_prompt = f"prompt=f{quote}{original_prompt} Target: {{current_value}}{quote}"
+            patched = patched[: prompt_match.start()] + new_prompt + patched[prompt_match.end() :]
         else:
             # No prompt= kwarg — add one with current_value context
             # Insert before the closing paren
