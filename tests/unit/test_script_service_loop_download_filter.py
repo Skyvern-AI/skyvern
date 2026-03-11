@@ -122,7 +122,11 @@ def test_append_to_loop_output_merges_downloaded_files() -> None:
     entry = mock_context.loop_output_values[0]
     assert entry["current_value"]["name"] == "test"
     assert entry["current_value"]["downloaded_files"] == ["/path/to/file.pdf"]
-    assert entry["current_value"]["extracted_information"] == {"key": "val"}
+    # extracted_information should NOT be copied into current_value — it already
+    # lives in output_value and duplicating it causes _collect_extracted_information
+    # to count it twice.
+    assert "extracted_information" not in entry["current_value"]
+    assert entry["output_value"]["extracted_information"] == {"key": "val"}
     assert entry["loop_value"] == {"name": "test"}
     assert entry["label"] == "my_block"
 
