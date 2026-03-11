@@ -112,7 +112,6 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     # Stop cleanup scheduler
     await stop_cleanup_scheduler()
 
-
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
         try:
