@@ -432,6 +432,9 @@ async def generate_workflow_script(
         LOG.error("Failed to generate workflow script source", exc_info=True)
         return
 
+    # 3.5) Post-process: fix static actions inside for-loop blocks
+    python_src = _fix_static_actions_in_for_loops(python_src)
+
     # 4) Persist script and files, then record mapping
     content_bytes = python_src.encode("utf-8")
     content_b64 = base64.b64encode(content_bytes).decode("utf-8")
@@ -477,6 +480,146 @@ async def generate_workflow_script(
             workflow_run_id=workflow_run.workflow_run_id,
             status=status,
         )
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: fix static actions inside for-loop blocks
+# ---------------------------------------------------------------------------
+# Matches `async for current_value in skyvern.loop(...):`  blocks.
+_FOR_LOOP_RE = re.compile(
+    r"^(?P<indent> *)async for current_value in skyvern\.loop\(.*\):\s*$",
+)
+# Matches `await page.click(` with its arguments spanning multiple lines.
+# We look for click calls that use ai='fallback' but don't reference current_value.
+# The args group supports one level of nested parens so CSS pseudo-selectors
+# like `:has-text(...)` or `:nth-child(2)` don't truncate the match.
+_PAGE_CLICK_CALL_RE = re.compile(
+    r"(?P<full>await page\.click\((?P<args>(?:[^()]*|\([^()]*\))*)\))",
+    re.DOTALL,
+)
+# Matches a prompt='...' or prompt="..." keyword argument inside a function call.
+_PROMPT_KWARG_RE = re.compile(r"""prompt\s*=\s*(['"])(.*?)\1""", re.DOTALL)
+
+
+def _fix_static_actions_in_for_loops(code: str) -> str:
+    """Detect page.click() calls inside for-loops that don't reference the loop variable.
+
+    When a click action inside a for-loop uses a static selector/prompt (not referencing
+    ``current_value``), it will resolve to the same element on every iteration — a common
+    bug in generated download scripts.
+
+    Fix: inject ``current_value`` into the prompt and upgrade ``ai='fallback'`` to
+    ``ai='proactive'`` so the LLM can disambiguate which element to click.
+    """
+    lines = code.split("\n")
+    result_lines: list[str] = []
+    i = 0
+    patched_count = 0
+
+    while i < len(lines):
+        line = lines[i]
+        m = _FOR_LOOP_RE.match(line)
+        if not m:
+            result_lines.append(line)
+            i += 1
+            continue
+
+        # Found a for-loop header. Collect the indented body.
+        loop_indent = m.group("indent")
+        body_indent_prefix = loop_indent + "    "  # 4-space indent inside loop
+        result_lines.append(line)
+        i += 1
+
+        # Gather body lines (lines that are indented deeper than the for-loop header or blank)
+        body_start = len(result_lines)
+        while i < len(lines):
+            body_line = lines[i]
+            # Body continues if the line is blank, or indented deeper than the for-loop
+            if body_line.strip() == "" or body_line.startswith(body_indent_prefix):
+                result_lines.append(body_line)
+                i += 1
+            else:
+                break
+
+        # Now check the body for static page.click() calls
+        body_text = "\n".join(result_lines[body_start:])
+        new_body_text = _patch_static_clicks_in_block(body_text)
+        if new_body_text != body_text:
+            patched_count += 1
+            # Replace body lines
+            result_lines[body_start:] = new_body_text.split("\n")
+
+    if patched_count > 0:
+        LOG.info("Fixed static click actions in for-loop blocks", patched_blocks=patched_count)
+    return "\n".join(result_lines)
+
+
+def _patch_static_clicks_in_block(body: str) -> str:
+    """Patch page.click() calls that don't reference current_value."""
+
+    def _replace_click(match: re.Match[str]) -> str:
+        full = match.group("full")
+        args = match.group("args")
+
+        # If the call already references current_value, leave it alone
+        if "current_value" in args:
+            return full
+
+        # Only patch clicks that explicitly use ai='fallback'.  Proactive
+        # clicks already use the LLM, and clicks with no ai= kwarg are not
+        # part of the AI-fallback system so should be left alone.
+        if "ai='proactive'" in args or 'ai="proactive"' in args:
+            return full
+        has_fallback = "ai='fallback'" in args or 'ai="fallback"' in args
+        if not has_fallback:
+            return full
+
+        # Upgrade ai='fallback' to ai='proactive'
+        patched = full
+        if "ai='fallback'" in patched:
+            patched = patched.replace("ai='fallback'", "ai='proactive'")
+        elif 'ai="fallback"' in patched:
+            patched = patched.replace('ai="fallback"', 'ai="proactive"')
+
+        # Derive indentation from the position of the match in the body text
+        # so injected code is correctly aligned regardless of nesting level.
+        # Walk backwards from the match start to find the beginning of the line.
+        match_start = match.start()
+        line_start = body.rfind("\n", 0, match_start)
+        if line_start == -1:
+            leading_text = body[:match_start]
+        else:
+            leading_text = body[line_start + 1 : match_start]
+        base_indent = leading_text if leading_text.isspace() or leading_text == "" else ""
+        kwarg_indent = base_indent + "    "
+
+        # Append current_value context to the prompt so the LLM knows which item to target
+        # Look for an existing prompt= kwarg and append to it
+        prompt_match = _PROMPT_KWARG_RE.search(patched)
+        if prompt_match:
+            quote = prompt_match.group(1)
+            original_prompt = prompt_match.group(2)
+            # Use an f-string so current_value is evaluated at runtime
+            new_prompt = (
+                f'prompt=f{quote}{original_prompt} '
+                f'Target: {{current_value}}{quote}'
+            )
+            patched = patched[:prompt_match.start()] + new_prompt + patched[prompt_match.end():]
+        else:
+            # No prompt= kwarg — add one with current_value context
+            # Insert before the closing paren
+            close_paren_idx = patched.rfind(")")
+            if close_paren_idx > 0:
+                before = patched[:close_paren_idx].rstrip().rstrip(",")
+                patched = (
+                    before
+                    + f",\n{kwarg_indent}prompt=f'Click the element for: {{current_value}}',\n{base_indent}"
+                    + patched[close_paren_idx:]
+                )
+
+        return patched
+
+    return _PAGE_CLICK_CALL_RE.sub(_replace_click, body)
 
 
 _IMPORT_RE = re.compile(r"^(?:import |from \S+ import )")
@@ -774,6 +917,7 @@ async def create_script_version_from_review(
         )
         if main_py_content:
             patched_main = _patch_main_py(main_py_content, updated_blocks)
+            patched_main = _fix_static_actions_in_for_loops(patched_main)
             patched_bytes = patched_main.encode("utf-8")
             patched_hash = hashlib.sha256(patched_bytes).hexdigest()
 

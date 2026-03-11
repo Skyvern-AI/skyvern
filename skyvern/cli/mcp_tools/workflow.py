@@ -200,6 +200,34 @@ def _validate_definition_structure(json_def: WorkflowCreateYamlRequest | None, a
     return None
 
 
+_CODE_V2_DEFAULTS: dict[str, Any] = {
+    "adaptive_caching": True,
+    "run_with": "code",
+}
+
+
+def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
+    """Inject Code 2.0 defaults into a JSON definition string when not explicitly set.
+
+    Only modifies JSON definitions (or auto-detected JSON). YAML is returned unchanged.
+    """
+    if fmt == "yaml":
+        return definition
+
+    try:
+        raw = json.loads(definition)
+    except (json.JSONDecodeError, TypeError):
+        return definition  # let _parse_definition handle the error
+
+    changed = False
+    for key, value in _CODE_V2_DEFAULTS.items():
+        if key not in raw:
+            raw[key] = value
+            changed = True
+
+    return json.dumps(raw) if changed else definition
+
+
 def _parse_definition(
     definition: str, fmt: str
 ) -> tuple[WorkflowCreateYamlRequest | None, str | None, dict[str, Any] | None]:
@@ -346,6 +374,9 @@ async def skyvern_workflow_create(
     """Create a new Skyvern workflow from a YAML or JSON definition. Use when you need to save
     a new automation workflow that can be run repeatedly with different parameters.
 
+    By default, workflows created via MCP use Code 2.0 (adaptive caching with run_with="code").
+    To disable this, explicitly set "adaptive_caching": false and/or "run_with": null in your definition.
+
     Best practice: use one block per logical step with a short focused prompt (2-3 sentences).
     Use "navigation" blocks for actions (filling forms, clicking) and "extraction" blocks for pulling data.
     Do NOT use the deprecated "task" block type.
@@ -396,6 +427,10 @@ async def skyvern_workflow_create(
                 "Use 'json', 'yaml', or 'auto'",
             ),
         )
+
+    # Default to Code 2.0 for MCP-created workflows (create only, not update).
+    # Inject defaults into the raw JSON before parsing so explicit user values are preserved.
+    definition = _inject_code_v2_defaults(definition, format)
 
     json_def, yaml_def, parse_err = _parse_definition(definition, format)
     if parse_err is not None:
