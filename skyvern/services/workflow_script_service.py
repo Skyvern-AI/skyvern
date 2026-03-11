@@ -288,6 +288,38 @@ async def get_workflow_script_by_cache_key_value(
     )
 
 
+async def get_latest_published_script(
+    organization_id: str,
+    workflow_permanent_id: str,
+) -> Script | None:
+    """Get the latest published script for a workflow (any cache key value).
+
+    When multiple published workflow scripts exist (e.g. different cache_key_value
+    variants), this returns the script with the highest version number to ensure
+    the most recently reviewed code is selected.
+    """
+    workflow_scripts = await app.DATABASE.get_workflow_scripts_by_permanent_id(
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        statuses=[ScriptStatus.published],
+    )
+    if not workflow_scripts:
+        return None
+
+    # N+1 queries: one per workflow_script. Acceptable because the number of
+    # published cache_key_value variants per workflow is typically 1-3.
+    # TODO: add a bulk get_latest_script_versions() if this becomes a bottleneck.
+    best: Script | None = None
+    for ws in workflow_scripts:
+        script = await app.DATABASE.get_latest_script_version(
+            script_id=ws.script_id,
+            organization_id=organization_id,
+        )
+        if script and (best is None or script.version > best.version):
+            best = script
+    return best
+
+
 async def _load_cached_script_block_sources(
     script: Script,
     organization_id: str,
@@ -634,7 +666,7 @@ async def create_script_version_from_review(
     base_script: Script,
     updated_blocks: dict[str, str],
     workflow: Workflow,
-    workflow_run: WorkflowRun,
+    workflow_run: WorkflowRun | None = None,
     conditional_blocks: dict[str, str] | None = None,
 ) -> Script | None:
     """Create a new script version incorporating updated block code from the AI reviewer.
@@ -656,7 +688,7 @@ async def create_script_version_from_review(
             organization_id=organization_id,
             script_id=base_script.script_id,
             version=base_script.version + 1,
-            run_id=workflow_run.workflow_run_id,
+            run_id=workflow_run.workflow_run_id if workflow_run else None,
         )
 
         # Copy existing script blocks from the base revision
@@ -714,7 +746,7 @@ async def create_script_version_from_review(
                     script_block_label=sb.script_block_label,
                     script_file_id=new_file.file_id,
                     run_signature=block_run_signature,
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run_id=workflow_run.workflow_run_id if workflow_run else None,
                     input_fields=sb.input_fields,
                     requires_agent=block_requires_agent,
                 )
@@ -816,11 +848,24 @@ async def create_script_version_from_review(
             )
 
         # Create the workflow script mapping for cache lookup
-        _, rendered_cache_key_value = await get_workflow_script(
-            workflow=workflow,
-            workflow_run=workflow_run,
-            status=ScriptStatus.published,
-        )
+        if workflow_run:
+            _, rendered_cache_key_value = await get_workflow_script(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                status=ScriptStatus.published,
+            )
+        else:
+            # No workflow run — look up the existing cache key value from the base script
+            existing_ws = await app.DATABASE.get_workflow_scripts_by_permanent_id(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                statuses=[ScriptStatus.published],
+            )
+            rendered_cache_key_value = ""
+            for ws in existing_ws:
+                if ws.script_id == base_script.script_id:
+                    rendered_cache_key_value = ws.cache_key_value
+                    break
 
         await app.DATABASE.create_workflow_script(
             organization_id=organization_id,
@@ -829,7 +874,7 @@ async def create_script_version_from_review(
             cache_key=workflow.cache_key or "",
             cache_key_value=rendered_cache_key_value,
             workflow_id=workflow.workflow_id,
-            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_run_id=workflow_run.workflow_run_id if workflow_run else None,
             status=ScriptStatus.published,
         )
 
