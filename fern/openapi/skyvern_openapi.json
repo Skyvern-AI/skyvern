@@ -17139,7 +17139,7 @@
           "ai_fallback": {
             "type": "boolean",
             "title": "Ai Fallback",
-            "default": false
+            "default": true
           },
           "cache_key": {
             "anyOf": [
@@ -17379,7 +17379,7 @@
           "ai_fallback": {
             "type": "boolean",
             "title": "Ai Fallback",
-            "default": false
+            "default": true
           },
           "cache_key": {
             "anyOf": [
