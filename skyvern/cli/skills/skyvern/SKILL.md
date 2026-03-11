@@ -18,8 +18,10 @@ skyvern init                        # optional -- configures local env
 ```
 
 **MCP upgrade** -- for richer AI-coding-tool integration (auto-tool-calling,
-prompts, etc.), run `skyvern setup claude-code --project` to register the
-Skyvern MCP server. MCP has its own instructions; this file covers CLI only.
+prompts, etc.), run `skyvern quickstart` or `skyvern init` and choose Claude
+Code during the MCP step. If you are configuring MCP later, run
+`skyvern setup claude-code`. MCP has its own instructions; this file covers CLI
+only.
 
 ---
 

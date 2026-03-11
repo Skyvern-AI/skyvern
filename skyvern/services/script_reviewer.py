@@ -80,6 +80,7 @@ class ScriptReviewer:
         stale_branches: list[ScriptBranchHit] | None = None,
         historical_episodes: list[ScriptFallbackEpisode] | None = None,
         run_parameter_values: dict[str, str] | None = None,
+        user_instructions: str | None = None,
     ) -> dict[str, str] | None:
         """Review fallback episodes and generate updated code for affected blocks.
 
@@ -108,23 +109,27 @@ class ScriptReviewer:
                 history_by_block[ep.block_label] = []
             history_by_block[ep.block_label].append(ep)
 
-        # Triage failed episodes — skip non-code-fixable failures
-        triaged_episodes = []
-        for episode in episodes:
-            if await self._triage_episode(episode, organization_id):
-                triaged_episodes.append(episode)
-            else:
-                # Mark as reviewed so we don't re-triage on every run
-                await app.DATABASE.mark_episode_reviewed(
-                    episode_id=episode.episode_id,
-                    organization_id=organization_id,
-                    reviewer_output="TRIAGE: not_code_fixable — skipped",
-                )
-                LOG.info(
-                    "ScriptReviewer: skipping non-code-fixable episode",
-                    episode_id=episode.episode_id,
-                    block_label=episode.block_label,
-                )
+        # Triage failed episodes — skip non-code-fixable failures.
+        # When user provides explicit instructions, skip triage entirely.
+        if user_instructions:
+            triaged_episodes = list(episodes)
+        else:
+            triaged_episodes = []
+            for episode in episodes:
+                if await self._triage_episode(episode, organization_id):
+                    triaged_episodes.append(episode)
+                else:
+                    # Mark as reviewed so we don't re-triage on every run
+                    await app.DATABASE.mark_episode_reviewed(
+                        episode_id=episode.episode_id,
+                        organization_id=organization_id,
+                        reviewer_output="TRIAGE: not_code_fixable — skipped",
+                    )
+                    LOG.info(
+                        "ScriptReviewer: skipping non-code-fixable episode",
+                        episode_id=episode.episode_id,
+                        block_label=episode.block_label,
+                    )
 
         if not triaged_episodes:
             return None
@@ -151,6 +156,7 @@ class ScriptReviewer:
                     all_parameter_keys=all_parameter_keys,
                     historical_episodes=history_by_block.get(block_label),
                     run_parameter_values=run_parameter_values,
+                    user_instructions=user_instructions,
                 )
                 if updated_code:
                     updated_blocks[block_label] = updated_code
@@ -165,6 +171,76 @@ class ScriptReviewer:
             return None
 
         return updated_blocks
+
+    async def review_with_user_instructions(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        script_revision_id: str | None,
+        user_instructions: str,
+        episodes: list[ScriptFallbackEpisode] | None = None,
+        run_parameter_values: dict[str, str] | None = None,
+    ) -> dict[str, str] | None:
+        """Review script blocks using user-provided instructions.
+
+        When episodes are available, they are included as context for the LLM.
+        When no episodes are available, the reviewer works from the existing code
+        and the user's instructions alone.
+
+        Returns {block_label: updated_code} or None if review fails.
+        """
+        if episodes:
+            return await self.review_fallback_episodes(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                script_revision_id=script_revision_id,
+                episodes=episodes,
+                run_parameter_values=run_parameter_values,
+                user_instructions=user_instructions,
+            )
+
+        # No episodes — review all blocks with user instructions only
+        navigation_goals, all_parameter_keys = await self._load_workflow_context(
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        block_codes = await self._load_all_block_codes(
+            organization_id=organization_id,
+            script_revision_id=script_revision_id,
+        )
+        if not block_codes:
+            LOG.warning(
+                "ScriptReviewer: no blocks found for instruction-only review",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            return None
+
+        updated_blocks: dict[str, str] = {}
+        for block_label, existing_code in block_codes.items():
+            try:
+                updated_code = await self._review_block(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    script_revision_id=script_revision_id,
+                    block_label=block_label,
+                    episodes=[],
+                    navigation_goal=navigation_goals.get(block_label),
+                    all_parameter_keys=all_parameter_keys,
+                    run_parameter_values=run_parameter_values,
+                    user_instructions=user_instructions,
+                    preloaded_code=existing_code,
+                )
+                if updated_code:
+                    updated_blocks[block_label] = updated_code
+            except Exception:
+                LOG.exception(
+                    "ScriptReviewer: failed to review block with instructions",
+                    block_label=block_label,
+                    organization_id=organization_id,
+                )
+
+        return updated_blocks if updated_blocks else None
 
     async def review_conditional_blocks(
         self,
@@ -399,6 +475,8 @@ class ScriptReviewer:
         all_parameter_keys: list[str] | None = None,
         historical_episodes: list[ScriptFallbackEpisode] | None = None,
         run_parameter_values: dict[str, str] | None = None,
+        user_instructions: str | None = None,
+        preloaded_code: str | None = None,
     ) -> str | None:
         """Review a single block's fallback episodes and generate updated code."""
         LOG.info(
@@ -408,8 +486,8 @@ class ScriptReviewer:
             navigation_goal=navigation_goal[:100] if navigation_goal else None,
         )
 
-        # Load the current cached code for the block
-        existing_code = await self._load_block_code(
+        # Use pre-loaded code if available, otherwise fetch from artifact store
+        existing_code = preloaded_code or await self._load_block_code(
             organization_id=organization_id,
             script_revision_id=script_revision_id,
             block_label=block_label,
@@ -506,6 +584,7 @@ class ScriptReviewer:
             stale_branches=stale_branch_info,
             parameter_keys=parameter_keys,
             historical_episodes=history_summaries,
+            user_instructions=user_instructions,
         )
 
         LOG.info(
@@ -647,8 +726,11 @@ class ScriptReviewer:
                         current_prompt = self._build_retry_prompt(updated_code, param_error, function_signature)
                     continue
 
-                # Validate structural regression (catch deleted branches, shrunk code)
-                regression_error = self._validate_structural_regression(updated_code, existing_code)
+                # Validate structural regression (catch deleted branches, shrunk code).
+                # Skip when user provides explicit instructions — they may request deletions.
+                regression_error = (
+                    None if user_instructions else self._validate_structural_regression(updated_code, existing_code)
+                )
                 if regression_error is not None:
                     LOG.warning(
                         "ScriptReviewer: structural regression detected, retrying",
@@ -802,6 +884,50 @@ class ScriptReviewer:
                 script_revision_id=script_revision_id,
             )
         return None
+
+    async def _load_all_block_codes(
+        self,
+        organization_id: str,
+        script_revision_id: str | None,
+    ) -> dict[str, str]:
+        """Load code for all blocks in a script revision.
+
+        Returns {block_label: code} for blocks that have code.
+        """
+        if not script_revision_id:
+            return {}
+        try:
+            script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+                script_revision_id=script_revision_id,
+                organization_id=organization_id,
+            )
+            result: dict[str, str] = {}
+            for sb in script_blocks:
+                if not sb.script_file_id:
+                    continue
+                script_file = await app.DATABASE.get_script_file_by_id(
+                    script_revision_id=script_revision_id,
+                    file_id=sb.script_file_id,
+                    organization_id=organization_id,
+                )
+                if script_file and script_file.artifact_id:
+                    artifact = await app.DATABASE.get_artifact_by_id(
+                        artifact_id=script_file.artifact_id,
+                        organization_id=organization_id,
+                    )
+                    if artifact:
+                        file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+                        if isinstance(file_content, bytes):
+                            result[sb.script_block_label] = file_content.decode("utf-8")
+                        elif isinstance(file_content, str):
+                            result[sb.script_block_label] = file_content
+            return result
+        except Exception:
+            LOG.exception(
+                "ScriptReviewer: failed to load all block codes",
+                script_revision_id=script_revision_id,
+            )
+            return {}
 
     async def _load_workflow_context(
         self,
