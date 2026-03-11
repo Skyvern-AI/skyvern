@@ -22,6 +22,7 @@
     "@codemirror/lang-html": "^6.4.9",
     "@codemirror/lang-json": "^6.0.1",
     "@codemirror/lang-python": "^6.1.6",
+    "@codemirror/merge": "^6.8.0",
     "@dagrejs/dagre": "^1.1.4",
     "@hookform/resolvers": "^3.3.4",
     "@novnc/novnc": "1.5.x",

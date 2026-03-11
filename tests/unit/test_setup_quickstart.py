@@ -9,6 +9,7 @@ Covers the key behavioral contracts:
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,7 @@ def test_guided_writes_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     _patch_env(monkeypatch)
     _patch_detection(monkeypatch, claude_code=True)
     monkeypatch.setattr("skyvern.cli.setup_commands._claude_code_global_config_path", lambda: config)
+    monkeypatch.chdir(tmp_path)
 
     result = CliRunner().invoke(setup_app, ["--yes"])
     assert result.exit_code == 0
@@ -87,6 +89,7 @@ def test_guided_dry_run_writes_nothing(tmp_path: Path, monkeypatch: pytest.Monke
     _patch_env(monkeypatch)
     _patch_detection(monkeypatch, claude_code=True)
     monkeypatch.setattr("skyvern.cli.setup_commands._claude_code_global_config_path", lambda: config)
+    monkeypatch.chdir(tmp_path)
 
     result = CliRunner().invoke(setup_app, ["--dry-run", "--yes"])
     assert result.exit_code == 0
@@ -111,7 +114,36 @@ def test_subcommand_still_works(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     # Prevent _install_skills from writing into the repo's .claude/skills/ during CI
     monkeypatch.setattr("skyvern.cli.setup_commands._install_skills", lambda *a, **kw: None)
 
-    result = CliRunner().invoke(setup_app, ["claude-code", "--yes"])
+    result = CliRunner().invoke(setup_app, ["claude-code", "--global", "--yes"])
     assert result.exit_code == 0
     data = json.loads(config.read_text())
     assert data["mcpServers"]["skyvern"]["headers"]["x-api-key"] == "test-key"
+
+
+def test_claude_code_local_auto_uses_project_config_and_installs_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
+
+    bundled_skill = tmp_path / "bundled" / "qa"
+    bundled_skill.mkdir(parents=True)
+    (bundled_skill / "SKILL.md").write_text("# qa\n", encoding="utf-8")
+
+    monkeypatch.chdir(project_dir)
+    monkeypatch.setenv("SKYVERN_API_KEY", "local-key")
+    monkeypatch.setenv("SKYVERN_BASE_URL", "http://localhost:8000")
+    monkeypatch.setattr("skyvern.cli.setup_commands.get_skill_dirs", lambda: [bundled_skill])
+
+    result = CliRunner().invoke(setup_app, ["claude-code", "--local", "--yes"])
+    assert result.exit_code == 0
+
+    data = json.loads((project_dir / ".mcp.json").read_text())
+    assert data["mcpServers"]["skyvern"]["command"] == sys.executable
+    assert data["mcpServers"]["skyvern"]["args"] == ["-m", "skyvern", "run", "mcp"]
+    assert data["mcpServers"]["skyvern"]["env"] == {
+        "SKYVERN_BASE_URL": "http://localhost:8000",
+        "SKYVERN_API_KEY": "local-key",
+    }
+    assert (project_dir / ".claude" / "skills" / "qa" / "SKILL.md").exists()

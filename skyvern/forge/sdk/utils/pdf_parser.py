@@ -3,7 +3,11 @@ Utility functions for PDF parsing with fallback support.
 
 This module provides robust PDF parsing that tries pypdf first and falls back
 to pdfplumber if pypdf fails, ensuring maximum compatibility with various PDF formats.
+For image-based/scanned PDFs where text extraction yields no content, pages can be
+rendered as images via render_pdf_pages_as_images for vision-LLM OCR.
 """
+
+import io
 
 import pdfplumber
 import structlog
@@ -207,3 +211,42 @@ def validate_pdf_file(
                 pypdf_error=str(pypdf_error),
                 pdfplumber_error=str(pdfplumber_error),
             )
+
+
+def render_pdf_pages_as_images(
+    file_path: str,
+    file_identifier: str | None = None,
+    max_pages: int = 10,
+    resolution: int = 150,
+) -> list[bytes]:
+    """Render PDF pages as PNG images using pdfplumber.
+
+    Returns a list of PNG byte buffers, one per page (up to max_pages).
+    Intended for vision-LLM fallback when text extraction returns nothing
+    (e.g. scanned / image-based PDFs).
+    """
+    identifier = file_identifier or file_path
+    page_images: list[bytes] = []
+
+    with pdfplumber.open(file_path) as pdf:
+        pages_to_render = min(len(pdf.pages), max_pages)
+        if pages_to_render < len(pdf.pages):
+            LOG.warning(
+                "PDF has more pages than max_pages for image rendering, truncating",
+                file_identifier=identifier,
+                total_pages=len(pdf.pages),
+                max_pages=max_pages,
+            )
+
+        for page in pdf.pages[:pages_to_render]:
+            img = page.to_image(resolution=resolution)
+            buf = io.BytesIO()
+            img.original.save(buf, format="PNG")
+            page_images.append(buf.getvalue())
+
+    LOG.info(
+        "Rendered PDF pages as images for vision-LLM fallback",
+        file_identifier=identifier,
+        pages_rendered=len(page_images),
+    )
+    return page_images

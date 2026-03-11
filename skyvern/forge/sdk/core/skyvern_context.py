@@ -49,6 +49,7 @@ class SkyvernContext:
     prompt: str | None = None
     parent_workflow_run_block_id: str | None = None
     loop_metadata: dict[str, Any] | None = None
+    loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[dict[str, Any]] | None = None
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
     script_mode: bool = False
