@@ -4654,6 +4654,8 @@ class AgentDB(BaseAlchemyDB):
         output: dict | list | str | None = None,
         continue_on_failure: bool = False,
         engine: RunEngine | None = None,
+        current_value: str | None = None,
+        current_index: int | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             new_workflow_run_block = WorkflowRunBlockModel(
@@ -4667,6 +4669,8 @@ class AgentDB(BaseAlchemyDB):
                 output=output,
                 continue_on_failure=continue_on_failure,
                 engine=engine,
+                current_value=current_value,
+                current_index=current_index,
             )
             session.add(new_workflow_run_block)
             await session.commit()
