@@ -463,12 +463,13 @@ def extract_data(
 # 2. .claude/skills/qa/SKILL.md              (project-local copy for this repo)
 # 3. skyvern/cli/mcp_tools/prompts.py        (QA_TEST_CONTENT — this file)
 QA_TEST_CONTENT = """\
-# QA — Test Frontend Changes in a Real Browser
+# QA — Validate Frontend and Backend Changes
 
-You read the developer's code diff, understand what UI was affected, open a real browser
-against their running dev server, and test that the changes actually work.
+Read the diff, classify what changed, and run the right validation path: browser QA for frontend/browser
+changes, API validation for backend surface changes, repo-native validation for backend-internal changes,
+and both for mixed changes.
 
-This is NOT a generic website crawler. It tests what CHANGED based on the code diff.
+This is NOT a generic crawler. It should validate the changed behavior with the right tools.
 
 ---
 
@@ -479,176 +480,181 @@ This is NOT a generic website crawler. It tests what CHANGED based on the code d
 ```bash
 # What files changed?
 git diff --name-only HEAD~1     # vs last commit (if changes are committed)
-git diff --name-only             # vs working tree (if uncommitted)
+git diff --name-only            # vs working tree (if uncommitted)
 
 # Full diff for context
-git diff HEAD~1                  # or git diff for uncommitted
+git diff HEAD~1                 # or git diff for uncommitted
 ```
 
-Pick whichever diff has content. If both are empty, there's nothing to QA.
+Pick whichever diff has content. If both are empty, there is nothing diff-driven to QA.
 
 ### Read the changed files
 
-For every changed frontend file (`.tsx`, `.jsx`, `.ts`, `.js`, `.css`, `.html`):
-- Read the FULL file (not just the diff) to understand the component
-- Look for: route paths, component names, text labels, form fields, button labels,
-  API endpoints called, conditional rendering, error states
+Read the full contents of every changed file that affects behavior:
 
-### Classify the changes
+- Frontend files: `.tsx`, `.jsx`, `.ts`, `.js`, `.css`, `.html`
+- Backend/API files: routes, controllers, request/response schemas, serializers, handlers
+- Backend-internal files: services, workers, validators, business logic, data-layer code
+- Tests that changed alongside the implementation
 
-| Change Type | What to Test |
-|-------------|-------------|
-| New component/page | Navigate to it, verify it renders, interact with its elements |
-| Modified component | Navigate to it, verify the specific change works (new button, new text, new behavior) |
-| Styling changes | Navigate, screenshot, verify layout isn't broken |
-| API integration | Navigate, trigger the action, verify the API call works (check network, verify UI updates) |
-| Form changes | Fill the form, submit, verify validation and success states |
-| Route changes | Navigate to old and new routes, verify routing works |
-| Shared component (used in many places) | Test 2-3 pages that use it |
-| Bug fix | Reproduce the original bug scenario, verify it's fixed |
+Look for routes, UI text, forms, API parameters, response fields, validation logic, error states,
+and any tests that describe the intended behavior.
 
-### Generate test cases
+### Classify the diff
 
-For each changed file, write specific test cases. Example:
+| Mode | Trigger | Primary validation |
+|------|---------|--------------------|
+| Frontend/browser | UI/routes/components/styles changed | Browser QA against the dev server |
+| Backend API | Route handlers, request/response schemas, or externally visible API behavior changed | Start backend locally and run targeted API requests |
+| Backend-internal | Services/workers/business logic changed without public API surface changes | Repo-native fast checks plus targeted tests |
+| Mixed | Frontend/browser and backend changed together | Backend validation first, then frontend/browser QA |
 
-If the diff shows changes to `LoginForm.tsx` adding a "Forgot password" link:
-```
-Test 1: Login page renders the new "Forgot password" link
-  - Navigate to /login
-  - Assert: link with text "Forgot password" exists
-  - Click it
-  - Assert: navigated to /forgot-password (or modal appeared)
+Rules:
 
-Test 2: Login form still works (regression)
-  - Navigate to /login
-  - Verify email and password inputs exist
-  - Submit empty form, verify validation errors appear
-```
-
-**Be specific.** Don't write "verify the page works." Write "verify the 'Forgot password'
-link navigates to /forgot-password."
+- If both frontend/browser and backend changed, use `Mixed`.
+- If only backend internals changed, do not invent unrelated browser tests or random API calls.
+- If a backend change might affect the public contract, inspect routes, schemas, and tests before treating it as internal-only.
+- If the diff is mostly documentation or comments, keep QA lightweight and report that no behavioral validation was warranted.
 
 ---
 
-## Step 2: Find the Dev Server
+## Step 2: Choose the Validation Strategy
 
-If a URL was provided, use it. Otherwise, auto-detect:
+### Frontend/browser mode
 
-```
-# Try common dev server ports
-# 5173 (Vite), 3000 (Next/CRA), 3001, 8080, 8000, 4200 (Angular)
-```
+Use browser automation against the dev server. Validate the specific UI changes plus 1-2 nearby regressions.
 
-Navigate to each until one responds. If none respond, tell the user:
-"Start your dev server first, then try again."
+### Backend API mode
+
+Read the repo's local instructions first, start the backend if needed, identify the changed
+endpoint(s), and run targeted HTTP requests to validate the changed contract.
+
+### Backend-internal mode
+
+Run the repo's fast verification commands first, then targeted unit/integration/scenario tests.
+Only do live API calls if the internal change affects exposed behavior.
+
+### Mixed mode
+
+Validate the backend first, then run frontend/browser QA against the flow that depends on it.
+If the backend contract is broken, frontend results are not trustworthy.
 
 ---
 
-## Step 3: Connect to a Browser
+## Step 3A: Frontend/Browser QA
+
+### Find the dev server
+
+If a URL was provided, use it. Otherwise try common local ports:
+
+```text
+5173, 3000, 3001, 8080, 8000, 4200
+```
+
+If none respond, start the most direct repo-documented local command for the
+changed surface. If the diff needs both frontend and backend running together
+and the repo provides a combined frontend/backend dev script, prefer that.
+Only ask the user to start something manually if the repo has no documented
+command or startup fails.
+
+### Connect to a browser
 
 Try these in order:
 
-### Option A: Local browser (fastest — works when MCP server runs locally)
-```
+#### Option A: Local browser (fastest)
+```text
 skyvern_browser_session_create(local=true, headless=false, timeout=15)
 ```
-Use `local=true` so the browser can reach `localhost`. Use `headless=false` so the user can watch.
+Use `local=true` so the browser can reach `localhost`.
 
-### Option B: Local browser via tunnel (for remote/cloud-hosted MCP + localhost dev server)
+#### Option B: Local browser via tunnel
 
-If local session creation fails — typically because the MCP server is running remotely
-(e.g., api.skyvern.com) — the cloud browser cannot reach `localhost`. The user needs to
-run a local browser and tunnel it.
-
-Tell the user to run these in separate terminals:
+If local session creation fails because the MCP server is remote, the cloud browser cannot reach
+`localhost`. Tell the user to run:
 
 ```bash
 # Terminal 1: Launch a local browser with CDP exposed
 skyvern browser serve --port 9222
 
-# Terminal 2: Tunnel it to the internet (install: brew install ngrok)
+# Terminal 2: Tunnel it to the internet
 ngrok http 9222
 ```
 
-Then connect to the ngrok URL:
-```
+Then connect:
+
+```text
 skyvern_browser_session_connect(cdp_url="wss://<ngrok-subdomain>.ngrok-free.app/devtools/browser/<id>")
 ```
 
-The user can get the browser ID from the `skyvern browser serve` output or by calling
-the ngrok URL's `/json` endpoint.
+The user can get the browser ID from the `skyvern browser serve` output or by calling the
+ngrok URL's `/json` endpoint.
 
-### Option C: Cloud browser (for publicly accessible URLs only)
-```
+#### Option C: Cloud browser
+```text
 skyvern_browser_session_create(timeout=15)
 ```
-Only works if the dev server URL is publicly accessible. Warn the user that `localhost`
-URLs will not work with cloud browsers.
+Only works for publicly reachable URLs. `localhost` URLs will not work here.
 
----
+### Generate frontend/browser test cases
 
-## Step 4: Run the Tests
+For each changed frontend file, write targeted checks. Example:
 
-For each test case generated in Step 1:
+```text
+Test 1: Settings page renders the new "Retry failed run" button
+  - Navigate to /settings/runs
+  - Assert: button exists
+  - Click it
+  - Assert: success toast appears
 
-### Navigate
+Test 2: Adjacent regression
+  - Verify the existing "Delete run" action still works or is still visible
 ```
+
+### Run the frontend/browser tests
+
+Navigate:
+
+```text
 skyvern_navigate(url="http://localhost:<port>/<route>")
 ```
 
-### Health gate (after every navigate, ~10ms)
-```
+Health gate:
+
+```text
 skyvern_evaluate(expression="(() => {
   const errors = [];
   const body = document.body?.innerText || '';
   if (body.includes('Something went wrong')) errors.push('error_message');
   if (body.includes('Cannot read properties')) errors.push('js_error_in_ui');
-  if (/\\bundefined\\b/.test(body) && !/\\bif\\b|\\btypeof\\b|\\bdocument|tutorial|example/i.test(body) \
-&& body.length < 5000) errors.push('undefined_text');
+  if (/\\bundefined\\b/.test(body) && !/\\bif\\b|\\btypeof\\b|\\bdocument|tutorial|example/i.test(body) && body.length < 5000) errors.push('undefined_text');
   if (body.includes('connection refused')) errors.push('connection_refused');
   if (/sign.?in|log.?in|auth/i.test(window.location.pathname)) errors.push('auth_redirect');
-  if (document.querySelector('[role=\"alert\"]')) errors.push('alert_element');
-  if (!document.querySelector('main, [role=\"main\"], nav, header, h1, h2, \
-[class*=\"layout\" i], [class*=\"page\" i], [class*=\"app\" i]'))
+  if (document.querySelector('[role=\\"alert\\"]')) errors.push('alert_element');
+  if (!document.querySelector('main, [role=\\"main\\"], nav, header, h1, h2, [class*=\\"layout\\" i], [class*=\\"page\\" i], [class*=\\"app\\" i]'))
     errors.push('blank_page');
   return JSON.stringify({ pass: errors.length === 0, errors });
 })()")
 ```
 
-### Assert with DOM queries (prefer `skyvern_evaluate` — fast, deterministic)
-```
-# Element exists
-skyvern_evaluate(expression="!!document.querySelector('a[href=\"/forgot-password\"]')")
+Prefer deterministic DOM assertions:
 
-# Text content
+```text
+skyvern_evaluate(expression="!!document.querySelector('button')")
 skyvern_evaluate(expression="document.querySelector('h1')?.textContent?.trim()")
-
-# Element count
-skyvern_evaluate(expression="document.querySelectorAll('.card').length")
-
-# URL after navigation
 skyvern_evaluate(expression="window.location.pathname")
 ```
 
-### Interact (use `skyvern_act` for natural language actions)
-```
-skyvern_act(prompt="Click the 'Forgot password' link")
-skyvern_act(prompt="Fill the email field with 'test@example.com' and click Submit")
-skyvern_act(prompt="Open the dropdown menu and select 'Settings'")
-```
+Use interaction tools when needed:
 
-### Visual checks (use `skyvern_validate` only when DOM queries aren't enough)
-```
-skyvern_validate(prompt="The login form shows email and password fields with a blue Submit button")
-```
-
-### Screenshot (after every significant action)
-```
+```text
+skyvern_act(prompt="Click the 'Retry failed run' button")
+skyvern_validate(prompt="The page shows the success toast and the form is no longer loading")
 skyvern_screenshot()
 ```
 
-### Failed network requests (once per page)
-```
+Also check for failed network requests once per page:
+
+```text
 skyvern_evaluate(expression="(() => {
   const entries = performance.getEntriesByType('resource').filter(e => e.responseStatus >= 400);
   return JSON.stringify({ failed: entries.map(e => ({ url: e.name, status: e.responseStatus })).slice(0, 5) });
@@ -657,35 +663,140 @@ skyvern_evaluate(expression="(() => {
 
 ---
 
-## Step 5: Report Results
+## Step 3B: Backend API QA
+
+### Gather repo-local context first
+
+Before starting the server or sending requests, read the repo's local instructions:
+
+- `README`, `AGENTS.md`, `CLAUDE.md`, `Makefile`, `package.json`, `pyproject.toml`
+- changed tests for the affected endpoints
+- docs that describe auth, local ports, or startup commands
+
+Do not guess the startup command if the repo already documents one.
+
+### Start the backend if needed
+
+If the backend is not responding on the expected local port:
+
+1. Start it with the most direct repo-documented local command for the changed
+   surface. If the validation needs both frontend and backend and the repo
+   documents a combined dev environment command, prefer that over inventing
+   separate startup steps.
+2. Wait for readiness
+3. Confirm the API is reachable before sending requests
+
+### Identify the changed API surface
+
+Use the diff to answer:
+
+- Which endpoints changed?
+- Which request parameters, headers, or bodies changed?
+- Which response fields or status codes changed?
+- Did auth requirements change?
+- Is there a mutation side effect that needs follow-up verification?
+
+Read the full handler, schema, and any changed tests.
+
+### Generate backend API test cases
+
+For each changed endpoint, create targeted checks:
+
+- Happy path with valid parameters
+- Empty result or not-found path where applicable
+- Invalid input or validation error path
+- Combined filters or sorting behavior when relevant
+- Follow-up read after mutation endpoints
+
+Example:
+
+```text
+Test 1: GET /api/runs returns the new field in the response body
+Test 2: GET /api/runs?status=missing returns an empty list, not a 500
+Test 3: POST /api/runs rejects invalid payload with a 4xx validation error
+Test 4: PATCH /api/runs/:id updates the record and a follow-up GET shows the change
+```
+
+### Execute the API requests
+
+Use the repo's documented auth scheme and local base URL. Use `curl`, the repo SDK, or a small
+one-off client if that is clearer than shell quoting.
+
+Examples:
+
+```bash
+curl -sS -H "Authorization: Bearer <token>" \
+  "http://localhost:<port>/api/..."
+
+curl -sS -X POST \
+  -H "Content-Type: application/json" \
+  -H "<auth-header>: <token>" \
+  -d '{"example":"value"}' \
+  "http://localhost:<port>/api/..."
+```
+
+Capture:
+
+- request being tested
+- status code
+- response body snippet or parsed result
+- whether the changed field/behavior is present
+
+If auth is required and local credentials are unavailable from repo docs, say so clearly and stop rather than faking coverage.
+
+---
+
+## Step 3C: Backend-Internal QA
+
+If the diff is backend-only but does not change an exposed endpoint or UI flow:
+
+1. Run the repo's fastest compile/type/lint checks for the changed files
+2. Run targeted unit/integration/scenario tests that cover the changed logic
+3. Add live API calls only if the internal change affects exposed behavior
+
+Good checks:
+
+- compile/type-check the changed files
+- targeted `pytest`, `npm test`, `go test`, or equivalent
+- scenario/integration tests around changed services or workflows
+
+Bad checks:
+
+- hitting an unrelated health endpoint and calling it validated
+- browsing the UI when no frontend behavior changed
+- calling random APIs just because the backend changed
+
+---
+
+## Step 4: Report Results
 
 ```markdown
 ## QA Report
 
-### Changes Tested
-Files: `LoginForm.tsx`, `ForgotPassword.tsx`
-Diff summary: Added "Forgot password" link to login form, new /forgot-password page
+### Validation Mode
+- Mode: Backend API
+- Scope: `routes/runs.py`, `schemas/run_response.py`
 
 ### Results
-| # | Test | Result | Screenshot |
-|---|------|--------|------------|
-| 1 | Login page renders "Forgot password" link | PASS | screenshot_1 |
-| 2 | Clicking link navigates to /forgot-password | PASS | screenshot_2 |
-| 3 | Forgot password page renders form | PASS | screenshot_3 |
-| 4 | Login form still works (regression) | PASS | screenshot_4 |
-| 5 | Empty form shows validation errors | FAIL | screenshot_5 |
+| # | Test | Result | Evidence |
+|---|------|--------|----------|
+| 1 | GET /api/runs returns `retryable` for valid runs | PASS | HTTP 200, field present |
+| 2 | GET /api/runs?status=missing returns empty list | PASS | HTTP 200, `[]` |
+| 3 | GET /api/runs?status=invalid returns validation error | PASS | HTTP 422 |
+| 4 | Frontend runs page still renders filter state | PASS | screenshot_3 |
 
 ### Issues Found
-1. **Empty login form submits without validation** — Submitting with no email/password
-   doesn't show error messages. The form submits and the page reloads.
-   Expected: validation errors. Screenshot: screenshot_5
-
-### Network
-- No failed requests detected
+1. `retryable` is missing from one serializer branch.
 
 ### Verdict
-4/5 tests passed. 1 issue found: missing form validation on empty submit.
+3/4 tests passed. 1 issue found.
 ```
+
+Use the evidence that actually matters:
+
+- screenshots for frontend/browser results
+- status codes and response snippets for backend API results
+- command + failing assertion for unit/integration tests
 
 ---
 
@@ -695,13 +806,12 @@ Diff summary: Added "Forgot password" link to login form, new /forgot-password p
 |---------------|------|-------|
 | Check element exists, text, count, URL | `skyvern_evaluate` | ~10ms |
 | Click, type, fill forms, multi-step interaction | `skyvern_act` | 5-30s |
-| "Does this look right?" visual check | `skyvern_validate` | 15-50s |
-| Get structured data from a page | `skyvern_extract` | 15-50s |
+| Visual check | `skyvern_validate` | 15-50s |
 | Screenshot | `skyvern_screenshot` | ~1s |
 | Wait for async content | `skyvern_wait` | varies |
 
-**Default to `skyvern_evaluate` for assertions.** Only use `skyvern_validate` when you
-can't express the check as a DOM query (visual layout, "does this look like a dashboard").
+Default to `skyvern_evaluate` for frontend/browser assertions. For backend API validation, prefer simple
+HTTP requests and deterministic response checks over browser-based inference.
 
 ---
 
@@ -709,61 +819,65 @@ can't express the check as a DOM query (visual layout, "does this look like a da
 
 | Problem | Action |
 |---------|--------|
-| No git diff found | Ask the user what they want to test, fall back to explore mode |
-| Dev server not running | Tell user to start it. Suggest common commands (npm run dev, etc.) |
-| Auth redirect on page | Report it. Ask if they want to provide credentials or skip that route. |
-| Component doesn't render | Screenshot + check console. Report with the specific error. |
-| Session create fails | Try cloud fallback. Warn about URL accessibility. |
+| No git diff found | Ask what behavior to validate, then fall back to explore mode |
+| Frontend dev server not running | Start the most direct repo-documented local command for the changed surface; prefer a combined dev command only when the validation needs both frontend and backend; only ask the user if no documented command exists or startup fails |
+| Backend server not running | Start the most direct repo-documented local command for the changed surface; prefer a combined dev environment command only when the validation needs both sides |
+| Cannot identify changed endpoint | Read changed routes, schemas, and tests before proceeding |
+| Auth required but no local creds available | Report the blocker clearly; do not fake coverage |
+| Component doesn't render | Capture screenshot and specific UI error |
+| API returns unexpected 5xx | Save request/response evidence and report the regression |
 
 ## Session Cleanup
 
-ALWAYS close the session when done, even if errors occurred:
-```
+Always close browser sessions when done:
+
+```text
 skyvern_browser_session_close()
 ```
+
+If you started local servers or background processes, leave a clear note about what is still running.
 
 ---
 
 ## Fallback: Explore Mode
 
-If there's no git diff (user just wants a general QA pass), fall back to exploring:
+If there is no useful diff:
 
-1. Navigate to the root URL
-2. Extract nav links and page structure with `skyvern_extract`
-3. Visit each major route, health gate + screenshot
-4. Test interactive elements (forms, buttons, links)
-5. Report findings
+1. Ask what behavior should be validated
+2. Use browser QA for frontend flows
+3. Use targeted API checks for backend flows
+4. Report findings with the same evidence standard
 
-But the primary mode is **diff-driven**. Always try to read the code changes first.
+The primary mode is still **diff-driven**. Always try to understand the code changes first.
 """
 
 
 def qa_test(
     url: Annotated[
         str,
-        Field(description="Dev server URL to test against, e.g. 'http://localhost:3000'"),
+        Field(description="Frontend or API base URL to test against, e.g. 'http://localhost:3000'"),
     ] = "",
     context: Annotated[
         str,
-        Field(description="What to focus on, e.g. 'test the checkout flow' or 'verify the login page'"),
+        Field(description="What to focus on, e.g. 'test the checkout flow' or 'validate the workflow filters API'"),
     ] = "",
 ) -> str:
-    """QA test frontend changes in a real browser.
+    """QA test recent code changes with the right validation path.
 
-    Reads the developer's git diff to understand what code changed, generates targeted
-    browser tests, runs them against a local dev server using Skyvern's browser tools,
-    and reports pass/fail with screenshots. Invoke this when a developer wants to verify
-    their UI changes work correctly.
+    Reads the developer's git diff to understand what changed, classifies the work as
+    frontend/browser, backend API, backend-internal, or mixed, and then runs targeted validation.
+    Frontend checks use Skyvern browser tools; backend validation uses repo-native startup,
+    HTTP requests, and targeted tests where appropriate.
     """
     parts = [QA_TEST_CONTENT]
     if url or context:
         parts.append("\n---\n")
     if url:
-        parts.append(f"Dev server URL: `{url}`\n")
+        parts.append(f"Target URL: `{url}`\n")
     if context:
         parts.append(
             f"Focus area: {context}\n\n"
-            "Start at Step 1: run `git diff` to understand the changes, then generate test cases "
-            "focused on the area described above."
+            "Start at Step 1: run `git diff` to understand the changes, choose the correct validation "
+            "mode, and focus the resulting checks on the area described above."
         )
     return "\n".join(parts)
