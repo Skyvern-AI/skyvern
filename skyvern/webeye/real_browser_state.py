@@ -9,7 +9,12 @@ import structlog
 from playwright.async_api import BrowserContext, Page, Playwright
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_PAGE_CLOSE_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
+from skyvern.constants import (
+    BROWSER_CLOSE_TIMEOUT,
+    BROWSER_PAGE_CLOSE_TIMEOUT,
+    NAVIGATION_MAX_RETRY_TIME,
+    NON_RETRIABLE_NAV_ERRORS,
+)
 from skyvern.exceptions import (
     EmptyBrowserContext,
     FailedToNavigateToUrl,
@@ -148,11 +153,21 @@ class RealBrowserState(BrowserState):
                     return
 
                 except Exception as e:
+                    error_str = str(e)
+
+                    if any(pattern in error_str for pattern in NON_RETRIABLE_NAV_ERRORS):
+                        LOG.warning(
+                            "Non-retriable navigation error, failing immediately",
+                            url=url,
+                            error=error_str,
+                        )
+                        raise FailedToNavigateToUrl(url=url, error_message=error_str)
+
                     if retry_time >= retry_times - 1:
-                        raise FailedToNavigateToUrl(url=url, error_message=str(e))
+                        raise FailedToNavigateToUrl(url=url, error_message=error_str)
 
                     LOG.warning(
-                        f"Error while navigating to url: {str(e)}",
+                        f"Error while navigating to url: {error_str}",
                         exc_info=True,
                         url=url,
                         retry_time=retry_time,
