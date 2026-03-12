@@ -215,7 +215,6 @@ async def get_workflow_script(
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=rendered_cache_key_value,
             statuses=[status],
-            use_cache=True,
         )
 
         if existing_script:

@@ -6393,7 +6393,7 @@ class AgentDB(BaseAlchemyDB):
                 if statuses is not None and len(statuses) > 0:
                     query = query.where(WorkflowScriptModel.status.in_(statuses))
 
-                query = query.order_by(ScriptModel.created_at.desc(), ScriptModel.version.desc()).limit(1)
+                query = query.order_by(ScriptModel.version.desc()).limit(1)
 
                 script = (await session.scalars(query)).first()
                 return convert_to_script(script) if script else None

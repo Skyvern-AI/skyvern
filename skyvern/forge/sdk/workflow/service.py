@@ -1019,14 +1019,34 @@ class WorkflowService:
             # Trigger AI Script Reviewer for adaptive caching workflows
             # Include terminated and failed runs (triage will filter non-code-fixable failures)
             # Skip canceled (user stopped) and timed_out (infrastructure issue)
+            # Only trigger if this run used the latest script version — stale runs produce
+            # episodes that may already be fixed in newer versions, and reviewing them creates
+            # redundant/regressive versions.
             if is_adaptive_caching(workflow, workflow_run) and pre_finally_status not in (
                 WorkflowRunStatus.canceled,
                 WorkflowRunStatus.timed_out,
             ):
-                asyncio.create_task(
-                    self._trigger_script_reviewer(workflow, workflow_run),
-                    name=f"script_reviewer_{workflow_run.workflow_run_id}",
-                )
+                should_trigger_reviewer = True
+                current_ctx = skyvern_context.current()
+                if current_ctx and current_ctx.script_id:
+                    latest_script = await app.DATABASE.get_latest_script_version(
+                        script_id=current_ctx.script_id,
+                        organization_id=workflow.organization_id,
+                    )
+                    if latest_script and latest_script.script_revision_id != current_ctx.script_revision_id:
+                        should_trigger_reviewer = False
+                        LOG.info(
+                            "Skipping script reviewer - run used stale script version",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            used_revision=current_ctx.script_revision_id,
+                            latest_revision=latest_script.script_revision_id,
+                            latest_version=latest_script.version,
+                        )
+                if should_trigger_reviewer:
+                    asyncio.create_task(
+                        self._trigger_script_reviewer(workflow, workflow_run),
+                        name=f"script_reviewer_{workflow_run.workflow_run_id}",
+                    )
 
             # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
             should_run_finally = finally_block_label and pre_finally_status != WorkflowRunStatus.canceled
