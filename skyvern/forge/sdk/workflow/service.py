@@ -4830,6 +4830,8 @@ class WorkflowService:
             return False
         if workflow.run_with == "code":
             return True
+        if workflow.run_with == "agent":
+            return False
         if workflow.adaptive_caching:
             return True
         return False
