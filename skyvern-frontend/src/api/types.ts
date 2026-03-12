@@ -115,6 +115,7 @@ export type Task = {
   status: Status;
   created_at: string; // ISO 8601
   modified_at: string; // ISO 8601
+  finished_at: string | null; // ISO 8601
   extracted_information: Record<string, unknown> | string | null;
   screenshot_url: string | null;
   recording_url: string | null;
@@ -385,6 +386,7 @@ export type DebugSessionApiResponse = {
 export type WorkflowRunApiResponse = {
   created_at: string;
   failure_reason: string | null;
+  finished_at: string | null; // ISO 8601
   modified_at: string;
   proxy_location: ProxyLocation | null;
   script_run: boolean | null;

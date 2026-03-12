@@ -200,10 +200,12 @@ This uses 5 blocks across 3 categories: browser automation, data and extraction,
 
 ### What you built
 
-```
-[find_hiring_thread] → [scrape_listings] → [process_each (loop)] → [send_digest]
-    Browser Task           Extraction        └─ [summarize]          Send Email
-                                                Text Prompt
+```mermaid
+flowchart LR
+    A["find_hiring_thread<br/>Browser Task"] --> B["scrape_listings<br/>Extraction"]
+    B --> C["process_each<br/>Loop"]
+    C --> D["summarize<br/>Text Prompt"]
+    D --> E["send_digest<br/>Send Email"]
 ```
 
 Five blocks, three categories, zero code. You can now re-run this workflow anytime, tweak the extraction schema to pull different fields, swap the email for an HTTP Request to post to Slack, or add a Conditional block to only email when listings match certain criteria.
