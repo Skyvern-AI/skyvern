@@ -105,6 +105,13 @@ repos:
     hooks:
       - id: prettier
         types: [javascript]
+        args: [--no-parallel]
+        exclude: |
+          (?x)(
+            node_modules/|
+            \.claude/worktrees/|
+            \.venv/
+          )
   - repo: local
     hooks:
       - id: frontend-precommit
