@@ -27,10 +27,9 @@ Traditional tools that automate web tasks end up failing because they treat the 
 
 [Skyvern](https://www.skyvern.com) is a browser automation tool that solves this problem by using AI that "sees" websites the way a human does. This means it can adapt when pages change and keep your automations running smoothly without you having to constantly babysit them. 
 
-<p align="center">
-  <img src="fern/images/geico_shu_recording_cropped.gif" width="600" />
-</p>
-<p align="center"><i>Skyvern in action, navigating the Geico site to acquire an insurance quote.</i></p>
+<!-- Demo Link-->
+https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f
+<p align="center"><i>Skyvern demo</i></p>
 
 --- 
 
@@ -77,6 +76,11 @@ This gives Skyvern three properties that traditional tools can't match:
   <img src="fern/images/finditparts_recording_crop.gif" width="600" />
 </p>
 <p align="center"><i>Sourcing auto parts across supplier websites. (<a href="https://app.skyvern.com/tasks/create/finditparts">See it in action</a>)</i></p>
+
+<p align="center">
+  <img src="fern/images/geico_shu_recording_cropped.gif" width="600" />
+</p>
+<p align="center"><i>Navigating an insurance site to get a quote. (<a href="https://app.skyvern.com/sign-in?redirect_to=https%3A%2F%2Fapp.skyvern.com%2Ftasks%2Fcreate%2Fgeico">See it in action</a>)</i></p>
 
 Skyvern can automate nearly any workflow that requires interacting with a website. Some of the common use cases include: 
 
