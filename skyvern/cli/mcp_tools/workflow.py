@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from enum import Enum
 from typing import Annotated, Any
 
 import structlog
+import yaml
 from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
@@ -206,6 +208,7 @@ _CODE_V2_DEFAULTS: dict[str, Any] = {
     "adaptive_caching": True,
     "run_with": "code",
 }
+_DEFAULT_MCP_PROXY_LOCATION = ProxyLocation.RESIDENTIAL
 
 
 def _deep_merge(base: Any, override: Any) -> Any:
@@ -265,6 +268,70 @@ def _make_invalid_json_definition_error(exc: Exception) -> dict[str, Any]:
     )
 
 
+def _load_definition_dict(definition: str, fmt: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Best-effort parse of a workflow definition into a mutable dict.
+
+    Used only for tool-side default injection. On parse failure, returns
+    ``(None, None)`` so the caller can preserve existing server-side validation
+    behavior.
+    """
+
+    def _as_dict(value: Any, parsed_format: str) -> tuple[dict[str, Any] | None, str | None]:
+        return (value, parsed_format) if isinstance(value, dict) else (None, None)
+
+    if fmt == "json":
+        try:
+            return _as_dict(json.loads(definition), "json")
+        except (json.JSONDecodeError, TypeError):
+            return None, None
+
+    if fmt == "yaml":
+        try:
+            return _as_dict(yaml.safe_load(definition), "yaml")
+        except yaml.YAMLError:
+            return None, None
+
+    try:
+        return _as_dict(json.loads(definition), "json")
+    except (json.JSONDecodeError, TypeError):
+        try:
+            return _as_dict(yaml.safe_load(definition), "yaml")
+        except yaml.YAMLError:
+            return None, None
+
+
+def _dump_definition_dict(raw: dict[str, Any], parsed_format: str) -> str:
+    def _coerce_enums(value: Any) -> Any:
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, dict):
+            return {key: _coerce_enums(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_coerce_enums(item) for item in value]
+        return value
+
+    raw = _coerce_enums(raw)
+    if parsed_format == "json":
+        return json.dumps(raw)
+    return yaml.safe_dump(raw, sort_keys=False)
+
+
+def _inject_missing_top_level_defaults(definition: str, fmt: str, defaults: dict[str, Any]) -> str:
+    """Inject missing top-level keys for JSON or YAML workflow definitions."""
+
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+
+    changed = False
+    for key, value in defaults.items():
+        if key not in raw:
+            raw[key] = value
+            changed = True
+
+    return _dump_definition_dict(raw, parsed_format) if changed else definition
+
+
 def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
     """Inject Code 2.0 defaults into a JSON definition string when not explicitly set.
 
@@ -285,6 +352,18 @@ def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
             changed = True
 
     return json.dumps(raw) if changed else definition
+
+
+async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workflow_id: str) -> str:
+    """Preserve or default workflow proxy location when MCP update omits it."""
+
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None or "proxy_location" in raw:
+        return definition
+
+    existing_workflow = await _get_workflow_by_id(workflow_id)
+    raw["proxy_location"] = existing_workflow.get("proxy_location") or _DEFAULT_MCP_PROXY_LOCATION
+    return _dump_definition_dict(raw, parsed_format)
 
 
 def _parse_definition(
@@ -473,9 +552,14 @@ async def skyvern_workflow_create(
             ),
         )
 
-    # Default to Code 2.0 for MCP-created workflows (create only, not update).
-    # Inject defaults into the raw JSON before parsing so explicit user values are preserved.
+    # Default MCP-created workflows to the same editor defaults while preserving
+    # any explicit user-supplied values.
     definition = _inject_code_v2_defaults(definition, format)
+    definition = _inject_missing_top_level_defaults(
+        definition,
+        format,
+        {"proxy_location": _DEFAULT_MCP_PROXY_LOCATION},
+    )
 
     json_def, yaml_def, parse_err = _parse_definition(definition, format)
     if parse_err is not None:
@@ -535,6 +619,30 @@ async def skyvern_workflow_update(
                 ErrorCode.INVALID_INPUT,
                 f"Invalid format: {format!r}",
                 "Use 'json', 'yaml', or 'auto'",
+            ),
+        )
+
+    try:
+        definition = await _inject_workflow_update_proxy_default(definition, format, workflow_id)
+    except NotFoundError:
+        return make_result(
+            "skyvern_workflow_update",
+            ok=False,
+            error=make_error(
+                ErrorCode.WORKFLOW_NOT_FOUND,
+                f"Workflow {workflow_id!r} not found",
+                "Verify the workflow ID with skyvern_workflow_list",
+            ),
+        )
+    except Exception as e:
+        LOG.warning("workflow_update_proxy_default_injection_failed", workflow_id=workflow_id, error=str(e))
+        return make_result(
+            "skyvern_workflow_update",
+            ok=False,
+            error=make_error(
+                ErrorCode.API_ERROR,
+                str(e),
+                "Check the workflow ID and Skyvern connection before retrying the update",
             ),
         )
 
