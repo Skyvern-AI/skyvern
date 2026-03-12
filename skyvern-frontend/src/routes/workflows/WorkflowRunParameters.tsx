@@ -42,6 +42,8 @@ function WorkflowRunParameters() {
     ? (location.state.extraHttpHeaders as Record<string, string>)
     : null;
 
+  const runWith = (location.state?.runWith as string) ?? null;
+
   const initialValues = getInitialValues(location, workflowParameters ?? []);
 
   if (isFetching) {
@@ -77,6 +79,7 @@ function WorkflowRunParameters() {
         extraHttpHeaders:
           extraHttpHeaders ?? workflow.extra_http_headers ?? null,
         cdpAddress: null,
+        runWith,
       }}
     />
   );

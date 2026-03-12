@@ -151,9 +151,15 @@ skyvern setup claude-code --global    # Force global Claude Code config
 skyvern setup claude                  # Register with Claude Desktop
 skyvern setup cursor             # Register with Cursor
 skyvern setup windsurf           # Register with Windsurf
+skyvern mcp switch                    # Interactively switch existing Skyvern MCP configs
+skyvern mcp switch --dry-run          # Preview changes without writing files
+skyvern mcp profile list              # List saved switch sources
+skyvern mcp profile save work-prod --api-key YOUR_KEY --base-url https://api.skyvern.com
 ```
 
 For the local self-hosted path, `skyvern quickstart` or `skyvern init` can also configure Claude Code during the interactive MCP step. In a project directory that flow writes `.mcp.json`, installs `.claude/skills/qa`, and keeps the MCP connection fully local for localhost testing.
+
+`skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, and Codex configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
 
 ### Other
 

@@ -465,7 +465,7 @@ class ScriptSkyvernPage(SkyvernPage):
                 await app.DATABASE.update_action_reasoning(
                     organization_id=str(context.organization_id),
                     action_id=str(created_action.action_id),
-                    reasoning=f"Script execution: {intention[:80]}",
+                    reasoning=f"Script execution: {intention[:80]}" if intention else "Script execution",
                 )
             else:
                 asyncio.create_task(

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from skyvern.cli.setup_commands import setup_app
+from skyvern.cli.setup_commands import _cursor_config_path, _windsurf_config_path, setup_app
 
 _FAKE_ENV = ("test-key", "https://api.skyvern.com")
 
@@ -81,3 +81,19 @@ def test_guided_setup_skips_claude_desktop_without_node_and_prints_bundle_hint(
     assert "one-click Skyvern bundle" in result.output
     assert ".mcpb" in result.output
     assert not config.exists()
+
+
+def test_cursor_config_path_uses_windows_home_on_wsl(monkeypatch: pytest.MonkeyPatch) -> None:
+    roaming_path = Path("/mnt/c/Users/alice/AppData/Roaming")
+    monkeypatch.setattr("skyvern.cli.setup_commands.detect_os", lambda: "wsl")
+    monkeypatch.setattr("skyvern.cli.setup_commands.get_windows_appdata_roaming", lambda: roaming_path)
+
+    assert _cursor_config_path() == Path("/mnt/c/Users/alice/.cursor/mcp.json")
+
+
+def test_windsurf_config_path_uses_windows_home_on_wsl(monkeypatch: pytest.MonkeyPatch) -> None:
+    roaming_path = Path("/mnt/c/Users/alice/AppData/Roaming")
+    monkeypatch.setattr("skyvern.cli.setup_commands.detect_os", lambda: "wsl")
+    monkeypatch.setattr("skyvern.cli.setup_commands.get_windows_appdata_roaming", lambda: roaming_path)
+
+    assert _windsurf_config_path() == Path("/mnt/c/Users/alice/.codeium/windsurf/mcp_config.json")

@@ -133,6 +133,31 @@ x-api-key = "SKYVERN_API_KEY"
 
 That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the connection (requires Node.js >= 20).
 
+## Switch an existing MCP config
+
+If you already have a Skyvern MCP entry and just need to switch to another API key or base URL, use the CLI instead of hand-editing JSON or TOML:
+
+```bash
+pip install skyvern
+skyvern mcp switch --dry-run
+skyvern mcp switch
+```
+
+The switcher scans supported local config files created by `skyvern setup` or manual setup, shows which ones already contain a Skyvern entry, lets you choose which apps to update, and writes a backup before changing anything.
+
+Today it can update:
+
+- Claude Code project `.mcp.json`
+- Claude Code global `~/.claude.json`
+- Claude Desktop JSON config
+- Cursor `~/.cursor/mcp.json`
+- Windsurf `~/.codeium/windsurf/mcp_config.json`
+- Codex `~/.codex/config.toml`
+
+`skyvern mcp switch` preserves the existing transport shape. Remote configs keep using `https://.../mcp/`; local stdio configs keep `SKYVERN_BASE_URL` and `SKYVERN_API_KEY` in the launched process environment. After switching, restart your AI client.
+
+If a config file exists but does not already contain a Skyvern entry, run `skyvern setup` or use the manual setup snippets on this page first.
+
 ## Alternative: Local mode (self-hosted)
 
 Use this if you are self-hosting Skyvern and want the MCP server to talk to your own instance instead of Skyvern Cloud. This runs a lightweight Python process on your machine that connects to your local Skyvern server. Requires Python 3.11, 3.12, or 3.13.
@@ -278,7 +303,7 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 <Accordion title="Invalid API key or 401 errors">
 Double-check that your API key is correct. You can find or regenerate it at [Settings](https://app.skyvern.com). Make sure there are no extra spaces or newlines when pasting the key.
 
-If you recently regenerated your API key, update it in your MCP config and restart your AI client.
+If you recently regenerated your API key, run `skyvern mcp switch` if you installed the CLI, or update the MCP config manually, then restart your AI client.
 </Accordion>
 
 <Accordion title="Tools not responding or timing out">

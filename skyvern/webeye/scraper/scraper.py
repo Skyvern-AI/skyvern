@@ -298,7 +298,16 @@ async def scrape_web_unsafe(
     # clicking start my quote)
     url = page.url
     if url == "about:blank" and not support_empty_page:
-        raise ScrapingFailedBlankPage()
+        # Allow scraping if the page has child frames with meaningful content
+        # (e.g., Edge PDF interstitial pages render content via iframes on about:blank).
+        # Filter out empty/blank frames (ad iframes, tracking pixels, detached frames).
+        meaningful_frames = [f for f in page.main_frame.child_frames if f.url and f.url not in ("about:blank", "")]
+        if not meaningful_frames:
+            raise ScrapingFailedBlankPage()
+        LOG.info(
+            "about:blank page has meaningful child frames, proceeding with scraping",
+            frame_count=len(meaningful_frames),
+        )
 
     skyvern_frame = await SkyvernFrame.create_instance(page)
     await skyvern_frame.safe_wait_for_animation_end()

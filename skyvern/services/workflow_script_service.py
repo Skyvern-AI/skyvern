@@ -2,7 +2,7 @@ import base64
 import hashlib
 import re
 import urllib.parse
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 from cachetools import TTLCache
@@ -215,7 +215,6 @@ async def get_workflow_script(
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=rendered_cache_key_value,
             statuses=[status],
-            use_cache=True,
         )
 
         if existing_script:
@@ -432,6 +431,9 @@ async def generate_workflow_script(
         LOG.error("Failed to generate workflow script source", exc_info=True)
         return
 
+    # 3.5) Post-process: fix static actions inside for-loop blocks
+    python_src = _fix_static_actions_in_for_loops(python_src)
+
     # 4) Persist script and files, then record mapping
     content_bytes = python_src.encode("utf-8")
     content_b64 = base64.b64encode(content_bytes).decode("utf-8")
@@ -477,6 +479,261 @@ async def generate_workflow_script(
             workflow_run_id=workflow_run.workflow_run_id,
             status=status,
         )
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: fix static actions inside for-loop blocks
+# ---------------------------------------------------------------------------
+# Matches `async for current_value in skyvern.loop(...):`  blocks.
+_FOR_LOOP_RE = re.compile(
+    r"^(?P<indent> *)async for current_value in skyvern\.loop\(.*\):\s*$",
+)
+# Matches the start of an `await page.click(` call.  We find the balanced
+# closing paren programmatically so CSS pseudo-selectors like `:has-text(...)`
+# or `:nth-child(2)` don't truncate the match — and we avoid a regex whose
+# nested quantifiers would cause exponential backtracking.
+_PAGE_CLICK_START_RE = re.compile(r"await page\.click\(")
+
+
+class _PromptKwargMatch(NamedTuple):
+    start: int
+    end: int
+    quote: str
+    value: str
+
+
+def _find_string_literal_end(text: str, start: int, quote: str) -> int | None:
+    """Return the closing quote index for a quoted string, or ``None`` if unterminated."""
+    pos = start + 1
+    escaped = False
+
+    while pos < len(text):
+        ch = text[pos]
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == quote:
+            return pos
+        pos += 1
+
+    return None
+
+
+def _is_identifier_char(ch: str) -> bool:
+    return ch == "_" or ch.isalnum()
+
+
+def _find_quoted_prompt_kwarg(text: str) -> tuple[_PromptKwargMatch | None, bool]:
+    """Find a quoted ``prompt=...`` kwarg with a deterministic single-pass scan.
+
+    Returns ``(match, False)`` when a quoted prompt kwarg is found, ``(None, False)``
+    when no such kwarg exists, and ``(None, True)`` when scanning encounters an
+    unterminated string and the call should be left untouched.
+    """
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        if ch in ("'", '"'):
+            string_end = _find_string_literal_end(text, i, ch)
+            if string_end is None:
+                return None, True
+            i = string_end + 1
+            continue
+
+        if not text.startswith("prompt", i):
+            i += 1
+            continue
+
+        prev_char = text[i - 1] if i > 0 else ""
+        next_idx = i + len("prompt")
+        next_char = text[next_idx] if next_idx < len(text) else ""
+        if (prev_char and _is_identifier_char(prev_char)) or (next_char and _is_identifier_char(next_char)):
+            i += 1
+            continue
+
+        value_start = next_idx
+        while value_start < len(text) and text[value_start].isspace():
+            value_start += 1
+        if value_start >= len(text) or text[value_start] != "=":
+            i += 1
+            continue
+
+        value_start += 1
+        while value_start < len(text) and text[value_start].isspace():
+            value_start += 1
+        if value_start >= len(text):
+            return None, True
+
+        quote = text[value_start]
+        if quote not in ("'", '"'):
+            i += 1
+            continue
+
+        string_end = _find_string_literal_end(text, value_start, quote)
+        if string_end is None:
+            return None, True
+
+        return (
+            _PromptKwargMatch(
+                start=i,
+                end=string_end + 1,
+                quote=quote,
+                value=text[value_start + 1 : string_end],
+            ),
+            False,
+        )
+
+    return None, False
+
+
+def _find_click_calls(text: str) -> list[tuple[int, int, str]]:
+    """Find all ``await page.click(...)`` calls with balanced parentheses.
+
+    Returns a list of (start, end, args) tuples where *start*/*end* are byte
+    offsets into *text* spanning the full call and *args* is the text between
+    the outer parentheses.
+    """
+    results: list[tuple[int, int, str]] = []
+    for m in _PAGE_CLICK_START_RE.finditer(text):
+        start = m.start()
+        pos = m.end()
+        depth = 1
+        while pos < len(text) and depth > 0:
+            ch = text[pos]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            pos += 1
+        if depth == 0:
+            results.append((start, pos, text[m.end() : pos - 1]))
+    return results
+
+
+def _fix_static_actions_in_for_loops(code: str) -> str:
+    """Detect page.click() calls inside for-loops that don't reference the loop variable.
+
+    When a click action inside a for-loop uses a static selector/prompt (not referencing
+    ``current_value``), it will resolve to the same element on every iteration — a common
+    bug in generated download scripts.
+
+    Fix: inject ``current_value`` into the prompt and upgrade ``ai='fallback'`` to
+    ``ai='proactive'`` so the LLM can disambiguate which element to click.
+    """
+    lines = code.split("\n")
+    result_lines: list[str] = []
+    i = 0
+    patched_count = 0
+
+    while i < len(lines):
+        line = lines[i]
+        m = _FOR_LOOP_RE.match(line)
+        if not m:
+            result_lines.append(line)
+            i += 1
+            continue
+
+        # Found a for-loop header. Collect the indented body.
+        loop_indent = m.group("indent")
+        body_indent_prefix = loop_indent + "    "  # 4-space indent inside loop
+        result_lines.append(line)
+        i += 1
+
+        # Gather body lines (lines that are indented deeper than the for-loop header or blank)
+        body_start = len(result_lines)
+        while i < len(lines):
+            body_line = lines[i]
+            # Body continues if the line is blank, or indented deeper than the for-loop
+            if body_line.strip() == "" or body_line.startswith(body_indent_prefix):
+                result_lines.append(body_line)
+                i += 1
+            else:
+                break
+
+        # Now check the body for static page.click() calls
+        body_text = "\n".join(result_lines[body_start:])
+        new_body_text = _patch_static_clicks_in_block(body_text)
+        if new_body_text != body_text:
+            patched_count += 1
+            # Replace body lines
+            result_lines[body_start:] = new_body_text.split("\n")
+
+    if patched_count > 0:
+        LOG.info("Fixed static click actions in for-loop blocks", patched_blocks=patched_count)
+    return "\n".join(result_lines)
+
+
+def _patch_static_clicks_in_block(body: str) -> str:
+    """Patch page.click() calls that don't reference current_value."""
+    calls = _find_click_calls(body)
+    if not calls:
+        return body
+
+    # Process matches in reverse order so earlier offsets stay valid.
+    for call_start, call_end, args in reversed(calls):
+        full = body[call_start:call_end]
+
+        # If the call already references current_value, leave it alone
+        if "current_value" in args:
+            continue
+
+        # Only patch clicks that explicitly use ai='fallback'.  Proactive
+        # clicks already use the LLM, and clicks with no ai= kwarg are not
+        # part of the AI-fallback system so should be left alone.
+        if "ai='proactive'" in args or 'ai="proactive"' in args:
+            continue
+        has_fallback = "ai='fallback'" in args or 'ai="fallback"' in args
+        if not has_fallback:
+            continue
+
+        # Upgrade ai='fallback' to ai='proactive'
+        patched = full
+        if "ai='fallback'" in patched:
+            patched = patched.replace("ai='fallback'", "ai='proactive'")
+        elif 'ai="fallback"' in patched:
+            patched = patched.replace('ai="fallback"', 'ai="proactive"')
+
+        # Derive indentation from the position of the match in the body text
+        # so injected code is correctly aligned regardless of nesting level.
+        # Walk backwards from the match start to find the beginning of the line.
+        line_start = body.rfind("\n", 0, call_start)
+        if line_start == -1:
+            leading_text = body[:call_start]
+        else:
+            leading_text = body[line_start + 1 : call_start]
+        base_indent = leading_text if leading_text.isspace() or leading_text == "" else ""
+        kwarg_indent = base_indent + "    "
+
+        # Append current_value context to the prompt so the LLM knows which item to target
+        # Look for an existing prompt= kwarg and append to it
+        prompt_match, malformed_prompt = _find_quoted_prompt_kwarg(patched)
+        if malformed_prompt:
+            continue
+        if prompt_match:
+            quote = prompt_match.quote
+            original_prompt = prompt_match.value
+            # Use an f-string so current_value is evaluated at runtime.
+            # Escape existing braces so they are literal in the f-string.
+            escaped_prompt = original_prompt.replace("{", "{{").replace("}", "}}")
+            new_prompt = f"prompt=f{quote}{escaped_prompt} Target: {{current_value}}{quote}"
+            patched = patched[: prompt_match.start] + new_prompt + patched[prompt_match.end :]
+        else:
+            # No prompt= kwarg — add one with current_value context
+            # Insert before the closing paren
+            close_paren_idx = patched.rfind(")")
+            if close_paren_idx > 0:
+                before = patched[:close_paren_idx].rstrip().rstrip(",")
+                patched = (
+                    before
+                    + f",\n{kwarg_indent}prompt=f'Click the element for: {{current_value}}',\n{base_indent}"
+                    + patched[close_paren_idx:]
+                )
+
+        body = body[:call_start] + patched + body[call_end:]
+
+    return body
 
 
 _IMPORT_RE = re.compile(r"^(?:import |from \S+ import )")
@@ -774,6 +1031,7 @@ async def create_script_version_from_review(
         )
         if main_py_content:
             patched_main = _patch_main_py(main_py_content, updated_blocks)
+            patched_main = _fix_static_actions_in_for_loops(patched_main)
             patched_bytes = patched_main.encode("utf-8")
             patched_hash = hashlib.sha256(patched_bytes).hexdigest()
 

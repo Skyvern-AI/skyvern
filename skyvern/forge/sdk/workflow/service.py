@@ -1019,14 +1019,34 @@ class WorkflowService:
             # Trigger AI Script Reviewer for adaptive caching workflows
             # Include terminated and failed runs (triage will filter non-code-fixable failures)
             # Skip canceled (user stopped) and timed_out (infrastructure issue)
+            # Only trigger if this run used the latest script version — stale runs produce
+            # episodes that may already be fixed in newer versions, and reviewing them creates
+            # redundant/regressive versions.
             if is_adaptive_caching(workflow, workflow_run) and pre_finally_status not in (
                 WorkflowRunStatus.canceled,
                 WorkflowRunStatus.timed_out,
             ):
-                asyncio.create_task(
-                    self._trigger_script_reviewer(workflow, workflow_run),
-                    name=f"script_reviewer_{workflow_run.workflow_run_id}",
-                )
+                should_trigger_reviewer = True
+                current_ctx = skyvern_context.current()
+                if current_ctx and current_ctx.script_id:
+                    latest_script = await app.DATABASE.get_latest_script_version(
+                        script_id=current_ctx.script_id,
+                        organization_id=workflow.organization_id,
+                    )
+                    if latest_script and latest_script.script_revision_id != current_ctx.script_revision_id:
+                        should_trigger_reviewer = False
+                        LOG.info(
+                            "Skipping script reviewer - run used stale script version",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            used_revision=current_ctx.script_revision_id,
+                            latest_revision=latest_script.script_revision_id,
+                            latest_version=latest_script.version,
+                        )
+                if should_trigger_reviewer:
+                    asyncio.create_task(
+                        self._trigger_script_reviewer(workflow, workflow_run),
+                        name=f"script_reviewer_{workflow_run.workflow_run_id}",
+                    )
 
             # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
             should_run_finally = finally_block_label and pre_finally_status != WorkflowRunStatus.canceled
@@ -4819,15 +4839,19 @@ class WorkflowService:
     ) -> bool:
         """Determine whether this run should attempt to execute cached scripts.
 
-        Note: This intentionally does NOT consult workflow.adaptive_caching.
-        Adaptive caching workflows (is_adaptive_caching=True) gather training
-        data on agent runs before any script exists. The script-recording and
-        fallback-episode logic uses is_adaptive_caching() separately.
+        When neither the run nor the workflow explicitly sets run_with, fall back
+        to the workflow's adaptive_caching flag. This allows workflows with
+        adaptive_caching=True to default into code-v2 mode without requiring
+        every API call to pass run_with explicitly.
         """
         if workflow_run.run_with in ("code", "code_v2"):
             return True
         if workflow_run.run_with == "agent":
             return False
         if workflow.run_with == "code":
+            return True
+        if workflow.run_with == "agent":
+            return False
+        if workflow.adaptive_caching:
             return True
         return False
