@@ -14,13 +14,14 @@ from typing import Annotated, Any
 import structlog
 from pydantic import Field
 
-from skyvern.client.errors import NotFoundError
+from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.client.types import WorkflowCreateYamlRequest
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
+from ._validation import validate_folder_id
 
 LOG = structlog.get_logger()
 
@@ -628,6 +629,62 @@ async def skyvern_workflow_delete(
         },
         timing_ms=timer.timing_ms,
     )
+
+
+async def skyvern_workflow_update_folder(
+    workflow_id: Annotated[str, "Workflow permanent ID (wpid_...)"],
+    folder_id: Annotated[
+        str | None,
+        "Folder ID (fld_...) to assign, or null to remove the workflow from its folder",
+    ] = None,
+) -> dict[str, Any]:
+    """Assign a workflow to a folder, or remove it from its current folder."""
+    if err := _validate_workflow_id(workflow_id, "skyvern_workflow_update_folder"):
+        return err
+    if folder_id is not None and (err := validate_folder_id(folder_id, "skyvern_workflow_update_folder")):
+        return err
+
+    skyvern = get_skyvern()
+
+    with Timer() as timer:
+        try:
+            workflow = await skyvern.update_workflow_folder(workflow_id, folder_id=folder_id)
+            timer.mark("sdk")
+        except NotFoundError:
+            return make_result(
+                "skyvern_workflow_update_folder",
+                ok=False,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.WORKFLOW_NOT_FOUND,
+                    f"Workflow {workflow_id!r} not found",
+                    "Verify the workflow ID with skyvern_workflow_list.",
+                ),
+            )
+        except BadRequestError as e:
+            return make_result(
+                "skyvern_workflow_update_folder",
+                ok=False,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    str(e),
+                    "Verify the folder ID with skyvern_folder_list or pass null to remove the folder assignment.",
+                ),
+            )
+        except Exception as e:
+            return make_result(
+                "skyvern_workflow_update_folder",
+                ok=False,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.API_ERROR, str(e), "Check the workflow ID, folder ID, and your permissions."
+                ),
+            )
+
+    data = _serialize_workflow(workflow)
+    data["sdk_equivalent"] = f"await skyvern.update_workflow_folder({workflow_id!r}, folder_id={folder_id!r})"
+    return make_result("skyvern_workflow_update_folder", data=data, timing_ms=timer.timing_ms)
 
 
 # ---------------------------------------------------------------------------

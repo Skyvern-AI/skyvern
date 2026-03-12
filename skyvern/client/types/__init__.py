@@ -107,6 +107,9 @@ if typing.TYPE_CHECKING:
     from .download_to_s3block import DownloadToS3Block
     from .download_to_s3block_yaml import DownloadToS3BlockYaml
     from .extensions import Extensions
+    from .folder import Folder
+    from .folder_create import FolderCreate
+    from .folder_update import FolderUpdate
     from .extract_action import ExtractAction
     from .extract_action_data import ExtractActionData
     from .extract_action_extract_schema import ExtractActionExtractSchema
@@ -416,6 +419,7 @@ if typing.TYPE_CHECKING:
     from .totp_type import TotpType
     from .upload_file_action import UploadFileAction
     from .upload_file_action_data import UploadFileActionData
+    from .update_workflow_folder_request import UpdateWorkflowFolderRequest
     from .upload_file_response import UploadFileResponse
     from .upload_to_s3block import UploadToS3Block
     from .upload_to_s3block_yaml import UploadToS3BlockYaml
@@ -672,6 +676,9 @@ _dynamic_imports: typing.Dict[str, str] = {
     "DownloadToS3Block": ".download_to_s3block",
     "DownloadToS3BlockYaml": ".download_to_s3block_yaml",
     "Extensions": ".extensions",
+    "Folder": ".folder",
+    "FolderCreate": ".folder_create",
+    "FolderUpdate": ".folder_update",
     "ExtractAction": ".extract_action",
     "ExtractActionData": ".extract_action_data",
     "ExtractActionExtractSchema": ".extract_action_extract_schema",
@@ -953,6 +960,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "TotpType": ".totp_type",
     "UploadFileAction": ".upload_file_action",
     "UploadFileActionData": ".upload_file_action_data",
+    "UpdateWorkflowFolderRequest": ".update_workflow_folder_request",
     "UploadFileResponse": ".upload_file_response",
     "UploadToS3Block": ".upload_to_s3block",
     "UploadToS3BlockYaml": ".upload_to_s3block_yaml",
@@ -1219,6 +1227,9 @@ __all__ = [
     "DownloadToS3Block",
     "DownloadToS3BlockYaml",
     "Extensions",
+    "Folder",
+    "FolderCreate",
+    "FolderUpdate",
     "ExtractAction",
     "ExtractActionData",
     "ExtractActionExtractSchema",
@@ -1500,6 +1511,7 @@ __all__ = [
     "TotpType",
     "UploadFileAction",
     "UploadFileActionData",
+    "UpdateWorkflowFolderRequest",
     "UploadFileResponse",
     "UploadToS3Block",
     "UploadToS3BlockYaml",
