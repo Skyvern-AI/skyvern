@@ -559,6 +559,8 @@ async def create_workflow_legacy(
         )
     except WorkflowDefinitionValidationException as e:
         raise e
+    except (SkyvernHTTPException, ValidationError) as e:
+        raise e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
         raise FailedToCreateWorkflow(str(e))
@@ -621,6 +623,8 @@ async def create_workflow(
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
     except WorkflowDefinitionValidationException as e:
+        raise e
+    except (SkyvernHTTPException, ValidationError) as e:
         raise e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)

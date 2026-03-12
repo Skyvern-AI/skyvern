@@ -71,6 +71,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     ConditionalBlock,
     ExtractionBlock,
+    ForLoopBlock,
     NavigationBlock,
     TaskV2Block,
     compute_conditional_scopes,
@@ -2443,6 +2444,7 @@ class WorkflowService:
     def _build_workflow_graph(
         self,
         blocks: list[BlockTypeVar],
+        skip_sequential_defaulting: bool = False,
     ) -> tuple[str, dict[str, BlockTypeVar], dict[str, str | None]]:
         all_blocks = blocks
         label_to_block: dict[str, BlockTypeVar] = {}
@@ -2456,11 +2458,12 @@ class WorkflowService:
 
         # Only apply sequential defaulting if there are no conditional blocks
         # Conditional blocks break sequential ordering since they have multiple branches
-        has_conditional_blocks = any(isinstance(block, ConditionalBlock) for block in all_blocks)
-        if not has_conditional_blocks:
-            for idx, block in enumerate(blocks[:-1]):
-                if default_next_map.get(block.label) is None:
-                    default_next_map[block.label] = blocks[idx + 1].label
+        if not skip_sequential_defaulting:
+            has_conditional_blocks = any(isinstance(block, ConditionalBlock) for block in all_blocks)
+            if not has_conditional_blocks:
+                for idx, block in enumerate(blocks[:-1]):
+                    if default_next_map.get(block.label) is None:
+                        default_next_map[block.label] = blocks[idx + 1].label
 
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
@@ -2485,10 +2488,17 @@ class WorkflowService:
 
         roots = [label for label, count in incoming.items() if count == 0]
         if not roots:
-            raise InvalidWorkflowDefinition("No entry block found for workflow definition")
+            raise InvalidWorkflowDefinition(
+                "Circular reference detected: every block is the target of another block's next_block_label,"
+                " so there is no starting block."
+                " At least one block must not be the target of any next_block_label or branch condition."
+            )
         if len(roots) > 1:
             raise InvalidWorkflowDefinition(
-                f"Multiple entry blocks detected ({', '.join(sorted(roots))}); only one entry block is supported."
+                f"Disconnected blocks detected: blocks ({', '.join(sorted(roots))}) are not reachable from any"
+                " other block. Every block must be reachable from the first block through next_block_label or"
+                " conditional branch references."
+                " Either connect them by setting another block's next_block_label to point to them, or remove them."
             )
 
         # Kahn's algorithm for cycle detection
@@ -2504,9 +2514,54 @@ class WorkflowService:
                     queue.append(neighbor)
 
         if visited_count != len(label_to_block):
-            raise InvalidWorkflowDefinition("Workflow definition contains a cycle; DAG traversal is required.")
+            raise InvalidWorkflowDefinition(
+                "Circular reference detected: some blocks form a loop through their next_block_label references,"
+                " causing an infinite cycle."
+                " Ensure that following next_block_label from any block eventually reaches a block"
+                " with next_block_label set to null."
+            )
 
         return roots[0], label_to_block, default_next_map
+
+    def validate_workflow_block_graph(self, workflow_definition: WorkflowDefinition) -> None:
+        """Validate the block graph before persisting.
+
+        Detects orphaned blocks, circular references, and dangling next_block_label references.
+        Recursively validates nested ForLoopBlock graphs at all nesting depths.
+        Raises InvalidWorkflowDefinition (422) on validation failure.
+
+        For v2 workflow definitions (blocks have explicit next_block_label), sequential
+        defaulting is skipped so that disconnected subgraphs are detected.
+        v1 workflows (no next_block_label on any block) are skipped since they use
+        purely sequential execution.
+        """
+        blocks = list(workflow_definition.blocks)
+        if not blocks:
+            return
+
+        # v1 workflows have no explicit next_block_label and run sequentially — skip DAG validation
+        version = workflow_definition.version or 1
+        if version < 2:
+            return
+
+        finally_block_label = workflow_definition.finally_block_label
+        if finally_block_label:
+            blocks = self._strip_finally_block_references(blocks, finally_block_label)
+
+        if not blocks:
+            return
+
+        self._build_workflow_graph(blocks, skip_sequential_defaulting=True)
+
+        # Recursively validate nested ForLoopBlock graphs (including the finally block)
+        self._validate_nested_blocks(workflow_definition.blocks)
+
+    @staticmethod
+    def _validate_nested_blocks(blocks: list[BlockTypeVar]) -> None:
+        """Recursively validate ForLoopBlock graphs at all nesting depths."""
+        for block in blocks:
+            if isinstance(block, ForLoopBlock):
+                block.validate_loop_blocks()
 
     async def create_workflow(
         self,
@@ -4194,6 +4249,9 @@ class WorkflowService:
                 potential_workflow.workflow_id,
                 request.workflow_definition,
             )
+
+            # Validate the block graph before persisting (detects orphans, cycles, dangling references)
+            self.validate_workflow_block_graph(workflow_definition)
 
             updated_workflow = await self.update_workflow_definition(
                 workflow_id=potential_workflow.workflow_id,
