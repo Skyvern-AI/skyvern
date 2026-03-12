@@ -187,6 +187,34 @@ async def test_workflow_create_preserves_unknown_fields(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_workflow_create_defaults_proxy_location_when_omitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_client = SimpleNamespace(create_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    definition = {
+        "title": "Default proxy workflow",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "navigation",
+                    "label": "visit",
+                    "url": "https://example.com",
+                    "title": "Visit",
+                    "navigation_goal": "Open the page",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_create(definition=json.dumps(definition), format="json")
+
+    sent_definition = fake_client.create_workflow.await_args.kwargs["json_definition"]
+    assert result["ok"] is True
+    assert sent_definition.proxy_location == "RESIDENTIAL"
+
+
+@pytest.mark.asyncio
 async def test_workflow_create_preserves_block_level_unknown_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unknown fields inside individual block dicts survive normalization via deep merge."""
     fake_client = SimpleNamespace(create_workflow=AsyncMock(return_value=_fake_workflow_response()))
@@ -214,6 +242,84 @@ async def test_workflow_create_preserves_block_level_unknown_fields(monkeypatch:
     sent_block = sent.workflow_definition.blocks[0]
     block_dict = sent_block.model_dump(mode="json") if hasattr(sent_block, "model_dump") else sent_block.__dict__
     assert block_dict.get("some_future_block_field") == 42
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_preserves_existing_proxy_when_omitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        assert workflow_id == "wpid_test"
+        assert version is None
+        return {"proxy_location": "RESIDENTIAL_AU"}
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "navigation",
+                    "label": "visit",
+                    "url": "https://example.com",
+                    "title": "Visit",
+                    "navigation_goal": "Open the page",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    sent_definition = fake_client.update_workflow.await_args.kwargs["json_definition"]
+    assert result["ok"] is True
+    assert sent_definition.proxy_location == "RESIDENTIAL_AU"
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_defaults_proxy_when_existing_is_null(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_client = SimpleNamespace(update_workflow=AsyncMock(return_value=_fake_workflow_response()))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        assert workflow_id == "wpid_test"
+        assert version is None
+        return {"proxy_location": None}
+
+    monkeypatch.setattr(workflow_tools, "_get_workflow_by_id", fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "navigation",
+                    "label": "visit",
+                    "url": "https://example.com",
+                    "title": "Visit",
+                    "navigation_goal": "Open the page",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    sent_definition = fake_client.update_workflow.await_args.kwargs["json_definition"]
+    assert result["ok"] is True
+    assert sent_definition.proxy_location == "RESIDENTIAL"
 
 
 @pytest.mark.asyncio
