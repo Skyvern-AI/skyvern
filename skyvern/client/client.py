@@ -23,6 +23,7 @@ from .types.create_credential_request_credential import CreateCredentialRequestC
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.extensions import Extensions
+from .types.folder import Folder
 from .types.get_run_response import GetRunResponse
 from .types.otp_type import OtpType
 from .types.persistent_browser_type import PersistentBrowserType
@@ -735,6 +736,84 @@ class Skyvern:
         )
         """
         _response = self._raw_client.delete_workflow(workflow_id, request_options=request_options)
+        return _response.data
+
+    def create_folder(
+        self,
+        *,
+        title: str,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        _response = self._raw_client.create_folder(
+            title=title,
+            description=description,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def get_folder(self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Folder:
+        _response = self._raw_client.get_folder(folder_id, request_options=request_options)
+        return _response.data
+
+    def get_folders(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        search: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Folder]:
+        _response = self._raw_client.get_folders(
+            page=page,
+            page_size=page_size,
+            search=search,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def update_folder(
+        self,
+        folder_id: str,
+        *,
+        title: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        _response = self._raw_client.update_folder(
+            folder_id,
+            title=title,
+            description=description,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def delete_folder(
+        self,
+        folder_id: str,
+        *,
+        delete_workflows: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.Optional[typing.Any]:
+        _response = self._raw_client.delete_folder(
+            folder_id,
+            delete_workflows=delete_workflows,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def update_workflow_folder(
+        self,
+        workflow_id: str,
+        *,
+        folder_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        _response = self._raw_client.update_workflow_folder(
+            workflow_id,
+            folder_id=folder_id,
+            request_options=request_options,
+        )
         return _response.data
 
     def get_artifact(self, artifact_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Artifact:
@@ -3084,6 +3163,84 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.delete_workflow(workflow_id, request_options=request_options)
+        return _response.data
+
+    async def create_folder(
+        self,
+        *,
+        title: str,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        _response = await self._raw_client.create_folder(
+            title=title,
+            description=description,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def get_folder(self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Folder:
+        _response = await self._raw_client.get_folder(folder_id, request_options=request_options)
+        return _response.data
+
+    async def get_folders(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        search: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Folder]:
+        _response = await self._raw_client.get_folders(
+            page=page,
+            page_size=page_size,
+            search=search,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def update_folder(
+        self,
+        folder_id: str,
+        *,
+        title: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        _response = await self._raw_client.update_folder(
+            folder_id,
+            title=title,
+            description=description,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def delete_folder(
+        self,
+        folder_id: str,
+        *,
+        delete_workflows: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.Optional[typing.Any]:
+        _response = await self._raw_client.delete_folder(
+            folder_id,
+            delete_workflows=delete_workflows,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def update_workflow_folder(
+        self,
+        workflow_id: str,
+        *,
+        folder_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        _response = await self._raw_client.update_workflow_folder(
+            workflow_id,
+            folder_id=folder_id,
+            request_options=request_options,
+        )
         return _response.data
 
     async def get_artifact(

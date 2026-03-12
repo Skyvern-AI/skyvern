@@ -33,6 +33,13 @@ from .credential import (
     skyvern_credential_get,
     skyvern_credential_list,
 )
+from .folder import (
+    skyvern_folder_create,
+    skyvern_folder_delete,
+    skyvern_folder_get,
+    skyvern_folder_list,
+    skyvern_folder_update,
+)
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
 from .session import (
     skyvern_browser_session_close,
@@ -51,6 +58,7 @@ from .workflow import (
     skyvern_workflow_run,
     skyvern_workflow_status,
     skyvern_workflow_update,
+    skyvern_workflow_update_folder,
 )
 
 mcp = FastMCP(
@@ -287,11 +295,19 @@ mcp.tool()(skyvern_credential_list)
 mcp.tool()(skyvern_credential_get)
 mcp.tool()(skyvern_credential_delete)
 
+# -- Folder management (no browser needed) --
+mcp.tool()(skyvern_folder_list)
+mcp.tool()(skyvern_folder_create)
+mcp.tool()(skyvern_folder_get)
+mcp.tool()(skyvern_folder_update)
+mcp.tool()(skyvern_folder_delete)
+
 # -- Workflow management (CRUD + execution, no browser needed) --
 mcp.tool()(skyvern_workflow_list)
 mcp.tool()(skyvern_workflow_get)
 mcp.tool()(skyvern_workflow_create)
 mcp.tool()(skyvern_workflow_update)
+mcp.tool()(skyvern_workflow_update_folder)
 mcp.tool()(skyvern_workflow_delete)
 mcp.tool()(skyvern_workflow_run)
 mcp.tool()(skyvern_workflow_status)
@@ -335,11 +351,18 @@ __all__ = [
     "skyvern_credential_list",
     "skyvern_credential_get",
     "skyvern_credential_delete",
+    # Folder management
+    "skyvern_folder_list",
+    "skyvern_folder_create",
+    "skyvern_folder_get",
+    "skyvern_folder_update",
+    "skyvern_folder_delete",
     # Workflow management
     "skyvern_workflow_list",
     "skyvern_workflow_get",
     "skyvern_workflow_create",
     "skyvern_workflow_update",
+    "skyvern_workflow_update_folder",
     "skyvern_workflow_delete",
     "skyvern_workflow_run",
     "skyvern_workflow_status",
