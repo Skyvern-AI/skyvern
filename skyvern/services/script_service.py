@@ -429,12 +429,21 @@ async def _create_workflow_block_run_and_task(
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
         workflow_run_context.update_block_metadata(label, context.loop_metadata)
 
+    current_value_str = None
+    current_index_val = None
+    if context.loop_metadata:
+        cv = context.loop_metadata.get("current_value")
+        current_value_str = str(cv) if cv is not None else None
+        current_index_val = context.loop_metadata.get("current_index")
+
     workflow_run_block = await app.DATABASE.create_workflow_run_block(
         workflow_run_id=workflow_run_id,
         parent_workflow_run_block_id=context.parent_workflow_run_block_id,
         organization_id=organization_id,
         block_type=block_type,
         label=label,
+        current_value=current_value_str,
+        current_index=current_index_val,
     )
 
     workflow_run_block_id = workflow_run_block.workflow_run_block_id
@@ -744,14 +753,15 @@ def _append_to_loop_output(output: Any, label: str | None = None) -> None:
     loop_value = context.loop_metadata.get("current_value")
     current_value: Any = loop_value
     # If the loop value is a dictionary, we'll create a safe copy so we can
-    # enrich it with block output data without mutating the original object
+    # enrich it with block output data without mutating the original object.
+    # Only copy downloaded_files here — extracted_information is already present
+    # in output_value and copying it into current_value causes duplication when
+    # _collect_extracted_information recursively walks both fields.
     if isinstance(loop_value, dict):
         current_value = copy.deepcopy(loop_value)
         if isinstance(output, dict):
             if "downloaded_files" in output:
                 current_value["downloaded_files"] = output.get("downloaded_files")
-            if "extracted_information" in output:
-                current_value["extracted_information"] = output.get("extracted_information")
 
     context.loop_output_values.append(
         {

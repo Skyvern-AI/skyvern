@@ -505,6 +505,8 @@ class Block(BaseModel, abc.ABC):
         parent_workflow_run_block_id: str | None = None,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        current_value: str | None = None,
+        current_index: int | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_block_id = None
@@ -521,6 +523,8 @@ class Block(BaseModel, abc.ABC):
                 block_type=self.block_type,
                 continue_on_failure=self.continue_on_failure,
                 engine=engine,
+                current_value=current_value,
+                current_index=current_index,
             )
             workflow_run_block_id = workflow_run_block.workflow_run_block_id
 
@@ -1856,6 +1860,8 @@ class ForLoopBlock(Block):
                     parent_workflow_run_block_id=parent_wrb_id,
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
+                    current_value=str(loop_over_value),
+                    current_index=loop_idx,
                 )
 
                 # Track conditional workflow_run_block_ids so branch targets

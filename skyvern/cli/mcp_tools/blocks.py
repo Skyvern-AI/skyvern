@@ -187,6 +187,18 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "label": "wait_for_processing",
         "wait_sec": 30,
     },
+    "text_prompt": {
+        "block_type": "text_prompt",
+        "label": "summarize_results",
+        "prompt": "Summarize {{ raw_results }} into a short customer-facing update",
+        "parameter_keys": ["raw_results"],
+        "json_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+            },
+        },
+    },
     "goto_url": {
         "block_type": "goto_url",
         "label": "open_cart",

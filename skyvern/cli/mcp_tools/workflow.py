@@ -17,6 +17,7 @@ from pydantic import Field
 from skyvern.client.errors import NotFoundError
 from skyvern.client.types import WorkflowCreateYamlRequest
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
@@ -200,6 +201,91 @@ def _validate_definition_structure(json_def: WorkflowCreateYamlRequest | None, a
     return None
 
 
+_CODE_V2_DEFAULTS: dict[str, Any] = {
+    "adaptive_caching": True,
+    "run_with": "code",
+}
+
+
+def _deep_merge(base: Any, override: Any) -> Any:
+    """Recursively merge normalized JSON-like data over the raw payload.
+
+    Unknown fields should survive normalization. Lists are merged by index so
+    overlapping items keep raw unknown keys even if normalization changes the
+    list length.
+    """
+
+    if isinstance(base, dict) and isinstance(override, dict):
+        result = dict(base)
+        for key, value in override.items():
+            if key in result:
+                result[key] = _deep_merge(result[key], value)
+            else:
+                result[key] = value
+        return result
+
+    if isinstance(base, list) and isinstance(override, list):
+        merged: list[Any] = []
+        for idx in range(max(len(base), len(override))):
+            if idx < len(base) and idx < len(override):
+                merged.append(_deep_merge(base[idx], override[idx]))
+            elif idx < len(override):
+                merged.append(override[idx])
+            else:
+                merged.append(base[idx])
+        return merged
+
+    return override
+
+
+def _normalize_json_definition(raw: Any) -> WorkflowCreateYamlRequest:
+    """Normalize JSON workflow definitions through the shared backend schema."""
+
+    if not isinstance(raw, dict):
+        raise TypeError("Workflow definition JSON must be an object")
+
+    try:
+        normalized = WorkflowCreateYAMLRequestSchema.model_validate(raw)
+    except Exception as exc:
+        # Internal schema is stricter than the Fern SDK — skip normalization so
+        # unknown/future fields are not rejected.
+        LOG.warning("Skipping text-prompt normalization; internal schema rejected payload", error=str(exc))
+        return WorkflowCreateYamlRequest(**raw)
+
+    merged = _deep_merge(raw, normalized.model_dump(mode="json"))
+    return WorkflowCreateYamlRequest(**merged)
+
+
+def _make_invalid_json_definition_error(exc: Exception) -> dict[str, Any]:
+    return make_error(
+        ErrorCode.INVALID_INPUT,
+        f"Invalid JSON definition: {exc}",
+        "Provide a valid JSON object for the workflow definition",
+    )
+
+
+def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
+    """Inject Code 2.0 defaults into a JSON definition string when not explicitly set.
+
+    Only modifies JSON definitions (or auto-detected JSON). YAML is returned unchanged.
+    """
+    if fmt == "yaml":
+        return definition
+
+    try:
+        raw = json.loads(definition)
+    except (json.JSONDecodeError, TypeError):
+        return definition  # let _parse_definition handle the error
+
+    changed = False
+    for key, value in _CODE_V2_DEFAULTS.items():
+        if key not in raw:
+            raw[key] = value
+            changed = True
+
+    return json.dumps(raw) if changed else definition
+
+
 def _parse_definition(
     definition: str, fmt: str
 ) -> tuple[WorkflowCreateYamlRequest | None, str | None, dict[str, Any] | None]:
@@ -209,42 +295,28 @@ def _parse_definition(
     Exactly one of the first two will be set on success, or error on failure.
     JSON input is parsed into a WorkflowCreateYamlRequest (the type the SDK expects).
     """
+
     if fmt == "json":
         try:
             raw = json.loads(definition)
-            return WorkflowCreateYamlRequest(**raw), None, None
         except (json.JSONDecodeError, TypeError) as e:
-            return (
-                None,
-                None,
-                make_error(
-                    ErrorCode.INVALID_INPUT,
-                    f"Invalid JSON definition: {e}",
-                    "Provide a valid JSON object for the workflow definition",
-                ),
-            )
+            return None, None, _make_invalid_json_definition_error(e)
+        try:
+            return _normalize_json_definition(raw), None, None
         except Exception as e:
-            return (
-                None,
-                None,
-                make_error(
-                    ErrorCode.INVALID_INPUT,
-                    f"Invalid workflow definition: {e}",
-                    "Check the workflow definition fields (title, workflow_definition with blocks)",
-                ),
-            )
+            return None, None, _make_invalid_json_definition_error(e)
     elif fmt == "yaml":
         return None, definition, None
     else:
         # auto: try JSON first, fall back to YAML
         try:
             raw = json.loads(definition)
-            return WorkflowCreateYamlRequest(**raw), None, None
         except (json.JSONDecodeError, TypeError):
             return None, definition, None
-        except Exception:
-            # JSON parsed but failed model validation — treat as YAML
-            return None, definition, None
+        try:
+            return _normalize_json_definition(raw), None, None
+        except Exception as e:
+            return None, None, _make_invalid_json_definition_error(e)
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +418,9 @@ async def skyvern_workflow_create(
     """Create a new Skyvern workflow from a YAML or JSON definition. Use when you need to save
     a new automation workflow that can be run repeatedly with different parameters.
 
+    By default, workflows created via MCP use Code 2.0 (adaptive caching with run_with="code").
+    To disable this, explicitly set "adaptive_caching": false and/or "run_with": null in your definition.
+
     Best practice: use one block per logical step with a short focused prompt (2-3 sentences).
     Use "navigation" blocks for actions (filling forms, clicking) and "extraction" blocks for pulling data.
     Do NOT use the deprecated "task" block type.
@@ -396,6 +471,10 @@ async def skyvern_workflow_create(
                 "Use 'json', 'yaml', or 'auto'",
             ),
         )
+
+    # Default to Code 2.0 for MCP-created workflows (create only, not update).
+    # Inject defaults into the raw JSON before parsing so explicit user values are preserved.
+    definition = _inject_code_v2_defaults(definition, format)
 
     json_def, yaml_def, parse_err = _parse_definition(definition, format)
     if parse_err is not None:

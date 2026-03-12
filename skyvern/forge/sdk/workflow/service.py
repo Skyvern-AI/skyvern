@@ -4819,15 +4819,17 @@ class WorkflowService:
     ) -> bool:
         """Determine whether this run should attempt to execute cached scripts.
 
-        Note: This intentionally does NOT consult workflow.adaptive_caching.
-        Adaptive caching workflows (is_adaptive_caching=True) gather training
-        data on agent runs before any script exists. The script-recording and
-        fallback-episode logic uses is_adaptive_caching() separately.
+        When neither the run nor the workflow explicitly sets run_with, fall back
+        to the workflow's adaptive_caching flag. This allows workflows with
+        adaptive_caching=True to default into code-v2 mode without requiring
+        every API call to pass run_with explicitly.
         """
         if workflow_run.run_with in ("code", "code_v2"):
             return True
         if workflow_run.run_with == "agent":
             return False
         if workflow.run_with == "code":
+            return True
+        if workflow.adaptive_caching:
             return True
         return False

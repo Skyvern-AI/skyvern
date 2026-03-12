@@ -119,6 +119,7 @@ type Props = {
     cdpAddress: string | null;
     maxScreenshotScrolls: number | null;
     extraHttpHeaders: Record<string, string> | null;
+    runWith: string | null;
   };
 };
 
@@ -264,9 +265,14 @@ function transformToWorkflowRunRequest(
   return transformed;
 }
 
+const VALID_RUN_WITH = new Set(["agent", "code", "code_v2"]);
+
 function deriveRunWith(
   workflow?: WorkflowApiResponse,
+  override?: string | null,
 ): "agent" | "code" | "code_v2" {
+  if (override && VALID_RUN_WITH.has(override))
+    return override as "agent" | "code" | "code_v2";
   if (workflow?.run_with === "code_v2") return "code_v2";
   if (workflow?.adaptive_caching && workflow?.run_with === "code")
     return "code_v2";
@@ -317,7 +323,7 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
-      runWith: deriveRunWith(workflow),
+      runWith: deriveRunWith(workflow, initialSettings.runWith),
       aiFallback: workflow?.ai_fallback ?? true,
     },
   });
@@ -427,7 +433,7 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
-      runWith: deriveRunWith(workflow),
+      runWith: deriveRunWith(workflow, initialSettings.runWith),
       aiFallback: workflow?.ai_fallback ?? true,
     });
     setIsFormReset(true);
