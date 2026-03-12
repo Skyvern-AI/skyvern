@@ -56,7 +56,7 @@ Complete technical documentation, build guides, and integration patterns are ava
 
 Instead of relying solely on code-defined interactions (like DOM parsing and XPaths), Skyvern uses prompts along with computer vision and large language models (LLMs) to parse items in the viewport in real-time, plan interactions, and execute them. 
 
-Simply put, Skyvern can recognize the intent and goal of a page and respond to it accordingly, similar to how a human would. 
+Simply put, Skyvern can recognize the intent and goal of a page and respond to it accordingly, similar to how a human would. This approach has earned Skyvern [85.8% on the WebVoyager benchmark](https://www.skyvern.com/blog/skyvern-2-0-state-of-the-art-web-navigation-with-85-8-on-webvoyager-eval/), the current state of the art for web navigation.
 
 This gives Skyvern three properties that traditional tools can't match: 
  
