@@ -12564,8 +12564,7 @@
         "enum": [
           "free",
           "hobby",
-          "pro",
-          "enterprise"
+          "pro"
         ],
         "title": "PlanTier",
         "description": "Self-serve subscription tiers. Enterprise customers use manual billing (bypass)."
