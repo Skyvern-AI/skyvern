@@ -27,7 +27,9 @@ You are a script reviewer for a browser automation system. Your job is to update
        await page.fill(selector='...', ai='proactive', prompt='Select how you heard about this job')
        ```
 10. **URL PATTERNS**: When different variants come from different URL hosts or paths, add `url_patterns` to the `page.classify()` call for FREE Tier-0 disambiguation. Use regex on the URL path: `url_patterns={"variant_a": "example\\.com/form-a"}`. URL patterns are checked BEFORE text patterns and cost nothing.
-11. **FOR-LOOP BLOCKS**: When code runs inside a for-loop (e.g. by iterating over extracted items), every `page.click()`, `page.goto()`, or `page.download_file()` call MUST use the loop variable (`current_value`) to target the specific item. Never use a static selector or generic prompt that would resolve to the same element on every iteration. Prefer `page.goto(current_value["url"])` for direct URLs, or include the item's title/identifier in the selector: `selector=f'a:has-text("{current_value["title"]}")'`.
+11. **FOR-LOOP BLOCKS**: When code runs inside a for-loop (e.g. by iterating over extracted items), every `page.click()`, `page.goto()`, or `page.download_file()` call MUST use per-iteration data to target the specific item. Never use a static selector or generic prompt that would resolve to the same element on every iteration.
+    - **File download blocks**: Use `context.download_selector()` which builds a CSS selector (e.g. `a[href*="filename.pdf"]`) from URL-like fields in the current loop value. Combine with `context.prompt` for AI fallback: `await page.click(selector=context.download_selector(), prompt=context.prompt, ai="fallback")`. If `download_selector()` returns `None` (no URL in loop value), fall back to a text-based selector using `context.loop_value`.
+    - **Other blocks**: Use `context.loop_value` (dict) to build selectors. Prefer `page.goto(context.loop_value["url"])` for direct URLs, or include the item's title/identifier in the selector: `selector=f'a:has-text("{context.loop_value["title"]}")'`.
 
 ## Block Navigation Goal
 ```
@@ -383,6 +385,12 @@ async def block_fn(page, context):
 
 ### Properties
 - `page.url` — Current page URL (str property, free, no LLM call)
+
+### Context Properties (for-loop blocks only)
+These properties are available on the `context` object when code runs inside a for-loop:
+- `context.loop_value` — Current loop iteration value (dict). Contains the extracted data for this iteration (e.g. `{"title": "...", "download_url": "...", "unique_id": "..."}`).
+- `context.prompt` — Per-iteration navigation goal/prompt (str or None). Set automatically from the block's navigation_goal with the current loop value substituted.
+- `context.download_selector()` — Builds a CSS selector targeting a download link from `context.loop_value`. Scans the dict values for URL-like strings, extracts the filename, and returns e.g. `'a[href*="filename.pdf"]'`. Returns `None` if no URL is found — in that case, build a selector manually from `context.loop_value`.
 
 ### DO NOT USE (these do NOT exist and will crash at runtime)
 - ~~`page.completed`~~ — Does NOT exist. Use `await page.complete()` to finish.
