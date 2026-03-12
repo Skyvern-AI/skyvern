@@ -1820,7 +1820,51 @@ async def download(
 
         try:
             await _prepare_cached_block_inputs(cache_key, prompt)
+
+            # Count downloaded files before running cached function so we can
+            # verify that the download actually produced a new file.
+            org_id = context.organization_id or ""
+            run_id = context.workflow_run_id or ""
+            files_before: list = []
+            files_before_ok = False
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    files_before = await app.STORAGE.get_downloaded_files(
+                        organization_id=org_id,
+                        run_id=run_id,
+                    )
+                files_before_ok = True
+            except asyncio.TimeoutError:
+                LOG.warning("Timeout getting downloaded files before cached download")
+
             await _run_cached_function(cached_fn)
+
+            # Verify a new file was actually downloaded.
+            # Retry briefly — file may not be visible in storage immediately after the click.
+            files_after: list = []
+            files_after_ok = False
+            for _attempt in range(3):
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        files_after = await app.STORAGE.get_downloaded_files(
+                            organization_id=org_id,
+                            run_id=run_id,
+                        )
+                    files_after_ok = True
+                except asyncio.TimeoutError:
+                    LOG.warning("Timeout getting downloaded files after cached download")
+                if len(files_after) > len(files_before):
+                    break
+                if _attempt < 2:
+                    await asyncio.sleep(2)
+
+            # Only raise if both calls succeeded — if either timed out, skip
+            # the check to avoid spurious AI fallbacks under degraded storage.
+            if files_before_ok and files_after_ok and len(files_after) <= len(files_before):
+                raise Exception(
+                    "Cached download function did not produce a new file. "
+                    f"Files before: {len(files_before)}, after: {len(files_after)}"
+                )
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
