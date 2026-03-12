@@ -29,6 +29,9 @@ from .types.create_credential_request_credential import CreateCredentialRequestC
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.extensions import Extensions
+from .types.folder import Folder
+from .types.folder_create import FolderCreate
+from .types.folder_update import FolderUpdate
 from .types.get_run_response import GetRunResponse
 from .types.otp_type import OtpType
 from .types.persistent_browser_type import PersistentBrowserType
@@ -48,6 +51,7 @@ from .types.task_run_request_proxy_location import TaskRunRequestProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
 from .types.upload_file_response import UploadFileResponse
+from .types.update_workflow_folder_request import UpdateWorkflowFolderRequest
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .types.workflow_run import WorkflowRun
@@ -851,6 +855,253 @@ class RawSkyvern:
                             type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def create_folder(
+        self,
+        *,
+        title: str,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[Folder]:
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/folders",
+            method="POST",
+            json=convert_and_respect_annotation_metadata(
+                object_=FolderCreate(title=title, description=description),
+                annotation=FolderCreate,
+                direction="write",
+            ),
+            headers={"content-type": "application/json"},
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(Folder, parse_obj_as(type_=Folder, object_=_response.json()))  # type: ignore
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def get_folder(
+        self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> HttpResponse[Folder]:
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/folders/{jsonable_encoder(folder_id)}",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(Folder, parse_obj_as(type_=Folder, object_=_response.json()))  # type: ignore
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def get_folders(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        search: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[typing.List[Folder]]:
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/folders",
+            method="GET",
+            params={"page": page, "page_size": page_size, "search": search},
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    typing.List[Folder],
+                    parse_obj_as(type_=typing.List[Folder], object_=_response.json()),  # type: ignore
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def update_folder(
+        self,
+        folder_id: str,
+        *,
+        title: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[Folder]:
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/folders/{jsonable_encoder(folder_id)}",
+            method="PUT",
+            json=convert_and_respect_annotation_metadata(
+                object_=FolderUpdate(title=title, description=description),
+                annotation=FolderUpdate,
+                direction="write",
+            ),
+            headers={"content-type": "application/json"},
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(Folder, parse_obj_as(type_=Folder, object_=_response.json()))  # type: ignore
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def delete_folder(
+        self,
+        folder_id: str,
+        *,
+        delete_workflows: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[typing.Optional[typing.Any]]:
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/folders/{jsonable_encoder(folder_id)}",
+            method="DELETE",
+            params={"delete_workflows": delete_workflows},
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                if _response is None or not _response.text.strip():
+                    return HttpResponse(response=_response, data=None)
+                _data = typing.cast(
+                    typing.Optional[typing.Any],
+                    parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=None
+                    if not _response.text.strip()
+                    else typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=None
+                    if not _response.text.strip()
+                    else typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            _response_json = None if not _response.text.strip() else _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def update_workflow_folder(
+        self,
+        workflow_id: str,
+        *,
+        folder_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[Workflow]:
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_id)}/folder",
+            method="PUT",
+            json=convert_and_respect_annotation_metadata(
+                object_=UpdateWorkflowFolderRequest(folder_id=folder_id),
+                annotation=UpdateWorkflowFolderRequest,
+                direction="write",
+            ),
+            headers={"content-type": "application/json"},
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(Workflow, parse_obj_as(type_=Workflow, object_=_response.json()))  # type: ignore
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
                     ),
                 )
             _response_json = _response.json()
@@ -4030,6 +4281,253 @@ class AsyncRawSkyvern:
                             type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def create_folder(
+        self,
+        *,
+        title: str,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[Folder]:
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/folders",
+            method="POST",
+            json=convert_and_respect_annotation_metadata(
+                object_=FolderCreate(title=title, description=description),
+                annotation=FolderCreate,
+                direction="write",
+            ),
+            headers={"content-type": "application/json"},
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(Folder, parse_obj_as(type_=Folder, object_=_response.json()))  # type: ignore
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def get_folder(
+        self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> AsyncHttpResponse[Folder]:
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/folders/{jsonable_encoder(folder_id)}",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(Folder, parse_obj_as(type_=Folder, object_=_response.json()))  # type: ignore
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def get_folders(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        search: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[typing.List[Folder]]:
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/folders",
+            method="GET",
+            params={"page": page, "page_size": page_size, "search": search},
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    typing.List[Folder],
+                    parse_obj_as(type_=typing.List[Folder], object_=_response.json()),  # type: ignore
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def update_folder(
+        self,
+        folder_id: str,
+        *,
+        title: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[Folder]:
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/folders/{jsonable_encoder(folder_id)}",
+            method="PUT",
+            json=convert_and_respect_annotation_metadata(
+                object_=FolderUpdate(title=title, description=description),
+                annotation=FolderUpdate,
+                direction="write",
+            ),
+            headers={"content-type": "application/json"},
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(Folder, parse_obj_as(type_=Folder, object_=_response.json()))  # type: ignore
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def delete_folder(
+        self,
+        folder_id: str,
+        *,
+        delete_workflows: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[typing.Optional[typing.Any]]:
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/folders/{jsonable_encoder(folder_id)}",
+            method="DELETE",
+            params={"delete_workflows": delete_workflows},
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                if _response is None or not _response.text.strip():
+                    return AsyncHttpResponse(response=_response, data=None)
+                _data = typing.cast(
+                    typing.Optional[typing.Any],
+                    parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=None
+                    if not _response.text.strip()
+                    else typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=None
+                    if not _response.text.strip()
+                    else typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            _response_json = None if not _response.text.strip() else _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def update_workflow_folder(
+        self,
+        workflow_id: str,
+        *,
+        folder_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[Workflow]:
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_id)}/folder",
+            method="PUT",
+            json=convert_and_respect_annotation_metadata(
+                object_=UpdateWorkflowFolderRequest(folder_id=folder_id),
+                annotation=UpdateWorkflowFolderRequest,
+                direction="write",
+            ),
+            headers={"content-type": "application/json"},
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(Workflow, parse_obj_as(type_=Workflow, object_=_response.json()))  # type: ignore
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
                     ),
                 )
             _response_json = _response.json()
