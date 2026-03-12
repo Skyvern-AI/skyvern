@@ -654,12 +654,12 @@ class BranchConditionYAML(BaseModel):
     is_default: bool = False
 
     @model_validator(mode="after")
-    def validate_condition(cls, condition: "BranchConditionYAML") -> "BranchConditionYAML":
-        if condition.criteria is None and not condition.is_default:
+    def validate_condition(self) -> "BranchConditionYAML":
+        if self.criteria is None and not self.is_default:
             raise ValueError("Branches without criteria must be marked as default.")
-        if condition.criteria is not None and condition.is_default:
+        if self.criteria is not None and self.is_default:
             raise ValueError("Default branches may not define criteria.")
-        return condition
+        return self
 
 
 class ConditionalBlockYAML(BlockYAML):
@@ -668,15 +668,15 @@ class ConditionalBlockYAML(BlockYAML):
     branch_conditions: list[BranchConditionYAML] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_branches(cls, block: "ConditionalBlockYAML") -> "ConditionalBlockYAML":
-        if not block.branch_conditions:
+    def validate_branches(self) -> "ConditionalBlockYAML":
+        if not self.branch_conditions:
             raise ValueError("Conditional blocks require at least one branch.")
 
-        default_branches = [branch for branch in block.branch_conditions if branch.is_default]
+        default_branches = [branch for branch in self.branch_conditions if branch.is_default]
         if len(default_branches) > 1:
             raise ValueError("Only one default branch is permitted per conditional block.")
 
-        return block
+        return self
 
 
 class CodeBlockYAML(BlockYAML):
@@ -1039,8 +1039,8 @@ class WorkflowDefinitionYAML(BaseModel):
     finally_block_label: str | None = None
 
     @model_validator(mode="after")
-    def validate_unique_block_labels(cls, workflow: "WorkflowDefinitionYAML") -> "WorkflowDefinitionYAML":
-        labels = [block.label for block in workflow.blocks]
+    def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":
+        labels = [block.label for block in self.blocks]
         duplicates = [label for label in labels if labels.count(label) > 1]
 
         if duplicates:
@@ -1050,13 +1050,13 @@ class WorkflowDefinitionYAML(BaseModel):
                 f"Found duplicate label(s): {', '.join(unique_duplicates)}"
             )
 
-        if workflow.finally_block_label and workflow.finally_block_label not in labels:
+        if self.finally_block_label and self.finally_block_label not in labels:
             raise ValueError(
-                f"finally_block_label '{workflow.finally_block_label}' does not reference a valid block. "
+                f"finally_block_label '{self.finally_block_label}' does not reference a valid block. "
                 f"Available labels: {', '.join(labels) if labels else '(none)'}"
             )
 
-        return workflow
+        return self
 
 
 class WorkflowCreateYAMLRequest(BaseModel):
