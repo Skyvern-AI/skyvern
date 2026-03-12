@@ -94,46 +94,30 @@ function WorkflowRunOutput() {
             ) : showExtractedInformation ? (
               <div className="space-y-2">
                 <h2>Extracted Information</h2>
-                <div
-                  style={{
-                    resize: "vertical",
-                    overflow: "hidden",
-                    minHeight: "96px",
-                    height: "200px",
-                  }}
-                >
-                  <CodeEditor
-                    language="json"
-                    value={JSON.stringify(
-                      (hasExtractedInformation(activeBlock.output) &&
-                        activeBlock.output.extracted_information) ??
-                        null,
+                <CodeEditor
+                  language="json"
+                  value={JSON.stringify(
+                    (hasExtractedInformation(activeBlock.output) &&
+                      activeBlock.output.extracted_information) ??
                       null,
-                      2,
-                    )}
-                    readOnly
-                    fullHeight
-                  />
-                </div>
+                    null,
+                    2,
+                  )}
+                  minHeight="96px"
+                  maxHeight="200px"
+                  readOnly
+                />
               </div>
             ) : activeBlock.output !== null ? (
               <div className="space-y-2">
                 <h2>Output</h2>
-                <div
-                  style={{
-                    resize: "vertical",
-                    overflow: "hidden",
-                    minHeight: "96px",
-                    height: "200px",
-                  }}
-                >
-                  <CodeEditor
-                    language="json"
-                    value={JSON.stringify(activeBlock.output, null, 2)}
-                    readOnly
-                    fullHeight
-                  />
-                </div>
+                <CodeEditor
+                  language="json"
+                  value={JSON.stringify(activeBlock.output, null, 2)}
+                  minHeight="96px"
+                  maxHeight="200px"
+                  readOnly
+                />
               </div>
             ) : (
               <div>This block has no outputs</div>
@@ -145,42 +129,26 @@ function WorkflowRunOutput() {
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
             <h1 className="text-lg font-bold">Task 2.0 Output</h1>
-            <div
-              style={{
-                resize: "vertical",
-                overflow: "hidden",
-                minHeight: "96px",
-                height: "200px",
-              }}
-            >
-              <CodeEditor
-                language="json"
-                value={JSON.stringify(observerOutput, null, 2)}
-                readOnly
-                fullHeight
-              />
-            </div>
+            <CodeEditor
+              language="json"
+              value={JSON.stringify(observerOutput, null, 2)}
+              readOnly
+              minHeight="96px"
+              maxHeight="200px"
+            />
           </div>
         </div>
       ) : null}
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
           <h1 className="text-lg font-bold">Workflow Run Outputs</h1>
-          <div
-            style={{
-              resize: "vertical",
-              overflow: "hidden",
-              minHeight: "96px",
-              height: "200px",
-            }}
-          >
-            <CodeEditor
-              language="json"
-              value={outputs ? JSON.stringify(outputs, null, 2) : ""}
-              readOnly
-              fullHeight
-            />
-          </div>
+          <CodeEditor
+            language="json"
+            value={outputs ? JSON.stringify(outputs, null, 2) : ""}
+            readOnly
+            minHeight="96px"
+            maxHeight="200px"
+          />
         </div>
       </div>
       <div className="rounded bg-slate-elevation2 p-6">
