@@ -5719,34 +5719,34 @@ class BranchCondition(BaseModel):
     is_default: bool = False
 
     @model_validator(mode="after")
-    def validate_condition(cls, condition_obj: BranchCondition) -> BranchCondition:
-        if isinstance(condition_obj.criteria, dict):
-            criteria_type = condition_obj.criteria.get("criteria_type")
+    def validate_condition(self) -> BranchCondition:
+        if isinstance(self.criteria, dict):
+            criteria_type = self.criteria.get("criteria_type")
             if criteria_type is None:
                 # Infer criteria type from expression format
-                expression = condition_obj.criteria.get("expression", "")
+                expression = self.criteria.get("expression", "")
                 if _is_pure_jinja_expression(expression):
                     criteria_type = "jinja2_template"
                 else:
                     criteria_type = "prompt"
             if criteria_type == "prompt":
-                condition_obj.criteria = PromptBranchCriteria(**condition_obj.criteria)
+                self.criteria = PromptBranchCriteria(**self.criteria)
             else:
-                condition_obj.criteria = JinjaBranchCriteria(**condition_obj.criteria)
-        if condition_obj.criteria is None and not condition_obj.is_default:
+                self.criteria = JinjaBranchCriteria(**self.criteria)
+        if self.criteria is None and not self.is_default:
             raise ValueError("Branches without criteria must be marked as default.")
-        if condition_obj.criteria is not None and condition_obj.is_default:
+        if self.criteria is not None and self.is_default:
             raise ValueError("Default branches may not define criteria.")
-        if condition_obj.criteria and isinstance(condition_obj.criteria, BranchCriteria):
-            expression = condition_obj.criteria.expression
-            criteria_dict = condition_obj.criteria.model_dump()
+        if self.criteria and isinstance(self.criteria, BranchCriteria):
+            expression = self.criteria.expression
+            criteria_dict = self.criteria.model_dump()
             if _is_pure_jinja_expression(expression):
                 criteria_dict["criteria_type"] = "jinja2_template"
-                condition_obj.criteria = JinjaBranchCriteria(**criteria_dict)
+                self.criteria = JinjaBranchCriteria(**criteria_dict)
             else:
                 criteria_dict["criteria_type"] = "prompt"
-                condition_obj.criteria = PromptBranchCriteria(**criteria_dict)
-        return condition_obj
+                self.criteria = PromptBranchCriteria(**criteria_dict)
+        return self
 
 
 class ConditionalBlock(Block):
@@ -5759,15 +5759,15 @@ class ConditionalBlock(Block):
     branch_conditions: list[BranchCondition] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_branches(cls, block: ConditionalBlock) -> ConditionalBlock:
-        if not block.branch_conditions:
+    def validate_branches(self) -> ConditionalBlock:
+        if not self.branch_conditions:
             raise ValueError("Conditional blocks require at least one branch.")
 
-        default_branches = [branch for branch in block.branch_conditions if branch.is_default]
+        default_branches = [branch for branch in self.branch_conditions if branch.is_default]
         if len(default_branches) > 1:
             raise ValueError("Only one default branch is permitted per conditional block.")
 
-        return block
+        return self
 
     def get_all_parameters(
         self,

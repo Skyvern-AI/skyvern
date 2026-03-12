@@ -111,6 +111,7 @@ def run_server() -> None:
         port=port,
         log_level="info",
         factory=True,
+        ws="websockets-sansio",
     )
 
 
@@ -237,6 +238,8 @@ def run_dev() -> None:
             "--port",
             str(skyvern_settings.PORT),
             "--factory",
+            "--ws",
+            "websockets-sansio",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
