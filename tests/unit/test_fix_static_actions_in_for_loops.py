@@ -126,6 +126,56 @@ class TestPatchStaticClicksInBlock:
         assert "Download the quarterly report" in result
         assert "Target: {current_value}" in result
 
+    def test_single_quoted_prompt_with_escaped_apostrophe_is_preserved(self) -> None:
+        body = textwrap.dedent("""\
+            await page.click(
+                selector='a.download-link',
+                ai='fallback',
+                prompt='Open the applicant\\'s file',
+            )""")
+        result = _patch_static_clicks_in_block(body)
+        assert "ai='proactive'" in result
+        assert "applicant\\'s file" in result
+        assert "Target: {current_value}" in result
+
+    def test_double_quoted_prompt_with_escaped_quotes_is_preserved(self) -> None:
+        body = textwrap.dedent("""\
+            await page.click(
+                selector="a.download-link",
+                ai="fallback",
+                prompt="Click the \\\"download\\\" link",
+            )""")
+        result = _patch_static_clicks_in_block(body)
+        assert 'ai="proactive"' in result
+        assert '\\"download\\"' in result
+        assert "Target: {current_value}" in result
+
+    def test_multiline_prompt_is_preserved(self) -> None:
+        body = textwrap.dedent("""\
+            await page.click(
+                selector='a.download-link',
+                ai='fallback',
+                prompt='Click the first matching row
+and then open the details panel',
+            )""")
+        result = _patch_static_clicks_in_block(body)
+        assert "ai='proactive'" in result
+        assert "Click the first matching row" in result
+        assert "and then open the details panel" in result
+        assert "Target: {current_value}" in result
+
+    def test_unterminated_prompt_with_many_backslashes_is_left_unchanged(self) -> None:
+        repeated_backslashes = "\\\\a" * 4000
+        body = (
+            "await page.click(\n"
+            "    selector='a.download-link',\n"
+            "    ai='fallback',\n"
+            f'    prompt="{repeated_backslashes}\n'
+            ")"
+        )
+        result = _patch_static_clicks_in_block(body)
+        assert result == body
+
 
 # ---------------------------------------------------------------------------
 # _fix_static_actions_in_for_loops (top-level function)
