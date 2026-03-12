@@ -196,21 +196,22 @@ class BitwardenService:
                     stderr=stderr.decode(),
                     returncode=shell_subprocess.returncode,
                 )
-        except asyncio.TimeoutError as e:
+        except asyncio.TimeoutError:
             LOG.error(
                 "Bitwarden command timed out",
                 timeout_seconds=timeout,
                 command=command[0:2],
                 exc_info=True,
             )
+            raise
+        finally:
             if shell_subprocess and shell_subprocess.returncode is None:
-                LOG.info("Killing timed-out Bitwarden subprocess", pid=shell_subprocess.pid)
+                LOG.info("Killing orphaned Bitwarden subprocess", pid=shell_subprocess.pid)
                 try:
                     shell_subprocess.kill()
                     await shell_subprocess.wait()
-                except ProcessLookupError:
+                except (ProcessLookupError, asyncio.CancelledError):
                     pass
-            raise e
 
     @staticmethod
     def _extract_session_key(unlock_cmd_output: str) -> str | None:
