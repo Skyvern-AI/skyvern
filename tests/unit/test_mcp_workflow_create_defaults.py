@@ -2,7 +2,14 @@
 
 import json
 
-from skyvern.cli.mcp_tools.workflow import _inject_code_v2_defaults, _parse_definition
+import yaml
+
+from skyvern.cli.mcp_tools.workflow import (
+    _inject_code_v2_defaults,
+    _inject_missing_top_level_defaults,
+    _parse_definition,
+)
+from skyvern.schemas.runs import ProxyLocation
 
 
 def _minimal_workflow_json(**overrides: object) -> str:
@@ -63,11 +70,51 @@ def test_explicit_null_run_with_preserved() -> None:
     assert parsed["adaptive_caching"] is True
 
 
-def test_yaml_passthrough_unchanged() -> None:
-    """YAML definitions are passed through without modification."""
-    yaml_str = "title: Test\nworkflow_definition:\n  blocks: []"
-    result = _inject_code_v2_defaults(yaml_str, "yaml")
-    assert result == yaml_str
+def test_proxy_default_injected_when_not_specified_json() -> None:
+    """MCP create should default omitted proxy_location to residential US."""
+    definition = _minimal_workflow_json()
+    result = _inject_missing_top_level_defaults(
+        definition,
+        "json",
+        {"proxy_location": ProxyLocation.RESIDENTIAL},
+    )
+    parsed = json.loads(result)
+    assert parsed["proxy_location"] == ProxyLocation.RESIDENTIAL
+
+
+def test_explicit_null_proxy_location_preserved_json() -> None:
+    """An explicit null proxy_location should not be overwritten by the default injector."""
+    definition = _minimal_workflow_json(proxy_location=None)
+    result = _inject_missing_top_level_defaults(
+        definition,
+        "json",
+        {"proxy_location": ProxyLocation.RESIDENTIAL},
+    )
+    parsed = json.loads(result)
+    assert "proxy_location" in parsed
+    assert parsed["proxy_location"] is None
+
+
+def test_proxy_default_injected_for_yaml() -> None:
+    """YAML definitions should receive the same omitted proxy default."""
+    yaml_str = """
+title: Test
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: navigation
+      label: step1
+      url: https://example.com
+      title: Step 1
+      navigation_goal: Click the button
+"""
+    result = _inject_missing_top_level_defaults(
+        yaml_str,
+        "yaml",
+        {"proxy_location": ProxyLocation.RESIDENTIAL},
+    )
+    parsed = yaml.safe_load(result)
+    assert parsed["proxy_location"] == ProxyLocation.RESIDENTIAL
 
 
 def test_invalid_json_passthrough() -> None:
