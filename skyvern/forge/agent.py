@@ -1080,26 +1080,31 @@ class ForgeAgent:
                     if json_response is None:
                         raise MissingExtractActionsResponse()
                     try:
-                        if pdf_embed_src := scraped_page.check_pdf_viewer_embed():
+                        # Check for PDF viewer: either <embed type="application/pdf"> or
+                        # Edge's PDF interstitial <iframe src="data:application/pdf;base64,...">
+                        pdf_src = scraped_page.check_pdf_viewer_embed()
+                        if not pdf_src:
+                            pdf_src = await scraped_page.check_pdf_iframe()
+                        if pdf_src:
                             LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
                             pdf_bytes: bytes | None = None
                             download_url: str | None = None
 
-                            # Check if the embed src is a data URI with base64 encoded PDF
+                            # Check if the src is a data URI with base64 encoded PDF
                             # Format: data:application/pdf[;charset=...];base64,<base64_data>
-                            if pdf_embed_src.startswith("data:application/pdf"):
+                            if pdf_src.startswith("data:application/pdf"):
                                 # Use more precise regex to extract base64 data after the base64, prefix
                                 # This pattern matches: data:application/pdf[;optional_params];base64,<data>
-                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_embed_src, re.S)
+                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_src, re.S)
                                 if not m:
                                     raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_embed_src,
+                                        pdf_embed_src=pdf_src,
                                         reason="Failed to extract base64 data from PDF embed src. Expected format: data:application/pdf[;charset=...];base64,<data>",
                                     )
 
                                 base64_data = m.group(1)
                                 LOG.info(
-                                    "Found base64 data in PDF embed src",
+                                    "Found base64 data in PDF src",
                                     step_id=step.step_id,
                                     base64_data_length=len(base64_data),
                                 )
@@ -1109,17 +1114,17 @@ class ForgeAgent:
                                     pdf_bytes = base64.b64decode(base64_data, validate=True)
                                 except Exception as e:
                                     raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_embed_src,
+                                        pdf_embed_src=pdf_src,
                                         reason=f"Failed to decode base64 data: {str(e)}",
                                     ) from e
                             else:
                                 # If not a data URI, treat it as a URL
                                 LOG.info(
-                                    "Found PDF embed src as URL (not base64 data)",
+                                    "Found PDF src as URL (not base64 data)",
                                     step_id=step.step_id,
-                                    download_url=pdf_embed_src,
+                                    download_url=pdf_src,
                                 )
-                                download_url = pdf_embed_src
+                                download_url = pdf_src
 
                             actions = [
                                 DownloadFileAction(
