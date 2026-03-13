@@ -1,9 +1,7 @@
-import logging
-
 import typer
 from dotenv import load_dotenv
 
-from skyvern.forge.sdk.forge_log import setup_logger as _setup_logger
+from skyvern._cli_bootstrap import configure_cli_bootstrap_logging as _configure_cli_bootstrap_logging
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 from ..auth_command import login as login_command
@@ -34,10 +32,8 @@ def configure_cli_logging() -> None:
         return
     _cli_logging_configured = True
 
-    # Suppress noisy SDK/third-party logs for CLI execution only.
-    for logger_name in ("skyvern", "httpx", "litellm", "playwright", "httpcore"):
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
-    _setup_logger()
+    # Keep callback-time execution aligned with the entrypoint bootstrap.
+    _configure_cli_bootstrap_logging()
 
 
 cli_app = typer.Typer(

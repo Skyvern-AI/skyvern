@@ -253,7 +253,7 @@ def workflow_status(
     """Get workflow run status."""
 
     async def _run() -> dict[str, Any]:
-        return await tool_workflow_status(run_id=run_id)
+        return await tool_workflow_status(run_id=run_id, verbosity="full")
 
     _run_tool(_run, json_output=json_output, hint_on_exception="Check the run ID and API key.")
 
