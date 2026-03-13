@@ -5477,6 +5477,7 @@ class AgentDB(BaseAlchemyDB):
         card_brand: str | None,
         totp_identifier: str | None = None,
         secret_label: str | None = None,
+        user_context: str | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = CredentialModel(
@@ -5491,6 +5492,7 @@ class AgentDB(BaseAlchemyDB):
                 card_last4=card_last4,
                 card_brand=card_brand,
                 secret_label=secret_label,
+                user_context=user_context,
             )
             session.add(credential)
             await session.commit()
@@ -5532,6 +5534,7 @@ class AgentDB(BaseAlchemyDB):
         name: str | None = None,
         browser_profile_id: str | None | object = _UNSET,
         tested_url: str | None | object = _UNSET,
+        user_context: str | None | object = _UNSET,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -5550,6 +5553,8 @@ class AgentDB(BaseAlchemyDB):
                 credential.browser_profile_id = browser_profile_id
             if tested_url is not _UNSET:
                 credential.tested_url = tested_url
+            if user_context is not _UNSET:
+                credential.user_context = user_context
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
