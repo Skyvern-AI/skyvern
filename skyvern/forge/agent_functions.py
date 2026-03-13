@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import hashlib
-from collections import deque
 from datetime import timedelta
 from typing import Dict, List
 
@@ -82,8 +81,10 @@ def _get_shape_cache_key(hash: str) -> str:
     return f"skyvern:shape:{hash}"
 
 
-def _remove_skyvern_attributes_legacy(element: Dict) -> Dict:
-    """Legacy: deep-copy based attribute removal (pre-V2)."""
+def _remove_skyvern_attributes(element: Dict) -> Dict:
+    """
+    To get the original HTML element without skyvern attributes
+    """
     element_copied = copy.deepcopy(element)
     for attr in ELEMENT_NODE_ATTRIBUTES:
         if element_copied.get(attr):
@@ -101,33 +102,9 @@ def _remove_skyvern_attributes_legacy(element: Dict) -> Dict:
 
     trimmed_children = []
     for child in children:
-        trimmed_children.append(_remove_skyvern_attributes_legacy(child))
+        trimmed_children.append(_remove_skyvern_attributes(child))
 
     element_copied["children"] = trimmed_children
-    return element_copied
-
-
-def _remove_skyvern_attributes(element: Dict) -> Dict:
-    """
-    To get the original HTML element without skyvern attributes.
-    V2 uses shallow copy + filtered dicts instead of double deepcopy for performance.
-    """
-    if not settings.ENABLE_DOM_PARSER_V2:
-        return _remove_skyvern_attributes_legacy(element)
-
-    element_copied = dict(element)
-    for attr in ELEMENT_NODE_ATTRIBUTES:
-        element_copied.pop(attr, None)
-
-    if "attributes" in element_copied:
-        element_copied["attributes"] = {
-            k: v for k, v in element_copied["attributes"].items() if k not in USELESS_SHAPE_ATTRIBUTE
-        }
-
-    children: List[Dict] | None = element_copied.get("children")
-    if children is not None:
-        element_copied["children"] = [_remove_skyvern_attributes(child) for child in children]
-
     return element_copied
 
 
@@ -542,7 +519,7 @@ class AgentFunction:
             skyvern_frame = await SkyvernFrame.create_instance(frame=frame)
             current_frame_index = context.frame_index_map.get(frame, 0)
 
-            queue: deque = deque()
+            queue = []
             element_cnt = 0
             eligible_svgs = []  # List to store eligible SVGs and their frames
 
@@ -550,7 +527,7 @@ class AgentFunction:
                 queue.append(element)
 
             while queue:
-                queue_ele = queue.popleft()
+                queue_ele = queue.pop(0)
 
                 element_cnt += 1
                 if element_cnt == MAX_ELEMENT_CNT:

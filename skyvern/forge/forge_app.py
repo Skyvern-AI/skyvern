@@ -206,6 +206,7 @@ def create_forge_app() -> ForgeApp:
     app.WORKFLOW_SERVICE = WorkflowService()
     app.AGENT_FUNCTION = AgentFunction()
     app.PERSISTENT_SESSIONS_MANAGER = DefaultPersistentSessionsManager(database=app.DATABASE)
+    app.PERSISTENT_SESSIONS_MANAGER.watch_session_pool()
     app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
@@ -256,7 +257,13 @@ def create_forge_app() -> ForgeApp:
     app.authenticate_user_function = None
     app.setup_api_app = None
     app.api_app_startup_event = None
-    app.api_app_shutdown_event = None
+
+    async def default_api_app_shutdown_event() -> None:
+        from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
+
+        await DefaultPersistentSessionsManager.close()
+
+    app.api_app_shutdown_event = default_api_app_shutdown_event
 
     app.agent = ForgeAgent()
 

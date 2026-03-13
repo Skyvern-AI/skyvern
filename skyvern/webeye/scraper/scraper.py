@@ -1,8 +1,7 @@
 import asyncio
 import copy
 import json
-import time
-from collections import defaultdict, deque
+from collections import defaultdict
 
 import structlog
 from playwright._impl._errors import TimeoutError
@@ -110,7 +109,6 @@ def clean_element_before_hashing(element: dict) -> dict:
 def hash_element(element: dict) -> str:
     hash_ready_element = clean_element_before_hashing(element)
     # Sort the keys to ensure consistent ordering
-    # NOTE: Do NOT change separators — hashes are persisted to the database for cached action matching.
     element_string = json.dumps(hash_ready_element, sort_keys=True)
 
     return calculate_sha256(element_string)
@@ -133,10 +131,7 @@ def build_element_dict(
         id_to_frame_dict[element_id] = element["frame"]
         element_hash = hash_element(element)
         id_to_element_hash[element_id] = element_hash
-        if SettingsManager.get_settings().ENABLE_DOM_PARSER_V2:
-            hash_to_element_ids.setdefault(element_hash, []).append(element_id)
-        else:
-            hash_to_element_ids[element_hash] = hash_to_element_ids.get(element_hash, []) + [element_id]
+        hash_to_element_ids[element_hash] = hash_to_element_ids.get(element_hash, []) + [element_id]
 
     return id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids
 
@@ -301,7 +296,6 @@ async def scrape_web_unsafe(
     # We check if the scroll_y_px_old is the same as scroll_y_px to determine if we have reached the end of the page.
     # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
     # clicking start my quote)
-    scrape_start_time = time.time()
     url = page.url
     if url == "about:blank" and not support_empty_page:
         # Allow scraping if the page has child frames with meaningful content
@@ -315,46 +309,23 @@ async def scrape_web_unsafe(
             frame_count=len(meaningful_frames),
         )
 
-    t0 = time.time()
     skyvern_frame = await SkyvernFrame.create_instance(page)
-    js_inject_time = time.time() - t0
     await skyvern_frame.safe_wait_for_animation_end()
 
     if wait_seconds > 0:
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
         await asyncio.sleep(wait_seconds)
 
-    t0 = time.time()
-    elements, element_tree, main_frame_time, child_frames_time, num_child_frames = await get_interactable_element_tree(
-        page, scrape_exclude, must_included_tags
-    )
-    element_tree_time = time.time() - t0
+    elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
     if not elements and not support_empty_page:
         LOG.warning("No elements found on the page, wait and retry")
         await empty_page_retry_wait()
-        t0 = time.time()
-        (
-            elements,
-            element_tree,
-            main_frame_time,
-            child_frames_time,
-            num_child_frames,
-        ) = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
-        element_tree_time = time.time() - t0
+        elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
 
-    # Deep copy once for cleanup (mutates in-place), then copy the cleaned result for trim.
-    # The second copy of the cleaned tree is cheaper since cleanup may remove elements.
-    t0 = time.time()
-    element_tree_copy = copy.deepcopy(element_tree)
-    element_tree = await cleanup_element_tree(page, url, element_tree_copy)
-    cleanup_time = time.time() - t0
-
-    t0 = time.time()
+    element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
     element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
-    trim_time = time.time() - t0
 
     screenshots = []
-    screenshot_time = 0.0
     if take_screenshots:
         element_tree_trimmed_html_str = "".join(
             json_to_html(element, need_skyvern_attrs=False) for element in element_tree_trimmed
@@ -372,7 +343,6 @@ async def scrape_web_unsafe(
         except Exception:
             LOG.warning("Failed to get current x, y position of the page", exc_info=True)
 
-        t0 = time.time()
         screenshots = await SkyvernFrame.take_split_screenshots(
             page=page,
             url=url,
@@ -380,26 +350,21 @@ async def scrape_web_unsafe(
             max_number=max_screenshot_number,
             scroll=scroll,
         )
-        screenshot_time = time.time() - t0
 
         # scroll back to the original x, y position of the page
         if x is not None and y is not None:
             await skyvern_frame.safe_scroll_to_x_y(x, y)
             LOG.debug("Scrolled back to the original x, y position of the page after scraping", x=x, y=y)
 
-    t0 = time.time()
     id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids = build_element_dict(
         elements
     )
-    build_dict_time = time.time() - t0
 
     # if there are no elements, fail the scraping unless support_empty_page is True
     if not elements and not support_empty_page:
         raise NoElementFound()
 
-    t0 = time.time()
     text_content = await get_frame_text(page.main_frame)
-    text_extraction_time = time.time() - t0
 
     html = ""
     window_dimension = None
@@ -414,25 +379,6 @@ async def scrape_web_unsafe(
             url=url,
             exc_info=True,
         )
-
-    total_scrape_time = time.time() - scrape_start_time
-    LOG.debug(
-        "Scraping performance metrics",
-        url=url,
-        total_scrape_time=total_scrape_time,
-        js_inject_time=js_inject_time,
-        element_tree_time=element_tree_time,
-        main_frame_time=main_frame_time,
-        child_frames_time=child_frames_time,
-        num_child_frames=num_child_frames,
-        cleanup_time=cleanup_time,
-        trim_time=trim_time,
-        screenshot_time=screenshot_time,
-        build_dict_time=build_dict_time,
-        text_extraction_time=text_extraction_time,
-        num_elements=len(elements),
-        num_screenshots=len(screenshots),
-    )
 
     return ScrapedPage(
         elements=elements,
@@ -534,20 +480,17 @@ async def get_interactable_element_tree(
     page: Page,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     must_included_tags: list[str] | None = None,
-) -> tuple[list[dict], list[dict], float, float, int]:
+) -> tuple[list[dict], list[dict]]:
     """
     Get the element tree of the page, including all the elements that are interactable.
     :param page: Page instance to get the element tree from.
-    :return: Tuple of (elements, element_tree, main_frame_time, child_frames_time, num_child_frames).
+    :return: Tuple containing the element tree and a map of element IDs to elements.
     """
     # main page index is 0
     skyvern_page = await SkyvernFrame.create_instance(page)
-
-    t0 = time.time()
     elements, element_tree = await skyvern_page.build_tree_from_body(
         frame_name="main.frame", frame_index=0, must_included_tags=must_included_tags
     )
-    main_frame_time = time.time() - t0
 
     context = skyvern_context.ensure_context()
     frames = await get_all_children_frames(page)
@@ -559,7 +502,6 @@ async def get_interactable_element_tree(
             frame_index = len(context.frame_index_map) + 1
             context.frame_index_map[frame] = frame_index
 
-    t0 = time.time()
     for frame in frames:
         frame_index = context.frame_index_map[frame]
         elements, element_tree = await add_frame_interactable_elements(
@@ -569,9 +511,8 @@ async def get_interactable_element_tree(
             element_tree,
             must_included_tags,
         )
-    child_frames_time = time.time() - t0
 
-    return elements, element_tree, main_frame_time, child_frames_time, len(frames)
+    return elements, element_tree
 
 
 class IncrementalScrapePage(ElementTreeBuilder):
@@ -616,9 +557,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
 
         self.elements = incremental_elements
 
-        incremental_tree_copy = copy.deepcopy(incremental_tree)
-        incremental_tree = await cleanup_element_tree(frame, frame.url, incremental_tree_copy)
-        # Second copy of cleaned tree is cheaper since cleanup may have removed elements
+        incremental_tree = await cleanup_element_tree(frame, frame.url, copy.deepcopy(incremental_tree))
         trimmed_element_tree = trim_element_tree(copy.deepcopy(incremental_tree))
 
         self.element_tree = incremental_tree
@@ -760,8 +699,7 @@ def _should_keep_unique_id(element: dict) -> bool:
     return element.get("interactable", False)
 
 
-def _trim_element_legacy(element: dict) -> dict:
-    """Legacy: list-based BFS with two-pass attribute filtering (pre-V2)."""
+def trim_element(element: dict) -> dict:
     queue = [element]
     while queue:
         queue_ele = queue.pop(0)
@@ -787,6 +725,7 @@ def _trim_element_legacy(element: dict) -> dict:
                 queue_ele["attributes"] = new_attributes
             else:
                 del queue_ele["attributes"]
+        # remove the tag, don't need it in the HTML tree
         if "keepAllAttr" in queue_ele:
             del queue_ele["keepAllAttr"]
 
@@ -811,53 +750,6 @@ def _trim_element_legacy(element: dict) -> dict:
 
         if "afterPseudoText" in queue_ele and not queue_ele.get("afterPseudoText"):
             del queue_ele["afterPseudoText"]
-
-    return element
-
-
-def trim_element(element: dict) -> dict:
-    if not SettingsManager.get_settings().ENABLE_DOM_PARSER_V2:
-        return _trim_element_legacy(element)
-
-    queue: deque = deque([element])
-    while queue:
-        queue_ele = queue.popleft()
-        queue_ele.pop("frame", None)
-        queue_ele.pop("frame_index", None)
-
-        if "id" in queue_ele and not _should_keep_unique_id(queue_ele):
-            del queue_ele["id"]
-
-        # Single-pass attribute filtering: remove base64 data AND whitelist in one pass
-        keep_all = queue_ele.get("keepAllAttr", False)
-        attributes = queue_ele.get("attributes")
-        if attributes:
-            new_attributes = _filter_attributes(attributes, keep_all)
-            if new_attributes:
-                queue_ele["attributes"] = new_attributes
-            else:
-                queue_ele.pop("attributes", None)
-
-        queue_ele.pop("keepAllAttr", None)
-
-        children = queue_ele.get("children")
-        if children:
-            queue.extend(children)
-        else:
-            queue_ele.pop("children", None)
-
-        text = queue_ele.get("text")
-        if text is not None and not str(text).strip():
-            del queue_ele["text"]
-
-        # Remove empty pseudo text fields using pop-and-reinsert pattern to avoid double lookup
-        before = queue_ele.pop("beforePseudoText", None)
-        if before:
-            queue_ele["beforePseudoText"] = before
-
-        after = queue_ele.pop("afterPseudoText", None)
-        if after:
-            queue_ele["afterPseudoText"] = after
 
     return element
 
@@ -888,24 +780,6 @@ def _trimmed_attributes(attributes: dict) -> dict:
         if key in RESERVED_ATTRIBUTES:
             new_attributes[key] = attributes[key]
 
-    return new_attributes
-
-
-def _filter_attributes(attributes: dict, keep_all: bool) -> dict:
-    """Single-pass attribute filtering: removes base64 data, applies whitelist, and truncates long names."""
-    new_attributes: dict = {}
-    for key, value in attributes.items():
-        # Skip base64 data URIs
-        if key in BASE64_INCLUDE_ATTRIBUTES and isinstance(value, str) and "data:" in value:
-            continue
-        # Apply whitelist (unless keepAllAttr is True)
-        if keep_all or key in RESERVED_ATTRIBUTES:
-            # Truncate long name attributes in the same pass
-            if key == "name" and isinstance(value, str) and len(value) > 500:
-                value = value[:500]
-            new_attributes[key] = value
-        elif key == "role" and value in ("listbox", "option"):
-            new_attributes[key] = value
     return new_attributes
 
 
