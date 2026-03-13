@@ -164,6 +164,7 @@ When no suggested selector is available, build one from the element's `[tag]`, `
 | `click: Submit` [tag: button] [text: "Submit"] | `await page.click(selector='button:has-text("Submit")', ai='fallback', prompt='Click Submit')` |
 | `click: Gender option` (no tag/attrs) | `await page.click(ai='fallback', prompt='Select the first gender option')` |
 | `complete: ...` | `await page.complete()` |
+| `terminate: ...` | `if <condition>: await page.terminate(errors=["reason"])` — see **Termination Rules** in the Lifecycle section below |
 
 ### Selector priority (most reliable first)
 1. `#id` — if the element has a stable `id` attribute (not auto-generated hex/numeric IDs)
@@ -379,6 +380,13 @@ async def block_fn(page, context):
 - `await page.complete()` — Mark the task as complete (call at the end)
 - `await page.wait(timeout_ms=)` — Wait for a duration
 - `await page.solve_captcha()` — Solve a CAPTCHA on the page
+- `await page.terminate(errors=["reason"])` — Stop the task when the goal cannot be achieved (see rules below)
+
+### Termination Rules
+- `page.terminate()` MUST be inside an `if`/`elif` branch guarded by `page.classify()` or `page.extract()`. NEVER call terminate unconditionally.
+- After a `page.classify()`, the `else` branch must be `element_fallback()`, not terminate — "unknown state" means "let the agent figure it out", not "give up." After a `page.extract()` with a known set of outcomes, terminate in `else` is acceptable when the else represents a definite failure condition (not an unknown state).
+- Only use terminate when the navigation goal explicitly describes conditions under which the task should stop (e.g., "if no invoice is available, terminate", "if the account doesn't exist, stop").
+- Do NOT use terminate as a fallback for "something went wrong" — that's what `element_fallback()` is for.
 
 ### AI Fallback
 - `await page.element_fallback(navigation_goal="...", max_steps=10)` — Hand off to AI agent
