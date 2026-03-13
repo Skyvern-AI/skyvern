@@ -73,7 +73,8 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const handleEngineChange = (value: RunEngine) => {
     const updates: Partial<NavigationNode["data"]> = { engine: value };
     if (value === RunEngine.SkyvernV2) {
-      // Switching to V2 — clear V1-specific fields
+      // Switching to V2 — preserve prompt content, clear V1-specific fields
+      updates.prompt = data.navigationGoal || data.prompt;
       updates.navigationGoal = "";
       updates.completeCriterion = "";
       updates.terminateCriterion = "";
@@ -85,7 +86,8 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
       updates.downloadSuffix = null;
       updates.includeActionHistoryInVerification = false;
     } else if (data.engine === RunEngine.SkyvernV2) {
-      // Switching away from V2 — clear V2-specific fields
+      // Switching away from V2 — preserve prompt content, clear V2-specific fields
+      updates.navigationGoal = data.prompt || data.navigationGoal;
       updates.prompt = "";
       updates.maxSteps = MAX_STEPS_DEFAULT;
     }

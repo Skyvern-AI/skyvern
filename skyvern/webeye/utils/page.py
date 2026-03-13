@@ -8,6 +8,7 @@ from typing import Any
 
 import structlog
 from PIL import Image
+from playwright._impl._errors import Error as PlaywrightError
 from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Page
 
@@ -248,6 +249,30 @@ class SkyvernFrame:
         try:
             async with asyncio.timeout(timeout_ms / 1000):
                 return await frame.evaluate(expression=expression, arg=arg)
+        except PlaywrightError as e:
+            error_msg = str(e)
+            is_context_destroyed = "Execution context was destroyed" in error_msg
+            is_domutils_missing = "ReferenceError" in error_msg and "is not defined" in error_msg
+            if is_context_destroyed or is_domutils_missing:
+                LOG.warning(
+                    "JS execution context lost (likely due to page navigation), re-injecting domUtils.js and retrying",
+                    expression=expression[:200],
+                    error=error_msg[:200],
+                )
+                try:
+                    await frame.evaluate(expression=JS_FUNCTION_DEFS)
+                except PlaywrightError:
+                    LOG.warning("Re-injection of domUtils.js also failed, page may still be navigating")
+                    raise
+                # First call failed fast (context destroyed, not timeout), so a fresh
+                # timeout for the retry is acceptable.
+                try:
+                    async with asyncio.timeout(timeout_ms / 1000):
+                        return await frame.evaluate(expression=expression, arg=arg)
+                except asyncio.TimeoutError:
+                    LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
+                    raise TimeoutError("Skyvern timed out trying to analyze the page")
+            raise
         except asyncio.TimeoutError:
             LOG.exception("Skyvern timed out trying to analyze the page", expression=expression)
             raise TimeoutError("Skyvern timed out trying to analyze the page")

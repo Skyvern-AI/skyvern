@@ -1,16 +1,17 @@
-import logging
-
 import typer
 from dotenv import load_dotenv
 
-from skyvern.forge.sdk.forge_log import setup_logger as _setup_logger
+from skyvern._cli_bootstrap import configure_cli_bootstrap_logging as _configure_cli_bootstrap_logging
 from skyvern.utils.env_paths import resolve_backend_env_path
 
+from ..auth_command import login as login_command
+from ..auth_command import signup as signup_command
 from ..block import block_app
 from ..credential import credential_app
 from ..credentials import credentials_app
 from ..docs import docs_app
 from ..init_command import init_browser, init_env
+from ..mcp_commands import mcp_app
 from ..quickstart import quickstart_app
 from ..run_commands import run_app
 from ..setup_commands import setup_app
@@ -31,10 +32,8 @@ def configure_cli_logging() -> None:
         return
     _cli_logging_configured = True
 
-    # Suppress noisy SDK/third-party logs for CLI execution only.
-    for logger_name in ("skyvern", "httpx", "litellm", "playwright", "httpcore"):
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
-    _setup_logger()
+    # Keep callback-time execution aligned with the entrypoint bootstrap.
+    _configure_cli_bootstrap_logging()
 
 
 cli_app = typer.Typer(
@@ -82,8 +81,12 @@ cli_app.add_typer(
     quickstart_app, name="quickstart", help="One-command setup and start for Skyvern (combines init and run)."
 )
 
+cli_app.command(name="login")(login_command)
+cli_app.command(name="signup", hidden=True)(signup_command)  # backwards compat
+
 # Browser automation commands
 cli_app.add_typer(browser_app, name="browser", help="Browser automation commands.")
+cli_app.add_typer(mcp_app, name="mcp", help="Switch local MCP client configs and manage optional saved profiles.")
 cli_app.add_typer(skill_app, name="skill", help="Manage bundled skill reference files.")
 cli_app.add_typer(setup_app, name="setup", help="Register Skyvern MCP with AI coding tools.")
 
@@ -92,10 +95,15 @@ cli_app.add_typer(setup_app, name="setup", help="Register Skyvern MCP with AI co
 def init_callback(
     ctx: typer.Context,
     no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
+    database_string: str = typer.Option(
+        "",
+        "--database-string",
+        help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
+    ),
 ) -> None:
     """Run full initialization when no subcommand is provided."""
     if ctx.invoked_subcommand is None:
-        init_env(no_postgres=no_postgres)
+        init_env(no_postgres=no_postgres, database_string=database_string)
 
 
 @init_app.command(name="browser")

@@ -118,8 +118,23 @@ export function isBlockItem(
   );
 }
 
-export function isTaskVariantBlockItem(item: unknown) {
+function isTaskVariantBlockItem(item: unknown) {
   return isBlockItem(item) && isTaskVariantBlock(item.block);
+}
+
+export function countActionsInTimeline(
+  timelineItems: Array<WorkflowRunTimelineItem>,
+): number {
+  return timelineItems.reduce((total, item) => {
+    let count = 0;
+    if (isTaskVariantBlockItem(item)) {
+      count += item.block?.actions?.length ?? 0;
+    }
+    if (item.children.length > 0) {
+      count += countActionsInTimeline(item.children);
+    }
+    return total + count;
+  }, 0);
 }
 
 export function isWorkflowRunBlock(item: unknown): item is WorkflowRunBlock {

@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, createElement } from "react";
 import { toast } from "@/components/ui/use-toast";
 import { VerificationToastContent } from "@/components/VerificationToast";
-import { enable2faNotifications } from "@/util/env";
 
 /** How long (minutes) before we consider the 2FA request timed out */
 const VERIFICATION_TIMEOUT_MINS = 15;
@@ -54,7 +53,18 @@ function useVerificationCodeAlert({
       return;
     }
 
-    const startTime = new Date(pollingStartedAt).getTime();
+    // Normalize to UTC: backend sends ISO 8601 without timezone suffix
+    // (e.g., "2026-02-21T12:00:00.000000" from Python's datetime.utcnow().isoformat())
+    // JavaScript interprets timestamps without "Z" as local time, causing incorrect calculations
+    let normalizedTimestamp = pollingStartedAt;
+    if (
+      !pollingStartedAt.endsWith("Z") &&
+      !pollingStartedAt.includes("+") &&
+      !pollingStartedAt.includes("-", 10)
+    ) {
+      normalizedTimestamp = pollingStartedAt + "Z";
+    }
+    const startTime = new Date(normalizedTimestamp).getTime();
     const timeoutMs = VERIFICATION_TIMEOUT_MINS * 60 * TIMER_TICK_MS;
 
     const updateTimer = () => {
@@ -71,7 +81,6 @@ function useVerificationCodeAlert({
 
   // Browser notification + in-app toast (fire once per waiting transition)
   useEffect(() => {
-    if (!enable2faNotifications) return;
     if (!isWaitingForCode || notifiedTags.has(notificationTag)) return;
     notifiedTags.add(notificationTag);
 

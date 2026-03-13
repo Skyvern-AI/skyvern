@@ -20,9 +20,10 @@ import {
 type Props = {
   value: string;
   onChange: (value: string) => void;
+  placeholder?: string;
 };
 
-function CredentialSelector({ value, onChange }: Props) {
+function CredentialSelector({ value, onChange, placeholder }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
   const { data: credentials, isFetching } = useCredentialsQuery({
     page_size: 100, // Reasonable limit for dropdown selector
@@ -50,7 +51,7 @@ function CredentialSelector({ value, onChange }: Props) {
         }}
       >
         <SelectTrigger>
-          <SelectValue placeholder="Select a credential" />
+          <SelectValue placeholder={placeholder ?? "Select a credential"} />
         </SelectTrigger>
         <SelectContent>
           {credentials.map((credential) => (
@@ -66,7 +67,7 @@ function CredentialSelector({ value, onChange }: Props) {
                   {credential.browser_profile_id && (
                     <>
                       <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-[10px] text-green-400">
-                        login-free
+                        saved-profile
                       </span>
                       {credential.tested_url && (
                         <span className="text-[10px] text-muted-foreground">

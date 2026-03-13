@@ -19,11 +19,14 @@ import { HiddenCopyableInput } from "@/components/ui/hidden-copyable-input";
 import { OnePasswordTokenForm } from "@/components/OnePasswordTokenForm";
 import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
 import { CustomCredentialServiceConfigForm } from "@/components/CustomCredentialServiceConfigForm";
+import { useVersionQuery } from "@/hooks/useVersionQuery";
+import { formatVersion } from "@/util/version";
 
 function Settings() {
   const { environment, organization, setEnvironment, setOrganization } =
     useSettingsStore();
   const apiKey = getRuntimeApiKey();
+  const { data: versionData } = useVersionQuery();
 
   return (
     <div className="flex flex-col gap-8">
@@ -109,6 +112,17 @@ function Settings() {
           <CustomCredentialServiceConfigForm />
         </CardContent>
       </Card>
+      {(__APP_VERSION__ !== "development" || versionData?.version) && (
+        <p className="text-center text-xs text-muted-foreground/50">
+          {__APP_VERSION__ !== "development" && (
+            <>UI: {formatVersion(__APP_VERSION__)}</>
+          )}
+          {__APP_VERSION__ !== "development" && versionData?.version && " | "}
+          {versionData?.version && (
+            <>API: {formatVersion(versionData.version)}</>
+          )}
+        </p>
+      )}
     </div>
   );
 }

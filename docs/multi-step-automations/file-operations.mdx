@@ -687,7 +687,7 @@ done
 </CodeGroup>
 
 - **`file_url`** points to the file. Here, `{{ resume }}` is a workflow parameter passed at runtime — it could be a public URL, an S3 presigned URL, or a Google Drive link.
-- **`file_type`** tells Skyvern how to read the file. Use `pdf`, `csv`, or `excel`.
+- **`file_type`** tells Skyvern how to read the file. Use `csv`, `excel`, `pdf`, `image`, or `docx`.
 - **`json_schema`** defines exactly what to extract. The LLM reads the PDF and returns data matching this structure. The `work_experience` array means you'll get one object per job with `company` and `role` fields.
 
 The output is available as `{{ parse_resume_output }}` in subsequent blocks and looks like this:
@@ -708,7 +708,7 @@ Without a `json_schema`, you get the raw parsed content instead — plain text f
 | Parameter | Type | Use this to |
 |-----------|------|-------------|
 | `file_url` | string | Point to the file (HTTP URL, S3 URI, or parameter like `{{ resume }}`) |
-| `file_type` | string | Specify format: `csv`, `excel`, or `pdf` |
+| `file_type` | string | Specify format: `csv`, `excel`, `pdf`, `image`, or `docx` |
 | `json_schema` | object | Define the structure you want extracted |
 
 **Supported sources for `file_url`:**

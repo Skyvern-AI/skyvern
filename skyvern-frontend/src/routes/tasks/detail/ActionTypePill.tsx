@@ -1,4 +1,5 @@
 import { ActionType, ReadableActionTypes } from "@/api/types";
+import { StatusPill } from "@/components/ui/status-pill";
 import {
   CursorArrowIcon,
   HandIcon,
@@ -19,10 +20,9 @@ const icons: Partial<Record<ActionType, React.ReactNode>> = {
 
 function ActionTypePill({ actionType }: Props) {
   return (
-    <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-      {icons[actionType] ?? null}
-      <span className="text-xs">{ReadableActionTypes[actionType]}</span>
-    </div>
+    <StatusPill icon={icons[actionType] ?? null}>
+      {ReadableActionTypes[actionType]}
+    </StatusPill>
   );
 }
 

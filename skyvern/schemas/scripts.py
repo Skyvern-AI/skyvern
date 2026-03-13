@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -127,6 +128,19 @@ class Script(BaseModel):
     deleted_at: datetime | None = Field(default=None, description="Timestamp when the script was soft deleted")
 
 
+class ScriptVersionSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    version: int
+    script_revision_id: str
+    created_at: datetime
+    run_id: str | None = None
+
+
+class ScriptVersionListResponse(BaseModel):
+    versions: list[ScriptVersionSummary]
+
+
 class ScriptBlock(BaseModel):
     script_block_id: str
     organization_id: str
@@ -138,6 +152,7 @@ class ScriptBlock(BaseModel):
     workflow_run_id: str | None = None
     workflow_run_block_id: str | None = None
     input_fields: list[str] | None = None
+    requires_agent: bool = False  # When True, block must run via agent even in code mode
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
@@ -153,6 +168,9 @@ class ScriptCacheKeyValuesResponse(BaseModel):
 
 class ScriptBlocksResponse(BaseModel):
     blocks: dict[str, str]
+    main_script: str | None = None
+    script_id: str | None = None
+    version: int | None = None
 
 
 class ScriptBlocksRequest(BaseModel):
@@ -189,3 +207,69 @@ class ClearCacheResponse(BaseModel):
 
     deleted_count: int = Field(..., description="Number of cached entries deleted")
     message: str = Field(..., description="Status message")
+
+
+class ScriptFallbackEpisode(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    episode_id: str
+    organization_id: str
+    workflow_permanent_id: str
+    workflow_run_id: str
+    script_revision_id: str | None = None
+    block_label: str
+    fallback_type: Literal["element", "full_block", "conditional_agent"]
+    error_message: str | None = None
+    classify_result: str | None = None
+    agent_actions: list | dict | None = None
+    page_url: str | None = None
+    page_text_snapshot: str | None = None
+    fallback_succeeded: bool | None = None
+    reviewed: bool = False
+    reviewer_output: str | None = None
+    new_script_revision_id: str | None = None
+    created_at: datetime
+    modified_at: datetime
+
+
+class FallbackEpisodeListResponse(BaseModel):
+    episodes: list[ScriptFallbackEpisode]
+    page: int
+    page_size: int
+    total_count: int
+
+
+class ScriptBranchHit(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    organization_id: str
+    workflow_permanent_id: str
+    block_label: str
+    branch_key: str
+    hit_count: int = 1
+    first_hit_at: datetime
+    last_hit_at: datetime
+
+
+class ReviewScriptRequest(BaseModel):
+    """Request body for user-initiated script review."""
+
+    user_instructions: str = Field(
+        ...,
+        min_length=1,
+        max_length=5000,
+        description="Instructions for how to fix the script",
+    )
+    workflow_run_id: str | None = Field(
+        None,
+        description="Workflow run ID to pull fallback episodes from (optional)",
+    )
+
+
+class ReviewScriptResponse(BaseModel):
+    """Response from a user-initiated script review."""
+
+    script_id: str
+    version: int
+    updated_blocks: list[str]
+    message: str | None = None

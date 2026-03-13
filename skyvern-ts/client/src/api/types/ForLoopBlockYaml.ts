@@ -14,4 +14,9 @@ export interface ForLoopBlockYaml {
     loop_over_parameter_key?: string;
     loop_variable_reference?: string;
     complete_if_empty?: boolean;
+    data_schema?: ForLoopBlockYaml.DataSchema;
+}
+
+export namespace ForLoopBlockYaml {
+    export type DataSchema = Record<string, unknown> | string;
 }
