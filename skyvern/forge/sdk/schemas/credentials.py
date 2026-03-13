@@ -177,6 +177,10 @@ class CredentialResponse(BaseModel):
     name: str = Field(..., description="Name of the credential", examples=["Amazon Login"])
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
     tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
+    user_context: str | None = Field(
+        default=None,
+        description="User-provided context describing the login sequence (e.g., 'click SSO button first')",
+    )
 
 
 class Credential(BaseModel):
@@ -208,6 +212,10 @@ class Credential(BaseModel):
     secret_label: str | None = Field(default=None, description="For secret credentials: optional label")
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
     tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
+    user_context: str | None = Field(
+        default=None,
+        description="User-provided context describing the login sequence (e.g., 'click SSO button first')",
+    )
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
@@ -228,6 +236,16 @@ class UpdateCredentialRequest(BaseModel):
         description="Optional login page URL associated with this credential",
         examples=["https://example.com/login"],
     )
+    user_context: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="Optional user-provided context describing the login sequence (e.g., 'click SSO button first')",
+    )
+
+    @field_validator("user_context", mode="before")
+    @classmethod
+    def normalize_user_context(cls, v: str | None) -> str | None:
+        return _normalize_optional_str(v)
 
 
 def _normalize_optional_str(v: str | None) -> str | None:
