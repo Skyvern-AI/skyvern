@@ -21,10 +21,13 @@ class TestTextPromptBlockYAMLNormalization:
     def test_converts_known_llm_key_to_model(self, monkeypatch) -> None:
         monkeypatch.setattr(SettingsManager, "_SettingsManager__instance", base_settings)
 
+        # Use the actual llm_key that base_settings maps gemini-2.5-flash to
+        # (VERTEX_GEMINI_2.5_FLASH when ENABLE_VERTEX_AI=True, GEMINI_2.5_FLASH otherwise)
+        actual_llm_key = base_settings.get_model_name_to_llm_key()["gemini-2.5-flash"]["llm_key"]
         block = TextPromptBlockYAML(
             label="summarize",
             prompt="Summarize the data.",
-            llm_key="VERTEX_GEMINI_2.5_FLASH",
+            llm_key=actual_llm_key,
         )
 
         assert block.model == {"model_name": "gemini-2.5-flash"}
