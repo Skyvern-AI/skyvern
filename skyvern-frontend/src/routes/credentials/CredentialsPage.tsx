@@ -112,15 +112,24 @@ function CredentialsPage() {
         </TabsList>
 
         <TabsContent value="passwords" className="space-y-4">
-          <CredentialsList filter="password" />
+          <CredentialsList
+            filter="password"
+            onStartBackgroundTest={startBackgroundTest}
+          />
         </TabsContent>
 
         <TabsContent value="creditCards" className="space-y-4">
-          <CredentialsList filter="credit_card" />
+          <CredentialsList
+            filter="credit_card"
+            onStartBackgroundTest={startBackgroundTest}
+          />
         </TabsContent>
 
         <TabsContent value="secrets" className="space-y-4">
-          <CredentialsList filter="secret" />
+          <CredentialsList
+            filter="secret"
+            onStartBackgroundTest={startBackgroundTest}
+          />
         </TabsContent>
 
         <TabsContent value="twoFactor" className="space-y-4">
