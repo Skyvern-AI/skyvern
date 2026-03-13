@@ -26,6 +26,7 @@ def _normalize_database_string(database_string: object) -> str:
     programmatically. Treat non-string values as empty so init falls back to
     standard PostgreSQL setup instead of trying to write an invalid value.
     """
+    # Typed as `object` on purpose: Typer may pass OptionInfo instead of str.
     return database_string if isinstance(database_string, str) else ""
 
 
