@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
 
+    # Script reviewer settings
+    FAILURE_REVIEW_DAILY_CAP: int = 3  # Max failure-triggered script reviews per wpid per day
+
     ADDITIONAL_MODULES: list[str] = []
 
     BROWSER_TYPE: str = "chromium-headful"
