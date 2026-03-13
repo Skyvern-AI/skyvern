@@ -25,7 +25,8 @@ export type ForLoopBlockYamlLoopBlocksItem =
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.TaskV2
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.HttpRequest
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.Conditional
-    | Skyvern.ForLoopBlockYamlLoopBlocksItem.PrintPage;
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.PrintPage
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.WorkflowTrigger;
 
 export namespace ForLoopBlockYamlLoopBlocksItem {
     export interface Task extends Skyvern.TaskBlockYaml {
@@ -118,5 +119,9 @@ export namespace ForLoopBlockYamlLoopBlocksItem {
 
     export interface PrintPage extends Skyvern.PrintPageBlockYaml {
         block_type: "print_page";
+    }
+
+    export interface WorkflowTrigger extends Skyvern.WorkflowTriggerBlockYaml {
+        block_type: "workflow_trigger";
     }
 }

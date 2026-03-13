@@ -1,5 +1,5 @@
 # Reference
-<details><summary><code>client.<a href="/src/Client.ts">changeTierApiV1BillingChangeTierPost</a>({ ...params }) -> Skyvern.ChangeTierResponse</code></summary>
+<details><summary><code>client.<a href="/src/Client.ts">updateWorkflowFolder</a>(workflowPermanentId, { ...params }) -> Skyvern.Workflow</code></summary>
 <dl>
 <dd>
 
@@ -11,10 +11,7 @@
 <dl>
 <dd>
 
-Redirect to Stripe Portal for tier changes.
-Portal handles proration based on configured settings:
-- Upgrades: Immediate proration charge
-- Downgrades: Apply at end of billing period
+Update a workflow's folder assignment for the latest version
 </dd>
 </dl>
 </dd>
@@ -29,9 +26,7 @@ Portal handles proration based on configured settings:
 <dd>
 
 ```typescript
-await client.changeTierApiV1BillingChangeTierPost({
-    tier: "free"
-});
+await client.updateWorkflowFolder("wpid_123");
 
 ```
 </dd>
@@ -47,7 +42,15 @@ await client.changeTierApiV1BillingChangeTierPost({
 <dl>
 <dd>
 
-**request:** `Skyvern.ChangeTierRequest` 
+**workflowPermanentId:** `string` — Workflow permanent ID
+    
+</dd>
+</dl>
+
+<dl>
+<dd>
+
+**request:** `Skyvern.UpdateWorkflowFolderRequest` 
     
 </dd>
 </dl>
