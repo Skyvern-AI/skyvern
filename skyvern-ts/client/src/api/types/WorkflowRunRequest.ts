@@ -23,9 +23,16 @@ export interface WorkflowRunRequest {
      * - RESIDENTIAL_DE: Germany
      * - RESIDENTIAL_NZ: New Zealand
      * - RESIDENTIAL_PH: Philippines
+     * - RESIDENTIAL_KR: South Korea
      * - RESIDENTIAL_ZA: South Africa
      * - RESIDENTIAL_AR: Argentina
      * - RESIDENTIAL_AU: Australia
+     * - RESIDENTIAL_BR: Brazil
+     * - RESIDENTIAL_TR: Turkey
+     * - RESIDENTIAL_CA: Canada
+     * - RESIDENTIAL_MX: Mexico
+     * - RESIDENTIAL_IT: Italy
+     * - RESIDENTIAL_NL: Netherlands
      * - RESIDENTIAL_ISP: ISP proxy
      * - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
      * - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
@@ -58,7 +65,7 @@ export interface WorkflowRunRequest {
     browser_address?: string;
     /** Whether to fallback to AI if the workflow run fails. */
     ai_fallback?: boolean;
-    /** Whether to run the workflow with agent or code. */
+    /** Whether to run the workflow with agent, code, or code_v2 (adaptive caching). */
     run_with?: string;
 }
 
@@ -78,9 +85,16 @@ export namespace WorkflowRunRequest {
      * - RESIDENTIAL_DE: Germany
      * - RESIDENTIAL_NZ: New Zealand
      * - RESIDENTIAL_PH: Philippines
+     * - RESIDENTIAL_KR: South Korea
      * - RESIDENTIAL_ZA: South Africa
      * - RESIDENTIAL_AR: Argentina
      * - RESIDENTIAL_AU: Australia
+     * - RESIDENTIAL_BR: Brazil
+     * - RESIDENTIAL_TR: Turkey
+     * - RESIDENTIAL_CA: Canada
+     * - RESIDENTIAL_MX: Mexico
+     * - RESIDENTIAL_IT: Italy
+     * - RESIDENTIAL_NL: Netherlands
      * - RESIDENTIAL_ISP: ISP proxy
      * - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
      * - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)

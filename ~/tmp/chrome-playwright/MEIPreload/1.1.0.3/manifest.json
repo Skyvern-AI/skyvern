@@ -1,0 +1,7 @@
+{
+  "manifest_version": 2,
+  "name": "MEI Preload",
+  "version": "1.1.0.3",
+  "description": "Preloaded Media Engagement Index data.",
+  "update_url": "https://clients2.google.com/service/update2/crx"
+}
