@@ -1084,7 +1084,6 @@ class SkyvernPage(Page):
 
     @action_wrap(ActionType.TERMINATE)
     async def terminate(self, errors: list[str], **kwargs: Any) -> None:
-        # TODO: update the workflow run status to terminated
         return
 
     @action_wrap(ActionType.COMPLETE)
