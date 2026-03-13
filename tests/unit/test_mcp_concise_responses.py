@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 
 import pytest
 
+import skyvern.cli.mcp_tools.workflow as workflow_tools
 from skyvern.cli.core.result import Artifact, BrowserContext, make_result, set_concise_responses
 
 
@@ -183,3 +185,70 @@ def test_verbose_returns_all_fields() -> None:
     assert result["data"]["resolved_selector"] is not None
     assert result["artifacts"] == []
     assert result["warnings"] == []
+
+
+def test_workflow_status_summary_stays_bounded_for_heavy_payload() -> None:
+    long_url = "https://artifacts.skyvern.example/" + ("x" * 1450)
+    heavy_run = {
+        "workflow_run_id": "wr_heavy",
+        "status": "terminated",
+        "failure_reason": "Execution terminated after repeated navigation failures",
+        "workflow_title": "Heavy workflow",
+        "recording_url": long_url,
+        "screenshot_urls": [f"{long_url}-{idx}" for idx in range(6)],
+        "downloaded_files": [{"url": f"{long_url}-download", "filename": "case-export.csv"}],
+        "outputs": {
+            "collect_customer_data": {
+                "task_screenshot_artifact_ids": [f"art_task_{idx}" for idx in range(12)],
+                "workflow_screenshot_artifact_ids": [f"art_workflow_{idx}" for idx in range(12)],
+                "task_screenshots": [f"{long_url}-task-{idx}" for idx in range(4)],
+                "workflow_screenshots": [f"{long_url}-workflow-{idx}" for idx in range(4)],
+                "extracted_information": [{"account_id": "acct_123", "status": "terminated"}],
+            },
+            "submit_case": [
+                {
+                    "task_screenshot_artifact_ids": [f"art_nested_{idx}" for idx in range(6)],
+                    "workflow_screenshot_artifact_ids": [f"art_followup_{idx}" for idx in range(6)],
+                    "task_screenshots": [f"{long_url}-nested-task-{idx}" for idx in range(3)],
+                    "workflow_screenshots": [f"{long_url}-nested-workflow-{idx}" for idx in range(4)],
+                }
+            ],
+            "extracted_information": [{"duplicated_rollup": True}],
+        },
+        "run_with": "code",
+    }
+
+    full_payload = workflow_tools._serialize_run_full(heavy_run)
+    summary_payload = workflow_tools._serialize_run_summary(heavy_run)
+
+    assert len(json.dumps(full_payload)) > 20_000
+    assert len(json.dumps(summary_payload)) < 2_000
+
+    result = make_result("skyvern_workflow_status", data=summary_payload)
+    assert len(json.dumps(result)) < 2_200
+    assert "recording_url" not in result["data"]
+    assert "output" not in result["data"]
+    assert result["data"]["artifact_summary"]["artifact_id_count"] == 36
+
+
+def test_workflow_status_summary_shrinks_simple_payload() -> None:
+    long_url = "https://artifacts.skyvern.example/" + ("y" * 1450)
+    simple_run = {
+        "workflow_run_id": "wr_simple",
+        "status": "completed",
+        "workflow_title": "Simple workflow",
+        "recording_url": long_url,
+        "screenshot_urls": [f"{long_url}-shot"],
+        "outputs": {
+            "result": "success",
+            "order_id": "ord_123",
+        },
+        "run_with": "code",
+    }
+
+    full_payload = workflow_tools._serialize_run_full(simple_run)
+    summary_payload = workflow_tools._serialize_run_summary(simple_run)
+
+    assert len(json.dumps(full_payload)) > 1_500
+    assert len(json.dumps(summary_payload)) < 800
+    assert summary_payload["output_summary"]["scalar_preview"] == {"result": "success", "order_id": "ord_123"}

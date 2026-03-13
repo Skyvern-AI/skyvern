@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastmcp import Client
 
 import skyvern.cli.mcp_tools.workflow as workflow_tools
+from skyvern.cli.mcp_tools import mcp
 
 
 def _fake_workflow_response() -> SimpleNamespace:
@@ -24,6 +26,64 @@ def _fake_workflow_response() -> SimpleNamespace:
         created_at=now,
         modified_at=now,
     )
+
+
+def _fake_http_response(payload: dict[str, object], status_code: int = 200) -> SimpleNamespace:
+    return SimpleNamespace(
+        status_code=status_code,
+        json=lambda: payload,
+        text=json.dumps(payload),
+    )
+
+
+def _heavy_workflow_run_payload(*, include_expanded_outputs: bool = True) -> dict[str, object]:
+    long_url = "https://artifacts.skyvern.example/" + ("x" * 1450)
+    screenshot_urls = [f"{long_url}-{idx}" for idx in range(6)]
+    task_artifact_ids = [f"art_task_{idx}" for idx in range(12)]
+    workflow_artifact_ids = [f"art_workflow_{idx}" for idx in range(12)]
+    outputs: dict[str, object] = {
+        "collect_customer_data": {
+            "task_screenshot_artifact_ids": task_artifact_ids,
+            "workflow_screenshot_artifact_ids": workflow_artifact_ids,
+            "extracted_information": [{"account_id": "acct_123", "status": "terminated"}],
+            "status": "terminated",
+        },
+        "submit_case": [
+            {
+                "workflow_screenshot_artifact_ids": [f"art_followup_{idx}" for idx in range(6)],
+                "task_screenshot_artifact_ids": [f"art_nested_{idx}" for idx in range(6)],
+                "result": "retry_required",
+            }
+        ],
+    }
+    if include_expanded_outputs:
+        outputs["collect_customer_data"] |= {
+            "task_screenshots": screenshot_urls[:4],
+            "workflow_screenshots": screenshot_urls[2:6],
+        }
+        outputs["submit_case"][0] |= {
+            "task_screenshots": screenshot_urls[:3],
+            "workflow_screenshots": screenshot_urls[1:5],
+        }
+        outputs["extracted_information"] = [{"duplicated_rollup": True}]
+
+    return {
+        "workflow_id": "wpid_heavy",
+        "workflow_run_id": "wr_heavy",
+        "status": "terminated",
+        "failure_reason": "Execution terminated after repeated navigation failures",
+        "workflow_title": "Heavy workflow",
+        "recording_url": long_url,
+        "screenshot_urls": screenshot_urls,
+        "downloaded_files": [
+            {
+                "url": f"{long_url}-download",
+                "filename": "case-export.csv",
+            }
+        ],
+        "outputs": outputs,
+        "run_with": "code",
+    }
 
 
 @pytest.mark.asyncio
@@ -439,3 +499,134 @@ async def test_mcp_text_prompt_without_llm_key_stays_null(monkeypatch: pytest.Mo
     assert result["ok"] is True
     assert sent_block.llm_key is None
     assert sent_block.model is None
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_uses_workflow_run_route_for_wr_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _heavy_workflow_run_payload(include_expanded_outputs=False)
+    request = AsyncMock(return_value=_fake_http_response(payload))
+    fake_client = SimpleNamespace(
+        get_run=AsyncMock(),
+        _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request)),
+    )
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    result = await workflow_tools.skyvern_workflow_status(run_id="wr_heavy")
+
+    assert result["ok"] is True
+    request.assert_awaited_once_with(
+        "api/v1/workflows/runs/wr_heavy",
+        method="GET",
+        params={"include_output_details": False},
+    )
+    fake_client.get_run.assert_not_awaited()
+    data = result["data"]
+    assert data["run_id"] == "wr_heavy"
+    assert data["run_type"] == "workflow_run"
+    assert "recording_url" not in data
+    assert "output" not in data
+    assert data["artifact_summary"]["recording_available"] is True
+    assert data["artifact_summary"]["artifact_id_count"] == 36
+    assert data["output_summary"]["nested_screenshot_count"] == 0
+    assert data["output_summary"]["has_extracted_information"] is True
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_full_preserves_expanded_workflow_details(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _heavy_workflow_run_payload(include_expanded_outputs=True)
+    request = AsyncMock(return_value=_fake_http_response(payload))
+    fake_client = SimpleNamespace(
+        get_run=AsyncMock(),
+        _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request)),
+    )
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    result = await workflow_tools.skyvern_workflow_status(run_id="wr_heavy", verbosity="full")
+
+    assert result["ok"] is True
+    request.assert_awaited_once_with(
+        "api/v1/workflows/runs/wr_heavy",
+        method="GET",
+        params={"include_output_details": True},
+    )
+    data = result["data"]
+    assert data["run_id"] == "wr_heavy"
+    assert data["recording_url"] == payload["recording_url"]
+    assert data["output"] == payload["outputs"]
+    assert data["workflow_title"] == "Heavy workflow"
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_task_runs_still_use_get_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    task_run = SimpleNamespace(
+        run_id="tsk_v2_123",
+        status="completed",
+        run_type="task_v2",
+        output={"answer": "42"},
+        failure_reason=None,
+        step_count=4,
+        recording_url=None,
+        app_url=None,
+        browser_session_id=None,
+        run_with=None,
+        created_at=None,
+        modified_at=None,
+        started_at=None,
+        finished_at=None,
+        queued_at=None,
+    )
+    fake_client = SimpleNamespace(get_run=AsyncMock(return_value=task_run))
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    result = await workflow_tools.skyvern_workflow_status(run_id="tsk_v2_123")
+
+    fake_client.get_run.assert_awaited_once_with("tsk_v2_123")
+    data = result["data"]
+    assert data["run_id"] == "tsk_v2_123"
+    assert data["step_count"] == 4
+    assert data["output_summary"]["scalar_preview"] == {"answer": "42"}
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_summary_via_mcp_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _heavy_workflow_run_payload(include_expanded_outputs=False)
+    request = AsyncMock(return_value=_fake_http_response(payload))
+    fake_client = SimpleNamespace(
+        get_run=AsyncMock(),
+        _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request)),
+    )
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("skyvern_workflow_status", {"run_id": "wr_heavy"})
+
+    assert result.is_error is False
+    assert isinstance(result.data, dict)
+    assert result.data["ok"] is True
+    data = result.data["data"]
+    assert data["run_id"] == "wr_heavy"
+    assert data["artifact_summary"]["artifact_id_count"] == 36
+    assert "recording_url" not in data
+    assert "output" not in data
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_full_via_mcp_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _heavy_workflow_run_payload(include_expanded_outputs=True)
+    request = AsyncMock(return_value=_fake_http_response(payload))
+    fake_client = SimpleNamespace(
+        get_run=AsyncMock(),
+        _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request)),
+    )
+    monkeypatch.setattr(workflow_tools, "get_skyvern", lambda: fake_client)
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("skyvern_workflow_status", {"run_id": "wr_heavy", "verbosity": "full"})
+
+    assert result.is_error is False
+    assert isinstance(result.data, dict)
+    assert result.data["ok"] is True
+    data = result.data["data"]
+    assert data["run_id"] == "wr_heavy"
+    assert data["recording_url"] == payload["recording_url"]
+    assert data["output"] == payload["outputs"]
