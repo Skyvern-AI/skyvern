@@ -2,7 +2,6 @@ import copy
 import json
 import typing
 from abc import ABC, abstractmethod
-from collections import deque
 from enum import StrEnum
 from typing import Any, Awaitable, Callable, Self
 
@@ -10,7 +9,6 @@ import structlog
 from playwright.async_api import Frame, Page
 from pydantic import BaseModel, PrivateAttr
 
-from skyvern.config import settings
 from skyvern.exceptions import UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
@@ -35,8 +33,10 @@ def build_attribute(key: str, value: Any) -> str:
     return f'{key}="{str(value)}"' if value else key
 
 
-def _json_to_html_legacy(element: dict, need_skyvern_attrs: bool = True) -> str:
-    """Legacy: always deep-copies attributes (pre-V2)."""
+def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
+    """
+    if element is flagged as dropped, the html format is empty
+    """
     tag = element["tagName"]
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
@@ -50,104 +50,23 @@ def _json_to_html_legacy(element: dict, need_skyvern_attrs: bool = True) -> str:
 
     context = skyvern_context.ensure_context()
 
+    # FIXME: Theoretically, all href links with over 69(64+1+4) length could be hashed
+    # but currently, just hash length>150 links to confirm the solution goes well
     if "href" in attributes and len(attributes.get("href", "")) > 150:
         href = attributes.get("href", "")
+        # jinja style can't accept the variable name starts with number
+        # adding "_" to make sure the variable name is valid.
         hashed_href = "_" + calculate_sha256(href)
         context.hashed_href_map[hashed_href] = href
         attributes["href"] = "{{" + hashed_href + "}}"
 
     if need_skyvern_attrs:
+        # adding the node attribute to attributes
         for attr in ELEMENT_NODE_ATTRIBUTES:
             value = element.get(attr)
             if value is None:
                 continue
             attributes[attr] = value
-
-    attributes_html = " ".join(build_attribute(key, value) for key, value in attributes.items())
-
-    if element.get("isSelectable", False):
-        tag = "select"
-
-    text = element.get("text", "")
-    children_html = "".join(
-        _json_to_html_legacy(child, need_skyvern_attrs=need_skyvern_attrs) for child in element.get("children", [])
-    )
-    option_html = "".join(
-        f'<option index="{option.get("optionIndex")}">{option.get("text")}</option>'
-        if option.get("text")
-        else f'<option index="{option.get("optionIndex")}" value="{option.get("value")}">{option.get("text")}</option>'
-        for option in element.get("options", [])
-    )
-
-    if element.get("purgeable", False):
-        return children_html + option_html
-
-    before_pseudo_text = element.get("beforePseudoText") or ""
-    after_pseudo_text = element.get("afterPseudoText") or ""
-
-    if (
-        tag in ["img", "input", "br", "hr", "meta", "link"]
-        and not option_html
-        and not children_html
-        and not before_pseudo_text
-        and not after_pseudo_text
-    ):
-        return f"<{tag} {attributes_html}/>" if attributes_html else f"<{tag}/>"
-
-    return (
-        (f"<{tag} {attributes_html}>" if attributes_html else f"<{tag}>")
-        + before_pseudo_text
-        + text
-        + children_html
-        + option_html
-        + after_pseudo_text
-        + f"</{tag}>"
-    )
-
-
-def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
-    """
-    if element is flagged as dropped, the html format is empty
-    """
-    if not settings.ENABLE_DOM_PARSER_V2:
-        return _json_to_html_legacy(element, need_skyvern_attrs)
-
-    tag = element["tagName"]
-    original_attrs = element.get("attributes", {})
-
-    interactable = element.get("interactable", False)
-    if element.get("isDropped", False):
-        if not interactable:
-            return ""
-        else:
-            LOG.debug("Element is interactable. Trimmed all attributes instead of dropping it", element=element)
-            original_attrs = {}
-
-    context = skyvern_context.ensure_context()
-
-    # Only shallow-copy attributes when we actually need to mutate them.
-    # This avoids dict() allocation on every element — most elements don't need it.
-    attributes = original_attrs
-    href_val = original_attrs.get("href", "")
-
-    if href_val and len(href_val) > 150:
-        attributes = dict(original_attrs)
-        # jinja style can't accept the variable name starts with number
-        # adding "_" to make sure the variable name is valid.
-        hashed_href = "_" + calculate_sha256(href_val)
-        context.hashed_href_map[hashed_href] = href_val
-        attributes["href"] = "{{" + hashed_href + "}}"
-
-    if need_skyvern_attrs:
-        # adding the node attribute to attributes
-        has_skyvern_attrs = any(element.get(attr) is not None for attr in ELEMENT_NODE_ATTRIBUTES)
-        if has_skyvern_attrs:
-            if attributes is original_attrs:
-                attributes = dict(original_attrs)
-            for attr in ELEMENT_NODE_ATTRIBUTES:
-                value = element.get(attr)
-                if value is not None:
-                    attributes[attr] = value
 
     attributes_html = " ".join(build_attribute(key, value) for key, value in attributes.items())
 
@@ -356,43 +275,23 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
-    @staticmethod
-    def _process_element_for_economy_tree_legacy(element: dict) -> dict | None:
-        """Legacy: recursive SVG removal (pre-V2)."""
+    def _process_element_for_economy_tree(self, element: dict) -> dict | None:
+        """
+        Helper method to process an element for the economy tree using BFS.
+        Removes SVG elements and their children.
+        """
+        # Skip SVG elements entirely
         if element.get("tagName", "").lower() == "svg":
             return None
 
+        # Process children using BFS
         if "children" in element:
             new_children = []
             for child in element["children"]:
-                processed_child = ScrapedPage._process_element_for_economy_tree_legacy(child)
+                processed_child = self._process_element_for_economy_tree(child)
                 if processed_child:
                     new_children.append(processed_child)
             element["children"] = new_children
-        return element
-
-    @staticmethod
-    def _process_element_for_economy_tree(element: dict) -> dict | None:
-        """
-        Process an element for the economy tree. V2 uses iterative BFS.
-        Removes SVG elements and their children.
-        """
-        if not settings.ENABLE_DOM_PARSER_V2:
-            return ScrapedPage._process_element_for_economy_tree_legacy(element)
-
-        if element.get("tagName", "").lower() == "svg":
-            return None
-
-        # BFS to filter SVG children at every level
-        queue: deque[dict] = deque([element])
-        while queue:
-            node = queue.popleft()
-            children = node.get("children")
-            if not children:
-                continue
-            filtered = [c for c in children if c.get("tagName", "").lower() != "svg"]
-            node["children"] = filtered
-            queue.extend(filtered)
         return element
 
     async def refresh(self, draw_boxes: bool = True, scroll: bool = True, max_retries: int = 0) -> Self:
