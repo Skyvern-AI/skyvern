@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import structlog
 import yaml
@@ -26,6 +27,13 @@ from ._session import get_skyvern
 from ._validation import validate_folder_id
 
 LOG = structlog.get_logger()
+_SUMMARY_TOP_LEVEL_KEY_LIMIT = 8
+_SUMMARY_SCALAR_PREVIEW_LIMIT = 3
+_SUMMARY_ARTIFACT_PREVIEW_LIMIT = 4
+_SUMMARY_STRING_PREVIEW_LIMIT = 120
+_SUMMARY_RECURSION_LIMIT = 10
+_SCREENSHOT_LIST_KEYS = frozenset({"task_screenshots", "workflow_screenshots", "screenshot_urls"})
+_SCREENSHOT_ARTIFACT_ID_KEYS = frozenset({"task_screenshot_artifact_ids", "workflow_screenshot_artifact_ids"})
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,6 +104,268 @@ def _serialize_run(run: Any) -> dict[str, Any]:
             data[ts_field] = val.isoformat()
 
     return data
+
+
+def _get_value(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _get_run_id(run: Any) -> str | None:
+    return _get_value(run, "run_id") or _get_value(run, "workflow_run_id")
+
+
+def _jsonable(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    return value
+
+
+def _truncate_preview(value: Any) -> Any:
+    value = _jsonable(value)
+    if isinstance(value, str) and len(value) > _SUMMARY_STRING_PREVIEW_LIMIT:
+        return f"{value[: _SUMMARY_STRING_PREVIEW_LIMIT - 3]}..."
+    return value
+
+
+def _is_scalarish(value: Any) -> bool:
+    return value is None or isinstance(value, str | int | float | bool)
+
+
+def _init_output_stats() -> dict[str, Any]:
+    return {
+        "has_extracted_information": False,
+        "nested_screenshot_count": 0,
+        "artifact_id_count": 0,
+        "artifact_ids_preview": [],
+    }
+
+
+def _note_artifact_ids(stats: dict[str, Any], values: list[Any]) -> None:
+    stats["artifact_id_count"] += len(values)
+    preview = stats["artifact_ids_preview"]
+    for value in values:
+        if len(preview) >= _SUMMARY_ARTIFACT_PREVIEW_LIMIT:
+            break
+        value_str = str(value)
+        if value_str not in preview:
+            preview.append(value_str)
+
+
+def _scan_output_value(value: Any, stats: dict[str, Any], depth: int = 0) -> None:
+    if depth > _SUMMARY_RECURSION_LIMIT:
+        return
+
+    value = _jsonable(value)
+
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            if key == "extracted_information" and nested_value is not None:
+                stats["has_extracted_information"] = True
+            if key in _SCREENSHOT_LIST_KEYS and isinstance(nested_value, list):
+                stats["nested_screenshot_count"] += len(nested_value)
+            if key in _SCREENSHOT_ARTIFACT_ID_KEYS and isinstance(nested_value, list):
+                _note_artifact_ids(stats, nested_value)
+            _scan_output_value(nested_value, stats, depth + 1)
+        return
+
+    if isinstance(value, list):
+        for item in value:
+            _scan_output_value(item, stats, depth + 1)
+
+
+def _summarize_output_value(output_value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    if output_value is None:
+        return {"present": False}, _init_output_stats()
+
+    output_value = _jsonable(output_value)
+    stats = _init_output_stats()
+    _scan_output_value(output_value, stats)
+
+    summary: dict[str, Any] = {"present": True}
+
+    if isinstance(output_value, dict):
+        top_level_keys = list(output_value.keys())
+        summary["top_level_keys"] = top_level_keys[:_SUMMARY_TOP_LEVEL_KEY_LIMIT]
+        if len(top_level_keys) > _SUMMARY_TOP_LEVEL_KEY_LIMIT:
+            summary["top_level_key_count"] = len(top_level_keys)
+        summary["block_output_count"] = len([key for key in top_level_keys if key != "extracted_information"])
+
+        scalar_preview: dict[str, Any] = {}
+        for key, value in output_value.items():
+            if key == "extracted_information":
+                continue
+            if _is_scalarish(value):
+                scalar_preview[key] = _truncate_preview(value)
+            elif (
+                isinstance(value, list)
+                and value
+                and len(value) <= _SUMMARY_SCALAR_PREVIEW_LIMIT
+                and all(_is_scalarish(item) for item in value)
+            ):
+                scalar_preview[key] = [_truncate_preview(item) for item in value]
+            if len(scalar_preview) >= _SUMMARY_SCALAR_PREVIEW_LIMIT:
+                break
+        if scalar_preview:
+            summary["scalar_preview"] = scalar_preview
+    elif isinstance(output_value, list):
+        summary["item_count"] = len(output_value)
+        if (
+            output_value
+            and len(output_value) <= _SUMMARY_SCALAR_PREVIEW_LIMIT
+            and all(_is_scalarish(item) for item in output_value)
+        ):
+            summary["scalar_preview"] = [_truncate_preview(item) for item in output_value]
+    else:
+        summary["scalar_preview"] = _truncate_preview(output_value)
+
+    summary["has_extracted_information"] = stats["has_extracted_information"]
+    summary["nested_screenshot_count"] = stats["nested_screenshot_count"]
+    summary["artifact_id_count"] = stats["artifact_id_count"]
+
+    return summary, stats
+
+
+def _summarize_artifacts(run: Any, output_stats: dict[str, Any]) -> dict[str, Any]:
+    downloaded_files = _jsonable(_get_value(run, "downloaded_files")) or []
+    screenshot_urls = _jsonable(_get_value(run, "screenshot_urls")) or []
+
+    summary: dict[str, Any] = {
+        "recording_available": bool(_get_value(run, "recording_url")),
+        "workflow_screenshot_count": len(screenshot_urls),
+        "downloaded_file_count": len(downloaded_files),
+        "artifact_id_count": output_stats["artifact_id_count"],
+    }
+
+    filenames = [
+        filename
+        for filename in (_get_value(file_info, "filename") for file_info in downloaded_files)
+        if isinstance(filename, str) and filename
+    ]
+    if filenames:
+        summary["downloaded_file_names"] = filenames[:_SUMMARY_SCALAR_PREVIEW_LIMIT]
+
+    if output_stats["artifact_ids_preview"]:
+        summary["artifact_ids_preview"] = output_stats["artifact_ids_preview"]
+
+    return summary
+
+
+def _serialize_run_summary(run: Any) -> dict[str, Any]:
+    run_id = _get_run_id(run)
+    run_type = _get_value(run, "run_type")
+    if run_type is None and _get_value(run, "workflow_run_id"):
+        run_type = "workflow_run"
+
+    output_value = _get_value(run, "output")
+    if output_value is None and _get_value(run, "outputs") is not None:
+        output_value = _get_value(run, "outputs")
+
+    output_summary, output_stats = _summarize_output_value(output_value)
+
+    summary: dict[str, Any] = {
+        "run_id": run_id,
+        "status": str(_get_value(run, "status")) if _get_value(run, "status") is not None else None,
+        "run_type": str(run_type) if run_type is not None else None,
+        "artifact_summary": _summarize_artifacts(run, output_stats),
+        "output_summary": output_summary,
+    }
+
+    failure_reason = _get_value(run, "failure_reason")
+    if failure_reason:
+        summary["failure_reason"] = failure_reason
+
+    run_with = _get_value(run, "run_with")
+    if run_with:
+        summary["run_with"] = run_with
+
+    workflow_title = _get_value(run, "workflow_title")
+    if workflow_title:
+        summary["workflow_title"] = workflow_title
+
+    step_count = _get_value(run, "step_count")
+    total_steps = _get_value(run, "total_steps")
+    if step_count is not None:
+        summary["step_count"] = step_count
+    elif total_steps is not None:
+        summary["total_steps"] = total_steps
+
+    return {key: value for key, value in summary.items() if value is not None}
+
+
+def _serialize_run_full(run: Any) -> dict[str, Any]:
+    if not isinstance(run, dict):
+        return _serialize_run(run)
+
+    data: dict[str, Any] = {
+        "run_id": _get_run_id(run),
+        "status": str(_get_value(run, "status")) if _get_value(run, "status") is not None else None,
+        "run_type": "workflow_run" if _get_value(run, "workflow_run_id") else _get_value(run, "run_type"),
+    }
+
+    for field in (
+        "workflow_id",
+        "workflow_title",
+        "failure_reason",
+        "recording_url",
+        "screenshot_urls",
+        "downloaded_files",
+        "downloaded_file_urls",
+        "parameters",
+        "errors",
+        "browser_session_id",
+        "browser_profile_id",
+        "run_with",
+        "total_steps",
+    ):
+        value = _get_value(run, field)
+        if value is not None:
+            data[field] = _jsonable(value)
+
+    outputs = _get_value(run, "outputs")
+    if outputs is not None:
+        data["output"] = _jsonable(outputs)
+
+    for ts_field in ("created_at", "modified_at", "started_at", "finished_at", "queued_at"):
+        value = _get_value(run, ts_field)
+        if value is not None:
+            data[ts_field] = _jsonable(value)
+
+    return {key: value for key, value in data.items() if value is not None}
+
+
+async def _get_workflow_run_status(
+    workflow_run_id: str,
+    *,
+    include_output_details: bool,
+) -> dict[str, Any]:
+    skyvern = get_skyvern()
+    # The generated SDK only exposes get_run() for /v1/runs/{run_id}; wr_... IDs
+    # require the workflow-run detail route until a public SDK helper exists.
+    response = await skyvern._client_wrapper.httpx_client.request(
+        f"api/v1/workflows/runs/{workflow_run_id}",
+        method="GET",
+        params={"include_output_details": include_output_details},
+    )
+    if response.status_code == 404:
+        raise NotFoundError(body={"detail": f"Workflow run {workflow_run_id!r} not found"})
+    if response.status_code >= 400:
+        detail = ""
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            detail = response.text
+        raise RuntimeError(f"HTTP {response.status_code}: {detail}")
+    return response.json()
 
 
 def _validate_workflow_id(workflow_id: str, action: str) -> dict[str, Any] | None:
@@ -911,17 +1181,36 @@ async def skyvern_workflow_run(
 
 async def skyvern_workflow_status(
     run_id: Annotated[str, "Run ID to check (wr_... for workflow runs, tsk_v2_... for task runs)"],
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="`summary` returns a compact status payload. `full` includes outputs, timestamps, and URLs."),
+    ] = "summary",
 ) -> dict[str, Any]:
     """Check the status and progress of a workflow or task run. Use when you need to monitor
     a running workflow, check if it completed, or retrieve its output."""
     if err := _validate_run_id(run_id, "skyvern_workflow_status"):
         return err
-
-    skyvern = get_skyvern()
+    if verbosity not in {"summary", "full"}:
+        return make_result(
+            "skyvern_workflow_status",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                f"Invalid verbosity: {verbosity!r}",
+                "Use verbosity='summary' for compact status or verbosity='full' for full detail.",
+            ),
+        )
 
     with Timer() as timer:
         try:
-            run = await skyvern.get_run(run_id)
+            if run_id.startswith("wr_"):
+                run = await _get_workflow_run_status(
+                    run_id,
+                    include_output_details=verbosity == "full",
+                )
+            else:
+                skyvern = get_skyvern()
+                run = await skyvern.get_run(run_id)
             timer.mark("sdk")
         except NotFoundError:
             return make_result(
@@ -942,8 +1231,14 @@ async def skyvern_workflow_status(
                 error=make_error(ErrorCode.API_ERROR, str(e), "Check the run ID and your API key"),
             )
 
-    data = _serialize_run(run)
-    data["sdk_equivalent"] = f"await skyvern.get_run({run_id!r})"
+    data = _serialize_run_full(run) if verbosity == "full" else _serialize_run_summary(run)
+    if run_id.startswith("wr_"):
+        data["sdk_equivalent"] = f"await skyvern_workflow_status(run_id={run_id!r}, verbosity={verbosity!r})"
+    else:
+        verbosity_arg = "" if verbosity == "summary" else f", verbosity={verbosity!r}"
+        data["sdk_equivalent"] = (
+            f"await skyvern.get_run({run_id!r})  # or skyvern_workflow_status(run_id={run_id!r}{verbosity_arg})"
+        )
     return make_result("skyvern_workflow_status", data=data, timing_ms=timer.timing_ms)
 
 

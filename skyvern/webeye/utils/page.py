@@ -20,12 +20,9 @@ from skyvern.forge.sdk.trace import traced
 LOG = structlog.get_logger()
 
 
-def load_js_script() -> str:
-    # TODO: Handle file location better. This is a hacky way to find the file location.
-    path = f"{SKYVERN_DIR}/webeye/scraper/domUtils.js"
+def load_js_script(filename: str = "domUtils.js") -> str:
+    path = f"{SKYVERN_DIR}/webeye/scraper/{filename}"
     try:
-        # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
-        # This will allow our code to be type safe.
         with open(path, encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError as e:
@@ -33,7 +30,8 @@ def load_js_script() -> str:
         raise e
 
 
-JS_FUNCTION_DEFS = load_js_script()
+JS_FUNCTION_DEFS = load_js_script("domUtils.js")
+JS_FUNCTION_DEFS_LEGACY = load_js_script("domUtils_legacy.js")
 
 
 class ScreenshotMode(StrEnum):
@@ -379,8 +377,17 @@ class SkyvernFrame:
     @classmethod
     async def create_instance(cls, frame: Page | Frame) -> SkyvernFrame:
         instance = cls(frame=frame)
-        await cls.evaluate(frame=instance.frame, expression=JS_FUNCTION_DEFS)
-        if SettingsManager.get_settings().ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE:
+        settings = SettingsManager.get_settings()
+        js_to_inject = JS_FUNCTION_DEFS if settings.ENABLE_DOM_PARSER_V2 else JS_FUNCTION_DEFS_LEGACY
+        t0 = time.time()
+        await cls.evaluate(frame=instance.frame, expression=js_to_inject)
+        js_inject_elapsed = time.time() - t0
+        LOG.debug(
+            "domUtils.js injection time",
+            elapsed_time=js_inject_elapsed,
+            dom_parser_v2=settings.ENABLE_DOM_PARSER_V2,
+        )
+        if settings.ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE:
             await instance.evaluate(
                 frame=instance.frame, expression="() => window.GlobalEnableAllTextualElements = true"
             )
@@ -543,12 +550,23 @@ class SkyvernFrame:
     ) -> tuple[list[dict], list[dict]]:
         must_included_tags = must_included_tags or []
         js_script = "async ([frame_name, frame_index, must_included_tags]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags)"
-        return await self.evaluate(
+        t0 = time.time()
+        result = await self.evaluate(
             frame=self.frame,
             expression=js_script,
             timeout_ms=timeout_ms,
             arg=[frame_name, frame_index, must_included_tags],
         )
+        elapsed = time.time() - t0
+        num_elements = len(result[0]) if result and len(result) > 0 else 0
+        LOG.debug(
+            "buildTreeFromBody JS execution time",
+            frame_name=frame_name,
+            frame_index=frame_index,
+            elapsed_time=elapsed,
+            num_elements=num_elements,
+        )
+        return result
 
     @traced()
     async def get_incremental_element_tree(

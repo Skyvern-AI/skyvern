@@ -223,7 +223,7 @@ skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 plugins = "sqlalchemy.ext.mypy.plugin"
 
 [project.scripts]
-skyvern = "skyvern.cli.commands:cli_app"
+skyvern = "skyvern.__main__:main"
 
 [tool.pytest.ini_options]
 norecursedirs = ["eval", "tests/sdk"]
