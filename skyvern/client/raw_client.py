@@ -3545,37 +3545,34 @@ class RawSkyvern:
         )
         try:
             if 200 <= _response.status_code < 300:
+                if _response is None or not _response.text.strip():
+                    return HttpResponse(response=_response, data=None)
                 _data = typing.cast(
-                    typing.Dict[str, typing.Optional[typing.Any]],
-                    parse_obj_as(
-                        type_=typing.Dict[str, typing.Optional[typing.Any]],  # type: ignore
-                        object_=_response.json(),
-                    ),
+                    typing.Optional[typing.Any],
+                    parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
                 )
                 return HttpResponse(response=_response, data=_data)
             if _response.status_code == 404:
                 raise NotFoundError(
                     headers=dict(_response.headers),
-                    body=typing.cast(
+                    body=None
+                    if not _response.text.strip()
+                    else typing.cast(
                         typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
                     ),
                 )
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     headers=dict(_response.headers),
-                    body=typing.cast(
+                    body=None
+                    if not _response.text.strip()
+                    else typing.cast(
                         typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
                     ),
                 )
-            _response_json = _response.json()
+            _response_json = None if not _response.text.strip() else _response.json()
         except JSONDecodeError:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
@@ -7151,37 +7148,34 @@ class AsyncRawSkyvern:
         )
         try:
             if 200 <= _response.status_code < 300:
+                if _response is None or not _response.text.strip():
+                    return AsyncHttpResponse(response=_response, data=None)
                 _data = typing.cast(
-                    typing.Dict[str, typing.Optional[typing.Any]],
-                    parse_obj_as(
-                        type_=typing.Dict[str, typing.Optional[typing.Any]],  # type: ignore
-                        object_=_response.json(),
-                    ),
+                    typing.Optional[typing.Any],
+                    parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
                 )
                 return AsyncHttpResponse(response=_response, data=_data)
             if _response.status_code == 404:
                 raise NotFoundError(
                     headers=dict(_response.headers),
-                    body=typing.cast(
+                    body=None
+                    if not _response.text.strip()
+                    else typing.cast(
                         typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
                     ),
                 )
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     headers=dict(_response.headers),
-                    body=typing.cast(
+                    body=None
+                    if not _response.text.strip()
+                    else typing.cast(
                         typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
+                        parse_obj_as(type_=typing.Optional[typing.Any], object_=_response.json()),  # type: ignore
                     ),
                 )
-            _response_json = _response.json()
+            _response_json = None if not _response.text.strip() else _response.json()
         except JSONDecodeError:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
