@@ -37,6 +37,9 @@ class WorkflowRun(UniversalBaseModel):
     sequential_key: typing.Optional[str] = None
     ai_fallback: typing.Optional[bool] = None
     code_gen: typing.Optional[bool] = None
+    waiting_for_verification_code: typing.Optional[bool] = None
+    verification_code_identifier: typing.Optional[str] = None
+    verification_code_polling_started_at: typing.Optional[dt.datetime] = None
     queued_at: typing.Optional[dt.datetime] = None
     started_at: typing.Optional[dt.datetime] = None
     finished_at: typing.Optional[dt.datetime] = None
