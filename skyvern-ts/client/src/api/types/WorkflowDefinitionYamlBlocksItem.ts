@@ -25,7 +25,8 @@ export type WorkflowDefinitionYamlBlocksItem =
     | Skyvern.WorkflowDefinitionYamlBlocksItem.TextPrompt
     | Skyvern.WorkflowDefinitionYamlBlocksItem.UploadToS3
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Validation
-    | Skyvern.WorkflowDefinitionYamlBlocksItem.Wait;
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.Wait
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.WorkflowTrigger;
 
 export namespace WorkflowDefinitionYamlBlocksItem {
     export interface Action extends Skyvern.ActionBlockYaml {
@@ -118,5 +119,9 @@ export namespace WorkflowDefinitionYamlBlocksItem {
 
     export interface Wait extends Skyvern.WaitBlockYaml {
         block_type: "wait";
+    }
+
+    export interface WorkflowTrigger extends Skyvern.WorkflowTriggerBlockYaml {
+        block_type: "workflow_trigger";
     }
 }
