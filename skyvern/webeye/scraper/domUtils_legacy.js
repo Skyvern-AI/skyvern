@@ -1,3 +1,4 @@
+// LEGACY FROZEN BASELINE — do not modify. See domUtils.js for the optimized version.
 // we only use chromium browser for now
 let browserNameForWorkarounds = "chromium";
 
@@ -157,8 +158,7 @@ class DomUtils {
       // this.
       let computedStyle;
       if ((clientRect.width === 0 || clientRect.height === 0) && testChildren) {
-        for (let ci = 0; ci < element.children.length; ci++) {
-          const child = element.children[ci];
+        for (const child of Array.from(element.children)) {
           computedStyle = getElementComputedStyle(child, null);
           if (!computedStyle) {
             continue;
@@ -361,27 +361,11 @@ class QuadTreeNode {
   }
 }
 
-// from playwright — with per-tree-build cache for non-pseudo styles
-const _computedStyleCache = new WeakMap();
-
+// from playwright
 function getElementComputedStyle(element, pseudo) {
-  if (!element.ownerDocument || !element.ownerDocument.defaultView) {
-    return undefined;
-  }
-  // Cache only non-pseudo styles (the hot path called 3-5× per element)
-  if (pseudo == null) {
-    const cached = _computedStyleCache.get(element);
-    if (cached !== undefined) {
-      return cached;
-    }
-    const style = element.ownerDocument.defaultView.getComputedStyle(
-      element,
-      null,
-    );
-    _computedStyleCache.set(element, style);
-    return style;
-  }
-  return element.ownerDocument.defaultView.getComputedStyle(element, pseudo);
+  return element.ownerDocument && element.ownerDocument.defaultView
+    ? element.ownerDocument.defaultView.getComputedStyle(element, pseudo)
+    : undefined;
 }
 
 // from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L76-L98
@@ -428,14 +412,8 @@ function hasASPClientControl() {
   return typeof ASPxClientControl !== "undefined";
 }
 
-// Cache for isHoverOnlyElement — called up to 3× per element
-// (isElementVisible, isInteractable, buildElementObject)
-const _hoverOnlyCache = new WeakMap();
-
 // Check if element is only visible on hover (e.g., hover-only buttons)
 function isHoverOnlyElement(element) {
-  const cached = _hoverOnlyCache.get(element);
-  if (cached !== undefined) return cached;
   // Check for common hover-only patterns in class names
   const className = element.className?.toString() ?? "";
   const parentClassName = element.parentElement?.className?.toString() ?? "";
@@ -447,7 +425,6 @@ function isHoverOnlyElement(element) {
     parentClassName.includes("hover-") ||
     parentClassName.includes("-hover")
   ) {
-    _hoverOnlyCache.set(element, true);
     return true;
   }
 
@@ -464,14 +441,12 @@ function isHoverOnlyElement(element) {
       parentClass.includes("item")
     ) {
       // This element might be revealed on parent hover
-      _hoverOnlyCache.set(element, true);
       return true;
     }
     parent = parent.parentElement;
     depth += 1;
   }
 
-  _hoverOnlyCache.set(element, false);
   return false;
 }
 
@@ -480,10 +455,9 @@ function isHoverOnlyElement(element) {
 function isElementVisible(element) {
   // TODO: This is a hack to not check visibility for option elements
   // because they are not visible by default. We check their parent instead for visibility.
-  const elTagName = element.tagName.toLowerCase();
   if (
-    elTagName === "option" ||
-    (elTagName === "input" &&
+    element.tagName.toLowerCase() === "option" ||
+    (element.tagName.toLowerCase() === "input" &&
       (element.type === "radio" || element.type === "checkbox"))
   )
     return element.parentElement && isElementVisible(element.parentElement);
@@ -649,10 +623,11 @@ function expectHitTarget(hitPoint, targetElement) {
 }
 
 function getChildElements(element) {
-  // Return the live HTMLCollection directly — callers iterate by index,
-  // and processElement only modifies attributes (not child structure),
-  // so the live collection remains stable during iteration.
-  return element.children;
+  if (element.childElementCount !== 0) {
+    return Array.from(element.children);
+  } else {
+    return [];
+  }
 }
 
 function isParent(parent, child) {
@@ -687,10 +662,9 @@ function isHidden(element) {
     return true;
   }
   if (element.hidden) {
-    const tn = element.tagName.toLowerCase();
     if (
       style?.cursor === "pointer" &&
-      tn === "input" &&
+      element.tagName.toLowerCase() === "input" &&
       (element.type === "submit" || element.type === "button")
     ) {
       // there are cases where the input is a "submit" button and the cursor is a pointer but the element has the hidden attr.
@@ -750,25 +724,6 @@ function hasAngularClickBinding(element) {
   );
 }
 
-// Pre-computed Set for widget roles — avoids recreating array on every hasWidgetRole call
-const WIDGET_ROLES = new Set([
-  "button",
-  "link",
-  "checkbox",
-  "menuitem",
-  "menuitemcheckbox",
-  "menuitemradio",
-  "radio",
-  "tab",
-  "combobox",
-  "searchbox",
-  "slider",
-  "spinbutton",
-  "switch",
-  "gridcell",
-  "option",
-]);
-
 function hasWidgetRole(element) {
   const role = element.getAttribute("role");
   if (!role) {
@@ -776,15 +731,44 @@ function hasWidgetRole(element) {
   }
   // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Roles#2._widget_roles
   // Not all roles make sense for the time being so we only check for the ones that do
-  const normalizedRole = role.toLowerCase().trim();
-  if (normalizedRole === "textbox") {
+  if (role.toLowerCase().trim() === "textbox") {
     return !isReadonlyElement(element);
   }
-  return WIDGET_ROLES.has(normalizedRole);
+
+  const widgetRoles = [
+    "button",
+    "link",
+    "checkbox",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "radio",
+    "tab",
+    "combobox",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "switch",
+    "gridcell",
+    "option",
+  ];
+  return widgetRoles.includes(role.toLowerCase().trim());
 }
 
 function isTableRelatedElement(element) {
-  return TABLE_RELATED_TAGS.has(element.tagName.toLowerCase());
+  const tagName = element.tagName.toLowerCase();
+  return [
+    "table",
+    "caption",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "th",
+    "td",
+    "colgroup",
+    "col",
+  ].includes(tagName);
 }
 
 function isDOMNodeRepresentDiv(element) {
@@ -861,74 +845,17 @@ function isValidCSSSelector(selector) {
   }
 }
 
-// Pre-computed tag sets for O(1) lookup in isInteractable hot path
-const ALWAYS_INTERACTABLE_TAGS = new Set([
-  "button",
-  "select",
-  "option",
-  "textarea",
-]);
-const POINTER_CHECK_TAGS = new Set([
-  "div",
-  "img",
-  "span",
-  "a",
-  "i",
-  "li",
-  "p",
-  "td",
-  "svg",
-  "strong",
-  "h1",
-  "h2",
-  "h3",
-  "h4",
-]);
-const SKIP_TAGS = new Set(["html", "iframe", "frameset", "frame"]);
-// Attributes that should be normalized to boolean true/false in buildElementObject
-const BOOLEAN_ATTRS = new Set([
-  "required",
-  "aria-required",
-  "checked",
-  "aria-checked",
-  "selected",
-  "aria-selected",
-  "readonly",
-  "aria-readonly",
-  "disabled",
-  "aria-disabled",
-]);
-const TABLE_RELATED_TAGS = new Set([
-  "table",
-  "caption",
-  "thead",
-  "tbody",
-  "tfoot",
-  "tr",
-  "th",
-  "td",
-  "colgroup",
-  "col",
-]);
+function isInteractable(element, hoverStylesMap) {
+  if (!isElementVisible(element)) {
+    return false;
+  }
 
-function isInteractable(
-  element,
-  hoverStylesMap,
-  skipVisibilityChecks = false,
-  pageFlags = {},
-) {
-  if (!skipVisibilityChecks) {
-    if (!isElementVisible(element)) {
-      return false;
-    }
+  if (isHidden(element)) {
+    return false;
+  }
 
-    if (isHidden(element)) {
-      return false;
-    }
-
-    if (isScriptOrStyle(element)) {
-      return false;
-    }
+  if (isScriptOrStyle(element)) {
+    return false;
   }
 
   if (hasWidgetRole(element)) {
@@ -953,7 +880,19 @@ function isInteractable(
   }
 
   const tagName = element.tagName.toLowerCase();
-  if (SKIP_TAGS.has(tagName)) {
+  if (tagName === "html") {
+    return false;
+  }
+
+  if (tagName === "iframe") {
+    return false;
+  }
+
+  if (tagName === "frameset") {
+    return false;
+  }
+
+  if (tagName === "frame") {
     return false;
   }
 
@@ -966,7 +905,12 @@ function isInteractable(
     return false;
   }
 
-  if (ALWAYS_INTERACTABLE_TAGS.has(tagName)) {
+  if (
+    tagName === "button" ||
+    tagName === "select" ||
+    tagName === "option" ||
+    tagName === "textarea"
+  ) {
     return true;
   }
 
@@ -1000,11 +944,18 @@ function isInteractable(
 
   // support listbox and options underneath it
   // div element should be checked here before the css pointer
-  const roleAttr = element.getAttribute("role")?.toLowerCase();
-  if ((tagName === "ul" || tagName === "div") && roleAttr === "listbox") {
+  if (
+    (tagName === "ul" || tagName === "div") &&
+    element.hasAttribute("role") &&
+    element.getAttribute("role").toLowerCase() === "listbox"
+  ) {
     return true;
   }
-  if ((tagName === "li" || tagName === "div") && roleAttr === "option") {
+  if (
+    (tagName === "li" || tagName === "div") &&
+    element.hasAttribute("role") &&
+    element.getAttribute("role").toLowerCase() === "option"
+  ) {
     return true;
   }
 
@@ -1024,7 +975,6 @@ function isInteractable(
   if (
     tagName === "div" &&
     className.includes("pac-item") &&
-    pageFlags.hasPacContainers !== false &&
     element.closest('div[class*="pac-container"]')
   ) {
     return true;
@@ -1032,23 +982,33 @@ function isInteractable(
 
   if (
     tagName === "div" &&
-    element.getAttribute("aria-disabled")?.toLowerCase() === "false"
+    element.hasAttribute("aria-disabled") &&
+    element.getAttribute("aria-disabled").toLowerCase() === "false"
   ) {
     return true;
   }
 
-  if (
-    tagName === "span" &&
-    pageFlags.hasDropdownContainers !== false &&
-    element.closest('div[id*="dropdown-container"]')
-  ) {
+  if (tagName === "span" && element.closest('div[id*="dropdown-container"]')) {
     return true;
   }
 
   // FIXME: maybe we need to enable the pointer check for all elements?
   if (
-    POINTER_CHECK_TAGS.has(tagName) ||
-    // customized elements like <my-login-button>, check pointer style
+    tagName === "div" ||
+    tagName === "img" ||
+    tagName === "span" ||
+    tagName === "a" ||
+    tagName === "i" ||
+    tagName === "li" ||
+    tagName === "p" ||
+    tagName === "td" ||
+    tagName === "svg" ||
+    tagName === "strong" ||
+    tagName === "h1" ||
+    tagName === "h2" ||
+    tagName === "h3" ||
+    tagName === "h4" ||
+    // sometime it's a customized element like <my-login-button>, we should check pointer style
     tagName.includes("button") ||
     tagName.includes("select") ||
     tagName.includes("option") ||
@@ -1087,7 +1047,11 @@ function isInteractable(
   }
 
   // consider <div tabindex="0"> as interactable
-  if (tagName === "div" && element.getAttribute("tabindex") === "0") {
+  if (
+    tagName.toLowerCase() === "div" &&
+    element.hasAttribute("tabindex") &&
+    element.getAttribute("tabindex").toLowerCase() === "0"
+  ) {
     return true;
   }
 
@@ -1136,10 +1100,15 @@ const isComboboxDropdown = (element) => {
   if (element.tagName.toLowerCase() !== "input") {
     return false;
   }
-  const role = element.getAttribute("role")?.toLowerCase() ?? "";
-  const haspopup = element.getAttribute("aria-haspopup")?.toLowerCase() ?? "";
-  const readonlyVal = element.getAttribute("readonly");
-  const readonly = readonlyVal && readonlyVal.toLowerCase() !== "false";
+  const role = element.getAttribute("role")
+    ? element.getAttribute("role").toLowerCase()
+    : "";
+  const haspopup = element.getAttribute("aria-haspopup")
+    ? element.getAttribute("aria-haspopup").toLowerCase()
+    : "";
+  const readonly =
+    element.getAttribute("readonly") &&
+    element.getAttribute("readonly").toLowerCase() !== "false";
   const controls = element.hasAttribute("aria-controls");
   return role && haspopup && controls && readonly;
 };
@@ -1149,16 +1118,24 @@ const isDivComboboxDropdown = (element) => {
   if (tagName !== "div") {
     return false;
   }
-  const role = element.getAttribute("role")?.toLowerCase() ?? "";
-  const haspopup = element.getAttribute("aria-haspopup")?.toLowerCase() ?? "";
+  const role = element.getAttribute("role")
+    ? element.getAttribute("role").toLowerCase()
+    : "";
+  const haspopup = element.getAttribute("aria-haspopup")
+    ? element.getAttribute("aria-haspopup").toLowerCase()
+    : "";
   const controls = element.hasAttribute("aria-controls");
   return role === "combobox" && controls && haspopup;
 };
 
 const isDropdownButton = (element) => {
   const tagName = element.tagName.toLowerCase();
-  const type = element.getAttribute("type")?.toLowerCase() ?? "";
-  const haspopup = element.getAttribute("aria-haspopup")?.toLowerCase() ?? "";
+  const type = element.getAttribute("type")
+    ? element.getAttribute("type").toLowerCase()
+    : "";
+  const haspopup = element.getAttribute("aria-haspopup")
+    ? element.getAttribute("aria-haspopup").toLowerCase()
+    : "";
   const hasExpanded = element.hasAttribute("aria-expanded");
   return (
     tagName === "button" &&
@@ -1170,7 +1147,9 @@ const isDropdownButton = (element) => {
 const isSelect2Dropdown = (element) => {
   const tagName = element.tagName.toLowerCase();
   const className = element.className.toString();
-  const role = element.getAttribute("role")?.toLowerCase() ?? "";
+  const role = element.getAttribute("role")
+    ? element.getAttribute("role").toLowerCase()
+    : "";
 
   if (tagName === "a") {
     return className.includes("select2-choice");
@@ -1271,7 +1250,9 @@ const isAngularDropdown = (element) => {
 
   const tagName = element.tagName.toLowerCase();
   if (tagName === "input" || tagName === "span") {
-    const ariaLabel = element.getAttribute("aria-label")?.toLowerCase() ?? "";
+    const ariaLabel = element.hasAttribute("aria-label")
+      ? element.getAttribute("aria-label").toLowerCase()
+      : "";
     return ariaLabel.includes("select") || ariaLabel.includes("choose");
   }
 
@@ -1292,34 +1273,21 @@ const isAngularMaterialDatePicker = (element) => {
   );
 };
 
-// Cache for pseudo-element content — called in hasBeforeOrAfterPseudoContent
-// and again in buildElementObject for the same element
-const _pseudoContentCache = new WeakMap();
-
 function getPseudoContent(element, pseudo) {
-  let elementCache = _pseudoContentCache.get(element);
-  if (elementCache && pseudo in elementCache) {
-    return elementCache[pseudo];
-  }
-
   const pseudoStyle = getElementComputedStyle(element, pseudo);
-  let result = null;
-  if (pseudoStyle) {
-    const content = pseudoStyle
-      .getPropertyValue("content")
-      .replace(/"/g, "")
-      .trim();
-    if (content !== "none" && content) {
-      result = content;
-    }
+  if (!pseudoStyle) {
+    return null;
+  }
+  const content = pseudoStyle
+    .getPropertyValue("content")
+    .replace(/"/g, "")
+    .trim();
+
+  if (content === "none" || !content) {
+    return null;
   }
 
-  if (!elementCache) {
-    elementCache = {};
-    _pseudoContentCache.set(element, elementCache);
-  }
-  elementCache[pseudo] = result;
-  return result;
+  return content;
 }
 
 function hasBeforeOrAfterPseudoContent(element) {
@@ -1345,8 +1313,12 @@ function removeMultipleSpaces(str) {
     return str;
   }
 
-  // Optimization: check if contains whitespace worth collapsing before running regex
-  if (!/\s{2}|[\t\n]/.test(str)) {
+  // Optimization: check if contains multiple spaces to avoid unnecessary regex replacement
+  if (
+    str.indexOf("  ") === -1 &&
+    str.indexOf("\t") === -1 &&
+    str.indexOf("\n") === -1
+  ) {
     return str;
   }
 
@@ -1375,9 +1347,10 @@ function cleanupText(text) {
 }
 
 const checkStringIncludeRequire = (str) => {
-  const lower = str.toLowerCase();
   return (
-    lower.includes("*") || lower.includes("✱") || lower.includes("require")
+    str.toLowerCase().includes("*") ||
+    str.toLowerCase().includes("✱") ||
+    str.toLowerCase().includes("require")
   );
 };
 
@@ -1462,10 +1435,10 @@ function getElementText(element) {
 }
 
 function getSelectOptions(element) {
+  const options = Array.from(element.options);
   const selectOptions = [];
 
-  for (let i = 0; i < element.options.length; i++) {
-    const option = element.options[i];
+  for (const option of options) {
     selectOptions.push({
       optionIndex: option.index,
       text: removeMultipleSpaces(option.textContent),
@@ -1546,7 +1519,6 @@ async function buildElementObject(
   element,
   interactable,
   purgeable = false,
-  cachedIsInSvg = null,
 ) {
   var element_id = element.getAttribute("unique_id") ?? (await uniqueId());
   var elementTagNameLower = element.tagName.toLowerCase();
@@ -1556,9 +1528,23 @@ async function buildElementObject(
   if (element.attributes[Symbol.iterator]) {
     for (const attr of element.attributes) {
       var attrValue = attr.value;
-      if (BOOLEAN_ATTRS.has(attr.name)) {
-        attrValue =
-          attrValue && attrValue.toLowerCase() === "false" ? false : true;
+      if (
+        attr.name === "required" ||
+        attr.name === "aria-required" ||
+        attr.name === "checked" ||
+        attr.name === "aria-checked" ||
+        attr.name === "selected" ||
+        attr.name === "aria-selected" ||
+        attr.name === "readonly" ||
+        attr.name === "aria-readonly" ||
+        attr.name === "disabled" ||
+        attr.name === "aria-disabled"
+      ) {
+        if (attrValue && attrValue.toLowerCase() === "false") {
+          attrValue = false;
+        } else {
+          attrValue = true;
+        }
       }
       attrs[attr.name] = attrValue;
     }
@@ -1652,10 +1638,7 @@ async function buildElementObject(
     purgeable: purgeable,
     // don't trim any attr of this element if keepAllAttr=True
     keepAllAttr:
-      elementTagNameLower === "svg" ||
-      (cachedIsInSvg !== null
-        ? cachedIsInSvg
-        : element.closest("svg") !== null),
+      elementTagNameLower === "svg" || element.closest("svg") !== null,
     isSelectable:
       elementTagNameLower === "select" ||
       isDatePickerSelector(element) ||
@@ -1747,15 +1730,6 @@ async function buildElementTree(
 
   var elements = [];
   var resultArray = [];
-  // O(1) parent lookup map — replaces the O(n) elements.find() that caused O(n²) tree building
-  const elementIdMap = new Map();
-  // Page-level check: does the page have any dropdown-container divs?
-  // If not, skip expensive .closest() for every span element.
-  const hasDropdownContainers =
-    document.querySelector('div[id*="dropdown-container"]') !== null;
-  // Page-level check: does the page have any Google Maps pac-container?
-  const hasPacContainers =
-    document.querySelector('div[class*="pac-container"]') !== null;
 
   async function processElement(
     element,
@@ -1811,12 +1785,7 @@ async function buildElementTree(
     }
     const isVisible = isElementVisible(element);
     if (isVisible && !isHidden(element) && !isScriptOrStyle(element)) {
-      // Pass skipVisibilityChecks=true since we already verified visible+not hidden+not script/style.
-      // Pass pageFlags so .closest() calls are skipped when the page lacks those containers.
-      let interactable = isInteractable(element, hoverStylesMap, true, {
-        hasDropdownContainers,
-        hasPacContainers,
-      });
+      let interactable = isInteractable(element, hoverStylesMap);
       let elementObj = null;
       let isParentSVG = null;
       if (must_included_tags.includes(tagName)) {
@@ -1839,25 +1808,13 @@ async function buildElementTree(
       } else if (hasBeforeOrAfterPseudoContent(element)) {
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (tagName === "svg") {
-        elementObj = await buildElementObject(
-          frame,
-          element,
-          interactable,
-          false,
-          true,
-        );
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (
         (isParentSVG = element.closest("svg")) &&
         isParentSVG.getAttribute("unique_id")
       ) {
         // if element is the children of the <svg> with an unique_id
-        elementObj = await buildElementObject(
-          frame,
-          element,
-          interactable,
-          false,
-          true,
-        );
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (tagName === "div" && isDOMNodeRepresentDiv(element)) {
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (
@@ -1870,45 +1827,46 @@ async function buildElementTree(
           interactable,
           true,
         );
-      } else {
-        // Cache getElementText() to avoid calling it twice
-        const cachedText = getElementText(element);
-        if (cachedText.length > 0 && cachedText.length <= 5000) {
-          if (window.GlobalEnableAllTextualElements) {
-            // force all textual elements to be interactable
-            interactable = true;
-          }
-          elementObj = await buildElementObject(frame, element, interactable);
-        } else if (full_tree) {
-          // when building full tree, we only get text from element itself
-          // elements without text are purgeable
-          elementObj = await buildElementObject(
-            frame,
-            element,
-            interactable,
-            true,
-          );
-          if (elementObj.text.length > 0) {
-            elementObj.purgeable = false;
-          }
+      } else if (
+        getElementText(element).length > 0 &&
+        getElementText(element).length <= 5000
+      ) {
+        if (window.GlobalEnableAllTextualElements) {
+          // force all textual elements to be interactable
+          interactable = true;
+        }
+        elementObj = await buildElementObject(frame, element, interactable);
+      } else if (full_tree) {
+        // when building full tree, we only get text from element itself
+        // elements without text are purgeable
+        elementObj = await buildElementObject(
+          frame,
+          element,
+          interactable,
+          true,
+        );
+        if (elementObj.text.length > 0) {
+          elementObj.purgeable = false;
         }
       }
 
       if (elementObj) {
         elementObj.xpath = current_xpath;
         elements.push(elementObj);
-        elementIdMap.set(elementObj.id, elementObj);
-        // If the element has no parent in the tree,
+        // If the element is interactable but has no interactable parent,
         // then it starts a new tree, so add it to the result array
+        // and set its id as the interactable parent id for the next elements
+        // under it
         if (parentId === null) {
           resultArray.push(elementObj);
         }
-        // Otherwise add it to the children of the parent via O(1) map lookup
+        // If the element is interactable and has an interactable parent,
+        // then add it to the children of the parent
         else {
-          const parentObj = elementIdMap.get(parentId);
-          if (parentObj) {
-            parentObj.children.push(elementObj);
-          }
+          // TODO: use dict/object so that we access these in O(1) instead
+          elements
+            .find((element) => element.id === parentId)
+            .children.push(elementObj);
         }
         parentId = elementObj.id;
       }
@@ -1952,51 +1910,24 @@ async function buildElementTree(
       return;
     }
 
-    let text = element.text;
-    if (!text) {
-      // Still recurse into children
-      for (let i = 0; i < element.children.length; i++) {
-        trimDuplicatedText(element.children[i]);
-      }
-      return;
-    }
-
-    // Collect all substrings to remove, then remove them in one pass
-    const textsToRemove = [];
-
     // if the element has options, text will be duplicated with the option text
     if (element.options) {
-      for (let i = 0; i < element.options.length; i++) {
-        if (element.options[i].text) {
-          textsToRemove.push(element.options[i].text);
-        }
-      }
+      element.options.forEach((option) => {
+        element.text = element.text.replace(option.text, "");
+      });
     }
 
-    for (let i = 0; i < element.children.length; i++) {
-      if (element.children[i].text) {
-        textsToRemove.push(element.children[i].text);
-      }
-    }
+    // BFS to delete duplicated text
+    element.children.forEach((child) => {
+      // delete duplicated text in the tree
+      element.text = element.text.replace(child.text, "");
+      trimDuplicatedText(child);
+    });
 
-    // Remove all collected substrings from parent text
-    for (let i = 0; i < textsToRemove.length; i++) {
-      const idx = text.indexOf(textsToRemove[i]);
-      if (idx !== -1) {
-        text =
-          text.substring(0, idx) +
-          text.substring(idx + textsToRemove[i].length);
-      }
-    }
-
-    // Clean up semicolons in one pass using a single regex
-    text = text.replace(/;+/g, ";").replace(/^;+|;+$/g, "");
-    element.text = text;
-
-    // Recurse into children
-    for (let i = 0; i < element.children.length; i++) {
-      trimDuplicatedText(element.children[i]);
-    }
+    // trim multiple ";"
+    element.text = element.text.replace(/;+/g, ";");
+    // trimleft and trimright ";"
+    element.text = element.text.replace(new RegExp(`^;+|;+$`, "g"), "");
   };
 
   // some elements without children nodes should be removed out, such as <label>
@@ -2138,19 +2069,14 @@ function groupElementsVisually(elements) {
   return groups;
 }
 
-// Helper functions — single-pass min/max avoids 4 intermediate arrays + spread
+// Helper functions
 function calculateBounds(elements) {
-  let left = Infinity,
-    top = Infinity,
-    right = -Infinity,
-    bottom = -Infinity;
-  for (let i = 0; i < elements.length; i++) {
-    const r = elements[i].rect;
-    if (r.left < left) left = r.left;
-    if (r.top < top) top = r.top;
-    if (r.right > right) right = r.right;
-    if (r.bottom > bottom) bottom = r.bottom;
-  }
+  const rects = elements.map((el) => el.rect);
+  const left = Math.min(...rects.map((r) => r.left));
+  const top = Math.min(...rects.map((r) => r.top));
+  const right = Math.max(...rects.map((r) => r.right));
+  const bottom = Math.max(...rects.map((r) => r.bottom));
+
   return {
     x: left,
     y: top,
@@ -2185,18 +2111,11 @@ function findOverlappingElements(element, allElements, quadTree, processed) {
 }
 
 function createRectangleForGroup(group) {
-  const elems = group.elements;
-  let top = Infinity,
-    left = Infinity,
-    bottom = -Infinity,
-    right = -Infinity;
-  for (let i = 0; i < elems.length; i++) {
-    const r = elems[i].rect;
-    if (r.top < top) top = r.top;
-    if (r.left < left) left = r.left;
-    if (r.bottom > bottom) bottom = r.bottom;
-    if (r.right > right) right = r.right;
-  }
+  const rects = group.elements.map((element) => element.rect);
+  const top = Math.min(...rects.map((rect) => rect.top));
+  const left = Math.min(...rects.map((rect) => rect.left));
+  const bottom = Math.max(...rects.map((rect) => rect.bottom));
+  const right = Math.max(...rects.map((rect) => rect.right));
   return Rect.create(left, top, right, bottom);
 }
 
@@ -2509,16 +2428,12 @@ function scrollToElementTop(element) {
  */
 async function getHoverStylesMap() {
   const hoverMap = new Map();
-  const sheets = Array.from(document.styleSheets);
+  const sheets = [...document.styleSheets];
 
   const parseCssSheet = (sheet) => {
     const rules = sheet.cssRules || sheet.rules;
     for (const rule of rules) {
       if (rule.type === 1 && rule.selectorText) {
-        // Fast-path: skip rules that don't contain :hover at all
-        if (!rule.selectorText.includes(":hover")) {
-          continue;
-        }
         // Split multiple selectors (e.g., "a:hover, button:hover")
         const selectors = rule.selectorText.split(",").map((s) => s.trim());
 
@@ -2540,17 +2455,8 @@ async function getHoverStylesMap() {
               continue;
             }
 
-            // Early check: only keep rules that set cursor (or already have it from prior rules)
-            const existingStyles = hoverMap.get(baseSelector);
-            const hasCursorInRule = rule.style.cursor;
-            const hasCursorInExisting =
-              existingStyles && "cursor" in existingStyles;
-            if (!hasCursorInRule && !hasCursorInExisting) {
-              continue;
-            }
-
             // Get or create styles object for this selector
-            let styles = existingStyles || {};
+            let styles = hoverMap.get(baseSelector) || {};
 
             // Add all style properties
             for (const prop of rule.style) {
@@ -2562,16 +2468,18 @@ async function getHoverStylesMap() {
             if (parts.length > 1) {
               const fullSelector = selector;
               styles["__nested__"] = styles["__nested__"] || [];
-              const nestedStyles = {};
-              for (const prop of rule.style) {
-                nestedStyles[prop] = rule.style[prop];
-              }
               styles["__nested__"].push({
                 selector: fullSelector,
-                styles: nestedStyles,
+                styles: Object.fromEntries(
+                  [...rule.style].map((prop) => [prop, rule.style[prop]]),
+                ),
               });
             }
 
+            // only need the style which includes the cursor attribute.
+            if (!("cursor" in styles)) {
+              continue;
+            }
             hoverMap.set(baseSelector, styles);
           }
         }
@@ -2601,35 +2509,15 @@ async function getHoverStylesMap() {
             url.searchParams.set("v", Date.now());
             newLink.href = url.toString();
             newLink.crossOrigin = "anonymous";
+            // until the new link loaded, removing the old one
             document.head.append(newLink);
 
-            // Wait for the stylesheet to load via event instead of fixed 1500ms sleep
-            await new Promise((resolve) => {
-              const timeout = setTimeout(() => {
-                _jsConsoleWarn(
-                  "Stylesheet load timed out after 3s:",
-                  newLink.href,
-                );
-                resolve();
-              }, 3000);
-              newLink.addEventListener("load", () => {
-                clearTimeout(timeout);
-                resolve();
-              });
-              newLink.addEventListener("error", () => {
-                clearTimeout(timeout);
-                resolve();
-              });
-            });
-
-            const allSheets = document.styleSheets;
-            let refreshedSheet = null;
-            for (let si = 0; si < allSheets.length; si++) {
-              if (allSheets[si].href === newLink.href) {
-                refreshedSheet = allSheets[si];
-                break;
-              }
-            }
+            // wait for a while until the sheet is fully loaded
+            await asyncSleepFor(1500);
+            const newSheets = [...document.styleSheets];
+            const refreshedSheet = newSheets.find(
+              (s) => s.href === newLink.href,
+            );
             if (!refreshedSheet) {
               newLink.remove();
               return;
@@ -2691,18 +2579,19 @@ if (window.globalDomDepthMap === undefined) {
 
 function isClassNameIncludesHidden(className) {
   // some hidden elements are with the classname like `class="select-items select-hide"` or `class="dropdown-container dropdown-invisible"`
-  const lower = className.toLowerCase();
   return (
-    lower.includes("hide") ||
-    lower.includes("invisible") ||
-    lower.includes("closed")
+    className.toLowerCase().includes("hide") ||
+    className.toLowerCase().includes("invisible") ||
+    className.toLowerCase().includes("closed")
   );
 }
 
 function isClassNameIncludesActivatedStatus(className) {
   // some elements are with the classname like `class="open"` or `class="active"` should be considered as activated by the click
-  const lower = className.toLowerCase();
-  return lower.includes("open") || lower.includes("active");
+  return (
+    className.toLowerCase().includes("open") ||
+    className.toLowerCase().includes("active")
+  );
 }
 
 function waitForNextFrame() {
@@ -3038,25 +2927,21 @@ function isAnimationFinished() {
  * This includes elements in the main document and shadow DOM.
  */
 function removeAllUniqueIds() {
-  // Function to recursively remove unique_id from an element and its children.
-  // We iterate element.children directly (live HTMLCollection) since
-  // removeAttribute only modifies attributes, not child structure.
+  // Function to recursively remove unique_id from an element and its children
   const removeUniqueIdFromElement = (element) => {
     if (element.hasAttribute("unique_id")) {
       element.removeAttribute("unique_id");
     }
 
     // Process children in the main DOM
-    const children = element.children;
-    for (let i = 0; i < children.length; i++) {
-      removeUniqueIdFromElement(children[i]);
+    for (const child of Array.from(element.children)) {
+      removeUniqueIdFromElement(child);
     }
 
     // Process elements in shadow DOM if present
     if (element.shadowRoot) {
-      const shadowChildren = element.shadowRoot.children;
-      for (let i = 0; i < shadowChildren.length; i++) {
-        removeUniqueIdFromElement(shadowChildren[i]);
+      for (const shadowChild of Array.from(element.shadowRoot.children)) {
+        removeUniqueIdFromElement(shadowChild);
       }
     }
   };
