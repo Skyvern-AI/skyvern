@@ -28,6 +28,7 @@ class Settings(BaseSettings):
 
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
+    ENABLE_DOM_PARSER_V2: bool = False
 
     ADDITIONAL_MODULES: list[str] = []
 
