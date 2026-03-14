@@ -9,6 +9,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Sequence, cast
 
 import libcst as cst
@@ -17,7 +18,7 @@ from fastapi import BackgroundTasks, HTTPException
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
-from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
+from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
 from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
@@ -25,6 +26,7 @@ from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import ScriptNotFound, ScriptTerminationException, StepTerminationError, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory, list_files_in_directory, rename_file
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
@@ -1837,18 +1839,29 @@ async def download(
             except asyncio.TimeoutError:
                 LOG.warning("Timeout getting downloaded files before cached download")
 
+            # Track local files before download for renaming with download_suffix
+            local_download_dir = get_path_for_workflow_download_directory(run_id)
+            local_files_before = list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
+
             await _run_cached_function(cached_fn)
 
-            # Upload downloaded files from local filesystem to S3 so that
-            # get_downloaded_files() (which queries S3) can find them.
-            try:
-                async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
-                    await app.STORAGE.save_downloaded_files(
-                        organization_id=org_id,
-                        run_id=run_id,
-                    )
-            except asyncio.TimeoutError:
-                LOG.warning("Timeout saving downloaded files after cached download")
+            # Rename newly downloaded files using download_suffix if provided
+            if download_suffix and local_download_dir.exists():
+                local_files_after = list_files_in_directory(local_download_dir)
+                new_files = list(set(local_files_after) - set(local_files_before))
+                for file in new_files:
+                    file_extension = Path(file).suffix
+                    # Skip incomplete downloads
+                    if file_extension == ".crdownload":
+                        continue
+                    target_path = local_download_dir / (download_suffix + file_extension)
+                    counter = 1
+                    final_file_name = download_suffix
+                    while target_path.exists():
+                        final_file_name = f"{download_suffix}_{counter}"
+                        target_path = local_download_dir / (final_file_name + file_extension)
+                        counter += 1
+                    rename_file(str(local_download_dir / file), final_file_name + file_extension)
 
             # Verify a new file was actually downloaded.
             # Retry briefly — file may not be visible in storage immediately after the click.
@@ -1896,6 +1909,7 @@ async def download(
                 url=url,
                 max_steps=max_steps,
                 complete_on_download=complete_on_download,
+                download_suffix=download_suffix,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
                 error_code_mapping=error_code_mapping,
@@ -1917,6 +1931,7 @@ async def download(
             include_action_history_in_verification=True,
             engine=RunEngine.skyvern_v1,
             model=model,
+            download_suffix=download_suffix,
         )
         await file_download_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
@@ -1978,6 +1993,7 @@ async def action(
                 prompt=prompt,
                 url=url,
                 max_steps=max_steps,
+                download_suffix=download_suffix,
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
                 error=e,
@@ -1999,6 +2015,7 @@ async def action(
             totp_identifier=totp_identifier,
             totp_verification_url=totp_url,
             model=model,
+            download_suffix=download_suffix,
         )
         await action_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
