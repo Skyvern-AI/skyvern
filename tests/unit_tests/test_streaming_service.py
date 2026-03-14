@@ -2,6 +2,10 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncio
+import platform
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
 from skyvern.forge.forge_app_initializer import start_forge_app
@@ -47,12 +51,15 @@ async def test_streaming_service_capture_screenshot_success():
 
     service = StreamingService()
 
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock()  # Successful run
-
+    # Mock asyncio.create_subprocess_shell to return a successful process
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate.return_value = (b"", b"")
+    
+    with patch("asyncio.create_subprocess_shell", return_value=mock_proc):
         result = await service._capture_screenshot("/tmp/test.png")
         assert result is True
-        mock_run.assert_called_once()
+        mock_proc.communicate.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -63,11 +70,15 @@ async def test_streaming_service_capture_screenshot_failure():
 
     service = StreamingService()
 
-    with patch("subprocess.run") as mock_run:
-        mock_run.side_effect = Exception("Capture failed")
-
+    # Mock asyncio.create_subprocess_shell to return a failed process
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 1
+    mock_proc.communicate.return_value = (b"", b"error")
+    
+    with patch("asyncio.create_subprocess_shell", return_value=mock_proc):
         result = await service._capture_screenshot("/tmp/test.png")
         assert result is False
+        mock_proc.communicate.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -114,5 +125,75 @@ async def test_streaming_service_monitor_loop_basic_flow():
                             task_mock.status.is_final.return_value = False
                             mock_get_task.return_value = task_mock
 
-                            service._stop_event.set()  # Stop after one iteration
-                            await service._monitor_loop()
+                        service._stop_event.set()  # Stop after one iteration
+                        await service._monitor_loop()
+
+
+@pytest.mark.asyncio
+async def test_streaming_service_platform_compatibility():
+    """Test platform compatibility check."""
+    # Initialize ForgeApp before creating service
+    start_forge_app()
+    
+    service = StreamingService()
+    
+    # Test that the platform check is called and doesn't raise an error on Linux/WSL
+    # Mock the is_linux_or_wsl function to return True
+    with patch("skyvern.services.streaming.service.is_linux_or_wsl", return_value=True):
+        # This should not raise an error
+        await service.start_monitoring()
+        # If we get here, the test passed
+        assert True
+
+
+@pytest.mark.asyncio
+async def test_streaming_service_platform_incompatibility():
+    """Test platform incompatibility raises error."""
+    # Initialize ForgeApp before creating service
+    start_forge_app()
+    
+    service = StreamingService()
+    
+    # Mock the is_linux_or_wsl function to return False
+    with patch("skyvern.services.streaming.service.is_linux_or_wsl", return_value=False):
+        # This should raise a RuntimeError
+        with pytest.raises(RuntimeError, match="Streaming service is only supported on Linux or WSL"):
+            await service.start_monitoring()
+
+
+@pytest.mark.asyncio
+async def test_streaming_service_async_subprocess_capture():
+    """Test async subprocess screenshot capture."""
+    # Initialize ForgeApp before creating service
+    start_forge_app()
+    
+    service = StreamingService()
+    
+    # Mock asyncio.create_subprocess_shell to return a successful process
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate.return_value = (b"", b"")
+    
+    with patch("asyncio.create_subprocess_shell", return_value=mock_proc):
+        result = await service._capture_screenshot("/tmp/test.png")
+        assert result is True
+        mock_proc.communicate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_streaming_service_async_subprocess_capture_failure():
+    """Test async subprocess screenshot capture failure."""
+    # Initialize ForgeApp before creating service
+    start_forge_app()
+    
+    service = StreamingService()
+    
+    # Mock asyncio.create_subprocess_shell to return a failed process
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 1
+    mock_proc.communicate.return_value = (b"", b"error")
+    
+    with patch("asyncio.create_subprocess_shell", return_value=mock_proc):
+        result = await service._capture_screenshot("/tmp/test.png")
+        assert result is False
+        mock_proc.communicate.assert_awaited_once()
