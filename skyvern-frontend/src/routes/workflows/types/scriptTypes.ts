@@ -52,6 +52,20 @@ export type FallbackEpisodeListResponse = {
   total_count: number;
 };
 
+export type ScriptVersionCompareResponse = {
+  script_id: string;
+  base_version: number;
+  base_blocks: { [blockName: string]: string };
+  base_main_script: string | null;
+  base_created_at: string;
+  base_run_id: string | null;
+  compare_version: number;
+  compare_blocks: { [blockName: string]: string };
+  compare_main_script: string | null;
+  compare_created_at: string;
+  compare_run_id: string | null;
+};
+
 export type ReviewScriptRequest = {
   user_instructions: string;
   workflow_run_id?: string | null;
