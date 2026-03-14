@@ -51,33 +51,11 @@ echo "Starting Xvfb..."
 rm -f /tmp/.X99-lock
 # Set display environment variable
 export DISPLAY=:99
-# Start Xvfb
-Xvfb :99 -screen 0 1920x1080x16 &
-xvfb=$!
 
-DISPLAY=:99 xterm 2>/dev/null &
+# The streaming service is now integrated into the ForgeApp
+# and will be started automatically when the API app starts
 
-# Wait for Xvfb to be ready before starting x11vnc
-for i in $(seq 1 10); do
-  xdpyinfo -display :99 >/dev/null 2>&1 && break
-  echo "Waiting for Xvfb to start (attempt $i/10)..."
-  sleep 1
-done
-if ! xdpyinfo -display :99 >/dev/null 2>&1; then
-  echo "ERROR: Xvfb failed to start on display :99 after 10 attempts"
-  exit 1
-fi
-
-echo "Starting x11vnc on display :99..."
-# VNC runs without a password (-nopw) because port 5900 is not exposed outside
-# the container. Browser streaming reaches users via websockify on port 6080.
-mkdir -p /data/log
-x11vnc -display :99 -forever -nopw -shared -rfbport 5900 -bg -o /dev/null 2>/data/log/x11vnc.err
-
-echo "Starting websockify on port 6080 -> localhost:5900..."
-websockify 6080 localhost:5900 --daemon
-
-python run_streaming.py > /dev/null &
-
+echo "Starting live streaming services..."
+./scripts/start_vnc_streaming.sh
 # Run the command and pass in all three arguments
 python -m skyvern.forge
