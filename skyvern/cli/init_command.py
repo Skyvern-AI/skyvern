@@ -19,11 +19,23 @@ from .llm_setup import setup_llm_providers, update_or_add_env_var
 from .mcp import setup_local_organization, setup_mcp
 
 
+def _normalize_database_string(database_string: object) -> str:
+    """Return a safe database string value for init flow.
+
+    Typer defaults can leak an OptionInfo object when commands are called
+    programmatically. Treat non-string values as empty so init falls back to
+    standard PostgreSQL setup instead of trying to write an invalid value.
+    """
+    # Typed as `object` on purpose: Typer may pass OptionInfo instead of str.
+    return database_string if isinstance(database_string, str) else ""
+
+
 def init_env(
     no_postgres: bool = False,
     database_string: str = "",
 ) -> bool:
     """Interactive initialization command for Skyvern."""
+    database_string = _normalize_database_string(database_string)
     console.print(
         Panel(
             "[bold green]Welcome to Skyvern CLI Initialization![/bold green]",
