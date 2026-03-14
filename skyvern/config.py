@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
 
+    # Script reviewer settings
+    FAILURE_REVIEW_DAILY_CAP: int = 3  # Max failure-triggered script reviews per wpid per day
+
     ADDITIONAL_MODULES: list[str] = []
 
     BROWSER_TYPE: str = "chromium-headful"
@@ -69,6 +72,8 @@ class Settings(BaseSettings):
     DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
+    DATABASE_POOL_SIZE: int = 5
+    DATABASE_POOL_MAX_OVERFLOW: int = 10
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
@@ -474,20 +479,28 @@ class Settings(BaseSettings):
         Keys are model names available to blocks in the frontend. These map to key names
         in LLMConfigRegistry._configs.
         """
-        mapping: dict[str, dict[str, str]] = {
-            "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-            "gemini-2.5-flash": {
-                "llm_key": "VERTEX_GEMINI_2.5_FLASH",
-                "label": "Gemini 2.5 Flash",
-            },
-            "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3_PRO", "label": "Gemini 3 Pro (Latest)"},
-            "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
-            "mercury-2": {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"},
-            "gemini-2.5-flash-lite": {
-                "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
-                "label": "Gemini 2.5 Flash Lite",
-            },
+        mapping: dict[str, dict[str, str]] = {}
+
+        # Gemini models: prefer Vertex when enabled, fall back to direct Gemini API
+        gemini_models = [
+            ("gemini-2.5-pro-preview-05-06", "VERTEX_GEMINI_2.5_PRO", "GEMINI_2.5_PRO", "Gemini 2.5 Pro"),
+            ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH", "GEMINI_2.5_FLASH", "Gemini 2.5 Flash"),
+            ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO", "GEMINI_3_PRO", "Gemini 3 Pro (Latest)"),
+            ("gemini-3.0-flash", "VERTEX_GEMINI_3.0_FLASH", "GEMINI_3.0_FLASH", "Gemini 3 Flash"),
+        ]
+        for model_name, vertex_key, gemini_key, label in gemini_models:
+            mapping[model_name] = {
+                "llm_key": vertex_key if self.ENABLE_VERTEX_AI else gemini_key,
+                "label": label,
+            }
+
+        # Gemini Flash Lite: Vertex-only (no direct Gemini API config exists)
+        mapping["gemini-2.5-flash-lite"] = {
+            "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
+            "label": "Gemini 2.5 Flash Lite",
         }
+
+        mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
 
         # GPT models: prefer Azure when enabled, fall back to OpenAI
         gpt_models = [
@@ -531,6 +544,26 @@ class Settings(BaseSettings):
             "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
             "label": "Anthropic Claude 4.5 Haiku",
         }
+
+        # Anthropic Claude 4.5 Sonnet & Opus
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-sonnet-4-5-20250929"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE",
+                "label": "Anthropic Claude 4.5 Sonnet",
+            }
+            mapping["claude-opus-4-5-20251101"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE",
+                "label": "Anthropic Claude 4.5 Opus",
+            }
+        else:
+            mapping["claude-sonnet-4-5-20250929"] = {
+                "llm_key": "ANTHROPIC_CLAUDE4.5_SONNET",
+                "label": "Anthropic Claude 4.5 Sonnet",
+            }
+            mapping["claude-opus-4-5-20251101"] = {
+                "llm_key": "ANTHROPIC_CLAUDE4.5_OPUS",
+                "label": "Anthropic Claude 4.5 Opus",
+            }
 
         # Anthropic Claude 4.6 Opus: prefer Bedrock when enabled, fall back to direct API
         if self.ENABLE_BEDROCK_ANTHROPIC:

@@ -331,6 +331,9 @@ class LLMAPIHandlerFactory:
                 exc_info=True,
             )
 
+    # Anthropic API requires budget_tokens >= 1024
+    ANTHROPIC_MIN_THINKING_BUDGET = 1024
+
     @staticmethod
     def _apply_anthropic_thinking_optimization(
         parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
@@ -354,11 +357,13 @@ class LLMAPIHandlerFactory:
                 model=model_label,
             )
         else:
-            # Use thinking parameter with budget_tokens for Anthropic models
+            # Use thinking parameter with budget_tokens for Anthropic models.
+            # Anthropic API requires budget_tokens >= 1024.
+            clamped_budget = max(new_budget, LLMAPIHandlerFactory.ANTHROPIC_MIN_THINKING_BUDGET)
             if "thinking" in parameters and isinstance(parameters["thinking"], dict):
-                parameters["thinking"]["budget_tokens"] = new_budget
+                parameters["thinking"]["budget_tokens"] = clamped_budget
             else:
-                parameters["thinking"] = {"budget_tokens": new_budget, "type": "enabled"}
+                parameters["thinking"] = {"budget_tokens": clamped_budget, "type": "enabled"}
             # Get safe model label for logging
             model_label = getattr(llm_config, "model_name", None)
             if model_label is None and isinstance(llm_config, LLMRouterConfig):
@@ -367,7 +372,7 @@ class LLMAPIHandlerFactory:
             LOG.debug(
                 "Applied thinking budget optimization (thinking)",
                 prompt_name=prompt_name,
-                budget=new_budget,
+                budget=clamped_budget,
                 model=model_label,
             )
 

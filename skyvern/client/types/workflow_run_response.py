@@ -110,7 +110,7 @@ class WorkflowRunResponse(UniversalBaseModel):
 
     run_with: typing.Optional[str] = pydantic.Field(default=None)
     """
-    Whether the workflow run was executed with agent or code
+    Whether the workflow run was executed with agent, code, or code_v2 (adaptive caching)
     """
 
     ai_fallback: typing.Optional[bool] = pydantic.Field(default=None)

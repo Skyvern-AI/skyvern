@@ -79,7 +79,7 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, validate_pdf_file
+from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -92,6 +92,10 @@ from skyvern.forge.sdk.workflow.exceptions import (
     MissingJinjaVariables,
     NoIterableValueFound,
     NoValidEmailRecipient,
+)
+from skyvern.forge.sdk.workflow.loop_download_filter import (
+    filter_downloaded_files_for_current_iteration,
+    to_downloaded_file_signature,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -501,6 +505,8 @@ class Block(BaseModel, abc.ABC):
         parent_workflow_run_block_id: str | None = None,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        current_value: str | None = None,
+        current_index: int | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_block_id = None
@@ -517,6 +523,8 @@ class Block(BaseModel, abc.ABC):
                 block_type=self.block_type,
                 continue_on_failure=self.continue_on_failure,
                 engine=engine,
+                current_value=current_value,
+                current_index=current_index,
             )
             workflow_run_block_id = workflow_run_block.workflow_run_block_id
 
@@ -1022,6 +1030,12 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
+                # SKY-7005: scope downloaded files to the current loop iteration
+                downloaded_files = filter_downloaded_files_for_current_iteration(
+                    downloaded_files,
+                    current_context.loop_internal_state if current_context else None,
+                )
+
                 task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                     organization_id=workflow_run.organization_id,
                     task_id=updated_task.task_id,
@@ -1104,6 +1118,12 @@ class BaseTaskBlock(Block):
 
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
+
+                # SKY-7005: scope downloaded files to the current loop iteration
+                downloaded_files = filter_downloaded_files_for_current_iteration(
+                    downloaded_files,
+                    current_context.loop_internal_state if current_context else None,
+                )
 
                 task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                     organization_id=workflow_run.organization_id,
@@ -1640,7 +1660,9 @@ class ForLoopBlock(Block):
         )
 
     def _build_loop_graph(
-        self, blocks: list[BlockTypeVar]
+        self,
+        blocks: list[BlockTypeVar],
+        skip_sequential_defaulting: bool = False,
     ) -> tuple[str, dict[str, BlockTypeVar], dict[str, str | None]]:
         label_to_block: dict[str, BlockTypeVar] = {}
         default_next_map: dict[str, str | None] = {}
@@ -1651,11 +1673,12 @@ class ForLoopBlock(Block):
             label_to_block[block.label] = block
             default_next_map[block.label] = block.next_block_label
 
-        has_conditional_blocks = any(block.block_type == BlockType.CONDITIONAL for block in blocks)
-        if not has_conditional_blocks:
-            for idx, block in enumerate(blocks[:-1]):
-                if default_next_map.get(block.label) is None:
-                    default_next_map[block.label] = blocks[idx + 1].label
+        if not skip_sequential_defaulting:
+            has_conditional_blocks = any(block.block_type == BlockType.CONDITIONAL for block in blocks)
+            if not has_conditional_blocks:
+                for idx, block in enumerate(blocks[:-1]):
+                    if default_next_map.get(block.label) is None:
+                        default_next_map[block.label] = blocks[idx + 1].label
 
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
@@ -1682,10 +1705,18 @@ class ForLoopBlock(Block):
 
         roots = [label for label, count in incoming.items() if count == 0]
         if not roots:
-            raise InvalidWorkflowDefinition(f"No entry block found for loop {self.label}")
+            raise InvalidWorkflowDefinition(
+                f"Circular reference detected inside loop {self.label}: every block is the target of another"
+                " block's next_block_label, so there is no starting block."
+                " At least one block must not be the target of any next_block_label or branch condition."
+            )
         if len(roots) > 1:
             raise InvalidWorkflowDefinition(
-                f"Multiple entry blocks detected in loop {self.label} ({', '.join(sorted(roots))}); only one entry block is supported."
+                f"Disconnected blocks detected inside loop {self.label}: blocks"
+                f" ({', '.join(sorted(roots))}) are not reachable from any other block."
+                " Every block must be reachable from the first block through next_block_label or"
+                " conditional branch references."
+                " Either connect them by setting another block's next_block_label to point to them, or remove them."
             )
 
         queue: deque[str] = deque([roots[0]])
@@ -1700,9 +1731,28 @@ class ForLoopBlock(Block):
                     queue.append(neighbor)
 
         if visited_count != len(label_to_block):
-            raise InvalidWorkflowDefinition(f"Loop {self.label} contains a cycle; DAG traversal is required.")
+            raise InvalidWorkflowDefinition(
+                f"Circular reference detected inside loop {self.label}: some blocks form a loop through their"
+                " next_block_label references, causing an infinite cycle."
+                " Ensure that following next_block_label from any block eventually reaches a block"
+                " with next_block_label set to null."
+            )
 
         return roots[0], label_to_block, default_next_map
+
+    def validate_loop_blocks(self) -> None:
+        """Validate the loop_blocks graph for cycles, orphans, and dangling references.
+
+        Skips sequential defaulting so that disconnected subgraphs are detected.
+        Also recursively validates any nested ForLoopBlock children.
+        Raises InvalidWorkflowDefinition (422) on validation failure.
+        """
+        if not self.loop_blocks:
+            return
+        self._build_loop_graph(self.loop_blocks, skip_sequential_defaulting=True)
+        for block in self.loop_blocks:
+            if isinstance(block, ForLoopBlock):
+                block.validate_loop_blocks()
 
     async def execute_loop_helper(
         self,
@@ -1743,6 +1793,35 @@ class ForLoopBlock(Block):
                     last_block=current_block,
                 )
             LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value)
+
+            # Capture baseline downloaded files for per-iteration scoping (SKY-7005)
+            loop_context = skyvern_context.current()
+            if loop_context:
+                downloaded_file_sigs_before: list[tuple[str | None, str | None, str | None]] = []
+                baseline_timed_out = False
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        downloaded_file_sigs_before = [
+                            to_downloaded_file_signature(fi)
+                            for fi in await app.STORAGE.get_downloaded_files(
+                                organization_id=organization_id or "",
+                                run_id=loop_context.run_id if loop_context.run_id else workflow_run_id,
+                            )
+                        ]
+                except asyncio.TimeoutError:
+                    baseline_timed_out = True
+                    LOG.warning(
+                        "Timeout getting baseline downloaded files for loop iteration",
+                        workflow_run_id=workflow_run_id,
+                        loop_idx=loop_idx,
+                    )
+                if baseline_timed_out:
+                    loop_context.loop_internal_state = None
+                else:
+                    loop_context.loop_internal_state = {
+                        "downloaded_file_signatures_before_iteration": downloaded_file_sigs_before,
+                    }
+
             # context parameter has been deprecated. However, it's still used by task v2 - we should migrate away from it.
             context_parameters_with_value = self.get_loop_block_context_parameters(workflow_run_id, loop_over_value)
             for context_parameter in context_parameters_with_value:
@@ -1811,6 +1890,8 @@ class ForLoopBlock(Block):
                     parent_workflow_run_block_id=parent_wrb_id,
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
+                    current_value=str(loop_over_value),
+                    current_index=loop_idx,
                 )
 
                 # Track conditional workflow_run_block_ids so branch targets
@@ -3283,10 +3364,9 @@ class FileParserBlock(Block):
             self.file_url, workflow_run_context
         )
 
-    def _detect_file_type_from_url(self, file_url: str) -> FileType:
-        """Detect file type based on file extension in the URL."""
+    def _detect_file_type_from_url(self, file_url: str, file_path: str | None = None) -> FileType:
+        """Detect file type based on file extension in the URL, with magic-byte fallback."""
         url_parsed = urlparse(file_url)
-        # TODO: use filetype.guess(file_path) to make the detection more robust
         suffix = Path(url_parsed.path).suffix.lower()
         if suffix in (".xlsx", ".xls", ".xlsm"):
             return FileType.EXCEL
@@ -3304,8 +3384,41 @@ class FileParserBlock(Block):
                 file_type=FileType.DOCX,
                 error="Legacy .doc format (Word 97-2003) is not supported. Please convert the file to .docx format.",
             )
-        else:
-            return FileType.CSV  # Default to CSV for .csv and any other extensions
+        elif suffix == ".csv":
+            return FileType.CSV
+
+        # URL extension is missing or unrecognized — try magic-byte detection on the downloaded file
+        if file_path:
+            detected = self._detect_file_type_from_magic_bytes(file_path)
+            if detected is not None:
+                LOG.info(
+                    "FileParserBlock: Detected file type from magic bytes (URL had no recognizable extension)",
+                    file_url=file_url,
+                    detected_file_type=detected,
+                )
+                return detected
+
+        return FileType.CSV  # Final fallback for truly unknown files
+
+    def _detect_file_type_from_magic_bytes(self, file_path: str) -> FileType | None:
+        """Detect file type from magic bytes using the filetype library. Returns None if unrecognized."""
+        kind = filetype.guess(file_path)
+        if kind is None:
+            return None
+
+        mime = kind.mime
+        if mime == "application/pdf":
+            return FileType.PDF
+        elif mime in (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        ):
+            return FileType.EXCEL
+        elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            return FileType.DOCX
+        elif mime.startswith("image/"):
+            return FileType.IMAGE
+        return None
 
     def _detect_file_encoding(self, file_path: str) -> str:
         """Detect the encoding of a file using charset-normalizer with fallbacks.
@@ -3432,12 +3545,46 @@ class FileParserBlock(Block):
         """Parse PDF file and return extracted text.
 
         Uses the shared PDF parsing utility that tries pypdf first,
-        then falls back to pdfplumber if pypdf fails.
+        then falls back to pdfplumber if pypdf fails. If text extraction
+        yields empty/minimal content (e.g. scanned or image-based PDFs),
+        renders pages as images and sends them to a vision LLM for OCR.
         """
         try:
-            return extract_pdf_file(file_path, file_identifier=self.file_url)
+            extracted_text = extract_pdf_file(file_path, file_identifier=self.file_url)
         except PDFParsingError as e:
             raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
+
+        # If text extraction returned meaningful content, use it directly
+        if extracted_text.strip():
+            return extracted_text
+
+        # Scanned / image-based PDF — render pages as images and use vision LLM
+        LOG.info(
+            "PDF text extraction returned empty content, falling back to vision LLM OCR",
+            file_url=self.file_url,
+        )
+        try:
+            page_images = render_pdf_pages_as_images(file_path, file_identifier=self.file_url)
+            if not page_images:
+                return extracted_text
+
+            llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                self.override_llm_key, default=app.LLM_API_HANDLER
+            )
+            llm_response = await llm_api_handler(
+                prompt=llm_prompt,
+                prompt_name="extract-text-from-image",
+                screenshots=page_images,
+                force_dict=True,
+            )
+            return llm_response.get("extracted_text", "")
+        except Exception:
+            LOG.exception(
+                "Failed to extract text from PDF via vision LLM fallback",
+                file_url=self.file_url,
+            )
+            raise
 
     async def _parse_image_file(self, file_path: str) -> str:
         """Parse image file using vision LLM for OCR."""
@@ -3608,7 +3755,7 @@ class FileParserBlock(Block):
 
         # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
         if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
-            self.file_type = self._detect_file_type_from_url(self.file_url)
+            self.file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
 
         # Validate the file type
         self.validate_file_type(self.file_url, file_path)
@@ -4285,6 +4432,9 @@ class TaskV2Block(Block):
             root_workflow_run_id = (
                 context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
             )
+            # Preserve loop_internal_state so per-iteration download filtering
+            # continues to work for subsequent blocks in the same loop iteration (SKY-7005)
+            loop_state = context.loop_internal_state if context else None
             skyvern_context.set(
                 skyvern_context.SkyvernContext(
                     organization_id=organization_id,
@@ -4296,6 +4446,7 @@ class TaskV2Block(Block):
                     run_id=current_run_id,
                     browser_session_id=browser_session_id,
                     max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
+                    loop_internal_state=loop_state,
                 )
             )
         result_dict = None
@@ -4323,12 +4474,30 @@ class TaskV2Block(Block):
             organization_id=organization_id,
         )
 
+        # Attempt to get downloaded files for the current iteration
+        current_context = skyvern_context.current()
+        downloaded_files: list[FileInfo] = []
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                downloaded_files = await app.STORAGE.get_downloaded_files(
+                    organization_id=organization_id or "",
+                    run_id=current_context.run_id if current_context and current_context.run_id else workflow_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning("Timeout getting downloaded files", task_v2_id=task_v2.observer_cruise_id)
+        downloaded_files = filter_downloaded_files_for_current_iteration(
+            downloaded_files,
+            current_context.loop_internal_state if current_context else None,
+        )
+
         task_v2_output = {
             "task_id": task_v2.observer_cruise_id,
             "status": task_v2.status,
             "summary": task_v2.summary,
             "extracted_information": result_dict,
             "failure_reason": failure_reason,
+            "downloaded_files": [fi.model_dump() for fi in downloaded_files],
+            "downloaded_file_urls": [fi.url for fi in downloaded_files],
             "task_screenshot_artifact_ids": [a.artifact_id for a in task_screenshot_artifacts],
             "workflow_screenshot_artifact_ids": [a.artifact_id for a in workflow_screenshot_artifacts],
         }
@@ -5580,34 +5749,34 @@ class BranchCondition(BaseModel):
     is_default: bool = False
 
     @model_validator(mode="after")
-    def validate_condition(cls, condition_obj: BranchCondition) -> BranchCondition:
-        if isinstance(condition_obj.criteria, dict):
-            criteria_type = condition_obj.criteria.get("criteria_type")
+    def validate_condition(self) -> BranchCondition:
+        if isinstance(self.criteria, dict):
+            criteria_type = self.criteria.get("criteria_type")
             if criteria_type is None:
                 # Infer criteria type from expression format
-                expression = condition_obj.criteria.get("expression", "")
+                expression = self.criteria.get("expression", "")
                 if _is_pure_jinja_expression(expression):
                     criteria_type = "jinja2_template"
                 else:
                     criteria_type = "prompt"
             if criteria_type == "prompt":
-                condition_obj.criteria = PromptBranchCriteria(**condition_obj.criteria)
+                self.criteria = PromptBranchCriteria(**self.criteria)
             else:
-                condition_obj.criteria = JinjaBranchCriteria(**condition_obj.criteria)
-        if condition_obj.criteria is None and not condition_obj.is_default:
+                self.criteria = JinjaBranchCriteria(**self.criteria)
+        if self.criteria is None and not self.is_default:
             raise ValueError("Branches without criteria must be marked as default.")
-        if condition_obj.criteria is not None and condition_obj.is_default:
+        if self.criteria is not None and self.is_default:
             raise ValueError("Default branches may not define criteria.")
-        if condition_obj.criteria and isinstance(condition_obj.criteria, BranchCriteria):
-            expression = condition_obj.criteria.expression
-            criteria_dict = condition_obj.criteria.model_dump()
+        if self.criteria and isinstance(self.criteria, BranchCriteria):
+            expression = self.criteria.expression
+            criteria_dict = self.criteria.model_dump()
             if _is_pure_jinja_expression(expression):
                 criteria_dict["criteria_type"] = "jinja2_template"
-                condition_obj.criteria = JinjaBranchCriteria(**criteria_dict)
+                self.criteria = JinjaBranchCriteria(**criteria_dict)
             else:
                 criteria_dict["criteria_type"] = "prompt"
-                condition_obj.criteria = PromptBranchCriteria(**criteria_dict)
-        return condition_obj
+                self.criteria = PromptBranchCriteria(**criteria_dict)
+        return self
 
 
 class ConditionalBlock(Block):
@@ -5620,15 +5789,15 @@ class ConditionalBlock(Block):
     branch_conditions: list[BranchCondition] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_branches(cls, block: ConditionalBlock) -> ConditionalBlock:
-        if not block.branch_conditions:
+    def validate_branches(self) -> ConditionalBlock:
+        if not self.branch_conditions:
             raise ValueError("Conditional blocks require at least one branch.")
 
-        default_branches = [branch for branch in block.branch_conditions if branch.is_default]
+        default_branches = [branch for branch in self.branch_conditions if branch.is_default]
         if len(default_branches) > 1:
             raise ValueError("Only one default branch is permitted per conditional block.")
 
-        return block
+        return self
 
     def get_all_parameters(
         self,

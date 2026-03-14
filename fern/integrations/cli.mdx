@@ -154,17 +154,26 @@ Register Skyvern's MCP server with your AI coding tools:
 
 ```bash
 skyvern setup                        # Auto-detect all tools and configure at once
-skyvern setup claude-code            # Configure Claude Code only (global)
-skyvern setup claude-code --project  # Configure Claude Code (project-level)
+skyvern setup claude-code            # Auto: .mcp.json in a project, ~/.claude.json otherwise
+skyvern setup claude-code --project  # Force project-local Claude Code config
+skyvern setup claude-code --global   # Force global Claude Code config
 skyvern setup claude-code --skip-skills  # MCP only, no skills
 skyvern setup claude                 # Configure Claude Desktop only
 skyvern setup cursor                 # Configure Cursor only
 skyvern setup windsurf               # Configure Windsurf only
+skyvern mcp switch                   # Interactively switch existing Skyvern MCP configs
+skyvern mcp switch --dry-run         # Preview changes without writing files
+skyvern mcp profile list             # List saved switch sources
+skyvern mcp profile save work-prod --api-key YOUR_KEY --base-url https://api.skyvern.com
 ```
 
 Use bare `skyvern setup` to configure everything at once. The per-tool subcommands are for when you only want to target one tool.
 
-`skyvern setup claude-code` writes the MCP config **and** copies bundled skills (including `/qa`) into your project's `.claude/skills/` directory. Use `--skip-skills` to opt out.
+`skyvern setup claude-code` writes the MCP config **and** copies bundled skills (including `/qa`) into your project's `.claude/skills/` directory. In a project, the default target is `.mcp.json`; use `--global` to override. Use `--skip-skills` to opt out.
+
+For Claude Desktop on macOS or Windows, the recommended no-Node path is the downloadable `.mcpb` bundle in [MCP Server](/integrations/mcp). `skyvern setup claude` still writes the manual `mcp-remote` JSON bridge, so remote mode requires Node.js unless you use the bundle.
+
+`skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, and Codex configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
 
 ### Self-hosted setup
 
@@ -175,6 +184,8 @@ skyvern init                     # Full interactive wizard (PostgreSQL, LLM prov
 skyvern init browser             # Initialize browser configuration only
 skyvern quickstart               # One-command init + start
 ```
+
+For the local self-hosted Claude Code path, `skyvern quickstart` or `skyvern init` can also configure MCP during the interactive wizard. In a project directory that flow writes `.mcp.json`, installs `.claude/skills/qa`, and keeps the connection fully local for localhost testing.
 
 ### Other
 
@@ -198,7 +209,7 @@ The CLI and MCP server share the same underlying logic. The CLI is for humans an
 
 ## Skills
 
-Skills are bundled markdown files that teach AI coding tools how to use Skyvern. They ship with `pip install skyvern` and are **automatically installed** when you run `skyvern setup claude-code`.
+Skills are bundled markdown files that teach AI coding tools how to use Skyvern. They ship with `pip install skyvern` and are **automatically installed** when you run `skyvern setup claude-code` or choose Claude Code during `skyvern init` / `skyvern quickstart`.
 
 | Skill | What it does |
 |-------|-------------|
@@ -217,7 +228,7 @@ skyvern skill copy qa -o .claude/skills     # Copy a single skill
 
 Skills are plain markdown files. Load them into any AI coding tool that supports custom instructions:
 
-**Claude Code** — run `skyvern setup claude-code`, which registers the MCP server **and** installs skills into `.claude/skills/`. The `/qa` skill is immediately available.
+**Claude Code** — run `skyvern quickstart` or `skyvern init`, then choose Claude Code during MCP setup. You can also run `skyvern setup claude-code` later. Both paths register the MCP server and install skills into `.claude/skills/`. The `/qa` skill is immediately available.
 
 **Codex** — copy skills into your project's `.codex/skills/` directory:
 

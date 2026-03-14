@@ -38,12 +38,14 @@ from skyvern.webeye.actions.actions import (
     ExtractAction,
     SelectOption,
     SolveCaptchaAction,
+    TerminateAction,
 )
 from skyvern.webeye.actions.handler import (
     ActionHandler,
     generate_totp_value,
     get_actual_value_of_parameter_if_secret,
     handle_complete_action,
+    handle_terminate_action,
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
@@ -465,7 +467,7 @@ class ScriptSkyvernPage(SkyvernPage):
                 await app.DATABASE.update_action_reasoning(
                     organization_id=str(context.organization_id),
                     action_id=str(created_action.action_id),
-                    reasoning=f"Script execution: {intention[:80]}",
+                    reasoning=f"Script execution: {intention[:80]}" if intention else "Script execution",
                 )
             else:
                 asyncio.create_task(
@@ -895,6 +897,47 @@ class ScriptSkyvernPage(SkyvernPage):
             result = await handle_complete_action(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
                 raise ScriptTerminationException(result[-1].exception_message)
+
+    @action_wrap(ActionType.TERMINATE)
+    async def terminate(self, errors: list[str], **kwargs: Any) -> None:
+        context = skyvern_context.current()
+        # Only run handler inside a full workflow context (DB lookups + LLM extraction)
+        if (
+            not context
+            or not context.organization_id
+            or not context.workflow_run_id
+            or not context.task_id
+            or not context.step_id
+        ):
+            msg = "Terminate called"
+            if errors:
+                msg += ": " + "; ".join(errors)
+            raise ScriptTerminationException(msg)
+
+        task = await app.DATABASE.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+        if task and step:
+            action = TerminateAction(
+                organization_id=context.organization_id,
+                workflow_run_id=context.workflow_run_id,
+                task_id=context.task_id,
+                step_id=context.step_id,
+                step_order=step.order,
+                action_order=context.action_order,
+                # errors=[] is list[UserDefinedError] for LLM-extracted error codes (populated by
+                # handle_terminate_action); errors param above is list[str] for exception messaging.
+                errors=[],
+                reasoning="; ".join(errors) if errors else None,
+            )
+            try:
+                await handle_terminate_action(action, self.page, self.scraped_page, task, step)
+            except Exception:
+                LOG.warning("handle_terminate_action failed during script terminate()", exc_info=True)
+
+        msg = "Terminate called"
+        if errors:
+            msg += ": " + "; ".join(errors)
+        raise ScriptTerminationException(msg)
 
     async def _update_step_output_before_complete(self, context: skyvern_context.SkyvernContext) -> None:
         """Update step.output with actions_and_results before complete validation.

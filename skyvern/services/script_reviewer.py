@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Literal
+from typing import Literal, Sequence
 
+import libcst as cst
 import structlog
 
 from skyvern.forge import app
@@ -80,6 +81,7 @@ class ScriptReviewer:
         stale_branches: list[ScriptBranchHit] | None = None,
         historical_episodes: list[ScriptFallbackEpisode] | None = None,
         run_parameter_values: dict[str, str] | None = None,
+        user_instructions: str | None = None,
     ) -> dict[str, str] | None:
         """Review fallback episodes and generate updated code for affected blocks.
 
@@ -108,23 +110,27 @@ class ScriptReviewer:
                 history_by_block[ep.block_label] = []
             history_by_block[ep.block_label].append(ep)
 
-        # Triage failed episodes — skip non-code-fixable failures
-        triaged_episodes = []
-        for episode in episodes:
-            if await self._triage_episode(episode, organization_id):
-                triaged_episodes.append(episode)
-            else:
-                # Mark as reviewed so we don't re-triage on every run
-                await app.DATABASE.mark_episode_reviewed(
-                    episode_id=episode.episode_id,
-                    organization_id=organization_id,
-                    reviewer_output="TRIAGE: not_code_fixable — skipped",
-                )
-                LOG.info(
-                    "ScriptReviewer: skipping non-code-fixable episode",
-                    episode_id=episode.episode_id,
-                    block_label=episode.block_label,
-                )
+        # Triage failed episodes — skip non-code-fixable failures.
+        # When user provides explicit instructions, skip triage entirely.
+        if user_instructions:
+            triaged_episodes = list(episodes)
+        else:
+            triaged_episodes = []
+            for episode in episodes:
+                if await self._triage_episode(episode, organization_id):
+                    triaged_episodes.append(episode)
+                else:
+                    # Mark as reviewed so we don't re-triage on every run
+                    await app.DATABASE.mark_episode_reviewed(
+                        episode_id=episode.episode_id,
+                        organization_id=organization_id,
+                        reviewer_output="TRIAGE: not_code_fixable — skipped",
+                    )
+                    LOG.info(
+                        "ScriptReviewer: skipping non-code-fixable episode",
+                        episode_id=episode.episode_id,
+                        block_label=episode.block_label,
+                    )
 
         if not triaged_episodes:
             return None
@@ -151,6 +157,7 @@ class ScriptReviewer:
                     all_parameter_keys=all_parameter_keys,
                     historical_episodes=history_by_block.get(block_label),
                     run_parameter_values=run_parameter_values,
+                    user_instructions=user_instructions,
                 )
                 if updated_code:
                     updated_blocks[block_label] = updated_code
@@ -165,6 +172,76 @@ class ScriptReviewer:
             return None
 
         return updated_blocks
+
+    async def review_with_user_instructions(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        script_revision_id: str | None,
+        user_instructions: str,
+        episodes: list[ScriptFallbackEpisode] | None = None,
+        run_parameter_values: dict[str, str] | None = None,
+    ) -> dict[str, str] | None:
+        """Review script blocks using user-provided instructions.
+
+        When episodes are available, they are included as context for the LLM.
+        When no episodes are available, the reviewer works from the existing code
+        and the user's instructions alone.
+
+        Returns {block_label: updated_code} or None if review fails.
+        """
+        if episodes:
+            return await self.review_fallback_episodes(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                script_revision_id=script_revision_id,
+                episodes=episodes,
+                run_parameter_values=run_parameter_values,
+                user_instructions=user_instructions,
+            )
+
+        # No episodes — review all blocks with user instructions only
+        navigation_goals, all_parameter_keys = await self._load_workflow_context(
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        block_codes = await self._load_all_block_codes(
+            organization_id=organization_id,
+            script_revision_id=script_revision_id,
+        )
+        if not block_codes:
+            LOG.warning(
+                "ScriptReviewer: no blocks found for instruction-only review",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            return None
+
+        updated_blocks: dict[str, str] = {}
+        for block_label, existing_code in block_codes.items():
+            try:
+                updated_code = await self._review_block(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    script_revision_id=script_revision_id,
+                    block_label=block_label,
+                    episodes=[],
+                    navigation_goal=navigation_goals.get(block_label),
+                    all_parameter_keys=all_parameter_keys,
+                    run_parameter_values=run_parameter_values,
+                    user_instructions=user_instructions,
+                    preloaded_code=existing_code,
+                )
+                if updated_code:
+                    updated_blocks[block_label] = updated_code
+            except Exception:
+                LOG.exception(
+                    "ScriptReviewer: failed to review block with instructions",
+                    block_label=block_label,
+                    organization_id=organization_id,
+                )
+
+        return updated_blocks if updated_blocks else None
 
     async def review_conditional_blocks(
         self,
@@ -399,6 +476,8 @@ class ScriptReviewer:
         all_parameter_keys: list[str] | None = None,
         historical_episodes: list[ScriptFallbackEpisode] | None = None,
         run_parameter_values: dict[str, str] | None = None,
+        user_instructions: str | None = None,
+        preloaded_code: str | None = None,
     ) -> str | None:
         """Review a single block's fallback episodes and generate updated code."""
         LOG.info(
@@ -408,8 +487,8 @@ class ScriptReviewer:
             navigation_goal=navigation_goal[:100] if navigation_goal else None,
         )
 
-        # Load the current cached code for the block
-        existing_code = await self._load_block_code(
+        # Use pre-loaded code if available, otherwise fetch from artifact store
+        existing_code = preloaded_code or await self._load_block_code(
             organization_id=organization_id,
             script_revision_id=script_revision_id,
             block_label=block_label,
@@ -506,6 +585,7 @@ class ScriptReviewer:
             stale_branches=stale_branch_info,
             parameter_keys=parameter_keys,
             historical_episodes=history_summaries,
+            user_instructions=user_instructions,
         )
 
         LOG.info(
@@ -647,8 +727,11 @@ class ScriptReviewer:
                         current_prompt = self._build_retry_prompt(updated_code, param_error, function_signature)
                     continue
 
-                # Validate structural regression (catch deleted branches, shrunk code)
-                regression_error = self._validate_structural_regression(updated_code, existing_code)
+                # Validate structural regression (catch deleted branches, shrunk code).
+                # Skip when user provides explicit instructions — they may request deletions.
+                regression_error = (
+                    None if user_instructions else self._validate_structural_regression(updated_code, existing_code)
+                )
                 if regression_error is not None:
                     LOG.warning(
                         "ScriptReviewer: structural regression detected, retrying",
@@ -658,6 +741,19 @@ class ScriptReviewer:
                     )
                     if attempt < max_attempts:
                         current_prompt = self._build_retry_prompt(updated_code, regression_error, function_signature)
+                    continue
+
+                # Validate bare terminate calls (must be inside if/elif, never unconditional)
+                terminate_error = self._validate_bare_terminate(updated_code)
+                if terminate_error is not None:
+                    LOG.warning(
+                        "ScriptReviewer: bare terminate detected, retrying",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=terminate_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(updated_code, terminate_error, function_signature)
                     continue
 
                 # Validate no hardcoded parameter values (catch leaked run-specific data)
@@ -802,6 +898,50 @@ class ScriptReviewer:
                 script_revision_id=script_revision_id,
             )
         return None
+
+    async def _load_all_block_codes(
+        self,
+        organization_id: str,
+        script_revision_id: str | None,
+    ) -> dict[str, str]:
+        """Load code for all blocks in a script revision.
+
+        Returns {block_label: code} for blocks that have code.
+        """
+        if not script_revision_id:
+            return {}
+        try:
+            script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+                script_revision_id=script_revision_id,
+                organization_id=organization_id,
+            )
+            result: dict[str, str] = {}
+            for sb in script_blocks:
+                if not sb.script_file_id:
+                    continue
+                script_file = await app.DATABASE.get_script_file_by_id(
+                    script_revision_id=script_revision_id,
+                    file_id=sb.script_file_id,
+                    organization_id=organization_id,
+                )
+                if script_file and script_file.artifact_id:
+                    artifact = await app.DATABASE.get_artifact_by_id(
+                        artifact_id=script_file.artifact_id,
+                        organization_id=organization_id,
+                    )
+                    if artifact:
+                        file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+                        if isinstance(file_content, bytes):
+                            result[sb.script_block_label] = file_content.decode("utf-8")
+                        elif isinstance(file_content, str):
+                            result[sb.script_block_label] = file_content
+            return result
+        except Exception:
+            LOG.exception(
+                "ScriptReviewer: failed to load all block codes",
+                script_revision_id=script_revision_id,
+            )
+            return {}
 
     async def _load_workflow_context(
         self,
@@ -1091,6 +1231,7 @@ class ScriptReviewer:
         "scroll": frozenset({"direction", "amount", "selector"}),
         "keypress": frozenset({"keys", "prompt"}),
         "wait": frozenset({"timeout_ms"}),
+        "terminate": frozenset({"errors"}),
         "complete": frozenset(set()),
         "goto": frozenset({"url", "timeout"}),
     }
@@ -1340,6 +1481,177 @@ class ScriptReviewer:
             )
 
         return None
+
+    def _validate_bare_terminate(self, code: str) -> str | None:
+        """Validate that page.terminate() is never called unconditionally.
+
+        Every page.terminate() call must be inside an if/elif branch (guarded by
+        a classify or extract result). A terminate at function-body level (not
+        inside any conditional) is rejected.
+
+        Uses libcst.parse_module to walk the tree and check that every
+        page.terminate() Expr node has a cst.If ancestor.
+
+        Note: the prompt distinguishes classify-else (should use element_fallback)
+        from extract-else (terminate is acceptable). This validator enforces only
+        the structural rule; else-branch semantics are left to the LLM prompt.
+
+        Returns an error message or None if valid.
+        """
+        # Fast short-circuit: skip libcst parsing when terminate is not present
+        if "terminate" not in code:
+            return None
+
+        try:
+            tree = cst.parse_module(code)
+        except cst.ParserSyntaxError:
+            return None  # compile check handles syntax errors separately
+
+        # Walk the CST looking for page.terminate() calls not inside an If node.
+        # Each top-level FunctionDef is validated independently.  Nested function
+        # definitions are intentionally not recursed into — generated script blocks
+        # are always a single top-level async function with no inner defs.
+        # libcst uses a single FunctionDef for both sync and async.
+        for stmt in tree.body:
+            func_def = stmt if isinstance(stmt, cst.FunctionDef) else None
+            if func_def is None:
+                continue
+            bare = ScriptReviewer._find_bare_terminate_in_body(func_def.body.body, inside_conditional=False)
+            if bare is not None:
+                return bare
+
+        return None
+
+    @staticmethod
+    def _find_bare_terminate_in_body(
+        stmts: Sequence[cst.BaseStatement],
+        inside_conditional: bool,
+    ) -> str | None:
+        """Recursively check statements for bare page.terminate() calls.
+
+        Returns an error message if a bare terminate is found, None otherwise.
+
+        Note: the prompt distinguishes classify-else (should use element_fallback)
+        from extract-else (terminate is acceptable). This validator only enforces
+        the structural rule (terminate must be inside *some* conditional). Finer
+        classify-vs-extract else-branch enforcement is left to the LLM prompt.
+        """
+
+        def _unwrap_body(suite: cst.BaseSuite | cst.Else | cst.Finally | None) -> Sequence[cst.BaseStatement]:
+            """Extract the statement list from an IndentedBlock, Else, or Finally."""
+            if suite is None:
+                return ()
+            if isinstance(suite, (cst.Else, cst.Finally)):
+                suite = suite.body
+            if isinstance(suite, cst.IndentedBlock):
+                return suite.body
+            return ()
+
+        def _check_bodies(bodies: list[Sequence[cst.BaseStatement]], cond: bool) -> str | None:
+            """Check multiple statement lists, returning the first error."""
+            for body in bodies:
+                err = ScriptReviewer._find_bare_terminate_in_body(body, inside_conditional=cond)
+                if err:
+                    return err
+            return None
+
+        for stmt in stmts:
+            # In libcst, expression statements are wrapped in SimpleStatementLine
+            if isinstance(stmt, cst.SimpleStatementLine):
+                for small_stmt in stmt.body:
+                    if isinstance(small_stmt, cst.Expr) and ScriptReviewer._is_terminate_call(small_stmt.value):
+                        if not inside_conditional:
+                            return (
+                                "page.terminate() must be inside an if/elif branch — unconditional terminate rejected"
+                            )
+
+            # Recurse into if/elif/else bodies
+            if isinstance(stmt, cst.If):
+                # The if and elif bodies are "inside a conditional".
+                # cst.If.orelse is If (elif) | Else (else) | None.
+                # Collect all branch bodies via the elif/else chain.
+                branch_bodies: list[Sequence[cst.BaseStatement]] = [_unwrap_body(stmt.body)]
+                orelse: cst.If | cst.Else | None = stmt.orelse
+                while orelse is not None:
+                    if isinstance(orelse, cst.If):
+                        branch_bodies.append(_unwrap_body(orelse.body))
+                        orelse = orelse.orelse
+                    elif isinstance(orelse, cst.Else):
+                        branch_bodies.append(_unwrap_body(orelse.body))
+                        orelse = None
+                    else:
+                        break
+                err = _check_bodies(branch_bodies, cond=True)
+                if err:
+                    return err
+
+            elif isinstance(stmt, (cst.For, cst.While)):
+                bodies: list[Sequence[cst.BaseStatement]] = [_unwrap_body(stmt.body)]
+                if stmt.orelse is not None:
+                    bodies.append(_unwrap_body(stmt.orelse))
+                err = _check_bodies(bodies, cond=inside_conditional)
+                if err:
+                    return err
+
+            elif isinstance(stmt, cst.With):
+                err = _check_bodies([_unwrap_body(stmt.body)], cond=inside_conditional)
+                if err:
+                    return err
+
+            elif isinstance(stmt, cst.Try):
+                # except handler bodies inherit inside_conditional from the
+                # enclosing scope (not set to True) — terminate in an except
+                # block is "something went wrong" error handling, which should
+                # use element_fallback, not terminate.
+                handler_bodies = [_unwrap_body(h.body) for h in stmt.handlers]
+                err = _check_bodies(
+                    [_unwrap_body(stmt.body), *handler_bodies, _unwrap_body(stmt.orelse), _unwrap_body(stmt.finalbody)],
+                    cond=inside_conditional,
+                )
+                if err:
+                    return err
+
+            elif isinstance(stmt, cst.TryStar):
+                handler_bodies = [_unwrap_body(h.body) for h in stmt.handlers]
+                err = _check_bodies(
+                    [_unwrap_body(stmt.body), *handler_bodies, _unwrap_body(stmt.orelse), _unwrap_body(stmt.finalbody)],
+                    cond=inside_conditional,
+                )
+                if err:
+                    return err
+
+            # Python 3.10+ match/case — each case body is conditional
+            elif isinstance(stmt, cst.Match):
+                err = _check_bodies([_unwrap_body(case.body) for case in stmt.cases], cond=True)
+                if err:
+                    return err
+
+            # FunctionDef stmts are intentionally not recursed into —
+            # generated scripts never contain nested function definitions.
+        return None
+
+    @staticmethod
+    def _is_terminate_call(node: cst.BaseExpression) -> bool:
+        """Check if a CST expression node is a page.terminate(...) call.
+
+        Handles both ``await page.terminate(...)`` and bare ``page.terminate(...)``.
+        Generated scripts always use ``await``, but we check both defensively.
+
+        The caller passes ``small_stmt.value`` (the inner expression of a
+        ``cst.Expr`` small statement), so this method receives a ``cst.Await``
+        or ``cst.Call`` node, never a ``cst.Expr`` wrapper.
+        """
+        call = node.expression if isinstance(node, cst.Await) else node
+        if not isinstance(call, cst.Call):
+            return False
+        func = call.func
+        return (
+            isinstance(func, cst.Attribute)
+            and isinstance(func.attr, cst.Name)
+            and func.attr.value == "terminate"
+            and isinstance(func.value, cst.Name)
+            and func.value.value == "page"
+        )
 
     # Regex to extract string literals (single or double quoted, excluding escaped quotes)
     _STRING_LITERAL_RE: re.Pattern[str] = re.compile(r"""(?<![\\])(['"])((?:(?!\1)[^\\]|\\.)*)(\1)""")

@@ -1,8 +1,9 @@
 """
 Unit tests for ScriptSkyvernPage.
 
-Tests _wait_for_page_ready_before_action (regression test for self._page bug, PR #8425)
-and _ensure_element_ids_on_page (injects unique_id attrs after page navigation).
+Tests _wait_for_page_ready_before_action (regression test for self._page bug, PR #8425),
+_ensure_element_ids_on_page (injects unique_id attrs after page navigation),
+and terminate() (raises ScriptTerminationException for Code 2.0 cached execution).
 """
 
 import inspect
@@ -13,6 +14,7 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
+from skyvern.exceptions import ScriptTerminationException
 
 
 def create_mock_page():
@@ -349,3 +351,208 @@ async def test_ensure_element_ids_catches_exceptions(mock_scraped_page, mock_ai)
 
         # Should NOT raise
         await script_page._ensure_element_ids_on_page()
+
+
+# =============================================================================
+# Tests for terminate()
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_terminate_raises_script_termination_exception_without_context(mock_scraped_page, mock_ai):
+    """
+    When there is no SkyvernContext, terminate() should raise ScriptTerminationException
+    with the error messages from the errors list.
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        with patch(
+            "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+            return_value=None,
+        ):
+            with pytest.raises(ScriptTerminationException, match="Terminate called: page not found"):
+                await script_page.terminate(errors=["page not found"])
+
+
+@pytest.mark.asyncio
+async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
+    """
+    When context, task, and step are available, terminate() should call
+    handle_terminate_action and then raise ScriptTerminationException.
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        mock_context = MagicMock()
+        mock_context.organization_id = "org_123"
+        mock_context.workflow_run_id = "wr_456"
+        mock_context.task_id = "tsk_789"
+        mock_context.step_id = "stp_012"
+        mock_context.action_order = 0
+
+        mock_task = MagicMock()
+        mock_step = MagicMock()
+        mock_step.order = 0
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=mock_context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_task",
+                new_callable=AsyncMock,
+                return_value=mock_task,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_step",
+                new_callable=AsyncMock,
+                return_value=mock_step,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.handle_terminate_action",
+                new_callable=AsyncMock,
+                return_value=[MagicMock(success=True)],
+            ) as mock_handler,
+        ):
+            with pytest.raises(ScriptTerminationException, match="Terminate called: error1; error2"):
+                await script_page.terminate(errors=["error1", "error2"])
+
+            # Verify handler was called with correct arguments
+            mock_handler.assert_called_once()
+            call_args = mock_handler.call_args
+            action = call_args[0][0]
+            assert action.organization_id == "org_123"
+            assert action.workflow_run_id == "wr_456"
+            assert action.task_id == "tsk_789"
+            assert action.step_id == "stp_012"
+            # Verify reasoning is set from errors for LLM extraction context
+            assert action.reasoning == "error1; error2"
+
+
+@pytest.mark.asyncio
+async def test_terminate_raises_even_when_task_not_found(mock_scraped_page, mock_ai):
+    """
+    When context exists but task/step are not found in the database,
+    terminate() should still raise ScriptTerminationException.
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        mock_context = MagicMock()
+        mock_context.organization_id = "org_123"
+        mock_context.workflow_run_id = "wr_456"
+        mock_context.task_id = "tsk_789"
+        mock_context.step_id = "stp_012"
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=mock_context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_task",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_step",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.handle_terminate_action",
+                new_callable=AsyncMock,
+            ) as mock_handler,
+        ):
+            with pytest.raises(ScriptTerminationException, match="Terminate called: task failed"):
+                await script_page.terminate(errors=["task failed"])
+
+            # Handler should NOT be called when task/step not found
+            mock_handler.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminate_raises_even_when_handler_fails(mock_scraped_page, mock_ai):
+    """
+    When handle_terminate_action raises an exception (e.g., LLM call fails during
+    extract_user_defined_errors), terminate() should still raise ScriptTerminationException
+    so upstream workflow/service.py correctly marks the block as terminated.
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        mock_context = MagicMock()
+        mock_context.organization_id = "org_123"
+        mock_context.workflow_run_id = "wr_456"
+        mock_context.task_id = "tsk_789"
+        mock_context.step_id = "stp_012"
+        mock_context.action_order = 0
+
+        mock_task = MagicMock()
+        mock_step = MagicMock()
+        mock_step.order = 0
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=mock_context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_task",
+                new_callable=AsyncMock,
+                return_value=mock_task,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.get_step",
+                new_callable=AsyncMock,
+                return_value=mock_step,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.handle_terminate_action",
+                new_callable=AsyncMock,
+                side_effect=Exception("LLM call failed"),
+            ) as mock_handler,
+        ):
+            # Should raise ScriptTerminationException, NOT the handler's Exception
+            with pytest.raises(ScriptTerminationException, match="Terminate called: handler error"):
+                await script_page.terminate(errors=["handler error"])
+
+            mock_handler.assert_called_once()

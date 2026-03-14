@@ -287,6 +287,12 @@ function Workspace({
 
   const handleRequestDeleteNode = useCallback(
     (nodeId: string, nodeLabel: string, confirmCallback: () => void) => {
+      const outputKey = getOutputParameterKey(nodeLabel);
+      const affected = getAffectedBlocks(nodes, outputKey);
+      if (affected.length === 0) {
+        confirmCallback();
+        return;
+      }
       deleteConfirmCallbackRef.current = confirmCallback;
       setDeleteBlockDialogState({
         open: true,
@@ -294,7 +300,7 @@ function Workspace({
         nodeLabel,
       });
     },
-    [],
+    [nodes],
   );
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
@@ -1579,6 +1585,7 @@ function Workspace({
                         }
                         showControlButtons={true}
                         resizeTrigger={windowResizeTrigger}
+                        isExecuting={!!workflowRun && !isFinalized}
                       />
                     </div>
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4">

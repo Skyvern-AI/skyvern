@@ -45,8 +45,21 @@ claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/"
 
 </Tab>
 <Tab title="Claude Desktop">
+**macOS / Windows (recommended, no Node.js required)**
 
-Add to your Claude Desktop config file:
+1. Download [`skyvern-claude-desktop.mcpb`](https://github.com/Skyvern-AI/skyvern/raw/main/skyvern/cli/mcpb/releases/skyvern-claude-desktop.mcpb).
+2. Double-click the downloaded `.mcpb` file.
+3. When Claude Desktop opens the Skyvern installer preview, click **Install**.
+4. In the **Configure Skyvern** dialog, paste your Skyvern API key.
+5. Leave **Skyvern MCP URL** set to `https://api.skyvern.com/mcp/` unless you are connecting to a different deployment, then click **Save**.
+
+If double-clicking is blocked by your system, you can instead open **Claude Desktop > Settings > Extensions > Install Extension** and select the downloaded file manually.
+
+The bundle defaults to `https://api.skyvern.com/mcp/` and removes the separate Node.js requirement.
+
+**Linux, self-hosted, or advanced fallback (requires Node.js >= 20)**
+
+Add this manual bridge to your Claude Desktop config file:
 
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Linux**: `~/.config/Claude/claude_desktop_config.json`
@@ -68,7 +81,7 @@ Add to your Claude Desktop config file:
 }
 ```
 
-This uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the remote MCP server to stdio. Requires Node.js >= 20.
+This fallback uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the remote MCP server to stdio. It still requires Node.js >= 20.
 
 </Tab>
 <Tab title="Cursor">
@@ -131,11 +144,36 @@ x-api-key = "SKYVERN_API_KEY"
 </Tab>
 </Tabs>
 
-That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the connection (requires Node.js >= 20).
+That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop on macOS and Windows can use the one-click Skyvern bundle; Linux and advanced setups can still use [mcp-remote](https://www.npmjs.com/package/mcp-remote) with Node.js >= 20.
 
 <Tip>
-Prefer a CLI? `pip install skyvern` then run `skyvern setup` — it auto-detects your AI tools and configures MCP for all of them at once.
+Prefer a CLI? For Skyvern Cloud, `pip install skyvern` then run `skyvern setup`. For the local self-hosted path, run `skyvern quickstart` or `skyvern init` and choose Claude Code during the MCP step.
 </Tip>
+
+## Switch an existing MCP config
+
+If you already have a Skyvern MCP entry and just need to switch to another API key or base URL, use the CLI instead of hand-editing JSON or TOML:
+
+```bash
+pip install skyvern
+skyvern mcp switch --dry-run
+skyvern mcp switch
+```
+
+The switcher scans supported local config files created by `skyvern setup` or manual setup, shows which ones already contain a Skyvern entry, lets you choose which apps to update, and writes a backup before changing anything.
+
+Today it can update:
+
+- Claude Code project `.mcp.json`
+- Claude Code global `~/.claude.json`
+- Claude Desktop JSON config
+- Cursor `~/.cursor/mcp.json`
+- Windsurf `~/.codeium/windsurf/mcp_config.json`
+- Codex `~/.codex/config.toml`
+
+`skyvern mcp switch` preserves the existing transport shape. Remote configs keep using `https://.../mcp/`; local stdio configs keep `SKYVERN_BASE_URL` and `SKYVERN_API_KEY` in the launched process environment. After switching, restart your AI client.
+
+If a config file exists but does not already contain a Skyvern entry, run `skyvern setup` or use the manual setup snippets on this page first.
 
 ## Alternative: Local mode (self-hosted)
 
@@ -149,24 +187,58 @@ Local mode requires Python 3.11, 3.12, or 3.13.
 pip install skyvern
 ```
 
-Before using MCP, start your local Skyvern server:
+### Recommended local Claude Code flow
+
+Run the setup wizard from your project or repo root:
+
+```bash
+skyvern quickstart
+# or: skyvern init
+```
+
+Choose:
+
+1. `local`
+2. `Claude Code` during the MCP setup step
+
+When you do that, Skyvern will:
+
+- generate local `SKYVERN_BASE_URL` and `SKYVERN_API_KEY`
+- write `.mcp.json` in the current project when you run inside a repo or app directory
+- pin the MCP command to the active Python interpreter with `python -m skyvern run mcp`
+- install bundled Claude Code skills into `.claude/skills/`, including `/qa`
+
+This path stays fully local. Claude Code talks to your local Skyvern server over stdio, so `localhost` targets work directly and you do **not** need Skyvern Cloud, `mcp-remote`, or browser tunneling.
+
+Before using MCP, start your local Skyvern server if `skyvern init` did not already do it:
 
 ```bash
 skyvern run server
 ```
 
-Then configure your AI client to use stdio transport:
+### Manual local MCP config
+
+If you want to configure your client manually instead of using the wizard, use stdio transport:
 
 <Tabs>
 <Tab title="Claude Code">
 
-```bash
-# For Skyvern Cloud, use https://api.skyvern.com instead of localhost
-claude mcp add --transport stdio skyvern \
-  --env SKYVERN_BASE_URL=http://localhost:8000 \
-  --env SKYVERN_API_KEY=YOUR_SKYVERN_API_KEY \
-  -- python3 -m skyvern run mcp
+```json
+{
+  "mcpServers": {
+    "skyvern": {
+      "command": "/usr/bin/python3",
+      "args": ["-m", "skyvern", "run", "mcp"],
+      "env": {
+        "SKYVERN_BASE_URL": "http://localhost:8000",
+        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
 ```
+
+Write this to `.mcp.json` in your project root, or to `~/.claude.json` for a user-level config. Replace `/usr/bin/python3` with the Python interpreter from the environment where you installed Skyvern.
 
 </Tab>
 <Tab title="Claude Desktop / Cursor / Windsurf">
@@ -209,7 +281,7 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 </Tabs>
 
 <Tip>
-You can also run `skyvern setup` to auto-detect installed clients and write configs automatically.
+`skyvern init` and `skyvern quickstart` can write the local MCP config for you. In a project directory, choosing Claude Code defaults to project-local `.mcp.json` and installs `.claude/skills/qa`.
 </Tip>
 
 <Accordion title="Config file locations by client">
@@ -271,13 +343,18 @@ This is especially powerful during development: make a code change, then ask you
 Always use `--api-key` when exposing your browser via tunnel. Without it, anyone with the ngrok URL has full browser control.
 </Warning>
 
+<Accordion title="Claude Desktop bundle updates">
+Private Claude Desktop bundles do not auto-update. Download the latest [`skyvern-claude-desktop.mcpb`](https://github.com/Skyvern-AI/skyvern/raw/main/skyvern/cli/mcpb/releases/skyvern-claude-desktop.mcpb) again, then reinstall it by double-clicking the bundle or using **Settings > Extensions**.
+</Accordion>
+
 ## QA your frontend changes
 
-If you install the Skyvern CLI, `skyvern setup claude-code` registers the MCP server **and** installs Claude Code skills — including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
+For the local self-hosted path, run `skyvern quickstart` or `skyvern init`, choose `local`, then choose `Claude Code` during the MCP step. That writes local stdio MCP config and installs Claude Code skills — including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
 
 ```bash
 pip install skyvern
-skyvern setup claude-code
+skyvern quickstart
+# or: skyvern init
 ```
 
 Then make a frontend change and type `/qa` in Claude Code. It will:
@@ -288,11 +365,7 @@ Then make a frontend change and type `/qa` in Claude Code. It will:
 4. Run the tests — navigate, click, fill forms, check the DOM
 5. Report pass/fail with screenshots
 
-For localhost testing, start a local browser first:
-
-```bash
-skyvern browser serve --tunnel
-```
+For localhost testing, start your local Skyvern backend and frontend. You do not need `skyvern browser serve --tunnel` for this path.
 
 <Tip>
 The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each) and `skyvern_act` for natural-language interactions. Tests are generated fresh from each diff — no test files to maintain.
@@ -303,7 +376,7 @@ The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each) and
 <Accordion title="Invalid API key or 401 errors">
 Double-check that your API key is correct. You can find or regenerate it at [Settings](https://app.skyvern.com). Make sure there are no extra spaces or newlines when pasting the key.
 
-If you recently regenerated your API key, update it in your MCP config and restart your AI client.
+If you recently regenerated your API key, run `skyvern mcp switch` if you installed the CLI, or update the MCP config manually, then restart your AI client.
 </Accordion>
 
 <Accordion title="Tools not responding or timing out">
@@ -313,7 +386,7 @@ If timeouts persist, check that your Skyvern account is active and has available
 </Accordion>
 
 <Accordion title="Python version errors (local mode only)">
-The Skyvern MCP server requires Python 3.11, 3.12, or 3.13. Check your version with `python3 --version`. If you have multiple Python versions installed, make sure the `command` in your MCP config points to a supported version:
+The Skyvern MCP server requires Python 3.11, 3.12, or 3.13. Check your version with `python3 --version`. Skyvern's generated local config already pins the active interpreter path automatically. If you are editing the config manually, make sure the `command` points to a supported version:
 
 ```bash
 which python3.11
@@ -335,6 +408,8 @@ skyvern run server
 ```
 
 Confirm the server is reachable at `http://localhost:8000`. If you changed the port, update `SKYVERN_BASE_URL` in your MCP config to match.
+
+You do not need Skyvern Cloud or browser tunneling for this path. Claude Code talks to the local MCP process over stdio, and that process talks to your local Skyvern server.
 </Accordion>
 
 <Accordion title="MCP client doesn't detect Skyvern">
@@ -345,4 +420,6 @@ which python3
 ```
 
 Use the full absolute path (e.g., `/usr/bin/python3` or `/Users/you/.pyenv/shims/python3`), not just `python3`. Restart your MCP client after editing the config file.
+
+If you used the wizard, re-run `skyvern init` or `skyvern setup claude-code --local` from the same Python environment to regenerate the config with the correct interpreter path.
 </Accordion>

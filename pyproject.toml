@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.23"
+version = "1.0.24"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -223,7 +223,7 @@ skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 plugins = "sqlalchemy.ext.mypy.plugin"
 
 [project.scripts]
-skyvern = "skyvern.cli.commands:cli_app"
+skyvern = "skyvern.__main__:main"
 
 [tool.pytest.ini_options]
 norecursedirs = ["eval", "tests/sdk"]

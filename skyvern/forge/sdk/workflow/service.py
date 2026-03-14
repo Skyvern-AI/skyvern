@@ -7,7 +7,7 @@ import uuid
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, Literal, cast
 
@@ -71,6 +71,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     ConditionalBlock,
     ExtractionBlock,
+    ForLoopBlock,
     NavigationBlock,
     TaskV2Block,
     compute_conditional_scopes,
@@ -1019,14 +1020,34 @@ class WorkflowService:
             # Trigger AI Script Reviewer for adaptive caching workflows
             # Include terminated and failed runs (triage will filter non-code-fixable failures)
             # Skip canceled (user stopped) and timed_out (infrastructure issue)
+            # Only trigger if this run used the latest script version — stale runs produce
+            # episodes that may already be fixed in newer versions, and reviewing them creates
+            # redundant/regressive versions.
             if is_adaptive_caching(workflow, workflow_run) and pre_finally_status not in (
                 WorkflowRunStatus.canceled,
                 WorkflowRunStatus.timed_out,
             ):
-                asyncio.create_task(
-                    self._trigger_script_reviewer(workflow, workflow_run),
-                    name=f"script_reviewer_{workflow_run.workflow_run_id}",
-                )
+                should_trigger_reviewer = True
+                current_ctx = skyvern_context.current()
+                if current_ctx and current_ctx.script_id:
+                    latest_script = await app.DATABASE.get_latest_script_version(
+                        script_id=current_ctx.script_id,
+                        organization_id=workflow.organization_id,
+                    )
+                    if latest_script and latest_script.script_revision_id != current_ctx.script_revision_id:
+                        should_trigger_reviewer = False
+                        LOG.info(
+                            "Skipping script reviewer - run used stale script version",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            used_revision=current_ctx.script_revision_id,
+                            latest_revision=latest_script.script_revision_id,
+                            latest_version=latest_script.version,
+                        )
+                if should_trigger_reviewer:
+                    asyncio.create_task(
+                        self._trigger_script_reviewer(workflow, workflow_run, pre_finally_status=pre_finally_status),
+                        name=f"script_reviewer_{workflow_run.workflow_run_id}",
+                    )
 
             # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
             should_run_finally = finally_block_label and pre_finally_status != WorkflowRunStatus.canceled
@@ -2423,6 +2444,7 @@ class WorkflowService:
     def _build_workflow_graph(
         self,
         blocks: list[BlockTypeVar],
+        skip_sequential_defaulting: bool = False,
     ) -> tuple[str, dict[str, BlockTypeVar], dict[str, str | None]]:
         all_blocks = blocks
         label_to_block: dict[str, BlockTypeVar] = {}
@@ -2436,11 +2458,12 @@ class WorkflowService:
 
         # Only apply sequential defaulting if there are no conditional blocks
         # Conditional blocks break sequential ordering since they have multiple branches
-        has_conditional_blocks = any(isinstance(block, ConditionalBlock) for block in all_blocks)
-        if not has_conditional_blocks:
-            for idx, block in enumerate(blocks[:-1]):
-                if default_next_map.get(block.label) is None:
-                    default_next_map[block.label] = blocks[idx + 1].label
+        if not skip_sequential_defaulting:
+            has_conditional_blocks = any(isinstance(block, ConditionalBlock) for block in all_blocks)
+            if not has_conditional_blocks:
+                for idx, block in enumerate(blocks[:-1]):
+                    if default_next_map.get(block.label) is None:
+                        default_next_map[block.label] = blocks[idx + 1].label
 
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
@@ -2465,10 +2488,17 @@ class WorkflowService:
 
         roots = [label for label, count in incoming.items() if count == 0]
         if not roots:
-            raise InvalidWorkflowDefinition("No entry block found for workflow definition")
+            raise InvalidWorkflowDefinition(
+                "Circular reference detected: every block is the target of another block's next_block_label,"
+                " so there is no starting block."
+                " At least one block must not be the target of any next_block_label or branch condition."
+            )
         if len(roots) > 1:
             raise InvalidWorkflowDefinition(
-                f"Multiple entry blocks detected ({', '.join(sorted(roots))}); only one entry block is supported."
+                f"Disconnected blocks detected: blocks ({', '.join(sorted(roots))}) are not reachable from any"
+                " other block. Every block must be reachable from the first block through next_block_label or"
+                " conditional branch references."
+                " Either connect them by setting another block's next_block_label to point to them, or remove them."
             )
 
         # Kahn's algorithm for cycle detection
@@ -2484,9 +2514,54 @@ class WorkflowService:
                     queue.append(neighbor)
 
         if visited_count != len(label_to_block):
-            raise InvalidWorkflowDefinition("Workflow definition contains a cycle; DAG traversal is required.")
+            raise InvalidWorkflowDefinition(
+                "Circular reference detected: some blocks form a loop through their next_block_label references,"
+                " causing an infinite cycle."
+                " Ensure that following next_block_label from any block eventually reaches a block"
+                " with next_block_label set to null."
+            )
 
         return roots[0], label_to_block, default_next_map
+
+    def validate_workflow_block_graph(self, workflow_definition: WorkflowDefinition) -> None:
+        """Validate the block graph before persisting.
+
+        Detects orphaned blocks, circular references, and dangling next_block_label references.
+        Recursively validates nested ForLoopBlock graphs at all nesting depths.
+        Raises InvalidWorkflowDefinition (422) on validation failure.
+
+        For v2 workflow definitions (blocks have explicit next_block_label), sequential
+        defaulting is skipped so that disconnected subgraphs are detected.
+        v1 workflows (no next_block_label on any block) are skipped since they use
+        purely sequential execution.
+        """
+        blocks = list(workflow_definition.blocks)
+        if not blocks:
+            return
+
+        # v1 workflows have no explicit next_block_label and run sequentially — skip DAG validation
+        version = workflow_definition.version or 1
+        if version < 2:
+            return
+
+        finally_block_label = workflow_definition.finally_block_label
+        if finally_block_label:
+            blocks = self._strip_finally_block_references(blocks, finally_block_label)
+
+        if not blocks:
+            return
+
+        self._build_workflow_graph(blocks, skip_sequential_defaulting=True)
+
+        # Recursively validate nested ForLoopBlock graphs (including the finally block)
+        self._validate_nested_blocks(workflow_definition.blocks)
+
+    @staticmethod
+    def _validate_nested_blocks(blocks: list[BlockTypeVar]) -> None:
+        """Recursively validate ForLoopBlock graphs at all nesting depths."""
+        for block in blocks:
+            if isinstance(block, ForLoopBlock):
+                block.validate_loop_blocks()
 
     async def create_workflow(
         self,
@@ -3787,6 +3862,7 @@ class WorkflowService:
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             task_v2=task_v2,
             browser_address=workflow_run.browser_address,
+            run_with=workflow_run.run_with,
             script_run=workflow_run.script_run,
             errors=errors,
         )
@@ -4173,6 +4249,9 @@ class WorkflowService:
                 potential_workflow.workflow_id,
                 request.workflow_definition,
             )
+
+            # Validate the block graph before persisting (detects orphans, cycles, dangling references)
+            self.validate_workflow_block_graph(workflow_definition)
 
             updated_workflow = await self.update_workflow_definition(
                 workflow_id=potential_workflow.workflow_id,
@@ -4564,6 +4643,7 @@ class WorkflowService:
         self,
         workflow: Workflow,
         workflow_run: WorkflowRun,
+        pre_finally_status: WorkflowRunStatus | None = None,
     ) -> None:
         """Trigger the AI Script Reviewer with Redis lock to prevent concurrent reviews per script family."""
         try:
@@ -4572,6 +4652,23 @@ class WorkflowService:
             script_id = context.script_id if context else None
             if not script_revision_id or not script_id:
                 return
+
+            # Determine if this is a failure-triggered review (script crashed, run failed)
+            # vs a fallback-triggered review (script failed but agent succeeded).
+            # Failure reviews are capped per wpid per day to prevent spam.
+            is_failure_review = pre_finally_status == WorkflowRunStatus.failed
+
+            if is_failure_review:
+                cap_exceeded = await self._check_failure_review_cap(
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                )
+                if cap_exceeded:
+                    LOG.info(
+                        "Skipping failure-triggered script review — daily cap exceeded for wpid",
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+                    return
 
             # Non-blocking lock per script family
             cache = CacheFactory.get_cache()
@@ -4583,10 +4680,12 @@ class WorkflowService:
                 except AttributeError:
                     LOG.debug("Cache doesn't support locking for script reviewer")
 
+            review_ran = False
             if lock is not None:
                 try:
                     async with lock:
                         await self._run_reviewer_locked(workflow, workflow_run, script_revision_id, script_id)
+                        review_ran = True
                 except LockError:
                     LOG.info(
                         "Skipping script review — another process is reviewing this script",
@@ -4596,12 +4695,67 @@ class WorkflowService:
             else:
                 # No Redis/cache available - proceed without lock (graceful degradation for OSS)
                 await self._run_reviewer_locked(workflow, workflow_run, script_revision_id, script_id)
+                review_ran = True
+
+            # Increment the failure review counter ONLY after a review actually ran.
+            # Skipped reviews (e.g., LockError) should not consume cap budget.
+            if is_failure_review and review_ran:
+                await self._increment_failure_review_counter(
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                )
         except Exception:
             LOG.warning(
                 "Failed to trigger script reviewer",
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 exc_info=True,
             )
+
+    @staticmethod
+    def _failure_review_cap_key(workflow_permanent_id: str) -> str:
+        """Build the Redis key for the daily failure-review counter."""
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        return f"script_reviewer:failure_cap:{workflow_permanent_id}:{today}"
+
+    async def _check_failure_review_cap(self, workflow_permanent_id: str) -> bool:
+        """Check if the daily failure-review cap has been reached for this wpid.
+
+        Returns True if the cap is exceeded and the review should be skipped.
+        Uses Redis get/set to maintain a per-wpid daily counter.
+        """
+        try:
+            cache = CacheFactory.get_cache()
+            if cache is None:
+                return False
+            cap_key = self._failure_review_cap_key(workflow_permanent_id)
+            raw_count = await cache.get(cap_key)
+            if raw_count is not None:
+                count = int(raw_count)
+                if count >= settings.FAILURE_REVIEW_DAILY_CAP:
+                    return True
+        except Exception:
+            LOG.debug("Failed to check failure review cap, allowing review", exc_info=True)
+        return False
+
+    async def _increment_failure_review_counter(self, workflow_permanent_id: str) -> None:
+        """Increment the daily failure-review counter for this wpid.
+
+        Uses Redis get+set with a 48-hour TTL (covers timezone edge cases).
+        Note: get+set is not atomic, so concurrent reviews for the same wpid
+        (different script_ids, different lock keys) may both read the same count
+        and overwrite each other, allowing up to ~2x the cap in the worst case.
+        Acceptable because the cap is a spam guard, not a hard limit, and the
+        repo restricts Redis to get/set/lock only.
+        """
+        try:
+            cache = CacheFactory.get_cache()
+            if cache is None:
+                return
+            cap_key = self._failure_review_cap_key(workflow_permanent_id)
+            raw_count = await cache.get(cap_key)
+            new_count = (int(raw_count) + 1) if raw_count is not None else 1
+            await cache.set(cap_key, str(new_count), ex=timedelta(hours=48))
+        except Exception:
+            LOG.debug("Failed to increment failure review counter", exc_info=True)
 
     async def _run_reviewer_locked(
         self,
@@ -4818,15 +4972,19 @@ class WorkflowService:
     ) -> bool:
         """Determine whether this run should attempt to execute cached scripts.
 
-        Note: This intentionally does NOT consult workflow.adaptive_caching.
-        Adaptive caching workflows (is_adaptive_caching=True) gather training
-        data on agent runs before any script exists. The script-recording and
-        fallback-episode logic uses is_adaptive_caching() separately.
+        When neither the run nor the workflow explicitly sets run_with, fall back
+        to the workflow's adaptive_caching flag. This allows workflows with
+        adaptive_caching=True to default into code-v2 mode without requiring
+        every API call to pass run_with explicitly.
         """
         if workflow_run.run_with in ("code", "code_v2"):
             return True
         if workflow_run.run_with == "agent":
             return False
         if workflow.run_with == "code":
+            return True
+        if workflow.run_with == "agent":
+            return False
+        if workflow.adaptive_caching:
             return True
         return False

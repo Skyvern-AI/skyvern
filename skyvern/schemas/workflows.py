@@ -1,4 +1,5 @@
 import abc
+import functools
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -7,6 +8,8 @@ import structlog
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from skyvern.config import settings
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
 from skyvern.utils.strings import sanitize_identifier
@@ -42,6 +45,26 @@ def sanitize_parameter_key(value: str) -> str:
         A sanitized key that is a valid Python identifier
     """
     return sanitize_identifier(value, default="parameter")
+
+
+def _has_jinja_syntax(value: str) -> bool:
+    return "{{" in value or "{%" in value
+
+
+@functools.lru_cache(maxsize=1)
+def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
+    """Build a reverse mapping from internal llm_key to public model_name.
+
+    Cached because settings don't change at runtime.  Tests that monkeypatch
+    settings must call ``_get_text_prompt_model_name_by_llm_key.cache_clear()``
+    to avoid cross-test pollution.
+    """
+    reverse_mapping: dict[str, str] = {}
+    for model_name, metadata in SettingsManager.get_settings().get_model_name_to_llm_key().items():
+        llm_key = metadata.get("llm_key")
+        if llm_key and llm_key not in reverse_mapping:
+            reverse_mapping[llm_key] = model_name
+    return reverse_mapping
 
 
 def _replace_references_in_value(value: Any, old_key: str, new_key: str) -> Any:
@@ -631,12 +654,12 @@ class BranchConditionYAML(BaseModel):
     is_default: bool = False
 
     @model_validator(mode="after")
-    def validate_condition(cls, condition: "BranchConditionYAML") -> "BranchConditionYAML":
-        if condition.criteria is None and not condition.is_default:
+    def validate_condition(self) -> "BranchConditionYAML":
+        if self.criteria is None and not self.is_default:
             raise ValueError("Branches without criteria must be marked as default.")
-        if condition.criteria is not None and condition.is_default:
+        if self.criteria is not None and self.is_default:
             raise ValueError("Default branches may not define criteria.")
-        return condition
+        return self
 
 
 class ConditionalBlockYAML(BlockYAML):
@@ -645,15 +668,15 @@ class ConditionalBlockYAML(BlockYAML):
     branch_conditions: list[BranchConditionYAML] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_branches(cls, block: "ConditionalBlockYAML") -> "ConditionalBlockYAML":
-        if not block.branch_conditions:
+    def validate_branches(self) -> "ConditionalBlockYAML":
+        if not self.branch_conditions:
             raise ValueError("Conditional blocks require at least one branch.")
 
-        default_branches = [branch for branch in block.branch_conditions if branch.is_default]
+        default_branches = [branch for branch in self.branch_conditions if branch.is_default]
         if len(default_branches) > 1:
             raise ValueError("Only one default branch is permitted per conditional block.")
 
-        return block
+        return self
 
 
 class CodeBlockYAML(BlockYAML):
@@ -678,6 +701,42 @@ class TextPromptBlockYAML(BlockYAML):
     prompt: str
     parameter_keys: list[str] | None = None
     json_schema: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def normalize_llm_selection(self) -> "TextPromptBlockYAML":
+        raw_llm_key = self.llm_key.strip() if self.llm_key else None
+
+        if self.model:
+            # `model` is the stable public contract; ignore any raw llm_key override
+            # once a model has been selected.
+            self.llm_key = None
+            return self
+
+        if not raw_llm_key:
+            self.llm_key = None
+            return self
+
+        if _has_jinja_syntax(raw_llm_key):
+            self.llm_key = raw_llm_key
+            return self
+
+        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
+        if model_name:
+            self.model = {"model_name": model_name}
+            self.llm_key = None
+            return self
+
+        if raw_llm_key in LLMConfigRegistry.get_model_names():
+            self.llm_key = raw_llm_key
+            return self
+
+        LOG.warning(
+            "Unrecognized text prompt llm_key; defaulting to Skyvern Optimized/default model path",
+            label=self.label,
+            llm_key=raw_llm_key,
+        )
+        self.llm_key = None
+        return self
 
 
 class DownloadToS3BlockYAML(BlockYAML):
@@ -980,8 +1039,8 @@ class WorkflowDefinitionYAML(BaseModel):
     finally_block_label: str | None = None
 
     @model_validator(mode="after")
-    def validate_unique_block_labels(cls, workflow: "WorkflowDefinitionYAML") -> "WorkflowDefinitionYAML":
-        labels = [block.label for block in workflow.blocks]
+    def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":
+        labels = [block.label for block in self.blocks]
         duplicates = [label for label in labels if labels.count(label) > 1]
 
         if duplicates:
@@ -991,13 +1050,13 @@ class WorkflowDefinitionYAML(BaseModel):
                 f"Found duplicate label(s): {', '.join(unique_duplicates)}"
             )
 
-        if workflow.finally_block_label and workflow.finally_block_label not in labels:
+        if self.finally_block_label and self.finally_block_label not in labels:
             raise ValueError(
-                f"finally_block_label '{workflow.finally_block_label}' does not reference a valid block. "
+                f"finally_block_label '{self.finally_block_label}' does not reference a valid block. "
                 f"Available labels: {', '.join(labels) if labels else '(none)'}"
             )
 
-        return workflow
+        return self
 
 
 class WorkflowCreateYAMLRequest(BaseModel):

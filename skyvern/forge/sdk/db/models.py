@@ -239,6 +239,7 @@ class ArtifactModel(Base):
     step_id = Column(String, index=True)
     artifact_type = Column(String)
     uri = Column(String)
+    bundle_key = Column(String, nullable=True)
     run_id = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -975,6 +976,7 @@ class CredentialModel(Base):
     secret_label = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True)
     tested_url = Column(String, nullable=True)
+    user_context = Column(String(1000), nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

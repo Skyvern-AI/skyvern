@@ -1147,6 +1147,7 @@ def _build_block_fn(
     actions: list[dict[str, Any]],
     value_to_param: dict[str, str] | None = None,
     use_semantic_selectors: bool = False,
+    is_in_for_loop: bool = False,
 ) -> FunctionDef:
     # Check if this block is form-filling (4+ input_text/select actions)
     if use_semantic_selectors and _is_form_filling_block(actions):
@@ -1162,28 +1163,37 @@ def _build_block_fn(
     if block.get("url"):
         body_stmts.append(cst.parse_statement(f"await page.goto({repr(block['url'])})"))
 
-    for act in actions:
-        if act["action_type"] in [
-            ActionType.COMPLETE,
-            ActionType.TERMINATE,
-            ActionType.NULL_ACTION,
-        ]:
-            continue
-
-        # For extraction blocks, assign extract action results to output variable
-        assign_to_output = act["action_type"] == "extract"
+    # For file_download blocks inside for-loops, generate a dynamic click that uses
+    # per-iteration context instead of hardcoded xpath/prompt from iteration 0.
+    block_type = block.get("block_type")
+    if is_in_for_loop and block_type == "file_download":
         body_stmts.append(
-            _action_to_stmt(
-                act,
-                block,
-                assign_to_output=assign_to_output,
-                value_to_param=value_to_param,
-                use_semantic_selectors=use_semantic_selectors,
+            cst.parse_statement(
+                'await page.click(selector=context.download_selector(), prompt=context.prompt, ai="fallback")'
             )
         )
+    else:
+        for act in actions:
+            if act["action_type"] in [
+                ActionType.COMPLETE,
+                ActionType.TERMINATE,
+                ActionType.NULL_ACTION,
+            ]:
+                continue
+
+            # For extraction blocks, assign extract action results to output variable
+            assign_to_output = act["action_type"] == "extract"
+            body_stmts.append(
+                _action_to_stmt(
+                    act,
+                    block,
+                    assign_to_output=assign_to_output,
+                    value_to_param=value_to_param,
+                    use_semantic_selectors=use_semantic_selectors,
+                )
+            )
 
     # add complete action
-    block_type = block.get("block_type")
     if block_type in SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION:
         complete_action = {"action_type": "complete"}
         body_stmts.append(_action_to_stmt(complete_action, block))
@@ -2818,6 +2828,7 @@ async def generate_workflow_script_python_code(
                     inner_actions,
                     value_to_param=value_to_param,
                     use_semantic_selectors=use_semantic_selectors,
+                    is_in_for_loop=True,
                 )
                 inner_block_code = cst.Module(body=[inner_fn_def]).code
 

@@ -1084,7 +1084,6 @@ class SkyvernPage(Page):
 
     @action_wrap(ActionType.TERMINATE)
     async def terminate(self, errors: list[str], **kwargs: Any) -> None:
-        # TODO: update the workflow run status to terminated
         return
 
     @action_wrap(ActionType.COMPLETE)
@@ -2917,3 +2916,43 @@ class RunContext:
         self.actions_and_results: list[tuple[Action, list[ActionResult]]] = []
         # Pre-extracted values from applicant context, keyed by canonical category name
         self.extracted_params: dict[str, str | None] = extracted_params or {}
+
+    @property
+    def prompt(self) -> str | None:
+        """Return the per-iteration prompt from SkyvernContext (set by script_service per loop iteration)."""
+        ctx = skyvern_context.current()
+        return ctx.prompt if ctx else None
+
+    @property
+    def loop_value(self) -> Any | None:
+        """Return the current loop iteration value from SkyvernContext.loop_metadata."""
+        ctx = skyvern_context.current()
+        if ctx and ctx.loop_metadata:
+            return ctx.loop_metadata.get("current_value")
+        return None
+
+    def download_selector(self) -> str | None:
+        """Build a CSS selector targeting a download link from the current loop value.
+
+        Scans the loop_value dict for URL-like strings, extracts the filename,
+        and returns a selector like ``a[href*="filename.pdf"]``. Returns None
+        if no URL is found.
+        """
+        value = self.loop_value
+        if not value or not isinstance(value, dict):
+            return None
+        for v in value.values():
+            if not isinstance(v, str):
+                continue
+            # Match URL-like strings (http/https or paths with file extensions)
+            if re.match(r"https?://", v) or re.match(r"/.*\.\w+", v):
+                # Extract filename from URL path
+                filename = v.rstrip("/").rsplit("/", 1)[-1]
+                # Strip query params
+                filename = filename.split("?")[0]
+                if filename and "." in filename:
+                    # Escape CSS special characters to avoid malformed selectors
+                    filename = re.sub(r'["\[\]\\]', "", filename)
+                    if filename:
+                        return f'a[href*="{filename}"]'
+        return None

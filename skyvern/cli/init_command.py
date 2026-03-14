@@ -2,7 +2,6 @@ import asyncio
 import subprocess
 import uuid
 
-import typer
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -21,12 +20,8 @@ from .mcp import setup_local_organization, setup_mcp
 
 
 def init_env(
-    no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
-    database_string: str = typer.Option(
-        "",
-        "--database-string",
-        help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
-    ),
+    no_postgres: bool = False,
+    database_string: str = "",
 ) -> bool:
     """Interactive initialization command for Skyvern."""
     console.print(
@@ -154,7 +149,7 @@ def init_env(
     console.print(f"✅ [green]{resolve_backend_env_path()} file has been initialized.[/green]")
 
     if Confirm.ask("\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?", default=True):
-        setup_mcp()
+        setup_mcp(local=run_local)
 
         if not run_local:
             console.print(
