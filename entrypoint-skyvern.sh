@@ -51,9 +51,6 @@ echo "Starting Xvfb..."
 rm -f /tmp/.X99-lock
 # Set display environment variable
 export DISPLAY=:99
-# Start Xvfb
-Xvfb :99 -screen 0 1920x1080x16 &
-xvfb=$!
 
 # The streaming service is now integrated into the ForgeApp
 # and will be started automatically when the API app starts

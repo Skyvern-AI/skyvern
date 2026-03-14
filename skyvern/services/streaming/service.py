@@ -1,6 +1,8 @@
 import asyncio
 import os
+import platform
 import subprocess
+import sys
 from typing import Optional
 
 import structlog
@@ -9,6 +11,24 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.utils.files import get_json_from_file, get_skyvern_state_file_path
+
+LOG = structlog.get_logger(__name__)
+
+
+def is_linux_or_wsl() -> bool:
+    """
+    Check if the current platform is Linux or WSL (Windows Subsystem for Linux).
+    
+    Returns:
+        True if running on Linux or WSL, False otherwise.
+    """
+    system = platform.system().lower()
+    if system == "linux":
+        # Check if running in WSL
+        if "microsoft" in platform.release().lower() or "wsl" in platform.version().lower():
+            return True
+        return True
+    return False
 
 INTERVAL = 1
 LOG = structlog.get_logger(__name__)
@@ -25,13 +45,23 @@ class StreamingService:
         self._monitoring_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
 
-    def start_monitoring(self) -> asyncio.Task:
+    async def start_monitoring(self) -> asyncio.Task:
         """
         Start the monitoring loop as a background task.
 
         Returns:
             The asyncio Task handling the monitoring loop.
         """
+        from skyvern.forge.sdk.state import initialize_skyvern_state_file
+        
+        # Check platform compatibility
+        if not is_linux_or_wsl():
+            LOG.error("Streaming service is only supported on Linux or WSL environments.")
+            raise RuntimeError("Streaming service is only supported on Linux or WSL environments.")
+        
+        # Ensure state file exists
+        await initialize_skyvern_state_file(task_id=None, workflow_run_id=None, organization_id=None)
+        
         if self._monitoring_task and not self._monitoring_task.done():
             LOG.warning("Streaming service monitoring is already running")
             return self._monitoring_task
@@ -155,16 +185,18 @@ class StreamingService:
             True if capture succeeded, False otherwise.
         """
         try:
-            subprocess.run(
+            proc = await asyncio.create_subprocess_shell(
                 f"xwd -root | xwdtopnm 2>/dev/null | pnmtopng > {file_path}",
-                shell=True,
                 env={"DISPLAY": ":99"},
-                check=True,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
+            stdout, stderr = await proc.communicate()
+            
+            if proc.returncode != 0:
+                LOG.error("Failed to capture screenshot", error=stderr.decode())
+                return False
             return True
-        except subprocess.CalledProcessError as e:
-            LOG.error("Failed to capture screenshot", error=str(e))
-            return False
         except Exception as e:
             LOG.error("Unexpected error capturing screenshot", error=str(e), exc_info=True)
             return False
