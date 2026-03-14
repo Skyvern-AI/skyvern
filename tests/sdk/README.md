@@ -31,13 +31,18 @@ pytest tests/sdk/python_sdk/test_sdk_simple_actions.py::test_clicks
 **Location:** `tests/sdk/typescript_sdk/`
 
 ### Prerequisites
-- Requires `.env` with `SKYVERN_API_KEY`
-- Requires Chrome with CDP on `localhost:9222`
+- Requires `.env` with `SKYVERN_API_KEY` — copy from the repo root: `cp .env tests/sdk/typescript_sdk/.env`
+- Requires the Skyvern server running: `skyvern run server`
+- Requires Chrome/Chromium with CDP on `localhost:9222` (see below)
 - Web server auto-starts via `run-test.js`
 
-**Launch Chrome with CDP:**
+**Launch Chromium with CDP:**
 ```bash
-/Users/stas/Library/Caches/ms-playwright/chromium-1194/chrome-mac/Chromium.app/Contents/MacOS/Chromium \
+# Find your Playwright Chromium path
+ls ~/Library/Caches/ms-playwright/
+
+# Then launch it (adjust the chromium-XXXX version to match yours)
+~/Library/Caches/ms-playwright/chromium-XXXX/chrome-mac/Chromium.app/Contents/MacOS/Chromium \
   --remote-debugging-port=9222 \
   --user-data-dir=~/tmp/chrome-playwright \
   about:blank

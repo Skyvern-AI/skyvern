@@ -1,3 +1,4 @@
+import { LogoMinimized } from "@/components/LogoMinimized";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -8,6 +9,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useOnChange } from "@/hooks/useOnChange";
+import { cn } from "@/util/utils";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
@@ -97,6 +99,13 @@ import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
+
+// Grace period after nodesInitialized before we start tracking changes.
+// Allows mount-time effects (ResizeObserver, visibility toggling) to settle.
+// Async API calls (e.g. WorkflowTriggerNode title hydration) are separately
+// protected by beginInternalUpdate/endInternalUpdate guards, so this timeout
+// only needs to cover synchronous mount-time effects.
+const INITIAL_LOAD_SETTLE_MS = 500;
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -318,6 +327,17 @@ function FlowRenderer({
   const parameters = useWorkflowParametersStore((state) => state.parameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
+
+  // Track layout phase for animation control:
+  // "pre-layout" = nodes hidden while Dagre hasn't computed positions yet
+  // "initial-load" = nodes fading in at their final positions (no position transition)
+  // "ready" = normal operation with position transitions enabled
+  // The 350ms timeout is coupled with the CSS fade-in duration (300ms) in reactFlowOverrideStyles.css
+  const [layoutPhase, setLayoutPhase] = useState<
+    "pre-layout" | "initial-load" | "ready"
+  >("pre-layout");
+  const hasCompletedInitialLoad = useRef(false);
+  const fadeTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const flowIsConstrained = debugStore.isDebugMode;
 
   // Track if this is the initial load to prevent false "unsaved changes" detection
@@ -329,8 +349,14 @@ function FlowRenderer({
   useEffect(() => {
     if (nodesInitialized) {
       setShouldConstrainPan(true);
-      // Mark initial load as complete after nodes are initialized
-      isInitialLoadRef.current = false;
+      // Delay marking initial load as complete to allow mount-time effects
+      // (ResizeObserver, async data fetches, visibility toggling) to settle
+      // before we start tracking changes. Must be long enough for async
+      // effects but short enough that users won't notice.
+      const timer = setTimeout(() => {
+        isInitialLoadRef.current = false;
+      }, INITIAL_LOAD_SETTLE_MS);
+      return () => clearTimeout(timer);
     }
   }, [nodesInitialized]);
 
@@ -391,8 +417,22 @@ function FlowRenderer({
   );
 
   useEffect(() => {
-    if (nodesInitialized) {
+    if (nodesInitialized && !hasCompletedInitialLoad.current) {
+      hasCompletedInitialLoad.current = true;
       doLayout(nodes, edges);
+      // After Dagre computes positions, wait one frame for the DOM to update
+      // with new positions, then fade in the nodes/edges at their final positions.
+      const rafId = requestAnimationFrame(() => {
+        setLayoutPhase("initial-load");
+        // After the fade-in animation completes, enable normal transform transitions
+        fadeTimerRef.current = setTimeout(() => {
+          setLayoutPhase("ready");
+        }, 350);
+      });
+      return () => {
+        cancelAnimationFrame(rafId);
+        if (fadeTimerRef.current) clearTimeout(fadeTimerRef.current);
+      };
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodesInitialized]);
@@ -405,6 +445,49 @@ function FlowRenderer({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targettedBlockLabel]);
+
+  // Re-layout when a loop node's header height changes (e.g., data schema toggled)
+  useEffect(() => {
+    const handleLoopHeaderResized = () => {
+      // Delay to let React process the updateNodeData state change
+      setTimeout(() => {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const currentEdges = reactFlowInstance.getEdges();
+        debouncedLayoutForDimensions(currentNodes, currentEdges);
+      }, 10);
+    };
+
+    window.addEventListener("loop-header-resized", handleLoopHeaderResized);
+    return () => {
+      window.removeEventListener(
+        "loop-header-resized",
+        handleLoopHeaderResized,
+      );
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+
+  // Re-layout when a workflow trigger node's async content changes
+  // (e.g., target workflow parameters finish loading, skeleton → actual fields)
+  useEffect(() => {
+    const handleTriggerContentChanged = () => {
+      setTimeout(() => {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const currentEdges = reactFlowInstance.getEdges();
+        debouncedLayoutForDimensions(currentNodes, currentEdges);
+      }, 10);
+    };
+
+    window.addEventListener(
+      "workflow-trigger-content-changed",
+      handleTriggerContentChanged,
+    );
+    return () => {
+      window.removeEventListener(
+        "workflow-trigger-content-changed",
+        handleTriggerContentChanged,
+      );
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
 
   useEffect(() => {
     const topLevelBlocks = getWorkflowBlocks(nodes, edges);
@@ -814,10 +897,21 @@ function FlowRenderer({
 
   return (
     <div
-      className="h-full w-full"
+      className={cn("relative h-full w-full", {
+        "react-flow--pre-layout": layoutPhase === "pre-layout",
+        "react-flow--initial-load":
+          layoutPhase === "initial-load" || layoutPhase === "pre-layout",
+      })}
       style={{ zIndex }}
       onMouseDownCapture={() => onMouseDownCapture?.()}
     >
+      {layoutPhase === "pre-layout" && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-950">
+          <div className="animate-pulse">
+            <LogoMinimized />
+          </div>
+        </div>
+      )}
       <Dialog
         open={blocker.state === "blocked"}
         onOpenChange={(open) => {
@@ -896,10 +990,11 @@ function FlowRenderer({
                     node.measured?.height !== newHeight
                   ) {
                     hasActualChanges = true;
-                    if (node.measured) {
-                      node.measured.width = newWidth;
-                      node.measured.height = newHeight;
-                    }
+                    node.measured = {
+                      ...node.measured,
+                      width: newWidth,
+                      height: newHeight,
+                    };
                   }
                 }
               });
@@ -913,11 +1008,11 @@ function FlowRenderer({
             // Only track changes after initial load is complete and not during internal updates
             // (e.g., switching conditional branches which is UI state, not workflow data)
             // Use getState() to get real-time value (not stale closure from render time)
-            const isInternalUpdate =
-              useWorkflowHasChangesStore.getState().isInternalUpdate;
+            const internalUpdateCount =
+              useWorkflowHasChangesStore.getState().internalUpdateCount;
             if (
               !isInitialLoadRef.current &&
-              !isInternalUpdate &&
+              internalUpdateCount === 0 &&
               changes.some((change) => {
                 return (
                   change.type === "add" ||

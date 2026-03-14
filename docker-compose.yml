@@ -25,6 +25,7 @@ services:
     # comment out if you want to externally call skyvern API
     ports:
       - 8000:8000
+      - 6080:6080 # for VNC WebSocket streaming
       - 9222:9222 # for cdp browser forwarding
     volumes:
       - ./artifacts:/data/artifacts

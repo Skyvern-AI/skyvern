@@ -106,7 +106,7 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
           onChange={(value) => {
             update({ jsonSchema: value });
           }}
-          suggestionContext={{}}
+          suggestionContext={{ current_schema: data.jsonSchema }}
         />
       </div>
     </div>

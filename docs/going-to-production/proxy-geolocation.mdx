@@ -221,6 +221,11 @@ export const COUNTRY_PATHS = {
 export const PROXY_LOCATIONS = [
   { code: "US", name: "United States", value: "RESIDENTIAL", timezone: "America/New_York", flag: "🇺🇸" },
   { code: "US_ISP", name: "United States (ISP)", value: "RESIDENTIAL_ISP", timezone: "America/New_York", flag: "🇺🇸" },
+  { code: "US_CA", name: "California", value: "US-CA", timezone: "America/Los_Angeles", flag: "🇺🇸" },
+  { code: "US_NY", name: "New York", value: "US-NY", timezone: "America/New_York", flag: "🇺🇸" },
+  { code: "US_TX", name: "Texas", value: "US-TX", timezone: "America/Chicago", flag: "🇺🇸" },
+  { code: "US_FL", name: "Florida", value: "US-FL", timezone: "America/New_York", flag: "🇺🇸" },
+  { code: "US_WA", name: "Washington", value: "US-WA", timezone: "America/Los_Angeles", flag: "🇺🇸" },
   { code: "CA", name: "Canada", value: "RESIDENTIAL_CA", timezone: "America/Toronto", flag: "🇨🇦" },
   { code: "MX", name: "Mexico", value: "RESIDENTIAL_MX", timezone: "America/Mexico_City", flag: "🇲🇽" },
   { code: "AR", name: "Argentina", value: "RESIDENTIAL_AR", timezone: "America/Argentina/Buenos_Aires", flag: "🇦🇷" },
@@ -236,13 +241,14 @@ export const PROXY_LOCATIONS = [
   { code: "ZA", name: "South Africa", value: "RESIDENTIAL_ZA", timezone: "Africa/Johannesburg", flag: "🇿🇦" },
   { code: "IN", name: "India", value: "RESIDENTIAL_IN", timezone: "Asia/Kolkata", flag: "🇮🇳" },
   { code: "PH", name: "Philippines", value: "RESIDENTIAL_PH", timezone: "Asia/Manila", flag: "🇵🇭" },
+  { code: "KR", name: "South Korea", value: "RESIDENTIAL_KR", timezone: "Asia/Seoul", flag: "🇰🇷" },
   { code: "JP", name: "Japan", value: "RESIDENTIAL_JP", timezone: "Asia/Tokyo", flag: "🇯🇵" },
   { code: "AU", name: "Australia", value: "RESIDENTIAL_AU", timezone: "Australia/Sydney", flag: "🇦🇺" },
   { code: "NZ", name: "New Zealand", value: "RESIDENTIAL_NZ", timezone: "Pacific/Auckland", flag: "🇳🇿" },
   { code: "NONE", name: "No Proxy", value: "NONE", timezone: "—", flag: "🚫" },
 ]
 
-export const AVAILABLE_COUNTRIES = ["US", "CA", "MX", "AR", "BR", "GB", "IE", "NL", "DE", "FR", "ES", "IT", "TR", "ZA", "IN", "PH", "JP", "AU", "NZ"]
+export const AVAILABLE_COUNTRIES = ["US", "CA", "MX", "AR", "BR", "GB", "IE", "NL", "DE", "FR", "ES", "IT", "TR", "ZA", "IN", "PH", "KR", "JP", "AU", "NZ"]
 
 export const ProxyMapSelector = () => {
   const [selected, setSelected] = useState("US")
@@ -559,6 +565,11 @@ Use these enum values for country-level targeting. Each routes through a residen
 |-------|---------|----------|
 | `RESIDENTIAL` | United States | America/New_York |
 | `RESIDENTIAL_ISP` | United States | America/New_York |
+| `US-CA` | California, US | America/Los_Angeles |
+| `US-NY` | New York, US | America/New_York |
+| `US-TX` | Texas, US | America/Chicago |
+| `US-FL` | Florida, US | America/New_York |
+| `US-WA` | Washington, US | America/Los_Angeles |
 | `RESIDENTIAL_AR` | Argentina | America/Argentina/Buenos_Aires |
 | `RESIDENTIAL_AU` | Australia | Australia/Sydney |
 | `RESIDENTIAL_BR` | Brazil | America/Sao_Paulo |
@@ -575,6 +586,7 @@ Use these enum values for country-level targeting. Each routes through a residen
 | `RESIDENTIAL_NL` | Netherlands | Europe/Amsterdam |
 | `RESIDENTIAL_NZ` | New Zealand | Pacific/Auckland |
 | `RESIDENTIAL_PH` | Philippines | Asia/Manila |
+| `RESIDENTIAL_KR` | South Korea | Asia/Seoul |
 | `RESIDENTIAL_TR` | Türkiye | Europe/Istanbul |
 | `RESIDENTIAL_ZA` | South Africa | Africa/Johannesburg |
 | `NONE` | No proxy | — |
@@ -720,7 +732,7 @@ Need a location that's not available? Get help in the [Skyvern Discord community
   <Card
     title="Browser Sessions"
     icon="window"
-    href="/browser-sessions/introduction"
+    href="/optimization/browser-sessions"
   >
     Maintain IP consistency across multi-step tasks
   </Card>

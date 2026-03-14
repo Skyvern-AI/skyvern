@@ -15,7 +15,7 @@ LOG = structlog.get_logger()
 
 
 class AuthStatus(str, Enum):
-    missing_env = "missing_env"
+    missing_api_key = "missing_api_key"
     invalid_format = "invalid_format"
     invalid = "invalid"
     expired = "expired"
@@ -28,17 +28,30 @@ class DiagnosticsResult(NamedTuple):
     detail: str | None
     validation: Any | None
     token: str | None
+    next_step: str | None = None
 
 
 def _is_local_request(request: Request) -> bool:
     host = request.client.host if request.client else None
     if not host:
+        LOG.warning("No client host found in request", client=request.client)
         return False
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
+        LOG.warning("Invalid IP address in request", host=host)
         return False
-    return addr.is_loopback or addr.is_private
+    # Check if request is from Docker host (gateway IP)
+    # Docker typically uses 172.x.x.x or 192.168.x.x for bridge networks
+    is_local = addr.is_loopback or addr.is_private
+    LOG.info(
+        "Checking if request is local",
+        host=host,
+        is_loopback=addr.is_loopback,
+        is_private=addr.is_private,
+        is_local=is_local,
+    )
+    return is_local
 
 
 def _require_local_access(request: Request) -> None:
@@ -51,7 +64,19 @@ def _require_local_access(request: Request) -> None:
 async def _evaluate_local_api_key(token: str) -> DiagnosticsResult:
     token_candidate = token.strip()
     if not token_candidate or token_candidate == "YOUR_API_KEY":
-        return DiagnosticsResult(status=AuthStatus.missing_env, detail=None, validation=None, token=None)
+        return DiagnosticsResult(
+            status=AuthStatus.missing_api_key,
+            detail=(
+                "No x-api-key header was provided. This endpoint validates the API key sent in the request, "
+                "not whether a .env file exists."
+            ),
+            validation=None,
+            token=None,
+            next_step=(
+                "Send the local API key in the x-api-key header, or call POST /api/v1/internal/auth/repair "
+                "from localhost to regenerate a local key and update the env files."
+            ),
+        )
 
     try:
         validation = await resolve_org_from_api_key(token_candidate, app.DATABASE)
@@ -99,10 +124,17 @@ def _emit_diagnostics(result: DiagnosticsResult) -> dict[str, object]:
     log_kwargs: dict[str, object] = {"status": status_value}
     if result.detail:
         log_kwargs["detail"] = result.detail
+    if result.next_step:
+        log_kwargs["next_step"] = result.next_step
 
     LOG.warning("Local auth diagnostics", **log_kwargs)
 
-    return {"status": status_value}
+    payload: dict[str, object] = {"status": status_value}
+    if result.detail:
+        payload["detail"] = result.detail
+    if result.next_step:
+        payload["next_step"] = result.next_step
+    return payload
 
 
 @router.post("/repair", include_in_schema=False)
@@ -127,7 +159,6 @@ async def repair_api_key(request: Request) -> dict[str, object]:
 
 @router.get("/status", include_in_schema=False)
 async def auth_status(request: Request) -> dict[str, object]:
-    _require_local_access(request)
     token_candidate = request.headers.get("x-api-key") or ""
     result = await _evaluate_local_api_key(token_candidate)
     return _emit_diagnostics(result)

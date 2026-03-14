@@ -1,3 +1,5 @@
+import re
+
 from fastapi import status
 
 
@@ -17,6 +19,12 @@ class SkyvernHTTPException(SkyvernException):
     def __init__(self, message: str | None = None, status_code: int = status.HTTP_400_BAD_REQUEST):
         self.status_code = status_code
         super().__init__(message)
+
+
+def get_user_facing_exception_message(exception: Exception) -> str:
+    if isinstance(exception, SkyvernException):
+        return exception.message or str(exception)
+    return f"Unexpected error: {exception}"
 
 
 class DisabledBlockExecutionError(SkyvernHTTPException):
@@ -214,10 +222,34 @@ class WorkflowRunParameterPersistenceError(SkyvernException):
         )
 
 
+# Covers the credential dict fields from SKY-8222 (password, username, secret_value, totp).
+# Not exhaustive — this is defense-in-depth; the root cause is fixed in the frontend.
+_SENSITIVE_CREDENTIAL_KEYS = ("password", "username", "secret", "totp", "secret_value")
+
+
+def sanitize_credential_for_error(credential_id: object) -> str:
+    """Prevent credential values from leaking into error messages.
+
+    When a credential dict is accidentally stringified and passed as a credential ID,
+    this ensures the raw values (passwords, usernames, etc.) are never included in
+    user-facing error messages, failure reasons, or logs.
+    """
+    if not isinstance(credential_id, str):
+        return f"<redacted - non-string type: {type(credential_id).__name__}>"
+    lower = credential_id.lower()
+    for key in _SENSITIVE_CREDENTIAL_KEYS:
+        if key in lower:
+            return "<redacted - contains credential data>"
+    if len(credential_id) > 200:
+        return "<redacted - value too long>"
+    return credential_id
+
+
 class InvalidCredentialId(SkyvernHTTPException):
     def __init__(self, credential_id: str) -> None:
         super().__init__(
-            f"Invalid credential ID: {credential_id}. Failed to resolve to a valid credential.",
+            f"Invalid credential ID: {sanitize_credential_for_error(credential_id)}."
+            " Failed to resolve to a valid credential.",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -277,10 +309,39 @@ class UnknownBrowserType(SkyvernException):
 
 
 class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
+    SUPPORT_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
+
     def __init__(self, browser_type: str, exception: Exception) -> None:
-        super().__init__(
-            f"Unknown error while creating browser context for {browser_type}. Exception type: {type(exception)} Exception message: {str(exception)}"
-        )
+        exception_type = type(exception).__name__
+        detail = self._get_detail(exception)
+        super().__init__(f"Failed to create browser context for {browser_type} ({exception_type}). {detail}")
+
+    @staticmethod
+    def _get_detail(exception: Exception) -> str:
+        raw_message = str(exception).strip()
+        # Patchright timeout errors include a verbose "Call log" section with launch args.
+        trimmed_message = raw_message.split("Call log:")[0].strip()
+        normalized_message = " ".join(trimmed_message.split())
+
+        timeout_match = re.search(r"Timeout\s+(\d+)ms\s+exceeded", normalized_message, flags=re.IGNORECASE)
+        if timeout_match and "launch_persistent_context" in normalized_message:
+            timeout_seconds = int(timeout_match.group(1)) // 1000
+            if timeout_seconds > 0:
+                return (
+                    f"Browser launch timed out after {timeout_seconds} seconds. "
+                    f"This is usually transient. {UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
+                )
+            return (
+                "Browser launch timed out. "
+                f"This is usually transient. {UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
+            )
+
+        if normalized_message:
+            if len(normalized_message) > 280:
+                normalized_message = f"{normalized_message[:277]}..."
+            return f"{normalized_message} {UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
+
+        return f"Unknown browser startup error. {UnknownErrorWhileCreatingBrowserContext.SUPPORT_GUIDANCE}"
 
 
 class OrganizationNotFound(SkyvernHTTPException):
@@ -422,8 +483,18 @@ class CredentialParameterParsingError(SkyvernException):
 
 
 class CredentialParameterNotFoundError(SkyvernException):
-    def __init__(self, credential_parameter_id: str) -> None:
-        super().__init__(f"Could not find credential parameter: {credential_parameter_id}")
+    def __init__(self, credential_parameter_id: str | None) -> None:
+        super().__init__(
+            f"Could not find credential parameter: {sanitize_credential_for_error(credential_parameter_id)}"
+        )
+
+
+class CredentialVaultNotConfiguredError(SkyvernException):
+    def __init__(self, vault_type: str, credential_id: str) -> None:
+        super().__init__(
+            f"Credential vault service '{vault_type}' is not configured. "
+            f"Credential {credential_id} was found in DB but cannot be resolved."
+        )
 
 
 class UnknownElementTreeFormat(SkyvernException):

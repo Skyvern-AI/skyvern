@@ -106,7 +106,11 @@ function useActions({ id }: Props): {
                 confidence: action.confidence_float,
                 input: getActionInput(action),
                 type: action.action_type,
-                success: actionResult?.[0]?.success ?? false,
+                // Wait actions always succeed — they intentionally return ActionFailure
+                // from the backend but completing a wait is expected, not a failure.
+                success:
+                  action.action_type === ActionTypes.wait ||
+                  (actionResult?.[0]?.success ?? false),
                 stepId: step.step_id,
                 index,
                 created_by: action.created_by,
@@ -121,7 +125,9 @@ function useActions({ id }: Props): {
             confidence: action.confidence_float ?? undefined,
             input: action.response ?? "",
             type: action.action_type,
+            // Wait actions always succeed — see comment in legacy path above.
             success:
+              action.action_type === ActionTypes.wait ||
               action.status === Status.Completed ||
               action.status === Status.Skipped,
             stepId: action.step_id ?? "",

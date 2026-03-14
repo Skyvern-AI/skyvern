@@ -1,0 +1,118 @@
+---
+title: Run Details
+subtitle: Inspect actions, outputs, recordings, and parameters for any run
+slug: cloud/viewing-results/run-details
+---
+
+Every run has a detail page showing what the AI saw, what it decided, what it extracted, and whether anything went wrong. Click any run in [Run History](/cloud/viewing-results/run-history) to get here.
+
+<img src="/images/cloud/task-run-details.png" alt="Run details page showing a completed workflow run" />
+
+## The header
+
+The top of the page shows the workflow title, a color-coded status badge, and the run ID. Three buttons on the right:
+
+- **API & Webhooks** — the exact API request that would reproduce this run, including endpoint, headers, and payload
+- **Edit** — jump to the workflow editor
+- **Rerun** — start a new run pre-filled with the same parameters (appears after the run finishes)
+
+While a run is in progress, a **Cancel** button appears instead of Rerun.
+
+<img src="/images/cloud/workflow-run-timeline.png" alt="A running workflow with live browser view and timeline" />
+
+## Extracted information
+
+On success, the **Extracted Information** section appears above the tabs — the structured data you asked for, displayed as JSON.
+
+<img src="/images/cloud/task-run-results.png" alt="Workflow Run Outputs showing extracted JSON data" />
+
+The output includes a `summary` (natural language description of what was accomplished), `extracted_information` (structured data matching your schema), and a `failure_reason` field that's `null` on success. On failure, a **Failure Reason** section appears instead with error details in a red box.
+
+## The five tabs
+
+### Overview
+
+The left panel shows the browser state (live stream while running, screenshots after completion). The right panel shows the AI's reasoning timeline.
+
+<img src="/images/cloud/task-run-actions-tab.png" alt="Overview tab showing browser screenshot and AI reasoning timeline" />
+
+The timeline is a chronological feed of three card types:
+
+| Card | What it shows |
+|------|--------------|
+| **Thought** | The AI's internal reasoning — what it sees, what it plans to do, and why. Tagged with "Decision." |
+| **Block** | When a workflow block starts or finishes (e.g., "Extraction"). Green checkmark = success. |
+| **Action** | Individual browser operations (e.g., "#1 Extract Data") with a description of what was done. |
+
+Click any timeline item to see its corresponding screenshot in the left panel. The **Actions** and **Steps** counters at the top give you a quick sense of how much work the run involved.
+
+<Tip>
+When a run produces wrong results, start with the Thought cards. Read the AI's reasoning to find where it went off track — a misidentified element, or a premature "goal met" conclusion.
+</Tip>
+
+### Output
+
+All output data in one place. **Workflow Run Outputs** shows the complete JSON with line numbers and syntax highlighting. **Workflow Run Downloaded Files** lists any files the workflow downloaded — click to download directly.
+
+### Parameters
+
+The configuration that produced this run: workflow input parameters (key-value pairs), webhook URL, proxy location, and HTTP headers. Use this to verify a run received the right inputs or to recreate a past result.
+
+When you select a block in the Overview timeline, this tab also shows that block's configuration — prompt, URL, schema, and other settings.
+
+### Recording
+
+Full video replay of the browser session. Every run is recorded automatically. Scrub through to see exactly what appeared on screen at any point.
+
+<Note>
+If the run was canceled before the browser started, you'll see a "No recording available" message.
+</Note>
+
+### Code
+
+Python code generated from the run. This tab appears when code generation is enabled (the default engine). Copy the code to run outside Skyvern, or click **Copy & Explain** for an AI-generated explanation.
+
+<img src="/images/cloud/workflow-run-code-tab.png" alt="Code tab showing generated Python code with syntax highlighting" />
+
+If the workflow uses cached code, a **Cache Key selector** lets you switch between versions.
+
+## Debugging failed runs
+
+Work through these in order:
+
+1. **Read the Failure Reason** at the top. It usually tells you what happened — timeout, navigation error, or missing element.
+2. **Walk the Thought cards** in the Overview timeline. Find the point where the AI made an incorrect assumption about page state.
+3. **Check the Parameters tab** to confirm inputs were correct. A wrong URL or missing parameter is a common cause.
+4. **Watch the Recording** to see what actually happened. Popups, CAPTCHAs, and unexpected page layouts are often obvious on video.
+
+## Run statuses
+
+| Status | Meaning |
+|--------|---------|
+| `created` | Initialized, waiting to be queued |
+| `queued` | Waiting for an available browser slot |
+| `running` | Actively executing — browser stream is live |
+| `completed` | Finished successfully |
+| `failed` | Stopped due to an error |
+| `terminated` | Stopped by the system (e.g., resource limits) |
+| `canceled` | Stopped by you via the Cancel button |
+| `timed_out` | Exceeded the configured time limit |
+
+While a run is in progress, the status badge updates automatically, the Overview tab shows a live browser stream, and the timeline grows as new items complete.
+
+<CardGroup cols={2}>
+  <Card
+    title="Downloading Artifacts"
+    icon="download"
+    href="/cloud/viewing-results/downloading-artifacts"
+  >
+    Access recordings, screenshots, and output files
+  </Card>
+  <Card
+    title="Watching Live Execution"
+    icon="eye"
+    href="/cloud/getting-started/monitor-a-run"
+  >
+    Monitor and take control of running tasks
+  </Card>
+</CardGroup>

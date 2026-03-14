@@ -262,7 +262,7 @@ versions = await client.get_workflow_versions(
 
 ```python
 updated = await client.update_workflow(
-    workflow_id: str,          # The version ID (not permanent ID).
+    workflow_id: str,          # The permanent ID (wpid_...).
     json_definition: dict | None = None,
     yaml_definition: str | None = None,
 ) -> Workflow
@@ -349,7 +349,7 @@ profile = await client.create_browser_profile(
     name: str,
     description: str | None = None,
     workflow_run_id: str | None = None,    # Run must have used persist_browser_session=True.
-    browser_session_id: str | None = None,
+    browser_session_id: str | None = None, # One of workflow_run_id or browser_session_id is required.
 ) -> BrowserProfile
 ```
 

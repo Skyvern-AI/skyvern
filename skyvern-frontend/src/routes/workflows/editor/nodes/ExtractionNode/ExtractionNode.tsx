@@ -118,7 +118,17 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
             </div>
 
             <WorkflowBlockInputTextarea
-              aiImprove={AI_IMPROVE_CONFIGS.extraction.dataExtractionGoal}
+              aiImprove={{
+                useCase:
+                  AI_IMPROVE_CONFIGS.extraction.dataExtractionGoal.useCase,
+                context: {
+                  ...AI_IMPROVE_CONFIGS.extraction.dataExtractionGoal.context,
+                  data_schema:
+                    data.dataSchema && data.dataSchema !== "null"
+                      ? data.dataSchema
+                      : undefined,
+                },
+              }}
               nodeId={id}
               onChange={(value) => {
                 if (!editable) {

@@ -32,6 +32,7 @@ Only `prompt` is a required parameter.
 | [`max_screenshot_scrolls`](#max_screenshot_scrolls) | integer | Capture lazy-loaded content in screenshots |
 | [`browser_address`](#browser_address) | string | Connect to your own browser for local development |
 | [`include_action_history_in_verification`](#include_action_history_in_verification) | boolean | Improve verification accuracy for multi-step forms |
+| [`run_with`](#run_with) | string | Choose whether to run with the AI agent or generated code |
 | [`model`](#model) | object | Configure model settings (e.g., temperature) |
 
 ---
@@ -293,8 +294,14 @@ Use this for geo-restricted content or to reduce bot detection.
 | `RESIDENTIAL_IT` | Italy |
 | `RESIDENTIAL_NL` | Netherlands |
 | `RESIDENTIAL_PH` | Philippines |
+| `RESIDENTIAL_KR` | South Korea |
 | `RESIDENTIAL_TR` | Turkey |
 | `RESIDENTIAL_ISP` | ISP proxy |
+| `US-CA` | California, US |
+| `US-NY` | New York, US |
+| `US-TX` | Texas, US |
+| `US-FL` | Florida, US |
+| `US-WA` | Washington, US |
 | `NONE` | No proxy |
 
 <CodeGroup>
@@ -325,7 +332,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 ```
 </CodeGroup>
 
-**Granular targeting (US states/cities):**
+**Granular targeting (state/city level):**
 
 <CodeGroup>
 ```python Python
@@ -748,6 +755,45 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
   -d '{
     "prompt": "Automate my local browser",
     "browser_address": "http://127.0.0.1:9222"
+  }'
+```
+</CodeGroup>
+
+---
+
+## `run_with`
+
+Choose whether the task runs with the AI agent or generated code.
+
+| Value | Description |
+|-------|-------------|
+| `agent` | Run with the AI agent (default). The agent analyzes screenshots and decides actions in real time. |
+| `code` | Run with generated code. Faster and more deterministic, but requires a previously published workflow. |
+
+<CodeGroup>
+```python Python
+result = await client.run_task(
+    prompt="Fill out the contact form",
+    run_with="agent"
+)
+```
+
+```typescript TypeScript
+const result = await client.runTask({
+  body: {
+    prompt: "Fill out the contact form",
+    run_with: "agent",
+  },
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Fill out the contact form",
+    "run_with": "agent"
   }'
 ```
 </CodeGroup>

@@ -103,8 +103,7 @@ function NavLinkGroup({
     return inputs.includes(match.pathname);
   });
 
-  const shouldCollapse =
-    collapsible && !sidebarCollapsed && links.length > initialVisibleCount;
+  const shouldCollapse = collapsible && links.length > initialVisibleCount;
   const alwaysVisibleLinks = shouldCollapse
     ? links.slice(0, initialVisibleCount)
     : links;
@@ -147,7 +146,7 @@ function NavLinkGroup({
         ))}
 
         {/* Collapsible section */}
-        {shouldCollapse && !sidebarCollapsed && (
+        {shouldCollapse && (
           <>
             {/* Peek item - fades out when collapsed */}
             <div
@@ -193,9 +192,19 @@ function NavLinkGroup({
             {/* Expand/collapse button */}
             <button
               onClick={() => setIsExpanded(!isExpanded)}
+              aria-label={
+                sidebarCollapsed
+                  ? isExpanded
+                    ? "Collapse links"
+                    : `Expand ${hiddenCount} more links`
+                  : undefined
+              }
               className={cn(
                 "flex w-full items-center gap-2 rounded-lg py-2 pl-3 text-slate-400 hover:bg-muted hover:text-primary",
                 { "py-1 pl-0 text-[0.8rem]": isMobile },
+                {
+                  "justify-center px-3": sidebarCollapsed,
+                },
               )}
             >
               <span
@@ -206,7 +215,9 @@ function NavLinkGroup({
               >
                 <ChevronDownIcon className="size-6" />
               </span>
-              <span>{isExpanded ? "Show less" : `${hiddenCount} more`}</span>
+              {!sidebarCollapsed && (
+                <span>{isExpanded ? "Show less" : `${hiddenCount} more`}</span>
+              )}
             </button>
           </>
         )}

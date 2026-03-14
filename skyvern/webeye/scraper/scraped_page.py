@@ -204,6 +204,23 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         LOG.info("Found a PDF viewer page", element=element)
         return attributes.get("src", "")
 
+    async def check_pdf_iframe(self) -> str | None:
+        """
+        Check if the page has a child iframe with PDF data URI content.
+        This handles Edge's PDF interstitial page where PDF links open in an iframe
+        with src="data:application/pdf;base64,..." on an about:blank page.
+        """
+        page = await self._browser_state.get_working_page()
+        if not page:
+            return None
+
+        for frame in page.main_frame.child_frames:
+            if frame.url and frame.url.startswith("data:application/pdf"):
+                LOG.info("Found a PDF iframe with data URI", frame_url_prefix=frame.url[:80])
+                return frame.url
+
+        return None
+
     def support_economy_elements_tree(self) -> bool:
         return True
 

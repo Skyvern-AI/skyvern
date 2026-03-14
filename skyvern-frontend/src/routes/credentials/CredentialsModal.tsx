@@ -9,19 +9,39 @@ import {
   useCredentialModalState,
   CredentialModalTypes,
 } from "./useCredentialModalState";
+import type { CredentialModalType } from "./useCredentialModalState";
 import { PasswordCredentialContent } from "./PasswordCredentialContent";
 import { SecretCredentialContent } from "./SecretCredentialContent";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { CreditCardCredentialContent } from "./CreditCardCredentialContent";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CreateCredentialRequest } from "@/api/types";
+import {
+  CreateCredentialRequest,
+  CredentialApiResponse,
+  isPasswordCredential,
+  isCreditCardCredential,
+  isSecretCredential,
+  TestCredentialStatusResponse,
+  TestLoginResponse,
+} from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
 import { AxiosError } from "axios";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import {
+  CheckCircledIcon,
+  CrossCircledIcon,
+  InfoCircledIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
+import { Checkbox } from "@/components/ui/checkbox";
+import { HelpTooltip } from "@/components/HelpTooltip";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { getHostname } from "@/util/getHostname";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -47,6 +67,20 @@ const SECRET_CREDENTIAL_INITIAL_VALUES = {
   secretValue: "",
 };
 
+// Maximum polling duration: 5 minutes
+const MAX_POLL_DURATION_MS = 5 * 60 * 1000;
+
+// Progressive status messages during test — each advances once at a real interval
+const TEST_STATUS_MESSAGES = [
+  "Testing credential login...",
+  "Entering credentials...",
+  "Verifying login...",
+  "This may take a moment...",
+  "Still working...",
+];
+// Delays (ms) before advancing to the next message (last message stays forever)
+const TEST_MESSAGE_DELAYS = [15_000, 30_000, 75_000, 60_000];
+
 // Function to generate a unique credential name
 function generateDefaultCredentialName(existingNames: string[]): string {
   const baseName = "credentials";
@@ -70,24 +104,40 @@ type Props = {
   /** Optional controlled mode: pass isOpen and onOpenChange to control modal state locally */
   isOpen?: boolean;
   onOpenChange?: (open: boolean) => void;
+  /** When provided, the modal opens in edit mode and pre-fills available fields */
+  editingCredential?: CredentialApiResponse;
+  /** Override the modal type (used in edit mode to set the correct form) */
+  overrideType?: CredentialModalType;
+  /** Called after a credential is saved with "Save browser session" checked to trigger an async test */
+  onStartBackgroundTest?: (
+    credentialId: string,
+    url: string,
+    userContext?: string,
+  ) => void;
 };
 
 function CredentialsModal({
   onCredentialCreated,
   isOpen: controlledIsOpen,
   onOpenChange: controlledOnOpenChange,
+  editingCredential,
+  overrideType,
+  onStartBackgroundTest,
 }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const {
     isOpen: urlIsOpen,
-    type,
+    type: urlType,
     setIsOpen: setUrlIsOpen,
   } = useCredentialModalState();
+
+  const isEditMode = !!editingCredential;
 
   // Use controlled props if provided, otherwise fall back to URL-based state
   const isOpen = controlledIsOpen ?? urlIsOpen;
   const setIsOpen = controlledOnOpenChange ?? setUrlIsOpen;
+  const type = overrideType ?? urlType;
   const { data: credentials } = useCredentialsQuery({
     page_size: 100,
   });
@@ -100,11 +150,140 @@ function CredentialsModal({
   const [secretCredentialValues, setSecretCredentialValues] = useState(
     SECRET_CREDENTIAL_INITIAL_VALUES,
   );
+  const [editingGroups, setEditingGroups] = useState({
+    name: false,
+    values: false,
+  });
 
-  // Set default name when modal opens
+  const handleEnableEditName = useCallback(() => {
+    setEditingGroups((prev) => ({ ...prev, name: true }));
+  }, []);
+
+  const handleEnableEditValues = useCallback(() => {
+    setEditingGroups((prev) => ({ ...prev, values: true }));
+  }, []);
+
+  // Test & Save Browser Profile state
+  const [testAndSave, setTestAndSave] = useState(false);
+  const [testUrl, setTestUrl] = useState("");
+  const [userContext, setUserContext] = useState("");
+  const [testStatus, setTestStatus] = useState<
+    "idle" | "testing" | "completed" | "failed" | "profile_failed"
+  >("idle");
+  const [testFailureReason, setTestFailureReason] = useState<string | null>(
+    null,
+  );
+  // The temporary credential ID and workflow run ID created by the test-login endpoint
+  const [testCredentialId, setTestCredentialId] = useState<string | null>(null);
+  // testWorkflowRunId is stored only as a ref (not state) because it's never
+  // rendered — it's only needed by cancelTest/close to call the cancel API.
+  // Refs mirror state so cancelTest always has the latest IDs regardless of
+  // React's async render cycle (e.g. cancel during the startTest HTTP call).
+  const testCredentialIdRef = useRef<string | null>(null);
+  const testWorkflowRunIdRef = useRef<string | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollStartTimeRef = useRef<number | null>(null);
+  const pollErrorCountRef = useRef(0);
+  // Guards against in-flight poll responses updating state after cancel/close
+  const pollCancelledRef = useRef(false);
+
+  // Captures save intent before mutation fires — testAndSave/testUrl may be
+  // reset by the time onSuccess runs, so we snapshot them here.
+  const saveIntentRef = useRef<{
+    shouldTestAfterSave: boolean;
+    testUrl: string;
+    userContext: string;
+    name: string;
+  }>({ shouldTestAfterSave: false, testUrl: "", userContext: "", name: "" });
+
+  // Cleanup polling on unmount
   useEffect(() => {
-    if (isOpen && credentials) {
-      const existingNames = credentials.map((cred) => cred.name);
+    return () => {
+      if (pollIntervalRef.current) {
+        clearTimeout(pollIntervalRef.current);
+      }
+    };
+  }, []);
+
+  // Invalidate a completed test when credential fields change — the saved
+  // temp credential no longer matches the form, so the user must re-test.
+  // Also clean up the orphaned temp credential on the backend.
+  useEffect(() => {
+    if (testStatus === "completed" || testStatus === "profile_failed") {
+      const staleCredId = testCredentialIdRef.current;
+      if (staleCredId) {
+        getClient(credentialGetter)
+          .then((client) => client.delete(`/credentials/${staleCredId}`))
+          .catch(() => {
+            // Best-effort cleanup
+          });
+      }
+      setTestStatus("idle");
+      setTestCredentialId(null);
+      testCredentialIdRef.current = null;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only react to login-affecting field changes, not testStatus, name, or userContext (context is cosmetic, not credential identity)
+  }, [
+    passwordCredentialValues.username,
+    passwordCredentialValues.password,
+    passwordCredentialValues.totp,
+    passwordCredentialValues.totp_type,
+    passwordCredentialValues.totp_identifier,
+    testUrl,
+  ]);
+
+  const nameInitializedRef = useRef(false);
+
+  // Set default name when modal opens, or pre-populate fields in edit mode
+  useEffect(() => {
+    if (!isOpen) {
+      nameInitializedRef.current = false;
+      return;
+    }
+
+    if (isEditMode) {
+      reset();
+      const cred = editingCredential.credential;
+      if (editingCredential.tested_url) {
+        setTestUrl(editingCredential.tested_url);
+      }
+      if (editingCredential.browser_profile_id) {
+        setTestAndSave(true);
+      }
+      if (editingCredential.user_context) {
+        setUserContext(editingCredential.user_context);
+      }
+      if (isPasswordCredential(cred)) {
+        setPasswordCredentialValues({
+          name: editingCredential.name,
+          username: cred.username,
+          password: "",
+          totp: "",
+          totp_type: cred.totp_type,
+          totp_identifier: cred.totp_identifier ?? "",
+        });
+      } else if (isCreditCardCredential(cred)) {
+        setCreditCardCredentialValues({
+          name: editingCredential.name,
+          cardNumber: "",
+          cardExpirationDate: "",
+          cardCode: "",
+          cardBrand: cred.brand,
+          cardHolderName: "",
+        });
+      } else if (isSecretCredential(cred)) {
+        setSecretCredentialValues({
+          name: editingCredential.name,
+          secretLabel: cred.secret_label ?? "",
+          secretValue: "",
+        });
+      }
+      return;
+    }
+
+    if (credentials && !nameInitializedRef.current) {
+      nameInitializedRef.current = true;
+      const existingNames = credentials.map((c) => c.name);
       const defaultName = generateDefaultCredentialName(existingNames);
 
       setPasswordCredentialValues((prev) => ({
@@ -120,13 +299,223 @@ function CredentialsModal({
         name: defaultName,
       }));
     }
-  }, [isOpen, credentials]);
+  }, [isOpen, credentials, isEditMode, editingCredential]);
 
   function reset() {
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
     setCreditCardCredentialValues(CREDIT_CARD_CREDENTIAL_INITIAL_VALUES);
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
+    setEditingGroups({ name: false, values: false });
+    setTestAndSave(false);
+    setTestUrl("");
+    setTestStatus("idle");
+    setTestFailureReason(null);
+    setTestCredentialId(null);
+    testCredentialIdRef.current = null;
+    testWorkflowRunIdRef.current = null;
+    pollStartTimeRef.current = null;
+    pollErrorCountRef.current = 0;
+    pollCancelledRef.current = false;
+    setUserContext("");
+    saveIntentRef.current = {
+      shouldTestAfterSave: false,
+      testUrl: "",
+      userContext: "",
+      name: "",
+    };
+    if (pollIntervalRef.current) {
+      clearTimeout(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
   }
+
+  const pollTestStatus = useCallback(
+    async (credentialId: string, workflowRunId: string) => {
+      // Bail out if test was canceled/closed while this request was in-flight
+      if (pollCancelledRef.current) return;
+
+      // Check if we've exceeded the maximum polling duration
+      if (
+        pollStartTimeRef.current &&
+        Date.now() - pollStartTimeRef.current > MAX_POLL_DURATION_MS
+      ) {
+        pollIntervalRef.current = null;
+        setTestStatus("failed");
+        setTestFailureReason(
+          "The test timed out after 5 minutes. The login may be taking too long or requires manual interaction.",
+        );
+        toast({
+          title: "Credential test timed out",
+          description:
+            "The test did not complete within 5 minutes. Please try again.",
+          variant: "destructive",
+        });
+        // Cancel the backend workflow run so it stops consuming resources
+        getClient(credentialGetter, "sans-api-v1")
+          .then((client) =>
+            client.post(
+              `/credentials/${credentialId}/test/${workflowRunId}/cancel`,
+            ),
+          )
+          .catch(() => {
+            // Best-effort — backend timeout will eventually clean up
+          });
+        return;
+      }
+
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<TestCredentialStatusResponse>(
+          `/credentials/${credentialId}/test/${workflowRunId}`,
+        );
+        const data = response.data;
+        // Check again after await — cancel may have happened while request was in-flight
+        if (pollCancelledRef.current) return;
+        pollErrorCountRef.current = 0; // Reset on successful poll
+
+        if (data.status === "completed") {
+          pollIntervalRef.current = null;
+          queryClient.invalidateQueries({ queryKey: ["credentials"] });
+
+          // Check if login succeeded but browser profile failed to save
+          if (data.browser_profile_failure_reason && !data.browser_profile_id) {
+            setTestStatus("profile_failed");
+            setTestFailureReason(data.browser_profile_failure_reason);
+            toast({
+              title: "Browser profile was not saved",
+              description: data.browser_profile_failure_reason,
+              variant: "destructive",
+            });
+            return;
+          }
+
+          setTestStatus("completed");
+          const profileHost = data.tested_url
+            ? getHostname(data.tested_url)
+            : null;
+          toast({
+            title: "Credential test passed",
+            description: data.browser_profile_id
+              ? profileHost
+                ? `Login successful! Saved browser session enabled for ${profileHost}`
+                : "Login successful! Saved browser session enabled."
+              : "Login successful!",
+            variant: "success",
+          });
+          return;
+        } else if (
+          data.status === "failed" ||
+          data.status === "terminated" ||
+          data.status === "timed_out" ||
+          data.status === "canceled"
+        ) {
+          pollIntervalRef.current = null;
+          setTestStatus("failed");
+          setTestFailureReason(data.failure_reason ?? "Unknown error");
+          const failedHost =
+            (data.tested_url ? getHostname(data.tested_url) : null) ??
+            (testUrl ? getHostname(testUrl) : null) ??
+            testUrl;
+          toast({
+            title: failedHost
+              ? `Unable to save browser session for ${failedHost}`
+              : "Unable to save browser session",
+            description:
+              data.failure_reason ?? "The login test did not succeed",
+            variant: "destructive",
+          });
+          return;
+        }
+        // Still running — schedule next poll
+        pollIntervalRef.current = setTimeout(() => {
+          pollTestStatus(credentialId, workflowRunId);
+        }, 3000);
+      } catch {
+        pollErrorCountRef.current++;
+        if (pollErrorCountRef.current >= 10) {
+          pollIntervalRef.current = null;
+          setTestStatus("failed");
+          setTestFailureReason(
+            "Network error — please check your connection and try again.",
+          );
+          toast({
+            title: "Connection lost",
+            description:
+              "Unable to reach the server after multiple attempts. Please check your connection.",
+            variant: "destructive",
+          });
+          return;
+        }
+        // Network error — retry after delay
+        pollIntervalRef.current = setTimeout(() => {
+          pollTestStatus(credentialId, workflowRunId);
+        }, 3000);
+      }
+    },
+    [credentialGetter, queryClient, testUrl],
+  );
+
+  const startTest = useCallback(async () => {
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const response = await client.post<TestLoginResponse>(
+        `/credentials/test-login`,
+        {
+          url: testUrl.trim(),
+          username: passwordCredentialValues.username.trim(),
+          password: passwordCredentialValues.password.trim(),
+          totp: passwordCredentialValues.totp.trim() || null,
+          totp_type: passwordCredentialValues.totp_type,
+          totp_identifier:
+            passwordCredentialValues.totp_identifier.trim() || null,
+          user_context: userContext.trim() || null,
+        },
+      );
+      const data = response.data;
+      testCredentialIdRef.current = data.credential_id;
+      testWorkflowRunIdRef.current = data.workflow_run_id;
+
+      // If the user canceled while the POST was in-flight, clean up immediately
+      if (pollCancelledRef.current) {
+        getClient(credentialGetter, "sans-api-v1")
+          .then((c) =>
+            c.post(
+              `/credentials/${data.credential_id}/test/${data.workflow_run_id}/cancel`,
+            ),
+          )
+          .catch(() => {});
+        testCredentialIdRef.current = null;
+        testWorkflowRunIdRef.current = null;
+        return;
+      }
+
+      setTestCredentialId(data.credential_id);
+      setTestStatus("testing");
+      pollStartTimeRef.current = Date.now();
+
+      // Start first poll after 3 seconds
+      pollIntervalRef.current = setTimeout(() => {
+        pollTestStatus(data.credential_id, data.workflow_run_id);
+      }, 3000);
+    } catch (error) {
+      setTestStatus("failed");
+      const detail = (
+        (error as AxiosError)?.response?.data as { detail?: string }
+      )?.detail;
+      setTestFailureReason(detail ?? "Failed to start credential test");
+      toast({
+        title: "Failed to start credential test",
+        description: detail ?? "An unexpected error occurred",
+        variant: "destructive",
+      });
+    }
+  }, [
+    credentialGetter,
+    testUrl,
+    passwordCredentialValues,
+    userContext,
+    pollTestStatus,
+  ]);
 
   const createCredentialMutation = useMutation({
     mutationFn: async (request: CreateCredentialRequest) => {
@@ -134,18 +523,60 @@ function CredentialsModal({
       const response = await client.post("/credentials", request);
       return response.data;
     },
-    onSuccess: (data) => {
-      reset();
-      setIsOpen(false);
+    onSuccess: async (data) => {
+      const {
+        shouldTestAfterSave,
+        testUrl: capturedTestUrl,
+        userContext: capturedUserContext,
+      } = saveIntentRef.current;
+
+      // Save metadata (tested_url, user_context) on the credential via PATCH
+      if (capturedTestUrl || capturedUserContext) {
+        try {
+          const client = await getClient(credentialGetter, "sans-api-v1");
+          await client.patch(`/credentials/${data.credential_id}`, {
+            name: data.name,
+            ...(capturedTestUrl && { tested_url: capturedTestUrl }),
+            user_context: capturedUserContext?.trim() || null,
+          });
+        } catch {
+          // Best-effort — credential was created, URL is just metadata
+        }
+      }
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
-      toast({
-        title: "Credential created",
-        description: "Your credential has been created successfully",
-        variant: "success",
-      });
       onCredentialCreated?.(data.credential_id);
+      reset();
+      setIsOpen(false);
+
+      if (shouldTestAfterSave && onStartBackgroundTest) {
+        onStartBackgroundTest(
+          data.credential_id,
+          capturedTestUrl,
+          capturedUserContext || undefined,
+        );
+        toast({
+          title: "Credential saved",
+          description:
+            "Testing browser profile in the background. You'll be notified when it's ready.",
+          variant: "success",
+        });
+      } else if (shouldTestAfterSave) {
+        // Background test hook not available in this context (e.g. workflow editor)
+        toast({
+          title: "Credential saved",
+          description:
+            "To set up a browser profile, test this credential from the Credentials page.",
+          variant: "success",
+        });
+      } else {
+        toast({
+          title: "Credential created",
+          description: "Your credential has been created successfully",
+          variant: "success",
+        });
+      }
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -156,6 +587,153 @@ function CredentialsModal({
       });
     },
   });
+
+  const updateCredentialMutation = useMutation({
+    mutationFn: async (request: CreateCredentialRequest) => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const response = await client.post(
+        `/credentials/${editingCredential?.credential_id}/update`,
+        request,
+      );
+      return response.data;
+    },
+    onSuccess: async () => {
+      const {
+        shouldTestAfterSave,
+        testUrl: capturedTestUrl,
+        userContext: capturedUserContext,
+        name: capturedName,
+      } = saveIntentRef.current;
+
+      // Persist metadata (tested_url, user_context) via PATCH
+      if (editingCredential?.credential_id) {
+        try {
+          const client = await getClient(credentialGetter, "sans-api-v1");
+          await client.patch(
+            `/credentials/${editingCredential.credential_id}`,
+            {
+              name: capturedName || editingCredential.name,
+              ...(capturedTestUrl && { tested_url: capturedTestUrl }),
+              user_context: capturedUserContext?.trim() || null,
+            },
+          );
+        } catch {
+          toast({
+            title: "Partial save",
+            description:
+              "Credential updated, but login instructions could not be saved. Please try editing again.",
+            variant: "destructive",
+          });
+        }
+      }
+
+      reset();
+      setIsOpen(false);
+      queryClient.invalidateQueries({
+        queryKey: ["credentials"],
+      });
+
+      if (
+        shouldTestAfterSave &&
+        capturedTestUrl &&
+        editingCredential?.credential_id &&
+        onStartBackgroundTest
+      ) {
+        onStartBackgroundTest(
+          editingCredential.credential_id,
+          capturedTestUrl,
+          capturedUserContext || undefined,
+        );
+        toast({
+          title: "Credential updated",
+          description:
+            "Testing login and saving browser session in the background…",
+          variant: "success",
+        });
+      } else {
+        toast({
+          title: "Credential updated",
+          description: "Your credential has been updated successfully",
+          variant: "success",
+        });
+      }
+    },
+    onError: (error: AxiosError) => {
+      const detail = (error.response?.data as { detail?: string })?.detail;
+      toast({
+        title: "Error",
+        description: detail ? detail : error.message,
+        variant: "destructive",
+      });
+    },
+  });
+
+  const renameCredentialMutation = useMutation({
+    mutationFn: async ({
+      id,
+      name,
+      tested_url,
+      user_context,
+    }: {
+      id: string;
+      name: string;
+      tested_url?: string;
+      user_context?: string | null;
+    }) => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const body: Record<string, string | null> = { name };
+      if (tested_url) {
+        body.tested_url = tested_url;
+      }
+      if (user_context !== undefined) {
+        body.user_context = user_context;
+      }
+      const response = await client.patch<CredentialApiResponse>(
+        `/credentials/${id}`,
+        body,
+      );
+      return response.data;
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({
+        queryKey: ["credentials"],
+      });
+      onCredentialCreated?.(data.credential_id);
+      reset();
+      setIsOpen(false);
+      toast({
+        title: "Credential saved",
+        description: "Your credential has been saved successfully",
+        variant: "success",
+      });
+    },
+    onError: (error: AxiosError) => {
+      const detail = (error.response?.data as { detail?: string })?.detail;
+      toast({
+        title: "Error",
+        description: detail ? detail : error.message,
+        variant: "destructive",
+      });
+    },
+  });
+
+  const activeMutation = isEditMode
+    ? updateCredentialMutation
+    : createCredentialMutation;
+
+  const handleRenameOnly = (name: string) => {
+    if (!editingCredential) return;
+    // Skip the API call if the name hasn't actually changed
+    if (name === editingCredential.name) {
+      reset();
+      setIsOpen(false);
+      return;
+    }
+    renameCredentialMutation.mutate({
+      id: editingCredential.credential_id,
+      name,
+    });
+  };
 
   const handleSave = () => {
     const name =
@@ -173,6 +751,20 @@ function CredentialsModal({
       return;
     }
 
+    // In edit mode, use editingGroups to determine what changed (type-agnostic)
+    if (isEditMode && editingCredential) {
+      if (!editingGroups.name && !editingGroups.values) {
+        // Nothing was edited — close silently
+        reset();
+        setIsOpen(false);
+        return;
+      }
+      if (editingGroups.name && !editingGroups.values) {
+        handleRenameOnly(name);
+        return;
+      }
+    }
+
     if (type === CredentialModalTypes.PASSWORD) {
       const username = passwordCredentialValues.username.trim();
       const password = passwordCredentialValues.password.trim();
@@ -187,7 +779,40 @@ function CredentialsModal({
         });
         return;
       }
-      createCredentialMutation.mutate({
+
+      // If test passed, rename the temp credential instead of creating a new one
+      if (testAndSave && testStatus === "completed" && testCredentialId) {
+        const url = testUrl.trim();
+        const ctx = userContext.trim();
+        renameCredentialMutation.mutate({
+          id: testCredentialId,
+          name,
+          tested_url: url || undefined,
+          user_context: ctx || null,
+        });
+        return;
+      }
+
+      // Capture intent before mutation — state will be reset in onSuccess
+      // In edit mode, only trigger a background test if the user actually changed
+      // credentials, user_context, or URL — not just because the checkbox was pre-checked.
+      const hasEditModeChanges =
+        !isEditMode ||
+        editingGroups.values ||
+        userContext.trim() !== (editingCredential?.user_context ?? "") ||
+        testUrl.trim() !== (editingCredential?.tested_url ?? "");
+      saveIntentRef.current = {
+        shouldTestAfterSave:
+          testAndSave &&
+          testStatus !== "completed" &&
+          testUrl.trim() !== "" &&
+          hasEditModeChanges,
+        testUrl: testUrl.trim(),
+        userContext: userContext.trim(),
+        name,
+      };
+
+      activeMutation.mutate({
         name,
         credential_type: "password",
         credential: {
@@ -242,7 +867,7 @@ function CredentialsModal({
       }
       // remove all spaces from the card number
       const number = creditCardCredentialValues.cardNumber.replace(/\s/g, "");
-      createCredentialMutation.mutate({
+      activeMutation.mutate({
         name,
         credential_type: "credit_card",
         credential: {
@@ -267,7 +892,7 @@ function CredentialsModal({
         return;
       }
 
-      createCredentialMutation.mutate({
+      activeMutation.mutate({
         name,
         credential_type: "secret",
         credential: {
@@ -278,12 +903,130 @@ function CredentialsModal({
     }
   };
 
+  const isTestInProgress = testStatus === "testing";
+  const isTestComplete =
+    testStatus === "completed" ||
+    testStatus === "failed" ||
+    testStatus === "profile_failed";
+
+  const [testMessageIndex, setTestMessageIndex] = useState(0);
+  useEffect(() => {
+    if (!isTestInProgress) {
+      setTestMessageIndex(0);
+      return;
+    }
+    // If we're at the last message, stay there
+    if (testMessageIndex >= TEST_STATUS_MESSAGES.length - 1) {
+      return;
+    }
+    const timeout = setTimeout(() => {
+      setTestMessageIndex((i) => i + 1);
+    }, TEST_MESSAGE_DELAYS[testMessageIndex] ?? 60_000);
+    return () => clearTimeout(timeout);
+  }, [isTestInProgress, testMessageIndex]);
+
   const credentialContent = (() => {
     if (type === CredentialModalTypes.PASSWORD) {
       return (
         <PasswordCredentialContent
           values={passwordCredentialValues}
           onChange={setPasswordCredentialValues}
+          url={testUrl}
+          onUrlChange={setTestUrl}
+          urlRequired={testAndSave}
+          urlDisabled={isTestInProgress}
+          editMode={isEditMode}
+          editingGroups={editingGroups}
+          onEnableEditName={handleEnableEditName}
+          onEnableEditValues={handleEnableEditValues}
+          afterUrl={
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <Checkbox
+                  id="test-and-save"
+                  checked={testAndSave}
+                  onCheckedChange={(checked) =>
+                    setTestAndSave(checked === true)
+                  }
+                  disabled={isTestInProgress}
+                />
+                <Label
+                  htmlFor="test-and-save"
+                  className="cursor-pointer text-sm font-medium"
+                >
+                  Save browser session for future logins
+                </Label>
+                <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future workflow runs will skip the login form entirely because the saved session is already authenticated." />
+              </div>
+
+              {testAndSave && (
+                <div className="space-y-1 pl-7">
+                  <Label
+                    htmlFor="user-context"
+                    className="text-xs text-muted-foreground"
+                  >
+                    Login instructions (optional)
+                  </Label>
+                  {/* maxLength is intentionally lower than the backend's 1000-char limit (defense-in-depth) */}
+                  <Textarea
+                    id="user-context"
+                    value={userContext}
+                    onChange={(e) => setUserContext(e.target.value)}
+                    placeholder='Describe the login flow, e.g. "Click the SSO button first, then enter Google credentials"'
+                    disabled={isTestInProgress}
+                    className="min-h-[60px] resize-y"
+                    rows={2}
+                    maxLength={500}
+                  />
+                </div>
+              )}
+
+              {isTestInProgress && (
+                <div className="flex items-center gap-2 pl-7 text-sm text-muted-foreground">
+                  <ReloadIcon className="size-4 animate-spin" />
+                  <span>{TEST_STATUS_MESSAGES[testMessageIndex]}</span>
+                </div>
+              )}
+              {testStatus === "completed" && (
+                <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
+                  <CheckCircledIcon className="size-4" />
+                  <span>
+                    {`Login test passed — saved browser session available for workflows using ${getHostname(testUrl) ?? testUrl}`}
+                  </span>
+                </div>
+              )}
+              {testStatus === "profile_failed" && (
+                <div className="space-y-1 pl-7">
+                  <div className="flex items-center gap-2 text-sm text-destructive">
+                    <CrossCircledIcon className="size-4" />
+                    <span>Browser profile was not saved</span>
+                  </div>
+                  {testFailureReason && (
+                    <p className="text-xs text-destructive/70">
+                      {testFailureReason}
+                    </p>
+                  )}
+                </div>
+              )}
+              {testStatus === "failed" && (
+                <div className="space-y-1 pl-7">
+                  <div className="flex items-center gap-2 text-sm text-destructive">
+                    <CrossCircledIcon className="size-4" />
+                    <span>
+                      {testUrl
+                        ? `Unable to save browser session for ${getHostname(testUrl) ?? testUrl}`
+                        : "Unable to save browser session"}
+                    </span>
+                  </div>
+                  {testFailureReason && (
+                    <p className="text-xs text-destructive/70">
+                      {testFailureReason}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          }
         />
       );
     }
@@ -292,6 +1035,10 @@ function CredentialsModal({
         <CreditCardCredentialContent
           values={creditCardCredentialValues}
           onChange={setCreditCardCredentialValues}
+          editMode={isEditMode}
+          editingGroups={editingGroups}
+          onEnableEditName={handleEnableEditName}
+          onEnableEditValues={handleEnableEditValues}
         />
       );
     }
@@ -299,15 +1046,130 @@ function CredentialsModal({
       <SecretCredentialContent
         values={secretCredentialValues}
         onChange={setSecretCredentialValues}
+        editMode={isEditMode}
+        editingGroups={editingGroups}
+        onEnableEditName={handleEnableEditName}
+        onEnableEditValues={handleEnableEditValues}
       />
     );
   })();
+
+  const handleTest = () => {
+    if (testUrl.trim() === "") {
+      toast({
+        title: "Error",
+        description: "Login URL is required to test credentials",
+        variant: "destructive",
+      });
+      return;
+    }
+    if (
+      !testUrl.trim().startsWith("http://") &&
+      !testUrl.trim().startsWith("https://")
+    ) {
+      toast({
+        title: "Error",
+        description: "Login URL must start with http:// or https://",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const username = passwordCredentialValues.username.trim();
+    const password = passwordCredentialValues.password.trim();
+    if (username === "" || password === "") {
+      toast({
+        title: "Error",
+        description: "Username and password are required to test",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Set testing state immediately to avoid button flash
+    pollCancelledRef.current = false;
+    setTestStatus("testing");
+    setTestFailureReason(null);
+    setTestCredentialId(null);
+    startTest();
+  };
+
+  const cancelTest = useCallback(async () => {
+    // Stop polling and prevent in-flight responses from updating state
+    pollCancelledRef.current = true;
+    if (pollIntervalRef.current) {
+      clearTimeout(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    setTestStatus("idle");
+    setTestFailureReason(null);
+    pollStartTimeRef.current = null;
+
+    // Use refs for IDs — state may be stale if cancel fires during startTest HTTP call
+    const credId = testCredentialIdRef.current;
+    const wrId = testWorkflowRunIdRef.current;
+    if (credId && wrId) {
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        await client.post(`/credentials/${credId}/test/${wrId}/cancel`);
+      } catch {
+        // Best-effort — backend background task will clean up regardless
+      }
+    }
+
+    testCredentialIdRef.current = null;
+    testWorkflowRunIdRef.current = null;
+    setTestCredentialId(null);
+    toast({
+      title: "Test canceled",
+      description: "The credential test has been canceled.",
+    });
+  }, [credentialGetter]);
+
+  // Whether the Test button should be shown
+  const showTestButton =
+    testAndSave &&
+    type === CredentialModalTypes.PASSWORD &&
+    (!isEditMode || editingGroups.values);
+
+  // Whether the Test button should be enabled
+  const canTest =
+    showTestButton &&
+    testUrl.trim() !== "" &&
+    passwordCredentialValues.username.trim() !== "" &&
+    passwordCredentialValues.password.trim() !== "" &&
+    !isTestInProgress;
 
   return (
     <Dialog
       open={isOpen}
       onOpenChange={(open) => {
         if (!open) {
+          // Prevent in-flight poll responses from updating state after close
+          pollCancelledRef.current = true;
+          // Cancel any in-progress test before closing — use refs for latest IDs
+          const credId = testCredentialIdRef.current;
+          const wrId = testWorkflowRunIdRef.current;
+          if (isTestInProgress && credId && wrId) {
+            getClient(credentialGetter, "sans-api-v1")
+              .then((client) =>
+                client.post(`/credentials/${credId}/test/${wrId}/cancel`),
+              )
+              .catch(() => {
+                // Best-effort cleanup
+              });
+          } else if (credId && !isTestInProgress) {
+            // Test completed but user closed without saving — delete orphaned temp credential
+            getClient(credentialGetter)
+              .then((client) => client.delete(`/credentials/${credId}`))
+              .catch(() => {});
+          }
+          testCredentialIdRef.current = null;
+          testWorkflowRunIdRef.current = null;
+          if (pollIntervalRef.current) {
+            clearTimeout(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+          }
           reset();
         }
         setIsOpen(open);
@@ -315,19 +1177,52 @@ function CredentialsModal({
     >
       <DialogContent className="w-[700px] max-w-[700px]">
         <DialogHeader>
-          <DialogTitle className="font-bold">Add Credential</DialogTitle>
+          <DialogTitle className="font-bold">
+            {isEditMode ? "Edit Credential" : "Add Credential"}
+          </DialogTitle>
         </DialogHeader>
+        {isEditMode && editingGroups.values && (
+          <Alert>
+            <InfoCircledIcon className="size-4" />
+            <AlertDescription>
+              For security, saved values are never retrieved. All credential
+              fields must be filled in to save your changes.
+            </AlertDescription>
+          </Alert>
+        )}
         {credentialContent}
+
         <DialogFooter>
-          <Button
-            onClick={handleSave}
-            disabled={createCredentialMutation.isPending}
-          >
-            {createCredentialMutation.isPending ? (
-              <ReloadIcon className="mr-2 size-4 animate-spin" />
-            ) : null}
-            Save
-          </Button>
+          <div className="flex w-full items-center justify-end gap-2">
+            {showTestButton &&
+              (isTestInProgress ? (
+                <Button variant="destructive" onClick={cancelTest}>
+                  Cancel Test
+                </Button>
+              ) : (
+                <Button
+                  variant="secondary"
+                  onClick={handleTest}
+                  disabled={!canTest}
+                >
+                  {isTestComplete ? "Retest" : "Test"}
+                </Button>
+              ))}
+            <Button
+              onClick={handleSave}
+              disabled={
+                activeMutation.isPending ||
+                renameCredentialMutation.isPending ||
+                isTestInProgress
+              }
+            >
+              {activeMutation.isPending ||
+              renameCredentialMutation.isPending ? (
+                <ReloadIcon className="mr-2 size-4 animate-spin" />
+              ) : null}
+              {isEditMode ? "Update" : "Save"}
+            </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>

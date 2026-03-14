@@ -22,9 +22,9 @@ export interface GetWorkflowsRequest {
     only_saved_tasks?: boolean;
     only_workflows?: boolean;
     only_templates?: boolean;
-    /** Unified search across workflow title, folder name, and parameter metadata (key, description, default_value). */
+    /** Case-insensitive substring search across: workflow title, folder name, and parameter metadata (key, description, default_value). A workflow is returned if any of these fields match. Soft-deleted parameter definitions are excluded. Takes precedence over the deprecated `title` parameter. */
     search_key?: string;
-    /** Deprecated: use search_key instead. */
+    /** Deprecated: use search_key instead. Falls back to title-only search if search_key is not provided. */
     title?: string;
     /** Filter workflows by folder ID */
     folder_id?: string;

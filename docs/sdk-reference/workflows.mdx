@@ -107,15 +107,25 @@ Create a new workflow from a JSON or YAML definition.
 ```python
 workflow = await client.create_workflow(
     json_definition={
-        "blocks": [
-            {
-                "block_type": "task",
-                "label": "extract_data",
-                "prompt": "Extract the top 3 products",
-                "url": "https://example.com/products",
-            }
-        ],
-        "parameters": [],
+        "title": "Extract Products",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "key": "target_url",
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "string",
+                    "description": "URL to scrape",
+                }
+            ],
+            "blocks": [
+                {
+                    "block_type": "task",
+                    "label": "extract_data",
+                    "prompt": "Extract the top 3 products",
+                    "url": "{{ target_url }}",
+                }
+            ],
+        },
     },
 )
 print(workflow.workflow_permanent_id)
@@ -229,17 +239,20 @@ Update an existing workflow's definition.
 
 ```python
 updated = await client.update_workflow(
-    "wf_abc123",
+    "wpid_abc123",
     json_definition={
-        "blocks": [
-            {
-                "block_type": "task",
-                "label": "extract_data",
-                "prompt": "Extract the top 5 products",
-                "url": "https://example.com/products",
-            }
-        ],
-        "parameters": [],
+        "title": "Extract Products",
+        "workflow_definition": {
+            "blocks": [
+                {
+                    "block_type": "task",
+                    "label": "extract_data",
+                    "prompt": "Extract the top 5 products",
+                    "url": "https://example.com/products",
+                }
+            ],
+            "parameters": [],
+        },
     },
 )
 print(f"Updated to v{updated.version}")
@@ -249,7 +262,7 @@ print(f"Updated to v{updated.version}")
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `workflow_id` | `str` | Yes | The workflow version ID (not the permanent ID). |
+| `workflow_id` | `str` | Yes | The workflow's permanent ID (`wpid_...`). |
 | `json_definition` | `WorkflowCreateYamlRequest` | No | Updated workflow definition as JSON. |
 | `yaml_definition` | `str` | No | Updated workflow definition as YAML. |
 

@@ -56,18 +56,23 @@ When you need reusable, multi-step automations, use **Workflows** instead.
 
 A **Workflow** is a reusable template composed of blocks. Unlike tasks, workflows can be versioned, shared across your team, and executed repeatedly with different parameters.
 
+```mermaid
+flowchart LR
+    A["Navigate<br/>Block"] --> B["Login<br/>Block"]
+    B --> C["Extract<br/>Block"]
+    C --> D["Download<br/>Block"]
+
+    subgraph WORKFLOW
+        direction LR
+        A
+        B
+        C
+        D
+    end
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        WORKFLOW                             │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐  │
-│  │ Navigate │ → │  Login   │ → │ Extract  │ → │ Download │  │
-│  │  Block   │   │  Block   │   │  Block   │   │  Block   │  │
-│  └──────────┘   └──────────┘   └──────────┘   └──────────┘  │
-│                                                             │
-│  Parameters: {{search_query}}, {{max_price}}                │
-│  Each block can reference outputs from previous blocks      │
-└─────────────────────────────────────────────────────────────┘
-```
+
+> **Parameters:** `{{search_query}}`, `{{max_price}}`
+> Each block can reference outputs from previous blocks.
 
 ```python
 result = await skyvern.run_workflow(
@@ -87,7 +92,7 @@ Workflows support Jinja templating:
 
 **Use Workflows for:** repeatable automations, multi-step processes, team-shared templates, complex logic with loops or conditionals.
 
-See [Workflow Blocks](/workflows/workflow-blocks-details) for the full block reference.
+See [Workflow Blocks](/multi-step-automations/workflow-blocks-reference) for the full block reference.
 
 ---
 
@@ -141,16 +146,14 @@ For detailed block configuration, see [Workflow Blocks](/workflows/workflow-bloc
 
 Every time you execute a task or workflow, Skyvern creates a **Run** to track progress and store outputs.
 
-```
-                    ┌→ completed
-                    │
-                    ├→ failed
-                    │
-created → queued → running ─┼→ timed_out
-                    │
-                    ├→ terminated
-                    │
-                    └→ canceled
+```mermaid
+flowchart LR
+    created --> queued --> running
+    running --> completed
+    running --> failed
+    running --> timed_out
+    running --> terminated
+    running --> canceled
 ```
 
 ```python
@@ -191,29 +194,12 @@ print(result.output)   # {"heading": "Welcome"}
 
 Credentials provide secure storage for authentication data. Skyvern encrypts credentials at rest and in transit, and injects them directly into the browser—**credentials are never sent to or seen by the LLM**.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    SECURITY MODEL                           │
-│                                                             │
-│  You store credentials      Skyvern encrypts & stores       │
-│         │                            │                      │
-│         ▼                            ▼                      │
-│  ┌─────────────┐             ┌─────────────────┐            │
-│  │ Skyvern UI  │             │ Encrypted Vault │            │
-│  │ or API      │ ─────────── │ (or Bitwarden,  │            │
-│  └─────────────┘             │  1Password)     │            │
-│                              └────────┬────────┘            │
-│                                       │                     │
-│                                       ▼                     │
-│                              ┌─────────────────┐            │
-│                              │ Login Block     │            │
-│                              │ injects into    │            │
-│                              │ browser fields  │            │
-│                              └─────────────────┘            │
-│                                       │                     │
-│                    LLM sees: "login happened"               │
-│                    LLM never sees: actual credentials       │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["You store credentials"] --> B["Skyvern UI<br/>or API"]
+    B --> C["Encrypted Vault<br/>(or Bitwarden, 1Password)"]
+    C --> D["Login Block<br/>injects into<br/>browser fields"]
+    D --> E["LLM sees: 'login happened'<br/>LLM never sees: actual credentials"]
 ```
 
 **Supported credential types:**
@@ -227,7 +213,7 @@ Credentials provide secure storage for authentication data. Skyvern encrypts cre
 - **1Password** — Sync from your 1Password vault
 - **Azure Key Vault** — Enterprise secret management
 
-See [Credentials](/credentials/introduction) for setup instructions.
+See [Credentials](/sdk-reference/credentials) for setup instructions.
 
 ---
 
@@ -235,24 +221,23 @@ See [Credentials](/credentials/introduction) for setup instructions.
 
 Skyvern offers two ways to manage browser state across runs:
 
+```mermaid
+flowchart LR
+    subgraph SESSION ["Browser Session (live, temporary)"]
+        A["Active Browser<br/>Instance"]
+    end
+    subgraph PROFILE ["Browser Profile (saved, reusable)"]
+        B["Snapshot of state<br/>(cookies, storage)"]
+    end
+    A -- "save" --> B
+    B -- "restore" --> A
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│   BROWSER SESSION                  BROWSER PROFILE          │
-│   (live, temporary)                (saved, reusable)        │
-│                                                             │
-│   ┌─────────────┐                 ┌─────────────┐           │
-│   │  Active     │   ──save──▶     │  Snapshot   │           │
-│   │  Browser    │                 │  of state   │           │
-│   │  Instance   │   ◀──restore──  │  (cookies,  │           │
-│   └─────────────┘                 │  storage)   │           │
-│                                   └─────────────┘           │
-│   • Expires after timeout         • Persists indefinitely  │
-│   • For real-time chaining        • For skipping login     │
-│   • Max 24 hours                  • Shared across team     │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+
+| | Browser Session | Browser Profile |
+|---|---|---|
+| **Lifetime** | Expires after timeout (max 24h) | Persists indefinitely |
+| **Use case** | Real-time task chaining | Skip login on repeated runs |
+| **Sharing** | Single use | Shared across team |
 
 ### Browser Sessions
 
@@ -304,7 +289,7 @@ await skyvern.run_workflow(
 
 **What's saved:** Cookies, authentication tokens, local storage, session storage.
 
-See [Browser Sessions](/browser-sessions/introduction) for details.
+See [Browser Sessions](/optimization/browser-sessions) for details.
 
 ---
 
@@ -387,14 +372,14 @@ result = await skyvern.run_task(
   <Card
     title="Build Workflows"
     icon="diagram-project"
-    href="/workflows/run-workflows"
+    href="/multi-step-automations/build-a-workflow"
   >
     Create multi-step automations
   </Card>
   <Card
     title="Workflow Blocks"
     icon="cube"
-    href="/workflows/workflow-blocks-details"
+    href="/multi-step-automations/workflow-blocks-reference"
   >
     Full reference for all block types
   </Card>

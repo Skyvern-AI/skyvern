@@ -77,6 +77,8 @@ class ForgeApp:
     AUTO_COMPLETION_LLM_API_HANDLER: LLMAPIHandler
     SVG_CSS_CONVERTER_LLM_API_HANDLER: LLMAPIHandler | None
     SCRIPT_GENERATION_LLM_API_HANDLER: LLMAPIHandler
+    SCRIPT_REVIEWER_LLM_API_HANDLER: LLMAPIHandler
+    ADAPTIVE_SCRIPT_GEN_LLM_API_HANDLER: LLMAPIHandler
     WORKFLOW_CONTEXT_MANAGER: WorkflowContextManager
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
@@ -117,6 +119,7 @@ def create_forge_app() -> ForgeApp:
         StorageFactory.set_storage(AzureStorage())
     app.STORAGE = StorageFactory.get_storage()
     app.CACHE = CacheFactory.get_cache()
+
     app.ARTIFACT_MANAGER = ArtifactManager()
     app.BROWSER_MANAGER = RealBrowserManager()
     app.EXPERIMENTATION_PROVIDER = NoOpExperimentationProvider()
@@ -199,11 +202,22 @@ def create_forge_app() -> ForgeApp:
         if settings.SCRIPT_GENERATION_LLM_KEY
         else app.SECONDARY_LLM_API_HANDLER
     )
+    app.SCRIPT_REVIEWER_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.SCRIPT_REVIEWER_LLM_KEY)
+        if settings.SCRIPT_REVIEWER_LLM_KEY
+        else app.LLM_API_HANDLER
+    )
+    app.ADAPTIVE_SCRIPT_GEN_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY)
+        if settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY
+        else app.LLM_API_HANDLER
+    )
 
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
     app.WORKFLOW_SERVICE = WorkflowService()
     app.AGENT_FUNCTION = AgentFunction()
     app.PERSISTENT_SESSIONS_MANAGER = DefaultPersistentSessionsManager(database=app.DATABASE)
+    app.PERSISTENT_SESSIONS_MANAGER.watch_session_pool()
     app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
     operating_system = detect_os()
     if operating_system in STREAMING_SUPPORTED_OS:
@@ -261,7 +275,13 @@ def create_forge_app() -> ForgeApp:
     app.authenticate_user_function = None
     app.setup_api_app = None
     app.api_app_startup_event = None
-    app.api_app_shutdown_event = None
+
+    async def default_api_app_shutdown_event() -> None:
+        from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
+
+        await DefaultPersistentSessionsManager.close()
+
+    app.api_app_shutdown_event = default_api_app_shutdown_event
 
     # Set up startup/shutdown events to manage streaming service monitoring
     if app.STREAMING_SERVICE:

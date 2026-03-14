@@ -9,7 +9,9 @@ from .totp_type import TotpType
 
 class PasswordCredentialResponse(UniversalBaseModel):
     """
-    Response model for password credentials, containing only the username.
+    Response model for password credentials — non-sensitive fields only.
+
+    SECURITY: Must NEVER include password, TOTP secret, or TOTP identifier.
     """
 
     username: str = pydantic.Field()

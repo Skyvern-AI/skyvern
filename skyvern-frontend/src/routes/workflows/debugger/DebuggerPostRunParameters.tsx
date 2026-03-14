@@ -13,6 +13,7 @@ import { DebuggerSendEmailBlockParameters } from "./DebuggerSendEmailBlockInfo";
 import { ProxyLocation } from "@/api/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { HelpTooltip } from "@/components/HelpTooltip";
+import { Switch } from "@/components/ui/switch";
 
 function DebuggerPostRunParameters() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
@@ -104,6 +105,127 @@ function DebuggerPostRunParameters() {
           </div>
         </div>
       ) : null}
+      {activeBlock && activeBlock.block_type === WorkflowBlockTypes.Wait ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-sm font-bold">Wait Block Parameters</h1>
+            <div className="flex flex-col gap-2">
+              <div className="flex w-full items-center justify-start gap-2">
+                <h1 className="text-sm">Wait Duration</h1>
+                <HelpTooltip content="Seconds to wait before proceeding." />
+              </div>
+              <Input
+                value={
+                  typeof activeBlock.wait_sec === "number"
+                    ? `${activeBlock.wait_sec}s`
+                    : "N/A"
+                }
+                readOnly
+              />
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.HumanInteraction ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-sm font-bold">
+              Human Interaction Block Parameters
+            </h1>
+            {activeBlock.instructions ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex w-full items-center justify-start gap-2">
+                  <h1 className="text-sm">Instructions</h1>
+                  <HelpTooltip content="Instructions for the human interaction." />
+                </div>
+                <AutoResizingTextarea
+                  value={activeBlock.instructions}
+                  readOnly
+                />
+              </div>
+            ) : null}
+            {activeBlock.positive_descriptor ? (
+              <div className="flex flex-col gap-2">
+                <h1 className="text-sm">Positive Descriptor</h1>
+                <Input value={activeBlock.positive_descriptor} readOnly />
+              </div>
+            ) : null}
+            {activeBlock.negative_descriptor ? (
+              <div className="flex flex-col gap-2">
+                <h1 className="text-sm">Negative Descriptor</h1>
+                <Input value={activeBlock.negative_descriptor} readOnly />
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.Conditional ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-sm font-bold">Conditional Block Parameters</h1>
+            {activeBlock.executed_branch_expression ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex w-full items-center justify-start gap-2">
+                  <h1 className="text-sm">Executed Expression</h1>
+                  <HelpTooltip content="The branch expression that was evaluated." />
+                </div>
+                <AutoResizingTextarea
+                  value={activeBlock.executed_branch_expression}
+                  readOnly
+                />
+              </div>
+            ) : null}
+            {typeof activeBlock.executed_branch_result === "boolean" ? (
+              <div className="flex flex-col gap-2">
+                <h1 className="text-sm">Branch Result</h1>
+                <div className="flex items-center gap-3">
+                  <Switch
+                    checked={activeBlock.executed_branch_result}
+                    disabled
+                  />
+                  <span className="text-sm text-slate-400">
+                    {activeBlock.executed_branch_result ? "True" : "False"}
+                  </span>
+                </div>
+              </div>
+            ) : null}
+            {activeBlock.executed_branch_next_block ? (
+              <div className="flex flex-col gap-2">
+                <h1 className="text-sm">Next Block</h1>
+                <Input
+                  value={activeBlock.executed_branch_next_block}
+                  readOnly
+                />
+              </div>
+            ) : null}
+            {activeBlock.executed_branch_id ? (
+              <div className="flex flex-col gap-2">
+                <h1 className="text-sm">Executed Branch ID</h1>
+                <Input value={activeBlock.executed_branch_id} readOnly />
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {activeBlock &&
+      activeBlock.block_type === WorkflowBlockTypes.TextPrompt ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-sm font-bold">Text Prompt Block Parameters</h1>
+            {activeBlock.prompt ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex w-full items-center justify-start gap-2">
+                  <h1 className="text-sm">Prompt</h1>
+                  <HelpTooltip content="Instructions passed to the selected LLM." />
+                </div>
+                <AutoResizingTextarea value={activeBlock.prompt} readOnly />
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
           <h1 className="text-sm font-bold">Workflow Parameters</h1>
@@ -171,6 +293,27 @@ function DebuggerPostRunParameters() {
               />
             </div>
           </div>
+          {workflowRun.browser_session_id ? (
+            <div className="flex flex-col gap-2">
+              <div className="flex w-full items-center justify-start gap-2">
+                <h1 className="text-sm">Browser Session ID</h1>
+                <HelpTooltip content="The browser session ID used for this run." />
+              </div>
+              <Input value={workflowRun.browser_session_id} readOnly />
+            </div>
+          ) : null}
+          {workflowRun.max_screenshot_scrolls != null ? (
+            <div className="flex flex-col gap-2">
+              <div className="flex w-full items-center justify-start gap-2">
+                <h1 className="text-sm">Max Screenshot Scrolls</h1>
+                <HelpTooltip content="Maximum number of screenshot scrolls." />
+              </div>
+              <Input
+                value={workflowRun.max_screenshot_scrolls.toString()}
+                readOnly
+              />
+            </div>
+          ) : null}
         </div>
       </div>
       {workflowRun.task_v2 ? (
@@ -187,10 +330,6 @@ function DebuggerPostRunParameters() {
                 readOnly
               />
             </div>
-            <AutoResizingTextarea
-              value={workflowRun.task_v2?.prompt ?? ""}
-              readOnly
-            />
           </div>
         </div>
       ) : null}

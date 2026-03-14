@@ -67,7 +67,7 @@ BLOCK STRUCTURE REQUIREMENTS:
 1. Each block MUST have: label, block_type, continue_on_failure
 2. Navigation blocks need: url (can be empty string ""), navigation_goal, engine (set to "skyvern-1.0")
 3. Login blocks need: url, navigation_goal, parameter_keys (empty array if no credentials), engine (set to "skyvern-1.0")
-4. Extraction blocks need: url (can be empty string ""), data_extraction_goal, data_schema, engine (set to "skyvern-1.0")
+4. Extraction blocks need: url (can be empty string ""), data_extraction_goal, data_schema (use snake_case for all field names, e.g., product_name, order_date), engine (set to "skyvern-1.0")
 5. Action blocks need: url (can be empty string ""), navigation_goal, engine (set to "skyvern-1.0")
 6. Validation blocks need: complete_criterion OR terminate_criterion (at least one must be set), parameter_keys (empty array if none)
 7. For_loop blocks need: loop_blocks, loop_variable_reference

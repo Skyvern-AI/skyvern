@@ -30,6 +30,10 @@
 
     --destructive: 0 84.2% 60.2%;
     --destructive-foreground: 210 40% 98%;
+    --error-bg-light: rgba(220, 38, 38, 0.1);
+
+    --warning: 32.1 94.6% 43.7%; /* amber-600 */
+    --warning-foreground: 36 100% 97.1%; /* amber-50 */
 
     --border: 214.3 31.8% 91.4%;
     --input: 214.3 31.8% 91.4%;
@@ -62,6 +66,7 @@
 
     --destructive: 0 72.2% 50.6%; /* red-600 */
     --destructive-foreground: 0 85.7% 97.3%; /* red-50 */
+    --error-bg-light: rgba(220, 38, 38, 0.1);
 
     --warning: 40.6 96.1% 40.4%; /* yellow-600 */
     --warning-foreground: 54.5 91.7% 95.3%; /* yellow-50 */

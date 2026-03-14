@@ -54,6 +54,7 @@ export const ProxyLocation = {
   ResidentialIT: "RESIDENTIAL_IT",
   ResidentialNL: "RESIDENTIAL_NL",
   ResidentialPH: "RESIDENTIAL_PH",
+  ResidentialKR: "RESIDENTIAL_KR",
   ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;
@@ -114,6 +115,8 @@ export type Task = {
   status: Status;
   created_at: string; // ISO 8601
   modified_at: string; // ISO 8601
+  started_at: string | null; // ISO 8601
+  finished_at: string | null; // ISO 8601
   extracted_information: Record<string, unknown> | string | null;
   screenshot_url: string | null;
   recording_url: string | null;
@@ -151,6 +154,9 @@ export type TaskApiResponse = {
   task_v2: TaskV2 | null;
   workflow_run_id: string | null;
   browser_session_id: string | null;
+  waiting_for_verification_code?: boolean;
+  verification_code_identifier?: string | null;
+  verification_code_polling_started_at?: string | null;
 };
 
 export type CreateTaskRequest = {
@@ -381,6 +387,8 @@ export type DebugSessionApiResponse = {
 export type WorkflowRunApiResponse = {
   created_at: string;
   failure_reason: string | null;
+  started_at: string | null; // ISO 8601
+  finished_at: string | null; // ISO 8601
   modified_at: string;
   proxy_location: ProxyLocation | null;
   script_run: boolean | null;
@@ -416,6 +424,10 @@ export type WorkflowRunStatusApiResponse = {
   workflow_title: string | null;
   browser_session_id: string | null;
   max_screenshot_scrolls: number | null;
+  run_with: string | null;
+  waiting_for_verification_code?: boolean;
+  verification_code_identifier?: string | null;
+  verification_code_polling_started_at?: string | null;
 };
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
@@ -441,7 +453,11 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   workflow_title: string | null;
   browser_session_id: string | null;
   max_screenshot_scrolls: number | null;
+  run_with: string | null;
   workflow: WorkflowApiResponse;
+  waiting_for_verification_code?: boolean;
+  verification_code_identifier?: string | null;
+  verification_code_polling_started_at?: string | null;
 };
 
 export type TaskGenerationApiResponse = {
@@ -501,6 +517,7 @@ export type Createv2TaskRequest = {
 export type PasswordCredentialApiResponse = {
   username: string;
   totp_type: "authenticator" | "email" | "text" | "none";
+  totp_identifier?: string | null;
 };
 
 export type CreditCardCredentialApiResponse = {
@@ -520,6 +537,9 @@ export type CredentialApiResponse = {
     | SecretCredentialResponse;
   credential_type: "password" | "credit_card" | "secret";
   name: string;
+  browser_profile_id?: string | null;
+  tested_url?: string | null;
+  user_context?: string | null;
 };
 
 export function isPasswordCredential(
@@ -624,3 +644,27 @@ export type PylonEmailHash = {
 };
 
 export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;
+
+export type TestLoginResponse = {
+  credential_id: string;
+  workflow_run_id: string;
+  status: string;
+};
+
+export type TestCredentialStatusResponse = {
+  credential_id: string;
+  workflow_run_id: string;
+  status:
+    | "created"
+    | "queued"
+    | "running"
+    | "completed"
+    | "failed"
+    | "timed_out"
+    | "terminated"
+    | "canceled";
+  failure_reason?: string | null;
+  browser_profile_id?: string | null;
+  tested_url?: string | null;
+  browser_profile_failure_reason?: string | null;
+};

@@ -41,7 +41,7 @@ export interface WorkflowRunResponse {
     errors?: Record<string, unknown>[];
     /** Total number of steps executed in this run */
     step_count?: number;
-    /** Whether the workflow run was executed with agent or code */
+    /** Whether the workflow run was executed with agent, code, or code_v2 (adaptive caching) */
     run_with?: string;
     /** Whether to fallback to AI if code run fails. */
     ai_fallback?: boolean;

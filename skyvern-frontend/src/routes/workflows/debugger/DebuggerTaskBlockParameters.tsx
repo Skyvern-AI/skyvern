@@ -140,6 +140,29 @@ function DebuggerTaskBlockParameters({ block }: Props) {
           </div>
         </div>
       ) : null}
+
+      <div className="flex flex-col gap-2">
+        <div className="flex w-full items-center justify-start gap-2">
+          <h1 className="text-sm">Continue on Failure</h1>
+          <HelpTooltip content="Whether to continue the workflow if this block fails" />
+        </div>
+        <div className="flex items-center gap-3">
+          <Switch checked={block.continue_on_failure} disabled />
+          <span className="text-sm text-slate-400">
+            {block.continue_on_failure ? "Enabled" : "Disabled"}
+          </span>
+        </div>
+      </div>
+
+      {block.engine ? (
+        <div className="flex flex-col gap-2">
+          <div className="flex w-full items-center justify-start gap-2">
+            <h1 className="text-sm">Engine</h1>
+            <HelpTooltip content="The execution engine used for this block" />
+          </div>
+          <Input value={block.engine} readOnly />
+        </div>
+      ) : null}
     </>
   );
 }

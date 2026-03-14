@@ -15,6 +15,7 @@ from sqlalchemy import (
     UnicodeText,
     UniqueConstraint,
     desc,
+    text,
 )
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
@@ -41,6 +42,7 @@ from skyvern.forge.sdk.db.id import (
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
     generate_script_block_id,
+    generate_script_fallback_episode_id,
     generate_script_file_id,
     generate_script_id,
     generate_script_revision_id,
@@ -116,6 +118,9 @@ class TaskModel(Base):
     model = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
     download_timeout = Column(Numeric, nullable=True)
+    waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
+    verification_code_identifier = Column(String, nullable=True)
+    verification_code_polling_started_at = Column(DateTime, nullable=True)
 
 
 class StepModel(Base):
@@ -201,6 +206,26 @@ class ArtifactModel(Base):
     __table_args__ = (
         Index("org_task_step_index", "organization_id", "task_id", "step_id"),
         Index("artifacts_org_created_at_index", "organization_id", "created_at"),
+        Index(
+            "ix_artifacts_workflow_run_block_id_partial",
+            "workflow_run_block_id",
+            postgresql_where=text("workflow_run_block_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_observer_thought_id_partial",
+            "observer_thought_id",
+            postgresql_where=text("observer_thought_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_observer_cruise_id_partial",
+            "observer_cruise_id",
+            postgresql_where=text("observer_cruise_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_artifacts_run_id_partial",
+            "run_id",
+            postgresql_where=text("run_id IS NOT NULL"),
+        ),
     )
 
     artifact_id = Column(String, primary_key=True, default=generate_artifact_id)
@@ -214,6 +239,7 @@ class ArtifactModel(Base):
     step_id = Column(String, index=True)
     artifact_type = Column(String)
     uri = Column(String)
+    bundle_key = Column(String, nullable=True)
     run_id = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -277,8 +303,10 @@ class WorkflowModel(Base):
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
-    ai_fallback = Column(Boolean, default=False, nullable=False)
+    ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
+    adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    generate_script_on_terminal = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     run_sequentially = Column(Boolean, nullable=True)
     sequential_key = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("folders.folder_id", ondelete="SET NULL"), nullable=True)
@@ -341,7 +369,7 @@ class WorkflowRunModel(Base):
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
-    browser_address = Column(String, nullable=True)
+    browser_address = Column(String, nullable=True, index=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
     depends_on_workflow_run_id = Column(String, nullable=True, index=True)
@@ -350,6 +378,9 @@ class WorkflowRunModel(Base):
     debug_session_id: Column = Column(String, nullable=True)
     ai_fallback = Column(Boolean, nullable=True)
     code_gen = Column(Boolean, nullable=True)
+    waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
+    verification_code_identifier = Column(String, nullable=True)
+    verification_code_polling_started_at = Column(DateTime, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -856,6 +887,7 @@ class PersistentBrowserSessionModel(Base):
     proxy_location = Column(String, nullable=True)
     extensions = Column(JSON, nullable=True)
     browser_type = Column(String, nullable=True)
+    browser_profile_id = Column(String, nullable=True, index=True)
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)
@@ -942,6 +974,9 @@ class CredentialModel(Base):
     card_last4 = Column(String, nullable=True)
     card_brand = Column(String, nullable=True)
     secret_label = Column(String, nullable=True)
+    browser_profile_id = Column(String, nullable=True)
+    tested_url = Column(String, nullable=True)
+    user_context = Column(String(1000), nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1086,6 +1121,7 @@ class ScriptBlockModel(Base):
     workflow_run_id = Column(String, nullable=True)
     workflow_run_block_id = Column(String, nullable=True)
     input_fields = Column(JSON, nullable=True)
+    requires_agent = Column(Boolean, nullable=False, server_default=sqlalchemy.false())
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1129,3 +1165,56 @@ class WorkflowCopilotChatMessageModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
+
+
+class ScriptFallbackEpisodeModel(Base):
+    __tablename__ = "script_fallback_episodes"
+    __table_args__ = (
+        Index("sfe_org_wpid_index", "organization_id", "workflow_permanent_id"),
+        Index("sfe_org_created_at_index", "organization_id", "created_at"),
+    )
+
+    episode_id = Column(String, primary_key=True, default=generate_script_fallback_episode_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    script_revision_id = Column(String, nullable=True)
+    block_label = Column(String, nullable=False)
+    fallback_type = Column(String, nullable=False)  # "element", "full_block", or "conditional_agent"
+    error_message = Column(UnicodeText, nullable=True)
+    classify_result = Column(String, nullable=True)
+    agent_actions = Column(JSON, nullable=True)
+    page_url = Column(String, nullable=True)
+    page_text_snapshot = Column(UnicodeText, nullable=True)
+    fallback_succeeded = Column(Boolean, nullable=True)  # None for legacy/element episodes
+    reviewed = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    reviewer_output = Column(UnicodeText, nullable=True)
+    new_script_revision_id = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class ScriptBranchHitModel(Base):
+    """Tracks which classify branches are accessed during cached script execution.
+
+    Used for TTL-based branch pruning — branches not accessed for a long time
+    can be removed by the script reviewer.
+    """
+
+    __tablename__ = "script_branch_hits"
+    __table_args__ = (Index("sbh_org_wpid_index", "organization_id", "workflow_permanent_id"),)
+
+    organization_id = Column(String, primary_key=True)
+    workflow_permanent_id = Column(String, primary_key=True)
+    block_label = Column(String, primary_key=True)
+    branch_key = Column(String, primary_key=True)  # The classify result string (e.g., "success", "error")
+
+    hit_count = Column(Integer, default=1, nullable=False)
+    first_hit_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    last_hit_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

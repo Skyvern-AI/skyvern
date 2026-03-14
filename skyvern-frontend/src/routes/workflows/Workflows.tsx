@@ -546,18 +546,18 @@ function Workflows() {
           </div>
         </div>
         <div className="rounded-lg border">
-          <Table>
+          <Table className="table-fixed">
             <TableHeader className="rounded-t-lg bg-slate-elevation2">
               <TableRow>
-                <TableHead className="w-1/4 rounded-tl-lg text-slate-400">
+                <TableHead className="w-[25%] rounded-tl-lg text-slate-400">
                   ID
                 </TableHead>
-                <TableHead className="w-1/4 text-slate-400">Title</TableHead>
-                <TableHead className="w-1/6 text-slate-400">Folder</TableHead>
-                <TableHead className="w-1/6 text-slate-400">
+                <TableHead className="w-[30%] text-slate-400">Title</TableHead>
+                <TableHead className="w-[15%] text-slate-400">Folder</TableHead>
+                <TableHead className="w-[15%] text-slate-400">
                   Created At
                 </TableHead>
-                <TableHead className="rounded-tr-lg"></TableHead>
+                <TableHead className="w-[15%] rounded-tr-lg"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -618,9 +618,11 @@ function Workflows() {
                       {isUploading ? (
                         <TableRow className="opacity-70">
                           <TableCell colSpan={2}>
-                            <div className="flex items-center gap-2">
-                              <ReloadIcon className="h-4 w-4 animate-spin text-blue-400" />
-                              <span>{workflow.title}</span>
+                            <div className="flex min-w-0 items-center gap-2">
+                              <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-400" />
+                              <span className="truncate" title={workflow.title}>
+                                {workflow.title}
+                              </span>
                             </div>
                           </TableCell>
                           <TableCell>
@@ -656,10 +658,15 @@ function Workflows() {
                               );
                             }}
                           >
-                            <HighlightText
-                              text={workflow.workflow_permanent_id}
-                              query={debouncedSearch}
-                            />
+                            <div
+                              className="truncate"
+                              title={workflow.workflow_permanent_id}
+                            >
+                              <HighlightText
+                                text={workflow.workflow_permanent_id}
+                                query={debouncedSearch}
+                              />
+                            </div>
                           </TableCell>
                           <TableCell
                             onClick={(event) => {
@@ -669,11 +676,13 @@ function Workflows() {
                               );
                             }}
                           >
-                            <div className="flex items-center gap-2">
-                              <HighlightText
-                                text={workflow.title}
-                                query={debouncedSearch}
-                              />
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="truncate" title={workflow.title}>
+                                <HighlightText
+                                  text={workflow.title}
+                                  query={debouncedSearch}
+                                />
+                              </span>
                               {workflow.is_template && (
                                 <TooltipProvider>
                                   <Tooltip>
@@ -695,9 +704,15 @@ function Workflows() {
                             }}
                           >
                             {workflow.folder_id ? (
-                              <div className="flex items-center gap-1.5">
-                                <FolderIcon className="h-3.5 w-3.5 text-blue-400" />
-                                <span className="text-sm">
+                              <div className="flex min-w-0 items-center gap-1.5">
+                                <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-400" />
+                                <span
+                                  className="truncate text-sm"
+                                  title={
+                                    foldersMap.get(workflow.folder_id)?.title ||
+                                    workflow.folder_id
+                                  }
+                                >
                                   <HighlightText
                                     text={
                                       foldersMap.get(workflow.folder_id)

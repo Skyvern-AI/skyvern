@@ -1,0 +1,95 @@
+---
+title: Downloading Artifacts
+subtitle: Access recordings, screenshots, and output files from your runs
+slug: cloud/viewing-results/downloading-artifacts
+---
+
+Every run generates artifacts — video recordings, screenshots at each decision point, extracted data as JSON, and any downloaded files. Most are visible in the [Run Details](/cloud/viewing-results/run-details) page, but you can also save them locally or pull them into another system.
+
+## From the UI
+
+| Artifact | How to download |
+|----------|----------------|
+| **Recordings** | Recording tab → right-click the video → **Save video as...** |
+| **Screenshots** | Overview tab → click a timeline item → right-click the image → **Save image as...** |
+| **Extracted data** | Output tab → select the JSON text and copy |
+| **Downloaded files** | Output tab → **Workflow Run Downloaded Files** → click any link |
+| **Generated code** | Code tab → **Copy** button in the top right |
+
+## From the API
+
+Use the API when you need artifacts programmatically — for a pipeline, an archive, or integration with another tool.
+
+### List artifacts for a run
+
+```bash
+curl -X GET "https://api.skyvern.com/v1/runs/{run_id}/artifacts" \
+  -H "x-api-key: YOUR_API_KEY"
+```
+
+Filter by type using the `artifact_type` parameter (repeatable):
+
+```bash
+curl -X GET "https://api.skyvern.com/v1/runs/{run_id}/artifacts?artifact_type=screenshot_llm&artifact_type=recording" \
+  -H "x-api-key: YOUR_API_KEY"
+```
+
+### Download an artifact
+
+Each artifact in the response includes a `signed_url` — a temporary, pre-authenticated download link:
+
+```json
+{
+  "artifact_id": "art_abc123",
+  "artifact_type": "screenshot_llm",
+  "signed_url": "https://storage.example.com/screenshot.png?token=...",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
+```bash
+curl -o screenshot.png "SIGNED_URL_HERE"
+```
+
+<Warning>
+Signed URLs expire after a short period. Always generate a fresh URL via the API rather than storing old ones.
+</Warning>
+
+### Artifact types
+
+| Value | What it is |
+|-------|-----------|
+| `recording` | Full browser session video |
+| `screenshot_llm` | Screenshots with numbered element annotations — what the AI analyzed |
+| `screenshot_action` | Screenshots taken after each browser action |
+| `screenshot_final` | Final page state when the run ended |
+| `llm_prompt` | Complete prompt sent to the LLM (goal, element tree, system instructions) |
+| `llm_request` | Raw API request payload sent to the model provider |
+| `llm_response` | Raw model response |
+| `llm_response_parsed` | Parsed action list — what the AI decided to do |
+| `visible_elements_tree` | DOM tree of interactive elements the AI could see (JSON) |
+| `html_scrape` | Full page HTML at the time of the step |
+| `skyvern_log` | Formatted execution logs |
+| `har` | HTTP Archive file — every network request the browser made |
+| `trace` | Browser trace file for performance analysis |
+
+<Tip>
+The annotated screenshots (`screenshot_llm`) and parsed action lists (`llm_response_parsed`) are the most useful for debugging. Annotated screenshots show which elements the AI identified, and the action list shows what it decided to do with them.
+</Tip>
+
+<CardGroup cols={2}>
+  <Card
+    title="Run Details"
+    icon="magnifying-glass"
+    href="/cloud/viewing-results/run-details"
+  >
+    Understand what each tab shows and how to debug failures
+  </Card>
+  <Card
+    title="Using Artifacts (API)"
+    icon="code"
+    href="/debugging/using-artifacts"
+  >
+    Full API reference for artifact retrieval
+  </Card>
+</CardGroup>

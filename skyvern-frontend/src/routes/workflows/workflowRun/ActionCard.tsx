@@ -1,4 +1,5 @@
 import { ActionsApiResponse, ActionTypes, Status } from "@/api/types";
+import { StatusPill } from "@/components/ui/status-pill";
 import {
   Tooltip,
   TooltipContent,
@@ -7,13 +8,12 @@ import {
 } from "@/components/ui/tooltip";
 import { Separator } from "@/components/ui/separator";
 import { ActionTypePill } from "@/routes/tasks/detail/ActionTypePill";
-import { cn } from "@/util/utils";
 import {
   CheckCircledIcon,
   CrossCircledIcon,
   LightningBoltIcon,
 } from "@radix-ui/react-icons";
-import { useCallback } from "react";
+import { RunCard } from "./RunCard";
 
 type Props = {
   action: ActionsApiResponse;
@@ -23,32 +23,19 @@ type Props = {
 };
 
 function ActionCard({ action, onClick, active, index }: Props) {
+  // Wait actions always succeed — they intentionally return ActionFailure
+  // from the backend but completing a wait is expected, not a failure.
   const success =
-    action.status === Status.Completed || action.status === Status.Skipped;
-
-  const refCallback = useCallback((element: HTMLDivElement | null) => {
-    if (element && active) {
-      element.scrollIntoView({
-        behavior: "smooth",
-        block: "start",
-      });
-    }
-    // this should only run once at mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    action.action_type === ActionTypes.wait ||
+    action.status === Status.Completed ||
+    action.status === Status.Skipped;
 
   return (
-    <div
-      className={cn(
-        "flex cursor-pointer rounded-lg border-2 border-transparent bg-slate-elevation3 hover:border-slate-50",
-        {
-          "border-l-destructive": !success,
-          "border-l-success": success,
-          "border-slate-50": active,
-        },
-      )}
+    <RunCard
+      active={active}
+      status={success ? "success" : "failure"}
       onClick={onClick}
-      ref={refCallback}
+      className="flex"
     >
       <div className="flex-1 space-y-2 p-4 pl-5">
         <div className="flex justify-between">
@@ -61,9 +48,11 @@ function ActionCard({ action, onClick, active, index }: Props) {
               <TooltipProvider>
                 <Tooltip delayDuration={300}>
                   <TooltipTrigger asChild>
-                    <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                      <LightningBoltIcon className="h-4 w-4 text-[gold]" />
-                    </div>
+                    <StatusPill
+                      icon={
+                        <LightningBoltIcon className="h-4 w-4 text-[gold]" />
+                      }
+                    />
                   </TooltipTrigger>
                   <TooltipContent className="max-w-[250px]">
                     Code Execution
@@ -72,13 +61,13 @@ function ActionCard({ action, onClick, active, index }: Props) {
               </TooltipProvider>
             )}
             {success ? (
-              <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                <CheckCircledIcon className="h-4 w-4 text-success" />
-              </div>
+              <StatusPill
+                icon={<CheckCircledIcon className="h-4 w-4 text-success" />}
+              />
             ) : (
-              <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                <CrossCircledIcon className="h-4 w-4 text-destructive" />
-              </div>
+              <StatusPill
+                icon={<CrossCircledIcon className="h-4 w-4 text-destructive" />}
+              />
             )}
           </div>
         </div>
@@ -95,7 +84,7 @@ function ActionCard({ action, onClick, active, index }: Props) {
           </>
         )}
       </div>
-    </div>
+    </RunCard>
   );
 }
 

@@ -1,0 +1,75 @@
+---
+title: Billing & Usage
+subtitle: Understand what you're paying for and manage your plan
+slug: cloud/account-settings/billing-usage
+---
+
+Skyvern bills per **credit** — each browser action the AI takes during a run consumes credits. You pay for real work, not for workflows created or credentials stored.
+
+## Plans
+
+Open **Billing** in the sidebar to see available plans and your current balance.
+
+<img src="/images/cloud/settings-billing-overview.png" alt="Billing page showing plan options and current balance" />
+
+| Plan | Price | Credits | Includes |
+|------|-------|---------|----------|
+| **Hobby** | $29/month | 30,000 credits/month | Email support, priority queue |
+| **Pro** | $149/month | 150,000 credits/month | Priority support, higher rate limits |
+
+Click **Switch to Hobby** or **Switch to Pro** to change plans. Your remaining dollar balance is applied as a credit toward your first subscription payment.
+
+<Note>
+Need custom volumes or a dedicated plan? Use the **Book a call** link at the bottom of the Billing page, or visit [View full pricing details](https://skyvern.com) for a complete comparison.
+</Note>
+
+## How credits are consumed
+
+A credit maps to one discrete browser action: clicking a button, typing into a field, selecting a dropdown, or extracting data from a page. Navigation counts too.
+
+| Example | Approximate credits |
+|---------|---------------------|
+| Login flow (email, password, submit) | ~3 |
+| Form fill (10 fields + submit) | ~11 |
+| Multi-page extraction (5 pages) | ~15–25 |
+
+Credits consumed by a run are visible on the [Run Details](/cloud/viewing-results/run-details) page — the **Actions** counter at the top of the Overview timeline shows exactly how many actions the AI took.
+
+<Tip>
+Reduce credit usage by being specific in your prompts. "Find information about pricing" causes the AI to explore multiple pages. "Extract the monthly price from the pricing table on /pricing" gets there directly.
+</Tip>
+
+## Your current balance
+
+The **Your Current Balance** section shows your remaining dollar balance. Credits are deducted as runs execute in real time. If your balance reaches zero, new runs won't start until you add credits or switch to a subscription plan.
+
+## FAQ
+
+<Accordion title="How do credits work?">
+Each browser action the AI takes — clicking, typing, navigating, extracting — costs one credit. Credits are deducted in real time as runs execute. Your plan includes a monthly credit allowance that resets each billing cycle. Unused credits don't roll over.
+</Accordion>
+
+<Accordion title="Can I buy more credits?">
+Yes. If you exhaust your monthly allowance, you can purchase additional credits from the Billing page. You can also upgrade to a higher plan for a larger monthly allowance.
+</Accordion>
+
+<Accordion title="Can I cancel anytime?">
+Yes. Downgrade or cancel your subscription from the Billing page. The change takes effect at the end of your current billing cycle, and you keep access to your credits until then.
+</Accordion>
+
+<CardGroup cols={2}>
+  <Card
+    title="API Keys"
+    icon="key"
+    href="/cloud/account-settings/api-keys"
+  >
+    Manage API keys for programmatic access
+  </Card>
+  <Card
+    title="Organization Settings"
+    icon="building"
+    href="/cloud/account-settings/organization-settings"
+  >
+    Manage your team and organization details
+  </Card>
+</CardGroup>

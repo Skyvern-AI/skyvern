@@ -18,10 +18,12 @@ from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.change_tier_response import ChangeTierResponse
 from .types.checkout_session_response import CheckoutSessionResponse
+from .types.clear_cache_response import ClearCacheResponse
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.extensions import Extensions
+from .types.folder import Folder
 from .types.get_run_response import GetRunResponse
 from .types.otp_type import OtpType
 from .types.persistent_browser_type import PersistentBrowserType
@@ -43,8 +45,10 @@ from .types.totp_code import TotpCode
 from .types.upload_file_response import UploadFileResponse
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
+from .types.workflow_run import WorkflowRun
 from .types.workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
 from .types.workflow_run_response import WorkflowRunResponse
+from .types.workflow_run_status import WorkflowRunStatus
 from .types.workflow_run_timeline import WorkflowRunTimeline
 from .types.workflow_status import WorkflowStatus
 
@@ -195,9 +199,16 @@ class Skyvern:
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
+            - RESIDENTIAL_KR: South Korea
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
+            - RESIDENTIAL_BR: Brazil
+            - RESIDENTIAL_TR: Turkey
+            - RESIDENTIAL_CA: Canada
+            - RESIDENTIAL_MX: Mexico
+            - RESIDENTIAL_IT: Italy
+            - RESIDENTIAL_NL: Netherlands
             - RESIDENTIAL_ISP: ISP proxy
             - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
             - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
@@ -359,9 +370,16 @@ class Skyvern:
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
+            - RESIDENTIAL_KR: South Korea
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
+            - RESIDENTIAL_BR: Brazil
+            - RESIDENTIAL_TR: Turkey
+            - RESIDENTIAL_CA: Canada
+            - RESIDENTIAL_MX: Mexico
+            - RESIDENTIAL_IT: Italy
+            - RESIDENTIAL_NL: Netherlands
             - RESIDENTIAL_ISP: ISP proxy
             - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
             - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
@@ -401,7 +419,7 @@ class Skyvern:
             Whether to fallback to AI if the workflow run fails.
 
         run_with : typing.Optional[str]
-            Whether to run the workflow with agent or code.
+            Whether to run the workflow with agent, code, or code_v2 (adaptive caching).
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -549,10 +567,10 @@ class Skyvern:
         only_templates : typing.Optional[bool]
 
         search_key : typing.Optional[str]
-            Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
+            Case-insensitive substring search across: workflow title, folder name, and parameter metadata (key, description, default_value). A workflow is returned if any of these fields match. Soft-deleted parameter definitions are excluded. Takes precedence over the deprecated `title` parameter.
 
         title : typing.Optional[str]
-            Deprecated: use search_key instead.
+            Deprecated: use search_key instead. Falls back to title-only search if search_key is not provided.
 
         folder_id : typing.Optional[str]
             Filter workflows by folder ID
@@ -878,6 +896,95 @@ class Skyvern:
         _response = self._raw_client.get_run_timeline(run_id, request_options=request_options)
         return _response.data
 
+    def get_workflow_runs(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        error_code: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[WorkflowRun]:
+        """
+        List workflow runs across all workflows for the current organization.
+
+        Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.
+
+        ### search_key
+
+        A case-insensitive substring search that matches against **any** of the following fields:
+
+        | Searched field | Description |
+        |---|---|
+        | `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |
+        | Parameter **key** | The `key` of any workflow parameter definition associated with the run |
+        | Parameter **description** | The `description` of any workflow parameter definition |
+        | Run parameter **value** | The actual value supplied for any parameter when the run was created |
+        | `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |
+
+        Soft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.
+
+        ### error_code
+
+        An **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).
+
+        ### Combining filters
+
+        All query parameters use AND logic:
+        - `?status=failed` — only failed runs
+        - `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error
+        - `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number for pagination.
+
+        page_size : typing.Optional[int]
+            Number of runs to return per page.
+
+        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
+            Filter by one or more run statuses.
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
+
+        error_code : typing.Optional[str]
+            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[WorkflowRun]
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow_runs(
+            page=1,
+            page_size=1,
+            search_key="search_key",
+            error_code="error_code",
+        )
+        """
+        _response = self._raw_client.get_workflow_runs(
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+            request_options=request_options,
+        )
+        return _response.data
+
     def get_workflow(
         self,
         workflow_permanent_id: str,
@@ -1180,6 +1287,7 @@ class Skyvern:
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserSessionResponse:
         """
@@ -1205,9 +1313,16 @@ class Skyvern:
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
+            - RESIDENTIAL_KR: South Korea
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
+            - RESIDENTIAL_BR: Brazil
+            - RESIDENTIAL_TR: Turkey
+            - RESIDENTIAL_CA: Canada
+            - RESIDENTIAL_MX: Mexico
+            - RESIDENTIAL_IT: Italy
+            - RESIDENTIAL_NL: Netherlands
             - RESIDENTIAL_ISP: ISP proxy
             - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
             - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
@@ -1221,6 +1336,9 @@ class Skyvern:
 
         browser_type : typing.Optional[PersistentBrowserType]
             The type of browser to use for the session.
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1244,6 +1362,7 @@ class Skyvern:
             proxy_location=proxy_location,
             extensions=extensions,
             browser_type=browser_type,
+            browser_profile_id=browser_profile_id,
             request_options=request_options,
         )
         return _response.data
@@ -1479,6 +1598,66 @@ class Skyvern:
         """
         _response = self._raw_client.create_credential(
             name=name, credential_type=credential_type, credential=credential, request_options=request_options
+        )
+        return _response.data
+
+    def update_credential(
+        self,
+        credential_id: str,
+        *,
+        name: str,
+        credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
+        credential: CreateCredentialRequestCredential,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> CredentialResponse:
+        """
+        Overwrites the stored credential data (e.g. username/password) while keeping the same credential_id.
+
+        Parameters
+        ----------
+        credential_id : str
+            The unique identifier of the credential to update
+
+        name : str
+            Name of the credential
+
+        credential_type : SkyvernForgeSdkSchemasCredentialsCredentialType
+            Type of credential to create
+
+        credential : CreateCredentialRequestCredential
+            The credential data to store
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        CredentialResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import NonEmptyPasswordCredential, Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.update_credential(
+            credential_id="cred_1234567890",
+            name="My Credential",
+            credential_type="password",
+            credential=NonEmptyPasswordCredential(
+                password="newpassword123",
+                username="user@example.com",
+            ),
+        )
+        """
+        _response = self._raw_client.update_credential(
+            credential_id,
+            name=name,
+            credential_type=credential_type,
+            credential=credential,
+            request_options=request_options,
         )
         return _response.data
 
@@ -1950,6 +2129,12 @@ class Skyvern:
         _response = self._raw_client.deploy_script(script_id, files=files, request_options=request_options)
         return _response.data
 
+    def clear_workflow_cache(
+        self, workflow_permanent_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> ClearCacheResponse:
+        _response = self._raw_client.clear_workflow_cache(workflow_permanent_id, request_options=request_options)
+        return _response.data
+
     def run_sdk_action(
         self,
         *,
@@ -2148,6 +2333,258 @@ class Skyvern:
         )
         return _response.data
 
+    def get_folders(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        search: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Folder]:
+        """
+        Get all folders for the organization
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number
+
+        page_size : typing.Optional[int]
+            Number of folders per page
+
+        search : typing.Optional[str]
+            Search folders by title or description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Folder]
+            Successfully retrieved folders
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_folders(
+            page=1,
+            page_size=1,
+            search="search",
+        )
+        """
+        _response = self._raw_client.get_folders(
+            page=page, page_size=page_size, search=search, request_options=request_options
+        )
+        return _response.data
+
+    def create_folder(
+        self,
+        *,
+        title: str,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        """
+        Create a new folder to organize workflows
+
+        Parameters
+        ----------
+        title : str
+            Folder title
+
+        description : typing.Optional[str]
+            Folder description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully created folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.create_folder(
+            title="title",
+        )
+        """
+        _response = self._raw_client.create_folder(
+            title=title, description=description, request_options=request_options
+        )
+        return _response.data
+
+    def get_folder(self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Folder:
+        """
+        Get a specific folder by ID
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully retrieved folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_folder(
+            folder_id="fld_123",
+        )
+        """
+        _response = self._raw_client.get_folder(folder_id, request_options=request_options)
+        return _response.data
+
+    def update_folder(
+        self,
+        folder_id: str,
+        *,
+        title: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        """
+        Update a folder's title or description
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        title : typing.Optional[str]
+            Folder title
+
+        description : typing.Optional[str]
+            Folder description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully updated folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.update_folder(
+            folder_id="fld_123",
+        )
+        """
+        _response = self._raw_client.update_folder(
+            folder_id, title=title, description=description, request_options=request_options
+        )
+        return _response.data
+
+    def delete_folder(
+        self,
+        folder_id: str,
+        *,
+        delete_workflows: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.Dict[str, typing.Optional[typing.Any]]:
+        """
+        Delete a folder. Optionally delete all workflows in the folder.
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        delete_workflows : typing.Optional[bool]
+            If true, also delete all workflows in this folder
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.Dict[str, typing.Optional[typing.Any]]
+            Successfully deleted folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.delete_folder(
+            folder_id="fld_123",
+            delete_workflows=True,
+        )
+        """
+        _response = self._raw_client.delete_folder(
+            folder_id, delete_workflows=delete_workflows, request_options=request_options
+        )
+        return _response.data
+
+    def update_workflow_folder(
+        self,
+        workflow_permanent_id: str,
+        *,
+        folder_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Update a workflow's folder assignment for the latest version
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        folder_id : typing.Optional[str]
+            Folder ID to assign workflow to. Set to null to remove from folder.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.update_workflow_folder(
+            workflow_permanent_id="wpid_123",
+        )
+        """
+        _response = self._raw_client.update_workflow_folder(
+            workflow_permanent_id, folder_id=folder_id, request_options=request_options
+        )
+        return _response.data
+
     @property
     def scripts(self):
         if self._scripts is None:
@@ -2298,9 +2735,16 @@ class AsyncSkyvern:
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
+            - RESIDENTIAL_KR: South Korea
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
+            - RESIDENTIAL_BR: Brazil
+            - RESIDENTIAL_TR: Turkey
+            - RESIDENTIAL_CA: Canada
+            - RESIDENTIAL_MX: Mexico
+            - RESIDENTIAL_IT: Italy
+            - RESIDENTIAL_NL: Netherlands
             - RESIDENTIAL_ISP: ISP proxy
             - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
             - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
@@ -2470,9 +2914,16 @@ class AsyncSkyvern:
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
+            - RESIDENTIAL_KR: South Korea
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
+            - RESIDENTIAL_BR: Brazil
+            - RESIDENTIAL_TR: Turkey
+            - RESIDENTIAL_CA: Canada
+            - RESIDENTIAL_MX: Mexico
+            - RESIDENTIAL_IT: Italy
+            - RESIDENTIAL_NL: Netherlands
             - RESIDENTIAL_ISP: ISP proxy
             - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
             - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
@@ -2512,7 +2963,7 @@ class AsyncSkyvern:
             Whether to fallback to AI if the workflow run fails.
 
         run_with : typing.Optional[str]
-            Whether to run the workflow with agent or code.
+            Whether to run the workflow with agent, code, or code_v2 (adaptive caching).
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2684,10 +3135,10 @@ class AsyncSkyvern:
         only_templates : typing.Optional[bool]
 
         search_key : typing.Optional[str]
-            Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
+            Case-insensitive substring search across: workflow title, folder name, and parameter metadata (key, description, default_value). A workflow is returned if any of these fields match. Soft-deleted parameter definitions are excluded. Takes precedence over the deprecated `title` parameter.
 
         title : typing.Optional[str]
-            Deprecated: use search_key instead.
+            Deprecated: use search_key instead. Falls back to title-only search if search_key is not provided.
 
         folder_id : typing.Optional[str]
             Filter workflows by folder ID
@@ -3079,6 +3530,103 @@ class AsyncSkyvern:
         _response = await self._raw_client.get_run_timeline(run_id, request_options=request_options)
         return _response.data
 
+    async def get_workflow_runs(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        error_code: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[WorkflowRun]:
+        """
+        List workflow runs across all workflows for the current organization.
+
+        Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.
+
+        ### search_key
+
+        A case-insensitive substring search that matches against **any** of the following fields:
+
+        | Searched field | Description |
+        |---|---|
+        | `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |
+        | Parameter **key** | The `key` of any workflow parameter definition associated with the run |
+        | Parameter **description** | The `description` of any workflow parameter definition |
+        | Run parameter **value** | The actual value supplied for any parameter when the run was created |
+        | `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |
+
+        Soft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.
+
+        ### error_code
+
+        An **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).
+
+        ### Combining filters
+
+        All query parameters use AND logic:
+        - `?status=failed` — only failed runs
+        - `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error
+        - `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number for pagination.
+
+        page_size : typing.Optional[int]
+            Number of runs to return per page.
+
+        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
+            Filter by one or more run statuses.
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
+
+        error_code : typing.Optional[str]
+            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[WorkflowRun]
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow_runs(
+                page=1,
+                page_size=1,
+                search_key="search_key",
+                error_code="error_code",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow_runs(
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+            request_options=request_options,
+        )
+        return _response.data
+
     async def get_workflow(
         self,
         workflow_permanent_id: str,
@@ -3445,6 +3993,7 @@ class AsyncSkyvern:
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserSessionResponse:
         """
@@ -3470,9 +4019,16 @@ class AsyncSkyvern:
             - RESIDENTIAL_DE: Germany
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
+            - RESIDENTIAL_KR: South Korea
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
+            - RESIDENTIAL_BR: Brazil
+            - RESIDENTIAL_TR: Turkey
+            - RESIDENTIAL_CA: Canada
+            - RESIDENTIAL_MX: Mexico
+            - RESIDENTIAL_IT: Italy
+            - RESIDENTIAL_NL: Netherlands
             - RESIDENTIAL_ISP: ISP proxy
             - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
             - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
@@ -3486,6 +4042,9 @@ class AsyncSkyvern:
 
         browser_type : typing.Optional[PersistentBrowserType]
             The type of browser to use for the session.
+
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3517,6 +4076,7 @@ class AsyncSkyvern:
             proxy_location=proxy_location,
             extensions=extensions,
             browser_type=browser_type,
+            browser_profile_id=browser_profile_id,
             request_options=request_options,
         )
         return _response.data
@@ -3794,6 +4354,74 @@ class AsyncSkyvern:
         """
         _response = await self._raw_client.create_credential(
             name=name, credential_type=credential_type, credential=credential, request_options=request_options
+        )
+        return _response.data
+
+    async def update_credential(
+        self,
+        credential_id: str,
+        *,
+        name: str,
+        credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
+        credential: CreateCredentialRequestCredential,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> CredentialResponse:
+        """
+        Overwrites the stored credential data (e.g. username/password) while keeping the same credential_id.
+
+        Parameters
+        ----------
+        credential_id : str
+            The unique identifier of the credential to update
+
+        name : str
+            Name of the credential
+
+        credential_type : SkyvernForgeSdkSchemasCredentialsCredentialType
+            Type of credential to create
+
+        credential : CreateCredentialRequestCredential
+            The credential data to store
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        CredentialResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern, NonEmptyPasswordCredential
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.update_credential(
+                credential_id="cred_1234567890",
+                name="My Credential",
+                credential_type="password",
+                credential=NonEmptyPasswordCredential(
+                    password="newpassword123",
+                    username="user@example.com",
+                ),
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.update_credential(
+            credential_id,
+            name=name,
+            credential_type=credential_type,
+            credential=credential,
+            request_options=request_options,
         )
         return _response.data
 
@@ -4331,6 +4959,12 @@ class AsyncSkyvern:
         _response = await self._raw_client.deploy_script(script_id, files=files, request_options=request_options)
         return _response.data
 
+    async def clear_workflow_cache(
+        self, workflow_permanent_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> ClearCacheResponse:
+        _response = await self._raw_client.clear_workflow_cache(workflow_permanent_id, request_options=request_options)
+        return _response.data
+
     async def run_sdk_action(
         self,
         *,
@@ -4570,6 +5204,306 @@ class AsyncSkyvern:
         """
         _response = await self._raw_client.change_tier_api_v1billing_change_tier_post(
             tier=tier, request_options=request_options
+        )
+        return _response.data
+
+    async def get_folders(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        search: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Folder]:
+        """
+        Get all folders for the organization
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number
+
+        page_size : typing.Optional[int]
+            Number of folders per page
+
+        search : typing.Optional[str]
+            Search folders by title or description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Folder]
+            Successfully retrieved folders
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_folders(
+                page=1,
+                page_size=1,
+                search="search",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_folders(
+            page=page, page_size=page_size, search=search, request_options=request_options
+        )
+        return _response.data
+
+    async def create_folder(
+        self,
+        *,
+        title: str,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        """
+        Create a new folder to organize workflows
+
+        Parameters
+        ----------
+        title : str
+            Folder title
+
+        description : typing.Optional[str]
+            Folder description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully created folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.create_folder(
+                title="title",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.create_folder(
+            title=title, description=description, request_options=request_options
+        )
+        return _response.data
+
+    async def get_folder(self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Folder:
+        """
+        Get a specific folder by ID
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully retrieved folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_folder(
+                folder_id="fld_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_folder(folder_id, request_options=request_options)
+        return _response.data
+
+    async def update_folder(
+        self,
+        folder_id: str,
+        *,
+        title: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        """
+        Update a folder's title or description
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        title : typing.Optional[str]
+            Folder title
+
+        description : typing.Optional[str]
+            Folder description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully updated folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.update_folder(
+                folder_id="fld_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.update_folder(
+            folder_id, title=title, description=description, request_options=request_options
+        )
+        return _response.data
+
+    async def delete_folder(
+        self,
+        folder_id: str,
+        *,
+        delete_workflows: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.Dict[str, typing.Optional[typing.Any]]:
+        """
+        Delete a folder. Optionally delete all workflows in the folder.
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        delete_workflows : typing.Optional[bool]
+            If true, also delete all workflows in this folder
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.Dict[str, typing.Optional[typing.Any]]
+            Successfully deleted folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.delete_folder(
+                folder_id="fld_123",
+                delete_workflows=True,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.delete_folder(
+            folder_id, delete_workflows=delete_workflows, request_options=request_options
+        )
+        return _response.data
+
+    async def update_workflow_folder(
+        self,
+        workflow_permanent_id: str,
+        *,
+        folder_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Update a workflow's folder assignment for the latest version
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        folder_id : typing.Optional[str]
+            Folder ID to assign workflow to. Set to null to remove from folder.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.update_workflow_folder(
+                workflow_permanent_id="wpid_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.update_workflow_folder(
+            workflow_permanent_id, folder_id=folder_id, request_options=request_options
         )
         return _response.data
 

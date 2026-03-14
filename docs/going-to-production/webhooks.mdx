@@ -6,7 +6,7 @@ slug: going-to-production/webhooks
 
 Workflows and task runs are asynchronous. When you call `run_task` or `run_workflow`, the API returns immediately with a run ID, but the actual execution happens in the background and can take variable time.
 
-Instead of polling the `get_runs` endpoint, you can use Webhooks to get notified when they finish.
+Instead of polling the `get_runs` endpoint, you can use Webhooks to get notified when they finish. Webhooks fire only when a run reaches a terminal status: `completed`, `failed`, `terminated`, `timed_out`, or `canceled`.
 
 This page covers setting them up, explains payload structure, signature verification, and handling delivery failures.
 

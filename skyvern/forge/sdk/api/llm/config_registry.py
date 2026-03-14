@@ -151,6 +151,18 @@ if settings.ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_4",
+        LLMConfig(
+            "gpt-5.4",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",
         LLMConfig(
             "gpt-4-turbo",
@@ -385,6 +397,18 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.6_OPUS",
+        LLMConfig(
+            "anthropic/claude-opus-4-6",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,  # Claude 4.6 does not support assistant message prefill
+            max_completion_tokens=64000,
+            temperature=1,  # Claude 4.6 only supports temperature=1
         ),
     )
 
@@ -512,6 +536,7 @@ if settings.ENABLE_BEDROCK:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -522,6 +547,18 @@ if settings.ENABLE_BEDROCK:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE4.6_OPUS_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-opus-4-6-v1",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,  # Claude 4.6 does not support assistant message prefill
+            max_completion_tokens=64000,
+            temperature=1,  # Claude 4.6 only supports temperature=1
         ),
     )
 
@@ -783,6 +820,31 @@ if settings.ENABLE_AZURE_GPT5_2:
         ),
     )
 
+if settings.ENABLE_AZURE_GPT5_4:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_4",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_4_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_4_DEPLOYMENT",
+                "AZURE_GPT5_4_API_KEY",
+                "AZURE_GPT5_4_API_BASE",
+                "AZURE_GPT5_4_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_4_API_BASE,
+                api_key=settings.AZURE_GPT5_4_API_KEY,
+                api_version=settings.AZURE_GPT5_4_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.4"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
 if settings.ENABLE_AZURE_O4_MINI:
     LLMConfigRegistry.register_config(
         "AZURE_OPENAI_O4_MINI",
@@ -1007,6 +1069,24 @@ if settings.ENABLE_GEMINI:
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
             ),
         ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_3_PRO",
+        LLMConfig(
+            "gemini/gemini-3.1-pro-preview",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+            ),
+        ),
+    )
+    # Backward compat alias for non-Vertex Gemini 3 Pro
+    LLMConfigRegistry.register_config(
+        "GEMINI_3.1_PRO",
+        LLMConfigRegistry.get_config("GEMINI_3_PRO"),
     )
 
 
@@ -1343,15 +1423,15 @@ if settings.ENABLE_VERTEX_AI:
         ),
     )
     LLMConfigRegistry.register_config(
-        "VERTEX_GEMINI_3.0_PRO",
+        "VERTEX_GEMINI_3_PRO",
         LLMConfig(
-            "vertex_ai/gemini-3-pro-preview",
+            "vertex_ai/gemini-3.1-pro-preview",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3-pro-preview" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-pro-preview" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1373,6 +1453,16 @@ if settings.ENABLE_VERTEX_AI:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
+    )
+    # Backward compat aliases — both resolve to the canonical VERTEX_GEMINI_3_PRO.
+    # Bump VERTEX_GEMINI_3_PRO above when Google ships a newer version.
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.0_PRO",
+        LLMConfigRegistry.get_config("VERTEX_GEMINI_3_PRO"),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.1_PRO",
+        LLMConfigRegistry.get_config("VERTEX_GEMINI_3_PRO"),
     )
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_2.5_FLASH_LITE",
@@ -1554,6 +1644,25 @@ if settings.ENABLE_MOONSHOT:
             ),
         ),
     )
+
+if settings.ENABLE_INCEPTION:
+    LLMConfigRegistry.register_config(
+        "INCEPTION_MERCURY_2",
+        LLMConfig(
+            "openai/mercury-2",
+            ["INCEPTION_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            litellm_params=LiteLLMParams(
+                api_key=settings.INCEPTION_API_KEY,
+                api_base=settings.INCEPTION_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openai/mercury-2"},
+            ),
+        ),
+    )
+
 # Add support for dynamically configuring OpenAI-compatible LLM models
 # Based on liteLLM's support for OpenAI-compatible APIs
 # See documentation: https://docs.litellm.ai/docs/providers/openai_compatible

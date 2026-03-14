@@ -40,6 +40,7 @@ export interface Action {
     click_context?: Skyvern.ClickContext;
     totp_timing_info?: Record<string, unknown>;
     has_mini_agent?: boolean;
+    skip_auto_complete_tab?: boolean;
     created_at?: string;
     modified_at?: string;
     created_by?: string;

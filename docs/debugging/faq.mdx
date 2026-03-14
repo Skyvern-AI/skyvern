@@ -88,7 +88,7 @@ result = await client.run_workflow(
 )
 ```
 
-Parameters are available in prompts using `{{ parameter_name }}` syntax. See [Workflow Parameters](/workflows/workflow-parameters) for details.
+Parameters are available in prompts using `{{ parameter_name }}` syntax. See [Workflow Parameters](/multi-step-automations/workflow-parameters) for details.
 </Accordion>
 
 <Accordion title="How do I use credentials in a workflow?">
@@ -96,7 +96,7 @@ Parameters are available in prompts using `{{ parameter_name }}` syntax. See [Wo
 2. **Reference in workflow** — Select the credential in the Login block's credential dropdown
 3. **Never hardcode** — Don't put passwords directly in prompts
 
-The AI will automatically fill the credential fields when it encounters a login form. See [Credentials](/credentials/introduction) for setup instructions.
+The AI will automatically fill the credential fields when it encounters a login form. See [Credentials](/sdk-reference/credentials) for setup instructions.
 </Accordion>
 
 <Accordion title="Can I run workflows on a schedule?">
@@ -106,7 +106,7 @@ Skyvern doesn't have built-in scheduling yet. Use external schedulers like:
 - **Zapier/Make** — Trigger workflows from automation platforms
 - **Your backend** — Integrate scheduling into your application
 
-Set up a [webhook](/running-tasks/webhooks-faq) to get notified when scheduled runs complete.
+Set up a [webhook](/going-to-production/webhooks) to get notified when scheduled runs complete.
 </Accordion>
 
 <Accordion title="Why isn't my workflow using the parameter values I passed?">
@@ -184,7 +184,7 @@ while True:
     await asyncio.sleep(5)
 ```
 
-Or use [webhooks](/running-tasks/webhooks-faq) to get notified when runs complete without polling.
+Or use [webhooks](/going-to-production/webhooks) to get notified when runs complete without polling.
 </Accordion>
 
 <Accordion title="Where can I find extracted data after a run completes?">

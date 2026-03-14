@@ -11,9 +11,11 @@ from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
     CredentialParameterNotFoundError,
+    CredentialVaultNotConfiguredError,
     ImaginarySecretValue,
     SkyvernException,
     WorkflowRunContextNotInitialized,
+    sanitize_credential_for_error,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
@@ -180,6 +182,7 @@ class WorkflowRunContext:
         self.workflow_run_outputs: dict[str, Any] = {}
         self._aws_client = aws_client
         self.organization_id: str | None = None
+        self.browser_session_id: str | None = None
         self.include_secrets_in_templates: bool = False
         self.credential_totp_identifiers: dict[str, str] = {}
 
@@ -376,12 +379,15 @@ class WorkflowRunContext:
         """
         # Check if it's in the format vault_id:item_id
         if ":" in credential_id:
-            LOG.info(f"Processing credential in vault_id:item_id format: {credential_id}")
+            LOG.info("Processing credential in vault_id:item_id format")
             vault_id, item_id = credential_id.split(":", 1)
             return vault_id, item_id
 
         # If we can't parse the credential_id, raise an error
-        raise ValueError(f"Invalid credential format: {credential_id}. Expected format: vault_id:item_id")
+        raise ValueError(
+            f"Invalid credential format: {sanitize_credential_for_error(credential_id)}."
+            " Expected format: vault_id:item_id"
+        )
 
     async def _register_credential_parameter_value(
         self,
@@ -396,7 +402,7 @@ class WorkflowRunContext:
         vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
         credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
         if credential_service is None:
-            raise CredentialParameterNotFoundError(credential_id)
+            raise CredentialVaultNotConfiguredError(vault_type=vault_type.value, credential_id=credential_id)
 
         credential_item = await credential_service.get_credential_item(db_credential)
         credential = credential_item.credential
@@ -445,13 +451,13 @@ class WorkflowRunContext:
                 f"Trying to register workflow parameter as a secret but it is not a string. Parameter key: {parameter.key}"
             )
 
-        LOG.info(f"Fetching credential parameter value for credential: {credential_id}")
+        LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
 
         # Handle regular credentials from the database
         try:
             await self._register_credential_parameter_value(credential_id, parameter, organization)
         except Exception as e:
-            LOG.error(f"Failed to get credential from database: {credential_id}. Error: {e}")
+            LOG.error("Failed to get credential from database", parameter_key=parameter.key, exc_info=True)
             raise e
 
     async def register_credential_parameter_value(
@@ -459,7 +465,7 @@ class WorkflowRunContext:
         parameter: CredentialParameter,
         organization: Organization,
     ) -> None:
-        LOG.info(f"Fetching credential parameter value for credential: {parameter.credential_id}")
+        LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
 
         credential_id = None
         if parameter.credential_id:
@@ -469,7 +475,7 @@ class WorkflowRunContext:
                 credential_id = parameter.credential_id
 
         if credential_id is None:
-            LOG.error(f"Credential ID not found for credential: {parameter.credential_id}")
+            LOG.error("Credential ID not found", parameter_key=parameter.key)
             raise CredentialParameterNotFoundError(parameter.credential_id)
 
         await self._register_credential_parameter_value(credential_id, parameter, organization)

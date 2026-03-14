@@ -24,9 +24,13 @@ LOG = structlog.get_logger()
 
 class Constants:
     DEFAULT_TEMPLATE_NAME = "improve-prompt-for-ai-browser-agent"
+    EXTRACTION_TEMPLATE_NAME = "improve-prompt-for-data-extraction"
     IMPROVE_PROMPT_USE_CASE_TO_TEMPLATE_MAP = {
         "new_workflow": DEFAULT_TEMPLATE_NAME,
         "task_v2_prompt": DEFAULT_TEMPLATE_NAME,
+        "workflow_editor.extraction.data_extraction_goal": EXTRACTION_TEMPLATE_NAME,
+        "workflow_editor.extraction.data_schema": EXTRACTION_TEMPLATE_NAME,
+        "workflow_editor.task.data_extraction_goal": EXTRACTION_TEMPLATE_NAME,
     }
 
 

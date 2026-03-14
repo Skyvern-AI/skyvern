@@ -28,6 +28,7 @@ ProxyLocation = typing.Union[
         "RESIDENTIAL_IT",
         "RESIDENTIAL_NL",
         "RESIDENTIAL_PH",
+        "RESIDENTIAL_KR",
         "RESIDENTIAL_ISP",
         "NONE",
     ],

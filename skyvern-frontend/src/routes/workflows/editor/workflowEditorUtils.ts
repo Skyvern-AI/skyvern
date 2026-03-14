@@ -47,6 +47,7 @@ import {
   FileUploadBlockYAML,
   HttpRequestBlockYAML,
   PrintPageBlockYAML,
+  WorkflowTriggerBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -131,6 +132,10 @@ import {
   validateJson,
 } from "./nodes/HttpRequestNode/httpValidation";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
+import {
+  isWorkflowTriggerNode,
+  workflowTriggerNodeDefaultData,
+} from "./nodes/WorkflowTriggerNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -192,8 +197,12 @@ export function descendants(nodes: Array<AppNode>, id: string): Array<AppNode> {
 }
 
 /**
- * Updates visibility for a node and all its descendants recursively.
- * For nested conditionals, respects their active branch settings.
+ * Updates visibility for a node and all its descendants.
+ * When hiding, hides everything in a single pass.
+ * When showing, processes top-down (parents before children) so that each
+ * node's visibility decision can read its parent conditional's already-resolved
+ * visibility. This is critical for deeply nested conditionals: a child should
+ * only be shown if its parent conditional is visible AND its branch is active.
  */
 export function updateNodeAndDescendantsVisibility(
   nodes: Array<AppNode>,
@@ -203,43 +212,73 @@ export function updateNodeAndDescendantsVisibility(
   const nodeDescendants = descendants(nodes, nodeId);
   const descendantIds = new Set([nodeId, ...nodeDescendants.map((n) => n.id)]);
 
-  return nodes.map((node) => {
-    if (!descendantIds.has(node.id)) {
-      return node;
-    }
-
-    // If we're hiding, hide everything
-    if (shouldHide) {
+  // When hiding, all descendants are hidden — single pass is fine
+  if (shouldHide) {
+    return nodes.map((node) => {
+      if (!descendantIds.has(node.id)) return node;
       return { ...node, hidden: true };
-    }
+    });
+  }
 
-    // If we're showing, need to respect nested conditional logic
-    if (node.id === nodeId) {
-      return { ...node, hidden: false };
-    }
+  // When showing, process top-down so parent visibility is resolved before
+  // children. descendants() returns in parent-first order (parents appear
+  // before their children in the array).
+  const result = [...nodes];
+  const indexById = new Map(result.map((n, i) => [n.id, i]));
 
-    // For descendants, check if they're in a nested conditional
+  // Show the root node
+  const rootIdx = indexById.get(nodeId);
+  if (rootIdx !== undefined) {
+    result[rootIdx] = { ...result[rootIdx]!, hidden: false };
+  }
+
+  // Process descendants in parent-first order, reading from `result`
+  // which reflects visibility decisions made for earlier (parent) nodes.
+  for (const desc of nodeDescendants) {
+    const idx = indexById.get(desc.id);
+    if (idx === undefined) continue;
+
+    const node = result[idx]!;
+
+    // Workflow block nodes inside a conditional: check parent conditional
     if (isWorkflowBlockNode(node) && node.data.conditionalNodeId) {
-      // This node is inside a conditional - find that conditional
-      const conditionalNode = nodes.find(
-        (n) => n.id === node.data.conditionalNodeId,
-      );
+      const conditionalIdx = indexById.get(node.data.conditionalNodeId);
+      const conditionalNode =
+        conditionalIdx !== undefined ? result[conditionalIdx] : undefined;
 
       if (conditionalNode && isWorkflowBlockNode(conditionalNode)) {
+        // If parent conditional is hidden, hide this node too
+        if (conditionalNode.hidden) {
+          result[idx] = { ...node, hidden: true };
+          continue;
+        }
+
         const conditionalData = conditionalNode.data as {
           activeBranchId?: string | null;
         };
         const activeBranchId = conditionalData.activeBranchId;
-
-        // Show only if this node belongs to the active branch
         const shouldShow = node.data.conditionalBranchId === activeBranchId;
-        return { ...node, hidden: !shouldShow };
+        result[idx] = { ...node, hidden: !shouldShow };
+        continue;
       }
     }
 
-    // Otherwise, show the node
-    return { ...node, hidden: false };
-  });
+    // Non-workflow-block nodes (start, adder): inherit parent's visibility
+    if (node.parentId) {
+      const parentIdx = indexById.get(node.parentId);
+      const parentNode =
+        parentIdx !== undefined ? result[parentIdx] : undefined;
+      if (parentNode) {
+        result[idx] = { ...node, hidden: parentNode.hidden ?? false };
+        continue;
+      }
+    }
+
+    // Default: show the node
+    result[idx] = { ...node, hidden: false };
+  }
+
+  return result;
 }
 
 export function getLoopNodeWidth(node: AppNode, nodes: Array<AppNode>): number {
@@ -297,7 +336,16 @@ function layout(
     const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
     const isTargetted =
       targettedBlockLabel && nodeLabel === targettedBlockLabel;
-    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
+    // Use measured header height when available, fall back to 225 for initial render.
+    // Add 28px to account for outer container (border-2 + p-2 = 10px) + gap (16px) + buffer.
+    const headerHeight = isLoopNode(node) ? node.data._headerHeight : undefined;
+    const baseMargin = headerHeight ? headerHeight + 28 : 225;
+    // Only add extra margin for the status row when using the fallback height,
+    // since the measured height already includes the status row content.
+    const marginy =
+      isTargetted && !headerHeight
+        ? baseMargin + TARGETTED_BLOCK_EXTRA_MARGIN
+        : baseMargin;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
@@ -506,9 +554,11 @@ function convertToNode(
           navigationGoal: block.navigation_goal ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
           dataSchema:
-            typeof block.data_schema === "string"
-              ? block.data_schema
-              : JSON.stringify(block.data_schema, null, 2),
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           allowDownloads: block.complete_on_download ?? false,
           downloadSuffix: block.download_suffix ?? null,
@@ -653,9 +703,11 @@ function convertToNode(
           url: block.url ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
           dataSchema:
-            typeof block.data_schema === "string"
-              ? block.data_schema
-              : JSON.stringify(block.data_schema, null, 2),
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
           parameterKeys: block.parameters.map((p) => p.key),
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
@@ -778,6 +830,12 @@ function convertToNode(
           loopVariableReference: loopVariableReference,
           completeIfEmpty: block.complete_if_empty,
           nextLoopOnFailure: block.next_loop_on_failure,
+          dataSchema:
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
         },
       };
     }
@@ -900,6 +958,23 @@ function convertToNode(
         },
       };
     }
+    case "workflow_trigger": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "workflowTrigger",
+        data: {
+          ...commonData,
+          workflowPermanentId: block.workflow_permanent_id ?? "",
+          workflowTitle: "",
+          payload: JSON.stringify(block.payload || {}, null, 2),
+          waitForCompletion: block.wait_for_completion ?? true,
+          browserSessionId: block.browser_session_id ?? "",
+          useParentBrowserSession: block.use_parent_browser_session ?? false,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
   }
 }
 
@@ -1016,12 +1091,16 @@ function collectLabelsForBranch(
   startLabel: string | null,
   stopLabel: string | null,
   blocksByLabel: Map<string, WorkflowBlock>,
+  excludeLabels?: Set<string>,
 ): Array<string> {
   const labels: Array<string> = [];
   const visited = new Set<string>();
   let current = startLabel ?? null;
 
   while (current && current !== stopLabel && !visited.has(current)) {
+    if (excludeLabels?.has(current)) {
+      break;
+    }
     visited.add(current);
     labels.push(current);
     const block = blocksByLabel.get(current);
@@ -1067,7 +1146,7 @@ function reconstructConditionalStructure(
   });
 
   // Process each conditional block
-  blocks.forEach((block) => {
+  blocks.forEach((block, blockIndex) => {
     if (block.block_type !== "conditional") {
       if (block.block_type === "for_loop") {
         // Recursively handle conditionals inside loops
@@ -1094,6 +1173,16 @@ function reconstructConditionalStructure(
     const conditionalNode = labelToNodeMap.get(block.label);
     if (!conditionalNode) {
       return;
+    }
+
+    // Blocks at or before this conditional must not be collected as branch
+    // children. Without this guard, next_block_label chains that loop back
+    // to earlier blocks (e.g. reporting → fetch_token) would pull the
+    // conditional itself into its own branch, setting parentId to its own id
+    // and crashing React Flow with a stack overflow.
+    const excludeLabels = new Set<string>();
+    for (let i = 0; i <= blockIndex; i++) {
+      excludeLabels.add(blocks[i]!.label);
     }
 
     // Create START and NodeAdder nodes for this conditional
@@ -1126,6 +1215,7 @@ function reconstructConditionalStructure(
         branch.next_block_label,
         block.next_block_label ?? null,
         blocksByLabel,
+        excludeLabels,
       );
 
       // Set metadata and parentId for all nodes in this branch
@@ -1274,7 +1364,9 @@ function getConditionalBranchNodeIds(
       .filter(
         (node) =>
           isWorkflowBlockNode(node) &&
-          !node.hidden &&
+          // Do NOT filter by !node.hidden here. Hidden is a UI-only concept
+          // for branch tab visibility. Serialization must consider all branch
+          // nodes to correctly identify merge targets.
           node.data.conditionalNodeId === conditionalNodeId &&
           Boolean(node.data.conditionalBranchId),
       )
@@ -1481,13 +1573,20 @@ function getElements(
     // conditional's own edges).
     const branchLabels = new Set<string>();
     const collectBranchLabels = (loopChildren: Array<WorkflowBlock>) => {
-      loopChildren.forEach((child) => {
+      loopChildren.forEach((child, childIndex) => {
         if (child.block_type === "conditional") {
+          // Exclude labels at or before this conditional to prevent
+          // back-reference chains from pulling in earlier blocks
+          const loopExclude = new Set<string>();
+          for (let i = 0; i <= childIndex; i++) {
+            loopExclude.add(loopChildren[i]!.label);
+          }
           child.branch_conditions.forEach((branch) => {
             collectLabelsForBranch(
               branch.next_block_label,
               child.next_block_label ?? null,
               blocksByLabel,
+              loopExclude,
             ).forEach((label) => branchLabels.add(label));
           });
         }
@@ -1507,31 +1606,20 @@ function getElements(
     if (children.length === 0) {
       edges.push(defaultEdge(startNodeId, adderNodeId));
     } else {
-      const childById = new Map<string, (typeof children)[number]>();
-      children.forEach((c) => childById.set(c.id, c));
+      // Chain children using their array order (after branch-label filtering)
+      // rather than the previous/next pointers from getNodeData. Those pointers
+      // reflect the original unfiltered array and may reference blocks that were
+      // removed as conditional branch targets, breaking the chain and leaving
+      // subsequent blocks (including merge targets) as unreachable orphans.
+      edges.push(edgeWithAddButton(startNodeId, children[0]!.id));
 
-      const firstChild =
-        children.find(
-          (c) => c.previous === null || !childById.has(c.previous),
-        ) ?? children[0]!;
-      edges.push(edgeWithAddButton(startNodeId, firstChild.id));
-
-      let current = firstChild;
-      let lastChild = firstChild;
-      while (current) {
-        const nextChild = current.next ? childById.get(current.next) : null;
-        if (!nextChild) {
-          break;
-        }
-        edges.push(edgeWithAddButton(current.id, nextChild.id));
-        lastChild = nextChild;
-        current = nextChild;
+      for (let i = 0; i < children.length - 1; i++) {
+        edges.push(edgeWithAddButton(children[i]!.id, children[i + 1]!.id));
       }
 
+      const lastChild = children[children.length - 1]!;
       nodes.push(nodeAdderNode(adderNodeId, block.id));
-      if (lastChild) {
-        edges.push(defaultEdge(lastChild.id, adderNodeId));
-      }
+      edges.push(defaultEdge(lastChild.id, adderNodeId));
       return;
     }
 
@@ -1951,6 +2039,17 @@ function createNode(
         },
       };
     }
+    case "workflowTrigger": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "workflowTrigger",
+        data: {
+          ...workflowTriggerNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "conditional": {
       const branches = createDefaultBranchConditions();
       return {
@@ -2002,9 +2101,14 @@ function findNextBlockLabel(
       return null;
     }
 
-    // If this node itself is a conditional, prefer its own merge label
+    // If this node itself is a conditional, compute merge label from edges
+    // (not node.data.mergeLabel which may be stale from deserialization)
     if (currentNode.type === "conditional") {
-      return currentNode.data.mergeLabel ?? null;
+      return findConditionalMergeLabel(
+        currentNode as ConditionalNode,
+        nodes,
+        edges,
+      );
     }
 
     const conditionalNodeId = currentNode.data.conditionalNodeId;
@@ -2432,6 +2536,25 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
       };
     }
+    case "workflowTrigger": {
+      const parsedPayload = JSONParseSafe(node.data.payload) as Record<
+        string,
+        unknown
+      > | null;
+      return {
+        ...base,
+        block_type: "workflow_trigger",
+        workflow_permanent_id: node.data.workflowPermanentId,
+        payload:
+          parsedPayload && Object.keys(parsedPayload).length > 0
+            ? parsedPayload
+            : null,
+        wait_for_completion: node.data.waitForCompletion,
+        browser_session_id: node.data.browserSessionId || null,
+        use_parent_browser_session: node.data.useParentBrowserSession,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
     case "conditional": {
       return serializeConditionalBlock(node as ConditionalNode, nodes, edges);
     }
@@ -2514,6 +2637,7 @@ function getOrderedChildrenBlocks(
         loop_blocks: loopChildren,
         loop_variable_reference: currentNode.data.loopVariableReference,
         complete_if_empty: currentNode.data.completeIfEmpty,
+        data_schema: JSONSafeOrString(currentNode.data.dataSchema),
       });
     } else {
       children.push(getWorkflowBlock(currentNode, nodes, edges));
@@ -2542,14 +2666,17 @@ function getOrderedChildrenBlocks(
 
     if (node.type === "loop") {
       const loopChildren = getOrderedChildrenBlocks(nodes, edges, node.id);
+      const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
       children.push({
         block_type: "for_loop",
         label: node.data.label,
         continue_on_failure: node.data.continueOnFailure,
         next_loop_on_failure: node.data.nextLoopOnFailure,
+        next_block_label: nextBlockLabel,
         loop_blocks: loopChildren,
         loop_variable_reference: node.data.loopVariableReference,
         complete_if_empty: node.data.completeIfEmpty,
+        data_schema: JSONSafeOrString(node.data.dataSchema),
       });
       includedIds.add(node.id);
       return;
@@ -2615,6 +2742,7 @@ function getWorkflowBlocksUtil(
           loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
           loop_variable_reference: node.data.loopVariableReference,
           complete_if_empty: node.data.completeIfEmpty,
+          data_schema: JSONSafeOrString(node.data.dataSchema),
         },
       ];
     }
@@ -3722,6 +3850,7 @@ function convertBlocksToBlockYAML(
           loop_blocks: convertBlocksToBlockYAML(block.loop_blocks),
           loop_variable_reference: block.loop_variable_reference,
           complete_if_empty: block.complete_if_empty,
+          data_schema: block.data_schema,
         };
         return blockYaml;
       }
@@ -3849,6 +3978,19 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "workflow_trigger": {
+        const blockYaml: WorkflowTriggerBlockYAML = {
+          ...base,
+          block_type: "workflow_trigger",
+          workflow_permanent_id: block.workflow_permanent_id,
+          payload: block.payload,
+          wait_for_completion: block.wait_for_completion,
+          browser_session_id: block.browser_session_id,
+          use_parent_browser_session: block.use_parent_browser_session,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
     }
   });
 }
@@ -3877,6 +4019,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
     run_with: workflow.run_with,
+    adaptive_caching: workflow.adaptive_caching ?? undefined,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
     run_sequentially: workflow.run_sequentially ?? undefined,
@@ -4068,9 +4211,20 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     jsonFields.forEach(({ value, name }) => {
       const result = validateJson(value);
       if (!result.valid && result.message) {
-        errors.push(`${node.data.label}: ${name} is not valid JSON.`);
+        errors.push(`${node.data.label}: ${name} - ${result.message}`);
       }
     });
+  });
+
+  const workflowTriggerNodes = nodes.filter(isWorkflowTriggerNode);
+  workflowTriggerNodes.forEach((node) => {
+    if (!node.data.workflowPermanentId.trim()) {
+      errors.push(`${node.data.label}: Workflow Permanent ID is required.`);
+    }
+    const payloadResult = validateJson(node.data.payload);
+    if (!payloadResult.valid && payloadResult.message) {
+      errors.push(`${node.data.label}: Payload - ${payloadResult.message}`);
+    }
   });
 
   return errors;
@@ -4112,10 +4266,13 @@ function isNodeInsideForLoop(nodes: Array<AppNode>, nodeId: string): boolean {
   if (!currentNode) {
     return false;
   }
-  const parentNode = currentNode.parentId
-    ? nodes.find((n) => n.id === currentNode.parentId)
-    : null;
-  return parentNode?.type === "loop";
+  let current: AppNode | undefined = currentNode;
+  while (current?.parentId) {
+    const parent = nodes.find((n) => n.id === current!.parentId);
+    if (parent?.type === "loop") return true;
+    current = parent;
+  }
+  return false;
 }
 
 export {

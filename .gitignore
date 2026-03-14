@@ -160,6 +160,7 @@ ig_*
 .idea/
 
 # Skyvern ignores
+browser_sessions/
 videos/
 skyvern/artifacts/
 artifacts/
@@ -188,4 +189,5 @@ tags.temp.tmp
 tmp/user_data_dir
 
 # Claude
-.claude
+.claude/*
+!.claude/skills/

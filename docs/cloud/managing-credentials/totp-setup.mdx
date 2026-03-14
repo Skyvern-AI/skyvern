@@ -1,0 +1,180 @@
+---
+title: 2FA / TOTP Setup
+subtitle: Configure two-factor authentication for automated logins
+slug: cloud/managing-credentials/totp-setup
+---
+
+Skyvern supports three 2FA methods for automated logins. **Authenticator App (TOTP)** is fully automatic: Skyvern generates codes locally. **Email** and **Text Message** require you to push codes via the UI or API. All three are configured on the [password credential](/cloud/managing-credentials/password-credentials) itself.
+
+## Authenticator App (TOTP)
+
+The preferred method. Skyvern generates valid 6-digit codes on demand during login flows with no delay and no manual steps.
+
+### How it works
+
+1. The Login block enters the username and password
+2. The site prompts for a 2FA code
+3. Skyvern generates a fresh TOTP code from the stored secret key
+4. The code is entered automatically and login completes
+
+### Setting it up
+
+<Steps>
+  <Step title="Create a password credential">
+    Go to the Credentials page and create a new password credential.
+  </Step>
+  <Step title="Expand Two-Factor Authentication">
+    Below the password fields, click the **Two-Factor Authentication** accordion.
+  </Step>
+  <Step title="Select Authenticator App">
+    Choose **Authenticator App** from the three options.
+  </Step>
+  <Step title="Paste your TOTP secret key">
+    Enter the secret key into the **Authenticator Key** field and click **Save**.
+  </Step>
+</Steps>
+
+<Accordion title="Finding your TOTP secret key">
+The secret key is the base32-encoded string behind the QR code you'd normally scan in an authenticator app. You can find it in a few places:
+
+- **Bitwarden**: Edit the login → TOTP field → copy the key
+- **1Password**: Edit the login → One-Time Password → copy the secret
+- **LastPass**: Edit the login → Advanced Settings → copy the TOTP secret
+- **Site settings**: Many sites show a "Can't scan?" link during 2FA setup that reveals the text key
+
+If you only have a QR code, decode it to extract the `secret=` parameter from the `otpauth://totp/...?secret=BASE32KEY` URI.
+</Accordion>
+
+---
+
+## Email and Text Message codes
+
+When a site sends 2FA codes via email or SMS, someone (or something) needs to deliver the code to Skyvern before the login can complete.
+
+### How it works
+
+1. The Login block enters the username and password
+2. The site sends a 2FA code to the configured email or phone number
+3. You push the code to Skyvern via the **2FA tab** or the API
+4. Skyvern enters the code and completes the login
+
+### Setting it up
+
+<Steps>
+  <Step title="Create a password credential">
+    Go to the Credentials page and create a new password credential.
+  </Step>
+  <Step title="Expand Two-Factor Authentication">
+    Below the password fields, click the **Two-Factor Authentication** accordion.
+  </Step>
+  <Step title="Select Email or Text Message">
+    Choose the method that matches how the site delivers codes.
+  </Step>
+  <Step title="Enter the identifier">
+    Provide the **email address** or **phone number** that receives the codes. For Email, this auto-fills from the Username field.
+  </Step>
+</Steps>
+
+---
+
+## Pushing codes to Skyvern
+
+Once a workflow is running and waiting for a 2FA code, you need to deliver it. There are two ways.
+
+### Via the UI
+
+Open the **2FA** tab on the Credentials page. The **Push a 2FA Code** form has two fields:
+
+| Field | What to enter |
+|-------|--------------|
+| **Identifier** | The email address or phone number that received the code |
+| **Verification content** | The full email/SMS body, or just the code itself. Skyvern extracts the digits automatically. |
+
+<img src="/images/cloud/credentials-2fa-push-form.png" alt="2FA tab showing the Push a 2FA Code form and code history table" />
+
+<Tip>
+If multiple workflows are running simultaneously, click **Add optional metadata** to link the code to a specific run using the workflow run ID, workflow ID, or task ID.
+</Tip>
+
+### Via the API
+
+For production, automate code delivery. Set up a forwarding rule that sends 2FA emails or texts to a script, and the script pushes the code to Skyvern:
+
+<CodeGroup>
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/credentials/totp" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "totp_identifier": "user@example.com",
+    "content": "Your verification code is 847291",
+    "source": "email_forwarder"
+  }'
+```
+
+```python Python
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+await skyvern.send_totp_code(
+    totp_identifier="user@example.com",
+    content="Your verification code is 847291",
+    source="email_forwarder",
+)
+```
+
+```typescript TypeScript
+import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+await skyvern.sendTotpCode({
+    totp_identifier: "user@example.com",
+    content: "Your verification code is 847291",
+    source: "email_forwarder",
+});
+```
+</CodeGroup>
+
+**Response:**
+```json
+{
+  "totp_code_id": "tc_abc123",
+  "totp_identifier": "user@example.com",
+  "code": "847291",
+  "source": "email_forwarder",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
+The `source` field is a free-text label for your own tracking (e.g., `"email_forwarder"`, `"twilio_webhook"`).
+
+To link a code to a specific run, pass `workflow_run_id`, `workflow_id`, or `task_id`. This is the API equivalent of the **Add optional metadata** option in the UI.
+
+<Tip>
+This turns email-based 2FA into something nearly as automated as an authenticator app. The main difference is latency while the email arrives and gets forwarded.
+</Tip>
+
+---
+
+## Viewing past codes
+
+The table below the push form shows all 2FA codes your organization has received: identifier, extracted code, source type, associated workflow run, and timestamps. Filter by identifier, OTP type (numeric code vs. magic link), and number of results per page.
+
+Use this for auditing and debugging: confirming that a code was received and delivered to the right run.
+
+<CardGroup cols={2}>
+  <Card
+    title="Password Credentials"
+    icon="key"
+    href="/cloud/managing-credentials/password-credentials"
+  >
+    Create credentials with 2FA methods attached
+  </Card>
+  <Card
+    title="Credentials Overview"
+    icon="lock"
+    href="/cloud/managing-credentials/credentials-overview"
+  >
+    Security model, quick start, and all credential types
+  </Card>
+</CardGroup>

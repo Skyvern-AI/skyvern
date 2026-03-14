@@ -54,6 +54,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
     ValidationBlock,
     WaitBlock,
+    WorkflowTriggerBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -418,6 +419,7 @@ def block_yaml_to_block(
             loop_variable_reference=block_yaml.loop_variable_reference,
             loop_blocks=loop_blocks,
             complete_if_empty=block_yaml.complete_if_empty,
+            data_schema=block_yaml.data_schema,
         )
     elif block_yaml.block_type == BlockType.CONDITIONAL:
         branch_conditions = []
@@ -702,6 +704,18 @@ def block_yaml_to_block(
             landscape=block_yaml.landscape,
             print_background=block_yaml.print_background,
             parameters=print_page_block_parameters,
+        )
+
+    elif block_yaml.block_type == BlockType.WORKFLOW_TRIGGER:
+        workflow_trigger_block_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return WorkflowTriggerBlock(
+            **base_kwargs,
+            workflow_permanent_id=block_yaml.workflow_permanent_id,
+            payload=block_yaml.payload,
+            wait_for_completion=block_yaml.wait_for_completion,
+            browser_session_id=block_yaml.browser_session_id,
+            use_parent_browser_session=block_yaml.use_parent_browser_session,
+            parameters=workflow_trigger_block_parameters,
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")

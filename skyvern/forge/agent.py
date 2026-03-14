@@ -55,7 +55,6 @@ from skyvern.exceptions import (
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
     ScrapingFailed,
-    SkyvernException,
     StepTerminationError,
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
@@ -63,11 +62,12 @@ from skyvern.exceptions import (
     TaskNotFound,
     UnsupportedActionType,
     UnsupportedTaskType,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.aws import aws_client
+from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_downloading_files_in_directory,
@@ -104,6 +104,7 @@ from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
@@ -415,6 +416,7 @@ class ForgeAgent:
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
         list_files_before: list[str] = []
+        browser_state: BrowserState | None = None
         try:
             if task.workflow_run_id:
                 list_files_before = list_files_in_directory(
@@ -546,7 +548,7 @@ class ForgeAgent:
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
                     for file in files_to_rename:
                         if file.startswith("s3://"):
-                            file_data = await aws_client.download_file(file, log_exception=False)
+                            file_data = await get_aws_client().download_file(file, log_exception=False)
                             if not file_data:
                                 continue
                             file = file.split("/")[-1]  # Extract filename from the end of S3 URI
@@ -723,7 +725,7 @@ class ForgeAgent:
                 "Step cannot be executed, marking task as failed",
                 exc_info=True,
             )
-            is_task_marked_as_failed = await self.fail_task(task, step, e.message)
+            is_task_marked_as_failed = await self.fail_task(task, step, e.message, browser_state)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -749,7 +751,7 @@ class ForgeAgent:
                 url=e.url,
             )
             failure_reason = f"Failed to navigate to URL. URL:{e.url}, Error:{e.error_message}"
-            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason)
+            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -794,7 +796,7 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
-            await self.fail_task(task, step, e.message)
+            await self.fail_task(task, step, e.message, browser_state)
             await self.clean_up_task(
                 task=task,
                 last_step=step,
@@ -814,7 +816,8 @@ class ForgeAgent:
                 task,
                 step,
                 sfe.reason
-                or "Skyvern failed to load the website. This usually happens when the website is not properly designed, and crashes the browser as a result.",
+                or "Skyvern failed to load the website. The page may have navigated unexpectedly or become unresponsive during analysis.",
+                browser_state,
             )
             await self.clean_up_task(
                 task=task,
@@ -830,6 +833,7 @@ class ForgeAgent:
                 task,
                 step,
                 "The browser does not have a valid page for skyvern to operate. This may be due to the website being empty or the browser crashing.",
+                browser_state,
             )
             await self.clean_up_task(
                 task=task,
@@ -842,11 +846,9 @@ class ForgeAgent:
         except Exception as e:
             LOG.exception("Got an unexpected exception in step, marking task as failed")
 
-            failure_reason = f"Unexpected error: {str(e)}"
-            if isinstance(e, SkyvernException):
-                failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+            failure_reason = get_user_facing_exception_message(e)
 
-            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason)
+            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -864,7 +866,9 @@ class ForgeAgent:
             context.step_id = None
             context.task_id = None
 
-    async def fail_task(self, task: Task, step: Step | None, reason: str | None) -> bool:
+    async def fail_task(
+        self, task: Task, step: Step | None, reason: str | None, browser_state: BrowserState | None = None
+    ) -> bool:
         try:
             if step is not None:
                 await self.update_step(
@@ -872,11 +876,50 @@ class ForgeAgent:
                     status=StepStatus.failed,
                 )
 
+            # Update task status first
             await self.update_task(
                 task,
                 status=TaskStatus.failed,
                 failure_reason=reason,
             )
+
+            # Detect user-defined errors if error_code_mapping is provided
+            if task.error_code_mapping and step is not None:
+                LOG.info(
+                    "Task has error_code_mapping, attempting to detect user-defined errors",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    error_code_mapping=task.error_code_mapping,
+                )
+
+                try:
+                    detected_errors = await detect_user_defined_errors_for_task(
+                        task=task,
+                        step=step,
+                        browser_state=browser_state,
+                        failure_reason=reason,
+                    )
+
+                    # Update task errors if any were detected
+                    # Only pass new errors — update_task() appends to existing errors
+                    if detected_errors:
+                        new_errors = [error.model_dump() for error in detected_errors]
+                        await app.DATABASE.update_task(
+                            task_id=task.task_id,
+                            organization_id=task.organization_id,
+                            errors=new_errors,
+                        )
+                        LOG.info(
+                            "Updated task with detected user-defined errors",
+                            task_id=task.task_id,
+                            error_codes=[e.error_code for e in detected_errors],
+                        )
+                except Exception:
+                    LOG.exception(
+                        "Failed to detect or store user-defined errors during task failure",
+                        task_id=task.task_id,
+                    )
+
             return True
         except TaskAlreadyCanceled:
             LOG.info(
@@ -1037,26 +1080,31 @@ class ForgeAgent:
                     if json_response is None:
                         raise MissingExtractActionsResponse()
                     try:
-                        if pdf_embed_src := scraped_page.check_pdf_viewer_embed():
+                        # Check for PDF viewer: either <embed type="application/pdf"> or
+                        # Edge's PDF interstitial <iframe src="data:application/pdf;base64,...">
+                        pdf_src = scraped_page.check_pdf_viewer_embed()
+                        if not pdf_src:
+                            pdf_src = await scraped_page.check_pdf_iframe()
+                        if pdf_src:
                             LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
                             pdf_bytes: bytes | None = None
                             download_url: str | None = None
 
-                            # Check if the embed src is a data URI with base64 encoded PDF
+                            # Check if the src is a data URI with base64 encoded PDF
                             # Format: data:application/pdf[;charset=...];base64,<base64_data>
-                            if pdf_embed_src.startswith("data:application/pdf"):
+                            if pdf_src.startswith("data:application/pdf"):
                                 # Use more precise regex to extract base64 data after the base64, prefix
                                 # This pattern matches: data:application/pdf[;optional_params];base64,<data>
-                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_embed_src, re.S)
+                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_src, re.S)
                                 if not m:
                                     raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_embed_src,
+                                        pdf_embed_src=pdf_src,
                                         reason="Failed to extract base64 data from PDF embed src. Expected format: data:application/pdf[;charset=...];base64,<data>",
                                     )
 
                                 base64_data = m.group(1)
                                 LOG.info(
-                                    "Found base64 data in PDF embed src",
+                                    "Found base64 data in PDF src",
                                     step_id=step.step_id,
                                     base64_data_length=len(base64_data),
                                 )
@@ -1066,17 +1114,17 @@ class ForgeAgent:
                                     pdf_bytes = base64.b64decode(base64_data, validate=True)
                                 except Exception as e:
                                     raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_embed_src,
+                                        pdf_embed_src=pdf_src,
                                         reason=f"Failed to decode base64 data: {str(e)}",
                                     ) from e
                             else:
                                 # If not a data URI, treat it as a URL
                                 LOG.info(
-                                    "Found PDF embed src as URL (not base64 data)",
+                                    "Found PDF src as URL (not base64 data)",
                                     step_id=step.step_id,
-                                    download_url=pdf_embed_src,
+                                    download_url=pdf_src,
                                 )
-                                download_url = pdf_embed_src
+                                download_url = pdf_src
 
                             actions = [
                                 DownloadFileAction(
@@ -1326,8 +1374,27 @@ class ForgeAgent:
                             digit=current_text,
                         )
 
+                # Skip sleep and post-action artifacts for page-level SCROLL to preserve
+                # scroll-driven JS state. Many pages enable buttons only while scrolled to
+                # bottom (e.g. T&C "Agree" buttons) and re-disable them after any delay or
+                # programmatic scroll. Sub-container scrolls (strategies 1 & 2) don't affect
+                # page position, so they keep normal sleep and artifact recording.
+                is_page_level_scroll = action.action_type == ActionType.SCROLL and any(
+                    r.success and isinstance(r.data, dict) and r.data.get("page_level_scroll") for r in results
+                )
+                if is_page_level_scroll:
+                    wait_time = 0.0
+
                 await asyncio.sleep(wait_time)
-                await self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                if not is_page_level_scroll:
+                    await self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                else:
+                    LOG.info(
+                        "Skipping post-action artifacts for page-level scroll",
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        action_idx=action_idx,
+                    )
                 for result in results:
                     result.step_retry_number = step.retry_index
                     result.step_order = step.order
@@ -1699,16 +1766,24 @@ class ForgeAgent:
                 message=llm_caller.current_tool_results,
                 message_length=len(llm_caller.message_history),
             )
+        type = "computer_20250124"
+        betas = ["computer-use-2025-01-24"]
+        # according to https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool
+        # "computer-use-2025-11-24" for Claude Opus 4.6, Claude Opus 4.5
+        # "computer-use-2025-01-24" for Claude Sonnet 4.6, Sonnet 4.5, Haiku 4.5, Opus 4.1, Sonnet 4, Opus 4, and Sonnet 3.7 (deprecated)
+
+        if "OPUS" in llm_caller.llm_key and ("4.6" in llm_caller.llm_key or "4.5" in llm_caller.llm_key):
+            type = "computer_20251124"
+            betas = ["computer-use-2025-11-24"]
         tools = [
             {
-                "type": "computer_20250124",
+                "type": type,
                 "name": "computer",
                 "display_height_px": settings.BROWSER_HEIGHT,
                 "display_width_px": settings.BROWSER_WIDTH,
             }
         ]
         thinking = {"type": "enabled", "budget_tokens": 1024}
-        betas = ["computer-use-2025-01-24"]
         window_dimension = cast(Resolution, scraped_page.window_dimension) if scraped_page.window_dimension else None
         if not llm_caller.message_history:
             llm_response = await llm_caller.call(
@@ -3142,7 +3217,7 @@ class ForgeAgent:
 
         current_context = skyvern_context.ensure_context()
         verification_code = current_context.totp_codes.get(task.task_id)
-        if (task.totp_verification_url or task.totp_identifier) and verification_code:
+        if verification_code:
             if (
                 isinstance(final_navigation_payload, dict)
                 and SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload
@@ -3999,7 +4074,7 @@ class ForgeAgent:
             if browser_state is not None:
                 page = await browser_state.get_working_page()
 
-            failure_reason = await self.summary_failure_reason_for_max_retries(
+            failure_response = await self.summary_failure_reason_for_max_retries(
                 organization=organization,
                 task=task,
                 step=step,
@@ -4007,13 +4082,23 @@ class ForgeAgent:
                 max_retries=max_retries_per_step,
             )
 
+            # Only pass new errors — update_task() appends to existing errors in the DB
+            new_errors: list[dict[str, Any]] = [ReachMaxRetriesError().model_dump()]
+            if failure_response.errors:
+                new_errors.extend([error.model_dump() for error in failure_response.errors])
+                LOG.info(
+                    "Detected user-defined errors for max retries failure",
+                    task_id=task.task_id,
+                    error_codes=[e.error_code for e in failure_response.errors],
+                )
+
             await self.update_task(
                 task,
                 TaskStatus.failed,
                 failure_reason=(
-                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_reason}"
+                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_response.reasoning}"
                 ),
-                errors=[ReachMaxRetriesError().model_dump()],
+                errors=new_errors,
             )
             return None
         else:
@@ -4151,7 +4236,7 @@ class ForgeAgent:
         step: Step,
         page: Page | None,
         max_retries: int,
-    ) -> str:
+    ) -> MaxStepsReasonResponse:
         html = ""
         screenshots: list[bytes] = []
         steps_results = []
@@ -4202,18 +4287,26 @@ class ForgeAgent:
             # If we detected LLM errors, return a clear message without calling the LLM
             if llm_errors:
                 llm_error_details = "; ".join(llm_errors)
-                return (
-                    f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
-                    f"This is typically caused by rate limiting, service outages, or resource exhaustion from the LLM provider. "
-                    f"Error details: {llm_error_details}"
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                        f"This is typically caused by rate limiting, service outages, or resource exhaustion from the LLM provider. "
+                        f"Error details: {llm_error_details}"
+                    ),
+                    errors=[],
                 )
 
             # If multiple steps failed without producing any actions, it's likely an LLM error during action extraction
             if steps_without_actions >= max_retries:
-                return (
-                    f"The task failed because all {max_retries} retry attempts failed to generate actions. "
-                    f"This is typically caused by LLM service errors during action extraction, such as rate limiting, "
-                    f"service outages, or resource exhaustion from the LLM provider. Please check the LLM service status and try again."
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed because all {max_retries} retry attempts failed to generate actions. "
+                        f"This is typically caused by LLM service errors during action extraction, such as rate limiting, "
+                        f"service outages, or resource exhaustion from the LLM provider. Please check the LLM service status and try again."
+                    ),
+                    errors=[],
                 )
 
             if page is not None:
@@ -4228,6 +4321,7 @@ class ForgeAgent:
                 steps=steps_results,
                 page_html=html,
                 max_retries=max_retries,
+                error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await app.SECONDARY_LLM_API_HANDLER(
@@ -4236,26 +4330,42 @@ class ForgeAgent:
                 step=step,
                 prompt_name="summarize-max-retries-reason",
             )
-            return json_response.get("reasoning", "")
+            return MaxStepsReasonResponse.model_validate(json_response)
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")
             # Check if we have LLM errors even if the summarization failed
             if llm_errors:
                 llm_error_details = "; ".join(llm_errors)
-                return (
-                    f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
-                    f"Error details: {llm_error_details}"
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                        f"Error details: {llm_error_details}"
+                    ),
+                    errors=[],
                 )
             # If multiple steps failed without actions during summarization failure, still report it
             if steps_without_actions >= max_retries:
-                return (
-                    f"The task failed because all {max_retries} retry attempts failed to generate actions. "
-                    f"This is typically caused by LLM service errors during action extraction."
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed because all {max_retries} retry attempts failed to generate actions. "
+                        f"This is typically caused by LLM service errors during action extraction."
+                    ),
+                    errors=[],
                 )
             if steps_results:
                 last_step_result = steps_results[-1]
-                return f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}"
-            return ""
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}",
+                    errors=[],
+                )
+            return MaxStepsReasonResponse(
+                page_info="",
+                reasoning="",
+                errors=[],
+            )
 
     async def handle_completed_step(
         self,
@@ -4424,6 +4534,7 @@ class ForgeAgent:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
 
+        # If no OTP verification needed, return early to avoid unnecessary processing
         if (
             not should_verify_by_magic_link
             and not place_to_enter_verification_code

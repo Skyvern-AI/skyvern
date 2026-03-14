@@ -307,6 +307,12 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                                   Skyvern Agent
                                 </SelectItem>
                                 <SelectItem value="code">Code</SelectItem>
+                                <SelectItem value="code_v2">
+                                  <span>Code 2.0</span>{" "}
+                                  <span className="text-xs italic text-yellow-400">
+                                    new
+                                  </span>
+                                </SelectItem>
                               </SelectContent>
                             </Select>
                           </div>
