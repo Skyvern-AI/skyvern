@@ -18,6 +18,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
@@ -881,17 +882,26 @@ async def run_task_v2_helper(
                 break
 
             if task_type == "extract":
-                block, block_yaml_list, parameter_yaml_list = await _generate_extraction_task(
-                    task_v2=task_v2,
-                    workflow_id=workflow_id,
-                    workflow_permanent_id=workflow.workflow_permanent_id,
-                    workflow_run_id=workflow_run_id,
-                    current_url=current_url,
-                    scraped_page=scraped_page,
-                    data_extraction_goal=plan,
-                    task_history=task_history,
-                )
-                task_history_record = {"type": task_type, "task": plan}
+                try:
+                    block, block_yaml_list, parameter_yaml_list = await _generate_extraction_task(
+                        task_v2=task_v2,
+                        workflow_id=workflow_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        workflow_run_id=workflow_run_id,
+                        current_url=current_url,
+                        scraped_page=scraped_page,
+                        data_extraction_goal=plan,
+                        task_history=task_history,
+                    )
+                    task_history_record = {"type": task_type, "task": plan}
+                except Exception:
+                    LOG.exception("Failed to generate extraction task")
+                    task_v2 = await mark_task_v2_as_failed(
+                        task_v2_id=task_v2_id,
+                        workflow_run_id=workflow_run_id,
+                        failure_reason="Failed to generate the extraction task.",
+                    )
+                    break
             elif task_type == "navigate":
                 original_url = url if i == 0 else None
                 navigation_goal = MINI_GOAL_TEMPLATE.format(main_goal=user_prompt, mini_goal=plan)
@@ -1482,12 +1492,30 @@ async def _generate_extraction_task(
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
 
-    generate_extraction_task_response = await app.LLM_API_HANDLER(
-        generate_extraction_task_prompt,
-        task_v2=task_v2,
-        prompt_name="task_v2_generate_extraction_task",
-        organization_id=task_v2.organization_id,
-    )
+    max_retries = 3
+    last_exc: Exception | None = None
+    generate_extraction_task_response: dict[str, Any] | None = None
+    for attempt in range(max_retries):
+        try:
+            generate_extraction_task_response = await app.LLM_API_HANDLER(
+                generate_extraction_task_prompt,
+                task_v2=task_v2,
+                prompt_name="task_v2_generate_extraction_task",
+                organization_id=task_v2.organization_id,
+            )
+            break
+        except (InvalidLLMResponseFormat, EmptyLLMResponseError) as e:
+            LOG.warning(
+                "Empty or invalid LLM response during extraction task generation, retrying",
+                attempt=attempt + 1,
+                max_attempts=max_retries,
+                error=str(e),
+            )
+            last_exc = e
+    else:
+        raise last_exc  # type: ignore[misc]
+
+    assert generate_extraction_task_response is not None
     LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
 
     # create OutputParameter for the data_extraction block
