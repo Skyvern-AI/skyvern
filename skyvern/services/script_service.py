@@ -17,7 +17,7 @@ from fastapi import BackgroundTasks, HTTPException
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
-from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
+from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
 from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
@@ -1838,17 +1838,6 @@ async def download(
                 LOG.warning("Timeout getting downloaded files before cached download")
 
             await _run_cached_function(cached_fn)
-
-            # Upload downloaded files from local filesystem to S3 so that
-            # get_downloaded_files() (which queries S3) can find them.
-            try:
-                async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
-                    await app.STORAGE.save_downloaded_files(
-                        organization_id=org_id,
-                        run_id=run_id,
-                    )
-            except asyncio.TimeoutError:
-                LOG.warning("Timeout saving downloaded files after cached download")
 
             # Verify a new file was actually downloaded.
             # Retry briefly — file may not be visible in storage immediately after the click.
