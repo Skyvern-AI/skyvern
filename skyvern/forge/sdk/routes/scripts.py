@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 
@@ -24,6 +25,7 @@ from skyvern.schemas.scripts import (
     ScriptCacheKeyValuesResponse,
     ScriptFallbackEpisode,
     ScriptStatus,
+    ScriptVersionCompareResponse,
     ScriptVersionListResponse,
     ScriptVersionSummary,
 )
@@ -321,6 +323,68 @@ async def get_script_version_code(
         include_main_script=True,
         script_id=script.script_id,
         version=script.version,
+    )
+
+
+@base_router.get(
+    "/scripts/{script_id}/compare",
+    include_in_schema=False,
+    response_model=ScriptVersionCompareResponse,
+)
+@base_router.get(
+    "/scripts/{script_id}/compare/",
+    include_in_schema=False,
+    response_model=ScriptVersionCompareResponse,
+)
+async def compare_script_versions(
+    script_id: str = Path(..., description="The script ID"),
+    base: int = Query(..., description="Base version number"),
+    compare: int = Query(..., description="Compare version number"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptVersionCompareResponse:
+    """Compare two script versions side by side."""
+    organization_id = current_org.organization_id
+
+    base_script, compare_script = await asyncio.gather(
+        app.DATABASE.get_script(script_id=script_id, organization_id=organization_id, version=base),
+        app.DATABASE.get_script(script_id=script_id, organization_id=organization_id, version=compare),
+    )
+    if not base_script:
+        raise HTTPException(status_code=404, detail=f"Base version {base} not found")
+    if not compare_script:
+        raise HTTPException(status_code=404, detail=f"Compare version {compare} not found")
+
+    base_response, compare_response = await asyncio.gather(
+        get_script_blocks_response(
+            script_revision_id=base_script.script_revision_id,
+            organization_id=organization_id,
+            workflow_permanent_id=script_id,
+            include_main_script=True,
+            script_id=base_script.script_id,
+            version=base_script.version,
+        ),
+        get_script_blocks_response(
+            script_revision_id=compare_script.script_revision_id,
+            organization_id=organization_id,
+            workflow_permanent_id=script_id,
+            include_main_script=True,
+            script_id=compare_script.script_id,
+            version=compare_script.version,
+        ),
+    )
+
+    return ScriptVersionCompareResponse(
+        script_id=script_id,
+        base_version=base_script.version,
+        base_blocks=base_response.blocks,
+        base_main_script=base_response.main_script,
+        base_created_at=base_script.created_at,
+        base_run_id=base_script.run_id,
+        compare_version=compare_script.version,
+        compare_blocks=compare_response.blocks,
+        compare_main_script=compare_response.main_script,
+        compare_created_at=compare_script.created_at,
+        compare_run_id=compare_script.run_id,
     )
 
 

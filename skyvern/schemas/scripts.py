@@ -251,6 +251,22 @@ class ScriptBranchHit(BaseModel):
     last_hit_at: datetime
 
 
+class ScriptVersionCompareResponse(BaseModel):
+    """Response containing two script versions for comparison."""
+
+    script_id: str
+    base_version: int
+    base_blocks: dict[str, str]
+    base_main_script: str | None = None
+    base_created_at: datetime
+    base_run_id: str | None = None
+    compare_version: int
+    compare_blocks: dict[str, str]
+    compare_main_script: str | None = None
+    compare_created_at: datetime
+    compare_run_id: str | None = None
+
+
 class ReviewScriptRequest(BaseModel):
     """Request body for user-initiated script review."""
 
