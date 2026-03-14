@@ -26,7 +26,7 @@ type ActiveTest = {
  * Hook that manages background credential browser-profile tests.
  *
  * After a credential is saved with "Save browser session" checked,
- * call `startBackgroundTest(credentialId, url)` to kick off an async test.
+ * call `startBackgroundTest(credentialId, url, userContext?)` to kick off an async test.
  * The hook polls the backend, shows toast notifications on completion/failure,
  * and invalidates the credentials query so the list updates.
  *
@@ -155,7 +155,7 @@ function useBackgroundCredentialTest() {
   }, [credentialGetter, queryClient, cleanup]);
 
   const startBackgroundTest = useCallback(
-    async (credentialId: string, url: string) => {
+    async (credentialId: string, url: string, userContext?: string) => {
       // Clean up any previous test
       cleanup();
 
@@ -166,6 +166,7 @@ function useBackgroundCredentialTest() {
           {
             url,
             save_browser_profile: true,
+            user_context: userContext?.trim() || null,
           },
         );
         const data = response.data;

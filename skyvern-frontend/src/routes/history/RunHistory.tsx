@@ -206,7 +206,7 @@ function RunHistory() {
               runs?.map((run) => {
                 if (isTask(run)) {
                   const taskExecutionTime = formatExecutionTime(
-                    run.created_at,
+                    run.started_at ?? run.created_at,
                     run.finished_at,
                   );
                   return (
@@ -255,7 +255,7 @@ function RunHistory() {
 
                 const isExpanded = expandedRows.has(run.workflow_run_id);
                 const workflowExecutionTime = formatExecutionTime(
-                  run.created_at,
+                  run.started_at ?? run.created_at,
                   run.finished_at,
                 );
 

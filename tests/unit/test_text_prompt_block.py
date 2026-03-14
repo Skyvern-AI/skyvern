@@ -16,15 +16,13 @@ block_module = sys.modules["skyvern.forge.sdk.workflow.models.block"]
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("model_name", "expected_llm_key"),
-    [
-        ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH"),
-        ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO"),
-    ],
+    "model_name",
+    ["gemini-2.5-flash", "gemini-3-pro-preview"],
 )
-async def test_text_prompt_block_uses_selected_model(monkeypatch, model_name, expected_llm_key):
+async def test_text_prompt_block_uses_selected_model(monkeypatch, model_name):
     # Reset SettingsManager to base settings so cloud overrides from earlier tests don't leak
     monkeypatch.setattr(SettingsManager, "_SettingsManager__instance", base_settings)
+    expected_llm_key = base_settings.get_model_name_to_llm_key()[model_name]["llm_key"]
     now = datetime.now(timezone.utc)
     output_parameter = OutputParameter(
         parameter_type=ParameterType.OUTPUT,
