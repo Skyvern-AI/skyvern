@@ -104,3 +104,14 @@ export type WorkflowScriptSummary = {
 export type WorkflowScriptsListResponse = {
   scripts: WorkflowScriptSummary[];
 };
+
+export type PinScriptRequest = {
+  cache_key_value: string;
+};
+
+export type PinScriptResponse = {
+  workflow_permanent_id: string;
+  cache_key_value: string;
+  is_pinned: boolean;
+  pinned_at: string | null;
+};

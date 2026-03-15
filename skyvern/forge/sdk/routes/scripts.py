@@ -17,6 +17,8 @@ from skyvern.schemas.scripts import (
     CreateScriptResponse,
     DeployScriptRequest,
     FallbackEpisodeListResponse,
+    PinScriptRequest,
+    PinScriptResponse,
     ReviewScriptRequest,
     ReviewScriptResponse,
     Script,
@@ -1027,6 +1029,101 @@ async def clear_workflow_cache(
     return ClearCacheResponse(
         deleted_count=deleted_count,
         message=f"Successfully cleared {deleted_count} database record(s) and {cache_cleared_count} in-memory cache entry(s) for workflow {workflow_permanent_id}",
+    )
+
+
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/pin",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/pin/",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+async def pin_workflow_script(
+    data: PinScriptRequest,
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> PinScriptResponse:
+    """Pin a script for a specific cache key value, preventing auto-updates."""
+    LOG.info(
+        "Pinning workflow script",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+    )
+
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    result = await app.DATABASE.pin_workflow_script(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+        pinned_by=None,
+    )
+
+    if not result:
+        raise HTTPException(status_code=404, detail="No script found for the given cache key value")
+
+    return PinScriptResponse(
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+        is_pinned=True,
+        pinned_at=result.pinned_at,
+    )
+
+
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/unpin",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/unpin/",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+async def unpin_workflow_script(
+    data: PinScriptRequest,
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> PinScriptResponse:
+    """Unpin a script for a specific cache key value, allowing auto-updates."""
+    LOG.info(
+        "Unpinning workflow script",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+    )
+
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    result = await app.DATABASE.unpin_workflow_script(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+    )
+
+    if not result:
+        raise HTTPException(status_code=404, detail="No script found for the given cache key value")
+
+    return PinScriptResponse(
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+        is_pinned=False,
+        pinned_at=None,
     )
 
 

@@ -4653,6 +4653,20 @@ class WorkflowService:
             if not script_revision_id or not script_id:
                 return
 
+            # Check if the script is pinned — skip auto-review for pinned scripts.
+            # Query by script_id (not workflow_run_id) because pinning is applied
+            # at the cache_key_value level and may not be on this run's row.
+            if await app.DATABASE.is_script_pinned(
+                organization_id=workflow.organization_id,
+                script_id=script_id,
+            ):
+                LOG.info(
+                    "Skipping script review — script is pinned",
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    script_id=script_id,
+                )
+                return
+
             # Determine if this is a failure-triggered review (script crashed, run failed)
             # vs a fallback-triggered review (script failed but agent succeeded).
             # Failure reviews are capped per wpid per day to prevent spam.

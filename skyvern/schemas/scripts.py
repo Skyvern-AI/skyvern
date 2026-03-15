@@ -210,6 +210,9 @@ class WorkflowScript(BaseModel):
     cache_key: str
     cache_key_value: str
     status: ScriptStatus
+    is_pinned: bool = False
+    pinned_at: datetime | None = None
+    pinned_by: str | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
@@ -321,3 +324,18 @@ class ReviewScriptResponse(BaseModel):
     version: int
     updated_blocks: list[str]
     message: str | None = None
+
+
+class PinScriptRequest(BaseModel):
+    """Request to pin a specific cache key variant's script."""
+
+    cache_key_value: str = Field(..., description="The cache key value to pin")
+
+
+class PinScriptResponse(BaseModel):
+    """Response after pinning/unpinning a script."""
+
+    workflow_permanent_id: str
+    cache_key_value: str
+    is_pinned: bool
+    pinned_at: datetime | None = None

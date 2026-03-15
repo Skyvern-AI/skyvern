@@ -6438,6 +6438,7 @@ class AgentDB(BaseAlchemyDB):
                 .filter_by(organization_id=organization_id)
                 .filter_by(workflow_permanent_id=workflow_permanent_id)
                 .filter_by(workflow_run_id=workflow_run_id)
+                .filter(WorkflowScriptModel.deleted_at.is_(None))
             )
             if statuses:
                 query = query.filter(WorkflowScriptModel.status.in_(statuses))
@@ -6660,6 +6661,124 @@ class AgentDB(BaseAlchemyDB):
 
                 query = query.order_by(WorkflowScriptModel.modified_at.desc())
                 return (await session.scalars(query)).all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    # ── Script Pinning ─────────────────────────────────────────────────
+
+    async def is_script_pinned(
+        self,
+        organization_id: str,
+        script_id: str,
+    ) -> bool:
+        """Check if any active workflow_script row for this script_id is pinned."""
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(WorkflowScriptModel.is_pinned)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.script_id == script_id,
+                        WorkflowScriptModel.is_pinned.is_(True),
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                    .limit(1)
+                )
+                result = await session.scalars(query)
+                return result.first() is not None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def pin_workflow_script(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+        pinned_by: str | None = None,
+    ) -> WorkflowScriptModel | None:
+        """Pin all workflow scripts for a given cache key value."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                    .values(
+                        is_pinned=True,
+                        pinned_at=datetime.utcnow(),
+                        pinned_by=pinned_by,
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+
+                # Return the first updated model for the response
+                query = (
+                    select(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key_value=cache_key_value)
+                    .filter_by(deleted_at=None)
+                    .limit(1)
+                )
+                result = await session.scalars(query)
+                return result.first()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def unpin_workflow_script(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+    ) -> WorkflowScriptModel | None:
+        """Unpin workflow scripts for a given cache key value."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                    .values(
+                        is_pinned=False,
+                        pinned_at=None,
+                        pinned_by=None,
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+
+                # Return the first updated model for the response
+                query = (
+                    select(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key_value=cache_key_value)
+                    .filter_by(deleted_at=None)
+                    .limit(1)
+                )
+                result = await session.scalars(query)
+                return result.first()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
