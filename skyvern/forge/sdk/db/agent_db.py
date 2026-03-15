@@ -6816,12 +6816,24 @@ class AgentDB(BaseAlchemyDB):
     async def get_fallback_episodes_count(
         self,
         organization_id: str,
-        workflow_permanent_id: str,
+        workflow_permanent_id: str | None = None,
         workflow_run_id: str | None = None,
         block_label: str | None = None,
         reviewed: bool | None = None,
         fallback_type: str | None = None,
+        script_revision_id: str | None = None,
     ) -> int:
+        """Count fallback episodes matching the given filters.
+
+        At least one scoping filter (workflow_permanent_id, workflow_run_id,
+        or script_revision_id) should be provided. Without any, this returns
+        the total count for the entire organization which is rarely intended.
+        """
+        if workflow_permanent_id is None and workflow_run_id is None and script_revision_id is None:
+            LOG.warning(
+                "get_fallback_episodes_count called without any scoping filter",
+                organization_id=organization_id,
+            )
         try:
             async with self.Session() as session:
                 query = (
@@ -6829,9 +6841,10 @@ class AgentDB(BaseAlchemyDB):
                     .select_from(ScriptFallbackEpisodeModel)
                     .filter(
                         ScriptFallbackEpisodeModel.organization_id == organization_id,
-                        ScriptFallbackEpisodeModel.workflow_permanent_id == workflow_permanent_id,
                     )
                 )
+                if workflow_permanent_id is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.workflow_permanent_id == workflow_permanent_id)
                 if workflow_run_id is not None:
                     query = query.filter(ScriptFallbackEpisodeModel.workflow_run_id == workflow_run_id)
                 if block_label is not None:
@@ -6840,6 +6853,8 @@ class AgentDB(BaseAlchemyDB):
                     query = query.filter(ScriptFallbackEpisodeModel.reviewed == reviewed)
                 if fallback_type is not None:
                     query = query.filter(ScriptFallbackEpisodeModel.fallback_type == fallback_type)
+                if script_revision_id is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.script_revision_id == script_revision_id)
 
                 result = await session.scalar(query)
                 return result or 0

@@ -26,6 +26,7 @@ from skyvern.schemas.scripts import (
     ScriptFallbackEpisode,
     ScriptStatus,
     ScriptVersionCompareResponse,
+    ScriptVersionDetailResponse,
     ScriptVersionListResponse,
     ScriptVersionSummary,
     WorkflowScriptsListResponse,
@@ -318,6 +319,7 @@ async def get_script_version_code(
     if not script:
         raise HTTPException(status_code=404, detail="Script version not found")
 
+    # script_id doubles as workflow_permanent_id for script-based lookups
     return await get_script_blocks_response(
         script_revision_id=script.script_revision_id,
         organization_id=current_org.organization_id,
@@ -387,6 +389,60 @@ async def compare_script_versions(
         compare_main_script=compare_response.main_script,
         compare_created_at=compare_script.created_at,
         compare_run_id=compare_script.run_id,
+    )
+
+
+@base_router.get(
+    "/scripts/{script_id}/versions/{version}/detail",
+    include_in_schema=False,
+    response_model=ScriptVersionDetailResponse,
+)
+@base_router.get(
+    "/scripts/{script_id}/versions/{version}/detail/",
+    include_in_schema=False,
+    response_model=ScriptVersionDetailResponse,
+)
+async def get_script_version_detail(
+    script_id: str = Path(..., description="The script ID"),
+    version: int = Path(..., description="The version number"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptVersionDetailResponse:
+    """Get full detail for a specific script version, including code blocks and metadata."""
+    organization_id = current_org.organization_id
+
+    script = await app.DATABASE.get_script(
+        script_id=script_id,
+        organization_id=organization_id,
+        version=version,
+    )
+    if not script:
+        raise HTTPException(status_code=404, detail="Script version not found")
+
+    # script_id doubles as workflow_permanent_id for script-based lookups
+    blocks_response, fallback_episode_count = await asyncio.gather(
+        get_script_blocks_response(
+            script_revision_id=script.script_revision_id,
+            organization_id=organization_id,
+            workflow_permanent_id=script_id,
+            include_main_script=True,
+            script_id=script.script_id,
+            version=script.version,
+        ),
+        app.DATABASE.get_fallback_episodes_count(
+            organization_id=organization_id,
+            script_revision_id=script.script_revision_id,
+        ),
+    )
+
+    return ScriptVersionDetailResponse(
+        script_id=script.script_id,
+        script_revision_id=script.script_revision_id,
+        version=script.version,
+        created_at=script.created_at,
+        run_id=script.run_id,
+        blocks=blocks_response.blocks,
+        main_script=blocks_response.main_script,
+        fallback_episode_count=fallback_episode_count,
     )
 
 
