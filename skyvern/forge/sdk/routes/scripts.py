@@ -17,6 +17,8 @@ from skyvern.schemas.scripts import (
     CreateScriptResponse,
     DeployScriptRequest,
     FallbackEpisodeListResponse,
+    PinScriptRequest,
+    PinScriptResponse,
     ReviewScriptRequest,
     ReviewScriptResponse,
     Script,
@@ -26,6 +28,7 @@ from skyvern.schemas.scripts import (
     ScriptFallbackEpisode,
     ScriptStatus,
     ScriptVersionCompareResponse,
+    ScriptVersionDetailResponse,
     ScriptVersionListResponse,
     ScriptVersionSummary,
     WorkflowScriptsListResponse,
@@ -318,6 +321,7 @@ async def get_script_version_code(
     if not script:
         raise HTTPException(status_code=404, detail="Script version not found")
 
+    # script_id doubles as workflow_permanent_id for script-based lookups
     return await get_script_blocks_response(
         script_revision_id=script.script_revision_id,
         organization_id=current_org.organization_id,
@@ -387,6 +391,60 @@ async def compare_script_versions(
         compare_main_script=compare_response.main_script,
         compare_created_at=compare_script.created_at,
         compare_run_id=compare_script.run_id,
+    )
+
+
+@base_router.get(
+    "/scripts/{script_id}/versions/{version}/detail",
+    include_in_schema=False,
+    response_model=ScriptVersionDetailResponse,
+)
+@base_router.get(
+    "/scripts/{script_id}/versions/{version}/detail/",
+    include_in_schema=False,
+    response_model=ScriptVersionDetailResponse,
+)
+async def get_script_version_detail(
+    script_id: str = Path(..., description="The script ID"),
+    version: int = Path(..., description="The version number"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptVersionDetailResponse:
+    """Get full detail for a specific script version, including code blocks and metadata."""
+    organization_id = current_org.organization_id
+
+    script = await app.DATABASE.get_script(
+        script_id=script_id,
+        organization_id=organization_id,
+        version=version,
+    )
+    if not script:
+        raise HTTPException(status_code=404, detail="Script version not found")
+
+    # script_id doubles as workflow_permanent_id for script-based lookups
+    blocks_response, fallback_episode_count = await asyncio.gather(
+        get_script_blocks_response(
+            script_revision_id=script.script_revision_id,
+            organization_id=organization_id,
+            workflow_permanent_id=script_id,
+            include_main_script=True,
+            script_id=script.script_id,
+            version=script.version,
+        ),
+        app.DATABASE.get_fallback_episodes_count(
+            organization_id=organization_id,
+            script_revision_id=script.script_revision_id,
+        ),
+    )
+
+    return ScriptVersionDetailResponse(
+        script_id=script.script_id,
+        script_revision_id=script.script_revision_id,
+        version=script.version,
+        created_at=script.created_at,
+        run_id=script.run_id,
+        blocks=blocks_response.blocks,
+        main_script=blocks_response.main_script,
+        fallback_episode_count=fallback_episode_count,
     )
 
 
@@ -971,6 +1029,101 @@ async def clear_workflow_cache(
     return ClearCacheResponse(
         deleted_count=deleted_count,
         message=f"Successfully cleared {deleted_count} database record(s) and {cache_cleared_count} in-memory cache entry(s) for workflow {workflow_permanent_id}",
+    )
+
+
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/pin",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/pin/",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+async def pin_workflow_script(
+    data: PinScriptRequest,
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> PinScriptResponse:
+    """Pin a script for a specific cache key value, preventing auto-updates."""
+    LOG.info(
+        "Pinning workflow script",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+    )
+
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    result = await app.DATABASE.pin_workflow_script(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+        pinned_by=None,
+    )
+
+    if not result:
+        raise HTTPException(status_code=404, detail="No script found for the given cache key value")
+
+    return PinScriptResponse(
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+        is_pinned=True,
+        pinned_at=result.pinned_at,
+    )
+
+
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/unpin",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/unpin/",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+async def unpin_workflow_script(
+    data: PinScriptRequest,
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> PinScriptResponse:
+    """Unpin a script for a specific cache key value, allowing auto-updates."""
+    LOG.info(
+        "Unpinning workflow script",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+    )
+
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    result = await app.DATABASE.unpin_workflow_script(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+    )
+
+    if not result:
+        raise HTTPException(status_code=404, detail="No script found for the given cache key value")
+
+    return PinScriptResponse(
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+        is_pinned=False,
+        pinned_at=None,
     )
 
 

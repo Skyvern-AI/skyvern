@@ -1091,6 +1091,11 @@ class WorkflowScriptModel(Base):
     cache_key_value = Column(String, nullable=False)  # e.g. "test-greenhouse.io/job/1-cache"
     status = Column(String, nullable=True, default="published")
 
+    # Script pinning
+    is_pinned = Column(Boolean, default=False, nullable=False, server_default="false")
+    pinned_at = Column(DateTime, nullable=True)
+    pinned_by = Column(String, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
