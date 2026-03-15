@@ -202,6 +202,25 @@ class WorkflowScript(BaseModel):
     deleted_at: datetime | None = None
 
 
+class WorkflowScriptSummary(BaseModel):
+    """Summary of a workflow script (cache key variant) with version info."""
+
+    script_id: str
+    cache_key: str
+    cache_key_value: str
+    status: ScriptStatus
+    latest_version: int
+    version_count: int
+    created_at: datetime
+    modified_at: datetime
+
+
+class WorkflowScriptsListResponse(BaseModel):
+    """Response for listing all scripts associated with a workflow."""
+
+    scripts: list[WorkflowScriptSummary]
+
+
 class ClearCacheResponse(BaseModel):
     """Response model for cache clearing operations."""
 

@@ -77,3 +77,19 @@ export type ReviewScriptResponse = {
   updated_blocks: string[];
   message?: string | null;
 };
+
+export type WorkflowScriptSummary = {
+  script_id: string;
+  cache_key: string;
+  cache_key_value: string;
+  // Must match ScriptStatus enum in skyvern/schemas/scripts.py
+  status: "published" | "pending";
+  latest_version: number;
+  version_count: number;
+  created_at: string;
+  modified_at: string;
+};
+
+export type WorkflowScriptsListResponse = {
+  scripts: WorkflowScriptSummary[];
+};

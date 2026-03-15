@@ -28,6 +28,8 @@ from skyvern.schemas.scripts import (
     ScriptVersionCompareResponse,
     ScriptVersionListResponse,
     ScriptVersionSummary,
+    WorkflowScriptsListResponse,
+    WorkflowScriptSummary,
 )
 from skyvern.services import script_service, workflow_script_service
 from skyvern.services.script_reviewer import ScriptReviewer
@@ -768,6 +770,85 @@ async def get_workflow_cache_key_values(
         total_count=total_count,
         values=values,
     )
+
+
+@base_router.get(
+    "/scripts/workflows/{workflow_permanent_id}",
+    include_in_schema=False,
+    response_model=WorkflowScriptsListResponse,
+)
+@base_router.get(
+    "/scripts/workflows/{workflow_permanent_id}/",
+    include_in_schema=False,
+    response_model=WorkflowScriptsListResponse,
+)
+async def list_workflow_scripts(
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowScriptsListResponse:
+    """List all scripts (cache key variants) for a workflow with version stats."""
+    organization_id = current_org.organization_id
+
+    # Verify workflow exists (consistent with other script endpoints)
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    workflow_scripts = await app.DATABASE.get_workflow_scripts_by_permanent_id(
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    if not workflow_scripts:
+        return WorkflowScriptsListResponse(scripts=[])
+
+    script_ids = list({ws.script_id for ws in workflow_scripts})
+    version_stats = await app.DATABASE.get_script_version_stats(
+        organization_id=organization_id,
+        script_ids=script_ids,
+    )
+
+    summaries = []
+    for ws in workflow_scripts:
+        latest_version, version_count = version_stats.get(ws.script_id, (0, 0))
+        # Skip scripts with no live versions (all soft-deleted)
+        if version_count == 0:
+            continue
+        status = ScriptStatus.published
+        if ws.status:
+            try:
+                status = ScriptStatus(ws.status)
+            except ValueError:
+                LOG.warning(
+                    "Unknown script status, defaulting to published",
+                    status=ws.status,
+                    script_id=ws.script_id,
+                    organization_id=organization_id,
+                )
+        else:
+            LOG.warning(
+                "WorkflowScript has null status, defaulting to published",
+                script_id=ws.script_id,
+                organization_id=organization_id,
+            )
+        summaries.append(
+            WorkflowScriptSummary(
+                script_id=ws.script_id,
+                cache_key=ws.cache_key,
+                cache_key_value=ws.cache_key_value,
+                status=status,
+                latest_version=latest_version,
+                version_count=version_count,
+                created_at=ws.created_at,
+                modified_at=ws.modified_at,
+            )
+        )
+
+    # Results are already sorted by modified_at DESC from the DB query
+    return WorkflowScriptsListResponse(scripts=summaries)
 
 
 @base_router.delete(

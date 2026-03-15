@@ -138,6 +138,9 @@ function WorkflowPage() {
               onSuccessfullyDeleted={() => navigate("/workflows")}
             />
           )}
+          {/* Scripts button intentionally hidden — page is reachable via
+              /workflows/:wpid/scripts but not linked from the UI until the
+              design is finalized and ready for user-facing release. */}
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/build`}>
               <Pencil2Icon className="mr-2 size-4" />
