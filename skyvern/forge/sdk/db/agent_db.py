@@ -6098,6 +6098,48 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_script_version_stats(
+        self,
+        organization_id: str,
+        script_ids: list[str],
+    ) -> dict[str, tuple[int, int]]:
+        """Return {script_id: (latest_version, version_count)} for the given script IDs."""
+        if not script_ids:
+            return {}
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(
+                        ScriptModel.script_id,
+                        func.max(ScriptModel.version),
+                        func.count(ScriptModel.script_revision_id),
+                    )
+                    .filter(
+                        ScriptModel.organization_id == organization_id,
+                        ScriptModel.script_id.in_(script_ids),
+                        ScriptModel.deleted_at.is_(None),
+                    )
+                    .group_by(ScriptModel.script_id)
+                )
+                rows = (await session.execute(query)).all()
+                return {row[0]: (row[1], row[2]) for row in rows}
+        except SQLAlchemyError:
+            LOG.error(
+                "SQLAlchemyError in get_script_version_stats",
+                organization_id=organization_id,
+                script_ids=script_ids,
+                exc_info=True,
+            )
+            raise
+        except Exception:
+            LOG.error(
+                "UnexpectedError in get_script_version_stats",
+                organization_id=organization_id,
+                script_ids=script_ids,
+                exc_info=True,
+            )
+            raise
+
     async def get_script_revision(self, script_revision_id: str, organization_id: str) -> Script | None:
         async with self.Session() as session:
             script = (
@@ -6616,6 +6658,7 @@ class AgentDB(BaseAlchemyDB):
                 if statuses:
                     query = query.filter(WorkflowScriptModel.status.in_([s.value for s in statuses]))
 
+                query = query.order_by(WorkflowScriptModel.modified_at.desc())
                 return (await session.scalars(query)).all()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
