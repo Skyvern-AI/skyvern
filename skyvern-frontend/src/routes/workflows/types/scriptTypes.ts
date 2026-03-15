@@ -24,6 +24,17 @@ export type ScriptVersionListResponse = {
   versions: ScriptVersionSummary[];
 };
 
+export type ScriptVersionDetailResponse = {
+  script_id: string;
+  script_revision_id: string;
+  version: number;
+  created_at: string;
+  run_id: string | null;
+  blocks: { [blockName: string]: string };
+  main_script: string | null;
+  fallback_episode_count: number;
+};
+
 export type ScriptFallbackEpisode = {
   episode_id: string;
   organization_id: string;
