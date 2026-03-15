@@ -141,6 +141,19 @@ class ScriptVersionListResponse(BaseModel):
     versions: list[ScriptVersionSummary]
 
 
+class ScriptVersionDetailResponse(BaseModel):
+    """Full detail for a single script version, including code and metadata."""
+
+    script_id: str
+    script_revision_id: str
+    version: int
+    created_at: datetime
+    run_id: str | None = None
+    blocks: dict[str, str]
+    main_script: str | None = None
+    fallback_episode_count: int = 0
+
+
 class ScriptBlock(BaseModel):
     script_block_id: str
     organization_id: str
