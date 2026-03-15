@@ -24,6 +24,17 @@ export type ScriptVersionListResponse = {
   versions: ScriptVersionSummary[];
 };
 
+export type ScriptVersionDetailResponse = {
+  script_id: string;
+  script_revision_id: string;
+  version: number;
+  created_at: string;
+  run_id: string | null;
+  blocks: { [blockName: string]: string };
+  main_script: string | null;
+  fallback_episode_count: number;
+};
+
 export type ScriptFallbackEpisode = {
   episode_id: string;
   organization_id: string;
@@ -92,4 +103,15 @@ export type WorkflowScriptSummary = {
 
 export type WorkflowScriptsListResponse = {
   scripts: WorkflowScriptSummary[];
+};
+
+export type PinScriptRequest = {
+  cache_key_value: string;
+};
+
+export type PinScriptResponse = {
+  workflow_permanent_id: string;
+  cache_key_value: string;
+  is_pinned: boolean;
+  pinned_at: string | null;
 };
