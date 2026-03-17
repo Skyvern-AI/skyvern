@@ -4,6 +4,7 @@ import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
 import type {
+  CredentialApiResponse,
   TestCredentialStatusResponse,
   TestLoginResponse,
 } from "@/api/types";
@@ -49,6 +50,41 @@ function useBackgroundCredentialTest() {
     return cleanup;
   }, [cleanup]);
 
+
+  const updateCredentialBrowserProfileInCache = useCallback(
+    (
+      credentialId: string,
+      browserProfileId?: string | null,
+      testedUrl?: string | null,
+    ) => {
+      queryClient.setQueriesData<Array<CredentialApiResponse>>(
+        { queryKey: ["credentials"] },
+        (credentials) => {
+          if (!credentials) {
+            return credentials;
+          }
+
+          let didUpdate = false;
+          const nextCredentials = credentials.map((credential) => {
+            if (credential.credential_id !== credentialId) {
+              return credential;
+            }
+
+            didUpdate = true;
+            return {
+              ...credential,
+              ...(browserProfileId ? { browser_profile_id: browserProfileId } : {}),
+              ...(testedUrl ? { tested_url: testedUrl } : {}),
+            };
+          });
+
+          return didUpdate ? nextCredentials : credentials;
+        },
+      );
+    },
+    [queryClient],
+  );
+
   const poll = useCallback(async () => {
     const test = activeTestRef.current;
     if (!test) return;
@@ -89,7 +125,14 @@ function useBackgroundCredentialTest() {
 
       if (data.status === "completed") {
         cleanup();
-        queryClient.invalidateQueries({ queryKey: ["credentials"] });
+        if (data.browser_profile_id) {
+          updateCredentialBrowserProfileInCache(
+            data.credential_id,
+            data.browser_profile_id,
+            data.tested_url,
+          );
+        }
+        await queryClient.invalidateQueries({ queryKey: ["credentials"] });
 
         if (data.browser_profile_failure_reason && !data.browser_profile_id) {
           toast({
@@ -117,7 +160,7 @@ function useBackgroundCredentialTest() {
         data.status === "canceled"
       ) {
         cleanup();
-        queryClient.invalidateQueries({ queryKey: ["credentials"] });
+        await queryClient.invalidateQueries({ queryKey: ["credentials"] });
         const host = test.url ? getHostname(test.url) : null;
         toast({
           title: host
@@ -152,7 +195,12 @@ function useBackgroundCredentialTest() {
         activeTestRef.current.timeoutId = setTimeout(poll, POLL_INTERVAL_MS);
       }
     }
-  }, [credentialGetter, queryClient, cleanup]);
+  }, [
+    credentialGetter,
+    queryClient,
+    cleanup,
+    updateCredentialBrowserProfileInCache,
+  ]);
 
   const startBackgroundTest = useCallback(
     async (credentialId: string, url: string, userContext?: string) => {
