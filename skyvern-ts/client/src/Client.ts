@@ -26,8 +26,8 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "1.0.24",
-                    "User-Agent": "@skyvern/client/1.0.24",
+                    "X-Fern-SDK-Version": "1.0.25",
+                    "User-Agent": "@skyvern/client/1.0.25",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
@@ -763,6 +763,524 @@ export class SkyvernClient {
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
                     "Timeout exceeded when calling POST /v1/workflows/{workflow_id}/delete.",
+                );
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Get all folders for the organization
+     *
+     * @param {Skyvern.GetFoldersRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.getFolders({
+     *         page: 1,
+     *         page_size: 1,
+     *         search: "search"
+     *     })
+     */
+    public getFolders(
+        request: Skyvern.GetFoldersRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.Folder[]> {
+        return core.HttpResponsePromise.fromPromise(this.__getFolders(request, requestOptions));
+    }
+
+    private async __getFolders(
+        request: Skyvern.GetFoldersRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.Folder[]>> {
+        const { page, page_size: pageSize, search } = request;
+        const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
+        if (page != null) {
+            _queryParams.page = page.toString();
+        }
+
+        if (pageSize != null) {
+            _queryParams.page_size = pageSize.toString();
+        }
+
+        if (search != null) {
+            _queryParams.search = search;
+        }
+
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "v1/folders",
+            ),
+            method: "GET",
+            headers: _headers,
+            queryParameters: { ..._queryParams, ...requestOptions?.queryParams },
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.Folder[], rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /v1/folders.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Create a new folder to organize workflows
+     *
+     * @param {Skyvern.FolderCreate} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.BadRequestError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.createFolder({
+     *         title: "title"
+     *     })
+     */
+    public createFolder(
+        request: Skyvern.FolderCreate,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.Folder> {
+        return core.HttpResponsePromise.fromPromise(this.__createFolder(request, requestOptions));
+    }
+
+    private async __createFolder(
+        request: Skyvern.FolderCreate,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.Folder>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "v1/folders",
+            ),
+            method: "POST",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.Folder, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 400:
+                    throw new Skyvern.BadRequestError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/folders.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Get a specific folder by ID
+     *
+     * @param {string} folderId - Folder ID
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.getFolder("fld_123")
+     */
+    public getFolder(
+        folderId: string,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.Folder> {
+        return core.HttpResponsePromise.fromPromise(this.__getFolder(folderId, requestOptions));
+    }
+
+    private async __getFolder(
+        folderId: string,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.Folder>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/folders/${core.url.encodePathParam(folderId)}`,
+            ),
+            method: "GET",
+            headers: _headers,
+            queryParameters: requestOptions?.queryParams,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.Folder, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /v1/folders/{folder_id}.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Update a folder's title or description
+     *
+     * @param {string} folderId - Folder ID
+     * @param {Skyvern.FolderUpdate} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.updateFolder("fld_123")
+     */
+    public updateFolder(
+        folderId: string,
+        request: Skyvern.FolderUpdate = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.Folder> {
+        return core.HttpResponsePromise.fromPromise(this.__updateFolder(folderId, request, requestOptions));
+    }
+
+    private async __updateFolder(
+        folderId: string,
+        request: Skyvern.FolderUpdate = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.Folder>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/folders/${core.url.encodePathParam(folderId)}`,
+            ),
+            method: "PUT",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.Folder, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling PUT /v1/folders/{folder_id}.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Delete a folder. Optionally delete all workflows in the folder.
+     *
+     * @param {string} folderId - Folder ID
+     * @param {Skyvern.DeleteFolderRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.deleteFolder("fld_123", {
+     *         delete_workflows: true
+     *     })
+     */
+    public deleteFolder(
+        folderId: string,
+        request: Skyvern.DeleteFolderRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Record<string, unknown>> {
+        return core.HttpResponsePromise.fromPromise(this.__deleteFolder(folderId, request, requestOptions));
+    }
+
+    private async __deleteFolder(
+        folderId: string,
+        request: Skyvern.DeleteFolderRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Record<string, unknown>>> {
+        const { delete_workflows: deleteWorkflows } = request;
+        const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
+        if (deleteWorkflows != null) {
+            _queryParams.delete_workflows = deleteWorkflows.toString();
+        }
+
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/folders/${core.url.encodePathParam(folderId)}`,
+            ),
+            method: "DELETE",
+            headers: _headers,
+            queryParameters: { ..._queryParams, ...requestOptions?.queryParams },
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Record<string, unknown>, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling DELETE /v1/folders/{folder_id}.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Update a workflow's folder assignment for the latest version
+     *
+     * @param {string} workflowPermanentId - Workflow permanent ID
+     * @param {Skyvern.UpdateWorkflowFolderRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.BadRequestError}
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.updateWorkflowFolder("wpid_123")
+     */
+    public updateWorkflowFolder(
+        workflowPermanentId: string,
+        request: Skyvern.UpdateWorkflowFolderRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.Workflow> {
+        return core.HttpResponsePromise.fromPromise(
+            this.__updateWorkflowFolder(workflowPermanentId, request, requestOptions),
+        );
+    }
+
+    private async __updateWorkflowFolder(
+        workflowPermanentId: string,
+        request: Skyvern.UpdateWorkflowFolderRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.Workflow>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/folder`,
+            ),
+            method: "PUT",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.Workflow, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 400:
+                    throw new Skyvern.BadRequestError(_response.error.body as unknown, _response.rawResponse);
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling PUT /v1/workflows/{workflow_permanent_id}/folder.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({
@@ -2331,12 +2849,11 @@ export class SkyvernClient {
      *
      * @example
      *     await client.createCredential({
-     *         name: "My Credential",
+     *         name: "Amazon Login",
      *         credential_type: "password",
      *         credential: {
      *             password: "securepassword123",
-     *             username: "user@example.com",
-     *             totp: "JBSWY3DPEHPK3PXP"
+     *             username: "user@example.com"
      *         }
      *     })
      */
@@ -2418,10 +2935,10 @@ export class SkyvernClient {
      *
      * @example
      *     await client.updateCredential("cred_1234567890", {
-     *         name: "My Credential",
+     *         name: "Amazon Login",
      *         credential_type: "password",
      *         credential: {
-     *             password: "newpassword123",
+     *             password: "securepassword123",
      *             username: "user@example.com"
      *         }
      *     })
@@ -3542,524 +4059,6 @@ export class SkyvernClient {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /api/v1/billing/change-tier.");
-            case "unknown":
-                throw new errors.SkyvernError({
-                    message: _response.error.errorMessage,
-                    rawResponse: _response.rawResponse,
-                });
-        }
-    }
-
-    /**
-     * Get all folders for the organization
-     *
-     * @param {Skyvern.GetFoldersRequest} request
-     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
-     *
-     * @throws {@link Skyvern.UnprocessableEntityError}
-     *
-     * @example
-     *     await client.getFolders({
-     *         page: 1,
-     *         page_size: 1,
-     *         search: "search"
-     *     })
-     */
-    public getFolders(
-        request: Skyvern.GetFoldersRequest = {},
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): core.HttpResponsePromise<Skyvern.Folder[]> {
-        return core.HttpResponsePromise.fromPromise(this.__getFolders(request, requestOptions));
-    }
-
-    private async __getFolders(
-        request: Skyvern.GetFoldersRequest = {},
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): Promise<core.WithRawResponse<Skyvern.Folder[]>> {
-        const { page, page_size: pageSize, search } = request;
-        const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
-        if (page != null) {
-            _queryParams.page = page.toString();
-        }
-
-        if (pageSize != null) {
-            _queryParams.page_size = pageSize.toString();
-        }
-
-        if (search != null) {
-            _queryParams.search = search;
-        }
-
-        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
-            this._options?.headers,
-            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
-            requestOptions?.headers,
-        );
-        const _response = await core.fetcher({
-            url: core.url.join(
-                (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
-                "v1/folders",
-            ),
-            method: "GET",
-            headers: _headers,
-            queryParameters: { ..._queryParams, ...requestOptions?.queryParams },
-            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
-            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
-            abortSignal: requestOptions?.abortSignal,
-        });
-        if (_response.ok) {
-            return { data: _response.body as Skyvern.Folder[], rawResponse: _response.rawResponse };
-        }
-
-        if (_response.error.reason === "status-code") {
-            switch (_response.error.statusCode) {
-                case 422:
-                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
-                default:
-                    throw new errors.SkyvernError({
-                        statusCode: _response.error.statusCode,
-                        body: _response.error.body,
-                        rawResponse: _response.rawResponse,
-                    });
-            }
-        }
-
-        switch (_response.error.reason) {
-            case "non-json":
-                throw new errors.SkyvernError({
-                    statusCode: _response.error.statusCode,
-                    body: _response.error.rawBody,
-                    rawResponse: _response.rawResponse,
-                });
-            case "timeout":
-                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /v1/folders.");
-            case "unknown":
-                throw new errors.SkyvernError({
-                    message: _response.error.errorMessage,
-                    rawResponse: _response.rawResponse,
-                });
-        }
-    }
-
-    /**
-     * Create a new folder to organize workflows
-     *
-     * @param {Skyvern.FolderCreate} request
-     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
-     *
-     * @throws {@link Skyvern.BadRequestError}
-     * @throws {@link Skyvern.UnprocessableEntityError}
-     *
-     * @example
-     *     await client.createFolder({
-     *         title: "title"
-     *     })
-     */
-    public createFolder(
-        request: Skyvern.FolderCreate,
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): core.HttpResponsePromise<Skyvern.Folder> {
-        return core.HttpResponsePromise.fromPromise(this.__createFolder(request, requestOptions));
-    }
-
-    private async __createFolder(
-        request: Skyvern.FolderCreate,
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): Promise<core.WithRawResponse<Skyvern.Folder>> {
-        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
-            this._options?.headers,
-            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
-            requestOptions?.headers,
-        );
-        const _response = await core.fetcher({
-            url: core.url.join(
-                (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
-                "v1/folders",
-            ),
-            method: "POST",
-            headers: _headers,
-            contentType: "application/json",
-            queryParameters: requestOptions?.queryParams,
-            requestType: "json",
-            body: request,
-            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
-            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
-            abortSignal: requestOptions?.abortSignal,
-        });
-        if (_response.ok) {
-            return { data: _response.body as Skyvern.Folder, rawResponse: _response.rawResponse };
-        }
-
-        if (_response.error.reason === "status-code") {
-            switch (_response.error.statusCode) {
-                case 400:
-                    throw new Skyvern.BadRequestError(_response.error.body as unknown, _response.rawResponse);
-                case 422:
-                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
-                default:
-                    throw new errors.SkyvernError({
-                        statusCode: _response.error.statusCode,
-                        body: _response.error.body,
-                        rawResponse: _response.rawResponse,
-                    });
-            }
-        }
-
-        switch (_response.error.reason) {
-            case "non-json":
-                throw new errors.SkyvernError({
-                    statusCode: _response.error.statusCode,
-                    body: _response.error.rawBody,
-                    rawResponse: _response.rawResponse,
-                });
-            case "timeout":
-                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/folders.");
-            case "unknown":
-                throw new errors.SkyvernError({
-                    message: _response.error.errorMessage,
-                    rawResponse: _response.rawResponse,
-                });
-        }
-    }
-
-    /**
-     * Get a specific folder by ID
-     *
-     * @param {string} folderId - Folder ID
-     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
-     *
-     * @throws {@link Skyvern.NotFoundError}
-     * @throws {@link Skyvern.UnprocessableEntityError}
-     *
-     * @example
-     *     await client.getFolder("fld_123")
-     */
-    public getFolder(
-        folderId: string,
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): core.HttpResponsePromise<Skyvern.Folder> {
-        return core.HttpResponsePromise.fromPromise(this.__getFolder(folderId, requestOptions));
-    }
-
-    private async __getFolder(
-        folderId: string,
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): Promise<core.WithRawResponse<Skyvern.Folder>> {
-        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
-            this._options?.headers,
-            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
-            requestOptions?.headers,
-        );
-        const _response = await core.fetcher({
-            url: core.url.join(
-                (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
-                `v1/folders/${core.url.encodePathParam(folderId)}`,
-            ),
-            method: "GET",
-            headers: _headers,
-            queryParameters: requestOptions?.queryParams,
-            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
-            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
-            abortSignal: requestOptions?.abortSignal,
-        });
-        if (_response.ok) {
-            return { data: _response.body as Skyvern.Folder, rawResponse: _response.rawResponse };
-        }
-
-        if (_response.error.reason === "status-code") {
-            switch (_response.error.statusCode) {
-                case 404:
-                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
-                case 422:
-                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
-                default:
-                    throw new errors.SkyvernError({
-                        statusCode: _response.error.statusCode,
-                        body: _response.error.body,
-                        rawResponse: _response.rawResponse,
-                    });
-            }
-        }
-
-        switch (_response.error.reason) {
-            case "non-json":
-                throw new errors.SkyvernError({
-                    statusCode: _response.error.statusCode,
-                    body: _response.error.rawBody,
-                    rawResponse: _response.rawResponse,
-                });
-            case "timeout":
-                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /v1/folders/{folder_id}.");
-            case "unknown":
-                throw new errors.SkyvernError({
-                    message: _response.error.errorMessage,
-                    rawResponse: _response.rawResponse,
-                });
-        }
-    }
-
-    /**
-     * Update a folder's title or description
-     *
-     * @param {string} folderId - Folder ID
-     * @param {Skyvern.FolderUpdate} request
-     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
-     *
-     * @throws {@link Skyvern.NotFoundError}
-     * @throws {@link Skyvern.UnprocessableEntityError}
-     *
-     * @example
-     *     await client.updateFolder("fld_123")
-     */
-    public updateFolder(
-        folderId: string,
-        request: Skyvern.FolderUpdate = {},
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): core.HttpResponsePromise<Skyvern.Folder> {
-        return core.HttpResponsePromise.fromPromise(this.__updateFolder(folderId, request, requestOptions));
-    }
-
-    private async __updateFolder(
-        folderId: string,
-        request: Skyvern.FolderUpdate = {},
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): Promise<core.WithRawResponse<Skyvern.Folder>> {
-        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
-            this._options?.headers,
-            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
-            requestOptions?.headers,
-        );
-        const _response = await core.fetcher({
-            url: core.url.join(
-                (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
-                `v1/folders/${core.url.encodePathParam(folderId)}`,
-            ),
-            method: "PUT",
-            headers: _headers,
-            contentType: "application/json",
-            queryParameters: requestOptions?.queryParams,
-            requestType: "json",
-            body: request,
-            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
-            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
-            abortSignal: requestOptions?.abortSignal,
-        });
-        if (_response.ok) {
-            return { data: _response.body as Skyvern.Folder, rawResponse: _response.rawResponse };
-        }
-
-        if (_response.error.reason === "status-code") {
-            switch (_response.error.statusCode) {
-                case 404:
-                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
-                case 422:
-                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
-                default:
-                    throw new errors.SkyvernError({
-                        statusCode: _response.error.statusCode,
-                        body: _response.error.body,
-                        rawResponse: _response.rawResponse,
-                    });
-            }
-        }
-
-        switch (_response.error.reason) {
-            case "non-json":
-                throw new errors.SkyvernError({
-                    statusCode: _response.error.statusCode,
-                    body: _response.error.rawBody,
-                    rawResponse: _response.rawResponse,
-                });
-            case "timeout":
-                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling PUT /v1/folders/{folder_id}.");
-            case "unknown":
-                throw new errors.SkyvernError({
-                    message: _response.error.errorMessage,
-                    rawResponse: _response.rawResponse,
-                });
-        }
-    }
-
-    /**
-     * Delete a folder. Optionally delete all workflows in the folder.
-     *
-     * @param {string} folderId - Folder ID
-     * @param {Skyvern.DeleteFolderRequest} request
-     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
-     *
-     * @throws {@link Skyvern.NotFoundError}
-     * @throws {@link Skyvern.UnprocessableEntityError}
-     *
-     * @example
-     *     await client.deleteFolder("fld_123", {
-     *         delete_workflows: true
-     *     })
-     */
-    public deleteFolder(
-        folderId: string,
-        request: Skyvern.DeleteFolderRequest = {},
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): core.HttpResponsePromise<Record<string, unknown>> {
-        return core.HttpResponsePromise.fromPromise(this.__deleteFolder(folderId, request, requestOptions));
-    }
-
-    private async __deleteFolder(
-        folderId: string,
-        request: Skyvern.DeleteFolderRequest = {},
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): Promise<core.WithRawResponse<Record<string, unknown>>> {
-        const { delete_workflows: deleteWorkflows } = request;
-        const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
-        if (deleteWorkflows != null) {
-            _queryParams.delete_workflows = deleteWorkflows.toString();
-        }
-
-        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
-            this._options?.headers,
-            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
-            requestOptions?.headers,
-        );
-        const _response = await core.fetcher({
-            url: core.url.join(
-                (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
-                `v1/folders/${core.url.encodePathParam(folderId)}`,
-            ),
-            method: "DELETE",
-            headers: _headers,
-            queryParameters: { ..._queryParams, ...requestOptions?.queryParams },
-            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
-            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
-            abortSignal: requestOptions?.abortSignal,
-        });
-        if (_response.ok) {
-            return { data: _response.body as Record<string, unknown>, rawResponse: _response.rawResponse };
-        }
-
-        if (_response.error.reason === "status-code") {
-            switch (_response.error.statusCode) {
-                case 404:
-                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
-                case 422:
-                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
-                default:
-                    throw new errors.SkyvernError({
-                        statusCode: _response.error.statusCode,
-                        body: _response.error.body,
-                        rawResponse: _response.rawResponse,
-                    });
-            }
-        }
-
-        switch (_response.error.reason) {
-            case "non-json":
-                throw new errors.SkyvernError({
-                    statusCode: _response.error.statusCode,
-                    body: _response.error.rawBody,
-                    rawResponse: _response.rawResponse,
-                });
-            case "timeout":
-                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling DELETE /v1/folders/{folder_id}.");
-            case "unknown":
-                throw new errors.SkyvernError({
-                    message: _response.error.errorMessage,
-                    rawResponse: _response.rawResponse,
-                });
-        }
-    }
-
-    /**
-     * Update a workflow's folder assignment for the latest version
-     *
-     * @param {string} workflowPermanentId - Workflow permanent ID
-     * @param {Skyvern.UpdateWorkflowFolderRequest} request
-     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
-     *
-     * @throws {@link Skyvern.BadRequestError}
-     * @throws {@link Skyvern.NotFoundError}
-     * @throws {@link Skyvern.UnprocessableEntityError}
-     *
-     * @example
-     *     await client.updateWorkflowFolder("wpid_123")
-     */
-    public updateWorkflowFolder(
-        workflowPermanentId: string,
-        request: Skyvern.UpdateWorkflowFolderRequest = {},
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): core.HttpResponsePromise<Skyvern.Workflow> {
-        return core.HttpResponsePromise.fromPromise(
-            this.__updateWorkflowFolder(workflowPermanentId, request, requestOptions),
-        );
-    }
-
-    private async __updateWorkflowFolder(
-        workflowPermanentId: string,
-        request: Skyvern.UpdateWorkflowFolderRequest = {},
-        requestOptions?: SkyvernClient.RequestOptions,
-    ): Promise<core.WithRawResponse<Skyvern.Workflow>> {
-        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
-            this._options?.headers,
-            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
-            requestOptions?.headers,
-        );
-        const _response = await core.fetcher({
-            url: core.url.join(
-                (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
-                `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/folder`,
-            ),
-            method: "PUT",
-            headers: _headers,
-            contentType: "application/json",
-            queryParameters: requestOptions?.queryParams,
-            requestType: "json",
-            body: request,
-            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
-            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
-            abortSignal: requestOptions?.abortSignal,
-        });
-        if (_response.ok) {
-            return { data: _response.body as Skyvern.Workflow, rawResponse: _response.rawResponse };
-        }
-
-        if (_response.error.reason === "status-code") {
-            switch (_response.error.statusCode) {
-                case 400:
-                    throw new Skyvern.BadRequestError(_response.error.body as unknown, _response.rawResponse);
-                case 404:
-                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
-                case 422:
-                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
-                default:
-                    throw new errors.SkyvernError({
-                        statusCode: _response.error.statusCode,
-                        body: _response.error.body,
-                        rawResponse: _response.rawResponse,
-                    });
-            }
-        }
-
-        switch (_response.error.reason) {
-            case "non-json":
-                throw new errors.SkyvernError({
-                    statusCode: _response.error.statusCode,
-                    body: _response.error.rawBody,
-                    rawResponse: _response.rawResponse,
-                });
-            case "timeout":
-                throw new errors.SkyvernTimeoutError(
-                    "Timeout exceeded when calling PUT /v1/workflows/{workflow_permanent_id}/folder.",
-                );
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,

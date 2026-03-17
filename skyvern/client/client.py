@@ -18,7 +18,6 @@ from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.change_tier_response import ChangeTierResponse
 from .types.checkout_session_response import CheckoutSessionResponse
-from .types.clear_cache_response import ClearCacheResponse
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
@@ -750,6 +749,258 @@ class Skyvern:
         )
         """
         _response = self._raw_client.delete_workflow(workflow_id, request_options=request_options)
+        return _response.data
+
+    def get_folders(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        search: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Folder]:
+        """
+        Get all folders for the organization
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number
+
+        page_size : typing.Optional[int]
+            Number of folders per page
+
+        search : typing.Optional[str]
+            Search folders by title or description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Folder]
+            Successfully retrieved folders
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_folders(
+            page=1,
+            page_size=1,
+            search="search",
+        )
+        """
+        _response = self._raw_client.get_folders(
+            page=page, page_size=page_size, search=search, request_options=request_options
+        )
+        return _response.data
+
+    def create_folder(
+        self,
+        *,
+        title: str,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        """
+        Create a new folder to organize workflows
+
+        Parameters
+        ----------
+        title : str
+            Folder title
+
+        description : typing.Optional[str]
+            Folder description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully created folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.create_folder(
+            title="title",
+        )
+        """
+        _response = self._raw_client.create_folder(
+            title=title, description=description, request_options=request_options
+        )
+        return _response.data
+
+    def get_folder(self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Folder:
+        """
+        Get a specific folder by ID
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully retrieved folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_folder(
+            folder_id="fld_123",
+        )
+        """
+        _response = self._raw_client.get_folder(folder_id, request_options=request_options)
+        return _response.data
+
+    def update_folder(
+        self,
+        folder_id: str,
+        *,
+        title: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        """
+        Update a folder's title or description
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        title : typing.Optional[str]
+            Folder title
+
+        description : typing.Optional[str]
+            Folder description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully updated folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.update_folder(
+            folder_id="fld_123",
+        )
+        """
+        _response = self._raw_client.update_folder(
+            folder_id, title=title, description=description, request_options=request_options
+        )
+        return _response.data
+
+    def delete_folder(
+        self,
+        folder_id: str,
+        *,
+        delete_workflows: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.Dict[str, typing.Optional[typing.Any]]:
+        """
+        Delete a folder. Optionally delete all workflows in the folder.
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        delete_workflows : typing.Optional[bool]
+            If true, also delete all workflows in this folder
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.Dict[str, typing.Optional[typing.Any]]
+            Successfully deleted folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.delete_folder(
+            folder_id="fld_123",
+            delete_workflows=True,
+        )
+        """
+        _response = self._raw_client.delete_folder(
+            folder_id, delete_workflows=delete_workflows, request_options=request_options
+        )
+        return _response.data
+
+    def update_workflow_folder(
+        self,
+        workflow_permanent_id: str,
+        *,
+        folder_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Update a workflow's folder assignment for the latest version
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        folder_id : typing.Optional[str]
+            Folder ID to assign workflow to. Set to null to remove from folder.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.update_workflow_folder(
+            workflow_permanent_id="wpid_123",
+        )
+        """
+        _response = self._raw_client.update_workflow_folder(
+            workflow_permanent_id, folder_id=folder_id, request_options=request_options
+        )
         return _response.data
 
     def get_artifact(self, artifact_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Artifact:
@@ -1587,12 +1838,11 @@ class Skyvern:
             api_key="YOUR_API_KEY",
         )
         client.create_credential(
-            name="My Credential",
+            name="Amazon Login",
             credential_type="password",
             credential=NonEmptyPasswordCredential(
                 password="securepassword123",
                 username="user@example.com",
-                totp="JBSWY3DPEHPK3PXP",
             ),
         )
         """
@@ -1644,10 +1894,10 @@ class Skyvern:
         )
         client.update_credential(
             credential_id="cred_1234567890",
-            name="My Credential",
+            name="Amazon Login",
             credential_type="password",
             credential=NonEmptyPasswordCredential(
-                password="newpassword123",
+                password="securepassword123",
                 username="user@example.com",
             ),
         )
@@ -2129,12 +2379,6 @@ class Skyvern:
         _response = self._raw_client.deploy_script(script_id, files=files, request_options=request_options)
         return _response.data
 
-    def clear_workflow_cache(
-        self, workflow_permanent_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> ClearCacheResponse:
-        _response = self._raw_client.clear_workflow_cache(workflow_permanent_id, request_options=request_options)
-        return _response.data
-
     def run_sdk_action(
         self,
         *,
@@ -2330,258 +2574,6 @@ class Skyvern:
         """
         _response = self._raw_client.change_tier_api_v1billing_change_tier_post(
             tier=tier, request_options=request_options
-        )
-        return _response.data
-
-    def get_folders(
-        self,
-        *,
-        page: typing.Optional[int] = None,
-        page_size: typing.Optional[int] = None,
-        search: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.List[Folder]:
-        """
-        Get all folders for the organization
-
-        Parameters
-        ----------
-        page : typing.Optional[int]
-            Page number
-
-        page_size : typing.Optional[int]
-            Number of folders per page
-
-        search : typing.Optional[str]
-            Search folders by title or description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.List[Folder]
-            Successfully retrieved folders
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.get_folders(
-            page=1,
-            page_size=1,
-            search="search",
-        )
-        """
-        _response = self._raw_client.get_folders(
-            page=page, page_size=page_size, search=search, request_options=request_options
-        )
-        return _response.data
-
-    def create_folder(
-        self,
-        *,
-        title: str,
-        description: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> Folder:
-        """
-        Create a new folder to organize workflows
-
-        Parameters
-        ----------
-        title : str
-            Folder title
-
-        description : typing.Optional[str]
-            Folder description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Folder
-            Successfully created folder
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.create_folder(
-            title="title",
-        )
-        """
-        _response = self._raw_client.create_folder(
-            title=title, description=description, request_options=request_options
-        )
-        return _response.data
-
-    def get_folder(self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Folder:
-        """
-        Get a specific folder by ID
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Folder
-            Successfully retrieved folder
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.get_folder(
-            folder_id="fld_123",
-        )
-        """
-        _response = self._raw_client.get_folder(folder_id, request_options=request_options)
-        return _response.data
-
-    def update_folder(
-        self,
-        folder_id: str,
-        *,
-        title: typing.Optional[str] = OMIT,
-        description: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> Folder:
-        """
-        Update a folder's title or description
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        title : typing.Optional[str]
-            Folder title
-
-        description : typing.Optional[str]
-            Folder description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Folder
-            Successfully updated folder
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.update_folder(
-            folder_id="fld_123",
-        )
-        """
-        _response = self._raw_client.update_folder(
-            folder_id, title=title, description=description, request_options=request_options
-        )
-        return _response.data
-
-    def delete_folder(
-        self,
-        folder_id: str,
-        *,
-        delete_workflows: typing.Optional[bool] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.Dict[str, typing.Optional[typing.Any]]:
-        """
-        Delete a folder. Optionally delete all workflows in the folder.
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        delete_workflows : typing.Optional[bool]
-            If true, also delete all workflows in this folder
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.Dict[str, typing.Optional[typing.Any]]
-            Successfully deleted folder
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.delete_folder(
-            folder_id="fld_123",
-            delete_workflows=True,
-        )
-        """
-        _response = self._raw_client.delete_folder(
-            folder_id, delete_workflows=delete_workflows, request_options=request_options
-        )
-        return _response.data
-
-    def update_workflow_folder(
-        self,
-        workflow_permanent_id: str,
-        *,
-        folder_id: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> Workflow:
-        """
-        Update a workflow's folder assignment for the latest version
-
-        Parameters
-        ----------
-        workflow_permanent_id : str
-            Workflow permanent ID
-
-        folder_id : typing.Optional[str]
-            Folder ID to assign workflow to. Set to null to remove from folder.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Workflow
-            Successfully updated workflow folder
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.update_workflow_folder(
-            workflow_permanent_id="wpid_123",
-        )
-        """
-        _response = self._raw_client.update_workflow_folder(
-            workflow_permanent_id, folder_id=folder_id, request_options=request_options
         )
         return _response.data
 
@@ -3350,6 +3342,306 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.delete_workflow(workflow_id, request_options=request_options)
+        return _response.data
+
+    async def get_folders(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        search: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Folder]:
+        """
+        Get all folders for the organization
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number
+
+        page_size : typing.Optional[int]
+            Number of folders per page
+
+        search : typing.Optional[str]
+            Search folders by title or description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Folder]
+            Successfully retrieved folders
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_folders(
+                page=1,
+                page_size=1,
+                search="search",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_folders(
+            page=page, page_size=page_size, search=search, request_options=request_options
+        )
+        return _response.data
+
+    async def create_folder(
+        self,
+        *,
+        title: str,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        """
+        Create a new folder to organize workflows
+
+        Parameters
+        ----------
+        title : str
+            Folder title
+
+        description : typing.Optional[str]
+            Folder description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully created folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.create_folder(
+                title="title",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.create_folder(
+            title=title, description=description, request_options=request_options
+        )
+        return _response.data
+
+    async def get_folder(self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Folder:
+        """
+        Get a specific folder by ID
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully retrieved folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_folder(
+                folder_id="fld_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_folder(folder_id, request_options=request_options)
+        return _response.data
+
+    async def update_folder(
+        self,
+        folder_id: str,
+        *,
+        title: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Folder:
+        """
+        Update a folder's title or description
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        title : typing.Optional[str]
+            Folder title
+
+        description : typing.Optional[str]
+            Folder description
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Folder
+            Successfully updated folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.update_folder(
+                folder_id="fld_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.update_folder(
+            folder_id, title=title, description=description, request_options=request_options
+        )
+        return _response.data
+
+    async def delete_folder(
+        self,
+        folder_id: str,
+        *,
+        delete_workflows: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.Dict[str, typing.Optional[typing.Any]]:
+        """
+        Delete a folder. Optionally delete all workflows in the folder.
+
+        Parameters
+        ----------
+        folder_id : str
+            Folder ID
+
+        delete_workflows : typing.Optional[bool]
+            If true, also delete all workflows in this folder
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.Dict[str, typing.Optional[typing.Any]]
+            Successfully deleted folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.delete_folder(
+                folder_id="fld_123",
+                delete_workflows=True,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.delete_folder(
+            folder_id, delete_workflows=delete_workflows, request_options=request_options
+        )
+        return _response.data
+
+    async def update_workflow_folder(
+        self,
+        workflow_permanent_id: str,
+        *,
+        folder_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Update a workflow's folder assignment for the latest version
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        folder_id : typing.Optional[str]
+            Folder ID to assign workflow to. Set to null to remove from folder.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.update_workflow_folder(
+                workflow_permanent_id="wpid_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.update_workflow_folder(
+            workflow_permanent_id, folder_id=folder_id, request_options=request_options
+        )
         return _response.data
 
     async def get_artifact(
@@ -4340,12 +4632,11 @@ class AsyncSkyvern:
 
         async def main() -> None:
             await client.create_credential(
-                name="My Credential",
+                name="Amazon Login",
                 credential_type="password",
                 credential=NonEmptyPasswordCredential(
                     password="securepassword123",
                     username="user@example.com",
-                    totp="JBSWY3DPEHPK3PXP",
                 ),
             )
 
@@ -4405,10 +4696,10 @@ class AsyncSkyvern:
         async def main() -> None:
             await client.update_credential(
                 credential_id="cred_1234567890",
-                name="My Credential",
+                name="Amazon Login",
                 credential_type="password",
                 credential=NonEmptyPasswordCredential(
-                    password="newpassword123",
+                    password="securepassword123",
                     username="user@example.com",
                 ),
             )
@@ -4959,12 +5250,6 @@ class AsyncSkyvern:
         _response = await self._raw_client.deploy_script(script_id, files=files, request_options=request_options)
         return _response.data
 
-    async def clear_workflow_cache(
-        self, workflow_permanent_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> ClearCacheResponse:
-        _response = await self._raw_client.clear_workflow_cache(workflow_permanent_id, request_options=request_options)
-        return _response.data
-
     async def run_sdk_action(
         self,
         *,
@@ -5204,306 +5489,6 @@ class AsyncSkyvern:
         """
         _response = await self._raw_client.change_tier_api_v1billing_change_tier_post(
             tier=tier, request_options=request_options
-        )
-        return _response.data
-
-    async def get_folders(
-        self,
-        *,
-        page: typing.Optional[int] = None,
-        page_size: typing.Optional[int] = None,
-        search: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.List[Folder]:
-        """
-        Get all folders for the organization
-
-        Parameters
-        ----------
-        page : typing.Optional[int]
-            Page number
-
-        page_size : typing.Optional[int]
-            Number of folders per page
-
-        search : typing.Optional[str]
-            Search folders by title or description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.List[Folder]
-            Successfully retrieved folders
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.get_folders(
-                page=1,
-                page_size=1,
-                search="search",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.get_folders(
-            page=page, page_size=page_size, search=search, request_options=request_options
-        )
-        return _response.data
-
-    async def create_folder(
-        self,
-        *,
-        title: str,
-        description: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> Folder:
-        """
-        Create a new folder to organize workflows
-
-        Parameters
-        ----------
-        title : str
-            Folder title
-
-        description : typing.Optional[str]
-            Folder description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Folder
-            Successfully created folder
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.create_folder(
-                title="title",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.create_folder(
-            title=title, description=description, request_options=request_options
-        )
-        return _response.data
-
-    async def get_folder(self, folder_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Folder:
-        """
-        Get a specific folder by ID
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Folder
-            Successfully retrieved folder
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.get_folder(
-                folder_id="fld_123",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.get_folder(folder_id, request_options=request_options)
-        return _response.data
-
-    async def update_folder(
-        self,
-        folder_id: str,
-        *,
-        title: typing.Optional[str] = OMIT,
-        description: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> Folder:
-        """
-        Update a folder's title or description
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        title : typing.Optional[str]
-            Folder title
-
-        description : typing.Optional[str]
-            Folder description
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Folder
-            Successfully updated folder
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.update_folder(
-                folder_id="fld_123",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.update_folder(
-            folder_id, title=title, description=description, request_options=request_options
-        )
-        return _response.data
-
-    async def delete_folder(
-        self,
-        folder_id: str,
-        *,
-        delete_workflows: typing.Optional[bool] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.Dict[str, typing.Optional[typing.Any]]:
-        """
-        Delete a folder. Optionally delete all workflows in the folder.
-
-        Parameters
-        ----------
-        folder_id : str
-            Folder ID
-
-        delete_workflows : typing.Optional[bool]
-            If true, also delete all workflows in this folder
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.Dict[str, typing.Optional[typing.Any]]
-            Successfully deleted folder
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.delete_folder(
-                folder_id="fld_123",
-                delete_workflows=True,
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.delete_folder(
-            folder_id, delete_workflows=delete_workflows, request_options=request_options
-        )
-        return _response.data
-
-    async def update_workflow_folder(
-        self,
-        workflow_permanent_id: str,
-        *,
-        folder_id: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> Workflow:
-        """
-        Update a workflow's folder assignment for the latest version
-
-        Parameters
-        ----------
-        workflow_permanent_id : str
-            Workflow permanent ID
-
-        folder_id : typing.Optional[str]
-            Folder ID to assign workflow to. Set to null to remove from folder.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Workflow
-            Successfully updated workflow folder
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.update_workflow_folder(
-                workflow_permanent_id="wpid_123",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.update_workflow_folder(
-            workflow_permanent_id, folder_id=folder_id, request_options=request_options
         )
         return _response.data
 
