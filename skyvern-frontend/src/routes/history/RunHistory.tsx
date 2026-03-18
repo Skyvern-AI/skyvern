@@ -27,7 +27,11 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
-import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
+import {
+  basicLocalTimeFormat,
+  basicTimeFormat,
+  formatExecutionTime,
+} from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
 import React, { useEffect, useState } from "react";
@@ -171,33 +175,40 @@ function RunHistory() {
         <Table>
           <TableHeader className="rounded-t-lg bg-slate-elevation2">
             <TableRow>
-              <TableHead className="w-1/5 rounded-tl-lg text-slate-400">
+              <TableHead className="w-[20%] rounded-tl-lg text-slate-400">
                 Run ID
               </TableHead>
-              <TableHead className="w-1/5 text-slate-400">Detail</TableHead>
-              <TableHead className="w-1/5 text-slate-400">Status</TableHead>
-              <TableHead className="w-1/5 text-slate-400">Created At</TableHead>
-              <TableHead className="w-1/5 rounded-tr-lg text-slate-400"></TableHead>
+              <TableHead className="w-[20%] text-slate-400">Detail</TableHead>
+              <TableHead className="w-[16%] text-slate-400">Status</TableHead>
+              <TableHead className="w-[16%] text-slate-400">
+                Created At
+              </TableHead>
+              <TableHead className="w-[16%] text-slate-400">Duration</TableHead>
+              <TableHead className="w-[12%] rounded-tr-lg text-slate-400"></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {isFetching ? (
               Array.from({ length: 10 }).map((_, index) => (
                 <TableRow key={index}>
-                  <TableCell colSpan={4}>
+                  <TableCell colSpan={6}>
                     <Skeleton className="h-4 w-full" />
                   </TableCell>
                 </TableRow>
               ))
             ) : runs?.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={4}>
+                <TableCell colSpan={6}>
                   <div className="text-center">No runs found</div>
                 </TableCell>
               </TableRow>
             ) : (
               runs?.map((run) => {
                 if (isTask(run)) {
+                  const taskExecutionTime = formatExecutionTime(
+                    run.started_at ?? run.created_at,
+                    run.finished_at,
+                  );
                   return (
                     <TableRow
                       key={run.task_id}
@@ -221,6 +232,11 @@ function RunHistory() {
                       >
                         {basicLocalTimeFormat(run.created_at)}
                       </TableCell>
+                      <TableCell className="text-slate-400">
+                        {taskExecutionTime ?? "-"}
+                      </TableCell>
+                      {/* Align with workflow row's expand button column. */}
+                      <TableCell />
                     </TableRow>
                   );
                 }
@@ -238,6 +254,10 @@ function RunHistory() {
                   );
 
                 const isExpanded = expandedRows.has(run.workflow_run_id);
+                const workflowExecutionTime = formatExecutionTime(
+                  run.started_at ?? run.created_at,
+                  run.finished_at,
+                );
 
                 return (
                   <React.Fragment key={run.workflow_run_id}>
@@ -276,6 +296,9 @@ function RunHistory() {
                       >
                         {basicLocalTimeFormat(run.created_at)}
                       </TableCell>
+                      <TableCell className="text-slate-400">
+                        {workflowExecutionTime ?? "-"}
+                      </TableCell>
                       <TableCell>
                         <div className="flex justify-end">
                           <TooltipProvider>
@@ -309,7 +332,7 @@ function RunHistory() {
                     {isExpanded && (
                       <TableRow key={`${run.workflow_run_id}-params`}>
                         <TableCell
-                          colSpan={5}
+                          colSpan={6}
                           className="bg-slate-50 dark:bg-slate-900/50"
                         >
                           <WorkflowRunParametersInline

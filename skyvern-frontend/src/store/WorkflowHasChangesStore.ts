@@ -31,13 +31,16 @@ type WorkflowHasChangesStore = {
   saveIsPending: boolean;
   saidOkToCodeCacheDeletion: boolean;
   showConfirmCodeCacheDeletion: boolean;
-  isInternalUpdate: boolean;
+  // Reference-counted flag: multiple concurrent internal updates won't
+  // accidentally clear each other. Gate on > 0 in consumers.
+  internalUpdateCount: number;
   setGetSaveData: (getSaveData: () => SaveData) => void;
   setHasChanges: (hasChanges: boolean) => void;
   setSaveIsPending: (isPending: boolean) => void;
   setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => void;
   setShowConfirmCodeCacheDeletion: (show: boolean) => void;
-  setIsInternalUpdate: (isInternalUpdate: boolean) => void;
+  beginInternalUpdate: () => void;
+  endInternalUpdate: () => void;
 };
 
 interface WorkflowSaveOpts {
@@ -50,7 +53,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     saveIsPending: false,
     saidOkToCodeCacheDeletion: false,
     showConfirmCodeCacheDeletion: false,
-    isInternalUpdate: false,
+    internalUpdateCount: 0,
     getSaveData: () => null,
     setGetSaveData: (getSaveData: () => SaveData) => {
       set({ getSaveData });
@@ -67,8 +70,13 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     setShowConfirmCodeCacheDeletion: (show: boolean) => {
       set({ showConfirmCodeCacheDeletion: show });
     },
-    setIsInternalUpdate: (isInternalUpdate: boolean) => {
-      set({ isInternalUpdate });
+    beginInternalUpdate: () => {
+      set((state) => ({ internalUpdateCount: state.internalUpdateCount + 1 }));
+    },
+    endInternalUpdate: () => {
+      set((state) => ({
+        internalUpdateCount: Math.max(0, state.internalUpdateCount - 1),
+      }));
     },
   };
 });
@@ -142,9 +150,13 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
         totp_verification_url: saveData.workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
-        run_with: saveData.settings.runWith,
+        run_with:
+          saveData.settings.runWith === "code_v2"
+            ? "code"
+            : saveData.settings.runWith,
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
+        adaptive_caching: saveData.settings.runWith === "code_v2",
         workflow_definition: {
           version: saveData.workflowDefinitionVersion,
           parameters: saveData.parameters,
@@ -202,19 +214,49 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       setHasChanges(false);
     },
     onError: (error: AxiosError) => {
-      const detail = (error.response?.data as { detail?: string })?.detail;
+      const responseData = error.response?.data as
+        | {
+            detail?:
+              | string
+              | Array<{
+                  loc?: Array<string | number>;
+                  msg?: string;
+                  type?: string;
+                }>;
+          }
+        | undefined;
+      const rawDetail = responseData?.detail;
 
       if (
-        detail &&
-        detail.startsWith("No confirmation for code cache deletion")
+        typeof rawDetail === "string" &&
+        rawDetail.startsWith("No confirmation for code cache deletion")
       ) {
         setShowConfirmCodeCacheDeletion(true);
         return;
       }
 
+      let description: string;
+      if (typeof rawDetail === "string" && rawDetail) {
+        description = rawDetail;
+      } else if (Array.isArray(rawDetail) && rawDetail.length > 0) {
+        // FastAPI's own 422 responses (e.g. request body validation) return detail
+        // as an array; our custom ValidationError handler returns it as a string.
+        description = rawDetail
+          .map((err) => {
+            const loc = err.loc
+              ?.filter((part) => part !== "body" && part !== "__root__")
+              .join(" -> ");
+            return loc ? `${loc}: ${err.msg}` : err.msg ?? "Unknown error";
+          })
+          .join("; ");
+      } else {
+        description =
+          "Failed to save workflow. Please check your workflow configuration and try again.";
+      }
+
       toast({
-        title: "Error",
-        description: detail ? detail : error.message,
+        title: "Failed to save workflow",
+        description,
         variant: "destructive",
       });
     },

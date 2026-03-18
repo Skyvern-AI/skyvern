@@ -22,7 +22,7 @@ function useBlockScriptsQuery({
 }: Props) {
   const credentialGetter = useCredentialGetter();
 
-  return useQuery<{ [blockName: string]: string }>({
+  return useQuery<ScriptBlocksResponse>({
     queryKey: [
       "block-scripts",
       workflowPermanentId,
@@ -34,7 +34,7 @@ function useBlockScriptsQuery({
     queryFn: async () => {
       const client = await getClient(credentialGetter, "sans-api-v1");
 
-      const result = await client
+      return client
         .post<ScriptBlocksResponse>(`/scripts/${workflowPermanentId}/blocks`, {
           cache_key: cacheKey ?? "",
           cache_key_value: cacheKeyValue ?? "",
@@ -42,8 +42,6 @@ function useBlockScriptsQuery({
           workflow_run_id: workflowRunId ?? null,
         })
         .then((response) => response.data);
-
-      return result.blocks;
     },
     refetchInterval: () => {
       if (!pollIntervalMs || pollIntervalMs === 0) {

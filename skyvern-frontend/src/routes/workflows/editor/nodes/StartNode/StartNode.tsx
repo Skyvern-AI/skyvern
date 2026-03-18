@@ -294,7 +294,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                               <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the workflow. To avoid using code, set this to 'Skyvern Agent'." />
                             </div>
                             <Select
-                              value={data.runWith ?? "agent"}
+                              value={data.runWith || "agent"}
                               onValueChange={(value) => {
                                 update({ runWith: value });
                               }}
@@ -307,6 +307,12 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                                   Skyvern Agent
                                 </SelectItem>
                                 <SelectItem value="code">Code</SelectItem>
+                                <SelectItem value="code_v2">
+                                  <span>Code 2.0</span>{" "}
+                                  <span className="text-xs italic text-yellow-400">
+                                    new
+                                  </span>
+                                </SelectItem>
                               </SelectContent>
                             </Select>
                           </div>

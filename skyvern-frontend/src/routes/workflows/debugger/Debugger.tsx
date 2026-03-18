@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useParams } from "react-router-dom";
 import { ReactFlowProvider } from "@xyflow/react";
 
+import { LogoMinimized } from "@/components/LogoMinimized";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { WorkflowSettings } from "../types/workflowTypes";
 import {
@@ -16,7 +17,7 @@ import { useBlockOutputStore } from "@/store/BlockOutputStore";
 
 function Debugger() {
   const { workflowPermanentId } = useParams();
-  const { data: workflow } = useWorkflowQuery({
+  const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
   });
   const { data: outputParameters } = useDebugSessionBlockOutputsQuery({
@@ -51,6 +52,16 @@ function Debugger() {
     setBlockOutputs(blockOutputs);
   }, [outputParameters, setBlockOutputs]);
 
+  if (isLoading) {
+    return (
+      <div className="flex h-screen w-full items-center justify-center">
+        <div className="animate-pulse">
+          <LogoMinimized />
+        </div>
+      </div>
+    );
+  }
+
   if (!workflow) {
     return null;
   }
@@ -71,7 +82,10 @@ function Debugger() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
-    runWith: workflow.run_with,
+    runWith:
+      workflow.adaptive_caching && workflow.run_with === "code"
+        ? "code_v2"
+        : workflow.run_with,
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
     runSequentially: workflow.run_sequentially ?? false,

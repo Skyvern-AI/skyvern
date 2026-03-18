@@ -1,0 +1,383 @@
+---
+title: External Credential Providers
+subtitle: Connect Bitwarden, 1Password, Azure Key Vault, or your own vault API
+slug: cloud/managing-credentials/external-providers
+---
+
+Instead of copying secrets into Skyvern, you can point Skyvern at your existing vault and it pulls credentials at runtime. If your organization already manages secrets in a dedicated vault, connect it as a credential source and reference items directly from workflow parameters.
+
+<Note>
+External providers are configured per-organization. Once connected, any workflow in the organization can reference credentials from that provider.
+</Note>
+
+## Choosing a provider
+
+| Source | Credential types | Setup | Best for |
+|--------|-----------------|-------|----------|
+| **Skyvern** (default) | Password, Credit Card, Secret | None (built in) | Most users, fastest setup |
+| **Bitwarden** | Password, Credit Card, Identity | Credential parameter config | Teams already using Bitwarden (enterprise) |
+| **1Password** | Password, Credit Card | Settings page setup | Teams with 1Password service accounts |
+| **Azure Key Vault** | Password (with optional TOTP) | Settings page setup | Enterprise Azure environments |
+| **Webhook (Custom API)** | Password, Credit Card | Settings page setup | Organizations with custom vaults |
+
+You can mix sources within the same workflow. For example, one Login block can use Skyvern-stored credentials while another uses Azure Key Vault.
+
+---
+
+## Bitwarden
+
+<Note>
+Bitwarden integration is available on the **enterprise plan**. Contact [sales@skyvern.com](mailto:sales@skyvern.com) for access.
+</Note>
+
+Works with hosted Bitwarden and the self-hosted [Vaultwarden](https://github.com/dani-garcia/vaultwarden) fork. Supports passwords, credit cards, and identity data (SSN, address, phone numbers).
+
+<Warning>
+Make sure your Bitwarden account is on `bitwarden.com`, not `bitwarden.eu`. The EU instance uses a different API that Skyvern does not currently support.
+</Warning>
+
+### Cloud setup
+
+<Steps>
+  <Step title="Create a Bitwarden Organization">
+    Log into Bitwarden, navigate to **Admin Console**, and ensure you have an organization created.
+  </Step>
+  <Step title="Create a collection to share with Skyvern">
+    In your organization, click **New → Create a collection**. Name it something identifiable (e.g., "Skyvern Credentials"). Skip this step if you already have a collection ready.
+  </Step>
+  <Step title="Configure access with the Skyvern team">
+    Go to the **Access** tab on your collection. This step requires coordination with the Skyvern enterprise team, who will configure access on their end. Contact [sales@skyvern.com](mailto:sales@skyvern.com) to get started.
+  </Step>
+  <Step title="Grab your Collection ID">
+    Click into the collection and find the collection UUID in the URL bar.
+  </Step>
+  <Step title="Add to a workflow">
+    In the Skyvern workflow editor, click **Parameters → Add Parameter → Credential Parameter** and select the **Bitwarden** tab. Enter your **Collection ID** and optionally an **Item ID** to target a specific vault item.
+  </Step>
+</Steps>
+
+### Configuration options
+
+| Field | Description |
+|-------|------------|
+| **Collection ID** | The UUID of your Bitwarden collection (found in the URL when viewing the collection) |
+| **Item ID** | Target a specific vault item. Leave blank to use URL matching instead. |
+| **URL Parameter Key** | Match credentials by the target URL. Useful when the same workflow runs against different sites. |
+
+### Identity data
+
+For identity fields (SSN, address, phone numbers), specify an **Identity Key** and a comma-separated list of **Identity Fields** (e.g., `ssn, address, phone`) in the Credential Parameter configuration panel.
+
+<Accordion title="Self-hosted Bitwarden (Vaultwarden)">
+Skyvern integrates with self-hosted Bitwarden-compatible services like Vaultwarden using the Bitwarden CLI server as a bridge:
+
+```text
+Skyvern → bw serve (CLI Server) → Vaultwarden
+```
+
+**Environment variables:**
+
+```bash
+# Skyvern Bitwarden Configuration
+SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID=your-org-id-here
+SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD=your-master-password-here
+SKYVERN_AUTH_BITWARDEN_CLIENT_ID=user.your-client-id-here
+SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET=your-client-secret-here
+
+# Vaultwarden Configuration
+BW_HOST=https://your-vaultwarden-server.com
+BW_CLIENTID=${SKYVERN_AUTH_BITWARDEN_CLIENT_ID}
+BW_CLIENTSECRET=${SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET}
+BW_PASSWORD=${SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD}
+
+# CLI Server Configuration
+BITWARDEN_SERVER=http://localhost
+BITWARDEN_SERVER_PORT=8002
+```
+
+Start the CLI server with Docker Compose:
+
+```bash
+docker-compose up -d bitwarden-cli
+```
+
+Verify it's running:
+
+```bash
+curl http://localhost:8002/status
+```
+</Accordion>
+
+---
+
+## 1Password
+
+Connects via a [service account token](https://developer.1password.com/docs/service-accounts/get-started/). A service account is an API-only identity that accesses vault items without a human login. Supports passwords and credit cards.
+
+### One-time setup
+
+<Steps>
+  <Step title="Create a service account">
+    In your 1Password admin console, go to **Developer > Service Accounts** and create a new service account. Grant it access to the vault that contains the credentials Skyvern needs.
+  </Step>
+  <Step title="Open Settings">
+    In Skyvern, go to **Settings** and find the **1Password** card.
+  </Step>
+  <Step title="Enter your service account token">
+    Paste the service account token from the previous step.
+  </Step>
+  <Step title="Save and verify">
+    Click **Update**. The status indicator turns **Active** once the token is validated.
+  </Step>
+</Steps>
+
+<Tip>
+If the status does not turn Active, verify that your service account token has access to the target vault and has not expired.
+</Tip>
+
+### Using in a workflow
+
+In the workflow editor, add a **Credential Parameter** and select **1Password** as the source. Provide the **Vault ID** and **Item ID**. You can find both IDs in the URL when viewing an item in the 1Password web app.
+
+<Warning>
+Credit cards from 1Password need a custom text field named **"Expire Date"**, **"Expiry Date"**, or **"Expiration Date"** in `MM/YYYY` or `MM/YY` format. 1Password does not expose the native expiration field through its API, so Skyvern reads this custom text field instead.
+</Warning>
+
+---
+
+## Azure Key Vault
+
+Pulls credentials stored as Azure secrets. Supports passwords with optional TOTP.
+
+### One-time setup
+
+<Steps>
+  <Step title="Open Settings">
+    Go to **Settings** and find the **Azure** card.
+  </Step>
+  <Step title="Enter your Azure credentials">
+    Provide your **Tenant ID**, **Client ID**, and **Client Secret**.
+  </Step>
+  <Step title="Save">
+    Click **Update**. Skyvern will use these credentials to access your vault.
+  </Step>
+</Steps>
+
+### Using in a workflow
+
+In the workflow editor, add a **Credential Parameter** and select **Azure Key Vault** as the source. Provide the vault name and the **secret names** that store the username, password, and optionally a TOTP secret. Enter the secret names, not the values themselves.
+
+For example, if your vault stores secrets named `salesforce-username`, `salesforce-password`, and `salesforce-totp`, enter those three names in the corresponding fields.
+
+---
+
+## Webhook (Custom API)
+
+Connect your own HTTP API as a credential backend. Skyvern calls your API to create, retrieve, and delete credentials, so sensitive data stays in your infrastructure.
+
+### API contract
+
+Your service must implement three endpoints. All requests include an `Authorization: Bearer {API_TOKEN}` header.
+
+**Create credential**
+```http
+POST {API_BASE_URL}
+Authorization: Bearer {API_TOKEN}
+Content-Type: application/json
+```
+
+The request body depends on the credential type. Your API must handle all three:
+
+<Accordion title="Password request body">
+```json
+{
+  "name": "Salesforce Login",
+  "type": "password",
+  "username": "user@example.com",
+  "password": "secure_password",
+  "totp": "JBSWY3DPEHPK3PXP",
+  "totp_type": "authenticator"
+}
+```
+The `totp` and `totp_type` fields are optional. `totp_type` can be `"authenticator"`, `"email"`, `"text_message"`, or `"none"`.
+</Accordion>
+
+<Accordion title="Credit card request body">
+```json
+{
+  "name": "Corporate Visa",
+  "type": "credit_card",
+  "card_holder_name": "Jane Doe",
+  "card_number": "4111111111111111",
+  "card_exp_month": "12",
+  "card_exp_year": "2025",
+  "card_cvv": "123",
+  "card_brand": "visa"
+}
+```
+</Accordion>
+
+<Accordion title="Secret request body">
+```json
+{
+  "name": "Stripe API Key",
+  "type": "secret",
+  "secret_value": "sk_live_abc123",
+  "secret_label": "api-key"
+}
+```
+The `secret_label` field is optional.
+</Accordion>
+
+Response (all types):
+```json
+{
+  "id": "cred_123456"
+}
+```
+
+**Get credential**
+```http
+GET {API_BASE_URL}/{credential_id}
+Authorization: Bearer {API_TOKEN}
+```
+
+Return the same fields that were sent during creation (minus `name`). Include `type` so Skyvern knows how to parse the response.
+
+**Delete credential**
+```http
+DELETE {API_BASE_URL}/{credential_id}
+Authorization: Bearer {API_TOKEN}
+```
+
+Response: HTTP 200
+
+### Setup
+
+<Steps>
+  <Step title="Open Settings">
+    Go to **Settings** and find the **Custom Credential Service** card.
+  </Step>
+  <Step title="Enter your API details">
+    Provide the **API Base URL** and **API Token** for your credential service.
+  </Step>
+  <Step title="Save">
+    Click **Update Configuration**. The status indicator turns **Active** once the configuration is saved.
+  </Step>
+</Steps>
+
+<Accordion title="Example: minimal FastAPI implementation">
+```python
+from fastapi import FastAPI, HTTPException, Depends, Header
+from pydantic import BaseModel
+from typing import Optional
+import uuid
+
+app = FastAPI()
+credentials_store = {}
+
+class CreateCredentialRequest(BaseModel):
+    name: str
+    type: str  # "password", "credit_card", or "secret"
+    # Password fields
+    username: Optional[str] = None
+    password: Optional[str] = None
+    totp: Optional[str] = None
+    totp_type: Optional[str] = None
+    # Credit card fields
+    card_holder_name: Optional[str] = None
+    card_number: Optional[str] = None
+    card_exp_month: Optional[str] = None
+    card_exp_year: Optional[str] = None
+    card_cvv: Optional[str] = None
+    card_brand: Optional[str] = None
+    # Secret fields
+    secret_value: Optional[str] = None
+    secret_label: Optional[str] = None
+
+class CredentialResponse(BaseModel):
+    id: str
+
+def verify_token(authorization: str = Header(...)):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Invalid authorization header")
+    token = authorization.split("Bearer ")[1]
+    if token != "your_expected_api_token":
+        raise HTTPException(401, "Invalid API token")
+
+@app.post("/api/v1/credentials", response_model=CredentialResponse)
+async def create_credential(
+    request: CreateCredentialRequest,
+    _: None = Depends(verify_token)
+):
+    credential_id = f"cred_{uuid.uuid4().hex[:12]}"
+    credentials_store[credential_id] = request.model_dump()
+    return CredentialResponse(id=credential_id)
+
+@app.get("/api/v1/credentials/{credential_id}")
+async def get_credential(
+    credential_id: str,
+    _: None = Depends(verify_token)
+):
+    if credential_id not in credentials_store:
+        raise HTTPException(404, "Credential not found")
+    return credentials_store[credential_id]
+
+@app.delete("/api/v1/credentials/{credential_id}")
+async def delete_credential(
+    credential_id: str,
+    _: None = Depends(verify_token)
+):
+    if credential_id not in credentials_store:
+        raise HTTPException(404, "Credential not found")
+    del credentials_store[credential_id]
+    return {"status": "deleted"}
+```
+</Accordion>
+
+<Accordion title="Self-hosted configuration (environment variables)">
+For self-hosted Skyvern deployments, set these environment variables instead of using the Settings UI:
+
+```bash
+CREDENTIAL_VAULT_TYPE=custom
+CUSTOM_CREDENTIAL_API_BASE_URL=https://credentials.company.com/api/v1/credentials
+CUSTOM_CREDENTIAL_API_TOKEN=your_api_token_here
+```
+
+Restart Skyvern after setting these variables.
+</Accordion>
+
+### Troubleshooting
+
+| Problem | What to check |
+|---------|--------------|
+| Status stays Inactive | Verify the API base URL is a valid URL and the API token is not empty. The configuration is validated on save but does not make a live request to your server. |
+| Credentials not created | Review your API logs for auth errors. Ensure the response includes an `id` field. Skyvern expects HTTP 200 for all operations. |
+| Credentials not retrieved | Ensure the GET response includes all required fields for the credential type (`username` and `password` for passwords, all card fields for credit cards, `secret_value` for secrets). |
+| Env config not working | Restart Skyvern after setting variables. Verify `CREDENTIAL_VAULT_TYPE=custom` is set and both URL and token are provided. The default vault type is `bitwarden`, so this variable must be explicitly set. |
+
+---
+
+<CardGroup cols={3}>
+  <Card
+    title="Credentials Overview"
+    icon="lock"
+    href="/cloud/managing-credentials/credentials-overview"
+  >
+    Built-in credential storage, security model, and quick start
+  </Card>
+  <Card
+    title="Password Credentials"
+    icon="key"
+    href="/cloud/managing-credentials/password-credentials"
+  >
+    Store login details with optional 2FA
+  </Card>
+  <Card
+    title="Workflow Parameters"
+    icon="sliders"
+    href="/cloud/building-workflows/add-parameters"
+  >
+    Configure credential parameters in the workflow editor
+  </Card>
+</CardGroup>

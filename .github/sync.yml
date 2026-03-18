@@ -35,6 +35,9 @@ Skyvern-AI/skyvern-cloud:
   - source: tests/unit/
     dest: tests/unit/
     deleteOrphaned: true
+  - source: tests/unit_tests/
+    dest: tests/unit_tests/
+    deleteOrphaned: true
   - source: tests/smoke_tests/
     dest: tests/smoke_tests/
     deleteOrphaned: true

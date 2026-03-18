@@ -332,7 +332,7 @@ async def main():
 
     # Run workflow with saved profile, no login needed
     result = await client.run_workflow(
-        workflow_id="wf_daily_metrics",
+        workflow_id="wpid_daily_metrics",
         browser_profile_id="bp_490705123456789012",
         wait_for_completion=True,
     )
@@ -351,7 +351,7 @@ async function main() {
   // Run workflow with saved profile, no login needed
   const result = await client.runWorkflow({
     body: {
-      workflow_id: "wf_daily_metrics",
+      workflow_id: "wpid_daily_metrics",
       browser_profile_id: "bp_490705123456789012",
     },
     waitForCompletion: true,
@@ -368,7 +368,7 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "workflow_id": "wf_daily_metrics",
+    "workflow_id": "wpid_daily_metrics",
     "browser_profile_id": "bp_490705123456789012"
   }'
 ```
@@ -381,7 +381,7 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
   "run_id": "wr_494469342201718946",
   "status": "created",
   "run_request": {
-    "workflow_id": "wf_daily_metrics",
+    "workflow_id": "wpid_daily_metrics",
     "browser_profile_id": "bp_490705123456789012",
     "proxy_location": "RESIDENTIAL"
   }

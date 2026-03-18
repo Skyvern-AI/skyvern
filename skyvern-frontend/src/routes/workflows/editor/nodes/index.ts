@@ -49,6 +49,8 @@ import { HumanInteractionNode } from "./HumanInteractionNode/types";
 import { HumanInteractionNode as HumanInteractionNodeComponent } from "./HumanInteractionNode/HumanInteractionNode";
 import { PrintPageNode } from "./PrintPageNode/types";
 import { PrintPageNode as PrintPageNodeComponent } from "./PrintPageNode/PrintPageNode";
+import { WorkflowTriggerNode } from "./WorkflowTriggerNode/types";
+import { WorkflowTriggerNode as WorkflowTriggerNodeComponent } from "./WorkflowTriggerNode/WorkflowTriggerNode";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -75,7 +77,8 @@ export type WorkflowBlockNode =
   | Taskv2Node
   | URLNode
   | HttpRequestNode
-  | PrintPageNode;
+  | PrintPageNode
+  | WorkflowTriggerNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -113,4 +116,5 @@ export const nodeTypes = {
   url: memo(URLNodeComponent),
   http_request: memo(HttpRequestNodeComponent),
   printPage: memo(PrintPageNodeComponent),
+  workflowTrigger: memo(WorkflowTriggerNodeComponent),
 } as const;

@@ -21,6 +21,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
     InvalidWorkflowDefinition,
+    WorkflowDefinitionHasDuplicateBlockLabels,
     WorkflowDefinitionHasDuplicateParameterKeys,
     WorkflowDefinitionHasReservedParameterKeys,
     WorkflowDefinitionHasUndefinedParameters,
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
     ValidationBlock,
     WaitBlock,
+    WorkflowTriggerBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -97,10 +99,17 @@ def convert_workflow_definition(
     if any(parameter.parameter_type == ParameterType.OUTPUT for parameter in workflow_definition_yaml.parameters):
         raise InvalidWorkflowDefinition(message="Cannot manually create output parameters")
 
+    # Collect all block labels recursively (including nested loop blocks) and check for duplicates
+    all_block_labels = _collect_all_block_labels(workflow_definition_yaml.blocks)
+    label_counts: dict[str, int] = {}
+    for label in all_block_labels:
+        label_counts[label] = label_counts.get(label, 0) + 1
+    duplicate_labels = {label for label, count in label_counts.items() if count > 1}
+    if duplicate_labels:
+        raise WorkflowDefinitionHasDuplicateBlockLabels(duplicate_labels)
+
     # Check if any parameter keys collide with automatically created output parameter keys
-    block_labels = [block.label for block in workflow_definition_yaml.blocks]
-    # TODO (kerem): Check if block labels are unique
-    output_parameter_keys = [f"{block_label}_output" for block_label in block_labels]
+    output_parameter_keys = [f"{label}_output" for label in all_block_labels]
     parameter_keys = [parameter.key for parameter in workflow_definition_yaml.parameters]
     if any(key in output_parameter_keys for key in parameter_keys):
         raise WorkflowDefinitionHasReservedParameterKeys(
@@ -324,6 +333,16 @@ def convert_workflow_definition(
     return workflow_definition
 
 
+def _collect_all_block_labels(block_yamls: list[BLOCK_YAML_TYPES]) -> list[str]:
+    """Recursively collect all block labels including those inside for-loop blocks."""
+    labels = []
+    for block_yaml in block_yamls:
+        labels.append(block_yaml.label)
+        if isinstance(block_yaml, ForLoopBlockYAML) and block_yaml.loop_blocks:
+            labels.extend(_collect_all_block_labels(block_yaml.loop_blocks))
+    return labels
+
+
 def _create_all_output_parameters_for_workflow(
     workflow_id: str, block_yamls: list[BLOCK_YAML_TYPES]
 ) -> dict[str, OutputParameter]:
@@ -418,6 +437,7 @@ def block_yaml_to_block(
             loop_variable_reference=block_yaml.loop_variable_reference,
             loop_blocks=loop_blocks,
             complete_if_empty=block_yaml.complete_if_empty,
+            data_schema=block_yaml.data_schema,
         )
     elif block_yaml.block_type == BlockType.CONDITIONAL:
         branch_conditions = []
@@ -702,6 +722,18 @@ def block_yaml_to_block(
             landscape=block_yaml.landscape,
             print_background=block_yaml.print_background,
             parameters=print_page_block_parameters,
+        )
+
+    elif block_yaml.block_type == BlockType.WORKFLOW_TRIGGER:
+        workflow_trigger_block_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return WorkflowTriggerBlock(
+            **base_kwargs,
+            workflow_permanent_id=block_yaml.workflow_permanent_id,
+            payload=block_yaml.payload,
+            wait_for_completion=block_yaml.wait_for_completion,
+            browser_session_id=block_yaml.browser_session_id,
+            use_parent_browser_session=block_yaml.use_parent_browser_session,
+            parameters=workflow_trigger_block_parameters,
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")

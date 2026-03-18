@@ -17,6 +17,7 @@ type Props = {
   onChange: (selected: string) => void;
   placeholder?: string;
   className?: string;
+  disabled?: boolean;
 };
 
 function DropdownWithOptions({
@@ -25,6 +26,7 @@ function DropdownWithOptions({
   onChange,
   placeholder,
   className,
+  disabled,
 }: Props) {
   return (
     <Select
@@ -32,6 +34,7 @@ function DropdownWithOptions({
       onValueChange={(value) => {
         onChange(value);
       }}
+      disabled={disabled}
     >
       <SelectTrigger className={className}>
         <SelectValue placeholder={placeholder} />

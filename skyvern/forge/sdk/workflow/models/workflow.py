@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, field_validator
 from typing_extensions import deprecated
 
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -12,7 +12,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NonTerminalFinallyBlock,
     WorkflowDefinitionHasDuplicateBlockLabels,
 )
-from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
 from skyvern.schemas.workflows import WorkflowStatus
@@ -41,12 +41,6 @@ class WorkflowRequestBody(BaseModel):
             return url
         return validate_url(url)
 
-    @model_validator(mode="after")
-    def validate_browser_reference(cls, values: "WorkflowRequestBody") -> "WorkflowRequestBody":
-        if values.browser_session_id and values.browser_profile_id:
-            raise ValueError("Cannot specify both browser_session_id and browser_profile_id")
-        return values
-
 
 @deprecated("Use WorkflowRunResponse instead")
 class RunWorkflowResponse(BaseModel):
@@ -61,20 +55,28 @@ class WorkflowDefinition(BaseModel):
     finally_block_label: str | None = None
 
     def validate(self) -> None:
-        labels: set[str] = set()
+        all_labels: set[str] = set()
         duplicate_labels: set[str] = set()
-        for block in self.blocks:
-            if block.label in labels:
-                duplicate_labels.add(block.label)
-            else:
-                labels.add(block.label)
+
+        def _collect_labels(blocks: list[BlockTypeVar]) -> None:
+            for block in blocks:
+                if block.label in all_labels:
+                    duplicate_labels.add(block.label)
+                else:
+                    all_labels.add(block.label)
+                if isinstance(block, ForLoopBlock) and block.loop_blocks:
+                    _collect_labels(block.loop_blocks)
+
+        _collect_labels(self.blocks)
 
         if duplicate_labels:
             raise WorkflowDefinitionHasDuplicateBlockLabels(duplicate_labels)
 
         if self.finally_block_label:
-            if self.finally_block_label not in labels:
-                raise InvalidFinallyBlockLabel(self.finally_block_label, list(labels))
+            # finally_block_label must reference a top-level block
+            top_level_labels = {block.label for block in self.blocks}
+            if self.finally_block_label not in top_level_labels:
+                raise InvalidFinallyBlockLabel(self.finally_block_label, list(top_level_labels))
             for block in self.blocks:
                 if block.label == self.finally_block_label and block.next_block_label is not None:
                     raise NonTerminalFinallyBlock(self.finally_block_label)
@@ -100,8 +102,10 @@ class Workflow(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     run_with: str | None = None
-    ai_fallback: bool = False
+    ai_fallback: bool = True
     cache_key: str | None = None
+    adaptive_caching: bool = False
+    generate_script_on_terminal: bool = False
     run_sequentially: bool | None = None
     sequential_key: str | None = None
     folder_id: str | None = None
@@ -112,7 +116,7 @@ class Workflow(BaseModel):
     deleted_at: datetime | None = None
 
     def get_output_parameter(self, label: str) -> OutputParameter | None:
-        for block in self.workflow_definition.blocks:
+        for block in get_all_blocks(self.workflow_definition.blocks):
             if block.label == label:
                 return block.output_parameter
         return None
@@ -172,16 +176,21 @@ class WorkflowRun(BaseModel):
     sequential_key: str | None = None
     ai_fallback: bool | None = None
     code_gen: bool | None = None
-    # 2FA verification code waiting state fields
-    waiting_for_verification_code: bool = False
-    verification_code_identifier: str | None = None
-    verification_code_polling_started_at: datetime | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
+
+
+def is_adaptive_caching(workflow: Workflow, workflow_run: WorkflowRun) -> bool:
+    """Compute effective adaptive caching mode from run-level override or workflow setting."""
+    if workflow_run.run_with == "code_v2":
+        return True
+    if workflow_run.run_with in ("code", "agent"):
+        return False
+    return workflow.adaptive_caching
 
 
 class WorkflowRunParameter(BaseModel):
@@ -228,12 +237,9 @@ class WorkflowRunResponseBase(BaseModel):
     browser_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
+    run_with: str | None = None
     script_run: ScriptRunResponse | None = None
     errors: list[dict[str, Any]] | None = None
-    # 2FA verification code waiting state fields
-    waiting_for_verification_code: bool = False
-    verification_code_identifier: str | None = None
-    verification_code_polling_started_at: datetime | None = None
 
 
 class WorkflowRunWithWorkflowResponse(WorkflowRunResponseBase):

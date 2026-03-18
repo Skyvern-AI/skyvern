@@ -27,7 +27,7 @@ def _session_api_key_hash() -> str | None:
     return hash_api_key_for_cache(api_key)
 
 
-async def skyvern_session_create(
+async def skyvern_browser_session_create(
     timeout: Annotated[int | None, Field(description="Session timeout in minutes (5-1440)")] = 60,
     proxy_location: Annotated[str | None, Field(description="Proxy location: RESIDENTIAL, US, etc.")] = None,
     local: Annotated[bool, Field(description="Launch local browser instead of cloud")] = False,
@@ -42,7 +42,7 @@ async def skyvern_session_create(
         try:
             if is_stateless_http_mode() and local:
                 return make_result(
-                    "skyvern_session_create",
+                    "skyvern_browser_session_create",
                     ok=False,
                     error=make_error(
                         ErrorCode.INVALID_INPUT,
@@ -58,7 +58,7 @@ async def skyvern_session_create(
                 timer.mark("sdk")
                 ctx = BrowserContext(mode="cloud_session", session_id=session.browser_session_id)
                 return make_result(
-                    "skyvern_session_create",
+                    "skyvern_browser_session_create",
                     browser_context=ctx,
                     data={
                         "session_id": session.browser_session_id,
@@ -84,7 +84,7 @@ async def skyvern_session_create(
 
         except ValueError as e:
             return make_result(
-                "skyvern_session_create",
+                "skyvern_browser_session_create",
                 ok=False,
                 timing_ms=timer.timing_ms,
                 error=make_error(
@@ -95,7 +95,7 @@ async def skyvern_session_create(
             )
         except Exception as e:
             return make_result(
-                "skyvern_session_create",
+                "skyvern_browser_session_create",
                 ok=False,
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Failed to create browser session"),
@@ -103,14 +103,14 @@ async def skyvern_session_create(
 
     if result.local:
         return make_result(
-            "skyvern_session_create",
+            "skyvern_browser_session_create",
             browser_context=ctx,
             data={"local": True, "headless": result.headless},
             timing_ms=timer.timing_ms,
         )
 
     return make_result(
-        "skyvern_session_create",
+        "skyvern_browser_session_create",
         browser_context=ctx,
         data={
             "session_id": result.session_id,
@@ -120,7 +120,7 @@ async def skyvern_session_create(
     )
 
 
-async def skyvern_session_close(
+async def skyvern_browser_session_close(
     session_id: Annotated[str | None, Field(description="Session ID to close (uses current if not specified)")] = None,
 ) -> dict[str, Any]:
     """Close a browser session when you're done. Frees cloud resources.
@@ -168,14 +168,14 @@ async def skyvern_session_close(
 
                 timer.mark("sdk")
                 return make_result(
-                    "skyvern_session_close",
+                    "skyvern_browser_session_close",
                     data={"session_id": result.session_id, "closed": result.closed},
                     timing_ms=timer.timing_ms,
                 )
 
             if current.browser is None:
                 return make_result(
-                    "skyvern_session_close",
+                    "skyvern_browser_session_close",
                     ok=False,
                     error=make_error(
                         ErrorCode.NO_ACTIVE_BROWSER,
@@ -191,20 +191,20 @@ async def skyvern_session_close(
 
         except Exception as e:
             return make_result(
-                "skyvern_session_close",
+                "skyvern_browser_session_close",
                 ok=False,
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Failed to close session"),
             )
 
     return make_result(
-        "skyvern_session_close",
+        "skyvern_browser_session_close",
         data={"session_id": closed_id, "closed": True},
         timing_ms=timer.timing_ms,
     )
 
 
-async def skyvern_session_list() -> dict[str, Any]:
+async def skyvern_browser_session_list() -> dict[str, Any]:
     """List all active browser sessions. Use to find available sessions to connect to."""
     with Timer() as timer:
         try:
@@ -226,7 +226,7 @@ async def skyvern_session_list() -> dict[str, Any]:
 
         except ValueError as e:
             return make_result(
-                "skyvern_session_list",
+                "skyvern_browser_session_list",
                 ok=False,
                 timing_ms=timer.timing_ms,
                 error=make_error(
@@ -237,7 +237,7 @@ async def skyvern_session_list() -> dict[str, Any]:
             )
         except Exception as e:
             return make_result(
-                "skyvern_session_list",
+                "skyvern_browser_session_list",
                 ok=False,
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Failed to list sessions"),
@@ -247,7 +247,7 @@ async def skyvern_session_list() -> dict[str, Any]:
     current_id = current.context.session_id if current.context else None
 
     return make_result(
-        "skyvern_session_list",
+        "skyvern_browser_session_list",
         data={
             "sessions": session_data,
             "count": len(session_data),
@@ -257,7 +257,7 @@ async def skyvern_session_list() -> dict[str, Any]:
     )
 
 
-async def skyvern_session_get(
+async def skyvern_browser_session_get(
     session_id: Annotated[str, "Browser session ID to get details for"],
 ) -> dict[str, Any]:
     """Get details about a specific browser session -- status, timeout, availability."""
@@ -268,7 +268,7 @@ async def skyvern_session_get(
             timer.mark("sdk")
         except Exception as e:
             return make_result(
-                "skyvern_session_get",
+                "skyvern_browser_session_get",
                 ok=False,
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.BROWSER_NOT_FOUND, str(e), "Check the session ID is correct"),
@@ -278,7 +278,7 @@ async def skyvern_session_get(
     is_current = current.context and current.context.session_id == session_id
 
     return make_result(
-        "skyvern_session_get",
+        "skyvern_browser_session_get",
         browser_context=BrowserContext(mode="cloud_session", session_id=session_id) if is_current else None,
         data={
             "session_id": session.browser_session_id,
@@ -293,7 +293,7 @@ async def skyvern_session_get(
     )
 
 
-async def skyvern_session_connect(
+async def skyvern_browser_session_connect(
     session_id: Annotated[str | None, Field(description="Cloud session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
@@ -303,7 +303,7 @@ async def skyvern_session_connect(
     """
     if not session_id and not cdp_url:
         return make_result(
-            "skyvern_session_connect",
+            "skyvern_browser_session_connect",
             ok=False,
             error=make_error(
                 ErrorCode.INVALID_INPUT,
@@ -318,14 +318,14 @@ async def skyvern_session_connect(
             timer.mark("sdk")
         except Exception as e:
             return make_result(
-                "skyvern_session_connect",
+                "skyvern_browser_session_connect",
                 ok=False,
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.BROWSER_NOT_FOUND, str(e), "Check the session ID or CDP URL is valid"),
             )
 
     return make_result(
-        "skyvern_session_connect",
+        "skyvern_browser_session_connect",
         browser_context=ctx,
         data={"connected": True},
         timing_ms=timer.timing_ms,

@@ -42,7 +42,9 @@ function WorkflowEditor() {
   if (isLoading || isGlobalWorkflowsLoading) {
     return (
       <div className="flex h-screen w-full items-center justify-center">
-        <LogoMinimized />
+        <div className="animate-pulse">
+          <LogoMinimized />
+        </div>
       </div>
     );
   }
@@ -72,7 +74,10 @@ function WorkflowEditor() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
-    runWith: workflow.run_with,
+    runWith:
+      workflow.adaptive_caching && workflow.run_with === "code"
+        ? "code_v2"
+        : workflow.run_with ?? "agent",
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
     runSequentially: workflow.run_sequentially ?? false,

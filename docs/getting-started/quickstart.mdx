@@ -6,7 +6,7 @@ slug: getting-started/quickstart
 Run your first browser automation in 5 minutes. By the end of this guide, you'll scrape the top post from Hacker News using Skyvern's AI agent.
 
 <Note>
-Prefer a visual interface? Try the [Cloud UI](/cloud/overview) instead — no code required.
+Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started/overview) instead — no code required.
 </Note>
 
 ## Step 1: Get your API key
@@ -108,7 +108,7 @@ The response includes a `run_id` you'll use to check status and fetch results.
 Since tasks run asynchronously, you have two options:
 
 1. **Polling** — Periodically check the task status (shown below)
-2. **Webhooks** — Get notified when the task completes ([see webhooks guide](/running-tasks/webhooks-faq))
+2. **Webhooks** — Get notified when the task completes ([see webhooks guide](/going-to-production/webhooks))
 
 The code below polls every 5 seconds until the task reaches a terminal state. Once complete, `run.output` contains the extracted data as a dictionary.
 
@@ -279,6 +279,10 @@ Docker is optional. If you have PostgreSQL installed locally, Skyvern will detec
 ### Set up local Skyvern
 
 ```bash
+# Run this from your app or repo root if you want Claude Code + /qa set up in-place
+skyvern quickstart
+
+# Or use setup-only mode if you do not want to start services yet
 skyvern init
 ```
 
@@ -292,7 +296,15 @@ This interactive wizard will:
 2. Configure your LLM provider
 3. Choose browser mode (headless, headful, or connect to existing Chrome)
 4. Generate local API credentials
-5. Download the Chromium browser
+5. Optionally configure local MCP for Claude Code, Claude Desktop, Cursor, or Windsurf
+6. Download the Chromium browser
+
+If you choose **Claude Code** during the MCP step and you run the wizard inside a project or repo, Skyvern will:
+
+- write a project-local `.mcp.json`
+- pin the MCP command to the active Python interpreter (`/path/to/python -m skyvern run mcp`)
+- install bundled Claude Code skills into `.claude/skills/`, including `/qa`
+- keep the whole path local, so Claude Code can test `localhost` directly without Skyvern Cloud or browser tunneling
 
 This will generate a .env file that stores your local configuration, LLM api keys and your local `BASE_URL` and `SKYVERN_API_KEY`:
 ```.env
@@ -317,6 +329,8 @@ SKYVERN_API_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MTMzODQ2MDksIn
 ```
 
 ### Start the local server
+
+If you used `skyvern quickstart` and chose to start services, Skyvern is already running. If you used `skyvern init`, start the server with:
 
 ```bash
 skyvern run server
@@ -353,6 +367,8 @@ asyncio.run(main())
 
 A browser window will open on your machine (if you chose headful mode). Recordings and logs are saved in the directory where you started the server.
 
+If you also selected Claude Code during setup, start your local frontend dev server and run `/qa http://localhost:3000` in Claude Code to validate the app against your local environment.
+
 <video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
   <source src="https://github.com/naman06dev/skyvern-docs/raw/8706c85d746e2a6870d81b6a95eaa511ad66dbf8/fern/images/skyvern-agent-local.mp4" type="video/mp4" />
 </video>
@@ -365,7 +381,7 @@ A browser window will open on your machine (if you chose headful mode). Recordin
   <Card
     title="Extract Structured Data"
     icon="database"
-    href="/running-tasks/run-tasks"
+    href="/running-automations/extract-structured-data"
   >
     Define a schema to get typed JSON output from your automations
   </Card>
@@ -379,14 +395,14 @@ A browser window will open on your machine (if you chose headful mode). Recordin
   <Card
     title="Build Workflows"
     icon="diagram-project"
-    href="/workflows/manage-workflows"
+    href="/multi-step-automations/build-a-workflow"
   >
     Chain multiple steps together for complex automations
   </Card>
   <Card
     title="Use Webhooks"
     icon="webhook"
-    href="/running-tasks/webhooks-faq"
+    href="/going-to-production/webhooks"
   >
     Get notified when tasks complete instead of polling
   </Card>

@@ -7,6 +7,7 @@ import requests  # type: ignore
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
+from skyvern.analytics import capture_setup_event
 from skyvern.utils import detect_os
 
 from .console import console
@@ -62,8 +63,21 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
             browser_location = default_location
 
         if not os.path.exists(browser_location):
+            capture_setup_event(
+                "chrome-detect",
+                success=False,
+                error_type="chrome_not_found",
+                error_message=f"Chrome not found at {browser_location}",
+                extra_data={"path": browser_location},
+            )
             console.print(
                 f"[yellow]Warning: Chrome not found at {browser_location}. Please verify the location is correct.[/yellow]"
+            )
+        else:
+            capture_setup_event(
+                "chrome-detect",
+                success=True,
+                extra_data={"path": browser_location},
             )
 
         console.print("\n[bold]To use CDP connection, Chrome must be running with remote debugging enabled.[/bold]")
@@ -87,6 +101,11 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
                 if response.status_code == 200:
                     try:
                         browser_info = response.json()
+                        capture_setup_event(
+                            "chrome-debug-connect",
+                            success=True,
+                            extra_data={"url": remote_debugging_url, "browser": browser_info.get("Browser")},
+                        )
                         console.print("✅ [green]Chrome is already running with remote debugging![/green]")
                         if "Browser" in browser_info:
                             console.print(f"  Browser: [bold]{browser_info['Browser']}[/bold]")
@@ -95,12 +114,33 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
                         console.print(f"  Connected to [link]{remote_debugging_url}[/link]")
                         return selected_browser, browser_location, remote_debugging_url
                     except ValueError:
+                        capture_setup_event(
+                            "chrome-debug-connect",
+                            success=False,
+                            error_type="port_not_chrome",
+                            error_message="Port is in use but doesn't appear to be Chrome with remote debugging",
+                            extra_data={"url": remote_debugging_url},
+                        )
                         console.print(
                             "[yellow]Port is in use, but doesn't appear to be Chrome with remote debugging.[/yellow]"
                         )
                 else:
+                    capture_setup_event(
+                        "chrome-debug-connect",
+                        success=False,
+                        error_type="chrome_bad_response",
+                        error_message=f"Chrome responded with status code {response.status_code}",
+                        extra_data={"url": remote_debugging_url, "status_code": response.status_code},
+                    )
                     console.print(f"[yellow]Chrome responded with status code {response.status_code}.[/yellow]")
             except requests.RequestException:
+                capture_setup_event(
+                    "chrome-debug-connect",
+                    success=False,
+                    error_type="chrome_not_running",
+                    error_message=f"No Chrome instance detected on {remote_debugging_url}",
+                    extra_data={"url": remote_debugging_url},
+                )
                 console.print(f"[red]No Chrome instance detected on {remote_debugging_url}[/red]")
         status.stop()
 

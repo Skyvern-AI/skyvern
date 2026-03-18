@@ -82,6 +82,8 @@ navigation:
             path: running-tasks/cancel-runs.mdx
           - page: Webhooks FAQ
             path: running-tasks/webhooks-faq.mdx
+          - page: Connect Your Local Browser
+            path: running-tasks/connect-local-browser.mdx
           - page: Proxy & Geo Targeting
             path: running-tasks/proxy-location.mdx
           - page: Advanced Settings for tasks
@@ -146,8 +148,10 @@ navigation:
             path: observability/overview.mdx
       - section: Integrations
         contents:
-          - page: Skyvern MCP
+          - page: MCP Server
             path: integrations/mcp.mdx
+          - page: CLI & Skills
+            path: integrations/cli.mdx
           - page: Zapier
             path: integrations/zapier.mdx
           - page: Make

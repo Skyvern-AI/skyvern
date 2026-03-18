@@ -6,6 +6,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel, update_forward_refs
+from .for_loop_block_yaml_data_schema import ForLoopBlockYamlDataSchema
 
 
 class ForLoopBlockYaml(UniversalBaseModel):
@@ -26,6 +27,7 @@ class ForLoopBlockYaml(UniversalBaseModel):
     loop_over_parameter_key: typing.Optional[str] = None
     loop_variable_reference: typing.Optional[str] = None
     complete_if_empty: typing.Optional[bool] = None
+    data_schema: typing.Optional[ForLoopBlockYamlDataSchema] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

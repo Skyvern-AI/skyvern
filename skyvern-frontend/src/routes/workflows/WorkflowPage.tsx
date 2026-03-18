@@ -25,6 +25,7 @@ import {
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
+  CodeIcon,
   MixerHorizontalIcon,
   Pencil2Icon,
   PlayIcon,
@@ -138,6 +139,12 @@ function WorkflowPage() {
               onSuccessfullyDeleted={() => navigate("/workflows")}
             />
           )}
+          <Button asChild variant="secondary">
+            <Link to={`/workflows/${workflowPermanentId}/scripts`}>
+              <CodeIcon className="mr-2 size-4" />
+              Scripts
+            </Link>
+          </Button>
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/build`}>
               <Pencil2Icon className="mr-2 size-4" />

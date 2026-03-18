@@ -5,10 +5,8 @@ Provides WS endpoints for streaming messages to/from our frontend application.
 import structlog
 from fastapi import WebSocket
 
-from skyvern.config import settings
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming.auth import _auth as local_auth
-from skyvern.forge.sdk.routes.streaming.auth import auth as real_auth
+from skyvern.forge.sdk.routes.streaming.auth import auth
 from skyvern.forge.sdk.routes.streaming.channels.message import (
     Loops,
     MessageChannel,
@@ -62,7 +60,6 @@ async def messages(
     client_id: str | None = None,
     token: str | None = None,
 ) -> None:
-    auth = local_auth if settings.ENV == "local" else real_auth
     organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
 
     if not organization_id:

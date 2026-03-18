@@ -285,3 +285,26 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         self._browser.workflow_run_id = response.workflow_run_id
 
         return response.result if response.result is not None else None
+
+    async def ai_classify(
+        self,
+        options: dict[str, str],
+        url_patterns: dict[str, str] | None = None,
+        text_patterns: dict[str, str | list[str]] | None = None,
+    ) -> str:
+        """Classify the current page state against named options.
+
+        Not yet supported via the SDK API. Raises NotImplementedError.
+        """
+        raise NotImplementedError("ai_classify is not yet supported via the SDK API")
+
+    async def ai_element_fallback(
+        self,
+        navigation_goal: str,
+        max_steps: int = 10,
+    ) -> None:
+        """Activate the AI agent from the current page position.
+
+        Not yet supported via the SDK API. Raises NotImplementedError.
+        """
+        raise NotImplementedError("ai_element_fallback is not yet supported via the SDK API")

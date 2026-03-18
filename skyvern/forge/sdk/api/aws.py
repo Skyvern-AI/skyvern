@@ -29,7 +29,7 @@ class S3StorageClass(StrEnum):
     ONEZONE_IA = "ONEZONE_IA"
     GLACIER = "GLACIER"
     GLACIER_IR = "GLACIER_IR"  # Glacier Instant Retrieval
-    # DEEP_ARCHIVE = "DEEP_ARCHIVE"
+    DEEP_ARCHIVE = "DEEP_ARCHIVE"
     # OUTPOSTS = "OUTPOSTS"
     # STANDARD_IA = "STANDARD_IA"
 
@@ -522,4 +522,11 @@ def tag_set_to_dict(tag_set: list[dict[str, str]]) -> dict[str, str]:
     return {tag["Key"]: tag["Value"] for tag in tag_set}
 
 
-aws_client = AsyncAWSClient()
+_aws_client: AsyncAWSClient | None = None
+
+
+def get_aws_client() -> AsyncAWSClient:
+    global _aws_client
+    if _aws_client is None:
+        _aws_client = AsyncAWSClient()
+    return _aws_client

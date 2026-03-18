@@ -87,13 +87,6 @@ pip install skyvern
 skyvern quickstart
 ```
 
-If you already have a database you want to use, pass a custom connection string to skip the
-local Docker PostgreSQL setup:
-
-```bash
-skyvern quickstart --database-string "postgresql+psycopg://user:password@localhost:5432/skyvern"
-```
-
 ### Option B: Docker Compose
 
 1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
@@ -269,17 +262,31 @@ BROWSER_TYPE=cdp-connect
 
 Restart Skyvern service `skyvern run all` and run the task through UI or code
 
-### Run Skyvern with any remote browser
-Grab the cdp connection url and pass it to Skyvern
+### Connect Skyvern Cloud to your local browser
+
+Let Skyvern Cloud control a Chrome browser running on your machine — with all your existing cookies, logins, and extensions. Useful for automating sites where you're already logged in or behind a VPN.
+
+```bash
+# One command to start Chrome + create a tunnel to Skyvern Cloud
+skyvern browser serve --tunnel
+```
+
+Then use the tunnel URL in your task:
 
 ```python
 from skyvern import Skyvern
 
-skyvern = Skyvern(cdp_url="your cdp connection url")
+skyvern = Skyvern(api_key="your-api-key")
 task = await skyvern.run_task(
-    prompt="Find the top post on hackernews today",
+    prompt="Download the latest invoice from my account",
+    browser_address="https://abc123.ngrok-free.dev",
 )
 ```
+
+> [!WARNING]
+> Always use `--api-key` when exposing your browser via a tunnel. Without it, anyone with the URL has full control of your browser. See the [security docs](https://www.skyvern.com/docs/optimization/browser-tunneling#security).
+
+See the [full documentation](https://www.skyvern.com/docs/optimization/browser-tunneling) for all options, manual tunnel setup, and troubleshooting.
 
 ### Get consistent output schema from your run
 You can do this by adding the `data_extraction_schema` parameter:
@@ -513,6 +520,7 @@ More extensive documentation can be found on our [📕 docs page](https://www.sk
 | Azure OpenAI | Any GPT models. Better performance with a multimodal llm (azure/gpt4-o) |
 | AWS Bedrock | Claude 3.5, Claude 3.7, Claude 4 (Sonnet, Opus), Claude 4.5 (Sonnet, Opus) |
 | Gemini | Gemini 3 Pro/Flash, Gemini 2.5 Pro/Flash |
+| MiniMax | MiniMax-M2.5, MiniMax-M2.5-highspeed (204K context) |
 | Ollama | Run any locally hosted model via [Ollama](https://github.com/ollama/ollama) |
 | OpenRouter | Access models through [OpenRouter](https://openrouter.ai) |
 | OpenAI-compatible | Any custom API endpoint that follows OpenAI's API format (via [liteLLM](https://docs.litellm.ai/docs/providers/openai_compatible)) |
@@ -562,6 +570,15 @@ Recommended `LLM_KEY`: `BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE`, `BE
 | `GEMINI_API_KEY` | Gemini API Key| String | `your_google_gemini_api_key`|
 
 Recommended `LLM_KEY`: `GEMINI_3.0_FLASH`, `GEMINI_2.5_PRO`, `GEMINI_2.5_FLASH`, `GEMINI_2.5_PRO_PREVIEW`, `GEMINI_2.5_FLASH_PREVIEW`
+
+##### MiniMax
+| Variable | Description| Type | Sample Value|
+| -------- | ------- | ------- | ------- |
+| `ENABLE_MINIMAX`| Register MiniMax models | Boolean | `true`, `false` |
+| `MINIMAX_API_KEY` | MiniMax API key | String | `your-minimax-api-key` |
+| `MINIMAX_API_BASE` | MiniMax API base URL | String | `https://api.minimax.io/v1` |
+
+Recommended `LLM_KEY`: `MINIMAX_M2_5`, `MINIMAX_M2_5_HIGHSPEED`
 
 ##### Ollama
 | Variable | Description| Type | Sample Value|

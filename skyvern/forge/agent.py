@@ -55,7 +55,6 @@ from skyvern.exceptions import (
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
     ScrapingFailed,
-    SkyvernException,
     StepTerminationError,
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
@@ -63,11 +62,12 @@ from skyvern.exceptions import (
     TaskNotFound,
     UnsupportedActionType,
     UnsupportedTaskType,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.aws import aws_client
+from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_downloading_files_in_directory,
@@ -104,7 +104,8 @@ from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
-from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
+from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
@@ -415,6 +416,7 @@ class ForgeAgent:
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
         list_files_before: list[str] = []
+        browser_state: BrowserState | None = None
         try:
             if task.workflow_run_id:
                 list_files_before = list_files_in_directory(
@@ -546,7 +548,7 @@ class ForgeAgent:
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
                     for file in files_to_rename:
                         if file.startswith("s3://"):
-                            file_data = await aws_client.download_file(file, log_exception=False)
+                            file_data = await get_aws_client().download_file(file, log_exception=False)
                             if not file_data:
                                 continue
                             file = file.split("/")[-1]  # Extract filename from the end of S3 URI
@@ -723,7 +725,7 @@ class ForgeAgent:
                 "Step cannot be executed, marking task as failed",
                 exc_info=True,
             )
-            is_task_marked_as_failed = await self.fail_task(task, step, e.message)
+            is_task_marked_as_failed = await self.fail_task(task, step, e.message, browser_state)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -749,7 +751,7 @@ class ForgeAgent:
                 url=e.url,
             )
             failure_reason = f"Failed to navigate to URL. URL:{e.url}, Error:{e.error_message}"
-            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason)
+            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -794,7 +796,7 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
-            await self.fail_task(task, step, e.message)
+            await self.fail_task(task, step, e.message, browser_state)
             await self.clean_up_task(
                 task=task,
                 last_step=step,
@@ -814,7 +816,8 @@ class ForgeAgent:
                 task,
                 step,
                 sfe.reason
-                or "Skyvern failed to load the website. This usually happens when the website is not properly designed, and crashes the browser as a result.",
+                or "Skyvern failed to load the website. The page may have navigated unexpectedly or become unresponsive during analysis.",
+                browser_state,
             )
             await self.clean_up_task(
                 task=task,
@@ -830,6 +833,7 @@ class ForgeAgent:
                 task,
                 step,
                 "The browser does not have a valid page for skyvern to operate. This may be due to the website being empty or the browser crashing.",
+                browser_state,
             )
             await self.clean_up_task(
                 task=task,
@@ -842,11 +846,9 @@ class ForgeAgent:
         except Exception as e:
             LOG.exception("Got an unexpected exception in step, marking task as failed")
 
-            failure_reason = f"Unexpected error: {str(e)}"
-            if isinstance(e, SkyvernException):
-                failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+            failure_reason = get_user_facing_exception_message(e)
 
-            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason)
+            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state)
             if is_task_marked_as_failed:
                 await self.clean_up_task(
                     task=task,
@@ -864,7 +866,9 @@ class ForgeAgent:
             context.step_id = None
             context.task_id = None
 
-    async def fail_task(self, task: Task, step: Step | None, reason: str | None) -> bool:
+    async def fail_task(
+        self, task: Task, step: Step | None, reason: str | None, browser_state: BrowserState | None = None
+    ) -> bool:
         try:
             if step is not None:
                 await self.update_step(
@@ -872,11 +876,50 @@ class ForgeAgent:
                     status=StepStatus.failed,
                 )
 
+            # Update task status first
             await self.update_task(
                 task,
                 status=TaskStatus.failed,
                 failure_reason=reason,
             )
+
+            # Detect user-defined errors if error_code_mapping is provided
+            if task.error_code_mapping and step is not None:
+                LOG.info(
+                    "Task has error_code_mapping, attempting to detect user-defined errors",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    error_code_mapping=task.error_code_mapping,
+                )
+
+                try:
+                    detected_errors = await detect_user_defined_errors_for_task(
+                        task=task,
+                        step=step,
+                        browser_state=browser_state,
+                        failure_reason=reason,
+                    )
+
+                    # Update task errors if any were detected
+                    # Only pass new errors — update_task() appends to existing errors
+                    if detected_errors:
+                        new_errors = [error.model_dump() for error in detected_errors]
+                        await app.DATABASE.update_task(
+                            task_id=task.task_id,
+                            organization_id=task.organization_id,
+                            errors=new_errors,
+                        )
+                        LOG.info(
+                            "Updated task with detected user-defined errors",
+                            task_id=task.task_id,
+                            error_codes=[e.error_code for e in detected_errors],
+                        )
+                except Exception:
+                    LOG.exception(
+                        "Failed to detect or store user-defined errors during task failure",
+                        task_id=task.task_id,
+                    )
+
             return True
         except TaskAlreadyCanceled:
             LOG.info(
@@ -1037,26 +1080,31 @@ class ForgeAgent:
                     if json_response is None:
                         raise MissingExtractActionsResponse()
                     try:
-                        if pdf_embed_src := scraped_page.check_pdf_viewer_embed():
+                        # Check for PDF viewer: either <embed type="application/pdf"> or
+                        # Edge's PDF interstitial <iframe src="data:application/pdf;base64,...">
+                        pdf_src = scraped_page.check_pdf_viewer_embed()
+                        if not pdf_src:
+                            pdf_src = await scraped_page.check_pdf_iframe()
+                        if pdf_src:
                             LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
                             pdf_bytes: bytes | None = None
                             download_url: str | None = None
 
-                            # Check if the embed src is a data URI with base64 encoded PDF
+                            # Check if the src is a data URI with base64 encoded PDF
                             # Format: data:application/pdf[;charset=...];base64,<base64_data>
-                            if pdf_embed_src.startswith("data:application/pdf"):
+                            if pdf_src.startswith("data:application/pdf"):
                                 # Use more precise regex to extract base64 data after the base64, prefix
                                 # This pattern matches: data:application/pdf[;optional_params];base64,<data>
-                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_embed_src, re.S)
+                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_src, re.S)
                                 if not m:
                                     raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_embed_src,
+                                        pdf_embed_src=pdf_src,
                                         reason="Failed to extract base64 data from PDF embed src. Expected format: data:application/pdf[;charset=...];base64,<data>",
                                     )
 
                                 base64_data = m.group(1)
                                 LOG.info(
-                                    "Found base64 data in PDF embed src",
+                                    "Found base64 data in PDF src",
                                     step_id=step.step_id,
                                     base64_data_length=len(base64_data),
                                 )
@@ -1066,17 +1114,17 @@ class ForgeAgent:
                                     pdf_bytes = base64.b64decode(base64_data, validate=True)
                                 except Exception as e:
                                     raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_embed_src,
+                                        pdf_embed_src=pdf_src,
                                         reason=f"Failed to decode base64 data: {str(e)}",
                                     ) from e
                             else:
                                 # If not a data URI, treat it as a URL
                                 LOG.info(
-                                    "Found PDF embed src as URL (not base64 data)",
+                                    "Found PDF src as URL (not base64 data)",
                                     step_id=step.step_id,
-                                    download_url=pdf_embed_src,
+                                    download_url=pdf_src,
                                 )
-                                download_url = pdf_embed_src
+                                download_url = pdf_src
 
                             actions = [
                                 DownloadFileAction(
@@ -2544,7 +2592,7 @@ class ForgeAgent:
                 step,
                 browser_state,
                 scraped_page,
-                verification_code_check=True,
+                verification_code_check=bool(task.totp_verification_url or task.totp_identifier),
                 expire_verification_code=True,
             )
 
@@ -4026,7 +4074,7 @@ class ForgeAgent:
             if browser_state is not None:
                 page = await browser_state.get_working_page()
 
-            failure_reason = await self.summary_failure_reason_for_max_retries(
+            failure_response = await self.summary_failure_reason_for_max_retries(
                 organization=organization,
                 task=task,
                 step=step,
@@ -4034,13 +4082,23 @@ class ForgeAgent:
                 max_retries=max_retries_per_step,
             )
 
+            # Only pass new errors — update_task() appends to existing errors in the DB
+            new_errors: list[dict[str, Any]] = [ReachMaxRetriesError().model_dump()]
+            if failure_response.errors:
+                new_errors.extend([error.model_dump() for error in failure_response.errors])
+                LOG.info(
+                    "Detected user-defined errors for max retries failure",
+                    task_id=task.task_id,
+                    error_codes=[e.error_code for e in failure_response.errors],
+                )
+
             await self.update_task(
                 task,
                 TaskStatus.failed,
                 failure_reason=(
-                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_reason}"
+                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_response.reasoning}"
                 ),
-                errors=[ReachMaxRetriesError().model_dump()],
+                errors=new_errors,
             )
             return None
         else:
@@ -4178,7 +4236,7 @@ class ForgeAgent:
         step: Step,
         page: Page | None,
         max_retries: int,
-    ) -> str:
+    ) -> MaxStepsReasonResponse:
         html = ""
         screenshots: list[bytes] = []
         steps_results = []
@@ -4229,18 +4287,26 @@ class ForgeAgent:
             # If we detected LLM errors, return a clear message without calling the LLM
             if llm_errors:
                 llm_error_details = "; ".join(llm_errors)
-                return (
-                    f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
-                    f"This is typically caused by rate limiting, service outages, or resource exhaustion from the LLM provider. "
-                    f"Error details: {llm_error_details}"
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                        f"This is typically caused by rate limiting, service outages, or resource exhaustion from the LLM provider. "
+                        f"Error details: {llm_error_details}"
+                    ),
+                    errors=[],
                 )
 
             # If multiple steps failed without producing any actions, it's likely an LLM error during action extraction
             if steps_without_actions >= max_retries:
-                return (
-                    f"The task failed because all {max_retries} retry attempts failed to generate actions. "
-                    f"This is typically caused by LLM service errors during action extraction, such as rate limiting, "
-                    f"service outages, or resource exhaustion from the LLM provider. Please check the LLM service status and try again."
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed because all {max_retries} retry attempts failed to generate actions. "
+                        f"This is typically caused by LLM service errors during action extraction, such as rate limiting, "
+                        f"service outages, or resource exhaustion from the LLM provider. Please check the LLM service status and try again."
+                    ),
+                    errors=[],
                 )
 
             if page is not None:
@@ -4255,6 +4321,7 @@ class ForgeAgent:
                 steps=steps_results,
                 page_html=html,
                 max_retries=max_retries,
+                error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await app.SECONDARY_LLM_API_HANDLER(
@@ -4263,26 +4330,42 @@ class ForgeAgent:
                 step=step,
                 prompt_name="summarize-max-retries-reason",
             )
-            return json_response.get("reasoning", "")
+            return MaxStepsReasonResponse.model_validate(json_response)
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")
             # Check if we have LLM errors even if the summarization failed
             if llm_errors:
                 llm_error_details = "; ".join(llm_errors)
-                return (
-                    f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
-                    f"Error details: {llm_error_details}"
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                        f"Error details: {llm_error_details}"
+                    ),
+                    errors=[],
                 )
             # If multiple steps failed without actions during summarization failure, still report it
             if steps_without_actions >= max_retries:
-                return (
-                    f"The task failed because all {max_retries} retry attempts failed to generate actions. "
-                    f"This is typically caused by LLM service errors during action extraction."
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed because all {max_retries} retry attempts failed to generate actions. "
+                        f"This is typically caused by LLM service errors during action extraction."
+                    ),
+                    errors=[],
                 )
             if steps_results:
                 last_step_result = steps_results[-1]
-                return f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}"
-            return ""
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}",
+                    errors=[],
+                )
+            return MaxStepsReasonResponse(
+                page_info="",
+                reasoning="",
+                errors=[],
+            )
 
     async def handle_completed_step(
         self,
@@ -4444,6 +4527,9 @@ class ForgeAgent:
         if not task.organization_id:
             return json_response, []
 
+        if not task.totp_verification_url and not task.totp_identifier:
+            return json_response, []
+
         should_verify_by_magic_link = json_response.get("should_verify_by_magic_link")
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
@@ -4464,10 +4550,8 @@ class ForgeAgent:
             return json_response, actions
 
         if should_verify_by_magic_link:
-            # Magic links still require TOTP config (need a source to poll the link from)
-            if task.totp_verification_url or task.totp_identifier:
-                actions = await self.handle_potential_magic_link(task, step, scraped_page, browser_state, json_response)
-                return json_response, actions
+            actions = await self.handle_potential_magic_link(task, step, scraped_page, browser_state, json_response)
+            return json_response, actions
 
         return json_response, []
 
@@ -4524,27 +4608,28 @@ class ForgeAgent:
     ) -> dict[str, Any]:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
-        if place_to_enter_verification_code and should_enter_verification_code and task.organization_id:
+        if (
+            place_to_enter_verification_code
+            and should_enter_verification_code
+            and (task.totp_verification_url or task.totp_identifier)
+            and task.organization_id
+        ):
             LOG.info("Need verification code")
-            # Try credential TOTP first (highest priority, doesn't need totp_url/totp_identifier)
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-            # Fall back to webhook/totp_identifier
-            if not otp_value:
-                workflow_id = workflow_permanent_id = None
-                if task.workflow_run_id:
-                    workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
-                    if workflow_run:
-                        workflow_id = workflow_run.workflow_id
-                        workflow_permanent_id = workflow_run.workflow_permanent_id
-                otp_value = await poll_otp_value(
-                    organization_id=task.organization_id,
-                    task_id=task.task_id,
-                    workflow_id=workflow_id,
-                    workflow_run_id=task.workflow_run_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                    totp_verification_url=task.totp_verification_url,
-                    totp_identifier=task.totp_identifier,
-                )
+            workflow_id = workflow_permanent_id = None
+            if task.workflow_run_id:
+                workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
+                if workflow_run:
+                    workflow_id = workflow_run.workflow_id
+                    workflow_permanent_id = workflow_run.workflow_permanent_id
+            otp_value = await poll_otp_value(
+                organization_id=task.organization_id,
+                task_id=task.task_id,
+                workflow_id=workflow_id,
+                workflow_run_id=task.workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                totp_verification_url=task.totp_verification_url,
+                totp_identifier=task.totp_identifier,
+            )
             if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
                 return json_response
 

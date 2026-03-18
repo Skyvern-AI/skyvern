@@ -173,6 +173,9 @@ async def download_file(
     output_dir: str | None = None,
     filename: str | None = None,
 ) -> str:
+    if not url or not url.strip():
+        raise ValueError("Download URL is empty — no file download was triggered by the browser")
+
     try:
         # Check if URL is a Google Drive link
         if "drive.google.com" in url:

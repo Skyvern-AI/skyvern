@@ -71,6 +71,8 @@ class ForgeApp:
     AUTO_COMPLETION_LLM_API_HANDLER: LLMAPIHandler
     SVG_CSS_CONVERTER_LLM_API_HANDLER: LLMAPIHandler | None
     SCRIPT_GENERATION_LLM_API_HANDLER: LLMAPIHandler
+    SCRIPT_REVIEWER_LLM_API_HANDLER: LLMAPIHandler
+    ADAPTIVE_SCRIPT_GEN_LLM_API_HANDLER: LLMAPIHandler
     WORKFLOW_CONTEXT_MANAGER: WorkflowContextManager
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
@@ -111,16 +113,6 @@ def create_forge_app() -> ForgeApp:
     app.STORAGE = StorageFactory.get_storage()
     app.CACHE = CacheFactory.get_cache()
 
-    if settings.NOTIFICATION_REGISTRY_TYPE == "redis" and settings.NOTIFICATION_REDIS_URL:
-        from redis.asyncio import from_url as redis_from_url
-
-        from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
-        from skyvern.forge.sdk.notification.redis import RedisNotificationRegistry
-        from skyvern.forge.sdk.redis.factory import RedisClientFactory
-
-        redis_client = redis_from_url(settings.NOTIFICATION_REDIS_URL, decode_responses=True)
-        RedisClientFactory.set_client(redis_client)
-        NotificationRegistryFactory.set_registry(RedisNotificationRegistry(redis_client))
     app.ARTIFACT_MANAGER = ArtifactManager()
     app.BROWSER_MANAGER = RealBrowserManager()
     app.EXPERIMENTATION_PROVIDER = NoOpExperimentationProvider()
@@ -199,11 +191,22 @@ def create_forge_app() -> ForgeApp:
         if settings.SCRIPT_GENERATION_LLM_KEY
         else app.SECONDARY_LLM_API_HANDLER
     )
+    app.SCRIPT_REVIEWER_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.SCRIPT_REVIEWER_LLM_KEY)
+        if settings.SCRIPT_REVIEWER_LLM_KEY
+        else app.LLM_API_HANDLER
+    )
+    app.ADAPTIVE_SCRIPT_GEN_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY)
+        if settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY
+        else app.LLM_API_HANDLER
+    )
 
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
     app.WORKFLOW_SERVICE = WorkflowService()
     app.AGENT_FUNCTION = AgentFunction()
     app.PERSISTENT_SESSIONS_MANAGER = DefaultPersistentSessionsManager(database=app.DATABASE)
+    app.PERSISTENT_SESSIONS_MANAGER.watch_session_pool()
     app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
@@ -254,7 +257,13 @@ def create_forge_app() -> ForgeApp:
     app.authenticate_user_function = None
     app.setup_api_app = None
     app.api_app_startup_event = None
-    app.api_app_shutdown_event = None
+
+    async def default_api_app_shutdown_event() -> None:
+        from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
+
+        await DefaultPersistentSessionsManager.close()
+
+    app.api_app_shutdown_event = default_api_app_shutdown_event
 
     app.agent = ForgeAgent()
 

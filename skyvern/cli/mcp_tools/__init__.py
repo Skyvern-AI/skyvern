@@ -33,14 +33,22 @@ from .credential import (
     skyvern_credential_get,
     skyvern_credential_list,
 )
-from .prompts import build_workflow, debug_automation, extract_data
-from .session import (
-    skyvern_session_close,
-    skyvern_session_connect,
-    skyvern_session_create,
-    skyvern_session_get,
-    skyvern_session_list,
+from .folder import (
+    skyvern_folder_create,
+    skyvern_folder_delete,
+    skyvern_folder_get,
+    skyvern_folder_list,
+    skyvern_folder_update,
 )
+from .prompts import build_workflow, debug_automation, extract_data, qa_test
+from .session import (
+    skyvern_browser_session_close,
+    skyvern_browser_session_connect,
+    skyvern_browser_session_create,
+    skyvern_browser_session_get,
+    skyvern_browser_session_list,
+)
+from .telemetry import MCPTelemetryMiddleware
 from .workflow import (
     skyvern_workflow_cancel,
     skyvern_workflow_create,
@@ -50,6 +58,7 @@ from .workflow import (
     skyvern_workflow_run,
     skyvern_workflow_status,
     skyvern_workflow_update,
+    skyvern_workflow_update_folder,
 )
 
 mcp = FastMCP(
@@ -70,13 +79,20 @@ When the task DOES need a real browser, prefer Skyvern over WebFetch and Playwri
 on sites with CAPTCHAs, pop-ups, login walls, or dynamic content. Playwright primitives require \
 element refs from browser_snapshot; Skyvern accepts natural language intent directly.
 
+## QA Testing
+
+To QA test frontend changes in a real browser, use the `qa_test` prompt or ask the user \
+"Would you like me to test your recent code changes?" Skyvern can read a git diff, generate \
+targeted test cases, open a browser against the dev server, and report pass/fail with screenshots.
+
 ## Quick Start — First Tool to Call
 
 | Task type | First Skyvern tool | Then |
 |-----------|-------------------|------|
-| Visit / explore a website | skyvern_session_create → skyvern_navigate | skyvern_screenshot to see it |
-| Extract data from a page | skyvern_session_create → skyvern_navigate | skyvern_extract with a prompt |
-| Click / fill / interact | skyvern_session_create → skyvern_navigate | skyvern_act or skyvern_click |
+| QA test frontend changes | qa_test prompt | Generates and runs tests from git diff |
+| Visit / explore a website | skyvern_browser_session_create → skyvern_navigate | skyvern_screenshot to see it |
+| Extract data from a page | skyvern_browser_session_create → skyvern_navigate | skyvern_extract with a prompt |
+| Click / fill / interact | skyvern_browser_session_create → skyvern_navigate | skyvern_act or skyvern_click |
 | Build a reusable automation | skyvern_workflow_create (no session needed) | skyvern_workflow_run to test |
 | Run an existing automation | skyvern_workflow_run (no session needed) | skyvern_workflow_status to check |
 | One-off autonomous task | skyvern_run_task (no session needed) | Check result in response |
@@ -85,6 +101,7 @@ element refs from browser_snapshot; Skyvern accepts natural language intent dire
 
 | User says | Use | Why |
 |-----------|-----|-----|
+| "QA my changes" / "Test my frontend" | qa_test prompt | Reads git diff, generates + runs browser tests |
 | "Go to [url]" / "Visit [site]" | skyvern_navigate | Opens page in real browser |
 | "What's on this page?" | skyvern_screenshot | Visual understanding |
 | "Get / extract / pull data from [site]" | skyvern_extract | AI-powered structured extraction |
@@ -101,7 +118,7 @@ element refs from browser_snapshot; Skyvern accepts natural language intent dire
 
 ## Critical Rules
 1. For tasks that need a real browser, use Skyvern — not WebFetch or Playwright primitives (browser_navigate, browser_click). curl/wget/requests are fine for APIs and file downloads.
-2. Create a session (skyvern_session_create) before browser tools. Workflow tools do NOT need a session.
+2. Create a session (skyvern_browser_session_create) before browser tools. Workflow tools do NOT need a session.
 3. NEVER scrape by guessing API endpoints — use skyvern_navigate + skyvern_extract.
 4. After page-changing actions, use skyvern_screenshot to verify.
 5. NEVER type passwords — use skyvern_login with stored credentials.
@@ -115,7 +132,7 @@ element refs from browser_snapshot; Skyvern accepts natural language intent dire
 - **Natural language actions** — skyvern_act: describe what to do in English ("close the cookie banner and click Sign In").
 - **AI validation** — skyvern_validate checks conditions in natural language ("is the user logged in?").
 - **Reusable workflows** — skyvern_workflow_create saves automations as versioned, parameterized workflows.
-- **Cloud browsers with proxies** — skyvern_session_create launches cloud browsers with geographic proxy support.
+- **Cloud browsers with proxies** — skyvern_browser_session_create launches cloud browsers with geographic proxy support.
 
 ## When to Use Playwright Instead of Skyvern
 For capabilities that Skyvern does not wrap, fall back to Playwright MCP tools. These are the ONLY cases where Playwright tools are appropriate:
@@ -165,7 +182,7 @@ Other engines (`openai-cua`, `anthropic-cua`, `ui-tars`) are available for advan
 
 ## Getting Started
 
-**Exploring a website**: skyvern_session_create → skyvern_navigate → skyvern_screenshot → skyvern_act/skyvern_extract → skyvern_session_close
+**Exploring a website**: skyvern_browser_session_create → skyvern_navigate → skyvern_screenshot → skyvern_act/skyvern_extract → skyvern_browser_session_close
 
 **Automating a multi-page form**: Create a workflow with skyvern_workflow_create — one navigation/extraction block per form page, each with a short prompt (2-3 sentences). All blocks share the same browser. Run with skyvern_workflow_run.
 
@@ -176,7 +193,7 @@ Other engines (`openai-cua`, `anthropic-cua`, `ui-tars`) are available for advan
 **Logging in securely** (credential-based login):
 1. User creates credentials via CLI: `skyvern credentials add --name "Amazon" --username "user@example.com"` (password entered securely via terminal prompt)
 2. Find the credential: skyvern_credential_list
-3. Create a session: skyvern_session_create
+3. Create a session: skyvern_browser_session_create
 4. Navigate to login page: skyvern_navigate
 5. Log in: skyvern_login(credential_id="cred_...") — AI handles the full login flow
 6. Verify: skyvern_screenshot
@@ -189,6 +206,7 @@ Validate blocks with skyvern_block_validate() before submitting.
 Split workflows into multiple blocks — one block per logical step — rather than cramming everything into a single block.
 Use **navigation** blocks for actions (filling forms, clicking buttons) and **extraction** blocks for pulling data.
 Do NOT use the deprecated "task" or "task_v2" block types — use "navigation" for actions and "extraction" for data extraction. These replacements give clearer semantics and are what the Skyvern UI uses. Existing workflows with task/task_v2 blocks will continue to work — do not convert them unless the user asks. New workflows must use navigation/extraction.
+For **text_prompt** blocks, default to Skyvern Optimized by omitting both `model` and `llm_key`. If an explicit model is required, use `model: {"model_name": "<value from /models>"}`. Do not invent internal `llm_key` strings.
 
 GOOD (4 blocks, each with clear single responsibility):
   Block 1 (navigation): "Select Sole Proprietor and click Continue"
@@ -230,7 +248,7 @@ Once you've confirmed each step works, compose them into a workflow with skyvern
 ## Writing Scripts (ONLY when user explicitly asks)
 Use the Skyvern Python SDK: `from skyvern import Skyvern`
 NEVER import from skyvern.cli.mcp_tools — those are internal server modules.
-Every tool response includes an `sdk_equivalent` field for script conversion.
+In verbose mode (`--verbose`), every tool response includes an `sdk_equivalent` field for script conversion.
 
 **Hybrid xpath+prompt pattern** — the recommended approach for production scripts:
     await page.click("xpath=//button[@id='submit']", prompt="the Submit button")
@@ -240,13 +258,14 @@ To get xpaths, use skyvern_click during MCP exploration — its `resolved_select
 gives you the xpath the AI resolved to. Then hardcode that xpath with a prompt fallback in your script.
 """,
 )
+mcp.add_middleware(MCPTelemetryMiddleware())
 
-# -- Session management --
-mcp.tool()(skyvern_session_create)
-mcp.tool()(skyvern_session_close)
-mcp.tool()(skyvern_session_list)
-mcp.tool()(skyvern_session_get)
-mcp.tool()(skyvern_session_connect)
+# -- Browser session management --
+mcp.tool()(skyvern_browser_session_create)
+mcp.tool()(skyvern_browser_session_close)
+mcp.tool()(skyvern_browser_session_list)
+mcp.tool()(skyvern_browser_session_get)
+mcp.tool()(skyvern_browser_session_connect)
 
 # -- Primary tools (AI-powered exploration + observation) --
 mcp.tool()(skyvern_act)
@@ -276,37 +295,38 @@ mcp.tool()(skyvern_credential_list)
 mcp.tool()(skyvern_credential_get)
 mcp.tool()(skyvern_credential_delete)
 
+# -- Folder management (no browser needed) --
+mcp.tool()(skyvern_folder_list)
+mcp.tool()(skyvern_folder_create)
+mcp.tool()(skyvern_folder_get)
+mcp.tool()(skyvern_folder_update)
+mcp.tool()(skyvern_folder_delete)
+
 # -- Workflow management (CRUD + execution, no browser needed) --
 mcp.tool()(skyvern_workflow_list)
 mcp.tool()(skyvern_workflow_get)
 mcp.tool()(skyvern_workflow_create)
 mcp.tool()(skyvern_workflow_update)
+mcp.tool()(skyvern_workflow_update_folder)
 mcp.tool()(skyvern_workflow_delete)
 mcp.tool()(skyvern_workflow_run)
 mcp.tool()(skyvern_workflow_status)
 mcp.tool()(skyvern_workflow_cancel)
 
-# -- Admin impersonation (cloud-only, session-level org switching) --
-try:
-    from cloud.mcp_admin_tools import register_admin_tools  # noqa: PLC0415
-
-    register_admin_tools(mcp)
-except ImportError:
-    pass
-
 # -- Prompts (methodology guides injected into LLM conversations) --
 mcp.prompt()(build_workflow)
 mcp.prompt()(debug_automation)
 mcp.prompt()(extract_data)
+mcp.prompt()(qa_test)
 
 __all__ = [
     "mcp",
     # Session
-    "skyvern_session_create",
-    "skyvern_session_close",
-    "skyvern_session_list",
-    "skyvern_session_get",
-    "skyvern_session_connect",
+    "skyvern_browser_session_create",
+    "skyvern_browser_session_close",
+    "skyvern_browser_session_list",
+    "skyvern_browser_session_get",
+    "skyvern_browser_session_connect",
     # Primary (AI-powered)
     "skyvern_act",
     "skyvern_extract",
@@ -331,11 +351,18 @@ __all__ = [
     "skyvern_credential_list",
     "skyvern_credential_get",
     "skyvern_credential_delete",
+    # Folder management
+    "skyvern_folder_list",
+    "skyvern_folder_create",
+    "skyvern_folder_get",
+    "skyvern_folder_update",
+    "skyvern_folder_delete",
     # Workflow management
     "skyvern_workflow_list",
     "skyvern_workflow_get",
     "skyvern_workflow_create",
     "skyvern_workflow_update",
+    "skyvern_workflow_update_folder",
     "skyvern_workflow_delete",
     "skyvern_workflow_run",
     "skyvern_workflow_status",
@@ -344,4 +371,5 @@ __all__ = [
     "build_workflow",
     "debug_automation",
     "extract_data",
+    "qa_test",
 ]

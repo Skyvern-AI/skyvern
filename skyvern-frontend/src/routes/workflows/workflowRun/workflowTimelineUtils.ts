@@ -6,6 +6,8 @@ import {
 } from "../types/workflowRunTypes";
 import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
 
+const containerBlockTypes = new Set(["for_loop", "conditional"]);
+
 function findBlockSurroundingAction(
   timeline: Array<WorkflowRunTimelineItem>,
   actionId: string,
@@ -101,4 +103,65 @@ function findActiveItem(
   return null;
 }
 
-export { findActiveItem, findBlockSurroundingAction };
+/**
+ * For container blocks (for_loop, conditional) that don't have their own
+ * screenshots, find the first descendant leaf block whose artifacts can be shown.
+ * Timeline children are ordered most-recent-first (DESC), so the first leaf
+ * block we encounter is the most recent one.
+ */
+function resolveScreenshotBlockId(
+  timeline: Array<WorkflowRunTimelineItem>,
+  block: WorkflowRunBlock,
+): string {
+  if (!containerBlockTypes.has(block.block_type)) {
+    return block.workflow_run_block_id;
+  }
+
+  const timelineItem = findTimelineBlockItem(
+    timeline,
+    block.workflow_run_block_id,
+  );
+  if (!timelineItem) {
+    return block.workflow_run_block_id;
+  }
+
+  const descendant = findFirstLeafBlockId(timelineItem.children);
+  return descendant ?? block.workflow_run_block_id;
+}
+
+function findTimelineBlockItem(
+  items: Array<WorkflowRunTimelineItem>,
+  blockId: string,
+): WorkflowRunTimelineItem | null {
+  const stack = [...items];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (
+      isBlockItem(current) &&
+      current.block.workflow_run_block_id === blockId
+    ) {
+      return current;
+    }
+    if (current.children) {
+      stack.push(...current.children);
+    }
+  }
+  return null;
+}
+
+function findFirstLeafBlockId(
+  items: Array<WorkflowRunTimelineItem>,
+): string | null {
+  for (const item of items) {
+    if (isBlockItem(item)) {
+      if (item.children.length > 0) {
+        const childResult = findFirstLeafBlockId(item.children);
+        if (childResult) return childResult;
+      }
+      return item.block.workflow_run_block_id;
+    }
+  }
+  return null;
+}
+
+export { findActiveItem, findBlockSurroundingAction, resolveScreenshotBlockId };

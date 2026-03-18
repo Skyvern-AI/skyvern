@@ -54,7 +54,14 @@ Pick the credential to use when running the workflow when you have defined a cre
 
 ## Reserved Parameters
 There are some parameters that are reserved by Skyvern and cannot be used as a parameter key/name:
-- `{{current_value}}`: this is a reserved parameter within the scope of a for loop block. It represents the current value that the loop is iterating over.
+- `{{current_item}}`: the current item in a for-loop block iteration (alias for `current_value`).
+- `{{current_value}}`: the current value that the for-loop block is iterating over.
+- `{{current_index}}`: the zero-based index of the current for-loop iteration.
+- `{{current_date}}`: automatically resolves to the current date in YYYY-MM-DD format (UTC).
+- `{{workflow_title}}`: the title of the workflow.
+- `{{workflow_id}}`: the unique ID of the workflow definition.
+- `{{workflow_permanent_id}}`: the permanent ID that persists across workflow versions.
+- `{{workflow_run_id}}`: the unique ID of the current workflow run.
 
 ## Block Output Parameters
 Any block name ({{your_block_name}} or {{your_block_name_output}}) can be referenced as a parameter by a later block, with the exception of referencing a block within a for loop from outside of the for loop block.

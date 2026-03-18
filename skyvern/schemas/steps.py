@@ -7,6 +7,10 @@ from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.responses import ActionResult
 
 
+class BrowserMetadata(BaseModel):
+    website_url: str | None = None
+
+
 class AgentStepOutput(BaseModel):
     """
     Output of the agent step, this is recorded in the database.
@@ -17,6 +21,7 @@ class AgentStepOutput(BaseModel):
     # Nullable for backwards compatibility, once backfill is done, this won't be nullable anymore
     actions_and_results: list[tuple[Action, list[ActionResult]]] | None = None
     errors: list[UserDefinedError] = []
+    browser_metadata: BrowserMetadata | None = None
 
     def __repr__(self) -> str:
         return f"AgentStepOutput({self.model_dump()})"

@@ -30,6 +30,7 @@ def is_final_status(status: str | None) -> bool:
 class PersistentBrowserType(StrEnum):
     MSEdge = "msedge"
     Chrome = "chrome"
+    CloakBrowser = "cloakbrowser"
 
 
 class Extensions(StrEnum):
@@ -61,6 +62,7 @@ class PersistentBrowserSession(BaseModel):
     deleted_at: datetime | None = None
     extensions: list[Extensions] | None = None
     browser_type: PersistentBrowserType | None = None
+    browser_profile_id: str | None = None
 
 
 class AddressablePersistentBrowserSession(PersistentBrowserSession):

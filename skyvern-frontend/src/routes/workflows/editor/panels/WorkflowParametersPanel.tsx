@@ -159,6 +159,14 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                       <button
                         type="button"
                         onClick={() => {
+                          const affected = getAffectedBlocks(
+                            nodes,
+                            parameter.key,
+                          );
+                          if (affected.length === 0) {
+                            handleDeleteParameter(parameter.key);
+                            return;
+                          }
                           setDeleteDialogState({
                             open: true,
                             parameterKey: parameter.key,

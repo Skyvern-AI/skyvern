@@ -27,6 +27,7 @@ BlockType = typing.Union[
         "http_request",
         "human_interaction",
         "print_page",
+        "workflow_trigger",
     ],
     typing.Any,
 ]
