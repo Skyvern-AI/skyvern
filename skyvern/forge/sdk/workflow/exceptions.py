@@ -16,7 +16,7 @@ class WorkflowDefinitionHasDuplicateBlockLabels(BaseWorkflowHTTPException):
         super().__init__(
             f"WorkflowDefinition has blocks with duplicate labels. Each block needs to have a unique "
             f"label. Duplicate label(s): {','.join(duplicate_labels)}",
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
@@ -25,7 +25,7 @@ class InvalidFinallyBlockLabel(BaseWorkflowHTTPException):
         super().__init__(
             f"finally_block_label '{finally_block_label}' does not reference a valid block in the workflow. "
             f"Available block labels: {', '.join(available_labels) if available_labels else '(none)'}",
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
@@ -34,7 +34,7 @@ class NonTerminalFinallyBlock(BaseWorkflowHTTPException):
         super().__init__(
             f"finally_block_label '{finally_block_label}' must be a terminal block (next_block_label must be null). "
             "Only blocks without a next_block_label can be used as finally blocks.",
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
@@ -70,7 +70,7 @@ class OutputParameterKeyCollisionError(BaseWorkflowHTTPException):
             f"Duplicate block label detected: '{block_label}' (output parameter key '{key}' already exists). "
             f"Each block must have a unique label across all nesting levels, including blocks inside loops. "
             f"Please rename one of the blocks with label '{block_label}' to a unique name.",
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
@@ -79,7 +79,7 @@ class WorkflowDefinitionHasDuplicateParameterKeys(BaseWorkflowHTTPException):
         super().__init__(
             f"WorkflowDefinition has parameters with duplicate keys. Each parameter needs to have a unique "
             f"key. Duplicate key(s): {','.join(duplicate_keys)}",
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
@@ -88,7 +88,7 @@ class WorkflowDefinitionHasReservedParameterKeys(BaseWorkflowHTTPException):
         super().__init__(
             f"WorkflowDefinition has parameters with reserved keys. User created parameters cannot have the following "
             f"reserved keys: {','.join(reserved_keys)}. Parameter keys: {','.join(parameter_keys)}",
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
@@ -96,7 +96,7 @@ class InvalidWorkflowDefinition(BaseWorkflowHTTPException):
     def __init__(self, message: str) -> None:
         super().__init__(
             message,
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
@@ -114,7 +114,7 @@ class ContextParameterSourceNotDefined(BaseWorkflowHTTPException):
     def __init__(self, context_parameter_key: str, source_key: str) -> None:
         super().__init__(
             f"Source parameter key {source_key} for context parameter {context_parameter_key} does not exist.",
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
@@ -122,7 +122,7 @@ class InvalidFileType(BaseWorkflowHTTPException):
     def __init__(self, file_url: str, file_type: str, error: str) -> None:
         super().__init__(
             f"File URL {file_url} is not a valid {file_type} file. Error: {error}",
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
@@ -153,7 +153,7 @@ class WorkflowDefinitionHasUndefinedParameters(WorkflowDefinitionValidationExcep
         )
         super().__init__(
             error_message,
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
