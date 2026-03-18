@@ -1,9 +1,13 @@
 import asyncio
 import base64
 import hashlib
+from typing import TYPE_CHECKING
 
 import structlog
 from fastapi import BackgroundTasks, Depends, HTTPException, Path, Query, Request
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.db.models import WorkflowScriptModel
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -26,6 +30,8 @@ from skyvern.schemas.scripts import (
     ScriptBlocksResponse,
     ScriptCacheKeyValuesResponse,
     ScriptFallbackEpisode,
+    ScriptRunsResponse,
+    ScriptRunSummary,
     ScriptStatus,
     ScriptVersionCompareResponse,
     ScriptVersionDetailResponse,
@@ -858,40 +864,55 @@ async def list_workflow_scripts(
     workflow_scripts = await app.DATABASE.get_workflow_scripts_by_permanent_id(
         organization_id=organization_id,
         workflow_permanent_id=workflow_permanent_id,
+        statuses=[ScriptStatus.published],
     )
 
     if not workflow_scripts:
         return WorkflowScriptsListResponse(scripts=[])
 
-    script_ids = list({ws.script_id for ws in workflow_scripts})
-    version_stats = await app.DATABASE.get_script_version_stats(
-        organization_id=organization_id,
-        script_ids=script_ids,
+    # Group by cache_key_value -- one row per variant.
+    # Multiple runs can reference the same script; collapse them.
+    by_cache_key: dict[str, list[WorkflowScriptModel]] = {}
+    for ws in workflow_scripts:
+        by_cache_key.setdefault(ws.cache_key_value, []).append(ws)
+
+    # Pick the most recent script per cache_key_value.
+    # Relies on get_workflow_scripts_by_permanent_id() ORDER BY modified_at DESC.
+    representatives: list[WorkflowScriptModel] = []
+    for _ckv, group in by_cache_key.items():
+        representatives.append(group[0])
+
+    if not representatives:
+        return WorkflowScriptsListResponse(scripts=[])
+
+    # Batch queries for version stats and run stats (success_rate + total_runs
+    # computed from the same DB population for consistency).
+    # These are independent -- run in parallel.
+    rep_script_ids = [ws.script_id for ws in representatives]
+    version_stats, run_stats = await asyncio.gather(
+        app.DATABASE.get_script_version_stats(
+            organization_id=organization_id,
+            script_ids=rep_script_ids,
+        ),
+        app.DATABASE.get_script_run_stats(
+            organization_id=organization_id,
+            script_ids=rep_script_ids,
+        ),
     )
 
     summaries = []
-    for ws in workflow_scripts:
+    for ws in representatives:
         latest_version, version_count = version_stats.get(ws.script_id, (0, 0))
-        # Skip scripts with no live versions (all soft-deleted)
         if version_count == 0:
             continue
-        status = ScriptStatus.published
-        if ws.status:
-            try:
-                status = ScriptStatus(ws.status)
-            except ValueError:
-                LOG.warning(
-                    "Unknown script status, defaulting to published",
-                    status=ws.status,
-                    script_id=ws.script_id,
-                    organization_id=organization_id,
-                )
-        else:
-            LOG.warning(
-                "WorkflowScript has null status, defaulting to published",
-                script_id=ws.script_id,
-                organization_id=organization_id,
-            )
+
+        try:
+            status = ScriptStatus(ws.status) if ws.status else ScriptStatus.published
+        except ValueError:
+            status = ScriptStatus.published
+
+        success_rate, total_runs = run_stats.get(ws.script_id, (None, 0))
+
         summaries.append(
             WorkflowScriptSummary(
                 script_id=ws.script_id,
@@ -900,13 +921,61 @@ async def list_workflow_scripts(
                 status=status,
                 latest_version=latest_version,
                 version_count=version_count,
+                total_runs=total_runs,
+                success_rate=success_rate,
+                is_pinned=bool(ws.is_pinned),
                 created_at=ws.created_at,
                 modified_at=ws.modified_at,
             )
         )
 
-    # Results are already sorted by modified_at DESC from the DB query
+    # Sort: published first, then by modified_at DESC
+    summaries.sort(key=lambda s: (s.status != ScriptStatus.published, -s.modified_at.timestamp()))
     return WorkflowScriptsListResponse(scripts=summaries)
+
+
+@base_router.get(
+    "/scripts/{script_id}/runs",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/scripts/{script_id}/runs/",
+    include_in_schema=False,
+)
+async def get_script_runs(
+    script_id: str = Path(..., description="The script ID"),
+    page_size: int = Query(50, ge=1, le=100),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptRunsResponse:
+    """Get workflow runs associated with a specific script, with status counts."""
+    organization_id = current_org.organization_id
+
+    # Verify script exists
+    script = await app.DATABASE.get_script(script_id=script_id, organization_id=organization_id)
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+
+    runs, total_count, status_counts = await app.DATABASE.get_workflow_runs_for_script(
+        organization_id=organization_id,
+        script_id=script_id,
+        page_size=page_size,
+    )
+
+    return ScriptRunsResponse(
+        runs=[
+            ScriptRunSummary(
+                workflow_run_id=r.workflow_run_id,
+                status=r.status or "unknown",
+                started_at=r.started_at,
+                finished_at=r.finished_at,
+                created_at=r.created_at,
+                failure_reason=r.failure_reason,
+            )
+            for r in runs
+        ],
+        total_count=total_count,
+        status_counts=status_counts,
+    )
 
 
 @base_router.delete(
