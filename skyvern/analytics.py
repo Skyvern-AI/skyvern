@@ -15,7 +15,7 @@ LOG = structlog.get_logger(__name__)
 
 
 def _build_posthog_client(api_key: str, host: str) -> Posthog:
-    return Posthog(api_key, host=host, disable_geoip=False)
+    return Posthog(api_key, host=host, disable_geoip=False, timeout=2)
 
 
 posthog = _build_posthog_client(
