@@ -63,14 +63,13 @@ class WorkflowVersionConflict(BaseWorkflowHTTPException):
 
 
 class OutputParameterKeyCollisionError(BaseWorkflowHTTPException):
-    def __init__(self, key: str, retry_count: int | None = None) -> None:
-        message = f"Output parameter key {key} already exists in the context manager."
-        if retry_count is not None:
-            message += f" Retrying {retry_count} more times."
-        elif retry_count == 0:
-            message += " Max duplicate retries reached, aborting."
+    def __init__(self, key: str) -> None:
+        # Extract the block label from the output parameter key (e.g. "block_1_output" -> "block_1")
+        block_label = key.removesuffix("_output")
         super().__init__(
-            message,
+            f"Duplicate block label detected: '{block_label}' (output parameter key '{key}' already exists). "
+            f"Each block must have a unique label across all nesting levels, including blocks inside loops. "
+            f"Please rename one of the blocks with label '{block_label}' to a unique name.",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 

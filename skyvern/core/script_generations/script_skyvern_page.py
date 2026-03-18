@@ -759,40 +759,6 @@ class ScriptSkyvernPage(SkyvernPage):
         )
         return ""
 
-    async def _auto_solve_captchas(self) -> bool:
-        """Proactively detect and solve captchas after page load.
-        Returns True if a captcha was detected and solved."""
-        context = skyvern_context.current()
-        is_script = context and context.script_mode
-        try:
-            from cloud.webeye.utils.captcha import cloudflare_detect_and_wait_for_resolve
-
-            # Wait for CapMonster extension to inject its addon div into the DOM.
-            # The extension needs a moment after page load to detect any Turnstile
-            # widget and inject its overlay. We use wait_for with a short timeout
-            # so non-captcha pages only add ~5s latency (acceptable since code mode
-            # saves minutes vs agent mode).
-            capmonster_div = self.page.locator('div[class~="cm-addon-turnstile"]')
-            try:
-                await capmonster_div.wait_for(state="attached", timeout=5_000)
-            except Exception:
-                # No CapMonster div appeared — no Cloudflare captcha on this page
-                return False
-
-            if is_script:
-                print("  🔓 Cloudflare captcha detected, solving...")
-
-            detected, solved = await cloudflare_detect_and_wait_for_resolve(self.page, timeout=90)
-            if detected and is_script:
-                print(f"  {'✓' if solved else '✗'} Cloudflare captcha {'solved' if solved else 'not solved'}")
-            return detected and solved
-        except ImportError:
-            # cloud module not available (open source)
-            return False
-        except Exception:
-            LOG.warning("Auto captcha solve failed", exc_info=True)
-            return False
-
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)
         url = prepend_scheme_and_validate_url(url)
@@ -838,7 +804,7 @@ class ScriptSkyvernPage(SkyvernPage):
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.task_id or not context.step_id:
             # Fallback: solve directly without DB context
-            await self._auto_solve_captchas()
+            await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
             return None
 
         task = await app.DATABASE.get_task(context.task_id, context.organization_id)
