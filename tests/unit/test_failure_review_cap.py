@@ -15,8 +15,10 @@ import pytest
 try:
     from redis.exceptions import LockError
 except ImportError:
+
     class LockError(Exception):  # type: ignore[no-redef]
         pass
+
 
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
