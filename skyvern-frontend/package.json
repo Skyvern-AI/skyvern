@@ -70,7 +70,7 @@
     "react-github-btn": "^1.4.0",
     "react-hook-form": "^7.51.1",
     "react-router-dom": "^6.30.2",
-    "serve-handler": "^6.1.6",
+    "serve-handler": "^6.1.7",
     "tailwind-merge": "^2.2.2",
     "tailwindcss-animate": "^1.0.7",
     "use-debounce": "^10.0.4",
