@@ -13182,7 +13182,8 @@
         "type": "string",
         "enum": [
           "msedge",
-          "chrome"
+          "chrome",
+          "cloakbrowser"
         ],
         "title": "PersistentBrowserType"
       },
