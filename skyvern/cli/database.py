@@ -29,7 +29,7 @@ def run_command(command: str, check: bool = True) -> tuple[Optional[str], Option
 def is_postgres_running() -> bool:
     if command_exists("pg_isready"):
         with console.status("[bold green]Checking PostgreSQL status...") as status:
-            result, _ = run_command("pg_isready")
+            result, _ = run_command("pg_isready", check=False)
             if result is not None and "accepting connections" in result:
                 status.stop()
                 return True
@@ -38,17 +38,59 @@ def is_postgres_running() -> bool:
     return False
 
 
-def database_exists(dbname: str, user: str) -> bool:
-    check_db_command = f'psql {dbname} -U {user} -c "\\q"'
-    output, _ = run_command(check_db_command, check=False)
-    return output is not None
+def role_and_database_ready(user: str, dbname: str) -> bool:
+    _, code = run_command(f'psql {dbname} -U {user} -c "\\q"', check=False)
+    return code == 0
+
+
+def _role_exists_via_catalog(user: str) -> bool:
+    output, code = run_command(
+        f"psql postgres -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{user}'\"",
+        check=False,
+    )
+    return code == 0 and output is not None and "1" in output
+
+
+def _database_exists_via_catalog(dbname: str) -> bool:
+    output, code = run_command(
+        f"psql postgres -tAc \"SELECT 1 FROM pg_database WHERE datname='{dbname}'\"",
+        check=False,
+    )
+    return code == 0 and output is not None and "1" in output
 
 
 def create_database_and_user() -> None:
     console.print("🚀 [bold green]Creating database user and database...[/bold green]")
-    run_command("createuser skyvern")
-    run_command("createdb skyvern -O skyvern")
-    console.print("✅ [bold green]Database and user created successfully.[/bold green]")
+
+    if _role_exists_via_catalog("skyvern"):
+        console.print("✅ [green]Role 'skyvern' already exists.[/green]")
+    else:
+        console.print("  Creating role 'skyvern'...")
+        _, code = run_command("createuser skyvern", check=False)
+        if code != 0:
+            console.print(
+                "[red]Failed to create role 'skyvern'. "
+                "You may need to create it manually:[/red]\n"
+                "  [bold]createuser skyvern[/bold]"
+            )
+            raise SystemExit(1)
+        console.print("  ✅ [green]Role 'skyvern' created.[/green]")
+
+    if _database_exists_via_catalog("skyvern"):
+        console.print("✅ [green]Database 'skyvern' already exists.[/green]")
+    else:
+        console.print("  Creating database 'skyvern'...")
+        _, code = run_command("createdb skyvern -O skyvern", check=False)
+        if code != 0:
+            console.print(
+                "[red]Failed to create database 'skyvern'. "
+                "You may need to create it manually:[/red]\n"
+                "  [bold]createdb skyvern -O skyvern[/bold]"
+            )
+            raise SystemExit(1)
+        console.print("  ✅ [green]Database 'skyvern' created.[/green]")
+
+    console.print("✅ [bold green]Database and user are ready.[/bold green]")
 
 
 def is_docker_running() -> bool:
@@ -76,7 +118,7 @@ def setup_postgresql(no_postgres: bool = False) -> None:
     if command_exists("psql") and is_postgres_running():
         console.print("✨ [green]PostgreSQL is already running locally.[/green]")
         capture_setup_event("database-local-detected", success=True, extra_data={"source": "local"})
-        if database_exists("skyvern", "skyvern"):
+        if role_and_database_ready("skyvern", "skyvern"):
             console.print("✅ [green]Database and user exist.[/green]")
         else:
             create_database_and_user()
@@ -173,7 +215,7 @@ def setup_postgresql(no_postgres: bool = False) -> None:
 
     with console.status("[bold green]Checking database...[/bold green]"):
         _, code = run_command(
-            "docker exec postgresql-container psql -U postgres -lqt | cut -d | -f 1 | grep -qw skyvern",
+            'docker exec postgresql-container psql -U postgres -lqt | cut -d "|" -f 1 | grep -qw skyvern',
             check=False,
         )
         if code == 0:

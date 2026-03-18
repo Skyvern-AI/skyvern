@@ -54,6 +54,7 @@ export const ProxyLocation = {
   ResidentialIT: "RESIDENTIAL_IT",
   ResidentialNL: "RESIDENTIAL_NL",
   ResidentialPH: "RESIDENTIAL_PH",
+  ResidentialKR: "RESIDENTIAL_KR",
   ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;
@@ -114,6 +115,8 @@ export type Task = {
   status: Status;
   created_at: string; // ISO 8601
   modified_at: string; // ISO 8601
+  started_at: string | null; // ISO 8601
+  finished_at: string | null; // ISO 8601
   extracted_information: Record<string, unknown> | string | null;
   screenshot_url: string | null;
   recording_url: string | null;
@@ -384,6 +387,8 @@ export type DebugSessionApiResponse = {
 export type WorkflowRunApiResponse = {
   created_at: string;
   failure_reason: string | null;
+  started_at: string | null; // ISO 8601
+  finished_at: string | null; // ISO 8601
   modified_at: string;
   proxy_location: ProxyLocation | null;
   script_run: boolean | null;
@@ -404,6 +409,7 @@ export type WorkflowRunStatusApiResponse = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
+  started_at: string | null;
   finished_at: string;
   modified_at: string;
   parameters: Record<string, unknown>;
@@ -419,6 +425,7 @@ export type WorkflowRunStatusApiResponse = {
   workflow_title: string | null;
   browser_session_id: string | null;
   max_screenshot_scrolls: number | null;
+  run_with: string | null;
   waiting_for_verification_code?: boolean;
   verification_code_identifier?: string | null;
   verification_code_polling_started_at?: string | null;
@@ -432,6 +439,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
+  started_at: string | null;
   finished_at: string;
   modified_at: string;
   parameters: Record<string, unknown>;
@@ -447,6 +455,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   workflow_title: string | null;
   browser_session_id: string | null;
   max_screenshot_scrolls: number | null;
+  run_with: string | null;
   workflow: WorkflowApiResponse;
   waiting_for_verification_code?: boolean;
   verification_code_identifier?: string | null;
@@ -532,6 +541,7 @@ export type CredentialApiResponse = {
   name: string;
   browser_profile_id?: string | null;
   tested_url?: string | null;
+  user_context?: string | null;
 };
 
 export function isPasswordCredential(

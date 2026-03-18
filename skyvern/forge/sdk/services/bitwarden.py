@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 from enum import IntEnum, StrEnum
 from typing import Tuple
@@ -23,7 +24,7 @@ from skyvern.exceptions import (
     BitwardenSyncError,
     BitwardenUnlockError,
 )
-from skyvern.forge.sdk.api.aws import aws_client
+from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
 from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
@@ -159,6 +160,15 @@ class RunCommandResult(BaseModel):
 
 class BitwardenService:
     @staticmethod
+    async def _apply_jitter() -> None:
+        """Apply random jitter delay to spread out concurrent Bitwarden CLI requests."""
+        max_jitter = settings.BITWARDEN_MAX_JITTER_SECONDS
+        if max_jitter > 0:
+            jitter = random.uniform(0, max_jitter)
+            LOG.debug("Applying Bitwarden jitter delay", jitter_seconds=round(jitter, 2))
+            await asyncio.sleep(jitter)
+
+    @staticmethod
     async def run_command(
         command: list[str], additional_env: dict[str, str] | None = None, timeout: int = 60
     ) -> RunCommandResult:
@@ -171,6 +181,7 @@ class BitwardenService:
         if additional_env:
             env.update(additional_env)  # Update with any additional environment variables
 
+        shell_subprocess = None
         try:
             async with asyncio.timeout(timeout):
                 shell_subprocess = await asyncio.create_subprocess_shell(
@@ -185,9 +196,22 @@ class BitwardenService:
                     stderr=stderr.decode(),
                     returncode=shell_subprocess.returncode,
                 )
-        except asyncio.TimeoutError as e:
-            LOG.error(f"Bitwarden command timed out after {timeout} seconds", exc_info=True)
-            raise e
+        except asyncio.TimeoutError:
+            LOG.error(
+                "Bitwarden command timed out",
+                timeout_seconds=timeout,
+                command=command[0:2],
+                exc_info=True,
+            )
+            raise
+        finally:
+            if shell_subprocess and shell_subprocess.returncode is None:
+                LOG.info("Killing orphaned Bitwarden subprocess", pid=shell_subprocess.pid)
+                try:
+                    shell_subprocess.kill()
+                    await shell_subprocess.wait()
+                except (ProcessLookupError, asyncio.CancelledError):
+                    pass
 
     @staticmethod
     def _extract_session_key(unlock_cmd_output: str) -> str | None:
@@ -227,6 +251,7 @@ class BitwardenService:
         if item_id and not is_uuid(item_id):
             raise BitwardenGetItemError(f"Invalid item ID: {item_id}. Check if the item ID is correct")
 
+        await BitwardenService._apply_jitter()
         for i in range(max_retries):
             # FIXME: just simply double the timeout for the second try. maybe a better backoff policy when needed
             timeout = (i + 1) * timeout
@@ -421,6 +446,8 @@ class BitwardenService:
         """
         if not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
             raise BitwardenAccessDeniedError()
+        if not fail_reasons:
+            await BitwardenService._apply_jitter()
         try:
             async with asyncio.timeout(timeout):
                 return await BitwardenService._get_sensitive_information_from_identity(
@@ -705,6 +732,8 @@ class BitwardenService:
         if not is_uuid(item_id):
             raise BitwardenGetItemError(f"Invalid item ID: {item_id}. Check if the item ID is correct")
 
+        if not fail_reasons:
+            await BitwardenService._apply_jitter()
         try:
             async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
                 return await BitwardenService._get_credit_card_data(
@@ -902,7 +931,8 @@ class BitwardenService:
     async def _get_skyvern_auth_master_password() -> str:
         master_password = settings.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD
         if not master_password:
-            master_password = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD)
+            secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD
+            master_password = await get_aws_client().get_secret(secret_key)
         if not master_password:
             raise BitwardenSecretError("Skyvern auth master password is not set")
         return master_password
@@ -911,7 +941,8 @@ class BitwardenService:
     async def _get_skyvern_auth_organization_id() -> str:
         bw_organization_id = settings.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID
         if not bw_organization_id:
-            bw_organization_id = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID)
+            secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID
+            bw_organization_id = await get_aws_client().get_secret(secret_key)
         if not bw_organization_id:
             raise BitwardenSecretError("Skyvern auth organization ID is not set")
         return bw_organization_id
@@ -920,7 +951,8 @@ class BitwardenService:
     async def _get_skyvern_auth_client_id() -> str:
         client_id = settings.SKYVERN_AUTH_BITWARDEN_CLIENT_ID
         if not client_id:
-            client_id = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_ID)
+            secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_ID
+            client_id = await get_aws_client().get_secret(secret_key)
         if not client_id:
             raise BitwardenSecretError("Skyvern auth client ID is not set")
         return client_id
@@ -929,7 +961,8 @@ class BitwardenService:
     async def _get_skyvern_auth_client_secret() -> str:
         client_secret = settings.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET
         if not client_secret:
-            client_secret = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET)
+            secret_key = BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET
+            client_secret = await get_aws_client().get_secret(secret_key)
         if not client_secret:
             raise BitwardenSecretError("Skyvern auth client secret is not set")
         return client_secret

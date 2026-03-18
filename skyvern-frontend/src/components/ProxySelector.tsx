@@ -9,9 +9,17 @@ type Props = {
   value: ProxyLocation;
   onChange: (value: ProxyLocation) => void;
   className?: string;
+  allowGranularSearch?: boolean;
+  modalPopover?: boolean;
 };
 
-function ProxySelector({ value, onChange, className }: Props) {
+function ProxySelector({
+  value,
+  onChange,
+  className,
+  allowGranularSearch = true,
+  modalPopover = false,
+}: Props) {
   // Convert input (string enum or object) to GeoTarget for the selector
   const geoTargetValue = proxyLocationToGeoTarget(value);
 
@@ -19,6 +27,8 @@ function ProxySelector({ value, onChange, className }: Props) {
     <GeoTargetSelector
       className={className}
       value={geoTargetValue}
+      allowGranularSearch={allowGranularSearch}
+      modalPopover={modalPopover}
       onChange={(newTarget) => {
         // Convert back to ProxyLocation enum if possible (for simple countries)
         // or keep as GeoTarget object

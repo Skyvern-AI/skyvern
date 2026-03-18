@@ -46,11 +46,27 @@ def _resolve_base_url() -> str | None:
     return settings.SKYVERN_BASE_URL or os.environ.get("SKYVERN_BASE_URL")
 
 
+def _resolve_self_base_url() -> str:
+    """Build the base URL for the current server process.
+
+    When the MCP server is hosted inside the FastAPI process (stateless HTTP
+    mode), tool handlers must call back to the *same* server rather than the
+    default ``SkyvernEnvironment.CLOUD`` URL.  This prevents staging API keys
+    from being sent to production (or vice-versa).
+
+    Always uses HTTP on localhost since TLS terminates at the load balancer.
+    """
+    return f"http://127.0.0.1:{settings.PORT}"
+
+
 def _build_cloud_client(api_key: str) -> Skyvern:
+    from .session_manager import is_stateless_http_mode  # noqa: PLC0415 — circular import
+
+    base_url: str | None = _resolve_self_base_url() if is_stateless_http_mode() else _resolve_base_url()
     return Skyvern(
         api_key=api_key,
         environment=SkyvernEnvironment.CLOUD,
-        base_url=_resolve_base_url(),
+        base_url=base_url,
     )
 
 

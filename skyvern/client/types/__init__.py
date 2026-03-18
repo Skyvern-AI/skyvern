@@ -154,7 +154,11 @@ if typing.TYPE_CHECKING:
     from .file_type import FileType
     from .file_upload_block import FileUploadBlock
     from .file_upload_block_yaml import FileUploadBlockYaml
+    from .folder import Folder
+    from .folder_create import FolderCreate
+    from .folder_update import FolderUpdate
     from .for_loop_block import ForLoopBlock
+    from .for_loop_block_data_schema import ForLoopBlockDataSchema
     from .for_loop_block_loop_blocks_item import (
         ForLoopBlockLoopBlocksItem,
         ForLoopBlockLoopBlocksItem_Action,
@@ -180,6 +184,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockLoopBlocksItem_UploadToS3,
         ForLoopBlockLoopBlocksItem_Validation,
         ForLoopBlockLoopBlocksItem_Wait,
+        ForLoopBlockLoopBlocksItem_WorkflowTrigger,
     )
     from .for_loop_block_loop_over import (
         ForLoopBlockLoopOver,
@@ -196,6 +201,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockLoopOver_Workflow,
     )
     from .for_loop_block_yaml import ForLoopBlockYaml
+    from .for_loop_block_yaml_data_schema import ForLoopBlockYamlDataSchema
     from .for_loop_block_yaml_loop_blocks_item import (
         ForLoopBlockYamlLoopBlocksItem,
         ForLoopBlockYamlLoopBlocksItem_Action,
@@ -221,6 +227,7 @@ if typing.TYPE_CHECKING:
         ForLoopBlockYamlLoopBlocksItem_UploadToS3,
         ForLoopBlockYamlLoopBlocksItem_Validation,
         ForLoopBlockYamlLoopBlocksItem_Wait,
+        ForLoopBlockYamlLoopBlocksItem_WorkflowTrigger,
     )
     from .geo_target import GeoTarget
     from .get_run_response import (
@@ -412,6 +419,7 @@ if typing.TYPE_CHECKING:
     from .thought_type import ThoughtType
     from .totp_code import TotpCode
     from .totp_type import TotpType
+    from .update_workflow_folder_request import UpdateWorkflowFolderRequest
     from .upload_file_action import UploadFileAction
     from .upload_file_action_data import UploadFileActionData
     from .upload_file_response import UploadFileResponse
@@ -500,6 +508,7 @@ if typing.TYPE_CHECKING:
         WorkflowDefinitionBlocksItem_UploadToS3,
         WorkflowDefinitionBlocksItem_Validation,
         WorkflowDefinitionBlocksItem_Wait,
+        WorkflowDefinitionBlocksItem_WorkflowTrigger,
     )
     from .workflow_definition_parameters_item import (
         WorkflowDefinitionParametersItem,
@@ -541,6 +550,7 @@ if typing.TYPE_CHECKING:
         WorkflowDefinitionYamlBlocksItem_UploadToS3,
         WorkflowDefinitionYamlBlocksItem_Validation,
         WorkflowDefinitionYamlBlocksItem_Wait,
+        WorkflowDefinitionYamlBlocksItem_WorkflowTrigger,
     )
     from .workflow_definition_yaml_parameters_item import (
         WorkflowDefinitionYamlParametersItem,
@@ -576,6 +586,22 @@ if typing.TYPE_CHECKING:
     from .workflow_run_timeline import WorkflowRunTimeline
     from .workflow_run_timeline_type import WorkflowRunTimelineType
     from .workflow_status import WorkflowStatus
+    from .workflow_trigger_block import WorkflowTriggerBlock
+    from .workflow_trigger_block_parameters_item import (
+        WorkflowTriggerBlockParametersItem,
+        WorkflowTriggerBlockParametersItem_AwsSecret,
+        WorkflowTriggerBlockParametersItem_AzureSecret,
+        WorkflowTriggerBlockParametersItem_AzureVaultCredential,
+        WorkflowTriggerBlockParametersItem_BitwardenCreditCardData,
+        WorkflowTriggerBlockParametersItem_BitwardenLoginCredential,
+        WorkflowTriggerBlockParametersItem_BitwardenSensitiveInformation,
+        WorkflowTriggerBlockParametersItem_Context,
+        WorkflowTriggerBlockParametersItem_Credential,
+        WorkflowTriggerBlockParametersItem_Onepassword,
+        WorkflowTriggerBlockParametersItem_Output,
+        WorkflowTriggerBlockParametersItem_Workflow,
+    )
+    from .workflow_trigger_block_yaml import WorkflowTriggerBlockYaml
 _dynamic_imports: typing.Dict[str, str] = {
     "ActAction": ".act_action",
     "ActActionData": ".act_action_data",
@@ -713,7 +739,11 @@ _dynamic_imports: typing.Dict[str, str] = {
     "FileType": ".file_type",
     "FileUploadBlock": ".file_upload_block",
     "FileUploadBlockYaml": ".file_upload_block_yaml",
+    "Folder": ".folder",
+    "FolderCreate": ".folder_create",
+    "FolderUpdate": ".folder_update",
     "ForLoopBlock": ".for_loop_block",
+    "ForLoopBlockDataSchema": ".for_loop_block_data_schema",
     "ForLoopBlockLoopBlocksItem": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Action": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Code": ".for_loop_block_loop_blocks_item",
@@ -738,6 +768,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockLoopBlocksItem_UploadToS3": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Validation": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Wait": ".for_loop_block_loop_blocks_item",
+    "ForLoopBlockLoopBlocksItem_WorkflowTrigger": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopOver": ".for_loop_block_loop_over",
     "ForLoopBlockLoopOver_AwsSecret": ".for_loop_block_loop_over",
     "ForLoopBlockLoopOver_AzureSecret": ".for_loop_block_loop_over",
@@ -751,6 +782,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockLoopOver_Output": ".for_loop_block_loop_over",
     "ForLoopBlockLoopOver_Workflow": ".for_loop_block_loop_over",
     "ForLoopBlockYaml": ".for_loop_block_yaml",
+    "ForLoopBlockYamlDataSchema": ".for_loop_block_yaml_data_schema",
     "ForLoopBlockYamlLoopBlocksItem": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Action": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Code": ".for_loop_block_yaml_loop_blocks_item",
@@ -775,6 +807,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ForLoopBlockYamlLoopBlocksItem_UploadToS3": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Validation": ".for_loop_block_yaml_loop_blocks_item",
     "ForLoopBlockYamlLoopBlocksItem_Wait": ".for_loop_block_yaml_loop_blocks_item",
+    "ForLoopBlockYamlLoopBlocksItem_WorkflowTrigger": ".for_loop_block_yaml_loop_blocks_item",
     "GeoTarget": ".geo_target",
     "GetRunResponse": ".get_run_response",
     "GetRunResponse_AnthropicCua": ".get_run_response",
@@ -947,6 +980,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ThoughtType": ".thought_type",
     "TotpCode": ".totp_code",
     "TotpType": ".totp_type",
+    "UpdateWorkflowFolderRequest": ".update_workflow_folder_request",
     "UploadFileAction": ".upload_file_action",
     "UploadFileActionData": ".upload_file_action_data",
     "UploadFileResponse": ".upload_file_response",
@@ -1028,6 +1062,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowDefinitionBlocksItem_UploadToS3": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_Validation": ".workflow_definition_blocks_item",
     "WorkflowDefinitionBlocksItem_Wait": ".workflow_definition_blocks_item",
+    "WorkflowDefinitionBlocksItem_WorkflowTrigger": ".workflow_definition_blocks_item",
     "WorkflowDefinitionParametersItem": ".workflow_definition_parameters_item",
     "WorkflowDefinitionParametersItem_AwsSecret": ".workflow_definition_parameters_item",
     "WorkflowDefinitionParametersItem_AzureSecret": ".workflow_definition_parameters_item",
@@ -1065,6 +1100,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowDefinitionYamlBlocksItem_UploadToS3": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_Validation": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlBlocksItem_Wait": ".workflow_definition_yaml_blocks_item",
+    "WorkflowDefinitionYamlBlocksItem_WorkflowTrigger": ".workflow_definition_yaml_blocks_item",
     "WorkflowDefinitionYamlParametersItem": ".workflow_definition_yaml_parameters_item",
     "WorkflowDefinitionYamlParametersItem_AwsSecret": ".workflow_definition_yaml_parameters_item",
     "WorkflowDefinitionYamlParametersItem_AzureVaultCredential": ".workflow_definition_yaml_parameters_item",
@@ -1097,6 +1133,20 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowRunTimeline": ".workflow_run_timeline",
     "WorkflowRunTimelineType": ".workflow_run_timeline_type",
     "WorkflowStatus": ".workflow_status",
+    "WorkflowTriggerBlock": ".workflow_trigger_block",
+    "WorkflowTriggerBlockParametersItem": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_AwsSecret": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_AzureSecret": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_AzureVaultCredential": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_BitwardenCreditCardData": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_BitwardenLoginCredential": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_BitwardenSensitiveInformation": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_Context": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_Credential": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_Onepassword": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_Output": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockParametersItem_Workflow": ".workflow_trigger_block_parameters_item",
+    "WorkflowTriggerBlockYaml": ".workflow_trigger_block_yaml",
 }
 
 
@@ -1258,7 +1308,11 @@ __all__ = [
     "FileType",
     "FileUploadBlock",
     "FileUploadBlockYaml",
+    "Folder",
+    "FolderCreate",
+    "FolderUpdate",
     "ForLoopBlock",
+    "ForLoopBlockDataSchema",
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
     "ForLoopBlockLoopBlocksItem_Code",
@@ -1283,6 +1337,7 @@ __all__ = [
     "ForLoopBlockLoopBlocksItem_UploadToS3",
     "ForLoopBlockLoopBlocksItem_Validation",
     "ForLoopBlockLoopBlocksItem_Wait",
+    "ForLoopBlockLoopBlocksItem_WorkflowTrigger",
     "ForLoopBlockLoopOver",
     "ForLoopBlockLoopOver_AwsSecret",
     "ForLoopBlockLoopOver_AzureSecret",
@@ -1296,6 +1351,7 @@ __all__ = [
     "ForLoopBlockLoopOver_Output",
     "ForLoopBlockLoopOver_Workflow",
     "ForLoopBlockYaml",
+    "ForLoopBlockYamlDataSchema",
     "ForLoopBlockYamlLoopBlocksItem",
     "ForLoopBlockYamlLoopBlocksItem_Action",
     "ForLoopBlockYamlLoopBlocksItem_Code",
@@ -1320,6 +1376,7 @@ __all__ = [
     "ForLoopBlockYamlLoopBlocksItem_UploadToS3",
     "ForLoopBlockYamlLoopBlocksItem_Validation",
     "ForLoopBlockYamlLoopBlocksItem_Wait",
+    "ForLoopBlockYamlLoopBlocksItem_WorkflowTrigger",
     "GeoTarget",
     "GetRunResponse",
     "GetRunResponse_AnthropicCua",
@@ -1492,6 +1549,7 @@ __all__ = [
     "ThoughtType",
     "TotpCode",
     "TotpType",
+    "UpdateWorkflowFolderRequest",
     "UploadFileAction",
     "UploadFileActionData",
     "UploadFileResponse",
@@ -1573,6 +1631,7 @@ __all__ = [
     "WorkflowDefinitionBlocksItem_UploadToS3",
     "WorkflowDefinitionBlocksItem_Validation",
     "WorkflowDefinitionBlocksItem_Wait",
+    "WorkflowDefinitionBlocksItem_WorkflowTrigger",
     "WorkflowDefinitionParametersItem",
     "WorkflowDefinitionParametersItem_AwsSecret",
     "WorkflowDefinitionParametersItem_AzureSecret",
@@ -1610,6 +1669,7 @@ __all__ = [
     "WorkflowDefinitionYamlBlocksItem_UploadToS3",
     "WorkflowDefinitionYamlBlocksItem_Validation",
     "WorkflowDefinitionYamlBlocksItem_Wait",
+    "WorkflowDefinitionYamlBlocksItem_WorkflowTrigger",
     "WorkflowDefinitionYamlParametersItem",
     "WorkflowDefinitionYamlParametersItem_AwsSecret",
     "WorkflowDefinitionYamlParametersItem_AzureVaultCredential",
@@ -1642,4 +1702,18 @@ __all__ = [
     "WorkflowRunTimeline",
     "WorkflowRunTimelineType",
     "WorkflowStatus",
+    "WorkflowTriggerBlock",
+    "WorkflowTriggerBlockParametersItem",
+    "WorkflowTriggerBlockParametersItem_AwsSecret",
+    "WorkflowTriggerBlockParametersItem_AzureSecret",
+    "WorkflowTriggerBlockParametersItem_AzureVaultCredential",
+    "WorkflowTriggerBlockParametersItem_BitwardenCreditCardData",
+    "WorkflowTriggerBlockParametersItem_BitwardenLoginCredential",
+    "WorkflowTriggerBlockParametersItem_BitwardenSensitiveInformation",
+    "WorkflowTriggerBlockParametersItem_Context",
+    "WorkflowTriggerBlockParametersItem_Credential",
+    "WorkflowTriggerBlockParametersItem_Onepassword",
+    "WorkflowTriggerBlockParametersItem_Output",
+    "WorkflowTriggerBlockParametersItem_Workflow",
+    "WorkflowTriggerBlockYaml",
 ]

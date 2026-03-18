@@ -403,6 +403,7 @@ class TestWorkflowCommands:
             proxy="RESIDENTIAL",
             wait=True,
             timeout=450,
+            run_with=None,
             json_output=True,
         )
 
@@ -414,6 +415,7 @@ class TestWorkflowCommands:
             "proxy_location": "RESIDENTIAL",
             "wait": True,
             "timeout_seconds": 450,
+            "run_with": None,
         }
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is True
@@ -449,6 +451,32 @@ class TestWorkflowCommands:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert parsed["error"]["code"] == "RUN_NOT_FOUND"
+
+    def test_workflow_status_cli_preserves_full_detail_behavior(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        tool = AsyncMock(
+            return_value={
+                "ok": True,
+                "action": "skyvern_workflow_status",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": {"run_id": "wr_123", "recording_url": "https://example.com/recording"},
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_status", tool)
+
+        workflow_cmd.workflow_status(run_id="wr_123", json_output=True)
+
+        assert tool.await_args.kwargs == {"run_id": "wr_123", "verbosity": "full"}
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is True
+        assert parsed["data"]["recording_url"] == "https://example.com/recording"
 
     def test_workflow_update_missing_definition_file_raises_bad_parameter(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

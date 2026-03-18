@@ -7,6 +7,7 @@ import {
 } from "./useCredentialModalState";
 import { CredentialsModal } from "./CredentialsModal";
 import { CredentialsList } from "./CredentialsList";
+import { useBackgroundCredentialTest } from "./useBackgroundCredentialTest";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -32,6 +33,7 @@ const DEFAULT_TAB: TabValue = "passwords";
 
 function CredentialsPage() {
   const { setIsOpen, setType } = useCredentialModalState();
+  const { startBackgroundTest } = useBackgroundCredentialTest();
   const [searchParams, setSearchParams] = useSearchParams();
   const tabParam = searchParams.get("tab");
   const matchedTab = TAB_VALUES.find((tab) => tab === tabParam);
@@ -110,22 +112,31 @@ function CredentialsPage() {
         </TabsList>
 
         <TabsContent value="passwords" className="space-y-4">
-          <CredentialsList filter="password" />
+          <CredentialsList
+            filter="password"
+            onStartBackgroundTest={startBackgroundTest}
+          />
         </TabsContent>
 
         <TabsContent value="creditCards" className="space-y-4">
-          <CredentialsList filter="credit_card" />
+          <CredentialsList
+            filter="credit_card"
+            onStartBackgroundTest={startBackgroundTest}
+          />
         </TabsContent>
 
         <TabsContent value="secrets" className="space-y-4">
-          <CredentialsList filter="secret" />
+          <CredentialsList
+            filter="secret"
+            onStartBackgroundTest={startBackgroundTest}
+          />
         </TabsContent>
 
         <TabsContent value="twoFactor" className="space-y-4">
           <CredentialsTotpTab />
         </TabsContent>
       </Tabs>
-      <CredentialsModal />
+      <CredentialsModal onStartBackgroundTest={startBackgroundTest} />
 
       {/* Footer note - only for Passwords and Credit Cards tabs */}
       {activeTab !== "twoFactor" && (

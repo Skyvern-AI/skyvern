@@ -1,6 +1,6 @@
 import { ReloadIcon, StopIcon } from "@radix-ui/react-icons";
 import { useState } from "react";
-import { useParams } from "react-router-dom";
+import { Outlet, useLocation, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
@@ -17,20 +17,26 @@ import {
 } from "@/components/ui/dialog";
 import { BrowserStream } from "@/components/BrowserStream";
 import { LogoMinimized } from "@/components/LogoMinimized";
-import { SwitchBar } from "@/components/SwitchBar";
+import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Toaster } from "@/components/ui/toaster";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useCloseBrowserSessionMutation } from "@/routes/browserSessions/hooks/useCloseBrowserSessionMutation";
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { type BrowserSession as BrowserSessionType } from "@/routes/workflows/types/browserSessionTypes";
 
+import { BrowserSessionDownloads } from "./BrowserSessionDownloads";
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
 
-type TabName = "stream" | "videos";
+type TabName = "stream" | "recordings" | "downloads";
 
 function BrowserSession() {
   const { browserSessionId } = useParams();
-  const [activeTab, setActiveTab] = useState<TabName>("stream");
+  const location = useLocation();
+  const activeTab: TabName = location.pathname.endsWith("/recordings")
+    ? "recordings"
+    : location.pathname.endsWith("/downloads")
+      ? "downloads"
+      : "stream";
   const [isDialogOpen, setIsDialogOpen] = useState(false);
 
   const credentialGetter = useCredentialGetter();
@@ -128,21 +134,11 @@ function BrowserSession() {
 
         {/* Tab Navigation */}
         <div className="flex w-full items-center justify-start gap-2">
-          <SwitchBar
-            className="border-none"
-            onChange={(value) => setActiveTab(value as TabName)}
-            value={activeTab}
+          <SwitchBarNavigation
             options={[
-              {
-                label: "Stream",
-                value: "stream",
-                helpText: "The live stream of the browser session (if active).",
-              },
-              {
-                label: "Recordings",
-                value: "videos",
-                helpText: "All recordings of this browser session.",
-              },
+              { label: "Stream", to: "stream" },
+              { label: "Recordings", to: "recordings" },
+              { label: "Downloads", to: "downloads" },
             ]}
           />
 
@@ -201,16 +197,26 @@ function BrowserSession() {
             />
           </div>
           <div
-            className="h-full w-full"
+            className="absolute left-0 top-0 h-full w-full"
             style={{
-              visibility: activeTab === "videos" ? "visible" : "hidden",
-              pointerEvents: activeTab === "videos" ? "auto" : "none",
+              visibility: activeTab === "recordings" ? "visible" : "hidden",
+              pointerEvents: activeTab === "recordings" ? "auto" : "none",
             }}
           >
             <BrowserSessionVideo />
           </div>
+          <div
+            className="absolute left-0 top-0 h-full w-full"
+            style={{
+              visibility: activeTab === "downloads" ? "visible" : "hidden",
+              pointerEvents: activeTab === "downloads" ? "auto" : "none",
+            }}
+          >
+            <BrowserSessionDownloads />
+          </div>
         </div>
       </div>
+      <Outlet />
       <Toaster />
     </div>
   );

@@ -33,6 +33,27 @@ except ImportError:
 LOG = structlog.get_logger()
 
 
+def format_validation_errors(exc: ValidationError) -> str:
+    """Format a Pydantic ValidationError into a human-readable string.
+
+    Filters out uninformative path segments ('__root__', 'body') and joins
+    multiple errors with '; '.
+    """
+    error_messages = []
+    for error in exc.errors():
+        loc = " -> ".join(str(part) for part in error["loc"] if part not in ("__root__", "body"))
+        msg = error["msg"]
+        if loc:
+            error_messages.append(f"{loc}: {msg}")
+        else:
+            error_messages.append(msg)
+    return (
+        "; ".join(error_messages)
+        if error_messages
+        else "A validation error occurred. Please check your input and try again."
+    )
+
+
 class ExecutionDatePlugin(Plugin):
     key = "execution_date"
 
@@ -70,6 +91,12 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         except Exception:
             LOG.exception("Failed to execute api app startup event")
 
+    # Close browser sessions left active by a previous process
+    try:
+        await forge_app.PERSISTENT_SESSIONS_MANAGER.cleanup_stale_sessions()
+    except Exception:
+        LOG.exception("Failed to clean up stale browser sessions")
+
     # Start cleanup scheduler if enabled
     cleanup_task = start_cleanup_scheduler()
     if cleanup_task:
@@ -90,20 +117,6 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
 
     # Stop cleanup scheduler
     await stop_cleanup_scheduler()
-
-    # Close notification registry (e.g. cancel Redis listener tasks)
-    from skyvern.forge.sdk.notification.factory import NotificationRegistryFactory
-
-    registry = NotificationRegistryFactory.get_registry()
-    if hasattr(registry, "close"):
-        await registry.close()
-
-    # Close shared Redis client (after registry so listener tasks drain first)
-    from skyvern.forge.sdk.redis.factory import RedisClientFactory
-
-    redis_client = RedisClientFactory.get_client()
-    if redis_client is not None:
-        await redis_client.close()
 
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
@@ -175,9 +188,10 @@ def create_api_app() -> FastAPI:
 
     @fastapi_app.exception_handler(ValidationError)
     async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
+        detail = format_validation_errors(exc)
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"detail": str(exc)},
+            content={"detail": detail},
         )
 
     @fastapi_app.exception_handler(Exception)

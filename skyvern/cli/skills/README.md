@@ -1,21 +1,35 @@
 # Skyvern Skills Package
 
-AI-powered browser automation skill for coding agents. Bundled with `pip install skyvern`.
+AI-powered browser automation skills for coding agents. Bundled with `pip install skyvern`.
 
 ## Quick Start
 
 ```bash
 pip install skyvern
-export SKYVERN_API_KEY="YOUR_KEY"   # get one at https://app.skyvern.com
+
+# Recommended local self-hosted path:
+skyvern quickstart   # or: skyvern init
+# choose local
+# choose Claude Code during the MCP step
+
+# You can also configure Claude Code later:
+skyvern setup claude-code
 ```
 
-The skill teaches CLI commands via `skyvern <command>` invocations. For richer
-AI-coding-tool integration, run `skyvern setup claude-code --project` to enable
-MCP (Model Context Protocol) with auto-tool-calling.
+The local wizard path writes project-local `.mcp.json`, pins the MCP command to
+your active Python interpreter, and installs these skills into
+`.claude/skills/` automatically. `skyvern setup claude-code` does the same
+setup later if you skipped it during `quickstart` / `init`.
 
 ## What's Included
 
-A single `skyvern` skill covering all browser automation capabilities:
+### qa
+QA test your frontend changes in a real browser. Reads your `git diff`, generates
+targeted browser tests, runs them against your local dev server, and reports
+pass/fail with screenshots. Invoke with `/qa` in Claude Code.
+
+### skyvern
+CLI reference covering all browser automation capabilities:
 
 - Browser session lifecycle (create, navigate, close)
 - AI actions: act, extract, validate, screenshot
@@ -26,19 +40,27 @@ A single `skyvern` skill covering all browser automation capabilities:
 - Block schema discovery and validation
 - Debugging with screenshot + validate loops
 
+### testing
+Smoke-test skill for verifying Skyvern deployments.
+
 ## Structure
 
 ```
+qa/
+  SKILL.md              Diff-driven frontend QA testing
 skyvern/
   SKILL.md              Main skill file (CLI-first, all capabilities)
   references/           17 deep-dive reference files
   examples/             Workflow JSON examples
+testing/
+  SKILL.md              Deployment smoke testing
 ```
 
-## Install to a Project
+## Manual Install
+
+If you prefer to install skills without running setup:
 
 ```bash
-# Copy skill files to your project
 skyvern skill copy --output .claude/skills
 skyvern skill copy --output .agents/skills
 ```

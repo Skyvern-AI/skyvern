@@ -68,6 +68,7 @@ class PersistentSessionsManager(Protocol):
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
         is_high_priority: bool = False,
+        browser_profile_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...
@@ -102,6 +103,10 @@ class PersistentSessionsManager(Protocol):
 
     async def close_all_sessions(self, organization_id: str) -> None:
         """Close all browser sessions for an organization."""
+        ...
+
+    async def cleanup_stale_sessions(self) -> None:
+        """Clean up sessions left active by a previous process."""
         ...
 
     @classmethod

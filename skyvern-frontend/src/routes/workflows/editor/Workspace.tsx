@@ -287,6 +287,12 @@ function Workspace({
 
   const handleRequestDeleteNode = useCallback(
     (nodeId: string, nodeLabel: string, confirmCallback: () => void) => {
+      const outputKey = getOutputParameterKey(nodeLabel);
+      const affected = getAffectedBlocks(nodes, outputKey);
+      if (affected.length === 0) {
+        confirmCallback();
+        return;
+      }
       deleteConfirmCallbackRef.current = confirmCallback;
       setDeleteBlockDialogState({
         open: true,
@@ -294,7 +300,7 @@ function Workspace({
         nodeLabel,
       });
     },
-    [],
+    [nodes],
   );
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
@@ -304,6 +310,17 @@ function Workspace({
         ? cacheKeyValueParam
         : constructCacheKeyValue({ codeKey: cacheKey, workflow }),
   );
+
+  // Track whether the cache-key-value was explicitly provided in URL or user-selected.
+  // When false, the auto-computed value should NOT appear in the URL.
+  const cacheKeyValueIsExplicitRef = useRef(!!cacheKeyValueParam);
+
+  // Helper that marks the cache key value as explicitly user-selected before updating state.
+  // Centralizes the ref+state pair so future handlers can't forget to set the ref.
+  const setExplicitCacheKeyValue = useCallback((v: string) => {
+    cacheKeyValueIsExplicitRef.current = true;
+    setCacheKeyValue(v);
+  }, []);
 
   const [showAllCode, setShowAllCode] = useState(false);
   const [leftSideLayoutMode, setLeftSideLayoutMode] = useState<
@@ -372,6 +389,22 @@ function Workspace({
 
   useEffect(() => {
     const currentUrlValue = searchParams.get("cache-key-value");
+
+    if (!cacheKeyValueIsExplicitRef.current) {
+      // Auto-computed value: remove param from URL if present
+      if (currentUrlValue !== null) {
+        setSearchParams(
+          (prev) => {
+            const newParams = new URLSearchParams(prev);
+            newParams.delete("cache-key-value");
+            return newParams;
+          },
+          { replace: true },
+        );
+      }
+      return;
+    }
+
     const targetValue = cacheKeyValue === "" ? null : cacheKeyValue;
 
     if (currentUrlValue !== targetValue) {
@@ -397,10 +430,14 @@ function Workspace({
     status: "published",
   });
 
-  const publishedLabelCount = Object.keys(blockScriptsPublished ?? {}).length;
+  const publishedLabelCount = Object.keys(
+    blockScriptsPublished?.blocks ?? {},
+  ).length;
+  const hasPublishedScript =
+    publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
 
   const isGeneratingCode =
-    publishedLabelCount === 0 && !isFinalized && Boolean(workflowRun);
+    !hasPublishedScript && !isFinalized && Boolean(workflowRun);
 
   const { data: blockScriptsPending } = useBlockScriptsQuery({
     cacheKey,
@@ -560,7 +597,7 @@ function Workspace({
   }, [isFinalized, queryClient, workflowRun]);
 
   useEffect(() => {
-    blockScriptStore.setScripts(blockScriptsPublished ?? {});
+    blockScriptStore.setScripts(blockScriptsPublished?.blocks ?? {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [blockScriptsPublished]);
 
@@ -724,6 +761,28 @@ function Workspace({
       window.removeEventListener(
         "conditional-branch-changed",
         handleBranchChange,
+      );
+    };
+  }, [getNodes, getEdges, setNodes, setEdges, blockLabel]);
+
+  // Re-layout when a loop node's header height changes (e.g., data schema toggled)
+  useEffect(() => {
+    const handleLoopHeaderResized = () => {
+      setTimeout(() => {
+        const currentNodes = getNodes() as Array<AppNode>;
+        const currentEdges = getEdges();
+
+        const layoutedElements = layout(currentNodes, currentEdges, blockLabel);
+        setNodes(layoutedElements.nodes);
+        setEdges(layoutedElements.edges);
+      }, 10);
+    };
+
+    window.addEventListener("loop-header-resized", handleLoopHeaderResized);
+    return () => {
+      window.removeEventListener(
+        "loop-header-resized",
+        handleLoopHeaderResized,
       );
     };
   }, [getNodes, getEdges, setNodes, setEdges, blockLabel]);
@@ -944,8 +1003,13 @@ function Workspace({
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
-  const code = getCode(orderedBlockLabels, blockScriptsPublished).join("");
-  const codePending = getCode(orderedBlockLabels, blockScriptsPending).join("");
+  const code = getCode(orderedBlockLabels, blockScriptsPublished?.blocks).join(
+    "",
+  );
+  const codePending = getCode(
+    orderedBlockLabels,
+    blockScriptsPending?.blocks,
+  ).join("");
 
   const handleCompareVersions = (
     version1: WorkflowVersion,
@@ -985,7 +1049,10 @@ function Workspace({
       extraHttpHeaders: workflowData.extra_http_headers
         ? JSON.stringify(workflowData.extra_http_headers)
         : null,
-      runWith: workflowData.run_with ?? null,
+      runWith:
+        workflowData.adaptive_caching && workflowData.run_with === "code"
+          ? "code_v2"
+          : workflowData.run_with ?? "agent",
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
       runSequentially: workflowData.run_sequentially ?? false,
@@ -1032,7 +1099,10 @@ function Workspace({
       extraHttpHeaders: selectedVersion.extra_http_headers
         ? JSON.stringify(selectedVersion.extra_http_headers)
         : null,
-      runWith: selectedVersion.run_with,
+      runWith:
+        selectedVersion.adaptive_caching && selectedVersion.run_with === "code"
+          ? "code_v2"
+          : selectedVersion.run_with ?? "agent",
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       runSequentially: selectedVersion.run_sequentially ?? false,
@@ -1154,12 +1224,12 @@ function Workspace({
           }
           showAllCode={showAllCode}
           onCacheKeyValueAccept={(v) => {
-            setCacheKeyValue(v ?? "");
+            setExplicitCacheKeyValue(v ?? "");
             setCacheKeyValueFilter("");
             closeWorkflowPanel();
           }}
           onCacheKeyValuesBlurred={(v) => {
-            setCacheKeyValue(v ?? "");
+            setExplicitCacheKeyValue(v ?? "");
           }}
           onCacheKeyValuesKeydown={(e) => {
             if (e.key === "Enter") {
@@ -1252,7 +1322,7 @@ function Workspace({
                     setPage(page);
                   }}
                   onSelect={(cacheKeyValue) => {
-                    setCacheKeyValue(cacheKeyValue);
+                    setExplicitCacheKeyValue(cacheKeyValue);
                     setCacheKeyValueFilter("");
                     closeWorkflowPanel();
                   }}
@@ -1327,7 +1397,7 @@ function Workspace({
                         setPage(page);
                       }}
                       onSelect={(cacheKeyValue) => {
-                        setCacheKeyValue(cacheKeyValue);
+                        setExplicitCacheKeyValue(cacheKeyValue);
                         setCacheKeyValueFilter("");
                         closeWorkflowPanel();
                       }}
@@ -1383,7 +1453,7 @@ function Workspace({
                   setPage(page);
                 }}
                 onSelect={(cacheKeyValue) => {
-                  setCacheKeyValue(cacheKeyValue);
+                  setExplicitCacheKeyValue(cacheKeyValue);
                   setCacheKeyValueFilter("");
                   closeWorkflowPanel();
                 }}
@@ -1515,6 +1585,7 @@ function Workspace({
                         }
                         showControlButtons={true}
                         resizeTrigger={windowResizeTrigger}
+                        isExecuting={!!workflowRun && !isFinalized}
                       />
                     </div>
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
@@ -1731,9 +1802,13 @@ function Workspace({
               created_at: new Date().toISOString(),
               modified_at: new Date().toISOString(),
               deleted_at: null,
-              run_with: saveData.settings.runWith,
+              run_with:
+                saveData.settings.runWith === "code_v2"
+                  ? "code"
+                  : saveData.settings.runWith,
               cache_key: saveData.settings.scriptCacheKey,
               ai_fallback: saveData.settings.aiFallback,
+              adaptive_caching: saveData.settings.runWith === "code_v2",
               run_sequentially: saveData.settings.runSequentially,
               sequential_key: saveData.settings.sequentialKey,
               folder_id: null,

@@ -33,6 +33,7 @@ class SkyvernContext:
     browser_container_task_arn: str | None = None
 
     # feature flags
+    enable_page_ready_wait: bool = False
     enable_parse_select_in_extract: bool = False
     use_prompt_caching: bool = False
     cached_static_prompt: str | None = None
@@ -49,10 +50,14 @@ class SkyvernContext:
     prompt: str | None = None
     parent_workflow_run_block_id: str | None = None
     loop_metadata: dict[str, Any] | None = None
+    loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[dict[str, Any]] | None = None
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
     script_mode: bool = False
     ai_mode_override: str | None = None
+    script_llm_call_count: int = 0
+    last_classify_result: str | None = None
+    skip_complete_verification: bool = False
 
     # magic link handling
     # task_id is the key, page is the value

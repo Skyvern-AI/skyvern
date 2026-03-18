@@ -18,6 +18,7 @@ export type WorkflowCreateYAMLRequest = {
   run_with?: string | null;
   cache_key?: string | null;
   ai_fallback?: boolean;
+  adaptive_caching?: boolean;
   run_sequentially?: boolean;
   sequential_key?: string | null;
   folder_id?: string | null;
@@ -142,7 +143,8 @@ export type BlockYAML =
   | Taskv2BlockYAML
   | URLBlockYAML
   | HttpRequestBlockYAML
-  | PrintPageBlockYAML;
+  | PrintPageBlockYAML
+  | WorkflowTriggerBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -360,6 +362,7 @@ export type ForLoopBlockYAML = BlockYAMLBase & {
   loop_blocks: Array<BlockYAML>;
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
+  data_schema?: Record<string, unknown> | string | null;
 };
 
 export type BranchCriteriaYAML = {
@@ -413,5 +416,15 @@ export type PrintPageBlockYAML = BlockYAMLBase & {
   format: string;
   landscape: boolean;
   print_background: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type WorkflowTriggerBlockYAML = BlockYAMLBase & {
+  block_type: "workflow_trigger";
+  workflow_permanent_id: string;
+  payload: Record<string, unknown> | null;
+  wait_for_completion: boolean;
+  browser_session_id?: string | null;
+  use_parent_browser_session?: boolean;
   parameter_keys?: Array<string> | null;
 };
