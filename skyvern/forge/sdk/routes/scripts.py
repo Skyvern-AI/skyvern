@@ -1,8 +1,13 @@
+import asyncio
 import base64
 import hashlib
+from typing import TYPE_CHECKING
 
 import structlog
 from fastapi import BackgroundTasks, Depends, HTTPException, Path, Query, Request
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.db.models import WorkflowScriptModel
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -16,6 +21,8 @@ from skyvern.schemas.scripts import (
     CreateScriptResponse,
     DeployScriptRequest,
     FallbackEpisodeListResponse,
+    PinScriptRequest,
+    PinScriptResponse,
     ReviewScriptRequest,
     ReviewScriptResponse,
     Script,
@@ -23,9 +30,15 @@ from skyvern.schemas.scripts import (
     ScriptBlocksResponse,
     ScriptCacheKeyValuesResponse,
     ScriptFallbackEpisode,
+    ScriptRunsResponse,
+    ScriptRunSummary,
     ScriptStatus,
+    ScriptVersionCompareResponse,
+    ScriptVersionDetailResponse,
     ScriptVersionListResponse,
     ScriptVersionSummary,
+    WorkflowScriptsListResponse,
+    WorkflowScriptSummary,
 )
 from skyvern.services import script_service, workflow_script_service
 from skyvern.services.script_reviewer import ScriptReviewer
@@ -314,6 +327,7 @@ async def get_script_version_code(
     if not script:
         raise HTTPException(status_code=404, detail="Script version not found")
 
+    # script_id doubles as workflow_permanent_id for script-based lookups
     return await get_script_blocks_response(
         script_revision_id=script.script_revision_id,
         organization_id=current_org.organization_id,
@@ -321,6 +335,122 @@ async def get_script_version_code(
         include_main_script=True,
         script_id=script.script_id,
         version=script.version,
+    )
+
+
+@base_router.get(
+    "/scripts/{script_id}/compare",
+    include_in_schema=False,
+    response_model=ScriptVersionCompareResponse,
+)
+@base_router.get(
+    "/scripts/{script_id}/compare/",
+    include_in_schema=False,
+    response_model=ScriptVersionCompareResponse,
+)
+async def compare_script_versions(
+    script_id: str = Path(..., description="The script ID"),
+    base: int = Query(..., description="Base version number"),
+    compare: int = Query(..., description="Compare version number"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptVersionCompareResponse:
+    """Compare two script versions side by side."""
+    organization_id = current_org.organization_id
+
+    base_script, compare_script = await asyncio.gather(
+        app.DATABASE.get_script(script_id=script_id, organization_id=organization_id, version=base),
+        app.DATABASE.get_script(script_id=script_id, organization_id=organization_id, version=compare),
+    )
+    if not base_script:
+        raise HTTPException(status_code=404, detail=f"Base version {base} not found")
+    if not compare_script:
+        raise HTTPException(status_code=404, detail=f"Compare version {compare} not found")
+
+    base_response, compare_response = await asyncio.gather(
+        get_script_blocks_response(
+            script_revision_id=base_script.script_revision_id,
+            organization_id=organization_id,
+            workflow_permanent_id=script_id,
+            include_main_script=True,
+            script_id=base_script.script_id,
+            version=base_script.version,
+        ),
+        get_script_blocks_response(
+            script_revision_id=compare_script.script_revision_id,
+            organization_id=organization_id,
+            workflow_permanent_id=script_id,
+            include_main_script=True,
+            script_id=compare_script.script_id,
+            version=compare_script.version,
+        ),
+    )
+
+    return ScriptVersionCompareResponse(
+        script_id=script_id,
+        base_version=base_script.version,
+        base_blocks=base_response.blocks,
+        base_main_script=base_response.main_script,
+        base_created_at=base_script.created_at,
+        base_run_id=base_script.run_id,
+        compare_version=compare_script.version,
+        compare_blocks=compare_response.blocks,
+        compare_main_script=compare_response.main_script,
+        compare_created_at=compare_script.created_at,
+        compare_run_id=compare_script.run_id,
+    )
+
+
+@base_router.get(
+    "/scripts/{script_id}/versions/{version}/detail",
+    include_in_schema=False,
+    response_model=ScriptVersionDetailResponse,
+)
+@base_router.get(
+    "/scripts/{script_id}/versions/{version}/detail/",
+    include_in_schema=False,
+    response_model=ScriptVersionDetailResponse,
+)
+async def get_script_version_detail(
+    script_id: str = Path(..., description="The script ID"),
+    version: int = Path(..., description="The version number"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptVersionDetailResponse:
+    """Get full detail for a specific script version, including code blocks and metadata."""
+    organization_id = current_org.organization_id
+
+    script = await app.DATABASE.get_script(
+        script_id=script_id,
+        organization_id=organization_id,
+        version=version,
+    )
+    if not script:
+        raise HTTPException(status_code=404, detail="Script version not found")
+
+    # script_id doubles as workflow_permanent_id for script-based lookups
+    blocks_response, fallback_episode_count = await asyncio.gather(
+        get_script_blocks_response(
+            script_revision_id=script.script_revision_id,
+            organization_id=organization_id,
+            workflow_permanent_id=script_id,
+            include_main_script=True,
+            script_id=script.script_id,
+            version=script.version,
+        ),
+        app.DATABASE.get_fallback_episodes_count(
+            organization_id=organization_id,
+            script_revision_id=script.script_revision_id,
+        ),
+    )
+
+    return ScriptVersionDetailResponse(
+        script_id=script.script_id,
+        script_revision_id=script.script_revision_id,
+        version=script.version,
+        created_at=script.created_at,
+        run_id=script.run_id,
+        blocks=blocks_response.blocks,
+        main_script=blocks_response.main_script,
+        fallback_episode_count=fallback_episode_count,
     )
 
 
@@ -706,6 +836,148 @@ async def get_workflow_cache_key_values(
     )
 
 
+@base_router.get(
+    "/scripts/workflows/{workflow_permanent_id}",
+    include_in_schema=False,
+    response_model=WorkflowScriptsListResponse,
+)
+@base_router.get(
+    "/scripts/workflows/{workflow_permanent_id}/",
+    include_in_schema=False,
+    response_model=WorkflowScriptsListResponse,
+)
+async def list_workflow_scripts(
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowScriptsListResponse:
+    """List all scripts (cache key variants) for a workflow with version stats."""
+    organization_id = current_org.organization_id
+
+    # Verify workflow exists (consistent with other script endpoints)
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    workflow_scripts = await app.DATABASE.get_workflow_scripts_by_permanent_id(
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        statuses=[ScriptStatus.published],
+    )
+
+    if not workflow_scripts:
+        return WorkflowScriptsListResponse(scripts=[])
+
+    # Group by cache_key_value -- one row per variant.
+    # Multiple runs can reference the same script; collapse them.
+    by_cache_key: dict[str, list[WorkflowScriptModel]] = {}
+    for ws in workflow_scripts:
+        by_cache_key.setdefault(ws.cache_key_value, []).append(ws)
+
+    # Pick the most recent script per cache_key_value.
+    # Relies on get_workflow_scripts_by_permanent_id() ORDER BY modified_at DESC.
+    representatives: list[WorkflowScriptModel] = []
+    for _ckv, group in by_cache_key.items():
+        representatives.append(group[0])
+
+    if not representatives:
+        return WorkflowScriptsListResponse(scripts=[])
+
+    # Batch queries for version stats and run stats (success_rate + total_runs
+    # computed from the same DB population for consistency).
+    # These are independent -- run in parallel.
+    rep_script_ids = [ws.script_id for ws in representatives]
+    version_stats, run_stats = await asyncio.gather(
+        app.DATABASE.get_script_version_stats(
+            organization_id=organization_id,
+            script_ids=rep_script_ids,
+        ),
+        app.DATABASE.get_script_run_stats(
+            organization_id=organization_id,
+            script_ids=rep_script_ids,
+        ),
+    )
+
+    summaries = []
+    for ws in representatives:
+        latest_version, version_count = version_stats.get(ws.script_id, (0, 0))
+        if version_count == 0:
+            continue
+
+        try:
+            status = ScriptStatus(ws.status) if ws.status else ScriptStatus.published
+        except ValueError:
+            status = ScriptStatus.published
+
+        success_rate, total_runs = run_stats.get(ws.script_id, (None, 0))
+
+        summaries.append(
+            WorkflowScriptSummary(
+                script_id=ws.script_id,
+                cache_key=ws.cache_key,
+                cache_key_value=ws.cache_key_value,
+                status=status,
+                latest_version=latest_version,
+                version_count=version_count,
+                total_runs=total_runs,
+                success_rate=success_rate,
+                is_pinned=bool(ws.is_pinned),
+                created_at=ws.created_at,
+                modified_at=ws.modified_at,
+            )
+        )
+
+    # Sort: published first, then by modified_at DESC
+    summaries.sort(key=lambda s: (s.status != ScriptStatus.published, -s.modified_at.timestamp()))
+    return WorkflowScriptsListResponse(scripts=summaries)
+
+
+@base_router.get(
+    "/scripts/{script_id}/runs",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/scripts/{script_id}/runs/",
+    include_in_schema=False,
+)
+async def get_script_runs(
+    script_id: str = Path(..., description="The script ID"),
+    page_size: int = Query(50, ge=1, le=100),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptRunsResponse:
+    """Get workflow runs associated with a specific script, with status counts."""
+    organization_id = current_org.organization_id
+
+    # Verify script exists
+    script = await app.DATABASE.get_script(script_id=script_id, organization_id=organization_id)
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+
+    runs, total_count, status_counts = await app.DATABASE.get_workflow_runs_for_script(
+        organization_id=organization_id,
+        script_id=script_id,
+        page_size=page_size,
+    )
+
+    return ScriptRunsResponse(
+        runs=[
+            ScriptRunSummary(
+                workflow_run_id=r.workflow_run_id,
+                status=r.status or "unknown",
+                started_at=r.started_at,
+                finished_at=r.finished_at,
+                created_at=r.created_at,
+                failure_reason=r.failure_reason,
+            )
+            for r in runs
+        ],
+        total_count=total_count,
+        status_counts=status_counts,
+    )
+
+
 @base_router.delete(
     "/scripts/{workflow_permanent_id}/value",
     include_in_schema=False,
@@ -826,6 +1098,101 @@ async def clear_workflow_cache(
     return ClearCacheResponse(
         deleted_count=deleted_count,
         message=f"Successfully cleared {deleted_count} database record(s) and {cache_cleared_count} in-memory cache entry(s) for workflow {workflow_permanent_id}",
+    )
+
+
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/pin",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/pin/",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+async def pin_workflow_script(
+    data: PinScriptRequest,
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> PinScriptResponse:
+    """Pin a script for a specific cache key value, preventing auto-updates."""
+    LOG.info(
+        "Pinning workflow script",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+    )
+
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    result = await app.DATABASE.pin_workflow_script(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+        pinned_by=None,
+    )
+
+    if not result:
+        raise HTTPException(status_code=404, detail="No script found for the given cache key value")
+
+    return PinScriptResponse(
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+        is_pinned=True,
+        pinned_at=result.pinned_at,
+    )
+
+
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/unpin",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/unpin/",
+    include_in_schema=False,
+    response_model=PinScriptResponse,
+)
+async def unpin_workflow_script(
+    data: PinScriptRequest,
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> PinScriptResponse:
+    """Unpin a script for a specific cache key value, allowing auto-updates."""
+    LOG.info(
+        "Unpinning workflow script",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+    )
+
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    result = await app.DATABASE.unpin_workflow_script(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+    )
+
+    if not result:
+        raise HTTPException(status_code=404, detail="No script found for the given cache key value")
+
+    return PinScriptResponse(
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=data.cache_key_value,
+        is_pinned=False,
+        pinned_at=None,
     )
 
 

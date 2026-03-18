@@ -428,8 +428,17 @@ class SkyvernPage(Page):
         # Skip fill when value is None (missing parameter) and AI won't generate one.
         # ai='proactive' means the LLM generates the value from the prompt, so None is fine there.
         if value is None and ai != "proactive":
-            LOG.info("Skipping fill — value is None (missing parameter)", selector=selector, prompt=prompt)
-            return ""
+            if prompt:
+                LOG.info(
+                    "Upgrading to proactive — value is None but prompt provided",
+                    selector=selector,
+                    prompt=prompt,
+                    original_ai=ai,
+                )
+                ai = "proactive"
+            else:
+                LOG.info("Skipping fill — value is None and no prompt", selector=selector, prompt=prompt)
+                return ""
 
         timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
         data = kwargs.pop("data", None)
@@ -544,10 +553,20 @@ class SkyvernPage(Page):
         if not selector and not prompt:
             raise ValueError("Missing input: pass a selector and/or a prompt.")
 
-        # Skip when value is None and AI won't generate one
+        # Skip fill when value is None (missing parameter) and AI won't generate one.
+        # ai='proactive' means the LLM generates the value from the prompt, so None is fine there.
         if value is None and ai != "proactive":
-            LOG.info("Skipping fill_autocomplete — value is None (missing parameter)", selector=selector, prompt=prompt)
-            return ""
+            if prompt:
+                LOG.info(
+                    "Upgrading to proactive — value is None but prompt provided",
+                    selector=selector,
+                    prompt=prompt,
+                    original_ai=ai,
+                )
+                ai = "proactive"
+            else:
+                LOG.info("Skipping fill_autocomplete — value is None and no prompt", selector=selector, prompt=prompt)
+                return ""
 
         context = skyvern_context.current()
         if context and context.ai_mode_override:

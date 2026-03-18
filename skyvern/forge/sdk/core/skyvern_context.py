@@ -33,6 +33,7 @@ class SkyvernContext:
     browser_container_task_arn: str | None = None
 
     # feature flags
+    enable_page_ready_wait: bool = False
     enable_parse_select_in_extract: bool = False
     use_prompt_caching: bool = False
     cached_static_prompt: str | None = None

@@ -11,7 +11,14 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from redis.exceptions import LockError
+
+try:
+    from redis.exceptions import LockError
+except ImportError:
+
+    class LockError(Exception):  # type: ignore[no-redef]
+        pass
+
 
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -154,7 +161,15 @@ class TestTriggerScriptReviewerFailureCap:
         mock_lock.__aenter__ = AsyncMock(return_value=mock_lock)
         mock_lock.__aexit__ = AsyncMock(return_value=False)
         self.mock_cache.get_lock = MagicMock(return_value=mock_lock)
+        # Mock is_script_pinned to return False (not pinned) so tests reach the cap logic
+        self._pin_patcher = patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.is_script_pinned",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        self._pin_patcher.start()
         yield  # type: ignore[misc]
+        self._pin_patcher.stop()
         CacheFactory.set_cache(self._original_cache)
 
     @pytest.mark.asyncio

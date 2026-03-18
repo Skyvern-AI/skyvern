@@ -434,6 +434,21 @@ async def generate_workflow_script(
     # 3.5) Post-process: fix static actions inside for-loop blocks
     python_src = _fix_static_actions_in_for_loops(python_src)
 
+    # 3.6) Validate generated Python is syntactically valid before persisting.
+    # A corrupted script will fail to load on the next run, causing the caching
+    # system to regenerate from scratch and lose version history.
+    try:
+        compile(python_src, "<generated_script>", "exec")
+    except SyntaxError as e:
+        LOG.error(
+            "Generated script has syntax error, skipping persist",
+            script_id=script.script_id,
+            version=script.version,
+            error=str(e),
+            lineno=e.lineno,
+        )
+        return
+
     # 4) Persist script and files, then record mapping
     content_bytes = python_src.encode("utf-8")
     content_b64 = base64.b64encode(content_bytes).decode("utf-8")
