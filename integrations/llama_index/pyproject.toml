@@ -36,7 +36,7 @@ override-dependencies = [
     "google-cloud-aiplatform>=1.133.0",
     # Cascading overrides needed to unblock the above security constraints:
     # fastmcp>=2.14.2 requires websockets>=15 (skyvern pins >=12,<15.1)
-    "websockets>=15.0.1,<17",
+    "websockets>=15.0.1,<16",
     # skyvern requires openai>=1.68.2 but llama-index needs <2;
     # keep openai in v1 range for llama-index compatibility
     "openai>=1.40.0,<2",
