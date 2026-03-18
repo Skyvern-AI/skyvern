@@ -7,6 +7,13 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[manifest]
+constraints = [
+    { name = "authlib", specifier = ">=1.6.9" },
+    { name = "pyasn1", specifier = ">=0.6.3" },
+    { name = "pyjwt", specifier = ">=2.12.0" },
+]
+
 [[package]]
 name = "aioboto3"
 version = "14.3.0"
@@ -4186,11 +4193,8 @@ name = "skyvern-langchain"
 version = "0.2.1"
 source = { editable = "." }
 dependencies = [
-    { name = "authlib" },
     { name = "langchain" },
     { name = "langchain-core" },
-    { name = "pyasn1" },
-    { name = "pyjwt" },
     { name = "skyvern" },
     { name = "urllib3" },
 ]
@@ -4202,11 +4206,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "authlib", specifier = ">=1.6.9" },
-    { name = "langchain", specifier = ">=0.3.19" },
+    { name = "langchain", specifier = ">=1.2.0" },
     { name = "langchain-core", specifier = ">=1.2.11" },
-    { name = "pyasn1", specifier = ">=0.6.3" },
-    { name = "pyjwt", specifier = ">=2.12.0" },
     { name = "skyvern", specifier = ">=0.2.0" },
     { name = "urllib3", specifier = ">=2.6.0" },
 ]
