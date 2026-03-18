@@ -73,7 +73,21 @@ function PasswordCredentialContent({
   >(
     totp_type === "email" || totp_type === "text" ? totp_type : "authenticator",
   );
+  const [totpAccordionValue, setTotpAccordionValue] = useState<string>("");
   const [showPassword, setShowPassword] = useState(false);
+
+  // Sync totpMethod and auto-expand accordion when totp_type prop changes
+  // (e.g. edit data arriving after mount)
+  useEffect(() => {
+    setTotpMethod(
+      totp_type === "email" || totp_type === "text"
+        ? totp_type
+        : "authenticator",
+    );
+    if (totp_type && totp_type !== "none") {
+      setTotpAccordionValue("two-factor-authentication");
+    }
+  }, [totp_type]);
   const prevUsernameRef = useRef(username);
   const prevTotpMethodRef = useRef<typeof totpMethod>(totpMethod);
   const totpIdentifierLabel =
@@ -130,10 +144,11 @@ function PasswordCredentialContent({
     prevTotpMethodRef.current = totpMethod;
   }, [totpMethod, totp_identifier, updateValues, username]);
 
-  // Update totp_type when totpMethod changes
+  // Update totp_type when totpMethod changes; also enter edit mode for values
   const handleTotpMethodChange = (
     method: "authenticator" | "email" | "text",
   ) => {
+    onEnableEditValues?.();
     setTotpMethod(method);
     updateValues({
       totp: method === "authenticator" ? totp : "",
@@ -253,7 +268,12 @@ function PasswordCredentialContent({
         )}
       </div>
       <Separator />
-      <Accordion type="single" collapsible>
+      <Accordion
+        type="single"
+        collapsible
+        value={totpAccordionValue}
+        onValueChange={setTotpAccordionValue}
+      >
         <AccordionItem value="two-factor-authentication" className="border-b-0">
           <AccordionTrigger className="py-2">
             Two-Factor Authentication
@@ -264,11 +284,7 @@ function PasswordCredentialContent({
                 Set up Skyvern to automatically retrieve two-factor
                 authentication codes.
               </p>
-              <div
-                className={cn("grid h-36 grid-cols-3 gap-4", {
-                  "pointer-events-none opacity-70": valuesReadOnly,
-                })}
-              >
+              <div className="grid h-36 grid-cols-3 gap-4">
                 <div
                   className={cn(
                     "flex cursor-pointer items-center justify-center gap-2 rounded-lg bg-slate-elevation1 hover:bg-slate-elevation3",

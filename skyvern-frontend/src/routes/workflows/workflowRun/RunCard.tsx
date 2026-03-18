@@ -31,16 +31,15 @@ function RunCard({
 
   return (
     <div
+      data-slot="runcard"
       className={cn(
-        "bg-slate-elevation3",
-        status != null
-          ? "rounded-lg border-2 border-transparent"
-          : "rounded-md border",
+        "rounded-lg bg-slate-elevation4 ring-1 ring-transparent transition-all duration-200",
+        status != null && "border-l-2 border-l-transparent",
         {
-          "cursor-pointer hover:border-slate-50": !!onClick,
+          "cursor-pointer hover:ring-white/20": !!onClick,
           "border-l-destructive": status === "failure",
           "border-l-success": status === "success",
-          "border-slate-50": active,
+          "ring-white/20": active,
         },
         className,
       )}
