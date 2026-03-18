@@ -270,19 +270,10 @@ function WorkflowRunTimelineBlockItem({
   const actions = block.actions ?? [];
   const isFinallyBlock = finallyBlockLabel && block.label === finallyBlockLabel;
 
-  const hasActiveAction =
-    isAction(activeItem) &&
-    Boolean(
-      block.actions?.find(
-        (action) => action.action_id === activeItem.action_id,
-      ),
-    );
-  const isActiveBlock =
-    isWorkflowRunBlock(activeItem) &&
-    activeItem.workflow_run_block_id === block.workflow_run_block_id;
-
   const showDiagnosticLink =
-    isTaskVariantBlock(block) && (hasActiveAction || isActiveBlock);
+    isTaskVariantBlock(block) &&
+    block.task_id !== null &&
+    block.task_id !== undefined;
 
   const refCallback = useCallback((element: HTMLDivElement | null) => {
     if (

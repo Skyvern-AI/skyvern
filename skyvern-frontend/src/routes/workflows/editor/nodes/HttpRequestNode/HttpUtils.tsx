@@ -213,14 +213,14 @@ export function RequestPreview({
 
   return (
     <div className="rounded-md border bg-slate-50 p-3 dark:bg-slate-900/50">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <MethodBadge method={method} />
-          <span className="font-mono text-sm text-slate-600 dark:text-slate-400">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <MethodBadge method={method} className="shrink-0" />
+          <span className="truncate font-mono text-sm text-slate-600 dark:text-slate-400">
             {url || "No URL specified"}
           </span>
           {hasFiles && (
-            <Badge variant="outline" className="text-xs">
+            <Badge variant="outline" className="shrink-0 text-xs">
               Files
             </Badge>
           )}
@@ -229,7 +229,7 @@ export function RequestPreview({
           variant="ghost"
           size="sm"
           onClick={() => setExpanded(!expanded)}
-          className="h-6 text-xs"
+          className="h-6 shrink-0 text-xs"
         >
           {expanded ? "Hide" : "Show"} Details
         </Button>
@@ -237,6 +237,14 @@ export function RequestPreview({
 
       {expanded && (
         <div className="mt-3 space-y-2">
+          {/* URL */}
+          <div>
+            <div className="mb-1 text-xs font-medium">URL:</div>
+            <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-100 p-2 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-400">
+              {url}
+            </pre>
+          </div>
+
           {/* Headers */}
           <div>
             <div className="mb-1 text-xs font-medium">Headers:</div>
