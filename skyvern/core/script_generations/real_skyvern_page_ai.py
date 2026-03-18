@@ -257,6 +257,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 if value and isinstance(data, dict) and "value" not in data:
                     data["value"] = value
 
+                otp_value = None
                 if (totp_identifier or totp_url) and context and organization_id and task_id:
                     if totp_identifier:
                         totp_identifier = _render_template_with_label(totp_identifier, label=self.current_label)

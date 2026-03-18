@@ -6111,13 +6111,17 @@ class AgentDB(BaseAlchemyDB):
                 query = (
                     select(
                         ScriptModel.script_id,
+                        # max(version) must include soft-deleted rows so next-version
+                        # assignment doesn't collide with the unique constraint.
                         func.max(ScriptModel.version),
-                        func.count(ScriptModel.script_revision_id),
+                        # version_count only counts live rows (for display).
+                        func.count(ScriptModel.script_revision_id).filter(
+                            ScriptModel.deleted_at.is_(None),
+                        ),
                     )
                     .filter(
                         ScriptModel.organization_id == organization_id,
                         ScriptModel.script_id.in_(script_ids),
-                        ScriptModel.deleted_at.is_(None),
                     )
                     .group_by(ScriptModel.script_id)
                 )
@@ -6286,6 +6290,16 @@ class AgentDB(BaseAlchemyDB):
                 )
             ).all()
             return [convert_to_script_file(script_file) for script_file in script_files]
+
+    async def soft_delete_script_by_revision(self, script_revision_id: str, organization_id: str) -> None:
+        async with self.Session() as session:
+            await session.execute(
+                update(ScriptModel)
+                .filter_by(script_revision_id=script_revision_id)
+                .filter_by(organization_id=organization_id)
+                .values(deleted_at=datetime.utcnow())
+            )
+            await session.commit()
 
     async def get_script_file_by_id(
         self,
@@ -6661,6 +6675,133 @@ class AgentDB(BaseAlchemyDB):
 
                 query = query.order_by(WorkflowScriptModel.modified_at.desc())
                 return (await session.scalars(query)).all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_runs_for_script(
+        self,
+        organization_id: str,
+        script_id: str,
+        page_size: int = 50,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+    ) -> tuple[list[WorkflowRunModel], int, dict[str, int]]:
+        """Get workflow runs associated with a script, with total count and status counts.
+
+        Returns (runs, total_count, status_counts) where runs is limited by page_size,
+        total_count is derived from the status_counts GROUP BY, and status_counts is a
+        GROUP BY aggregation of statuses across all runs.
+
+        If created_after/created_before are provided, filters runs to those that started
+        within the time window (used for version-scoped queries).
+        """
+        try:
+            async with self.Session() as session:
+                # Subquery: distinct run IDs for this script
+                run_ids_subquery = (
+                    select(distinct(WorkflowScriptModel.workflow_run_id))
+                    .filter_by(organization_id=organization_id, script_id=script_id)
+                    .filter(WorkflowScriptModel.deleted_at.is_(None))
+                    .filter(WorkflowScriptModel.workflow_run_id.isnot(None))
+                )
+
+                # Base filter for workflow runs
+                base_filters = [
+                    WorkflowRunModel.workflow_run_id.in_(run_ids_subquery),
+                    WorkflowRunModel.organization_id == organization_id,
+                ]
+                if created_after is not None:
+                    base_filters.append(WorkflowRunModel.created_at >= created_after)
+                if created_before is not None:
+                    base_filters.append(WorkflowRunModel.created_at < created_before)
+
+                # Count statuses via GROUP BY (also gives us total_count)
+                status_query = (
+                    select(WorkflowRunModel.status, func.count())
+                    .filter(*base_filters)
+                    .group_by(WorkflowRunModel.status)
+                )
+                status_counts = {(s or "unknown"): c for s, c in (await session.execute(status_query)).all()}
+                total_count = sum(status_counts.values())
+
+                if total_count == 0:
+                    return [], 0, {}
+
+                # Get the actual workflow runs (paginated)
+                runs_query = (
+                    select(WorkflowRunModel)
+                    .filter(*base_filters)
+                    .order_by(WorkflowRunModel.created_at.desc())
+                    .limit(page_size)
+                )
+                runs = list((await session.scalars(runs_query)).all())
+
+                return runs, total_count, status_counts
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_script_run_stats(
+        self,
+        organization_id: str,
+        script_ids: list[str],
+    ) -> dict[str, tuple[float | None, int]]:
+        """Get success rate and total run count for each script_id.
+
+        Both metrics are computed from the same population (workflow_scripts joined
+        to workflow_runs), so they are always consistent.
+
+        Returns a dict mapping script_id -> (success_rate, total_runs) where
+        success_rate is 0.0-1.0 or None if no runs.
+        """
+        if not script_ids:
+            return {}
+        try:
+            async with self.Session() as session:
+                # Join workflow_scripts -> workflow_runs, group by script_id and status
+                query = (
+                    select(
+                        WorkflowScriptModel.script_id,
+                        WorkflowRunModel.status,
+                        func.count(distinct(WorkflowRunModel.workflow_run_id)),
+                    )
+                    .join(
+                        WorkflowRunModel,
+                        WorkflowScriptModel.workflow_run_id == WorkflowRunModel.workflow_run_id,
+                    )
+                    .filter(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.script_id.in_(script_ids),
+                        WorkflowScriptModel.deleted_at.is_(None),
+                        WorkflowScriptModel.workflow_run_id.isnot(None),
+                        WorkflowRunModel.organization_id == organization_id,
+                    )
+                    .group_by(WorkflowScriptModel.script_id, WorkflowRunModel.status)
+                )
+                rows = (await session.execute(query)).all()
+
+                # Aggregate per script_id
+                totals: dict[str, int] = {}
+                completed: dict[str, int] = {}
+                for sid, status, count in rows:
+                    totals[sid] = totals.get(sid, 0) + count
+                    if status == "completed":
+                        completed[sid] = completed.get(sid, 0) + count
+
+                return {
+                    sid: (
+                        (completed.get(sid, 0) / totals[sid]) if totals.get(sid) else None,
+                        totals.get(sid, 0),
+                    )
+                    for sid in script_ids
+                }
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
