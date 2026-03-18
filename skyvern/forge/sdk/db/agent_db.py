@@ -199,25 +199,48 @@ def _serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     return result
 
 
-DB_CONNECT_ARGS: dict[str, Any] = {}
+def _build_engine(database_string: str) -> Any:
+    """
+    Build a SQLAlchemy async engine.
 
-if "postgresql+psycopg" in settings.DATABASE_STRING:
-    DB_CONNECT_ARGS = {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"}
-elif "postgresql+asyncpg" in settings.DATABASE_STRING:
-    DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
+    When DISABLE_CONNECTION_POOL=True (NullPool): enforce statement_timeout
+    and allow prepared statements.
+
+    When DISABLE_CONNECTION_POOL=False (QueuePool): disable prepared statements
+    and do not set statement_timeout - set at role level in the database,
+    since the transaction pooler does not maintain session-level settings.
+    """
+    connect_args: dict[str, Any] = {}
+    if settings.DISABLE_CONNECTION_POOL:
+        if "postgresql+psycopg" in database_string:
+            connect_args["options"] = f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"
+        if "postgresql+asyncpg" in database_string:
+            connect_args["server_settings"] = {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}
+        return create_async_engine(
+            database_string,
+            json_serializer=_custom_json_serializer,
+            connect_args=connect_args,
+            poolclass=pool.NullPool,
+        )
+
+    else:
+        if "postgresql+psycopg" in database_string:
+            connect_args["prepare_threshold"] = None
+        if "postgresql+asyncpg" in database_string:
+            connect_args["statement_cache_size"] = 0
+        return create_async_engine(
+            database_string,
+            json_serializer=_custom_json_serializer,
+            connect_args=connect_args,
+            pool_pre_ping=True,
+            pool_size=settings.DATABASE_POOL_SIZE,
+            max_overflow=settings.DATABASE_POOL_MAX_OVERFLOW,
+        )
 
 
 class AgentDB(BaseAlchemyDB):
     def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
-        super().__init__(
-            db_engine
-            or create_async_engine(
-                database_string,
-                json_serializer=_custom_json_serializer,
-                connect_args=DB_CONNECT_ARGS,
-                poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
-            )
-        )
+        super().__init__(db_engine or _build_engine(database_string))
         self.debug_enabled = debug_enabled
 
     def is_retryable_error(self, error: SQLAlchemyError) -> bool:
@@ -1807,7 +1830,7 @@ class AgentDB(BaseAlchemyDB):
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         run_with: str | None = None,
-        ai_fallback: bool = False,
+        ai_fallback: bool = True,
         cache_key: str | None = None,
         adaptive_caching: bool = False,
         generate_script_on_terminal: bool = False,
@@ -3200,18 +3223,22 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def get_last_workflow_run_for_browser_session(
+    async def _get_last_workflow_run_by_filter(
         self,
-        browser_session_id: str,
         organization_id: str | None = None,
+        **filters: str,
     ) -> WorkflowRun | None:
+        """Get the last queued or running workflow run matching the given column filters.
+
+        Used for browser_session_id and browser_address sequential execution.
+        """
         try:
             async with self.Session() as session:
-                # check if there's a queued run
-                query = select(WorkflowRunModel).filter_by(browser_session_id=browser_session_id)
+                query = select(WorkflowRunModel).filter_by(**filters)
                 if organization_id:
                     query = query.filter_by(organization_id=organization_id)
 
+                # check if there's a queued run
                 queue_query = query.filter_by(status=WorkflowRunStatus.queued)
                 queue_query = queue_query.order_by(WorkflowRunModel.modified_at.desc())
                 workflow_run = (await session.scalars(queue_query)).first()
@@ -3229,6 +3256,26 @@ class AgentDB(BaseAlchemyDB):
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
+
+    async def get_last_workflow_run_for_browser_session(
+        self,
+        browser_session_id: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRun | None:
+        return await self._get_last_workflow_run_by_filter(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
+
+    async def get_last_workflow_run_for_browser_address(
+        self,
+        browser_address: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRun | None:
+        return await self._get_last_workflow_run_by_filter(
+            organization_id=organization_id,
+            browser_address=browser_address,
+        )
 
     async def get_workflows_depending_on(
         self,
@@ -4608,6 +4655,8 @@ class AgentDB(BaseAlchemyDB):
         output: dict | list | str | None = None,
         continue_on_failure: bool = False,
         engine: RunEngine | None = None,
+        current_value: str | None = None,
+        current_index: int | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             new_workflow_run_block = WorkflowRunBlockModel(
@@ -4621,6 +4670,8 @@ class AgentDB(BaseAlchemyDB):
                 output=output,
                 continue_on_failure=continue_on_failure,
                 engine=engine,
+                current_value=current_value,
+                current_index=current_index,
             )
             session.add(new_workflow_run_block)
             await session.commit()
@@ -5471,6 +5522,7 @@ class AgentDB(BaseAlchemyDB):
         card_brand: str | None,
         totp_identifier: str | None = None,
         secret_label: str | None = None,
+        user_context: str | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = CredentialModel(
@@ -5485,6 +5537,7 @@ class AgentDB(BaseAlchemyDB):
                 card_last4=card_last4,
                 card_brand=card_brand,
                 secret_label=secret_label,
+                user_context=user_context,
             )
             session.add(credential)
             await session.commit()
@@ -5526,6 +5579,7 @@ class AgentDB(BaseAlchemyDB):
         name: str | None = None,
         browser_profile_id: str | None | object = _UNSET,
         tested_url: str | None | object = _UNSET,
+        user_context: str | None | object = _UNSET,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -5544,6 +5598,8 @@ class AgentDB(BaseAlchemyDB):
                 credential.browser_profile_id = browser_profile_id
             if tested_url is not _UNSET:
                 credential.tested_url = tested_url
+            if user_context is not _UNSET:
+                credential.user_context = user_context
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
@@ -6016,6 +6072,78 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_script_versions(
+        self,
+        script_id: str,
+        organization_id: str,
+    ) -> list[Script]:
+        """Get all versions of a script, ordered by version DESC."""
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ScriptModel)
+                    .filter(
+                        ScriptModel.script_id == script_id,
+                        ScriptModel.organization_id == organization_id,
+                        ScriptModel.deleted_at.is_(None),
+                    )
+                    .order_by(ScriptModel.version.desc())
+                )
+                result = await session.scalars(query)
+                return [convert_to_script(row) for row in result.all()]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_script_version_stats(
+        self,
+        organization_id: str,
+        script_ids: list[str],
+    ) -> dict[str, tuple[int, int]]:
+        """Return {script_id: (latest_version, version_count)} for the given script IDs."""
+        if not script_ids:
+            return {}
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(
+                        ScriptModel.script_id,
+                        # max(version) must include soft-deleted rows so next-version
+                        # assignment doesn't collide with the unique constraint.
+                        func.max(ScriptModel.version),
+                        # version_count only counts live rows (for display).
+                        func.count(ScriptModel.script_revision_id).filter(
+                            ScriptModel.deleted_at.is_(None),
+                        ),
+                    )
+                    .filter(
+                        ScriptModel.organization_id == organization_id,
+                        ScriptModel.script_id.in_(script_ids),
+                    )
+                    .group_by(ScriptModel.script_id)
+                )
+                rows = (await session.execute(query)).all()
+                return {row[0]: (row[1], row[2]) for row in rows}
+        except SQLAlchemyError:
+            LOG.error(
+                "SQLAlchemyError in get_script_version_stats",
+                organization_id=organization_id,
+                script_ids=script_ids,
+                exc_info=True,
+            )
+            raise
+        except Exception:
+            LOG.error(
+                "UnexpectedError in get_script_version_stats",
+                organization_id=organization_id,
+                script_ids=script_ids,
+                exc_info=True,
+            )
+            raise
+
     async def get_script_revision(self, script_revision_id: str, organization_id: str) -> Script | None:
         async with self.Session() as session:
             script = (
@@ -6162,6 +6290,16 @@ class AgentDB(BaseAlchemyDB):
                 )
             ).all()
             return [convert_to_script_file(script_file) for script_file in script_files]
+
+    async def soft_delete_script_by_revision(self, script_revision_id: str, organization_id: str) -> None:
+        async with self.Session() as session:
+            await session.execute(
+                update(ScriptModel)
+                .filter_by(script_revision_id=script_revision_id)
+                .filter_by(organization_id=organization_id)
+                .values(deleted_at=datetime.utcnow())
+            )
+            await session.commit()
 
     async def get_script_file_by_id(
         self,
@@ -6314,6 +6452,7 @@ class AgentDB(BaseAlchemyDB):
                 .filter_by(organization_id=organization_id)
                 .filter_by(workflow_permanent_id=workflow_permanent_id)
                 .filter_by(workflow_run_id=workflow_run_id)
+                .filter(WorkflowScriptModel.deleted_at.is_(None))
             )
             if statuses:
                 query = query.filter(WorkflowScriptModel.status.in_(statuses))
@@ -6361,7 +6500,7 @@ class AgentDB(BaseAlchemyDB):
                 if statuses is not None and len(statuses) > 0:
                     query = query.where(WorkflowScriptModel.status.in_(statuses))
 
-                query = query.order_by(ScriptModel.created_at.desc(), ScriptModel.version.desc()).limit(1)
+                query = query.order_by(ScriptModel.version.desc()).limit(1)
 
                 script = (await session.scalars(query)).first()
                 return convert_to_script(script) if script else None
@@ -6534,7 +6673,253 @@ class AgentDB(BaseAlchemyDB):
                 if statuses:
                     query = query.filter(WorkflowScriptModel.status.in_([s.value for s in statuses]))
 
+                query = query.order_by(WorkflowScriptModel.modified_at.desc())
                 return (await session.scalars(query)).all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_runs_for_script(
+        self,
+        organization_id: str,
+        script_id: str,
+        page_size: int = 50,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+    ) -> tuple[list[WorkflowRunModel], int, dict[str, int]]:
+        """Get workflow runs associated with a script, with total count and status counts.
+
+        Returns (runs, total_count, status_counts) where runs is limited by page_size,
+        total_count is derived from the status_counts GROUP BY, and status_counts is a
+        GROUP BY aggregation of statuses across all runs.
+
+        If created_after/created_before are provided, filters runs to those that started
+        within the time window (used for version-scoped queries).
+        """
+        try:
+            async with self.Session() as session:
+                # Subquery: distinct run IDs for this script
+                run_ids_subquery = (
+                    select(distinct(WorkflowScriptModel.workflow_run_id))
+                    .filter_by(organization_id=organization_id, script_id=script_id)
+                    .filter(WorkflowScriptModel.deleted_at.is_(None))
+                    .filter(WorkflowScriptModel.workflow_run_id.isnot(None))
+                )
+
+                # Base filter for workflow runs
+                base_filters = [
+                    WorkflowRunModel.workflow_run_id.in_(run_ids_subquery),
+                    WorkflowRunModel.organization_id == organization_id,
+                ]
+                if created_after is not None:
+                    base_filters.append(WorkflowRunModel.created_at >= created_after)
+                if created_before is not None:
+                    base_filters.append(WorkflowRunModel.created_at < created_before)
+
+                # Count statuses via GROUP BY (also gives us total_count)
+                status_query = (
+                    select(WorkflowRunModel.status, func.count())
+                    .filter(*base_filters)
+                    .group_by(WorkflowRunModel.status)
+                )
+                status_counts = {(s or "unknown"): c for s, c in (await session.execute(status_query)).all()}
+                total_count = sum(status_counts.values())
+
+                if total_count == 0:
+                    return [], 0, {}
+
+                # Get the actual workflow runs (paginated)
+                runs_query = (
+                    select(WorkflowRunModel)
+                    .filter(*base_filters)
+                    .order_by(WorkflowRunModel.created_at.desc())
+                    .limit(page_size)
+                )
+                runs = list((await session.scalars(runs_query)).all())
+
+                return runs, total_count, status_counts
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_script_run_stats(
+        self,
+        organization_id: str,
+        script_ids: list[str],
+    ) -> dict[str, tuple[float | None, int]]:
+        """Get success rate and total run count for each script_id.
+
+        Both metrics are computed from the same population (workflow_scripts joined
+        to workflow_runs), so they are always consistent.
+
+        Returns a dict mapping script_id -> (success_rate, total_runs) where
+        success_rate is 0.0-1.0 or None if no runs.
+        """
+        if not script_ids:
+            return {}
+        try:
+            async with self.Session() as session:
+                # Join workflow_scripts -> workflow_runs, group by script_id and status
+                query = (
+                    select(
+                        WorkflowScriptModel.script_id,
+                        WorkflowRunModel.status,
+                        func.count(distinct(WorkflowRunModel.workflow_run_id)),
+                    )
+                    .join(
+                        WorkflowRunModel,
+                        WorkflowScriptModel.workflow_run_id == WorkflowRunModel.workflow_run_id,
+                    )
+                    .filter(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.script_id.in_(script_ids),
+                        WorkflowScriptModel.deleted_at.is_(None),
+                        WorkflowScriptModel.workflow_run_id.isnot(None),
+                        WorkflowRunModel.organization_id == organization_id,
+                    )
+                    .group_by(WorkflowScriptModel.script_id, WorkflowRunModel.status)
+                )
+                rows = (await session.execute(query)).all()
+
+                # Aggregate per script_id
+                totals: dict[str, int] = {}
+                completed: dict[str, int] = {}
+                for sid, status, count in rows:
+                    totals[sid] = totals.get(sid, 0) + count
+                    if status == "completed":
+                        completed[sid] = completed.get(sid, 0) + count
+
+                return {
+                    sid: (
+                        (completed.get(sid, 0) / totals[sid]) if totals.get(sid) else None,
+                        totals.get(sid, 0),
+                    )
+                    for sid in script_ids
+                }
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    # ── Script Pinning ─────────────────────────────────────────────────
+
+    async def is_script_pinned(
+        self,
+        organization_id: str,
+        script_id: str,
+    ) -> bool:
+        """Check if any active workflow_script row for this script_id is pinned."""
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(WorkflowScriptModel.is_pinned)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.script_id == script_id,
+                        WorkflowScriptModel.is_pinned.is_(True),
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                    .limit(1)
+                )
+                result = await session.scalars(query)
+                return result.first() is not None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def pin_workflow_script(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+        pinned_by: str | None = None,
+    ) -> WorkflowScriptModel | None:
+        """Pin all workflow scripts for a given cache key value."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                    .values(
+                        is_pinned=True,
+                        pinned_at=datetime.utcnow(),
+                        pinned_by=pinned_by,
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+
+                # Return the first updated model for the response
+                query = (
+                    select(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key_value=cache_key_value)
+                    .filter_by(deleted_at=None)
+                    .limit(1)
+                )
+                result = await session.scalars(query)
+                return result.first()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def unpin_workflow_script(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+    ) -> WorkflowScriptModel | None:
+        """Unpin workflow scripts for a given cache key value."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                    .values(
+                        is_pinned=False,
+                        pinned_at=None,
+                        pinned_by=None,
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+
+                # Return the first updated model for the response
+                query = (
+                    select(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key_value=cache_key_value)
+                    .filter_by(deleted_at=None)
+                    .limit(1)
+                )
+                result = await session.scalars(query)
+                return result.first()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -6649,6 +7034,109 @@ class AgentDB(BaseAlchemyDB):
                     .where(ScriptFallbackEpisodeModel.organization_id == organization_id)
                 )
                 await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_fallback_episodes(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        page: int = 1,
+        page_size: int = 20,
+        workflow_run_id: str | None = None,
+        block_label: str | None = None,
+        reviewed: bool | None = None,
+        fallback_type: str | None = None,
+    ) -> list[ScriptFallbackEpisode]:
+        try:
+            async with self.Session() as session:
+                query = select(ScriptFallbackEpisodeModel).filter(
+                    ScriptFallbackEpisodeModel.organization_id == organization_id,
+                    ScriptFallbackEpisodeModel.workflow_permanent_id == workflow_permanent_id,
+                )
+                if workflow_run_id is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.workflow_run_id == workflow_run_id)
+                if block_label is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.block_label == block_label)
+                if reviewed is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.reviewed == reviewed)
+                if fallback_type is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.fallback_type == fallback_type)
+
+                offset = (page - 1) * page_size
+                query = query.order_by(ScriptFallbackEpisodeModel.created_at.desc()).limit(page_size).offset(offset)
+
+                result = await session.scalars(query)
+                return [ScriptFallbackEpisode.model_validate(row) for row in result.all()]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_fallback_episodes_count(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str | None = None,
+        workflow_run_id: str | None = None,
+        block_label: str | None = None,
+        reviewed: bool | None = None,
+        fallback_type: str | None = None,
+        script_revision_id: str | None = None,
+    ) -> int:
+        """Count fallback episodes matching the given filters.
+
+        At least one scoping filter (workflow_permanent_id, workflow_run_id,
+        or script_revision_id) should be provided. Without any, this returns
+        the total count for the entire organization which is rarely intended.
+        """
+        if workflow_permanent_id is None and workflow_run_id is None and script_revision_id is None:
+            LOG.warning(
+                "get_fallback_episodes_count called without any scoping filter",
+                organization_id=organization_id,
+            )
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(func.count())
+                    .select_from(ScriptFallbackEpisodeModel)
+                    .filter(
+                        ScriptFallbackEpisodeModel.organization_id == organization_id,
+                    )
+                )
+                if workflow_permanent_id is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.workflow_permanent_id == workflow_permanent_id)
+                if workflow_run_id is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.workflow_run_id == workflow_run_id)
+                if block_label is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.block_label == block_label)
+                if reviewed is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.reviewed == reviewed)
+                if fallback_type is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.fallback_type == fallback_type)
+                if script_revision_id is not None:
+                    query = query.filter(ScriptFallbackEpisodeModel.script_revision_id == script_revision_id)
+
+                result = await session.scalar(query)
+                return result or 0
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_fallback_episode(
+        self,
+        episode_id: str,
+        organization_id: str,
+    ) -> ScriptFallbackEpisode | None:
+        try:
+            async with self.Session() as session:
+                query = select(ScriptFallbackEpisodeModel).filter(
+                    ScriptFallbackEpisodeModel.episode_id == episode_id,
+                    ScriptFallbackEpisodeModel.organization_id == organization_id,
+                )
+                result = await session.scalar(query)
+                if result:
+                    return ScriptFallbackEpisode.model_validate(result)
+                return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

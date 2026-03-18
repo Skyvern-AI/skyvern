@@ -6,7 +6,7 @@ import enum
 import typing as t
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_Action,
@@ -103,10 +103,9 @@ class TargetInfo(BaseModel):
 
 
 class CdpEventFrame(BaseModel):
-    url: str | None = None
+    model_config = ConfigDict(extra="allow")
 
-    class Config:
-        extra = "allow"
+    url: str | None = None
 
 
 class ExfiltratedEventCdpParams(BaseModel):

@@ -33,6 +33,13 @@ from .credential import (
     skyvern_credential_get,
     skyvern_credential_list,
 )
+from .folder import (
+    skyvern_folder_create,
+    skyvern_folder_delete,
+    skyvern_folder_get,
+    skyvern_folder_list,
+    skyvern_folder_update,
+)
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
 from .session import (
     skyvern_browser_session_close,
@@ -41,6 +48,7 @@ from .session import (
     skyvern_browser_session_get,
     skyvern_browser_session_list,
 )
+from .telemetry import MCPTelemetryMiddleware
 from .workflow import (
     skyvern_workflow_cancel,
     skyvern_workflow_create,
@@ -50,6 +58,7 @@ from .workflow import (
     skyvern_workflow_run,
     skyvern_workflow_status,
     skyvern_workflow_update,
+    skyvern_workflow_update_folder,
 )
 
 mcp = FastMCP(
@@ -197,6 +206,7 @@ Validate blocks with skyvern_block_validate() before submitting.
 Split workflows into multiple blocks — one block per logical step — rather than cramming everything into a single block.
 Use **navigation** blocks for actions (filling forms, clicking buttons) and **extraction** blocks for pulling data.
 Do NOT use the deprecated "task" or "task_v2" block types — use "navigation" for actions and "extraction" for data extraction. These replacements give clearer semantics and are what the Skyvern UI uses. Existing workflows with task/task_v2 blocks will continue to work — do not convert them unless the user asks. New workflows must use navigation/extraction.
+For **text_prompt** blocks, default to Skyvern Optimized by omitting both `model` and `llm_key`. If an explicit model is required, use `model: {"model_name": "<value from /models>"}`. Do not invent internal `llm_key` strings.
 
 GOOD (4 blocks, each with clear single responsibility):
   Block 1 (navigation): "Select Sole Proprietor and click Continue"
@@ -248,6 +258,7 @@ To get xpaths, use skyvern_click during MCP exploration — its `resolved_select
 gives you the xpath the AI resolved to. Then hardcode that xpath with a prompt fallback in your script.
 """,
 )
+mcp.add_middleware(MCPTelemetryMiddleware())
 
 # -- Browser session management --
 mcp.tool()(skyvern_browser_session_create)
@@ -284,11 +295,19 @@ mcp.tool()(skyvern_credential_list)
 mcp.tool()(skyvern_credential_get)
 mcp.tool()(skyvern_credential_delete)
 
+# -- Folder management (no browser needed) --
+mcp.tool()(skyvern_folder_list)
+mcp.tool()(skyvern_folder_create)
+mcp.tool()(skyvern_folder_get)
+mcp.tool()(skyvern_folder_update)
+mcp.tool()(skyvern_folder_delete)
+
 # -- Workflow management (CRUD + execution, no browser needed) --
 mcp.tool()(skyvern_workflow_list)
 mcp.tool()(skyvern_workflow_get)
 mcp.tool()(skyvern_workflow_create)
 mcp.tool()(skyvern_workflow_update)
+mcp.tool()(skyvern_workflow_update_folder)
 mcp.tool()(skyvern_workflow_delete)
 mcp.tool()(skyvern_workflow_run)
 mcp.tool()(skyvern_workflow_status)
@@ -332,11 +351,18 @@ __all__ = [
     "skyvern_credential_list",
     "skyvern_credential_get",
     "skyvern_credential_delete",
+    # Folder management
+    "skyvern_folder_list",
+    "skyvern_folder_create",
+    "skyvern_folder_get",
+    "skyvern_folder_update",
+    "skyvern_folder_delete",
     # Workflow management
     "skyvern_workflow_list",
     "skyvern_workflow_get",
     "skyvern_workflow_create",
     "skyvern_workflow_update",
+    "skyvern_workflow_update_folder",
     "skyvern_workflow_delete",
     "skyvern_workflow_run",
     "skyvern_workflow_status",

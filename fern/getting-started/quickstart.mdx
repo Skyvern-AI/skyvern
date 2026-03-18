@@ -42,8 +42,10 @@ You can also run browser tasks locally with Python code, with a little bit of se
 
 1. **Configure Skyvern** Run the setup wizard which will guide you through the configuration process. This will generate a `.env` as the configuration settings file.
         ```bash
-        skyvern init
+        skyvern quickstart
+        # or: skyvern init
         ```
+        If you choose `local` and then `Claude Code` during the MCP step, Skyvern writes project-local `.mcp.json`, installs `.claude/skills/qa`, and keeps the whole path local so Claude Code can test `localhost` directly without Skyvern Cloud or tunneling.
 
 2. **Run Task In Python Code**
         ```python

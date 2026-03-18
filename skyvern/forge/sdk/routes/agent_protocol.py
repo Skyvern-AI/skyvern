@@ -24,6 +24,7 @@ from pydantic import ValidationError
 
 from skyvern import analytics
 from skyvern._version import __version__
+from skyvern.analytics import get_oss_version
 from skyvern.config import settings
 from skyvern.exceptions import (
     MissingBrowserAddressError,
@@ -558,6 +559,8 @@ async def create_workflow_legacy(
         )
     except WorkflowDefinitionValidationException as e:
         raise e
+    except (SkyvernHTTPException, ValidationError) as e:
+        raise e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
         raise FailedToCreateWorkflow(str(e))
@@ -620,6 +623,8 @@ async def create_workflow(
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
     except WorkflowDefinitionValidationException as e:
+        raise e
+    except (SkyvernHTTPException, ValidationError) as e:
         raise e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
@@ -1075,8 +1080,10 @@ async def delete_workflow(
 @base_router.post(
     "/folders",
     response_model=Folder,
-    tags=["Workflows"],
-    include_in_schema=False,
+    tags=["Workflow Folders"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "create_folder",
+    },
     description="Create a new folder to organize workflows",
     summary="Create folder",
     responses={
@@ -1115,8 +1122,10 @@ async def create_folder(
 @base_router.get(
     "/folders/{folder_id}",
     response_model=Folder,
-    tags=["Workflows"],
-    include_in_schema=False,
+    tags=["Workflow Folders"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_folder",
+    },
     description="Get a specific folder by ID",
     summary="Get folder",
     responses={
@@ -1157,8 +1166,10 @@ async def get_folder(
 @base_router.get(
     "/folders",
     response_model=list[Folder],
-    tags=["Workflows"],
-    include_in_schema=False,
+    tags=["Workflow Folders"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_folders",
+    },
     description="Get all folders for the organization",
     summary="Get folders",
     responses={
@@ -1212,8 +1223,10 @@ async def get_folders(
 @base_router.put(
     "/folders/{folder_id}",
     response_model=Folder,
-    tags=["Workflows"],
-    include_in_schema=False,
+    tags=["Workflow Folders"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "update_folder",
+    },
     description="Update a folder's title or description",
     summary="Update folder",
     responses={
@@ -1256,8 +1269,10 @@ async def update_folder(
 @legacy_base_router.delete("/folders/{folder_id}/", include_in_schema=False)
 @base_router.delete(
     "/folders/{folder_id}",
-    tags=["Workflows"],
-    include_in_schema=False,
+    tags=["Workflow Folders"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "delete_folder",
+    },
     description="Delete a folder. Optionally delete all workflows in the folder.",
     summary="Delete folder",
     responses={
@@ -1290,8 +1305,10 @@ async def delete_folder(
 @base_router.put(
     "/workflows/{workflow_permanent_id}/folder",
     response_model=Workflow,
-    tags=["Workflows"],
-    include_in_schema=False,
+    tags=["Workflow Folders"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "update_workflow_folder",
+    },
     description="Update a workflow's folder assignment for the latest version",
     summary="Update workflow folder",
     responses={
@@ -1690,6 +1707,19 @@ async def heartbeat() -> Response:
     Check if the server is running.
     """
     return Response(content="Server is running.", status_code=200, headers={"X-Skyvern-API-Version": __version__})
+
+
+@legacy_base_router.get(
+    "/version",
+    tags=["server"],
+    include_in_schema=False,
+)
+@legacy_base_router.get("/version/", include_in_schema=False)
+async def get_version() -> dict[str, str]:
+    """
+    Get the current server version.
+    """
+    return {"version": get_oss_version()}
 
 
 @legacy_base_router.get(

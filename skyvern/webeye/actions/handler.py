@@ -535,7 +535,36 @@ class ActionHandler:
         page: Page,
         action: Action,
     ) -> list[ActionResult]:
-        LOG.info("Handling action", action=action)
+        LOG.info(
+            "Handling action",
+            action_type=action.action_type,
+            action_id=action.action_id,
+            status=action.status,
+            source_action_id=action.source_action_id,
+            step_order=action.step_order,
+            action_order=action.action_order,
+            confidence_float=action.confidence_float,
+            description=action.description,
+            reasoning=action.reasoning,
+            intention=action.intention,
+            response=action.response,
+            element_id=action.element_id,
+            errors=action.errors,
+            file_name=action.file_name,
+            file_url=action.file_url,
+            download=action.download,
+            download_triggered=action.download_triggered,
+            is_upload_file_tag=action.is_upload_file_tag,
+            text=action.text,
+            input_or_select_context=action.input_or_select_context,
+            option=action.option,
+            is_checked=action.is_checked,
+            verified=action.verified,
+            click_context=action.click_context,
+            totp_timing_info=action.totp_timing_info,
+            has_mini_agent=action.has_mini_agent,
+            skip_auto_complete_tab=action.skip_auto_complete_tab,
+        )
         actions_result: list[ActionResult] = []
         llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
         try:
@@ -2101,9 +2130,18 @@ async def handle_terminate_action(
     step: Step,
 ) -> list[ActionResult]:
     if task.error_code_mapping:
-        action.errors = await extract_user_defined_errors(
-            task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
-        )
+        try:
+            action.errors = await extract_user_defined_errors(
+                task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
+            )
+        except Exception:
+            LOG.warning(
+                "extract_user_defined_errors failed, using errors from action reasoning",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                action_errors=action.errors,
+                exc_info=True,
+            )
     return [ActionSuccess()]
 
 

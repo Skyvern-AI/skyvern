@@ -1,0 +1,151 @@
+---
+title: Skyvern Documentation
+slug: /
+mode: custom
+---
+
+<div className="sk-page">
+
+{/* ===== HERO ===== */}
+
+<div className="sk-hero">
+  <div className="sk-hero-inner">
+    <div className="sk-hero-left">
+      <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "12px" }}>
+        <p className="sk-mono sk-label" style={{ margin: "0" }}>DOCUMENTATION</p>
+        <a href="/changelog" className="sk-version-badge">v1.0.22 — latest</a>
+      </div>
+      <h1 className="sk-hero-title">
+        Automate any<br />browser workflow<br /><span className="sk-hero-accent">with AI.</span>
+      </h1>
+      <p className="sk-hero-sub">
+        Describe what you want in plain English. Skyvern opens a real browser, reads the page visually, and completes the task.
+      </p>
+      <div className="sk-hero-actions">
+        <a href="/getting-started/quickstart" className="sk-btn-primary">Get started with the API →</a>
+        <a href="/cloud/getting-started/overview" className="sk-btn-secondary">Use the dashboard</a>
+      </div>
+    </div>
+    <div className="sk-hero-right">
+      <div className="sk-terminal">
+        <div className="sk-terminal-bar">
+          <span className="sk-dot sk-dot-red"></span>
+          <span className="sk-dot sk-dot-yellow"></span>
+          <span className="sk-dot sk-dot-green"></span>
+          <span className="sk-terminal-title">skyvern.log</span>
+        </div>
+        <div className="sk-terminal-body">
+          <p className="sk-mono">> Initializing browser session...</p>
+          <p className="sk-mono sk-t-teal">> Navigating to target URL... [OK]</p>
+          <p className="sk-mono sk-t-teal">> Analyzing page with vision... [OK]</p>
+          <p className="sk-mono">> Planning actions...</p>
+          <p className="sk-mono sk-t-orange">→ ACTIONS_PLANNED: 4</p>
+          <p className="sk-mono">> Executing: fill_form</p>
+          <p className="sk-mono">> Executing: click_submit</p>
+          <p className="sk-mono sk-t-teal">> Task completed successfully</p>
+          <p className="sk-mono sk-t-muted">→ DURATION: 3.2s</p>
+          <p className="sk-mono">> READY<span className="sk-cursor">▊</span></p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{/* ===== BENTO GRID — 3 PERSONA LANES ===== */}
+
+<div className="sk-bento-row sk-bento-3col">
+  <div className="sk-bento-cell">
+    <p className="sk-mono sk-label">01 — NO CODE</p>
+    <h3 className="sk-cell-title">Automate without code</h3>
+    <p className="sk-cell-desc">Use the dashboard to run tasks and build workflows visually.</p>
+    <div className="sk-cell-links">
+      <a href="/cloud/getting-started/overview" className="sk-cell-link">Dashboard overview <span className="sk-arrow">↗</span></a>
+      <a href="/cloud/getting-started/run-your-first-task" className="sk-cell-link">Run your first task <span className="sk-arrow">↗</span></a>
+      <a href="/cloud/building-workflows/build-a-workflow" className="sk-cell-link">Build a workflow <span className="sk-arrow">↗</span></a>
+      <a href="/integrations/zapier" className="sk-cell-link">Connect to Zapier <span className="sk-arrow">↗</span></a>
+    </div>
+  </div>
+  <div className="sk-bento-cell">
+    <p className="sk-mono sk-label">02 — API</p>
+    <h3 className="sk-cell-title">Build with the API</h3>
+    <p className="sk-cell-desc">Integrate browser automation into your product with Python, TypeScript, or REST.</p>
+    <div className="sk-cell-links">
+      <a href="/getting-started/quickstart" className="sk-cell-link">API quickstart <span className="sk-arrow">↗</span></a>
+      <a href="/sdk-reference/overview" className="sk-cell-link">Python SDK <span className="sk-arrow">↗</span></a>
+      <a href="/ts-sdk-reference/overview" className="sk-cell-link">TypeScript SDK <span className="sk-arrow">↗</span></a>
+      <a href="/api-reference" className="sk-cell-link">API reference <span className="sk-arrow">↗</span></a>
+    </div>
+  </div>
+  <div className="sk-bento-cell">
+    <p className="sk-mono sk-label">03 — SELF-HOST</p>
+    <h3 className="sk-cell-title">Self-host</h3>
+    <p className="sk-cell-desc">Run Skyvern on your own infrastructure with your own LLM keys.</p>
+    <div className="sk-cell-links">
+      <a href="/self-hosted/overview" className="sk-cell-link">Deployment overview <span className="sk-arrow">↗</span></a>
+      <a href="/self-hosted/docker" className="sk-cell-link">Docker setup <span className="sk-arrow">↗</span></a>
+      <a href="/self-hosted/llm-configuration" className="sk-cell-link">LLM configuration <span className="sk-arrow">↗</span></a>
+      <a href="/self-hosted/kubernetes" className="sk-cell-link">Kubernetes <span className="sk-arrow">↗</span></a>
+    </div>
+  </div>
+</div>
+
+{/* ===== BENTO GRID — 2 COL: HOW IT WORKS + CONCEPTS ===== */}
+
+<div className="sk-bento-row sk-bento-2col">
+  <a href="/getting-started/introduction" className="sk-bento-cell sk-bento-cell-link">
+    <p className="sk-mono sk-label">ARCHITECTURE</p>
+    <h3 className="sk-cell-title">How Skyvern works</h3>
+    <p className="sk-cell-desc">The agent loop, Planner-Agent-Validator architecture, and what happens under the hood when you run a task.</p>
+    <span className="sk-mono sk-arrow-lg">↗</span>
+  </a>
+  <a href="/getting-started/core-concepts" className="sk-bento-cell sk-bento-cell-link">
+    <p className="sk-mono sk-label">REFERENCE</p>
+    <h3 className="sk-cell-title">Core concepts</h3>
+    <p className="sk-cell-desc">Tasks, workflows, blocks, runs, credentials, browser sessions, and engines.</p>
+    <span className="sk-mono sk-arrow-lg">↗</span>
+  </a>
+</div>
+
+{/* ===== BENTO GRID — 4 COL: USE CASES ===== */}
+
+<p className="sk-mono sk-label" style={{ marginBottom: "24px", marginTop: "32px" }}>USE CASES</p>
+
+<div className="sk-bento-row sk-bento-4col">
+  <a href="/cookbooks/bulk-invoice-downloader" className="sk-bento-cell sk-bento-cell-link sk-bento-cell-sm sk-usecase-teal">
+    <h4 className="sk-cell-title-sm">Download invoices</h4>
+    <p className="sk-cell-desc-sm">Log into vendor portals, find invoices, download PDFs.</p>
+    <span className="sk-mono sk-arrow-sm">↗</span>
+  </a>
+  <a href="/cookbooks/job-application-filler" className="sk-bento-cell sk-bento-cell-link sk-bento-cell-sm sk-usecase-orange">
+    <h4 className="sk-cell-title-sm">Fill forms at scale</h4>
+    <p className="sk-cell-desc-sm">Submit applications, registrations, and compliance forms.</p>
+    <span className="sk-mono sk-arrow-sm">↗</span>
+  </a>
+  <a href="/running-automations/extract-structured-data" className="sk-bento-cell sk-bento-cell-link sk-bento-cell-sm sk-usecase-teal">
+    <h4 className="sk-cell-title-sm">Extract data</h4>
+    <p className="sk-cell-desc-sm">Pull structured data from any site without an API.</p>
+    <span className="sk-mono sk-arrow-sm">↗</span>
+  </a>
+  <a href="/cookbooks/healthcare-portal-data" className="sk-bento-cell sk-bento-cell-link sk-bento-cell-sm sk-usecase-orange">
+    <h4 className="sk-cell-title-sm">Healthcare portals</h4>
+    <p className="sk-cell-desc-sm">Extract patient demographics and billing from EHR portals.</p>
+    <span className="sk-mono sk-arrow-sm">↗</span>
+  </a>
+</div>
+
+{/* ===== FOOTER CTA ===== */}
+
+<div className="sk-footer-cta">
+  <div className="sk-footer-cta-inner">
+    <p className="sk-footer-cta-text">
+      <span className="sk-mono" style={{ color: "var(--sk-blue)", marginRight: "8px" }}>●</span>
+      Open source · 20.8k+ GitHub stars
+    </p>
+    <div className="sk-footer-cta-links">
+      <a href="https://github.com/Skyvern-AI/skyvern" className="sk-footer-link">GitHub ↗</a>
+      <a href="https://discord.gg/skyvern" className="sk-footer-link">Discord ↗</a>
+    </div>
+  </div>
+</div>
+
+</div>

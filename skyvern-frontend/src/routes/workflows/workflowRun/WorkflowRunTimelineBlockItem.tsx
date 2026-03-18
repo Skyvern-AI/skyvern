@@ -88,13 +88,19 @@ function getLoopIterationGroups(
   items: Array<WorkflowRunTimelineItem>,
 ): Array<LoopIterationGroup> {
   const groupsByKey = new Map<string, LoopIterationGroup>();
+  const unknownItems: Array<WorkflowRunTimelineItem> = [];
 
+  // First pass: group items with known indexes, collect unknown items separately
   items.forEach((item) => {
     const currentIndex = isBlockItem(item) ? item.block.current_index : null;
     const currentValue = isBlockItem(item) ? item.block.current_value : null;
-    const groupKey =
-      currentIndex === null ? "unknown" : `index-${currentIndex}`;
 
+    if (currentIndex === null) {
+      unknownItems.push(item);
+      return;
+    }
+
+    const groupKey = `index-${currentIndex}`;
     if (!groupsByKey.has(groupKey)) {
       groupsByKey.set(groupKey, {
         index: currentIndex,
@@ -109,6 +115,33 @@ function getLoopIterationGroups(
     }
     group.items.push(item);
   });
+
+  // Second pass: merge unknown items into the highest-index group.
+  // During streaming, these are blocks whose current_index hasn't been
+  // populated yet — they belong to the currently-executing iteration.
+  if (unknownItems.length > 0) {
+    if (groupsByKey.size > 0) {
+      let maxIndex = -1;
+      let maxGroup: LoopIterationGroup | null = null;
+      for (const group of groupsByKey.values()) {
+        if (group.index !== null && group.index > maxIndex) {
+          maxIndex = group.index;
+          maxGroup = group;
+        }
+      }
+      if (maxGroup) {
+        unknownItems.forEach((item) => maxGroup!.items.push(item));
+      }
+    } else {
+      // No known groups exist yet — all items are unknown.
+      // The first iteration must be running.
+      groupsByKey.set("index-0", {
+        index: 0,
+        currentValue: null,
+        items: unknownItems,
+      });
+    }
+  }
 
   return Array.from(groupsByKey.values()).sort((left, right) => {
     if (left.index === null && right.index === null) {
@@ -237,19 +270,10 @@ function WorkflowRunTimelineBlockItem({
   const actions = block.actions ?? [];
   const isFinallyBlock = finallyBlockLabel && block.label === finallyBlockLabel;
 
-  const hasActiveAction =
-    isAction(activeItem) &&
-    Boolean(
-      block.actions?.find(
-        (action) => action.action_id === activeItem.action_id,
-      ),
-    );
-  const isActiveBlock =
-    isWorkflowRunBlock(activeItem) &&
-    activeItem.workflow_run_block_id === block.workflow_run_block_id;
-
   const showDiagnosticLink =
-    isTaskVariantBlock(block) && (hasActiveAction || isActiveBlock);
+    isTaskVariantBlock(block) &&
+    block.task_id !== null &&
+    block.task_id !== undefined;
 
   const refCallback = useCallback((element: HTMLDivElement | null) => {
     if (
@@ -592,9 +616,7 @@ function WorkflowRunTimelineBlockItem({
               const loopValueFromIterable =
                 group.index !== null ? loopValues[group.index] ?? null : null;
               const iterationNumber =
-                group.index !== null
-                  ? group.index + 1
-                  : loopIterationGroups.length - groupIndex;
+                group.index !== null ? group.index + 1 : groupIndex + 1;
               const currentValuePreview = truncateValue(
                 stringifyTimelineValue(
                   loopValueFromIterable ?? group.currentValue,

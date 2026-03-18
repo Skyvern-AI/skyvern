@@ -17,6 +17,8 @@ import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
 import { TasksPage } from "./routes/tasks/list/TasksPage";
 import { Debugger } from "@/routes/workflows/debugger/Debugger";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
+import { WorkflowScriptDetailPage } from "./routes/workflows/WorkflowScriptDetailPage";
+import { WorkflowScriptsPage } from "./routes/workflows/WorkflowScriptsPage";
 import { WorkflowRun } from "./routes/workflows/WorkflowRun";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
 import { Workflows } from "./routes/workflows/Workflows";
@@ -165,6 +167,20 @@ const router = createBrowserRouter([
               {
                 path: "runs",
                 element: <WorkflowPage />,
+              },
+              {
+                path: "scripts",
+                element: <Outlet />,
+                children: [
+                  {
+                    index: true,
+                    element: <WorkflowScriptsPage />,
+                  },
+                  {
+                    path: ":scriptId",
+                    element: <WorkflowScriptDetailPage />,
+                  },
+                ],
               },
               {
                 path: ":workflowRunId",

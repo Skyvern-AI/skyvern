@@ -31,13 +31,16 @@ type WorkflowHasChangesStore = {
   saveIsPending: boolean;
   saidOkToCodeCacheDeletion: boolean;
   showConfirmCodeCacheDeletion: boolean;
-  isInternalUpdate: boolean;
+  // Reference-counted flag: multiple concurrent internal updates won't
+  // accidentally clear each other. Gate on > 0 in consumers.
+  internalUpdateCount: number;
   setGetSaveData: (getSaveData: () => SaveData) => void;
   setHasChanges: (hasChanges: boolean) => void;
   setSaveIsPending: (isPending: boolean) => void;
   setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => void;
   setShowConfirmCodeCacheDeletion: (show: boolean) => void;
-  setIsInternalUpdate: (isInternalUpdate: boolean) => void;
+  beginInternalUpdate: () => void;
+  endInternalUpdate: () => void;
 };
 
 interface WorkflowSaveOpts {
@@ -50,7 +53,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     saveIsPending: false,
     saidOkToCodeCacheDeletion: false,
     showConfirmCodeCacheDeletion: false,
-    isInternalUpdate: false,
+    internalUpdateCount: 0,
     getSaveData: () => null,
     setGetSaveData: (getSaveData: () => SaveData) => {
       set({ getSaveData });
@@ -67,8 +70,13 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     setShowConfirmCodeCacheDeletion: (show: boolean) => {
       set({ showConfirmCodeCacheDeletion: show });
     },
-    setIsInternalUpdate: (isInternalUpdate: boolean) => {
-      set({ isInternalUpdate });
+    beginInternalUpdate: () => {
+      set((state) => ({ internalUpdateCount: state.internalUpdateCount + 1 }));
+    },
+    endInternalUpdate: () => {
+      set((state) => ({
+        internalUpdateCount: Math.max(0, state.internalUpdateCount - 1),
+      }));
     },
   };
 });

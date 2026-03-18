@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
 
+    # Script reviewer settings
+    FAILURE_REVIEW_DAILY_CAP: int = 3  # Max failure-triggered script reviews per wpid per day
+
     ADDITIONAL_MODULES: list[str] = []
 
     BROWSER_TYPE: str = "chromium-headful"
@@ -69,6 +72,8 @@ class Settings(BaseSettings):
     DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
+    DATABASE_POOL_SIZE: int = 5
+    DATABASE_POOL_MAX_OVERFLOW: int = 10
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
@@ -101,10 +106,6 @@ class Settings(BaseSettings):
     # Shared Redis URL (used by any service that needs Redis)
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # Notification registry settings ("local" or "redis")
-    NOTIFICATION_REGISTRY_TYPE: str = "local"
-    NOTIFICATION_REDIS_URL: str | None = None  # Deprecated: falls back to REDIS_URL
-
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
@@ -125,6 +126,11 @@ class Settings(BaseSettings):
 
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
+    ANALYTICS_TEST_ID: str | None = None
+    POSTHOG_PROJECT_API_KEY: str = "phc_bVT2ugnZhMHRWqMvSRHPdeTjaPxQqT3QSsI3r5FlQR5"
+    POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
+    MCP_POSTHOG_PROJECT_API_KEY: str | None = "phc_m4epBbGS1Hf4NPRFNpR4WQ9Ob6yGy6SLbQckBxp3n0P"
+    MCP_POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
 
     # email settings
     SMTP_HOST: str = "localhost"
@@ -159,6 +165,7 @@ class Settings(BaseSettings):
     #####################
     BITWARDEN_TIMEOUT_SECONDS: int = 60
     BITWARDEN_MAX_RETRIES: int = 2
+    BITWARDEN_MAX_JITTER_SECONDS: float = 2.0
 
     # task generation settings
     PROMPT_CACHE_WINDOW_HOURS: int = 24
@@ -318,6 +325,13 @@ class Settings(BaseSettings):
     AZURE_GPT5_2_API_BASE: str | None = None
     AZURE_GPT5_2_API_VERSION: str = "2025-04-01-preview"
 
+    # AZURE gpt-5.4
+    ENABLE_AZURE_GPT5_4: bool = False
+    AZURE_GPT5_4_DEPLOYMENT: str = "gpt-5.4"
+    AZURE_GPT5_4_API_KEY: str | None = None
+    AZURE_GPT5_4_API_BASE: str | None = None
+    AZURE_GPT5_4_API_VERSION: str = "2025-04-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
@@ -357,6 +371,11 @@ class Settings(BaseSettings):
     ENABLE_MOONSHOT: bool = False
     MOONSHOT_API_KEY: str | None = None
     MOONSHOT_API_BASE: str = "https://api.moonshot.cn/v1"
+
+    # MINIMAX
+    ENABLE_MINIMAX: bool = False
+    MINIMAX_API_KEY: str | None = None
+    MINIMAX_API_BASE: str = "https://api.minimax.io/v1"
 
     # INCEPTION AI
     ENABLE_INCEPTION: bool = False
@@ -465,20 +484,28 @@ class Settings(BaseSettings):
         Keys are model names available to blocks in the frontend. These map to key names
         in LLMConfigRegistry._configs.
         """
-        mapping: dict[str, dict[str, str]] = {
-            "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-            "gemini-2.5-flash": {
-                "llm_key": "VERTEX_GEMINI_2.5_FLASH",
-                "label": "Gemini 2.5 Flash",
-            },
-            "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3_PRO", "label": "Gemini 3 Pro (Latest)"},
-            "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
-            "mercury-2": {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"},
-            "gemini-2.5-flash-lite": {
-                "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
-                "label": "Gemini 2.5 Flash Lite",
-            },
+        mapping: dict[str, dict[str, str]] = {}
+
+        # Gemini models: prefer Vertex when enabled, fall back to direct Gemini API
+        gemini_models = [
+            ("gemini-2.5-pro-preview-05-06", "VERTEX_GEMINI_2.5_PRO", "GEMINI_2.5_PRO", "Gemini 2.5 Pro"),
+            ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH", "GEMINI_2.5_FLASH", "Gemini 2.5 Flash"),
+            ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO", "GEMINI_3_PRO", "Gemini 3 Pro (Latest)"),
+            ("gemini-3.0-flash", "VERTEX_GEMINI_3.0_FLASH", "GEMINI_3.0_FLASH", "Gemini 3 Flash"),
+        ]
+        for model_name, vertex_key, gemini_key, label in gemini_models:
+            mapping[model_name] = {
+                "llm_key": vertex_key if self.ENABLE_VERTEX_AI else gemini_key,
+                "label": label,
+            }
+
+        # Gemini Flash Lite: Vertex-only (no direct Gemini API config exists)
+        mapping["gemini-2.5-flash-lite"] = {
+            "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
+            "label": "Gemini 2.5 Flash Lite",
         }
+
+        mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
 
         # GPT models: prefer Azure when enabled, fall back to OpenAI
         gpt_models = [
@@ -492,6 +519,7 @@ class Settings(BaseSettings):
                 "GPT 5 Mini",
             ),
             ("azure/gpt-5.2", self.ENABLE_AZURE_GPT5_2, "AZURE_OPENAI_GPT5_2", "OPENAI_GPT5_2", "GPT 5.2"),
+            ("azure/gpt-5.4", self.ENABLE_AZURE_GPT5_4, "AZURE_OPENAI_GPT5_4", "OPENAI_GPT5_4", "GPT 5.4"),
             ("azure/o3", self.ENABLE_AZURE_O3, "AZURE_OPENAI_O3", "OPENAI_O3", "GPT O3"),
         ]
         for model_name, azure_enabled, azure_key, openai_key, label in gpt_models:
@@ -521,6 +549,26 @@ class Settings(BaseSettings):
             "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
             "label": "Anthropic Claude 4.5 Haiku",
         }
+
+        # Anthropic Claude 4.5 Sonnet & Opus
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-sonnet-4-5-20250929"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE",
+                "label": "Anthropic Claude 4.5 Sonnet",
+            }
+            mapping["claude-opus-4-5-20251101"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE",
+                "label": "Anthropic Claude 4.5 Opus",
+            }
+        else:
+            mapping["claude-sonnet-4-5-20250929"] = {
+                "llm_key": "ANTHROPIC_CLAUDE4.5_SONNET",
+                "label": "Anthropic Claude 4.5 Sonnet",
+            }
+            mapping["claude-opus-4-5-20251101"] = {
+                "llm_key": "ANTHROPIC_CLAUDE4.5_OPUS",
+                "label": "Anthropic Claude 4.5 Opus",
+            }
 
         # Anthropic Claude 4.6 Opus: prefer Bedrock when enabled, fall back to direct API
         if self.ENABLE_BEDROCK_ANTHROPIC:

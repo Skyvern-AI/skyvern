@@ -871,6 +871,485 @@
         ]
       }
     },
+    "/v1/folders": {
+      "post": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Create folder",
+        "description": "Create a new folder to organize workflows",
+        "operationId": "create_folder_v1_folders_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FolderCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully created folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Folder"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "create_folder"
+      },
+      "get": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Get folders",
+        "description": "Get all folders for the organization",
+        "operationId": "get_folders_v1_folders_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "description": "Number of folders per page",
+              "default": 100,
+              "title": "Page Size"
+            },
+            "description": "Number of folders per page"
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Search folders by title or description",
+              "title": "Search"
+            },
+            "description": "Search folders by title or description"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved folders",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Folder"
+                  },
+                  "title": "Response Get Folders V1 Folders Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_folders"
+      }
+    },
+    "/v1/folders/{folder_id}": {
+      "get": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Get folder",
+        "description": "Get a specific folder by ID",
+        "operationId": "get_folder_v1_folders__folder_id__get",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Folder ID",
+              "examples": [
+                "fld_123"
+              ],
+              "title": "Folder Id"
+            },
+            "description": "Folder ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Folder"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_folder"
+      },
+      "put": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Update folder",
+        "description": "Update a folder's title or description",
+        "operationId": "update_folder_v1_folders__folder_id__put",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Folder ID",
+              "examples": [
+                "fld_123"
+              ],
+              "title": "Folder Id"
+            },
+            "description": "Folder ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FolderUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully updated folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Folder"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_folder"
+      },
+      "delete": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Delete folder",
+        "description": "Delete a folder. Optionally delete all workflows in the folder.",
+        "operationId": "delete_folder_v1_folders__folder_id__delete",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Folder ID",
+              "examples": [
+                "fld_123"
+              ],
+              "title": "Folder Id"
+            },
+            "description": "Folder ID"
+          },
+          {
+            "name": "delete_workflows",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "If true, also delete all workflows in this folder",
+              "default": false,
+              "title": "Delete Workflows"
+            },
+            "description": "If true, also delete all workflows in this folder"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully deleted folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Delete Folder V1 Folders  Folder Id  Delete"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_folder"
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/folder": {
+      "put": {
+        "tags": [
+          "Workflow Folders"
+        ],
+        "summary": "Update workflow folder",
+        "description": "Update a workflow's folder assignment for the latest version",
+        "operationId": "update_workflow_folder_v1_workflows__workflow_permanent_id__folder_put",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "examples": [
+                "wpid_123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWorkflowFolderRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully updated workflow folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Workflow"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Folder not found"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_workflow_folder"
+      }
+    },
     "/v1/artifacts/{artifact_id}": {
       "get": {
         "tags": [
@@ -1968,6 +2447,9 @@
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
           },
+          "404": {
+            "description": "Browser profile not found"
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -2349,17 +2831,19 @@
               "schema": {
                 "$ref": "#/components/schemas/CreateCredentialRequest",
                 "description": "The credential data to create",
+                "examples": [
+                  {
+                    "name": "My Credential",
+                    "credential_type": "PASSWORD",
+                    "credential": {
+                      "username": "user@example.com",
+                      "password": "securepassword123",
+                      "totp": "JBSWY3DPEHPK3PXP"
+                    }
+                  }
+                ],
                 "openapi_extra": {
                   "x-fern-sdk-parameter-name": "data"
-                }
-              },
-              "example": {
-                "name": "My Credential",
-                "credential_type": "PASSWORD",
-                "credential": {
-                  "username": "user@example.com",
-                  "password": "securepassword123",
-                  "totp": "JBSWY3DPEHPK3PXP"
                 }
               }
             }
@@ -2571,16 +3055,18 @@
               "schema": {
                 "$ref": "#/components/schemas/CreateCredentialRequest",
                 "description": "The new credential data to store",
+                "examples": [
+                  {
+                    "name": "My Credential",
+                    "credential_type": "PASSWORD",
+                    "credential": {
+                      "username": "user@example.com",
+                      "password": "newpassword123"
+                    }
+                  }
+                ],
                 "openapi_extra": {
                   "x-fern-sdk-parameter-name": "data"
-                }
-              },
-              "example": {
-                "name": "My Credential",
-                "credential_type": "PASSWORD",
-                "credential": {
-                  "username": "user@example.com",
-                  "password": "newpassword123"
                 }
               }
             }
@@ -3298,73 +3784,6 @@
             }
           }
         }
-      }
-    },
-    "/v1/scripts/{workflow_permanent_id}/cache": {
-      "delete": {
-        "tags": [
-          "Scripts"
-        ],
-        "summary": "Clear cached scripts for workflow",
-        "description": "Clear all cached scripts for a specific workflow. This will trigger script regeneration on subsequent runs.",
-        "operationId": "clear_workflow_cache_v1_scripts__workflow_permanent_id__cache_delete",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "The workflow permanent ID to clear cache for",
-              "examples": [
-                "wpid_abc123"
-              ],
-              "title": "Workflow Permanent Id"
-            },
-            "description": "The workflow permanent ID to clear cache for"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ClearCacheResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "clear_workflow_cache"
       }
     },
     "/v1/sdk/run_action": {
@@ -4761,6 +5180,17 @@
             "type": "string",
             "title": "Uri"
           },
+          "bundle_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundle Key"
+          },
           "task_id": {
             "anyOf": [
               {
@@ -4905,7 +5335,9 @@
           "trace",
           "har",
           "script_file",
-          "pdf"
+          "pdf",
+          "step_archive",
+          "task_archive"
         ],
         "title": "ArtifactType"
       },
@@ -5753,7 +6185,8 @@
           "pdf_parser",
           "http_request",
           "human_interaction",
-          "print_page"
+          "print_page",
+          "workflow_trigger"
         ],
         "title": "BlockType"
       },
@@ -6107,6 +6540,18 @@
             ],
             "description": "The type of browser used for the session."
           },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`."
+          },
           "vnc_streaming_supported": {
             "type": "boolean",
             "title": "Vnc Streaming Supported",
@@ -6287,27 +6732,6 @@
           "tier"
         ],
         "title": "CheckoutSubscriptionRequest"
-      },
-      "ClearCacheResponse": {
-        "properties": {
-          "deleted_count": {
-            "type": "integer",
-            "title": "Deleted Count",
-            "description": "Number of cached entries deleted"
-          },
-          "message": {
-            "type": "string",
-            "title": "Message",
-            "description": "Status message"
-          }
-        },
-        "type": "object",
-        "required": [
-          "deleted_count",
-          "message"
-        ],
-        "title": "ClearCacheResponse",
-        "description": "Response model for cache clearing operations."
       },
       "ClickAction": {
         "properties": {
@@ -6930,7 +7354,7 @@
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n"
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n"
           },
           "extensions": {
             "anyOf": [
@@ -6957,6 +7381,19 @@
               }
             ],
             "description": "The type of browser to use for the session."
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^bp_"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`."
           }
         },
         "type": "object",
@@ -7290,6 +7727,18 @@
             ],
             "title": "Tested Url",
             "description": "Login page URL used during the credential test"
+          },
+          "user_context": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Context",
+            "description": "User-provided context describing the login sequence (e.g., 'click SSO button first')"
           }
         },
         "type": "object",
@@ -9280,6 +9729,125 @@
         ],
         "title": "FileUploadBlockYAML"
       },
+      "Folder": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Title",
+            "description": "Folder title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Folder description"
+          },
+          "folder_id": {
+            "type": "string",
+            "title": "Folder Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "workflow_count": {
+            "type": "integer",
+            "title": "Workflow Count",
+            "description": "Number of workflows in this folder",
+            "default": 0
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "folder_id",
+          "organization_id",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "Folder",
+        "description": "Response model for a folder"
+      },
+      "FolderCreate": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Title",
+            "description": "Folder title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Folder description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title"
+        ],
+        "title": "FolderCreate",
+        "description": "Request model for creating a folder"
+      },
+      "FolderUpdate": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title",
+            "description": "Folder title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Folder description"
+          }
+        },
+        "type": "object",
+        "title": "FolderUpdate",
+        "description": "Request model for updating a folder"
+      },
       "ForLoopBlock": {
         "properties": {
           "label": {
@@ -9406,6 +9974,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PrintPageBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowTriggerBlock"
                 }
               ],
               "discriminator": {
@@ -9433,7 +10004,8 @@
                   "text_prompt": "#/components/schemas/TextPromptBlock",
                   "upload_to_s3": "#/components/schemas/UploadToS3Block",
                   "validation": "#/components/schemas/ValidationBlock",
-                  "wait": "#/components/schemas/WaitBlock"
+                  "wait": "#/components/schemas/WaitBlock",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlock"
                 }
               }
             },
@@ -9659,6 +10231,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PrintPageBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
                 }
               ]
             },
@@ -12616,7 +13191,8 @@
         "enum": [
           "free",
           "hobby",
-          "pro"
+          "pro",
+          "enterprise"
         ],
         "title": "PlanTier",
         "description": "Self-serve subscription tiers. Enterprise customers use manual billing (bypass)."
@@ -14543,7 +15119,7 @@
               }
             ],
             "title": "Proxy Location",
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "data_extraction_schema": {
@@ -15766,6 +16342,25 @@
         ],
         "title": "TotpType",
         "description": "Type of 2FA/TOTP method used."
+      },
+      "UpdateWorkflowFolderRequest": {
+        "properties": {
+          "folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder Id",
+            "description": "Folder ID to assign workflow to. Set to null to remove from folder."
+          }
+        },
+        "type": "object",
+        "title": "UpdateWorkflowFolderRequest",
+        "description": "Request model for updating a workflow's folder assignment"
       },
       "UploadFileAction": {
         "properties": {
@@ -17191,7 +17786,7 @@
           "ai_fallback": {
             "type": "boolean",
             "title": "Ai Fallback",
-            "default": false
+            "default": true
           },
           "cache_key": {
             "anyOf": [
@@ -17203,6 +17798,16 @@
               }
             ],
             "title": "Cache Key"
+          },
+          "adaptive_caching": {
+            "type": "boolean",
+            "title": "Adaptive Caching",
+            "default": false
+          },
+          "generate_script_on_terminal": {
+            "type": "boolean",
+            "title": "Generate Script On Terminal",
+            "default": false
           },
           "run_sequentially": {
             "anyOf": [
@@ -17421,7 +18026,7 @@
           "ai_fallback": {
             "type": "boolean",
             "title": "Ai Fallback",
-            "default": false
+            "default": true
           },
           "cache_key": {
             "anyOf": [
@@ -17434,6 +18039,16 @@
             ],
             "title": "Cache Key",
             "default": "default"
+          },
+          "adaptive_caching": {
+            "type": "boolean",
+            "title": "Adaptive Caching",
+            "default": false
+          },
+          "generate_script_on_terminal": {
+            "type": "boolean",
+            "title": "Generate Script On Terminal",
+            "default": false
           },
           "run_sequentially": {
             "type": "boolean",
@@ -17605,6 +18220,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PrintPageBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowTriggerBlock"
                 }
               ],
               "discriminator": {
@@ -17632,7 +18250,8 @@
                   "text_prompt": "#/components/schemas/TextPromptBlock",
                   "upload_to_s3": "#/components/schemas/UploadToS3Block",
                   "validation": "#/components/schemas/ValidationBlock",
-                  "wait": "#/components/schemas/WaitBlock"
+                  "wait": "#/components/schemas/WaitBlock",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlock"
                 }
               }
             },
@@ -17789,6 +18408,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PrintPageBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
                 }
               ],
               "discriminator": {
@@ -17816,7 +18438,8 @@
                   "text_prompt": "#/components/schemas/TextPromptBlockYAML",
                   "upload_to_s3": "#/components/schemas/UploadToS3BlockYAML",
                   "validation": "#/components/schemas/ValidationBlockYAML",
-                  "wait": "#/components/schemas/WaitBlockYAML"
+                  "wait": "#/components/schemas/WaitBlockYAML",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlockYAML"
                 }
               }
             },
@@ -18302,34 +18925,6 @@
               }
             ],
             "title": "Code Gen"
-          },
-          "waiting_for_verification_code": {
-            "type": "boolean",
-            "title": "Waiting For Verification Code",
-            "default": false
-          },
-          "verification_code_identifier": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Verification Code Identifier"
-          },
-          "verification_code_polling_started_at": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "date-time"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Verification Code Polling Started At"
           },
           "queued_at": {
             "anyOf": [
@@ -18877,7 +19472,7 @@
               }
             ],
             "title": "Proxy Location",
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}",
             "default": "RESIDENTIAL"
           },
           "webhook_url": {
@@ -19013,7 +19608,12 @@
               }
             ],
             "title": "Run With",
-            "description": "Whether to run the workflow with agent or code."
+            "description": "Whether to run the workflow with agent, code, or code_v2 (adaptive caching).",
+            "examples": [
+              "agent",
+              "code",
+              "code_v2"
+            ]
           }
         },
         "type": "object",
@@ -19292,10 +19892,11 @@
               }
             ],
             "title": "Run With",
-            "description": "Whether the workflow run was executed with agent or code",
+            "description": "Whether the workflow run was executed with agent, code, or code_v2 (adaptive caching)",
             "examples": [
               "agent",
-              "code"
+              "code",
+              "code_v2"
             ]
           },
           "ai_fallback": {
@@ -19417,6 +20018,271 @@
           "import_failed"
         ],
         "title": "WorkflowStatus"
+      },
+      "WorkflowTriggerBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "workflow_trigger",
+            "title": "Block Type",
+            "default": "workflow_trigger"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "payload": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload"
+          },
+          "wait_for_completion": {
+            "type": "boolean",
+            "title": "Wait For Completion",
+            "default": true
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id"
+          },
+          "use_parent_browser_session": {
+            "type": "boolean",
+            "title": "Use Parent Browser Session",
+            "default": false
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "workflow_permanent_id"
+        ],
+        "title": "WorkflowTriggerBlock"
+      },
+      "WorkflowTriggerBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "workflow_trigger",
+            "title": "Block Type",
+            "default": "workflow_trigger"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "payload": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload"
+          },
+          "wait_for_completion": {
+            "type": "boolean",
+            "title": "Wait For Completion",
+            "default": true
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id"
+          },
+          "use_parent_browser_session": {
+            "type": "boolean",
+            "title": "Use Parent Browser Session",
+            "default": false
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "workflow_permanent_id"
+        ],
+        "title": "WorkflowTriggerBlockYAML"
       },
       "skyvern__forge__sdk__schemas__credentials__CredentialType": {
         "type": "string",

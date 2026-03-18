@@ -20,9 +20,14 @@ import { credentialTypeToModalType } from "./useCredentialModalState";
 
 type Props = {
   credential: CredentialApiResponse;
+  onStartBackgroundTest?: (
+    credentialId: string,
+    url: string,
+    userContext?: string,
+  ) => void;
 };
 
-function CredentialItem({ credential }: Props) {
+function CredentialItem({ credential, onStartBackgroundTest }: Props) {
   const [editModalOpen, setEditModalOpen] = useState(false);
   const credentialData = credential.credential;
   const modalType = credentialTypeToModalType(credential.credential_type);
@@ -148,6 +153,7 @@ function CredentialItem({ credential }: Props) {
         onOpenChange={setEditModalOpen}
         editingCredential={credential}
         overrideType={modalType}
+        onStartBackgroundTest={onStartBackgroundTest}
       />
     </div>
   );

@@ -20,9 +20,10 @@ import {
 type Props = {
   value: string;
   onChange: (value: string) => void;
+  placeholder?: string;
 };
 
-function CredentialSelector({ value, onChange }: Props) {
+function CredentialSelector({ value, onChange, placeholder }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
   const { data: credentials, isFetching } = useCredentialsQuery({
     page_size: 100, // Reasonable limit for dropdown selector
@@ -50,7 +51,7 @@ function CredentialSelector({ value, onChange }: Props) {
         }}
       >
         <SelectTrigger>
-          <SelectValue placeholder="Select a credential" />
+          <SelectValue placeholder={placeholder ?? "Select a credential"} />
         </SelectTrigger>
         <SelectContent>
           {credentials.map((credential) => (

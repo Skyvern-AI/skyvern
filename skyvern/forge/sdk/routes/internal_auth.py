@@ -15,7 +15,7 @@ LOG = structlog.get_logger()
 
 
 class AuthStatus(str, Enum):
-    missing_env = "missing_env"
+    missing_api_key = "missing_api_key"
     invalid_format = "invalid_format"
     invalid = "invalid"
     expired = "expired"
@@ -28,6 +28,7 @@ class DiagnosticsResult(NamedTuple):
     detail: str | None
     validation: Any | None
     token: str | None
+    next_step: str | None = None
 
 
 def _is_local_request(request: Request) -> bool:
@@ -63,7 +64,19 @@ def _require_local_access(request: Request) -> None:
 async def _evaluate_local_api_key(token: str) -> DiagnosticsResult:
     token_candidate = token.strip()
     if not token_candidate or token_candidate == "YOUR_API_KEY":
-        return DiagnosticsResult(status=AuthStatus.missing_env, detail=None, validation=None, token=None)
+        return DiagnosticsResult(
+            status=AuthStatus.missing_api_key,
+            detail=(
+                "No x-api-key header was provided. This endpoint validates the API key sent in the request, "
+                "not whether a .env file exists."
+            ),
+            validation=None,
+            token=None,
+            next_step=(
+                "Send the local API key in the x-api-key header, or call POST /api/v1/internal/auth/repair "
+                "from localhost to regenerate a local key and update the env files."
+            ),
+        )
 
     try:
         validation = await resolve_org_from_api_key(token_candidate, app.DATABASE)
@@ -111,10 +124,17 @@ def _emit_diagnostics(result: DiagnosticsResult) -> dict[str, object]:
     log_kwargs: dict[str, object] = {"status": status_value}
     if result.detail:
         log_kwargs["detail"] = result.detail
+    if result.next_step:
+        log_kwargs["next_step"] = result.next_step
 
     LOG.warning("Local auth diagnostics", **log_kwargs)
 
-    return {"status": status_value}
+    payload: dict[str, object] = {"status": status_value}
+    if result.detail:
+        payload["detail"] = result.detail
+    if result.next_step:
+        payload["next_step"] = result.next_step
+    return payload
 
 
 @router.post("/repair", include_in_schema=False)

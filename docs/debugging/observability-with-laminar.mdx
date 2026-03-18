@@ -1,0 +1,210 @@
+---
+title: Observability with Laminar
+subtitle: Add observability to your Skyvern automations with Laminar
+slug: debugging/observability-with-laminar
+---
+
+[Laminar](https://www.lmnr.ai/) is an observability platform for AI applications. When integrated with Skyvern, it captures traces of your automation runs in Laminar's dashboard. What you see depends on how you're running Skyvern:
+
+- **Skyvern Cloud (via SDK)** — Laminar wraps the `run_task` / `run_workflow` call, so you get a trace span around the API request and response: latency, status, errors, and the returned output.
+- **Self-hosted** — Skyvern's server can export full traces to Laminar, including every LLM call (prompts, responses, token usage), browser actions, and workflow step execution. See [self-hosted tracing setup](#self-hosted-tracing-setup) below.
+
+<Tip>
+Laminar traces complement [artifacts](/debugging/using-artifacts). Use artifacts for per-run debugging (screenshots, recordings, logs) and Laminar for tracking patterns across runs — failure rates, response times, and which tasks are slowest.
+</Tip>
+
+<Note>
+This guide is also available in the [Laminar documentation](https://docs.lmnr.ai/tracing/integrations/skyvern).
+</Note>
+
+---
+
+## Prerequisites
+
+Laminar integration requires a Skyvern SDK and the Laminar SDK:
+
+<CodeGroup>
+```bash Python
+pip install skyvern 'lmnr[all]'
+```
+
+```bash TypeScript
+npm install @skyvern/client @lmnr-ai/lmnr
+```
+</CodeGroup>
+
+You will also need:
+- A **Skyvern API key** — get one at [app.skyvern.com/settings](https://app.skyvern.com/settings/api-keys)
+- A **Laminar API key** — sign up at [lmnr.ai](https://www.lmnr.ai/) and create a project
+
+---
+
+## Set up environment variables
+
+Add both keys to your `.env` file:
+
+```bash .env
+SKYVERN_API_KEY=your-skyvern-api-key
+LMNR_PROJECT_API_KEY=your-laminar-api-key
+```
+
+<Frame>
+    <video
+    autoPlay
+    controls
+    muted
+    playsInline
+    className="w-full aspect-video rounded-xl"
+    src="/images/laminar-keys.mp4"
+    ></video>
+</Frame>
+
+---
+
+## Run a traced task
+
+This example scrapes the top 3 posts from Hacker News with Laminar tracing enabled. Call `Laminar.initialize()` before any Skyvern calls — it reads `LMNR_PROJECT_API_KEY` from your environment automatically.
+
+<CodeGroup>
+```python Python
+import os
+import asyncio
+from dotenv import load_dotenv
+load_dotenv()
+
+from lmnr import Laminar
+Laminar.initialize()
+
+from skyvern import Skyvern
+
+client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+
+async def main():
+    result = await client.run_task(
+        prompt="Get the title and URL of the top 3 posts on Hacker News.",
+        url="https://news.ycombinator.com",
+        wait_for_completion=True,
+    )
+    print(f"Status: {result.status}")
+    print(f"Output: {result.output}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Laminar } from "@lmnr-ai/lmnr";
+Laminar.initialize();
+
+import { Skyvern } from "@skyvern/client";
+
+const client = new Skyvern({
+  apiKey: process.env.SKYVERN_API_KEY,
+});
+
+async function main() {
+  const result = await client.runTask({
+    body: {
+      prompt: "Get the title and URL of the top 3 posts on Hacker News.",
+      url: "https://news.ycombinator.com",
+    },
+    waitForCompletion: true,
+  });
+  console.log(`Status: ${result.status}`);
+  console.log(`Output: ${JSON.stringify(result.output, null, 2)}`);
+}
+
+main();
+```
+</CodeGroup>
+
+Expected output:
+
+```json
+{
+  "status": "completed",
+  "output": {
+    "posts": [
+      {"title": "Zig – Type Resolution Redesign and Language Changes", "url": "https://ziglang.org/devlog/2026/..."},
+      {"title": "Create value for others and don't worry about the returns", "url": "https://geohot.github.io/..."},
+      {"title": "U+237C ⍼ Is Azimuth", "url": "https://ionathan.ch/2026/02/16/angzarr.html"}
+    ]
+  }
+}
+```
+
+The task runs, the output is returned, and the full trace — every HTTP call, timing, and payload — appears in your Laminar dashboard.
+
+<Note>
+**Python only:** You will see a `ForgeApp is not initialized` error in stderr on startup. This is harmless — `lmnr[all]` tries to instrument Skyvern's server-side internals, which aren't present when using the client SDK. Your traces still work correctly.
+</Note>
+
+<Warning>
+**Python only:** `LaminarLiteLLMCallback` is deprecated and unnecessary. Laminar instruments LiteLLM directly — no callback setup is needed.
+</Warning>
+
+---
+
+## What traces capture
+
+What shows up in Laminar depends on your setup.
+
+### Skyvern Cloud (via SDK)
+
+When calling `run_task` or `run_workflow` through the SDK, Laminar traces the client-side call:
+
+| Trace data | What it shows |
+|------------|---------------|
+| API request/response | The full round-trip to Skyvern's API — status, latency, payload size |
+| Task output | The extracted data or completion result |
+| Errors | HTTP errors, timeouts, and task failures |
+
+This is useful for monitoring how your application interacts with Skyvern — tracking which tasks fail, how long they take, and what outputs you're getting back.
+
+### Self-hosted
+
+When running Skyvern on your own infrastructure, you get deep server-side traces by configuring Laminar in Skyvern's environment. This gives you visibility into everything happening inside the agent:
+
+| Trace data | What it shows |
+|------------|---------------|
+| LLM interactions | Every prompt sent to the model and its response, including token counts |
+| Browser actions | Each click, type, and navigation the agent performed |
+| Workflow steps | Sequential block execution and data passed between blocks |
+| Image tracing | Screenshots sent to the LLM for analysis |
+| Performance metrics | Latency and cost per LLM call |
+| Errors | Exceptions at any layer — LLM, browser, workflow engine |
+
+---
+
+## Self-hosted tracing setup
+
+If you're running Skyvern on your own infrastructure, add these to your server's environment:
+
+```bash .env
+LMNR_PROJECT_API_KEY=your-laminar-api-key
+```
+
+Skyvern's server includes a built-in `LaminarTrace` integration that initializes Laminar with the LiteLLM callback, capturing every LLM call, token count, and cost. It disables the automatic Skyvern/Patchright instrumentors (to avoid conflicts) and uses Laminar's `@observe` decorator on internal methods instead.
+
+No code changes needed — once the env var is set, traces appear in your Laminar project automatically.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Using Artifacts"
+    icon="file-lines"
+    href="/debugging/using-artifacts"
+  >
+    Per-run recordings, screenshots, logs, and network data
+  </Card>
+  <Card
+    title="Troubleshooting Guide"
+    icon="wrench"
+    href="/debugging/troubleshooting-guide"
+  >
+    Common issues and how to fix them
+  </Card>
+</CardGroup>
