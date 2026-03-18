@@ -192,14 +192,16 @@ Bedrock inference profile keys (`*_INFERENCE_PROFILE`) use cross-region inferenc
 ```bash .env
 ENABLE_MINIMAX=true
 MINIMAX_API_KEY=your-minimax-api-key
-LLM_KEY=MINIMAX_M2_5
+LLM_KEY=MINIMAX_M2_7
 ```
 
 ### Available models
 
 | LLM_KEY | Model | Notes |
 |---------|-------|-------|
-| `MINIMAX_M2_5` | MiniMax-M2.5 | Recommended, 204K context |
+| `MINIMAX_M2_7` | MiniMax-M2.7 | Recommended, latest flagship model |
+| `MINIMAX_M2_7_HIGHSPEED` | MiniMax-M2.7-highspeed | High-speed variant of M2.7 |
+| `MINIMAX_M2_5` | MiniMax-M2.5 | Previous generation, 204K context |
 | `MINIMAX_M2_5_HIGHSPEED` | MiniMax-M2.5-highspeed | Faster variant, 204K context |
 
 ### Optional settings

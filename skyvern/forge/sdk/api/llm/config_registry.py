@@ -1656,6 +1656,40 @@ if settings.ENABLE_MOONSHOT:
 
 if settings.ENABLE_MINIMAX:
     LLMConfigRegistry.register_config(
+        "MINIMAX_M2_7",
+        LLMConfig(
+            "openai/MiniMax-M2.7",
+            ["MINIMAX_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=4096,
+            temperature=0.5,
+            litellm_params=LiteLLMParams(
+                api_key=settings.MINIMAX_API_KEY,
+                api_base=settings.MINIMAX_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openai/MiniMax-M2.7"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "MINIMAX_M2_7_HIGHSPEED",
+        LLMConfig(
+            "openai/MiniMax-M2.7-highspeed",
+            ["MINIMAX_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=4096,
+            temperature=0.5,
+            litellm_params=LiteLLMParams(
+                api_key=settings.MINIMAX_API_KEY,
+                api_base=settings.MINIMAX_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openai/MiniMax-M2.7-highspeed"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "MINIMAX_M2_5",
         LLMConfig(
             "openai/MiniMax-M2.5",

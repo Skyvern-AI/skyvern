@@ -520,7 +520,7 @@ More extensive documentation can be found on our [📕 docs page](https://www.sk
 | Azure OpenAI | Any GPT models. Better performance with a multimodal llm (azure/gpt4-o) |
 | AWS Bedrock | Claude 3.5, Claude 3.7, Claude 4 (Sonnet, Opus), Claude 4.5 (Sonnet, Opus) |
 | Gemini | Gemini 3 Pro/Flash, Gemini 2.5 Pro/Flash |
-| MiniMax | MiniMax-M2.5, MiniMax-M2.5-highspeed (204K context) |
+| MiniMax | MiniMax-M2.7, MiniMax-M2.7-highspeed, MiniMax-M2.5, MiniMax-M2.5-highspeed (204K context) |
 | Ollama | Run any locally hosted model via [Ollama](https://github.com/ollama/ollama) |
 | OpenRouter | Access models through [OpenRouter](https://openrouter.ai) |
 | OpenAI-compatible | Any custom API endpoint that follows OpenAI's API format (via [liteLLM](https://docs.litellm.ai/docs/providers/openai_compatible)) |
@@ -578,7 +578,7 @@ Recommended `LLM_KEY`: `GEMINI_3.0_FLASH`, `GEMINI_2.5_PRO`, `GEMINI_2.5_FLASH`,
 | `MINIMAX_API_KEY` | MiniMax API key | String | `your-minimax-api-key` |
 | `MINIMAX_API_BASE` | MiniMax API base URL | String | `https://api.minimax.io/v1` |
 
-Recommended `LLM_KEY`: `MINIMAX_M2_5`, `MINIMAX_M2_5_HIGHSPEED`
+Recommended `LLM_KEY`: `MINIMAX_M2_7`, `MINIMAX_M2_7_HIGHSPEED`, `MINIMAX_M2_5`, `MINIMAX_M2_5_HIGHSPEED`
 
 ##### Ollama
 | Variable | Description| Type | Sample Value|
