@@ -227,6 +227,9 @@ class WorkflowScriptSummary(BaseModel):
     status: ScriptStatus
     latest_version: int
     version_count: int
+    total_runs: int = 0
+    success_rate: float | None = None
+    is_pinned: bool = False
     created_at: datetime
     modified_at: datetime
 
@@ -235,6 +238,25 @@ class WorkflowScriptsListResponse(BaseModel):
     """Response for listing all scripts associated with a workflow."""
 
     scripts: list[WorkflowScriptSummary]
+
+
+class ScriptRunSummary(BaseModel):
+    """Summary of a workflow run that used a specific script."""
+
+    workflow_run_id: str
+    status: str
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime
+    failure_reason: str | None = None
+
+
+class ScriptRunsResponse(BaseModel):
+    """Response for listing runs associated with a script."""
+
+    runs: list[ScriptRunSummary]
+    total_count: int
+    status_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class ClearCacheResponse(BaseModel):

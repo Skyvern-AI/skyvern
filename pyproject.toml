@@ -121,6 +121,7 @@ dev = [
     "curlify>=3.0.0",
     "openpyxl>=3.1.0",
     "gspread>=6",
+    "python-pptx>=1.0.2",
 ]
 
 [tool.hatch.build]

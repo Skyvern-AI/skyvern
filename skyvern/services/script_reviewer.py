@@ -727,6 +727,21 @@ class ScriptReviewer:
                         current_prompt = self._build_retry_prompt(updated_code, param_error, function_signature)
                     continue
 
+                # Validate parameter references are preserved from existing code.
+                # Unlike _validate_structural_regression, this is NOT skipped when user_instructions
+                # is set — dropping parameter refs is never intentional and always causes runtime failures.
+                preservation_error = self._validate_parameter_preservation(updated_code, existing_code, parameter_keys)
+                if preservation_error is not None:
+                    LOG.warning(
+                        "ScriptReviewer: parameter preservation regression, retrying",
+                        block_label=block_label,
+                        attempt=attempt,
+                        error=preservation_error,
+                    )
+                    if attempt < max_attempts:
+                        current_prompt = self._build_retry_prompt(updated_code, preservation_error, function_signature)
+                    continue
+
                 # Validate structural regression (catch deleted branches, shrunk code).
                 # Skip when user provides explicit instructions — they may request deletions.
                 regression_error = (
@@ -1388,6 +1403,16 @@ class ScriptReviewer:
     # Regex to find context.parameters['key'] or context.parameters["key"]
     _PARAM_REF_RE = re.compile(r"""context\.parameters\[['"](\w+)['"]\]""")
 
+    def _find_param_refs_excluding_comments(self, code: str) -> list[str]:
+        """Extract parameter reference keys from code, skipping comment lines."""
+        refs: list[str] = []
+        for line in code.split("\n"):
+            if line.lstrip().startswith("#"):
+                continue
+            for match in self._PARAM_REF_RE.finditer(line):
+                refs.append(match.group(1))
+        return refs
+
     def _validate_parameter_references(self, code: str, parameter_keys: list[str]) -> str | None:
         """Validate that context.parameters['key'] references use known parameter keys.
 
@@ -1418,6 +1443,36 @@ class ScriptReviewer:
             f"Valid parameter keys are: {', '.join(repr(k) for k in sorted(valid_keys))}. "
             f"For fields without a matching parameter, use ai='proactive' with a descriptive prompt "
             f"instead of context.parameters['invented_name']."
+        )
+
+    def _validate_parameter_preservation(
+        self, new_code: str, existing_code: str | None, parameter_keys: list[str]
+    ) -> str | None:
+        """Ensure parameter references from existing code are preserved in updated code.
+
+        Catches the case where the LLM drops value=context.parameters['key'] references
+        when rewriting block code (e.g., adding classify branches), replacing them with
+        ai='proactive' fill() calls that have no value and silently become no-ops.
+        """
+        if not existing_code or not parameter_keys:
+            return None
+
+        old_params = set(self._find_param_refs_excluding_comments(existing_code))
+        new_params = set(self._find_param_refs_excluding_comments(new_code))
+
+        # Only flag parameters that are in the valid keys list (ignore spurious refs)
+        valid_old = old_params & set(parameter_keys)
+        dropped = valid_old - new_params
+
+        if not dropped:
+            return None
+
+        return (
+            f"Parameter references dropped: {', '.join(f'context.parameters[{k!r}]' for k in sorted(dropped))}. "
+            f"The existing code referenced these workflow parameters but the updated code does not. "
+            f"Every page.fill() or page.fill_autocomplete() for a field that maps to a workflow parameter "
+            f"MUST include value=context.parameters['key']. Do NOT replace with ai='proactive' — "
+            f"parameter values from context.parameters are deterministic; AI-generated values are not."
         )
 
     def _validate_structural_regression(self, new_code: str, existing_code: str | None) -> str | None:
