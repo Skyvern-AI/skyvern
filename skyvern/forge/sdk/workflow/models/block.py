@@ -2407,12 +2407,32 @@ class TextPromptBlock(Block):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
+    def _render_schema_templates(self, obj: Any, workflow_run_context: WorkflowRunContext) -> Any:
+        if isinstance(obj, str):
+            try:
+                return self.format_block_parameter_template_from_workflow_run_context(obj, workflow_run_context)
+            except Exception:
+                LOG.warning(
+                    "Failed to render Jinja template in json_schema value, using original value",
+                    value=obj,
+                    block_label=self.label,
+                    exc_info=True,
+                )
+                return obj
+        elif isinstance(obj, dict):
+            return {k: self._render_schema_templates(v, workflow_run_context) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._render_schema_templates(item, workflow_run_context) for item in obj]
+        return obj
+
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.llm_key:
             self.llm_key = self.format_block_parameter_template_from_workflow_run_context(
                 self.llm_key, workflow_run_context
             )
         self.prompt = self.format_block_parameter_template_from_workflow_run_context(self.prompt, workflow_run_context)
+        if self.json_schema:
+            self.json_schema = self._render_schema_templates(self.json_schema, workflow_run_context)
 
     async def send_prompt(
         self,

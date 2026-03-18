@@ -489,6 +489,12 @@ class AgentFunction:
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
 
+    async def auto_solve_captchas(self, page: Page) -> bool:
+        """Proactively detect and solve captchas on the current page.
+        Returns True if a captcha was detected and solved.
+        Cloud override provides actual solving; OSS base is a no-op."""
+        return False
+
     async def generate_async_operations(
         self,
         organization: Organization,

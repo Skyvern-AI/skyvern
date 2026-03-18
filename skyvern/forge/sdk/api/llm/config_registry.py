@@ -349,6 +349,9 @@ if settings.ENABLE_ANTHROPIC:
             max_completion_tokens=8192,
         ),
     )
+    # All Claude 4+ models require temperature=1 when extended thinking is enabled.
+    # The runtime applies thinking optimization to all Anthropic models, so temperature=1
+    # must be set here to avoid "temperature must be 1" errors from the Anthropic API.
     LLMConfigRegistry.register_config(
         "ANTHROPIC_CLAUDE4_OPUS",
         LLMConfig(
@@ -357,6 +360,7 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=32000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -367,6 +371,7 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -377,6 +382,7 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -387,6 +393,7 @@ if settings.ENABLE_ANTHROPIC:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -516,6 +523,7 @@ if settings.ENABLE_BEDROCK:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=64000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -526,6 +534,7 @@ if settings.ENABLE_BEDROCK:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=32000,
+            temperature=1,
         ),
     )
     LLMConfigRegistry.register_config(

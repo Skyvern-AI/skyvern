@@ -556,3 +556,203 @@ async def test_terminate_raises_even_when_handler_fails(mock_scraped_page, mock_
                 await script_page.terminate(errors=["handler error"])
 
             mock_handler.assert_called_once()
+
+
+# =============================================================================
+# Tests for fill() proactive upgrade when value=None + prompt
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_fill_value_none_with_prompt_upgrades_to_proactive(mock_scraped_page, mock_ai):
+    """
+    When fill() is called with value=None and a prompt but ai != 'proactive',
+    it should upgrade ai to 'proactive' and delegate to _input_text instead of
+    returning "" (the old silent no-op behavior).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        # Mock _input_text to capture the call
+        script_page._input_text = AsyncMock(return_value="filled_value")
+
+        result = await script_page.fill(
+            selector="#email",
+            value=None,
+            prompt="Fill the email address field",
+            ai="fallback",
+        )
+
+        # Should NOT return "" — should delegate to _input_text
+        assert result == "filled_value"
+        script_page._input_text.assert_called_once()
+        call_kwargs = script_page._input_text.call_args.kwargs
+        assert call_kwargs["ai"] == "proactive"
+
+
+@pytest.mark.asyncio
+async def test_fill_value_none_no_prompt_still_skips(mock_scraped_page, mock_ai):
+    """
+    When fill() is called with value=None and NO prompt and ai != 'proactive',
+    it should still return "" (skip the fill).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        script_page._input_text = AsyncMock(return_value="should_not_reach")
+
+        result = await script_page.fill(
+            selector="#email",
+            value=None,
+            ai="fallback",
+        )
+
+        assert result == ""
+        script_page._input_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fill_value_none_proactive_unchanged(mock_scraped_page, mock_ai):
+    """
+    When fill() is called with value=None and ai='proactive', it should
+    proceed as before (not return early, delegate to _input_text).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        script_page._input_text = AsyncMock(return_value="ai_value")
+
+        result = await script_page.fill(
+            selector="#email",
+            value=None,
+            prompt="Fill the email",
+            ai="proactive",
+        )
+
+        assert result == "ai_value"
+        script_page._input_text.assert_called_once()
+
+
+# =============================================================================
+# Tests for fill_autocomplete() proactive upgrade when value=None + prompt
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_fill_autocomplete_value_none_with_prompt_upgrades_to_proactive(mock_scraped_page, mock_ai):
+    """
+    When fill_autocomplete() is called with value=None and a prompt but ai != 'proactive',
+    it should upgrade ai to 'proactive' and delegate to ai_input_text instead of
+    returning "" (the old silent no-op behavior).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        script_page._ai.ai_input_text = AsyncMock(return_value="filled_value")
+
+        result = await script_page.fill_autocomplete(
+            selector="#city",
+            value=None,
+            prompt="Fill the city field",
+            ai="fallback",
+        )
+
+        assert result == "filled_value"
+        script_page._ai.ai_input_text.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_fill_autocomplete_value_none_no_prompt_still_skips(mock_scraped_page, mock_ai):
+    """
+    When fill_autocomplete() is called with value=None and NO prompt and ai != 'proactive',
+    it should still return "" (skip the fill).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        script_page._ai.ai_input_text = AsyncMock(return_value="should_not_reach")
+
+        result = await script_page.fill_autocomplete(
+            selector="#city",
+            value=None,
+            ai="fallback",
+        )
+
+        assert result == ""
+        script_page._ai.ai_input_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fill_autocomplete_value_none_proactive_unchanged(mock_scraped_page, mock_ai):
+    """
+    When fill_autocomplete() is called with value=None and ai='proactive', it should
+    proceed as before (delegate to ai_input_text).
+    """
+    mock_page = create_mock_page()
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=mock_page,
+            ai=mock_ai,
+        )
+
+        script_page._ai.ai_input_text = AsyncMock(return_value="ai_value")
+
+        result = await script_page.fill_autocomplete(
+            selector="#city",
+            value=None,
+            prompt="Fill the city",
+            ai="proactive",
+        )
+
+        assert result == "ai_value"
+        script_page._ai.ai_input_text.assert_called_once()

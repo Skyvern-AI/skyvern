@@ -24,6 +24,17 @@ export type ScriptVersionListResponse = {
   versions: ScriptVersionSummary[];
 };
 
+export type ScriptVersionDetailResponse = {
+  script_id: string;
+  script_revision_id: string;
+  version: number;
+  created_at: string;
+  run_id: string | null;
+  blocks: { [blockName: string]: string };
+  main_script: string | null;
+  fallback_episode_count: number;
+};
+
 export type ScriptFallbackEpisode = {
   episode_id: string;
   organization_id: string;
@@ -76,4 +87,49 @@ export type ReviewScriptResponse = {
   version: number;
   updated_blocks: string[];
   message?: string | null;
+};
+
+export type WorkflowScriptSummary = {
+  script_id: string;
+  cache_key: string;
+  cache_key_value: string;
+  // Must match ScriptStatus enum in skyvern/schemas/scripts.py
+  status: "published" | "pending";
+  latest_version: number;
+  version_count: number;
+  total_runs: number;
+  success_rate: number | null;
+  is_pinned: boolean;
+  created_at: string;
+  modified_at: string;
+};
+
+export type WorkflowScriptsListResponse = {
+  scripts: WorkflowScriptSummary[];
+};
+
+export type PinScriptRequest = {
+  cache_key_value: string;
+};
+
+export type PinScriptResponse = {
+  workflow_permanent_id: string;
+  cache_key_value: string;
+  is_pinned: boolean;
+  pinned_at: string | null;
+};
+
+export type ScriptRunSummary = {
+  workflow_run_id: string;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  failure_reason: string | null;
+};
+
+export type ScriptRunsResponse = {
+  runs: ScriptRunSummary[];
+  total_count: number;
+  status_counts: Record<string, number>;
 };
