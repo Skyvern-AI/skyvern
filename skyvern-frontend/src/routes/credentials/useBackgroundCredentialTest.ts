@@ -88,6 +88,19 @@ function useBackgroundCredentialTest() {
       }
 
       if (data.status === "completed") {
+        // The backend sets browser_profile_id in a separate background task
+        // AFTER the workflow completes. If the profile isn't ready yet and
+        // no failure reason has been reported, keep polling.
+        if (!data.browser_profile_id && !data.browser_profile_failure_reason) {
+          if (activeTestRef.current) {
+            activeTestRef.current.timeoutId = setTimeout(
+              poll,
+              POLL_INTERVAL_MS,
+            );
+          }
+          return;
+        }
+
         cleanup();
         queryClient.invalidateQueries({ queryKey: ["credentials"] });
 
