@@ -1849,6 +1849,22 @@ async def download(
 
             await _run_cached_function(cached_fn)
 
+            # Check local filesystem for newly downloaded files.
+            # This is the primary verification — it doesn't depend on S3/remote
+            # storage and catches the case where download_selector() returned None
+            # causing the click to silently succeed without downloading anything.
+            local_files_after_download = (
+                list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
+            )
+            # Filter out incomplete .crdownload files from both lists for an accurate comparison
+            local_new_files = set(local_files_after_download) - set(local_files_before)
+            local_new_complete_files = [f for f in local_new_files if not f.endswith(".crdownload")]
+            if not local_new_complete_files:
+                raise Exception(
+                    "Cached download block did not produce a new file on the local filesystem. "
+                    f"Local files before: {len(local_files_before)}, after: {len(local_files_after_download)}"
+                )
+
             # Rename newly downloaded files using download_suffix if provided.
             # Rename runs BEFORE S3 upload so that remote storage receives the
             # correctly-named file and subsequent blocks get the right URLs.
