@@ -190,7 +190,7 @@ def create_api_app() -> FastAPI:
     async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
         detail = format_validation_errors(exc)
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": detail},
         )
 
