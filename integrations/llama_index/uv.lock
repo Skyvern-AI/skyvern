@@ -21,7 +21,7 @@ overrides = [
     { name = "pypdf", specifier = ">=6.8.0" },
     { name = "python-multipart", specifier = ">=0.0.22" },
     { name = "starlette", specifier = ">=0.49.1" },
-    { name = "websockets", specifier = ">=15.0.1" },
+    { name = "websockets", specifier = ">=15.0.1,<17" },
 ]
 
 [[package]]

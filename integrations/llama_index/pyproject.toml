@@ -19,8 +19,8 @@ build-backend = "hatchling.build"
 dev = ["twine>=6.1.0,<7"]
 
 # Security: override vulnerable transitive dependency versions (SKY-8441)
-# Using override-dependencies because several of these conflict with
-# skyvern's pinned ranges (e.g. pypdf<6, python-multipart<0.0.19).
+# Using override-dependencies because several of these are transitive deps
+# that need newer versions than what the resolver picks by default.
 [tool.uv]
 override-dependencies = [
     "authlib>=1.6.9",
@@ -35,9 +35,9 @@ override-dependencies = [
     "starlette>=0.49.1",
     "google-cloud-aiplatform>=1.133.0",
     # Cascading overrides needed to unblock the above security constraints:
-    # fastmcp>=2.14.2 requires websockets>=15 (skyvern pins <13)
-    "websockets>=15.0.1",
-    # litellm/skyvern requires openai>=2 but llama-index needs <2;
+    # fastmcp>=2.14.2 requires websockets>=15 (skyvern pins >=12,<15.1)
+    "websockets>=15.0.1,<17",
+    # skyvern requires openai>=1.68.2 but llama-index needs <2;
     # keep openai in v1 range for llama-index compatibility
     "openai>=1.40.0,<2",
 ]
