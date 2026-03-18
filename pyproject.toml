@@ -72,6 +72,11 @@ dependencies = [
     "zstandard>=0.25.0",
     "sse-starlette>=3.0.3,<4",
     "opentelemetry-api>=1.39.0,<2",
+    # Security: minimum versions for transitive dependencies (SKY-8441)
+    "authlib>=1.6.9",
+    "pyasn1>=0.6.3",
+    "PyJWT>=2.12.0",
+    "tornado>=6.5.5",
 ]
 
 [dependency-groups]
