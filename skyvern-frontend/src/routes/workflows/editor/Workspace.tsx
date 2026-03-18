@@ -1052,7 +1052,7 @@ function Workspace({
       runWith:
         workflowData.adaptive_caching && workflowData.run_with === "code"
           ? "code_v2"
-          : workflowData.run_with ?? null,
+          : workflowData.run_with ?? "agent",
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
       runSequentially: workflowData.run_sequentially ?? false,
@@ -1102,7 +1102,7 @@ function Workspace({
       runWith:
         selectedVersion.adaptive_caching && selectedVersion.run_with === "code"
           ? "code_v2"
-          : selectedVersion.run_with,
+          : selectedVersion.run_with ?? "agent",
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       runSequentially: selectedVersion.run_sequentially ?? false,

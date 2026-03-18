@@ -2765,7 +2765,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
-    runWith: "agent",
+    runWith: "code_v2",
     scriptCacheKey: null,
     aiFallback: true,
     runSequentially: false,
