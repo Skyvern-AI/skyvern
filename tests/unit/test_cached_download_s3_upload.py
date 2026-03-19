@@ -189,20 +189,32 @@ async def test_download_suffix_rename_uses_file_path_directly(setup, tmp_path):
 
 @pytest.mark.asyncio
 async def test_verification_raises_when_no_new_file(setup):
-    """When no new file appears on local filesystem, the cached path should raise
-    and fall back to AI."""
+    """When no new file appears on local filesystem, the poll loop should exhaust
+    the grace period and fall back to AI."""
     refs = setup(
         get_side_effect=[[], [], [], []],
-        list_files_side_effect=[[], []],  # before=empty, after=still empty (local verification fails)
+        list_files_side_effect=[[] for _ in range(10)],  # before + polls all empty
     )
     try:
         from skyvern.services.script_service import download
 
-        await download(prompt="Download invoice", label="test_block")
+        call_count = 0
+
+        def advancing_time():
+            nonlocal call_count
+            call_count += 1
+            return call_count * 3.0
+
+        with (
+            patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock),
+            patch(f"{MODULE}.asyncio.get_running_loop") as mock_loop,
+        ):
+            mock_loop.return_value.time = advancing_time
+            await download(prompt="Download invoice", label="test_block")
 
         refs["fallback"].assert_called_once()
         error_arg = refs["fallback"].call_args.kwargs.get("error")
-        assert "did not produce a new file on the local filesystem" in str(error_arg)
+        assert "no file produced" in str(error_arg).lower() or "did not produce" in str(error_arg).lower()
     finally:
         _cleanup(refs)
 
@@ -420,69 +432,171 @@ async def test_block_marked_completed_on_success(setup, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_local_verification_fails_when_no_file_downloaded(setup):
+async def test_poll_fails_when_no_file_downloaded(setup):
     """SKY-8433: When download_selector() returns None and click silently succeeds
-    without downloading anything, the local filesystem check should detect
-    no new files and trigger AI fallback instead of silently succeeding."""
+    without downloading anything, the poll loop should detect no new files
+    after the grace period and trigger AI fallback."""
+    # The poll loop checks list_files once per iteration. With a 6s grace period
+    # and 2s sleep, we need: 1 (before) + ~4 poll iterations of empty results.
     refs = setup(
-        get_side_effect=[[]],  # S3 before-check only; local check fails before S3 after-check
-        list_files_side_effect=[[], []],  # before=empty, after=still empty
+        get_side_effect=[[]],
+        list_files_side_effect=[[] for _ in range(10)],
     )
     try:
         from skyvern.services.script_service import download
 
-        await download(prompt="Download invoice", label="test_block")
+        # Mock time to advance past grace period, mock sleep to not wait
+        call_count = 0
+
+        def advancing_time():
+            nonlocal call_count
+            call_count += 1
+            return call_count * 3.0  # each call advances 3s, exceeds 6s grace after 2 polls
+
+        with (
+            patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock),
+            patch(f"{MODULE}.asyncio.get_running_loop") as mock_loop,
+        ):
+            mock_loop.return_value.time = advancing_time
+            await download(prompt="Download invoice", label="test_block")
 
         refs["fallback"].assert_called_once()
         error_arg = refs["fallback"].call_args.kwargs.get("error")
-        assert "did not produce a new file on the local filesystem" in str(error_arg)
-        # S3 save should NOT be called since local check fails first
+        assert "no file produced" in str(error_arg).lower() or "did not produce" in str(error_arg).lower()
         refs["storage"].save_downloaded_files.assert_not_called()
     finally:
         _cleanup(refs)
 
 
 @pytest.mark.asyncio
-async def test_local_verification_ignores_crdownload_files(setup, tmp_path):
-    """Incomplete .crdownload files should not count as successful downloads
-    for local filesystem verification."""
+async def test_poll_waits_for_crdownload_to_complete(setup, tmp_path):
+    """When a .crdownload file appears (browser-native download in progress),
+    the poll loop should keep waiting until the complete file appears."""
     download_dir = tmp_path / "downloads"
     incomplete_file = str(download_dir / "invoice.pdf.crdownload")
+    complete_file = str(download_dir / "invoice.pdf")
     refs = setup(
-        get_side_effect=[[]],
-        list_files_side_effect=[[], [incomplete_file]],  # only incomplete file appeared
+        get_side_effect=[[], [complete_file]],
+        list_files_side_effect=[
+            [],  # before
+            [incomplete_file],  # poll 1: .crdownload detected, keep waiting
+            [incomplete_file],  # poll 2: still downloading
+            [complete_file],  # poll 3: download finished, .crdownload renamed
+        ],
     )
     try:
         from skyvern.services.script_service import download
 
-        await download(prompt="Download invoice", label="test_block")
+        with patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            await download(prompt="Download invoice", label="test_block")
 
-        refs["fallback"].assert_called_once()
-        error_arg = refs["fallback"].call_args.kwargs.get("error")
-        assert "did not produce a new file on the local filesystem" in str(error_arg)
+        refs["fallback"].assert_not_called()
+        refs["update_block"].assert_called_once()
+        refs["storage"].save_downloaded_files.assert_called_once()
     finally:
         _cleanup(refs)
 
 
 @pytest.mark.asyncio
-async def test_local_verification_passes_with_complete_file(setup, tmp_path):
-    """When a complete file appears on the local filesystem after the cached
-    function runs, the local verification should pass and allow the block
-    to proceed to S3 upload and completion."""
+async def test_poll_passes_immediately_with_complete_file(setup, tmp_path):
+    """When a complete file appears immediately after the cached function
+    (CDP atomic write), the poll should pass on the first check with no waiting."""
     download_dir = tmp_path / "downloads"
     local_file = str(download_dir / "invoice.pdf")
     refs = setup(
-        get_side_effect=[[], [local_file]],  # S3 verification also passes
-        list_files_side_effect=[[], [local_file]],  # local verification passes
+        get_side_effect=[[], [local_file]],
+        list_files_side_effect=[[], [local_file]],  # before=empty, first poll=file present
     )
     try:
         from skyvern.services.script_service import download
 
-        await download(prompt="Download invoice", label="test_block")
+        sleep_mock = AsyncMock()
+        with patch(f"{MODULE}.asyncio.sleep", sleep_mock):
+            await download(prompt="Download invoice", label="test_block")
 
         refs["fallback"].assert_not_called()
         refs["update_block"].assert_called_once()
-        # S3 save should be called since local check passed
         refs["storage"].save_downloaded_files.assert_called_once()
+        # Should not have slept — file was there immediately
+        sleep_mock.assert_not_called()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_poll_grace_period_only_crdownload_fails(setup, tmp_path):
+    """If only .crdownload files appear and never complete within the timeout,
+    the poll should eventually fail and trigger AI fallback."""
+    download_dir = tmp_path / "downloads"
+    incomplete_file = str(download_dir / "invoice.pdf.crdownload")
+    refs = setup(
+        get_side_effect=[[]],
+        # Keep returning only .crdownload forever — simulate stalled download
+        list_files_side_effect=[[], *[[incomplete_file]] * 200],
+    )
+    try:
+        from skyvern.services.script_service import download
+
+        # Mock sleep to not actually wait, and mock time to advance past timeout
+        call_count = 0
+        real_time = asyncio.get_running_loop().time
+
+        def advancing_time():
+            nonlocal call_count
+            call_count += 1
+            # Each call advances 10s, so after ~30 calls we exceed _DOWNLOAD_TIMEOUT (300s)
+            return real_time() + (call_count * 10)
+
+        with (
+            patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock),
+            patch(f"{MODULE}.asyncio.get_running_loop") as mock_loop,
+        ):
+            mock_loop.return_value.time = advancing_time
+            await download(prompt="Download invoice", label="test_block")
+
+        refs["fallback"].assert_called_once()
+        error_arg = refs["fallback"].call_args.kwargs.get("error")
+        assert "never completed" in str(error_arg).lower() or "timed out" in str(error_arg).lower()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_poll_crdownload_disappears_without_complete_file(setup, tmp_path):
+    """When a .crdownload file appears then disappears (download cancelled/failed)
+    without a complete file replacing it, the loop should eventually time out
+    instead of looping forever."""
+    download_dir = tmp_path / "downloads"
+    incomplete_file = str(download_dir / "invoice.pdf.crdownload")
+    refs = setup(
+        get_side_effect=[[]],
+        list_files_side_effect=[
+            [],  # before
+            [incomplete_file],  # poll 1: .crdownload appears
+            [],  # poll 2: .crdownload disappeared, no complete file
+            [],  # poll 3+: still nothing
+            *[[] for _ in range(50)],
+        ],
+    )
+    try:
+        from skyvern.services.script_service import download
+
+        call_count = 0
+
+        def advancing_time():
+            nonlocal call_count
+            call_count += 1
+            return call_count * 10.0
+
+        with (
+            patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock),
+            patch(f"{MODULE}.asyncio.get_running_loop") as mock_loop,
+        ):
+            mock_loop.return_value.time = advancing_time
+            await download(prompt="Download invoice", label="test_block")
+
+        refs["fallback"].assert_called_once()
+        error_arg = refs["fallback"].call_args.kwargs.get("error")
+        assert "disappeared" in str(error_arg).lower() or "did not produce" in str(error_arg).lower()
     finally:
         _cleanup(refs)
