@@ -3,11 +3,11 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from workers.run_parameters import RunSkyvernWorkflowParams
 
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from tests.unit.worker_activity_import_helpers import import_temporal_v2_worker_activities
-from workers.run_parameters import RunSkyvernWorkflowParams
 
 
 @pytest.mark.asyncio
