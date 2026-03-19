@@ -48,9 +48,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { TableSearchInput } from "@/components/TableSearchInput";
+import { getClient } from "@/api/AxiosClient";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { toast } from "@/components/ui/use-toast";
 import { useOrganizationSchedulesQuery } from "./useOrganizationSchedulesQuery";
 import {
   useDeleteOrgScheduleMutation,
@@ -62,6 +66,32 @@ import { cronToHumanReadable } from "@/routes/workflows/editor/panels/schedulePa
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import type { OrganizationScheduleItem } from "@/routes/workflows/types/scheduleTypes";
 import { CreateOrgScheduleDialog } from "./CreateOrgScheduleDialog";
+
+const BULK_CONCURRENCY_LIMIT = 5;
+
+async function runWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  limit: number,
+): Promise<PromiseSettledResult<T>[]> {
+  const results: Array<PromiseSettledResult<T>> = new Array(tasks.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < tasks.length) {
+      const index = nextIndex++;
+      try {
+        results[index] = { status: "fulfilled", value: await tasks[index]!() };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(limit, tasks.length) }, () => worker()),
+  );
+  return results;
+}
 
 type ScheduleStatus = "active" | "paused";
 
@@ -111,11 +141,19 @@ function SchedulesPage() {
   const [statusFilters, setStatusFilters] = useState<ScheduleStatus[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const lastSelectedIndex = useRef<number | null>(null);
+  const [isBulkOperating, setIsBulkOperating] = useState(false);
   const [deleteDialog, setDeleteDialog] = useState<{
     open: boolean;
     schedule: OrganizationScheduleItem | null;
   }>({ open: false, schedule: null });
+  const [bulkDeleteDialog, setBulkDeleteDialog] = useState<{
+    open: boolean;
+    count: number;
+  }>({ open: false, count: 0 });
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
+
+  const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
 
   const statusFilter =
     statusFilters.length === 1 ? statusFilters[0] : undefined;
@@ -207,28 +245,115 @@ function SchedulesPage() {
     selected.has(s.workflow_schedule_id),
   );
 
+  async function runBulkOperation(
+    items: OrganizationScheduleItem[],
+    makeTask: (
+      client: Awaited<ReturnType<typeof getClient>>,
+      item: OrganizationScheduleItem,
+    ) => Promise<void>,
+    successLabel: string,
+    failureLabel: string,
+  ) {
+    if (items.length === 0) return;
+    setIsBulkOperating(true);
+    try {
+      const client = await getClient(credentialGetter);
+      const results = await runWithConcurrency(
+        items.map((item) => () => makeTask(client, item)),
+        BULK_CONCURRENCY_LIMIT,
+      );
+      const succeeded = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.filter((r) => r.status === "rejected").length;
+      if (failed === 0) {
+        toast({
+          title: `${succeeded} schedule${succeeded !== 1 ? "s" : ""} ${successLabel} successfully.`,
+          variant: "success",
+        });
+        setSelected(new Set());
+      } else if (succeeded === 0) {
+        toast({
+          title: `Failed to ${failureLabel} ${failed} schedule${failed !== 1 ? "s" : ""}.`,
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: `${succeeded}/${items.length} schedules ${successLabel} successfully. ${failed} failed.`,
+          variant: "destructive",
+        });
+        // Keep only failed items selected so the user can retry
+        const failedIds = new Set<string>();
+        results.forEach((result, i) => {
+          if (result.status === "rejected") {
+            failedIds.add(items[i]!.workflow_schedule_id);
+          }
+        });
+        setSelected(failedIds);
+      }
+      queryClient.invalidateQueries({ queryKey: ["organizationSchedules"] });
+      queryClient.invalidateQueries({ queryKey: ["scheduleDetail"] });
+    } finally {
+      setIsBulkOperating(false);
+    }
+  }
+
   function handleBulkActivate() {
-    selectedSchedules
-      .filter((s) => !s.enabled)
-      .forEach((s) => enableMutation.mutate(s));
-    setSelected(new Set());
+    const toActivate = selectedSchedules.filter((s) => !s.enabled);
+    void runBulkOperation(
+      toActivate,
+      (client, item) =>
+        client.post(
+          `/workflows/${item.workflow_permanent_id}/schedules/${item.workflow_schedule_id}/enable`,
+        ),
+      "activated",
+      "activate",
+    );
   }
 
   function handleBulkPause() {
-    selectedSchedules
-      .filter((s) => s.enabled)
-      .forEach((s) => disableMutation.mutate(s));
-    setSelected(new Set());
+    const toPause = selectedSchedules.filter((s) => s.enabled);
+    void runBulkOperation(
+      toPause,
+      (client, item) =>
+        client.post(
+          `/workflows/${item.workflow_permanent_id}/schedules/${item.workflow_schedule_id}/disable`,
+        ),
+      "paused",
+      "pause",
+    );
   }
 
   function handleBulkDuplicate() {
-    selectedSchedules.forEach((s) => duplicateMutation.mutate(s));
-    setSelected(new Set());
+    void runBulkOperation(
+      selectedSchedules,
+      (client, item) =>
+        client.post(`/workflows/${item.workflow_permanent_id}/schedules`, {
+          cron_expression: item.cron_expression,
+          timezone: item.timezone,
+          enabled: item.enabled,
+          parameters: item.parameters,
+          name: `${item.name ?? item.workflow_title} (copy)`,
+        }),
+      "duplicated",
+      "duplicate",
+    );
   }
 
   function handleBulkDelete() {
-    selectedSchedules.forEach((s) => deleteMutation.mutate(s));
-    setSelected(new Set());
+    setBulkDeleteDialog({ open: true, count: selected.size });
+  }
+
+  async function handleBulkDeleteConfirm() {
+    await runBulkOperation(
+      selectedSchedules,
+      (client, item) =>
+        client.delete(
+          `/workflows/${item.workflow_permanent_id}/schedules/${item.workflow_schedule_id}`,
+        ),
+      "deleted",
+      "delete",
+    );
+
+    setBulkDeleteDialog({ open: false, count: 0 });
   }
 
   const showCheckbox = schedules.length > 1;
@@ -520,13 +645,14 @@ function SchedulesPage() {
       {selected.size > 0 && (
         <div className="fixed inset-x-0 bottom-6 mx-auto flex w-fit items-center gap-3 rounded-lg border border-slate-700 bg-slate-900 px-6 py-3 shadow-xl">
           <span className="text-sm text-slate-300">
-            {selected.size} selected
+            {isBulkOperating ? "Processing…" : `${selected.size} selected`}
           </span>
           <div className="h-6 w-px bg-slate-700" />
           <Button
             size="sm"
             className="bg-green-900 text-green-50 hover:bg-green-800"
             onClick={handleBulkActivate}
+            disabled={isBulkOperating}
           >
             <PlayIcon className="mr-1.5 size-3.5" />
             Activate
@@ -535,6 +661,7 @@ function SchedulesPage() {
             size="sm"
             className="bg-amber-800 text-amber-50 hover:bg-amber-700"
             onClick={handleBulkPause}
+            disabled={isBulkOperating}
           >
             <PauseIcon className="mr-1.5 size-3.5" />
             Pause
@@ -543,6 +670,7 @@ function SchedulesPage() {
             size="sm"
             className="bg-blue-800 text-blue-50 hover:bg-blue-700"
             onClick={handleBulkDuplicate}
+            disabled={isBulkOperating}
           >
             <CopyIcon className="mr-1.5 size-3.5" />
             Duplicate
@@ -551,12 +679,50 @@ function SchedulesPage() {
             size="sm"
             className="bg-red-900 text-red-50 hover:bg-red-800"
             onClick={handleBulkDelete}
+            disabled={isBulkOperating}
           >
             <TrashIcon className="mr-1.5 size-3.5" />
             Delete
           </Button>
         </div>
       )}
+
+      {/* Bulk delete confirmation dialog */}
+      <Dialog
+        open={bulkDeleteDialog.open}
+        onOpenChange={(open) => {
+          if (!open && !isBulkOperating) {
+            setBulkDeleteDialog({ open: false, count: 0 });
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete {bulkDeleteDialog.count} Schedules</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete {bulkDeleteDialog.count}{" "}
+              {bulkDeleteDialog.count === 1 ? "schedule" : "schedules"}? This
+              action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="secondary"
+              disabled={isBulkOperating}
+              onClick={() => setBulkDeleteDialog({ open: false, count: 0 })}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={isBulkOperating}
+              onClick={handleBulkDeleteConfirm}
+            >
+              {isBulkOperating ? "Deleting..." : "Delete"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Delete confirmation dialog */}
       <Dialog
