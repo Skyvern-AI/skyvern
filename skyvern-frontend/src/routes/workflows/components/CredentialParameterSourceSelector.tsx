@@ -69,7 +69,7 @@ function CredentialParameterSourceSelector({ value, onChange }: Props) {
           onChange(value);
         }}
       >
-        <SelectTrigger>
+        <SelectTrigger className="nopan">
           <SelectValue placeholder="Select a credential" />
         </SelectTrigger>
         <SelectContent>

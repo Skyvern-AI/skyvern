@@ -50,7 +50,7 @@ function CredentialSelector({ value, onChange, placeholder }: Props) {
           }
         }}
       >
-        <SelectTrigger>
+        <SelectTrigger className="nopan">
           <SelectValue placeholder={placeholder ?? "Select a credential"} />
         </SelectTrigger>
         <SelectContent>

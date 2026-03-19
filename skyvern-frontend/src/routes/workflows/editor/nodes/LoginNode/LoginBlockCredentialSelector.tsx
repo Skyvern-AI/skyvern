@@ -254,8 +254,8 @@ function LoginBlockCredentialSelector({
         <SelectTrigger
           className={
             isCredentialMissing
-              ? "w-full border-red-500 text-red-500"
-              : "w-full"
+              ? "nopan w-full border-red-500 text-red-500"
+              : "nopan w-full"
           }
         >
           {isCredentialMissing ? (
