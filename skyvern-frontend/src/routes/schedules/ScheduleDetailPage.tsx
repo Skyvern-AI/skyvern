@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   ArrowLeftIcon,
   Pencil1Icon,
@@ -215,6 +215,13 @@ function ScheduleDetailPage() {
           <p className="text-xs text-slate-500">
             {humanReadable} · {schedule.timezone}
           </p>
+          <Link
+            to={`/workflows/${schedule.workflow_permanent_id}/runs`}
+            className="mt-1 inline-block text-xs text-slate-400 hover:text-slate-200 hover:underline"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {workflowTitle} runs →
+          </Link>
         </div>
         <Switch checked={schedule.enabled} onCheckedChange={handleToggle} />
         <Button

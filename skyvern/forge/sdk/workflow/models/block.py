@@ -2210,50 +2210,149 @@ class CodeBlock(Block):
     code: str
     parameters: list[PARAMETER_TYPE] = []
 
+    # Dangerous attribute names that must never be accessed in user code.
+    # This blocks subprocess creation, OS access, and sandbox-escape primitives.
+    # NOTE: This is a blocklist-based sandbox, not real process-level isolation.
+    # It is inherently incomplete — a determined attacker may find bypasses.
+    # Long-term we should run user code in a proper sandbox. This blocklist is
+    # a defense-in-depth layer, not a security boundary.
+    # NOTE: Do not add names that collide with safe module methods (e.g. re.compile).
+    # Builtin functions like compile(), eval(), exec() are already blocked via __builtins__: {}.
+    BLOCKED_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {
+            # Subprocess / OS execution
+            "create_subprocess_exec",
+            "create_subprocess_shell",
+            "system",
+            "popen",
+            "Popen",
+            "exec",
+            "spawn",
+            "spawnl",
+            "spawnle",
+            "spawnlp",
+            "spawnlpe",
+            "check_call",
+            "check_output",
+            "execv",
+            "execve",
+            "execvp",
+            "execvpe",
+            "execl",
+            "execlp",
+            "execlpe",
+            "fork",
+            # Network primitives
+            "open_connection",
+            "start_server",
+            "create_connection",
+            "create_server",
+            # Frame / code object internals (classic RestrictedPython escape vectors)
+            "f_globals",
+            "f_locals",
+            "f_builtins",
+            "f_code",
+            "co_code",
+            "co_consts",
+            "co_names",
+            "co_varnames",
+            "gi_frame",
+            "gi_code",
+            "cr_frame",
+            "cr_code",
+            "tb_frame",
+            "tb_next",
+            # Class hierarchy escape
+            "mro",
+            # Filesystem operations (unambiguous — these only appear on os/pathlib, not user objects)
+            "listdir",
+            "makedirs",
+            "rmdir",
+            # Module traversal (json.codecs.sys.modules etc.)
+            "codecs",
+            "modules",
+            "builtins",
+            "stdout",
+            "stderr",
+            "stdin",
+            # Sandbox-escape helpers (builtin equivalents already blocked via __builtins__: {})
+            "getattr",
+            "setattr",
+            "delattr",
+            "globals",
+            "eval",
+            "vars",
+        }
+    )
+
     @staticmethod
     def is_safe_code(code: str) -> None:
         tree = ast.parse(code)
         for node in ast.walk(tree):
+            # Block dunder attribute access (obj.__foo__)
             if hasattr(node, "attr") and str(node.attr).startswith("__"):
+                raise InsecureCodeDetected("Not allowed to access private methods or attributes")
+            # Block bare dunder identifiers (__capture_locals, __builtins__, etc.)
+            if isinstance(node, ast.Name) and node.id.startswith("__"):
                 raise InsecureCodeDetected("Not allowed to access private methods or attributes")
             if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
                 raise InsecureCodeDetected("Not allowed to import modules")
+            # Block dangerous method/attribute access on any object
+            if hasattr(node, "attr") and node.attr in CodeBlock.BLOCKED_ATTRS:
+                raise InsecureCodeDetected(f"Not allowed to access '{node.attr}'")
 
     @staticmethod
     def build_safe_vars() -> dict[str, Any]:
         return {
             "__builtins__": {},  # only allow several builtins due to security concerns
-            "locals": locals,
             "print": print,
             "len": len,
             "range": range,
             "str": str,
             "int": int,
+            "float": float,
             "dict": dict,
             "list": list,
             "tuple": tuple,
             "set": set,
             "bool": bool,
-            "asyncio": asyncio,
-            "re": re,
-            "json": json,
+            "sleep": asyncio.sleep,
+            "asyncio": SimpleNamespace(sleep=asyncio.sleep),
+            "re": SimpleNamespace(
+                match=re.match,
+                search=re.search,
+                findall=re.findall,
+                sub=re.sub,
+                compile=re.compile,
+                split=re.split,
+                IGNORECASE=re.IGNORECASE,
+                MULTILINE=re.MULTILINE,
+                DOTALL=re.DOTALL,
+            ),
+            "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
             "Exception": Exception,
         }
 
     def generate_async_user_function(
         self, code: str, page: Page, parameters: dict[str, Any] | None = None
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
-        code = textwrap.indent(code, "    ")
+        # SECURITY: validate before exec(). The AST check must run on the raw
+        # user code so it can block dunder identifiers like __capture_locals.
+        self.is_safe_code(code)
+        code = textwrap.indent(textwrap.dedent(code), "    ")
         full_code = f"""
 async def wrapper():
 {code}
-    return locals()
+    return __capture_locals()
 """
         runtime_variables: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {}
         safe_vars = self.build_safe_vars()
         if parameters:
-            safe_vars.update(parameters)
+            for key, value in parameters.items():
+                if key not in safe_vars:
+                    safe_vars[key] = value
         safe_vars["page"] = page
+        safe_vars["__capture_locals"] = locals
         exec(full_code, safe_vars, runtime_variables)
         return runtime_variables["wrapper"]
 
@@ -2359,8 +2458,9 @@ async def wrapper():
                 parameter_values[parameter.key] = secret_value if secret_value is not None else value
 
         try:
-            self.is_safe_code(self.code)
-        except Exception as e:
+            user_function = self.generate_async_user_function(self.code, page, parameter_values)
+            result = await user_function()
+        except InsecureCodeDetected as e:
             return await self.build_block_result(
                 success=False,
                 failure_reason=str(e),
@@ -2369,10 +2469,6 @@ async def wrapper():
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-
-        user_function = self.generate_async_user_function(self.code, page, parameter_values)
-        try:
-            result = await user_function()
         except Exception as e:
             exc = CustomizedCodeException(e)
             return await self.build_block_result(
@@ -5989,10 +6085,15 @@ class ConditionalBlock(Block):
         }
 
         # Step 4: Create and execute single ExtractionBlock.
-        # When all expressions have been Jinja-rendered successfully, omit
-        # browser_session_id so the LLM won't reinterpret resolved literal
-        # values as on-screen references (SKY-7985).
-        effective_browser_session_id = browser_session_id if has_any_pure_natlang else None
+        # Always pass the browser_session_id so page-referencing conditions
+        # (e.g. "the date on the page matches X") can see the screenshot.
+        # The prompt template instructs the LLM to only use page content
+        # when the condition explicitly references the page, and to evaluate
+        # self-contained conditions purely from the expression text.
+        # NOTE: The previous approach of setting browser_session_id=None for
+        # Jinja-rendered expressions (SKY-7985) was ineffective because
+        # BaseTaskBlock.execute() finds the browser via workflow_run_id cache
+        # regardless of browser_session_id.
 
         output_param = OutputParameter(
             output_parameter_id=str(uuid.uuid4()),
@@ -6015,7 +6116,7 @@ class ConditionalBlock(Block):
             block_label=self.label,
             num_conditions=len(branches),
             extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-            has_browser_session=effective_browser_session_id is not None,
+            has_browser_session=browser_session_id is not None,
             has_any_pure_natlang=has_any_pure_natlang,
             has_context=context_json is not None,
         )
@@ -6025,7 +6126,7 @@ class ConditionalBlock(Block):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                browser_session_id=effective_browser_session_id,
+                browser_session_id=browser_session_id,
             )
 
             if not extraction_result.success:

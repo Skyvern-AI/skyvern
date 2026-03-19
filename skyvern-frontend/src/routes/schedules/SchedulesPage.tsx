@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import {
   ChevronDownIcon,
@@ -507,8 +507,16 @@ function SchedulesPage() {
                       />
                     </TableCell>
                   )}
-                  <TableCell className="truncate font-medium">
-                    {schedule.workflow_title}
+                  <TableCell
+                    className="truncate font-medium"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Link
+                      to={`/workflows/${schedule.workflow_permanent_id}/runs`}
+                      className="hover:underline"
+                    >
+                      {schedule.workflow_title}
+                    </Link>
                   </TableCell>
                   <TableCell className="truncate text-slate-400">
                     {schedule.name ?? "\u2014"}
