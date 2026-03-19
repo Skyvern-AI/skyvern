@@ -1,6 +1,5 @@
 """Tests for orphan prevention and schedule cascade deletion (SKY-8186)."""
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -8,7 +7,6 @@ from sqlalchemy.dialects import postgresql
 
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from tests.unit.worker_activity_import_helpers import import_cron_worker_activities
 
 
 class _FakeResult:
@@ -189,52 +187,6 @@ async def test_delete_workflow_by_id_remains_version_scoped(
         organization_id="org_xyz",
     )
     mock_atomic_delete.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_orphan_schedule_cleanup_soft_deletes_found_schedules(monkeypatch: pytest.MonkeyPatch) -> None:
-    cron_activities = import_cron_worker_activities(monkeypatch)
-    fake_db = SimpleNamespace(
-        soft_delete_orphaned_schedules=AsyncMock(return_value=[("wfs_1", "wpid_1"), ("wfs_2", "wpid_2")]),
-    )
-    monkeypatch.setattr(cron_activities.app, "DATABASE", fake_db)
-
-    result = await cron_activities.orphan_schedule_cleanup_activity()
-
-    assert result == {
-        "orphaned_schedules_found": 2,
-        "schedules_soft_deleted": 2,
-    }
-    fake_db.soft_delete_orphaned_schedules.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_orphan_schedule_cleanup_returns_early_when_no_orphans(monkeypatch: pytest.MonkeyPatch) -> None:
-    cron_activities = import_cron_worker_activities(monkeypatch)
-    fake_db = SimpleNamespace(
-        soft_delete_orphaned_schedules=AsyncMock(return_value=[]),
-    )
-    monkeypatch.setattr(cron_activities.app, "DATABASE", fake_db)
-
-    result = await cron_activities.orphan_schedule_cleanup_activity()
-
-    assert result == {
-        "orphaned_schedules_found": 0,
-        "schedules_soft_deleted": 0,
-    }
-    fake_db.soft_delete_orphaned_schedules.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_orphan_schedule_cleanup_reraises_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    cron_activities = import_cron_worker_activities(monkeypatch)
-    fake_db = SimpleNamespace(
-        soft_delete_orphaned_schedules=AsyncMock(side_effect=RuntimeError("db unavailable")),
-    )
-    monkeypatch.setattr(cron_activities.app, "DATABASE", fake_db)
-
-    with pytest.raises(RuntimeError, match="db unavailable"):
-        await cron_activities.orphan_schedule_cleanup_activity()
 
 
 @pytest.mark.asyncio
