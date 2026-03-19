@@ -16,10 +16,14 @@ def minimax_registry():
 
     import skyvern.config as config_mod
     import skyvern.forge.sdk.api.llm.config_registry as reg_mod
+    import skyvern.forge.sdk.settings_manager as sm_mod
 
-    # Clear registry and reload to re-register with MiniMax enabled
+    # Clear registry and reload to re-register with MiniMax enabled.
+    # settings_manager must be reloaded so that SettingsManager picks up the
+    # new Settings instance (which reads the env vars we just set).
     reg_mod.LLMConfigRegistry._configs = {}
     importlib.reload(config_mod)
+    importlib.reload(sm_mod)
     importlib.reload(reg_mod)
 
     yield reg_mod.LLMConfigRegistry
@@ -29,6 +33,7 @@ def minimax_registry():
     os.environ.pop("MINIMAX_API_KEY", None)
     reg_mod.LLMConfigRegistry._configs = {}
     importlib.reload(config_mod)
+    importlib.reload(sm_mod)
     importlib.reload(reg_mod)
 
 
