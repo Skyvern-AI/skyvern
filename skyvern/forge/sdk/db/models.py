@@ -60,6 +60,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
     generate_workflow_run_id,
+    generate_workflow_schedule_id,
     generate_workflow_script_id,
     generate_workflow_template_id,
 )
@@ -326,6 +327,39 @@ class WorkflowModel(Base):
     is_saved_task = Column(Boolean, default=False, nullable=False)
 
 
+class WorkflowScheduleModel(Base):
+    __tablename__ = "workflow_schedules"
+    __table_args__ = (
+        Index(
+            "idx_workflow_schedules_org_workflow",
+            "organization_id",
+            "workflow_permanent_id",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        Index("idx_workflow_schedules_org_enabled", "organization_id", "enabled"),
+    )
+
+    workflow_schedule_id = Column(String, primary_key=True, default=generate_workflow_schedule_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False, index=True)
+    cron_expression = Column(String, nullable=False)
+    timezone = Column(String, nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
+    parameters = Column(JSON, nullable=True)
+    temporal_schedule_id = Column(String, nullable=True)
+    name = Column(String, nullable=True)
+    description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class WorkflowTemplateModel(Base):
     """
     Tracks which workflows are marked as templates.
@@ -376,6 +410,8 @@ class WorkflowRunModel(Base):
     sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     debug_session_id: Column = Column(String, nullable=True)
+    trigger_type = Column(String, nullable=True)
+    workflow_schedule_id = Column(String, nullable=True, index=True)
     ai_fallback = Column(Boolean, nullable=True)
     code_gen = Column(Boolean, nullable=True)
     waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
