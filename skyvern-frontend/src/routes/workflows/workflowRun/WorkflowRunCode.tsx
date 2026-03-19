@@ -287,21 +287,21 @@ function WorkflowRunCode(props?: Props) {
   const generatedByThisRun = versions.filter(
     (v) => v.run_id != null && v.run_id === workflowRunId,
   );
-  const didGenerate = generatedByThisRun.length > 0;
-  const generatedVersion = didGenerate
-    ? Math.max(...generatedByThisRun.map((v) => v.version))
-    : null;
-  const earliestGeneratedVersion = didGenerate
-    ? Math.min(...generatedByThisRun.map((v) => v.version))
-    : null;
-  // "Used" = the version that existed before this run created new ones,
-  // OR the currentVersion if the run didn't generate anything (just used cache)
-  const usedVersion = didGenerate
-    ? versions.find(
-        (v) =>
-          v.version < earliestGeneratedVersion! && v.run_id !== workflowRunId,
-      )?.version ?? null
-    : currentVersion;
+  const generatedVersion =
+    generatedByThisRun.length > 0
+      ? Math.max(...generatedByThisRun.map((v) => v.version))
+      : currentVersion;
+  const earliestGeneratedVersion =
+    generatedByThisRun.length > 0
+      ? Math.min(...generatedByThisRun.map((v) => v.version))
+      : null;
+  const usedVersion =
+    earliestGeneratedVersion != null
+      ? versions.find(
+          (v) =>
+            v.version < earliestGeneratedVersion && v.run_id !== workflowRunId,
+        )?.version ?? null
+      : null;
 
   // Edit button shown when not in edit mode and there's a script to edit
   const editButton =
@@ -342,7 +342,7 @@ function WorkflowRunCode(props?: Props) {
     ) : null;
 
   // Version selector — "Used → Generated" chips instead of dropdown
-  const activeChipVersion = selectedVersion ?? generatedVersion ?? usedVersion;
+  const activeChipVersion = selectedVersion ?? generatedVersion;
 
   const versionSelector = !versionsFetched ? null : (
     <div className="flex items-center gap-1">
@@ -356,12 +356,12 @@ function WorkflowRunCode(props?: Props) {
                 ? "border-blue-500 bg-blue-500/20 text-blue-300"
                 : "border-slate-700 text-slate-400 hover:border-slate-500",
             )}
-            onClick={() => setSelectedVersion(didGenerate ? usedVersion : null)}
+            onClick={() => setSelectedVersion(usedVersion)}
             disabled={isEditing}
           >
             Used: #{usedVersion}
           </button>
-          {didGenerate && <span className="text-xs text-slate-600">→</span>}
+          <span className="text-xs text-slate-600">→</span>
         </>
       )}
       {generatedVersion != null && (
