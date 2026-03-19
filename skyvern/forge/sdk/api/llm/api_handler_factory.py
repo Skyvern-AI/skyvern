@@ -493,6 +493,7 @@ class LLMAPIHandlerFactory:
             raw_response: bool = False,
             window_dimension: Resolution | None = None,
             force_dict: bool = True,
+            system_prompt: str | None = None,
         ) -> dict[str, Any] | Any:
             """
             Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
@@ -561,6 +562,14 @@ class LLMAPIHandlerFactory:
                     )
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
+
+                # Prepend system message for role separation (e.g., workflow copilot)
+                if system_prompt:
+                    system_message = {
+                        "role": "system",
+                        "content": [{"type": "text", "text": system_prompt}],
+                    }
+                    messages = [system_message] + messages
 
                 async def _log_llm_request_artifact(model_label: str, vertex_cache_attached_flag: bool) -> str:
                     llm_request_payload = {
@@ -937,6 +946,7 @@ class LLMAPIHandlerFactory:
             raw_response: bool = False,
             window_dimension: Resolution | None = None,
             force_dict: bool = True,
+            system_prompt: str | None = None,
         ) -> dict[str, Any] | Any:
             start_time = time.time()
             active_parameters = base_parameters or {}
@@ -1005,6 +1015,14 @@ class LLMAPIHandlerFactory:
                 model_name = llm_config.model_name
 
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
+
+                # Prepend system message for role separation (e.g., workflow copilot)
+                if system_prompt:
+                    system_message = {
+                        "role": "system",
+                        "content": [{"type": "text", "text": system_prompt}],
+                    }
+                    messages = [system_message] + messages
 
                 # Inject context caching system message when available
                 # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts
@@ -1407,6 +1425,7 @@ class LLMCaller:
         raw_response: bool = False,
         window_dimension: Resolution | None = None,
         force_dict: bool = True,
+        system_prompt: str | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any] | Any:
         start_time = time.perf_counter()
