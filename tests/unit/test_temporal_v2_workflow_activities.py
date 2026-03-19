@@ -1,4 +1,3 @@
-import importlib
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
@@ -7,62 +6,15 @@ import pytest
 
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-
-# Skip the entire module when the cloud-only workers package is not available
-pytest.importorskip("workers.temporal_v2_worker.activities")
-
-
-def _import_activities_module(monkeypatch: pytest.MonkeyPatch):
-    # activities.py imports cloud-only modules at import time, so these tests
-    # stub them and re-import the module for each test case.
-    from dataclasses import dataclass
-    from typing import Optional
-
-    cloud_package = ModuleType("cloud")
-    cloud_package.__path__ = []
-    cloud_services = ModuleType("cloud.services")
-    data_scrubber_module = ModuleType("cloud.services.data_scrubber_service")
-    workers_package = ModuleType("workers")
-    workers_package.__path__ = []
-    worker_utils_module = ModuleType("workers.worker_utils")
-    run_parameters_module = ModuleType("workers.run_parameters")
-
-    class DataScrubber:
-        pass
-
-    async def activity_teardown() -> None:
-        return None
-
-    @dataclass
-    class RunSkyvernWorkflowParams:
-        organization_id: str
-        workflow_run_id: str
-        is_scheduled_run: bool = False
-        workflow_permanent_id: Optional[str] = None
-        workflow_schedule_id: Optional[str] = None
-
-    data_scrubber_module.DataScrubber = DataScrubber
-    worker_utils_module.activity_teardown = activity_teardown
-    run_parameters_module.RunSkyvernWorkflowParams = RunSkyvernWorkflowParams
-    monkeypatch.setitem(sys.modules, "cloud", cloud_package)
-    monkeypatch.setitem(sys.modules, "cloud.services", cloud_services)
-    monkeypatch.setitem(sys.modules, "cloud.services.data_scrubber_service", data_scrubber_module)
-    temporal_v2_worker_package = ModuleType("workers.temporal_v2_worker")
-    temporal_v2_worker_package.__path__ = []
-    monkeypatch.setitem(sys.modules, "workers", workers_package)
-    monkeypatch.setitem(sys.modules, "workers.worker_utils", worker_utils_module)
-    monkeypatch.setitem(sys.modules, "workers.run_parameters", run_parameters_module)
-    monkeypatch.setitem(sys.modules, "workers.temporal_v2_worker", temporal_v2_worker_package)
-    sys.modules.pop("workers.temporal_v2_worker.activities", None)
-    activities = importlib.import_module("workers.temporal_v2_worker.activities")
-    return activities, RunSkyvernWorkflowParams
+from tests.unit.worker_activity_import_helpers import import_temporal_v2_worker_activities
+from workers.run_parameters import RunSkyvernWorkflowParams
 
 
 @pytest.mark.asyncio
 async def test_setup_scheduled_workflow_run_sets_trigger_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    activities, RunSkyvernWorkflowParams = _import_activities_module(monkeypatch)
+    activities = import_temporal_v2_worker_activities(monkeypatch)
     created_workflow_run = SimpleNamespace(workflow_run_id="wr_sched_123", status=WorkflowRunStatus.created)
     queued_workflow_run = SimpleNamespace(workflow_run_id="wr_sched_123", status=WorkflowRunStatus.queued)
     organization = SimpleNamespace(organization_id="org_123")
@@ -109,7 +61,7 @@ async def test_setup_scheduled_workflow_run_sets_trigger_metadata(
 async def test_setup_scheduled_workflow_run_reuses_existing_run_without_duplicate_task_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    activities, RunSkyvernWorkflowParams = _import_activities_module(monkeypatch)
+    activities = import_temporal_v2_worker_activities(monkeypatch)
     existing_workflow_run = SimpleNamespace(workflow_run_id="wr_sched_123", status=WorkflowRunStatus.queued)
     organization = SimpleNamespace(organization_id="org_123")
 
@@ -147,7 +99,7 @@ async def test_setup_scheduled_workflow_run_reuses_existing_run_without_duplicat
 async def test_setup_scheduled_workflow_run_requeues_existing_created_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    activities, RunSkyvernWorkflowParams = _import_activities_module(monkeypatch)
+    activities = import_temporal_v2_worker_activities(monkeypatch)
     existing_workflow_run = SimpleNamespace(workflow_run_id="wr_sched_123", status=WorkflowRunStatus.created)
     queued_workflow_run = SimpleNamespace(workflow_run_id="wr_sched_123", status=WorkflowRunStatus.queued)
     organization = SimpleNamespace(organization_id="org_123")
@@ -190,7 +142,7 @@ async def test_setup_scheduled_workflow_run_requeues_existing_created_run(
 async def test_run_workflow_activity_rejects_scheduled_runs_without_workflow_permanent_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    activities, RunSkyvernWorkflowParams = _import_activities_module(monkeypatch)
+    activities = import_temporal_v2_worker_activities(monkeypatch)
     run_workflow_module = ModuleType("scripts.run_workflow")
     run_workflow_module.execute_workflow = AsyncMock()
     monkeypatch.setitem(sys.modules, "scripts.run_workflow", run_workflow_module)
@@ -216,7 +168,7 @@ async def test_run_workflow_activity_rejects_scheduled_runs_without_workflow_per
 async def test_run_workflow_activity_rejects_scheduled_runs_without_schedule_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    activities, RunSkyvernWorkflowParams = _import_activities_module(monkeypatch)
+    activities = import_temporal_v2_worker_activities(monkeypatch)
     run_workflow_module = ModuleType("scripts.run_workflow")
     run_workflow_module.execute_workflow = AsyncMock()
     monkeypatch.setitem(sys.modules, "scripts.run_workflow", run_workflow_module)
