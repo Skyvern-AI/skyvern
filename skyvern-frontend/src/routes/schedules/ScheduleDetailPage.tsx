@@ -449,16 +449,24 @@ function ScheduleDetailPage() {
 
           <div className="rounded-lg border border-slate-700 p-4">
             <h3 className="mb-4 text-sm text-slate-400">Upcoming Runs</h3>
-            <p className="mb-2 text-xs text-slate-400">
-              Next {next_runs.length} runs
-            </p>
-            <div className="space-y-0.5">
-              {next_runs.map((run) => (
-                <p key={run} className="text-xs text-slate-500">
-                  {formatNextRun(new Date(run), schedule.timezone)}
+            {schedule.enabled ? (
+              <>
+                <p className="mb-2 text-xs text-slate-400">
+                  Next {next_runs.length} runs
                 </p>
-              ))}
-            </div>
+                <div className="space-y-0.5">
+                  {next_runs.map((run) => (
+                    <p key={run} className="text-xs text-slate-500">
+                      {formatNextRun(new Date(run), schedule.timezone)}
+                    </p>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <p className="text-xs text-slate-500">
+                Schedule is paused — no upcoming runs
+              </p>
+            )}
           </div>
         </div>
       </div>
