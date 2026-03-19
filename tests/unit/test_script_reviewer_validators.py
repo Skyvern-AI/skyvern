@@ -107,3 +107,83 @@ async def block_fn(page, context):
         # Even if "send_email" is technically a value somewhere, it's a block label
         params = {"account_number": "12345678"}
         assert self.reviewer._validate_no_hardcoded_values(code, params) is None
+
+
+class TestValidateParameterPreservation:
+    """Tests for _validate_parameter_preservation."""
+
+    def setup_method(self) -> None:
+        self.reviewer = ScriptReviewer()
+
+    def test_no_existing_code_returns_none(self) -> None:
+        new_code = "await page.fill(selector='#email', ai='proactive', prompt='email')"
+        assert self.reviewer._validate_parameter_preservation(new_code, None, ["email"]) is None
+
+    def test_no_parameter_keys_returns_none(self) -> None:
+        old_code = "await page.fill(selector='#email', value=context.parameters['email'])"
+        new_code = "await page.fill(selector='#email', ai='proactive', prompt='email')"
+        assert self.reviewer._validate_parameter_preservation(new_code, old_code, []) is None
+
+    def test_preserved_refs_returns_none(self) -> None:
+        """When all parameter refs are preserved, validation passes."""
+        old_code = """
+await page.fill(selector='#email', value=context.parameters['email'])
+await page.fill(selector='#pass', value=context.parameters['password'])
+"""
+        new_code = """
+choice = await page.classify(...)
+if choice == 0:
+    await page.fill(selector='#email', value=context.parameters['email'])
+    await page.fill(selector='#pass', value=context.parameters['password'])
+"""
+        assert self.reviewer._validate_parameter_preservation(new_code, old_code, ["email", "password"]) is None
+
+    def test_detects_dropped_refs(self) -> None:
+        """When the LLM drops value= refs, validation catches it."""
+        old_code = """
+await page.fill(selector='#email', value=context.parameters['email'])
+await page.fill(selector='#pass', value=context.parameters['password'])
+"""
+        new_code = """
+choice = await page.classify(...)
+if choice == 0:
+    await page.fill(selector='#email', ai='proactive', prompt='fill email')
+    await page.fill(selector='#pass', ai='proactive', prompt='fill password')
+"""
+        error = self.reviewer._validate_parameter_preservation(new_code, old_code, ["email", "password"])
+        assert error is not None
+        assert "email" in error
+        assert "password" in error
+        assert "dropped" in error.lower()
+
+    def test_ignores_refs_not_in_parameter_keys(self) -> None:
+        """Spurious refs in old code that aren't valid keys should be ignored."""
+        old_code = "await page.fill(selector='#x', value=context.parameters['invented_key'])"
+        new_code = "await page.fill(selector='#x', ai='proactive', prompt='fill x')"
+        assert self.reviewer._validate_parameter_preservation(new_code, old_code, ["email", "password"]) is None
+
+    def test_partial_drop_detected(self) -> None:
+        """Dropping one ref while keeping another should flag only the dropped one."""
+        old_code = """
+await page.fill(selector='#email', value=context.parameters['email'])
+await page.fill(selector='#pass', value=context.parameters['password'])
+"""
+        new_code = """
+await page.fill(selector='#email', value=context.parameters['email'])
+await page.fill(selector='#pass', ai='proactive', prompt='fill password')
+"""
+        error = self.reviewer._validate_parameter_preservation(new_code, old_code, ["email", "password"])
+        assert error is not None
+        assert "context.parameters['password']" in error
+        assert "context.parameters['email']" not in error
+
+    def test_commented_ref_in_new_code_counts_as_dropped(self) -> None:
+        """A parameter ref only in a comment in new code should be flagged as dropped."""
+        old_code = "await page.fill(selector='#email', value=context.parameters['email'])"
+        new_code = """
+# was: context.parameters['email']
+await page.fill(selector='#email', ai='proactive', prompt='fill email')
+"""
+        error = self.reviewer._validate_parameter_preservation(new_code, old_code, ["email"])
+        assert error is not None
+        assert "email" in error

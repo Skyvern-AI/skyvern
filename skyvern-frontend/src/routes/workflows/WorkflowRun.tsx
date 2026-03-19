@@ -24,6 +24,7 @@ import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { runsApiBaseUrl } from "@/util/env";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import {
   CodeIcon,
   FileIcon,
@@ -355,6 +356,21 @@ function WorkflowRun() {
               ) : null}
             </div>
             <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
+            {workflowRun &&
+              (workflowRun.started_at || workflowRun.finished_at) && (
+                <div className="flex gap-4 text-sm text-slate-400">
+                  {workflowRun.started_at && (
+                    <span title={basicTimeFormat(workflowRun.started_at)}>
+                      Started: {basicLocalTimeFormat(workflowRun.started_at)}
+                    </span>
+                  )}
+                  {workflowRun.finished_at && (
+                    <span title={basicTimeFormat(workflowRun.finished_at)}>
+                      Finished: {basicLocalTimeFormat(workflowRun.finished_at)}
+                    </span>
+                  )}
+                </div>
+              )}
             {workflowRun?.browser_session_id && (
               <Link
                 className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"

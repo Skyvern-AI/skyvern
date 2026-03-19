@@ -97,6 +97,9 @@ export type WorkflowScriptSummary = {
   status: "published" | "pending";
   latest_version: number;
   version_count: number;
+  total_runs: number;
+  success_rate: number | null;
+  is_pinned: boolean;
   created_at: string;
   modified_at: string;
 };
@@ -114,4 +117,19 @@ export type PinScriptResponse = {
   cache_key_value: string;
   is_pinned: boolean;
   pinned_at: string | null;
+};
+
+export type ScriptRunSummary = {
+  workflow_run_id: string;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  failure_reason: string | null;
+};
+
+export type ScriptRunsResponse = {
+  runs: ScriptRunSummary[];
+  total_count: number;
+  status_counts: Record<string, number>;
 };

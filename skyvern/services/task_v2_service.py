@@ -602,16 +602,6 @@ async def run_task_v2_helper(
         current_run_id,
         properties={"organization_id": organization_id, "task_url": task_v2.url},
     )
-    enable_task_v2_termination = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-        "ENABLE_TASK_V2_TERMINATION",
-        current_run_id,
-        properties={"organization_id": organization_id, "task_url": task_v2.url},
-    )
-    LOG.info(
-        "Task v2 termination feature flag",
-        enable_task_v2_termination=enable_task_v2_termination,
-        organization_id=organization_id,
-    )
     skyvern_context.set(
         SkyvernContext(
             organization_id=organization_id,
@@ -785,7 +775,6 @@ async def run_task_v2_helper(
                 user_goal=user_prompt,
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
-                enable_termination=bool(enable_task_v2_termination),
             )
             thought = await app.DATABASE.create_thought(
                 task_v2_id=task_v2_id,
@@ -854,8 +843,7 @@ async def run_task_v2_helper(
                     )
                 break
 
-            # Only handle termination if the feature flag is enabled
-            if enable_task_v2_termination and should_terminate is True:
+            if should_terminate is True:
                 task_v2 = await _handle_task_v2_termination(
                     task_v2_id=task_v2_id,
                     organization_id=organization_id,
@@ -1038,7 +1026,6 @@ async def run_task_v2_helper(
                 user_goal=user_prompt,
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
-                enable_termination=bool(enable_task_v2_termination),
             )
             thought = await app.DATABASE.create_thought(
                 task_v2_id=task_v2_id,
@@ -1097,8 +1084,7 @@ async def run_task_v2_helper(
                     )
                 break
 
-            # Only handle termination if the feature flag is enabled
-            if enable_task_v2_termination and should_terminate:
+            if should_terminate:
                 task_v2 = await _handle_task_v2_termination(
                     task_v2_id=task_v2_id,
                     organization_id=organization_id,

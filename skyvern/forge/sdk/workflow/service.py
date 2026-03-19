@@ -55,6 +55,7 @@ from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -577,6 +578,63 @@ class WorkflowService:
         if credential is None:
             raise InvalidCredentialId(credential_id)
 
+    async def validate_schedule_parameters(
+        self,
+        workflow: Workflow,
+        organization: Organization,
+        request_data: dict[str, Any] | None,
+    ) -> None:
+        all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
+        schedule_parameters = [
+            cast(WorkflowParameter, workflow_parameter)
+            for workflow_parameter in all_workflow_parameters
+            if self._is_schedule_input_parameter(workflow_parameter)
+        ]
+        request_data = request_data or {}
+
+        defined_keys = {workflow_parameter.key for workflow_parameter in schedule_parameters}
+        unknown_keys = sorted(set(request_data) - defined_keys)
+        if unknown_keys:
+            unknown_keys_str = ", ".join(unknown_keys)
+            raise SkyvernHTTPException(
+                message=(
+                    f"Unknown schedule parameters for workflow {workflow.workflow_permanent_id}: {unknown_keys_str}"
+                )
+            )
+
+        missing_parameters: list[str] = []
+        for workflow_parameter in schedule_parameters:
+            if workflow_parameter.key in request_data:
+                request_value = request_data[workflow_parameter.key]
+                # Treat explicit None as "use the default at execution time". Validate the
+                # default value instead so the check matches what actually runs.
+                if request_value is None and workflow_parameter.default_value is not None:
+                    request_value = workflow_parameter.default_value
+                if self._is_missing_required_value(workflow_parameter, request_value):
+                    missing_parameters.append(workflow_parameter.key)
+                    continue
+                if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                    if not isinstance(request_value, str):
+                        raise InvalidCredentialId(f"Credential ID must be a string, got {type(request_value).__name__}")
+                    await self._validate_credential_id(request_value, organization)
+            elif workflow_parameter.default_value is not None:
+                if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                    if not isinstance(workflow_parameter.default_value, str):
+                        raise InvalidCredentialId(
+                            f"Credential ID must be a string, got {type(workflow_parameter.default_value).__name__}"
+                        )
+                    await self._validate_credential_id(workflow_parameter.default_value, organization)
+            else:
+                missing_parameters.append(workflow_parameter.key)
+
+        if missing_parameters:
+            missing_keys_str = ", ".join(sorted(missing_parameters))
+            raise SkyvernHTTPException(
+                message=(
+                    f"Missing schedule parameters for workflow {workflow.workflow_permanent_id}: {missing_keys_str}"
+                )
+            )
+
     async def setup_workflow_run(
         self,
         request_id: str | None,
@@ -589,6 +647,9 @@ class WorkflowService:
         parent_workflow_run_id: str | None = None,
         debug_session_id: str | None = None,
         code_gen: bool | None = None,
+        workflow_run_id: str | None = None,
+        trigger_type: WorkflowRunTriggerType | None = None,
+        workflow_schedule_id: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -625,6 +686,9 @@ class WorkflowService:
             sequential_key=workflow.sequential_key,
             debug_session_id=debug_session_id,
             code_gen=code_gen,
+            workflow_run_id=workflow_run_id,
+            trigger_type=trigger_type,
+            workflow_schedule_id=workflow_schedule_id,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -740,6 +804,19 @@ class WorkflowService:
         if isinstance(error, IntegrityError):
             return "value cannot be null"
         return "database error while saving parameter value"
+
+    @staticmethod
+    def _is_schedule_input_parameter(workflow_parameter: Any) -> bool:
+        """Check whether a parameter is user-configurable input for scheduled runs.
+
+        Filters to WorkflowParameter instances only — excludes ContextParameter,
+        OutputParameter, and CredentialParameter (the model class, whose credentials
+        are resolved at runtime).  Note that a WorkflowParameter whose
+        workflow_parameter_type is CREDENTIAL_ID *is* included here because the
+        user supplies the credential ID string at schedule time; only the actual
+        CredentialParameter objects are excluded.
+        """
+        return isinstance(workflow_parameter, WorkflowParameter)
 
     @staticmethod
     def _is_missing_required_value(workflow_parameter: WorkflowParameter, value: Any) -> bool:
@@ -3101,16 +3178,30 @@ class WorkflowService:
         workflow_permanent_id: str,
         organization_id: str | None = None,
     ) -> None:
-        await app.DATABASE.soft_delete_workflow_by_permanent_id(
+        # Delete workflow and schedules in one DB transaction so we do not leave
+        # the workflow active if a process exits between separate commits.
+        deleted_schedule_ids = await app.DATABASE.soft_delete_workflow_and_schedules_by_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
         )
+        if deleted_schedule_ids:
+            LOG.info(
+                "Cascade-deleted schedules during workflow deletion",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                deleted_schedule_ids=deleted_schedule_ids,
+                count=len(deleted_schedule_ids),
+            )
 
     async def delete_workflow_by_id(
         self,
         workflow_id: str,
         organization_id: str,
     ) -> None:
+        # This path is rollback-only for a single workflow version created during
+        # save/update flows. It must stay version-scoped and non-cascading because
+        # schedules belong to the permanent workflow and should remain attached to
+        # the previously valid version if the new version creation fails.
         await app.DATABASE.soft_delete_workflow_by_id(
             workflow_id=workflow_id,
             organization_id=organization_id,
@@ -3176,6 +3267,9 @@ class WorkflowService:
         sequential_key: str | None = None,
         debug_session_id: str | None = None,
         code_gen: bool | None = None,
+        workflow_run_id: str | None = None,
+        trigger_type: WorkflowRunTriggerType | None = None,
+        workflow_schedule_id: str | None = None,
     ) -> WorkflowRun:
         # validate the browser session or profile id
         browser_profile_id = workflow_request.browser_profile_id
@@ -3263,6 +3357,9 @@ class WorkflowService:
             debug_session_id=debug_session_id,
             ai_fallback=workflow_request.ai_fallback,
             code_gen=code_gen,
+            workflow_run_id=workflow_run_id,
+            trigger_type=trigger_type,
+            workflow_schedule_id=workflow_schedule_id,
         )
 
     async def _update_workflow_run_status(
@@ -3812,6 +3909,24 @@ class WorkflowService:
         errors: list[dict[str, Any]] = []
         for task in workflow_run_tasks:
             errors.extend(task.errors)
+
+        # Also collect block-level error codes (e.g. FILE_PARSER_ERROR) into the
+        # same errors array so they appear in the top-level workflow run response,
+        # matching the task-level error format. Uses a lightweight query that only
+        # fetches blocks with non-null error_codes to avoid a full block load on
+        # every status poll.
+        block_errors = await app.DATABASE.get_workflow_run_block_errors(
+            workflow_run_id=workflow_run_id, organization_id=organization_id
+        )
+        for error_codes, failure_reason in block_errors:
+            for code in error_codes:
+                errors.append(
+                    {
+                        "error_code": code,
+                        "reasoning": failure_reason or "",
+                        "confidence_float": 1.0,
+                    }
+                )
 
         total_steps = None
         total_cost = None
@@ -4516,7 +4631,7 @@ class WorkflowService:
                 return
 
             async def _regenerate_script() -> None:
-                """Delete old script and generate new one.
+                """Create a new version of the existing script, preserving version history.
 
                 Uses double-check pattern: re-verify regeneration is needed after acquiring lock
                 to handle race conditions where another process regenerated while we waited.
@@ -4529,38 +4644,44 @@ class WorkflowService:
                     statuses=[ScriptStatus.published],
                     use_cache=False,
                 )
-                if fresh_script and fresh_script.script_id != existing_script.script_id:
+                if fresh_script and fresh_script.script_revision_id != existing_script.script_revision_id:
                     LOG.info(
                         "Script already regenerated by another process, skipping",
                         workflow_id=workflow.workflow_id,
                         workflow_run_id=workflow_run.workflow_run_id,
                         cache_key_value=rendered_cache_key_value,
-                        existing_script_id=existing_script.script_id,
-                        fresh_script_id=fresh_script.script_id,
+                        existing_revision=existing_script.script_revision_id,
+                        fresh_revision=fresh_script.script_revision_id,
                     )
                     return
 
+                # Get the latest version number so we can increment it
+                version_stats = await app.DATABASE.get_script_version_stats(
+                    organization_id=workflow.organization_id,
+                    script_ids=[existing_script.script_id],
+                )
+                latest_version, _ = version_stats.get(existing_script.script_id, (0, 0))
+                next_version = latest_version + 1
+
                 LOG.info(
-                    "deleting old workflow script and generating new script",
+                    "Regenerating script as new version (preserving history)",
                     workflow_id=workflow.workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                     cache_key_value=rendered_cache_key_value,
                     script_id=existing_script.script_id,
-                    script_revision_id=existing_script.script_revision_id,
+                    old_version=latest_version,
+                    new_version=next_version,
                     run_with=workflow_run.run_with,
                     blocks_to_update=list(blocks_to_update),
                     code_gen=code_gen,
                 )
 
-                await app.DATABASE.delete_workflow_scripts_by_permanent_id(
-                    organization_id=workflow.organization_id,
-                    workflow_permanent_id=workflow.workflow_permanent_id,
-                    script_ids=[existing_script.script_id],
-                )
-
+                # Create a new version of the SAME script_id instead of a new script
                 regenerated_script = await app.DATABASE.create_script(
                     organization_id=workflow.organization_id,
                     run_id=workflow_run.workflow_run_id,
+                    script_id=existing_script.script_id,
+                    version=next_version,
                 )
 
                 await workflow_script_service.generate_workflow_script(
@@ -4571,6 +4692,25 @@ class WorkflowService:
                     cached_script=existing_script,
                     updated_block_labels=blocks_to_update,
                 )
+
+                # If generation failed (e.g. syntax error), clean up the empty script row
+                # to avoid orphaned versions that skip version numbers on next regeneration.
+                script_files = await app.DATABASE.get_script_files(
+                    script_revision_id=regenerated_script.script_revision_id,
+                    organization_id=workflow.organization_id,
+                )
+                if not script_files:
+                    LOG.warning(
+                        "Script generation produced no files, soft-deleting empty version",
+                        script_id=regenerated_script.script_id,
+                        version=regenerated_script.version,
+                    )
+                    await app.DATABASE.soft_delete_script_by_revision(
+                        script_revision_id=regenerated_script.script_revision_id,
+                        organization_id=workflow.organization_id,
+                    )
+                    return
+
                 aio_task_primary_key = f"{regenerated_script.script_id}_{regenerated_script.version}"
                 if aio_task_primary_key in app.ARTIFACT_MANAGER.upload_aiotasks_map:
                     aio_tasks = app.ARTIFACT_MANAGER.upload_aiotasks_map[aio_task_primary_key]
@@ -4986,19 +5126,15 @@ class WorkflowService:
     ) -> bool:
         """Determine whether this run should attempt to execute cached scripts.
 
-        When neither the run nor the workflow explicitly sets run_with, fall back
-        to the workflow's adaptive_caching flag. This allows workflows with
-        adaptive_caching=True to default into code-v2 mode without requiring
-        every API call to pass run_with explicitly.
+        Priority: run-level run_with > workflow-level run_with > default (agent).
+        The adaptive_caching flag does NOT independently force code mode — it only
+        controls whether a code run uses v1 or v2 (see is_adaptive_caching()).
         """
         if workflow_run.run_with in ("code", "code_v2"):
             return True
         if workflow_run.run_with == "agent":
             return False
-        if workflow.run_with == "code":
+        if workflow.run_with in ("code", "code_v2"):
             return True
-        if workflow.run_with == "agent":
-            return False
-        if workflow.adaptive_caching:
-            return True
+        # workflow.run_with is "agent" or null — default to agent
         return False

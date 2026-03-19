@@ -231,6 +231,7 @@ class Block(BaseModel, abc.ABC):
         executed_branch_expression: str | None = None,
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
+        error_codes: list[str] | None = None,
     ) -> BlockResult:
         # TODO: update workflow run block status and failure reason
         if isinstance(output_parameter_value, str):
@@ -247,10 +248,12 @@ class Block(BaseModel, abc.ABC):
                 executed_branch_expression=executed_branch_expression,
                 executed_branch_result=executed_branch_result,
                 executed_branch_next_block=executed_branch_next_block,
+                error_codes=error_codes,
             )
         return BlockResult(
             success=success,
             failure_reason=failure_reason,
+            error_codes=error_codes or [],
             output_parameter=self.output_parameter,
             output_parameter_value=output_parameter_value,
             status=status,
@@ -498,6 +501,10 @@ class Block(BaseModel, abc.ABC):
                 organization_id=organization_id,
             )
 
+    def get_failure_error_codes(self) -> list[str]:
+        """Return block-level error codes for unexpected failures. Override in subclasses."""
+        return []
+
     @traced()
     async def execute_safe(
         self,
@@ -588,6 +595,7 @@ class Block(BaseModel, abc.ABC):
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                error_codes=self.get_failure_error_codes() or None,
             )
 
     @abc.abstractmethod
@@ -2407,12 +2415,32 @@ class TextPromptBlock(Block):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
+    def _render_schema_templates(self, obj: Any, workflow_run_context: WorkflowRunContext) -> Any:
+        if isinstance(obj, str):
+            try:
+                return self.format_block_parameter_template_from_workflow_run_context(obj, workflow_run_context)
+            except Exception:
+                LOG.warning(
+                    "Failed to render Jinja template in json_schema value, using original value",
+                    value=obj,
+                    block_label=self.label,
+                    exc_info=True,
+                )
+                return obj
+        elif isinstance(obj, dict):
+            return {k: self._render_schema_templates(v, workflow_run_context) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._render_schema_templates(item, workflow_run_context) for item in obj]
+        return obj
+
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.llm_key:
             self.llm_key = self.format_block_parameter_template_from_workflow_run_context(
                 self.llm_key, workflow_run_context
             )
         self.prompt = self.format_block_parameter_template_from_workflow_run_context(self.prompt, workflow_run_context)
+        if self.json_schema:
+            self.json_schema = self._render_schema_templates(self.json_schema, workflow_run_context)
 
     async def send_prompt(
         self,
@@ -3350,6 +3378,9 @@ class FileParserBlock(Block):
     file_type: FileType
     json_schema: dict[str, Any] | None = None
 
+    def get_failure_error_codes(self) -> list[str]:
+        return ["FILE_PARSER_ERROR"]
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -3745,20 +3776,32 @@ class FileParserBlock(Block):
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                error_codes=self.get_failure_error_codes() or None,
             )
 
-        # Download the file
-        if self.file_url.startswith("s3://"):
-            file_path = await download_from_s3(self.get_async_aws_client(), self.file_url)
-        else:
-            file_path = await download_file(self.file_url)
+        try:
+            # Download the file
+            if self.file_url.startswith("s3://"):
+                file_path = await download_from_s3(self.get_async_aws_client(), self.file_url)
+            else:
+                file_path = await download_file(self.file_url)
 
-        # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
-        if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
-            self.file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
+            # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
+            if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
+                self.file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
 
-        # Validate the file type
-        self.validate_file_type(self.file_url, file_path)
+            # Validate the file type
+            self.validate_file_type(self.file_url, file_path)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to download or validate file: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                error_codes=self.get_failure_error_codes() or None,
+            )
 
         LOG.debug(
             "FileParserBlock: After file type validation",
@@ -3787,6 +3830,7 @@ class FileParserBlock(Block):
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                error_codes=self.get_failure_error_codes() or None,
             )
 
         # If json_schema is provided, use AI to extract structured data
@@ -3810,6 +3854,7 @@ class FileParserBlock(Block):
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    error_codes=self.get_failure_error_codes() or None,
                 )
         else:
             # Return raw parsed data

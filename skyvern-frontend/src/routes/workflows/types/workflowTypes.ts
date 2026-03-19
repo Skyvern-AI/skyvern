@@ -617,7 +617,7 @@ export type WorkflowSettings = {
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  runWith: string | null; // 'agent' or 'code'
+  runWith: string | null; // 'agent', 'code', or 'code_v2'
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
   runSequentially: boolean;
