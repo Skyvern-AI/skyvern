@@ -56,6 +56,8 @@
     "cors": "^2.8.5",
     "country-state-city": "^3.2.1",
     "cross-spawn": "^7.0.6",
+    "cron-parser": "^5.5.0",
+    "cronstrue": "^3.13.0",
     "embla-carousel-react": "^8.0.0",
     "@microsoft/fetch-event-source": "^2.0.1",
     "express": "^4.21.2",
