@@ -74,7 +74,7 @@ function LoginBlockCredentialSelector({
       parameter.parameterType === "onepassword",
   );
   const isCloud = useContext(CloudContext);
-  const { data: credentials = [], isLoading } = useCredentialsQuery({
+  const { data: credentials = [], isFetching } = useCredentialsQuery({
     enabled: isCloud,
     page_size: 100,
   });
@@ -120,7 +120,7 @@ function LoginBlockCredentialSelector({
     return !credentialIdsInVault.has(selectedCredentialId);
   }, [selectedCredentialId, credentialIdsInVault]);
 
-  if (isCloud && isLoading) {
+  if (isCloud && isFetching) {
     return <Skeleton className="h-8 w-full" />;
   }
 

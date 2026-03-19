@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   ArrowLeftIcon,
   Pencil1Icon,
@@ -215,6 +215,13 @@ function ScheduleDetailPage() {
           <p className="text-xs text-slate-500">
             {humanReadable} · {schedule.timezone}
           </p>
+          <Link
+            to={`/workflows/${schedule.workflow_permanent_id}/runs`}
+            className="mt-1 inline-block text-xs text-slate-400 hover:text-slate-200 hover:underline"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {workflowTitle} runs →
+          </Link>
         </div>
         <Switch checked={schedule.enabled} onCheckedChange={handleToggle} />
         <Button
@@ -449,24 +456,16 @@ function ScheduleDetailPage() {
 
           <div className="rounded-lg border border-slate-700 p-4">
             <h3 className="mb-4 text-sm text-slate-400">Upcoming Runs</h3>
-            {schedule.enabled ? (
-              <>
-                <p className="mb-2 text-xs text-slate-400">
-                  Next {next_runs.length} runs
+            <p className="mb-2 text-xs text-slate-400">
+              Next {next_runs.length} runs
+            </p>
+            <div className="space-y-0.5">
+              {next_runs.map((run) => (
+                <p key={run} className="text-xs text-slate-500">
+                  {formatNextRun(new Date(run), schedule.timezone)}
                 </p>
-                <div className="space-y-0.5">
-                  {next_runs.map((run) => (
-                    <p key={run} className="text-xs text-slate-500">
-                      {formatNextRun(new Date(run), schedule.timezone)}
-                    </p>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <p className="text-xs text-slate-500">
-                Schedule is paused — no upcoming runs
-              </p>
-            )}
+              ))}
+            </div>
           </div>
         </div>
       </div>
