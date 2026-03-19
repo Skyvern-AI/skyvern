@@ -27,7 +27,7 @@
     }
   },
   "logo": {
-    "light": "/logo/light.png",
+    "light": "/images/skyvern_logo_blackbg.png",
     "dark": "/logo/dark.png",
     "href": "https://skyvern.com"
   },
@@ -236,7 +236,7 @@
     "primary": {
       "type": "button",
       "label": "Get API Key",
-      "href": "https://app.skyvern.com/settings/api-keys"
+      "href": "https://app.skyvern.com/settings/"
     }
   },
   "footer": {
