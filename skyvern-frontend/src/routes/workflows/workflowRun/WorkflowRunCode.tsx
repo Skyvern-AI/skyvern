@@ -282,7 +282,26 @@ function WorkflowRunCode(props?: Props) {
     );
   }
 
-  const hasVersions = versions.length > 1;
+  // Compute "used" vs "generated" versions for this run
+  const workflowRunId = workflowRun?.workflow_run_id;
+  const generatedByThisRun = versions.filter(
+    (v) => v.run_id != null && v.run_id === workflowRunId,
+  );
+  const generatedVersion =
+    generatedByThisRun.length > 0
+      ? Math.max(...generatedByThisRun.map((v) => v.version))
+      : currentVersion;
+  const earliestGeneratedVersion =
+    generatedByThisRun.length > 0
+      ? Math.min(...generatedByThisRun.map((v) => v.version))
+      : null;
+  const usedVersion =
+    earliestGeneratedVersion != null
+      ? versions.find(
+          (v) =>
+            v.version < earliestGeneratedVersion && v.run_id !== workflowRunId,
+        )?.version ?? null
+      : null;
 
   // Edit button shown when not in edit mode and there's a script to edit
   const editButton =
@@ -322,51 +341,49 @@ function WorkflowRunCode(props?: Props) {
       </div>
     ) : null;
 
-  // Version selector — badge when single version, dropdown when multiple
-  const versionSelector = !versionsFetched ? null : hasVersions ? (
-    <Select
-      value={String(selectedVersion ?? currentVersion ?? "")}
-      onValueChange={(v: string) => setSelectedVersion(Number(v))}
-      disabled={isEditing}
-    >
-      <SelectTrigger className="h-7 w-auto min-w-[5rem] gap-1.5 rounded-full border-slate-700 px-2.5 text-xs">
-        <SelectValue placeholder="Version" />
-      </SelectTrigger>
-      <SelectContent>
-        {versions.map((v) => {
-          const isRunVersion = v.version === currentVersion;
-          const isLatest = v.version === versions[0]?.version;
-          return (
-            <SelectItem key={v.version} value={String(v.version)}>
-              <span className="flex items-center gap-1.5">
-                <span
-                  className={cn({
-                    "font-semibold text-emerald-400": isRunVersion,
-                  })}
-                >
-                  v{v.version}
-                </span>
-                {isRunVersion && (
-                  <span className="rounded-sm bg-emerald-900/50 px-1 py-0.5 text-[10px] leading-none text-emerald-300">
-                    this run
-                  </span>
-                )}
-                {isLatest && !isRunVersion && (
-                  <span className="rounded-sm bg-blue-900/50 px-1 py-0.5 text-[10px] leading-none text-blue-300">
-                    latest
-                  </span>
-                )}
-              </span>
-            </SelectItem>
-          );
-        })}
-      </SelectContent>
-    </Select>
-  ) : currentVersion != null ? (
-    <span className="rounded-full border border-slate-700 px-2.5 py-1 text-xs text-slate-400">
-      v{currentVersion}
-    </span>
-  ) : null;
+  // Version selector — "Used → Generated" chips instead of dropdown
+  const activeChipVersion = selectedVersion ?? generatedVersion;
+
+  const versionSelector = !versionsFetched ? null : (
+    <div className="flex items-center gap-1">
+      {usedVersion != null && (
+        <>
+          <button
+            type="button"
+            className={cn(
+              "rounded-full border px-2.5 py-1 text-xs transition-colors",
+              activeChipVersion === usedVersion
+                ? "border-blue-500 bg-blue-500/20 text-blue-300"
+                : "border-slate-700 text-slate-400 hover:border-slate-500",
+            )}
+            onClick={() => setSelectedVersion(usedVersion)}
+            disabled={isEditing}
+          >
+            Used: #{usedVersion}
+          </button>
+          <span className="text-xs text-slate-600">→</span>
+        </>
+      )}
+      {generatedVersion != null && (
+        <button
+          type="button"
+          className={cn(
+            "rounded-full border px-2.5 py-1 text-xs transition-colors",
+            activeChipVersion === generatedVersion || selectedVersion === null
+              ? "border-emerald-500 bg-emerald-500/20 text-emerald-300"
+              : "border-slate-700 text-slate-400 hover:border-slate-500",
+          )}
+          onClick={() => setSelectedVersion(null)}
+          disabled={isEditing}
+        >
+          Generated: #{generatedVersion}
+          {usedVersion == null && (
+            <span className="ml-1 text-[10px] text-slate-500">(initial)</span>
+          )}
+        </button>
+      )}
+    </div>
+  );
 
   if (!showCacheKeyValueSelector || !cacheKey || cacheKey === "") {
     return (
