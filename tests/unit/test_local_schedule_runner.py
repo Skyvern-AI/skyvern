@@ -1,4 +1,3 @@
-import importlib.util
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -6,11 +5,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from skyvern.forge.sdk.workflow.schedules import compute_previous_fire_time
-
-_skip_no_local_schedules = pytest.mark.skipif(
-    importlib.util.find_spec("scripts.run_local_schedules") is None,
-    reason="scripts.run_local_schedules not available (cloud-only)",
-)
 
 
 class TestComputePreviousFireTime:
@@ -38,7 +32,6 @@ class TestComputePreviousFireTime:
         assert now - result <= timedelta(minutes=5)
 
 
-@_skip_no_local_schedules
 class TestShouldFire:
     @pytest.mark.asyncio
     async def test_true_when_no_recent_run(self) -> None:
@@ -82,7 +75,6 @@ class TestShouldFire:
         assert result is False
 
 
-@_skip_no_local_schedules
 class TestFireScheduleAuthCheck:
     @pytest.mark.asyncio
     async def test_skips_without_auth_token(self) -> None:
@@ -112,7 +104,6 @@ class TestFireScheduleAuthCheck:
         )
 
 
-@_skip_no_local_schedules
 class TestDryRun:
     @pytest.mark.asyncio
     async def test_dry_run_does_not_fire(self) -> None:
