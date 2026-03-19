@@ -29,6 +29,8 @@ import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import {
+  ChevronDownIcon,
+  ChevronRightIcon,
   DrawingPinFilledIcon,
   DrawingPinIcon,
   FileTextIcon,
@@ -39,15 +41,16 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type AxiosError } from "axios";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { usePinScriptMutation } from "./hooks/usePinScriptMutation";
+import { useScriptVersionsQuery } from "./hooks/useScriptVersionsQuery";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import { useWorkflowScriptsQuery } from "./hooks/useWorkflowScriptsQuery";
 import { WorkflowActions } from "./WorkflowActions";
 import type { WorkflowScriptSummary } from "./types/scriptTypes";
 
-const TABLE_COL_COUNT = 7;
+const TABLE_COL_COUNT = 6;
 
 function PinButton({
   workflowPermanentId,
@@ -252,8 +255,6 @@ function ScriptsTableRows({
   scripts: WorkflowScriptSummary[];
   workflowPermanentId: string;
 }) {
-  const navigate = useNavigate();
-
   if (isLoading) {
     return (
       <TableRow>
@@ -299,51 +300,180 @@ function ScriptsTableRows({
   }
 
   return scripts.map((script) => (
-    <TableRow
+    <ScriptRow
       key={script.script_id}
-      className="cursor-pointer"
-      onClick={() =>
-        navigate(
-          `/workflows/${workflowPermanentId}/scripts/${script.script_id}`,
-        )
-      }
-    >
-      <TableCell className="w-10">
-        <PinButton workflowPermanentId={workflowPermanentId} script={script} />
-      </TableCell>
-      <TableCell className="font-mono text-sm">
-        {script.cache_key_value || "(default)"}
-      </TableCell>
-      <TableCell>v{script.latest_version}</TableCell>
-      <TableCell>{script.total_runs}</TableCell>
-      <TableCell>
-        {script.success_rate != null ? (
-          <span
-            className={
-              script.success_rate >= 0.8
-                ? "text-green-500"
-                : script.success_rate >= 0.5
-                  ? "text-yellow-500"
-                  : "text-red-500"
-            }
-          >
-            {Math.round(script.success_rate * 100)}%
-          </span>
-        ) : (
-          <span className="text-muted-foreground">-</span>
-        )}
-      </TableCell>
-      <TableCell title={basicTimeFormat(script.modified_at)}>
-        {basicLocalTimeFormat(script.modified_at)}
-      </TableCell>
-      <TableCell>
-        <DeleteScriptButton
-          workflowPermanentId={workflowPermanentId}
-          script={script}
-        />
-      </TableCell>
-    </TableRow>
+      script={script}
+      workflowPermanentId={workflowPermanentId}
+    />
   ));
+}
+
+function ScriptRow({
+  script,
+  workflowPermanentId,
+}: {
+  script: WorkflowScriptSummary;
+  workflowPermanentId: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const navigate = useNavigate();
+  const hasRevisions = script.version_count > 1;
+
+  const { data: versions, isLoading: versionsLoading } = useScriptVersionsQuery(
+    {
+      scriptId: expanded ? script.script_id : undefined,
+    },
+  );
+
+  // Group versions by run_id — each sub-row = one run that modified the script.
+  // versions is ordered DESC (newest first).
+  const runGroups: {
+    run_id: string | null;
+    count: number;
+    latest_at: string;
+    latest_version: number;
+    is_initial: boolean;
+  }[] = [];
+  if (versions?.versions) {
+    const vList = [...versions.versions].reverse(); // chronological order
+    const seen = new Map<string, number>();
+    for (const v of vList) {
+      const key = v.run_id ?? `__none_${v.version}`;
+      const existing = seen.get(key);
+      if (existing !== undefined && runGroups[existing]) {
+        runGroups[existing].count += 1;
+        runGroups[existing].latest_version = v.version;
+      } else {
+        seen.set(key, runGroups.length);
+        runGroups.push({
+          run_id: v.run_id,
+          count: 1,
+          latest_at: v.created_at,
+          latest_version: v.version,
+          is_initial: runGroups.length === 0,
+        });
+      }
+    }
+    runGroups.reverse(); // newest first for display
+  }
+
+  return (
+    <Fragment>
+      <TableRow
+        className="cursor-pointer"
+        onClick={() => {
+          if (hasRevisions) {
+            setExpanded(!expanded);
+          } else {
+            navigate(
+              `/workflows/${workflowPermanentId}/scripts/${script.script_id}`,
+            );
+          }
+        }}
+      >
+        <TableCell className="w-8">
+          {hasRevisions ? (
+            expanded ? (
+              <ChevronDownIcon className="size-4 text-muted-foreground" />
+            ) : (
+              <ChevronRightIcon className="size-4 text-muted-foreground" />
+            )
+          ) : null}
+        </TableCell>
+        <TableCell>
+          <div className="flex items-center gap-2">
+            <PinButton
+              workflowPermanentId={workflowPermanentId}
+              script={script}
+            />
+            <div className="flex flex-col gap-0.5">
+              <Link
+                to={`/workflows/${workflowPermanentId}/scripts/${script.script_id}`}
+                className="font-mono text-sm text-blue-400 hover:underline"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {script.cache_key_value || "(default)"}
+              </Link>
+              <span className="font-mono text-xs text-muted-foreground">
+                {script.script_id}
+              </span>
+            </div>
+          </div>
+        </TableCell>
+        <TableCell>{script.version_count}</TableCell>
+        <TableCell>{script.total_runs}</TableCell>
+        <TableCell title={basicTimeFormat(script.modified_at)}>
+          {basicLocalTimeFormat(script.modified_at)}
+        </TableCell>
+        <TableCell>
+          <DeleteScriptButton
+            workflowPermanentId={workflowPermanentId}
+            script={script}
+          />
+        </TableCell>
+      </TableRow>
+      {expanded && (
+        <>
+          {versionsLoading ? (
+            <TableRow>
+              <TableCell colSpan={TABLE_COL_COUNT}>
+                <Skeleton className="mx-8 h-5 w-3/4" />
+              </TableCell>
+            </TableRow>
+          ) : (
+            runGroups.map((group) => (
+              <TableRow
+                key={group.run_id ?? `no-run-v${group.latest_version}`}
+                className="cursor-pointer bg-muted/30 hover:bg-muted/50"
+                onClick={() =>
+                  navigate(
+                    `/workflows/${workflowPermanentId}/scripts/${script.script_id}?version=${group.latest_version}`,
+                  )
+                }
+              >
+                <TableCell />
+                <TableCell className="pl-8 text-sm">
+                  {group.run_id ? (
+                    <Link
+                      to={`/workflows/${workflowPermanentId}/${group.run_id}/code`}
+                      className="font-mono text-xs text-blue-400 hover:underline"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {group.run_id}
+                    </Link>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">-</span>
+                  )}
+                </TableCell>
+                <TableCell className="text-xs">
+                  {group.is_initial ? (
+                    <span className="text-muted-foreground">
+                      Initial script
+                    </span>
+                  ) : (
+                    <>
+                      {group.count}{" "}
+                      <span className="text-muted-foreground">
+                        {group.count === 1 ? "correction" : "corrections"}
+                      </span>
+                    </>
+                  )}
+                </TableCell>
+                <TableCell />
+                <TableCell
+                  className="text-xs"
+                  title={basicTimeFormat(group.latest_at)}
+                >
+                  {basicLocalTimeFormat(group.latest_at)}
+                </TableCell>
+                <TableCell />
+              </TableRow>
+            ))
+          )}
+        </>
+      )}
+    </Fragment>
+  );
 }
 
 function WorkflowScriptsPage() {
@@ -379,8 +509,15 @@ function WorkflowScriptsPage() {
             </>
           ) : (
             <>
-              <h1 className="text-lg font-semibold">{workflow?.title}</h1>
-              <h2 className="text-sm">{workflowPermanentId}</h2>
+              <Link
+                to={`/workflows/${workflowPermanentId}/runs`}
+                className="text-lg font-semibold hover:text-blue-400 hover:underline"
+              >
+                {workflow?.title}
+              </Link>
+              <h2 className="text-sm text-muted-foreground">
+                {workflowPermanentId}
+              </h2>
             </>
           )}
         </div>
@@ -424,11 +561,10 @@ function WorkflowScriptsPage() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-10" />
+                <TableHead className="w-8" />
                 <TableHead>Cache Key Value</TableHead>
-                <TableHead>Version</TableHead>
-                <TableHead>Total Runs</TableHead>
-                <TableHead>Success Rate</TableHead>
+                <TableHead>Total Revisions</TableHead>
+                <TableHead>Runs</TableHead>
                 <TableHead>Last Updated</TableHead>
                 <TableHead className="w-12" />
               </TableRow>

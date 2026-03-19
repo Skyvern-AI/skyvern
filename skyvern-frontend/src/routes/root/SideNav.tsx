@@ -3,15 +3,18 @@ import { NavLinkGroup } from "@/components/NavLinkGroup";
 import { useSidebarStore } from "@/store/SidebarStore";
 import { cn } from "@/util/utils";
 import {
+  CalendarIcon,
   CounterClockwiseClockIcon,
   GearIcon,
   GlobeIcon,
   LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { KeyIcon } from "@/components/icons/KeyIcon.tsx";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 
 function SideNav() {
   const { collapsed } = useSidebarStore();
+  const schedulesEnabled = useFeatureFlag("WORKFLOW_SCHEDULES");
 
   return (
     <nav
@@ -37,6 +40,15 @@ function SideNav() {
             to: "/runs",
             icon: <CounterClockwiseClockIcon className="size-6" />,
           },
+          ...(schedulesEnabled
+            ? [
+                {
+                  label: "Schedules",
+                  to: "/schedules",
+                  icon: <CalendarIcon className="size-6" />,
+                },
+              ]
+            : []),
           {
             label: "Browsers",
             to: "/browser-sessions",

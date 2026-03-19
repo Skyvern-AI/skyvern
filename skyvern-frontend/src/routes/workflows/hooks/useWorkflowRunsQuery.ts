@@ -14,6 +14,7 @@ type Props = {
   workflowPermanentId?: string;
   statusFilters?: Array<Status>;
   page: number;
+  pageSize?: number;
   search?: string;
 } & UseQueryOptions;
 
@@ -21,6 +22,7 @@ function useWorkflowRunsQuery({
   workflowPermanentId,
   statusFilters,
   page,
+  pageSize,
   search,
   ...queryOptions
 }: Props) {
@@ -33,6 +35,7 @@ function useWorkflowRunsQuery({
       { statusFilters },
       workflowPermanentId,
       page,
+      pageSize,
       search,
     ],
     queryFn: async () => {
@@ -42,6 +45,9 @@ function useWorkflowRunsQuery({
         (workflow) => workflow.workflow_permanent_id === workflowPermanentId,
       );
       params.append("page", String(page));
+      if (pageSize) {
+        params.append("page_size", String(pageSize));
+      }
       if (isGlobalWorkflow) {
         params.append("template", "true");
       }
