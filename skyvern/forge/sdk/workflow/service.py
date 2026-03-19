@@ -2121,27 +2121,48 @@ class WorkflowService:
                 ):
                     try:
                         # Extract the branch expressions and results for the reviewer.
-                        # Evaluations from ConditionalBlock.execute() don't include
-                        # next_block_label, so we look it up from the block's branches.
+                        # Evaluations from ConditionalBlock.execute() stop at the first
+                        # matched branch (break on match), so unevaluated branches
+                        # (including the default) may be missing. We merge runtime
+                        # evaluations with the full branch definitions so the script
+                        # reviewer always sees every branch — this is critical for the
+                        # branch-return validator which checks that generated code only
+                        # returns labels/indices from the defined branches.
                         evaluations = branch_metadata.get("evaluations", [])
-                        # Build index→next_block_label from the block's branch definitions
-                        branch_next_labels: dict[int, str] = {}
+                        eval_by_index: dict[int, dict] = {}
+                        for ev in evaluations:
+                            idx = ev.get("branch_index")
+                            if idx is not None:
+                                eval_by_index[idx] = ev
+
+                        expressions = []
                         if hasattr(block, "ordered_branches"):
                             for idx, b in enumerate(block.ordered_branches):
-                                if b.next_block_label:
-                                    branch_next_labels[idx] = b.next_block_label
-                        expressions = []
-                        for ev in evaluations:
-                            branch_idx = ev.get("branch_index")
-                            next_label = branch_next_labels.get(branch_idx) if branch_idx is not None else None
-                            expr_info = {
-                                "original_expression": ev.get("original_expression"),
-                                "rendered_expression": ev.get("rendered_expression"),
-                                "result": ev.get("result"),
-                                "is_default": ev.get("is_default", False),
-                                "next_block_label": next_label,
-                            }
-                            expressions.append(expr_info)
+                                ev = eval_by_index.get(idx)
+                                expr_info = {
+                                    "original_expression": (
+                                        ev.get("original_expression")
+                                        if ev
+                                        else (b.criteria.expression if b.criteria else None)
+                                    ),
+                                    "rendered_expression": ev.get("rendered_expression") if ev else None,
+                                    "result": ev.get("result") if ev else None,
+                                    "is_default": ev.get("is_default", b.is_default) if ev else b.is_default,
+                                    "next_block_label": b.next_block_label,
+                                }
+                                expressions.append(expr_info)
+                        else:
+                            # Fallback: no ordered_branches, use evaluations as-is
+                            for ev in evaluations:
+                                expressions.append(
+                                    {
+                                        "original_expression": ev.get("original_expression"),
+                                        "rendered_expression": ev.get("rendered_expression"),
+                                        "result": ev.get("result"),
+                                        "is_default": ev.get("is_default", False),
+                                        "next_block_label": ev.get("next_block_label"),
+                                    }
+                                )
                         cond_context = skyvern_context.current()
                         cond_episode = await app.DATABASE.create_fallback_episode(
                             organization_id=organization_id,

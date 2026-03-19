@@ -18,6 +18,7 @@ import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChan
 import { useRequestDeleteNodeCallback } from "@/routes/workflows/hooks/useRequestDeleteNodeCallback";
 import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
+import { useBrowserSessionRateLimit } from "@/routes/workflows/hooks/useBrowserSessionRateLimit";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -204,8 +205,10 @@ function NodeHeader({
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
+  const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
+    isRateLimited,
   });
   const { data: workflow } = useWorkflowQuery({
     workflowPermanentId,

@@ -187,3 +187,120 @@ await page.fill(selector='#email', ai='proactive', prompt='fill email')
         error = self.reviewer._validate_parameter_preservation(new_code, old_code, ["email"])
         assert error is not None
         assert "email" in error
+
+
+class TestValidateBranchReturns:
+    """Tests for _validate_branch_returns."""
+
+    BRANCHES_TWO = [
+        {"original_expression": "x > 0", "next_block_label": "block_3", "is_default": False},
+        {"original_expression": None, "next_block_label": "block_4", "is_default": True},
+    ]
+
+    def test_valid_returns_passes(self) -> None:
+        code = """
+async def block_fn(page, context):
+    if context.parameters.get('x', 0) > 0:
+        return {"next_block_label": "block_3", "branch_index": 0}
+    else:
+        return {"next_block_label": "block_4", "branch_index": 1}
+"""
+        assert ScriptReviewer._validate_branch_returns(code, self.BRANCHES_TWO) is None
+
+    def test_invalid_label_detected(self) -> None:
+        """Labels not in the branch definitions should be flagged."""
+        code = """
+async def block_fn(page, context):
+    if context.parameters.get('x', 0) > 0:
+        return {"next_block_label": "block_99", "branch_index": 0}
+    else:
+        return {"next_block_label": "block_4", "branch_index": 1}
+"""
+        error = ScriptReviewer._validate_branch_returns(code, self.BRANCHES_TWO)
+        assert error is not None
+        assert "block_99" in error
+
+    def test_invalid_index_detected(self) -> None:
+        """branch_index values outside 0..N-1 should be flagged."""
+        code = """
+async def block_fn(page, context):
+    if context.parameters.get('x', 0) > 0:
+        return {"next_block_label": "block_3", "branch_index": 0}
+    else:
+        return {"next_block_label": "block_4", "branch_index": -1}
+"""
+        error = ScriptReviewer._validate_branch_returns(code, self.BRANCHES_TWO)
+        assert error is not None
+        assert "-1" in error
+
+    def test_none_label_invalid_when_not_in_branches(self) -> None:
+        """None next_block_label should be flagged when no branch has a null target."""
+        code = """
+async def block_fn(page, context):
+    if context.parameters.get('x', 0) > 0:
+        return {"next_block_label": "block_3", "branch_index": 0}
+    else:
+        return {"next_block_label": None, "branch_index": 1}
+"""
+        error = ScriptReviewer._validate_branch_returns(code, self.BRANCHES_TWO)
+        assert error is not None
+        assert "next_block_label" in error
+
+    def test_none_label_valid_when_in_branches(self) -> None:
+        """None next_block_label should pass when a branch has a null target."""
+        branches = [
+            {"original_expression": "x > 0", "next_block_label": "block_3", "is_default": False},
+            {"original_expression": None, "next_block_label": None, "is_default": True},
+        ]
+        code = """
+async def block_fn(page, context):
+    if context.parameters.get('x', 0) > 0:
+        return {"next_block_label": "block_3", "branch_index": 0}
+    else:
+        return {"next_block_label": None, "branch_index": 1}
+"""
+        assert ScriptReviewer._validate_branch_returns(code, branches) is None
+
+    def test_no_literals_passes(self) -> None:
+        """Code using variables (not literals) should pass — can't validate statically."""
+        code = """
+async def block_fn(page, context):
+    label = compute_label()
+    idx = compute_index()
+    return {"next_block_label": label, "branch_index": idx}
+"""
+        assert ScriptReviewer._validate_branch_returns(code, self.BRANCHES_TWO) is None
+
+    def test_comments_ignored(self) -> None:
+        """Values in comments should not trigger validation."""
+        code = """
+async def block_fn(page, context):
+    # return {"next_block_label": "block_99", "branch_index": -1}
+    if context.parameters.get('x', 0) > 0:
+        return {"next_block_label": "block_3", "branch_index": 0}
+    else:
+        return {"next_block_label": "block_4", "branch_index": 1}
+"""
+        assert ScriptReviewer._validate_branch_returns(code, self.BRANCHES_TWO) is None
+
+    def test_empty_branches_passes(self) -> None:
+        assert ScriptReviewer._validate_branch_returns("return {}", []) is None
+
+    def test_single_quotes_handled(self) -> None:
+        """Single-quoted keys should be parsed correctly."""
+        code = """
+async def block_fn(page, context):
+    return {'next_block_label': 'block_3', 'branch_index': 0}
+"""
+        assert ScriptReviewer._validate_branch_returns(code, self.BRANCHES_TWO) is None
+
+    def test_both_label_and_index_invalid(self) -> None:
+        """Both invalid label and index should be reported."""
+        code = """
+async def block_fn(page, context):
+    return {"next_block_label": "wrong_label", "branch_index": -1}
+"""
+        error = ScriptReviewer._validate_branch_returns(code, self.BRANCHES_TWO)
+        assert error is not None
+        assert "wrong_label" in error
+        assert "-1" in error
