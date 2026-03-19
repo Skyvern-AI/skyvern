@@ -12,3 +12,9 @@ class TaskType(StrEnum):
     general = "general"
     validation = "validation"
     action = "action"
+
+
+class WorkflowRunTriggerType(StrEnum):
+    manual = "manual"
+    api = "api"
+    scheduled = "scheduled"
