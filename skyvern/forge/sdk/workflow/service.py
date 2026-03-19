@@ -3178,16 +3178,30 @@ class WorkflowService:
         workflow_permanent_id: str,
         organization_id: str | None = None,
     ) -> None:
-        await app.DATABASE.soft_delete_workflow_by_permanent_id(
+        # Delete workflow and schedules in one DB transaction so we do not leave
+        # the workflow active if a process exits between separate commits.
+        deleted_schedule_ids = await app.DATABASE.soft_delete_workflow_and_schedules_by_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
         )
+        if deleted_schedule_ids:
+            LOG.info(
+                "Cascade-deleted schedules during workflow deletion",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                deleted_schedule_ids=deleted_schedule_ids,
+                count=len(deleted_schedule_ids),
+            )
 
     async def delete_workflow_by_id(
         self,
         workflow_id: str,
         organization_id: str,
     ) -> None:
+        # This path is rollback-only for a single workflow version created during
+        # save/update flows. It must stay version-scoped and non-cascading because
+        # schedules belong to the permanent workflow and should remain attached to
+        # the previously valid version if the new version creation fails.
         await app.DATABASE.soft_delete_workflow_by_id(
             workflow_id=workflow_id,
             organization_id=organization_id,

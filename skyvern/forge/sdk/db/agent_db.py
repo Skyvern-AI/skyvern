@@ -2915,23 +2915,92 @@ class AgentDB(BaseAlchemyDB):
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def soft_delete_workflow_by_permanent_id(
+    async def soft_delete_workflow_and_schedules_by_permanent_id(
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
-    ) -> None:
-        async with self.Session() as session:
-            # soft delete the workflow by setting the deleted_at field
-            update_deleted_at_query = (
-                update(WorkflowModel)
-                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
-                .where(WorkflowModel.deleted_at.is_(None))
-            )
-            if organization_id:
-                update_deleted_at_query = update_deleted_at_query.filter_by(organization_id=organization_id)
-            update_deleted_at_query = update_deleted_at_query.values(deleted_at=datetime.utcnow())
-            await session.execute(update_deleted_at_query)
-            await session.commit()
+    ) -> list[str]:
+        """Soft-delete a workflow and its active schedules in a single DB transaction."""
+        try:
+            async with self.Session() as session:
+                select_query = (
+                    select(WorkflowScheduleModel.workflow_schedule_id)
+                    .where(WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(WorkflowScheduleModel.deleted_at.is_(None))
+                )
+                if organization_id is not None:
+                    select_query = select_query.where(WorkflowScheduleModel.organization_id == organization_id)
+                result = await session.execute(select_query)
+                schedule_ids = list(result.scalars().all())
+
+                deleted_at = datetime.utcnow()
+                if schedule_ids:
+                    update_schedules_query = (
+                        update(WorkflowScheduleModel)
+                        .where(WorkflowScheduleModel.workflow_schedule_id.in_(schedule_ids))
+                        .values(deleted_at=deleted_at)
+                    )
+                    await session.execute(update_schedules_query)
+
+                update_workflow_query = (
+                    update(WorkflowModel)
+                    .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                )
+                if organization_id is not None:
+                    update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
+                await session.execute(update_workflow_query.values(deleted_at=deleted_at))
+                await session.commit()
+                return schedule_ids
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in soft_delete_workflow_and_schedules_by_permanent_id", exc_info=True)
+            raise
+
+    async def soft_delete_orphaned_schedules(self, limit: int = 500) -> list[tuple[str, str]]:
+        """Soft-delete orphaned schedules and return their identities.
+
+        Uses a single UPDATE ... RETURNING statement so orphan detection and
+        soft-deletion happen atomically in one DB round-trip.
+        """
+        try:
+            async with self.Session() as session:
+                active_workflow_exists = (
+                    select(WorkflowModel.workflow_permanent_id)
+                    .where(WorkflowModel.workflow_permanent_id == WorkflowScheduleModel.workflow_permanent_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .correlate(WorkflowScheduleModel)
+                    .exists()
+                )
+                orphaned_schedules = (
+                    select(
+                        WorkflowScheduleModel.workflow_schedule_id.label("workflow_schedule_id"),
+                        WorkflowScheduleModel.workflow_permanent_id.label("workflow_permanent_id"),
+                    )
+                    .where(WorkflowScheduleModel.deleted_at.is_(None))
+                    .where(~active_workflow_exists)
+                    .limit(limit)
+                    .cte("orphaned_schedules")
+                )
+                update_query = (
+                    update(WorkflowScheduleModel)
+                    .where(
+                        WorkflowScheduleModel.workflow_schedule_id.in_(
+                            select(orphaned_schedules.c.workflow_schedule_id)
+                        )
+                    )
+                    .where(WorkflowScheduleModel.deleted_at.is_(None))
+                    .values(deleted_at=datetime.utcnow())
+                    .returning(
+                        WorkflowScheduleModel.workflow_schedule_id,
+                        WorkflowScheduleModel.workflow_permanent_id,
+                    )
+                )
+                result = await session.execute(update_query)
+                await session.commit()
+                return [(row[0], row[1]) for row in result.all()]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in soft_delete_orphaned_schedules", exc_info=True)
+            raise
 
     async def add_workflow_template(
         self,
