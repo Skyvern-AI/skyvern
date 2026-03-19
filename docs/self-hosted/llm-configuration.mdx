@@ -185,32 +185,6 @@ Bedrock inference profile keys (`*_INFERENCE_PROFILE`) use cross-region inferenc
 
 ---
 
-## MiniMax
-
-[MiniMax](https://www.minimax.io/) models with 204K context window and vision support.
-
-```bash .env
-ENABLE_MINIMAX=true
-MINIMAX_API_KEY=your-minimax-api-key
-LLM_KEY=MINIMAX_M2_5
-```
-
-### Available models
-
-| LLM_KEY | Model | Notes |
-|---------|-------|-------|
-| `MINIMAX_M2_5` | MiniMax-M2.5 | Recommended, 204K context |
-| `MINIMAX_M2_5_HIGHSPEED` | MiniMax-M2.5-highspeed | Faster variant, 204K context |
-
-### Optional settings
-
-```bash .env
-# Use a custom API endpoint
-MINIMAX_API_BASE=https://api.minimax.io/v1
-```
-
----
-
 ## Ollama (Local Models)
 
 Run open-source models locally with [Ollama](https://ollama.ai/). No API costs, but requires sufficient local compute.
