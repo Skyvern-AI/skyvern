@@ -869,6 +869,19 @@ wheels = [
 ]
 
 [[package]]
+name = "croniter"
+version = "3.0.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+    { name = "pytz" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/07/ea/98665cd116af6d3c4e79c8dc91bbd9a13746cb3c7d72efbfdef5b720c43b/croniter-3.0.4.tar.gz", hash = "sha256:f9dcd4bdb6c97abedb6f09d6ed3495b13ede4d4544503fa580b6372a56a0c520", size = 54500, upload-time = "2024-10-25T12:22:33.14Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/63/f5/135d0e57e5bdd2f978388d77ee818f1ac5ac584eb48034362770001f4cad/croniter-3.0.4-py2.py3-none-any.whl", hash = "sha256:96e14cdd5dcb479dd48d7db14b53d8434b188dfb9210448bef6f65663524a6f0", size = 23220, upload-time = "2024-10-25T12:22:30.75Z" },
+]
+
+[[package]]
 name = "cryptography"
 version = "46.0.5"
 source = { registry = "https://pypi.org/simple" }
@@ -5521,6 +5534,7 @@ dependencies = [
     { name = "azure-keyvault-secrets" },
     { name = "azure-storage-blob" },
     { name = "cachetools" },
+    { name = "croniter" },
     { name = "curlparser" },
     { name = "email-validator" },
     { name = "fastapi" },
@@ -5638,6 +5652,7 @@ requires-dist = [
     { name = "azure-keyvault-secrets", specifier = ">=4.2.0,<5" },
     { name = "azure-storage-blob", specifier = ">=12.26.0" },
     { name = "cachetools", specifier = ">=5.3.2,<6" },
+    { name = "croniter", specifier = ">=1.3.8,<4" },
     { name = "curlparser", specifier = ">=0.1.0,<0.2" },
     { name = "email-validator", specifier = ">=2.2.0,<3" },
     { name = "fastapi", specifier = ">=0.121.0,<0.129" },
