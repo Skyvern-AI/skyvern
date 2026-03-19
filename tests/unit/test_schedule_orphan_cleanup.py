@@ -1,6 +1,5 @@
 """Tests for orphan prevention and schedule cascade deletion (SKY-8186)."""
 
-import importlib.util
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -10,11 +9,6 @@ from sqlalchemy.dialects import postgresql
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from tests.unit.worker_activity_import_helpers import import_cron_worker_activities
-
-_skip_no_workers = pytest.mark.skipif(
-    not importlib.util.find_spec("workers"),
-    reason="workers package not available (cloud-only)",
-)
 
 
 class _FakeResult:
@@ -197,7 +191,6 @@ async def test_delete_workflow_by_id_remains_version_scoped(
     mock_atomic_delete.assert_not_awaited()
 
 
-@_skip_no_workers
 @pytest.mark.asyncio
 async def test_orphan_schedule_cleanup_soft_deletes_found_schedules(monkeypatch: pytest.MonkeyPatch) -> None:
     cron_activities = import_cron_worker_activities(monkeypatch)
@@ -215,7 +208,6 @@ async def test_orphan_schedule_cleanup_soft_deletes_found_schedules(monkeypatch:
     fake_db.soft_delete_orphaned_schedules.assert_awaited_once_with()
 
 
-@_skip_no_workers
 @pytest.mark.asyncio
 async def test_orphan_schedule_cleanup_returns_early_when_no_orphans(monkeypatch: pytest.MonkeyPatch) -> None:
     cron_activities = import_cron_worker_activities(monkeypatch)
@@ -233,7 +225,6 @@ async def test_orphan_schedule_cleanup_returns_early_when_no_orphans(monkeypatch
     fake_db.soft_delete_orphaned_schedules.assert_awaited_once_with()
 
 
-@_skip_no_workers
 @pytest.mark.asyncio
 async def test_orphan_schedule_cleanup_reraises_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     cron_activities = import_cron_worker_activities(monkeypatch)
