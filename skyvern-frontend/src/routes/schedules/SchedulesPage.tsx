@@ -146,6 +146,10 @@ function SchedulesPage() {
     open: boolean;
     schedule: OrganizationScheduleItem | null;
   }>({ open: false, schedule: null });
+  const [bulkDeleteDialog, setBulkDeleteDialog] = useState<{
+    open: boolean;
+    count: number;
+  }>({ open: false, count: 0 });
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
 
   const credentialGetter = useCredentialGetter();
@@ -335,7 +339,11 @@ function SchedulesPage() {
   }
 
   function handleBulkDelete() {
-    void runBulkOperation(
+    setBulkDeleteDialog({ open: true, count: selected.size });
+  }
+
+  async function handleBulkDeleteConfirm() {
+    await runBulkOperation(
       selectedSchedules,
       (client, item) =>
         client.delete(
@@ -344,6 +352,8 @@ function SchedulesPage() {
       "deleted",
       "delete",
     );
+
+    setBulkDeleteDialog({ open: false, count: 0 });
   }
 
   const showCheckbox = schedules.length > 1;
@@ -676,6 +686,43 @@ function SchedulesPage() {
           </Button>
         </div>
       )}
+
+      {/* Bulk delete confirmation dialog */}
+      <Dialog
+        open={bulkDeleteDialog.open}
+        onOpenChange={(open) => {
+          if (!open && !isBulkOperating) {
+            setBulkDeleteDialog({ open: false, count: 0 });
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete {bulkDeleteDialog.count} Schedules</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete {bulkDeleteDialog.count}{" "}
+              {bulkDeleteDialog.count === 1 ? "schedule" : "schedules"}? This
+              action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="secondary"
+              disabled={isBulkOperating}
+              onClick={() => setBulkDeleteDialog({ open: false, count: 0 })}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={isBulkOperating}
+              onClick={handleBulkDeleteConfirm}
+            >
+              {isBulkOperating ? "Deleting..." : "Delete"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Delete confirmation dialog */}
       <Dialog
