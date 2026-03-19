@@ -2648,9 +2648,27 @@ async def generate_workflow_script_python_code(
             block_workflow_run_id = cached_source.workflow_run_id
             block_workflow_run_block_id = cached_source.workflow_run_block_id
         else:
+            task_id = task.get("task_id", "")
+            block_actions = actions_by_task.get(task_id, [])
+
+            # Skip blocks that have no actions AND no task_id — they haven't executed yet.
+            # Creating script_block entries for actionless blocks causes a permanent
+            # stuck state where generate_script_if_needed thinks they're cached but
+            # the Python file has no code for them. (SKY-8443)
+            # Note: a block WITH task_id but zero actions is valid — it means the block
+            # executed but completed immediately (e.g., page.complete() with no interaction).
+            # _build_block_fn handles this correctly by generating a minimal function.
+            if not block_actions and not task_id:
+                LOG.debug(
+                    "Skipping block with no actions and no task_id — not yet executed",
+                    block_label=block_name,
+                    script_id=script_id,
+                )
+                continue
+
             block_fn_def = _build_block_fn(
                 task,
-                actions_by_task.get(task.get("task_id", ""), []),
+                block_actions,
                 value_to_param=value_to_param,
                 use_semantic_selectors=use_semantic_selectors,
             )
@@ -2708,6 +2726,16 @@ async def generate_workflow_script_python_code(
             block_workflow_run_id = cached_source.workflow_run_id
             block_workflow_run_block_id = cached_source.workflow_run_block_id
         else:
+            # Skip task_v2 blocks that haven't executed (no child workflow run).
+            # Same rationale as task_v1 guard — prevents phantom script_block entries. (SKY-8443)
+            if not child_blocks and not task_v2.get("block_workflow_run_id"):
+                LOG.debug(
+                    "Skipping task_v2 block with no child blocks — not yet executed",
+                    block_label=task_v2_label,
+                    script_id=script_id,
+                )
+                continue
+
             task_v2_fn_def = _build_task_v2_block_fn(task_v2, child_blocks)
             task_v2_block_body: list[cst.CSTNode] = [task_v2_fn_def]
 
