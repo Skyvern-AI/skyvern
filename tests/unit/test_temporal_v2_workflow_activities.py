@@ -4,10 +4,10 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from workers.run_parameters import RunSkyvernWorkflowParams
 
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from workers.run_parameters import RunSkyvernWorkflowParams
 
 
 def _import_activities_module(monkeypatch: pytest.MonkeyPatch):
