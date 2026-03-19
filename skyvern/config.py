@@ -372,11 +372,6 @@ class Settings(BaseSettings):
     MOONSHOT_API_KEY: str | None = None
     MOONSHOT_API_BASE: str = "https://api.moonshot.cn/v1"
 
-    # MINIMAX
-    ENABLE_MINIMAX: bool = False
-    MINIMAX_API_KEY: str | None = None
-    MINIMAX_API_BASE: str = "https://api.minimax.io/v1"
-
     # INCEPTION AI
     ENABLE_INCEPTION: bool = False
     INCEPTION_API_KEY: str | None = None
