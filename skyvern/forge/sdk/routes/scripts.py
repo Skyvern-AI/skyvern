@@ -723,7 +723,35 @@ async def get_workflow_script_blocks(
         if not workflow_run:
             workflow_run_id = None
         else:
-            # find the published script if any and return that
+            # Try to find the script version pinned to this specific run first.
+            # get_workflow_script() always resolves the latest version for a
+            # cache_key_value, but the Code tab should show the version that was
+            # active when this run executed (SKY-8448).
+            workflow_script = await app.DATABASE.get_workflow_script(
+                organization_id=current_org.organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                statuses=[ScriptStatus.published],
+            )
+            if workflow_script:
+                published_script = await workflow_script_service.get_workflow_script_by_cache_key_value(
+                    organization_id=current_org.organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    cache_key_value=workflow_script.cache_key_value,
+                    workflow_run_id=workflow_run_id,
+                    statuses=[ScriptStatus.published],
+                )
+                if published_script:
+                    return await get_script_blocks_response(
+                        script_revision_id=published_script.script_revision_id,
+                        organization_id=current_org.organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        include_main_script=include_main_script,
+                        script_id=published_script.script_id,
+                        version=published_script.version,
+                    )
+
+            # Fall back to latest version (for runs without a workflow_script entry)
             published_script, _ = await workflow_script_service.get_workflow_script(
                 workflow=workflow,
                 workflow_run=workflow_run,
@@ -945,6 +973,7 @@ async def list_workflow_scripts(
 async def get_script_runs(
     script_id: str = Path(..., description="The script ID"),
     page_size: int = Query(50, ge=1, le=100),
+    version: int | None = Query(None, description="Filter runs to a specific script version"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ScriptRunsResponse:
     """Get workflow runs associated with a specific script, with status counts."""
@@ -955,10 +984,34 @@ async def get_script_runs(
     if not script:
         raise HTTPException(status_code=404, detail="Script not found")
 
+    created_after = None
+    created_before = None
+
+    if version is not None:
+        # Get all versions to determine the time window for this version
+        all_versions = await app.DATABASE.get_script_versions(
+            script_id=script_id,
+            organization_id=organization_id,
+        )
+        # versions is ordered by version DESC
+        version_found = False
+        for i, v in enumerate(all_versions):
+            if v.version == version:
+                created_after = v.created_at
+                # Next higher version (i-1 in DESC order) sets the upper bound
+                if i > 0:
+                    created_before = all_versions[i - 1].created_at
+                version_found = True
+                break
+        if not version_found:
+            raise HTTPException(status_code=404, detail=f"Script version {version} not found")
+
     runs, total_count, status_counts = await app.DATABASE.get_workflow_runs_for_script(
         organization_id=organization_id,
         script_id=script_id,
         page_size=page_size,
+        created_after=created_after,
+        created_before=created_before,
     )
 
     return ScriptRunsResponse(
