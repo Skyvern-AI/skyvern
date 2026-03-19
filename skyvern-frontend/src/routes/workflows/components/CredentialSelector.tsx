@@ -25,11 +25,11 @@ type Props = {
 
 function CredentialSelector({ value, onChange, placeholder }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
-  const { data: credentials, isLoading } = useCredentialsQuery({
+  const { data: credentials, isFetching } = useCredentialsQuery({
     page_size: 100, // Reasonable limit for dropdown selector
   });
 
-  if (isLoading) {
+  if (isFetching) {
     return <Skeleton className="h-10 w-full" />;
   }
 

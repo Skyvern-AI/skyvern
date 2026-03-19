@@ -19,7 +19,7 @@ type Props = {
 };
 
 function CredentialParameterSourceSelector({ value, onChange }: Props) {
-  const { data: credentials, isLoading } = useCredentialsQuery({
+  const { data: credentials, isFetching } = useCredentialsQuery({
     page_size: 100, // Reasonable limit for dropdown selector
   });
   // Use local state for modal to avoid conflicts with other CredentialsModal instances
@@ -31,7 +31,7 @@ function CredentialParameterSourceSelector({ value, onChange }: Props) {
       parameter.dataType === WorkflowParameterValueType.CredentialId,
   );
 
-  if (isLoading) {
+  if (isFetching) {
     return <Skeleton className="h-10 w-full" />;
   }
 
