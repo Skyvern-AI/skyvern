@@ -5,6 +5,7 @@ from typing import Any, List
 from pydantic import BaseModel, field_validator
 from typing_extensions import deprecated
 
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -176,6 +177,8 @@ class WorkflowRun(BaseModel):
     sequential_key: str | None = None
     ai_fallback: bool | None = None
     code_gen: bool | None = None
+    trigger_type: WorkflowRunTriggerType | None = None
+    workflow_schedule_id: str | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None

@@ -434,20 +434,23 @@ async def generate_workflow_script(
     # 3.5) Post-process: fix static actions inside for-loop blocks
     python_src = _fix_static_actions_in_for_loops(python_src)
 
-    # 3.6) Validate generated Python is syntactically valid before persisting.
-    # A corrupted script will fail to load on the next run, causing the caching
-    # system to regenerate from scratch and lose version history.
+    # 3.6) Validate generated Python is syntactically valid.
+    # Log a warning but still persist — the Script Reviewer will correct syntax
+    # errors when processing the fallback episodes. Returning early here would
+    # leave the script revision without files, causing the regeneration path to
+    # soft-delete it. That prevents the reviewer from setting
+    # new_script_revision_id on episodes, which breaks the Script Update Card
+    # on workflow run pages (SKY-8434).
     try:
         compile(python_src, "<generated_script>", "exec")
     except SyntaxError as e:
-        LOG.error(
-            "Generated script has syntax error, skipping persist",
+        LOG.warning(
+            "Generated script has syntax error, persisting for Script Reviewer to fix",
             script_id=script.script_id,
             version=script.version,
             error=str(e),
             lineno=e.lineno,
         )
-        return
 
     # 4) Persist script and files, then record mapping
     content_bytes = python_src.encode("utf-8")

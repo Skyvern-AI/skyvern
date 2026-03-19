@@ -1,6 +1,6 @@
 import abc
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
@@ -399,6 +399,7 @@ class BlockResult:
     output_parameter_value: dict[str, Any] | list | str | None = None
     status: BlockStatus | None = None
     failure_reason: str | None = None
+    error_codes: list[str] = field(default_factory=list)
     workflow_run_block_id: str | None = None
 
 

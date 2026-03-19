@@ -32,7 +32,7 @@ import { AxiosError } from "axios";
 import {
   CheckCircledIcon,
   CrossCircledIcon,
-  InfoCircledIcon,
+  ExclamationTriangleIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -1182,11 +1182,12 @@ function CredentialsModal({
           </DialogTitle>
         </DialogHeader>
         {isEditMode && editingGroups.values && (
-          <Alert>
-            <InfoCircledIcon className="size-4" />
+          <Alert variant="warning">
+            <ExclamationTriangleIcon className="size-4" />
             <AlertDescription>
-              For security, saved values are never retrieved. All credential
-              fields must be filled in to save your changes.
+              For security, saved values are never retrieved. Changing any field
+              other than the credential name requires re-entering all fields,
+              including passwords and 2FA settings.
             </AlertDescription>
           </Alert>
         )}

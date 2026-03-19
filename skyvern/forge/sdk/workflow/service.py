@@ -55,6 +55,7 @@ from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -577,6 +578,63 @@ class WorkflowService:
         if credential is None:
             raise InvalidCredentialId(credential_id)
 
+    async def validate_schedule_parameters(
+        self,
+        workflow: Workflow,
+        organization: Organization,
+        request_data: dict[str, Any] | None,
+    ) -> None:
+        all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
+        schedule_parameters = [
+            cast(WorkflowParameter, workflow_parameter)
+            for workflow_parameter in all_workflow_parameters
+            if self._is_schedule_input_parameter(workflow_parameter)
+        ]
+        request_data = request_data or {}
+
+        defined_keys = {workflow_parameter.key for workflow_parameter in schedule_parameters}
+        unknown_keys = sorted(set(request_data) - defined_keys)
+        if unknown_keys:
+            unknown_keys_str = ", ".join(unknown_keys)
+            raise SkyvernHTTPException(
+                message=(
+                    f"Unknown schedule parameters for workflow {workflow.workflow_permanent_id}: {unknown_keys_str}"
+                )
+            )
+
+        missing_parameters: list[str] = []
+        for workflow_parameter in schedule_parameters:
+            if workflow_parameter.key in request_data:
+                request_value = request_data[workflow_parameter.key]
+                # Treat explicit None as "use the default at execution time". Validate the
+                # default value instead so the check matches what actually runs.
+                if request_value is None and workflow_parameter.default_value is not None:
+                    request_value = workflow_parameter.default_value
+                if self._is_missing_required_value(workflow_parameter, request_value):
+                    missing_parameters.append(workflow_parameter.key)
+                    continue
+                if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                    if not isinstance(request_value, str):
+                        raise InvalidCredentialId(f"Credential ID must be a string, got {type(request_value).__name__}")
+                    await self._validate_credential_id(request_value, organization)
+            elif workflow_parameter.default_value is not None:
+                if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                    if not isinstance(workflow_parameter.default_value, str):
+                        raise InvalidCredentialId(
+                            f"Credential ID must be a string, got {type(workflow_parameter.default_value).__name__}"
+                        )
+                    await self._validate_credential_id(workflow_parameter.default_value, organization)
+            else:
+                missing_parameters.append(workflow_parameter.key)
+
+        if missing_parameters:
+            missing_keys_str = ", ".join(sorted(missing_parameters))
+            raise SkyvernHTTPException(
+                message=(
+                    f"Missing schedule parameters for workflow {workflow.workflow_permanent_id}: {missing_keys_str}"
+                )
+            )
+
     async def setup_workflow_run(
         self,
         request_id: str | None,
@@ -589,6 +647,9 @@ class WorkflowService:
         parent_workflow_run_id: str | None = None,
         debug_session_id: str | None = None,
         code_gen: bool | None = None,
+        workflow_run_id: str | None = None,
+        trigger_type: WorkflowRunTriggerType | None = None,
+        workflow_schedule_id: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -625,6 +686,9 @@ class WorkflowService:
             sequential_key=workflow.sequential_key,
             debug_session_id=debug_session_id,
             code_gen=code_gen,
+            workflow_run_id=workflow_run_id,
+            trigger_type=trigger_type,
+            workflow_schedule_id=workflow_schedule_id,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -740,6 +804,19 @@ class WorkflowService:
         if isinstance(error, IntegrityError):
             return "value cannot be null"
         return "database error while saving parameter value"
+
+    @staticmethod
+    def _is_schedule_input_parameter(workflow_parameter: Any) -> bool:
+        """Check whether a parameter is user-configurable input for scheduled runs.
+
+        Filters to WorkflowParameter instances only — excludes ContextParameter,
+        OutputParameter, and CredentialParameter (the model class, whose credentials
+        are resolved at runtime).  Note that a WorkflowParameter whose
+        workflow_parameter_type is CREDENTIAL_ID *is* included here because the
+        user supplies the credential ID string at schedule time; only the actual
+        CredentialParameter objects are excluded.
+        """
+        return isinstance(workflow_parameter, WorkflowParameter)
 
     @staticmethod
     def _is_missing_required_value(workflow_parameter: WorkflowParameter, value: Any) -> bool:
@@ -3176,6 +3253,9 @@ class WorkflowService:
         sequential_key: str | None = None,
         debug_session_id: str | None = None,
         code_gen: bool | None = None,
+        workflow_run_id: str | None = None,
+        trigger_type: WorkflowRunTriggerType | None = None,
+        workflow_schedule_id: str | None = None,
     ) -> WorkflowRun:
         # validate the browser session or profile id
         browser_profile_id = workflow_request.browser_profile_id
@@ -3263,6 +3343,9 @@ class WorkflowService:
             debug_session_id=debug_session_id,
             ai_fallback=workflow_request.ai_fallback,
             code_gen=code_gen,
+            workflow_run_id=workflow_run_id,
+            trigger_type=trigger_type,
+            workflow_schedule_id=workflow_schedule_id,
         )
 
     async def _update_workflow_run_status(
@@ -3812,6 +3895,24 @@ class WorkflowService:
         errors: list[dict[str, Any]] = []
         for task in workflow_run_tasks:
             errors.extend(task.errors)
+
+        # Also collect block-level error codes (e.g. FILE_PARSER_ERROR) into the
+        # same errors array so they appear in the top-level workflow run response,
+        # matching the task-level error format. Uses a lightweight query that only
+        # fetches blocks with non-null error_codes to avoid a full block load on
+        # every status poll.
+        block_errors = await app.DATABASE.get_workflow_run_block_errors(
+            workflow_run_id=workflow_run_id, organization_id=organization_id
+        )
+        for error_codes, failure_reason in block_errors:
+            for code in error_codes:
+                errors.append(
+                    {
+                        "error_code": code,
+                        "reasoning": failure_reason or "",
+                        "confidence_float": 1.0,
+                    }
+                )
 
         total_steps = None
         total_cost = None
