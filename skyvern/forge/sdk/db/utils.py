@@ -28,6 +28,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
+    WorkflowScheduleModel,
 )
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
@@ -42,6 +43,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
@@ -735,3 +737,14 @@ def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) ->
         raise ValueError(f"Unsupported action type: {action_model.action_type}")
 
     return action_class(**action_data)
+
+
+def convert_to_workflow_schedule(
+    workflow_schedule_model: WorkflowScheduleModel, debug_enabled: bool = False
+) -> WorkflowSchedule:
+    if debug_enabled:
+        LOG.debug(
+            "Converting WorkflowScheduleModel to WorkflowSchedule",
+            workflow_schedule_id=workflow_schedule_model.workflow_schedule_id,
+        )
+    return WorkflowSchedule.model_validate(workflow_schedule_model)
