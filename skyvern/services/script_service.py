@@ -18,12 +18,18 @@ from fastapi import BackgroundTasks, HTTPException
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
-from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
+from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
 from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import ScriptNotFound, ScriptTerminationException, StepTerminationError, WorkflowRunNotFound
+from skyvern.exceptions import (
+    CachedDownloadError,
+    ScriptNotFound,
+    ScriptTerminationException,
+    StepTerminationError,
+    WorkflowRunNotFound,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory, list_files_in_directory, rename_file
@@ -1849,21 +1855,91 @@ async def download(
 
             await _run_cached_function(cached_fn)
 
-            # Check local filesystem for newly downloaded files.
-            # This is the primary verification — it doesn't depend on S3/remote
-            # storage and catches the case where download_selector() returned None
-            # causing the click to silently succeed without downloading anything.
-            local_files_after_download = (
-                list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
-            )
-            # Filter out incomplete .crdownload files from both lists for an accurate comparison
-            local_new_files = set(local_files_after_download) - set(local_files_before)
-            local_new_complete_files = [f for f in local_new_files if not f.endswith(".crdownload")]
-            if not local_new_complete_files:
-                raise Exception(
-                    "Cached download block did not produce a new file on the local filesystem. "
-                    f"Local files before: {len(local_files_before)}, after: {len(local_files_after_download)}"
-                )
+            # Poll local filesystem for newly downloaded files.
+            #
+            # Two download mechanisms exist with different write patterns:
+            #   1. CDP Fetch interceptor (primary): streams body to memory, then
+            #      writes the complete file atomically. File is usually on disk by
+            #      the time page.click() returns.
+            #   2. Browser native download: creates a .crdownload temp file that
+            #      grows incrementally, then renames to the final name on completion.
+            #
+            # Strategy:
+            #   - Check immediately (catches fast CDP atomic writes).
+            #   - If a .crdownload is detected, a browser-native download is in
+            #     progress — keep polling until it completes or times out.
+            #   - If nothing appears within a short grace period, the cached click
+            #     likely did nothing (e.g. download_selector() returned None).
+            # Shorter than agent-path constants (BROWSER_DOWNLOAD_TIMEOUT=600,
+            # BROWSER_DOWNLOAD_MAX_WAIT_TIME=120) — cached fallback to AI is cheap.
+            _POLL_INTERVAL = 2  # seconds between filesystem checks
+            _GRACE_PERIOD = 6  # seconds to wait when no download activity detected
+            _DOWNLOAD_TIMEOUT = 300  # max seconds to wait for an in-progress download
+            _DISAPPEARED_TIMEOUT = 30  # seconds to wait after .crdownload vanishes without completion
+            _download_detected = False
+            _disappeared_at: float | None = None
+            _loop = asyncio.get_running_loop()
+            _poll_start = _loop.time()
+
+            while True:
+                _now = _loop.time()
+                _elapsed = _now - _poll_start
+                _local_files_now = list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
+                _new_files = set(_local_files_now) - set(local_files_before)
+                _new_complete = [f for f in _new_files if not f.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+                _new_downloading = [f for f in _new_files if f.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+
+                # A complete file appeared — download succeeded
+                if _new_complete:
+                    break
+
+                # A .crdownload file exists — browser-native download in progress
+                if _new_downloading:
+                    if not _download_detected:
+                        LOG.info(
+                            "Download in progress — .crdownload file detected, waiting for completion",
+                            workflow_run_id=run_id,
+                            downloading_files=len(_new_downloading),
+                        )
+                    _download_detected = True
+                    _disappeared_at = None  # reset — file is (still) present
+                    if _elapsed > _DOWNLOAD_TIMEOUT:
+                        raise CachedDownloadError(
+                            ".crdownload file never completed. "
+                            f"Files before: {len(local_files_before)}, after: {len(_local_files_now)}"
+                        )
+                    await asyncio.sleep(_POLL_INTERVAL)
+                    continue
+
+                # Download was detected earlier but .crdownload disappeared without a
+                # complete file replacing it (cancelled/failed). Use a shorter timeout
+                # measured from when the file vanished, not from poll start.
+                if _download_detected:
+                    if _disappeared_at is None:
+                        _disappeared_at = _now
+                    if _now - _disappeared_at > _DISAPPEARED_TIMEOUT:
+                        raise CachedDownloadError(
+                            "Download disappeared without completing. "
+                            f"Files before: {len(local_files_before)}, after: {len(_local_files_now)}"
+                        )
+                    await asyncio.sleep(_POLL_INTERVAL)
+                    continue
+
+                # Nothing new at all — wait a grace period then give up
+                if _elapsed >= _GRACE_PERIOD:
+                    LOG.warning(
+                        "Cached download produced no file after grace period",
+                        workflow_run_id=run_id,
+                        elapsed=_elapsed,
+                        files_before=len(local_files_before),
+                        files_after=len(_local_files_now),
+                    )
+                    raise CachedDownloadError(
+                        "No file produced after cached download. "
+                        f"Files before: {len(local_files_before)}, after: {len(_local_files_now)}"
+                    )
+
+                await asyncio.sleep(_POLL_INTERVAL)
 
             # Rename newly downloaded files using download_suffix if provided.
             # Rename runs BEFORE S3 upload so that remote storage receives the
@@ -1875,7 +1951,7 @@ async def download(
                 for file_path in new_files:
                     file_extension = Path(file_path).suffix
                     # Skip incomplete downloads
-                    if file_extension == ".crdownload":
+                    if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                         continue
                     final_file_name = download_suffix
                     target_path = local_download_dir / (final_file_name + file_extension)

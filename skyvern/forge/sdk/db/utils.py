@@ -5,7 +5,7 @@ import pydantic.json
 import structlog
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     ArtifactModel,
@@ -91,6 +91,16 @@ from skyvern.webeye.actions.actions import (
 )
 
 LOG = structlog.get_logger()
+
+
+def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
+    if not raw:
+        return None
+    try:
+        return WorkflowRunTriggerType(raw)
+    except ValueError:
+        LOG.warning("Unknown trigger_type in DB, defaulting to None", trigger_type=raw)
+        return None
 
 
 def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
@@ -428,6 +438,8 @@ def convert_to_workflow_run(
         run_with=workflow_run_model.run_with,
         code_gen=workflow_run_model.code_gen,
         ai_fallback=workflow_run_model.ai_fallback,
+        trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
+        workflow_schedule_id=workflow_run_model.workflow_schedule_id,
     )
 
 
@@ -607,6 +619,7 @@ def convert_to_workflow_run_block(
         output=workflow_run_block_model.output,
         continue_on_failure=workflow_run_block_model.continue_on_failure,
         failure_reason=workflow_run_block_model.failure_reason,
+        error_codes=workflow_run_block_model.error_codes or [],
         engine=workflow_run_block_model.engine,
         task_id=workflow_run_block_model.task_id,
         loop_values=workflow_run_block_model.loop_values,

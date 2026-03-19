@@ -2295,9 +2295,11 @@ async def handle_scroll_action(
             )
             for _ in range(iterations):
                 await page.mouse.wheel(0, wheel_delta)
-                await page.wait_for_timeout(100)
-            # Wait for page JS to process scroll events (e.g. enabling buttons)
-            await page.wait_for_timeout(500)
+                # Use asyncio.sleep instead of page.wait_for_timeout because the latter
+                # sends CDP commands that anti-bot systems (Akamai, Imperva) can detect.
+                await asyncio.sleep(0.1)
+            # Wait for page JS to process scroll events (e.g. enabling buttons).
+            await asyncio.sleep(0.5)
 
             # Record which element was just page-level scrolled. The click handler
             # checks this to skip scroll_into_view() for the SAME element, which

@@ -12,6 +12,7 @@ import { statusIsFinalized } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { cn, formatMs, toDate } from "@/util/utils";
 
+import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import {
@@ -29,8 +30,10 @@ function DebuggerBlockRuns() {
   const { data: workflow } = useWorkflowQuery({
     workflowPermanentId,
   });
+  const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
+    isRateLimited,
   });
   const { data: debugSessionRuns } = useDebugSessionRunsQuery({
     debugSessionId: debugSession?.debug_session_id,
