@@ -3896,6 +3896,24 @@ class WorkflowService:
         for task in workflow_run_tasks:
             errors.extend(task.errors)
 
+        # Also collect block-level error codes (e.g. FILE_PARSER_ERROR) into the
+        # same errors array so they appear in the top-level workflow run response,
+        # matching the task-level error format. Uses a lightweight query that only
+        # fetches blocks with non-null error_codes to avoid a full block load on
+        # every status poll.
+        block_errors = await app.DATABASE.get_workflow_run_block_errors(
+            workflow_run_id=workflow_run_id, organization_id=organization_id
+        )
+        for error_codes, failure_reason in block_errors:
+            for code in error_codes:
+                errors.append(
+                    {
+                        "error_code": code,
+                        "reasoning": failure_reason or "",
+                        "confidence_float": 1.0,
+                    }
+                )
+
         total_steps = None
         total_cost = None
         if include_step_count or include_cost:

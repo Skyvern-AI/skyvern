@@ -775,6 +775,7 @@ class WorkflowRunBlockModel(Base):
     output = Column(JSON, nullable=True)
     continue_on_failure = Column(Boolean, nullable=False, default=False)
     failure_reason = Column(String, nullable=True)
+    error_codes = Column(JSON, nullable=True)
     engine = Column(String, nullable=True)
 
     # for loop block

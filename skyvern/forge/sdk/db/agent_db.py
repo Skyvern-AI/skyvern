@@ -3879,13 +3879,19 @@ class AgentDB(BaseAlchemyDB):
     def _apply_error_code_filter(query, error_code: str | None):  # type: ignore[no-untyped-def]
         if not error_code:
             return query
-        error_code_exists = exists(
+        error_code_in_tasks = exists(
             select(1)
             .select_from(TaskModel)
             .where(TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
             .where(cast(TaskModel.errors, JSONB).contains(literal([{"error_code": error_code}], type_=JSONB)))
         )
-        return query.where(error_code_exists)
+        error_code_in_blocks = exists(
+            select(1)
+            .select_from(WorkflowRunBlockModel)
+            .where(WorkflowRunBlockModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+            .where(cast(WorkflowRunBlockModel.error_codes, JSONB).contains(literal([error_code], type_=JSONB)))
+        )
+        return query.where(or_(error_code_in_tasks, error_code_in_blocks))
 
     async def get_workflow_runs(
         self,
@@ -5256,6 +5262,8 @@ class AgentDB(BaseAlchemyDB):
         http_request_timeout: int | None = None,
         http_request_follow_redirects: bool | None = None,
         ai_fallback_triggered: bool | None = None,
+        # block-level error codes (e.g. ["FILE_PARSER_ERROR"])
+        error_codes: list[str] | None = None,
         # human interaction block
         instructions: str | None = None,
         positive_descriptor: str | None = None,
@@ -5283,6 +5291,8 @@ class AgentDB(BaseAlchemyDB):
                     workflow_run_block.task_id = task_id
                 if failure_reason:
                     workflow_run_block.failure_reason = failure_reason
+                if error_codes is not None:
+                    workflow_run_block.error_codes = error_codes
                 # Use `is not None` instead of truthiness checks so that falsy
                 # values like current_index=0, empty loop_values=[], or
                 # current_value="" are correctly persisted. Without this,
@@ -5414,6 +5424,22 @@ class AgentDB(BaseAlchemyDB):
                 convert_to_workflow_run_block(workflow_run_block, task=tasks_dict.get(workflow_run_block.task_id))
                 for workflow_run_block in workflow_run_blocks
             ]
+
+    async def get_workflow_run_block_errors(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> list[tuple[list[str], str | None]]:
+        """Return (error_codes, failure_reason) tuples for blocks with non-null error_codes."""
+        async with self.Session() as session:
+            query = select(WorkflowRunBlockModel.error_codes, WorkflowRunBlockModel.failure_reason).filter_by(
+                workflow_run_id=workflow_run_id
+            )
+            if organization_id is not None:
+                query = query.filter_by(organization_id=organization_id)
+            query = query.where(WorkflowRunBlockModel.error_codes.isnot(None))
+            rows = (await session.execute(query)).all()
+            return [(row.error_codes, row.failure_reason) for row in rows]
 
     async def create_browser_profile(
         self,
