@@ -19,13 +19,14 @@ export default defineConfig({
   },
   define: {
     __APP_VERSION__: JSON.stringify(
-      (() => {
-        try {
-          return execSync("git rev-parse HEAD").toString().trim();
-        } catch {
-          return "development";
-        }
-      })(),
+      process.env.APP_VERSION ||
+        (() => {
+          try {
+            return execSync("git rev-parse HEAD").toString().trim();
+          } catch {
+            return "development";
+          }
+        })(),
     ),
   },
 });
