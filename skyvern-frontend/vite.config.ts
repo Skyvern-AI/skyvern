@@ -1,3 +1,4 @@
+import { execSync } from "child_process";
 import path from "path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
@@ -15,5 +16,17 @@ export default defineConfig({
     alias: {
       "@": path.resolve(__dirname, "./src"),
     },
+  },
+  define: {
+    __APP_VERSION__: JSON.stringify(
+      process.env.APP_VERSION ||
+        (() => {
+          try {
+            return execSync("git rev-parse HEAD").toString().trim();
+          } catch {
+            return "development";
+          }
+        })(),
+    ),
   },
 });
