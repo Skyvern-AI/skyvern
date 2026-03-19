@@ -94,6 +94,7 @@ import {
 } from "./workflowEditorUtils";
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
+import { WorkflowSchedulePanel } from "./panels/schedulePanel/WorkflowSchedulePanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
 import { WorkflowSettings } from "../types/workflowTypes";
 import { ProxyLocation } from "@/api/types";
@@ -1222,6 +1223,10 @@ function Workspace({
             workflowPanelState.active &&
             workflowPanelState.content === "parameters"
           }
+          schedulesPanelOpen={
+            workflowPanelState.active &&
+            workflowPanelState.content === "schedules"
+          }
           showAllCode={showAllCode}
           onCacheKeyValueAccept={(v) => {
             setExplicitCacheKeyValue(v ?? "");
@@ -1257,6 +1262,19 @@ function Workspace({
               setWorkflowPanelState({
                 active: true,
                 content: "parameters",
+              });
+            }
+          }}
+          onScheduleClick={() => {
+            if (
+              workflowPanelState.active &&
+              workflowPanelState.content === "schedules"
+            ) {
+              closeWorkflowPanel();
+            } else {
+              setWorkflowPanelState({
+                active: true,
+                content: "schedules",
               });
             }
           }}
@@ -1331,6 +1349,11 @@ function Workspace({
               {workflowPanelState.content === "parameters" && (
                 <div className="z-30">
                   <WorkflowParametersPanel />
+                </div>
+              )}
+              {workflowPanelState.content === "schedules" && (
+                <div className="z-30">
+                  <WorkflowSchedulePanel />
                 </div>
               )}
               {workflowPanelState.content === "history" && (
@@ -1408,6 +1431,11 @@ function Workspace({
                       <WorkflowParametersPanel />
                     </div>
                   )}
+                  {workflowPanelState.content === "schedules" && (
+                    <div className="z-30">
+                      <WorkflowSchedulePanel />
+                    </div>
+                  )}
                   {workflowPanelState.content === "history" && (
                     <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30 h-[calc(100vh-14rem)]">
                       <WorkflowHistoryPanel
@@ -1461,6 +1489,9 @@ function Workspace({
             )}
             {workflowPanelState.content === "parameters" && (
               <WorkflowParametersPanel />
+            )}
+            {workflowPanelState.content === "schedules" && (
+              <WorkflowSchedulePanel />
             )}
             {workflowPanelState.content === "history" && (
               <div className="h-[calc(100vh-14rem)]">
