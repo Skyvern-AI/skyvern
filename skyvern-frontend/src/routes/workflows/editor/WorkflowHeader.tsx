@@ -3,6 +3,7 @@ import {
   BookmarkIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  ClockIcon,
   CodeIcon,
   CopyIcon,
   PlayIcon,
@@ -36,6 +37,7 @@ import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { cn } from "@/util/utils";
 import { CacheKeyValuesResponse } from "@/routes/workflows/types/scriptTypes";
 
@@ -50,6 +52,7 @@ type Props = {
   isGeneratingCode?: boolean;
   isTemplate?: boolean;
   parametersPanelOpen: boolean;
+  schedulesPanelOpen: boolean;
   saving: boolean;
   showAllCode: boolean;
   onCacheKeyValueAccept: (cacheKeyValue: string | null) => void;
@@ -57,6 +60,7 @@ type Props = {
   onCacheKeyValuesFilter: (cacheKeyValue: string) => void;
   onCacheKeyValuesKeydown: (e: React.KeyboardEvent<HTMLInputElement>) => void;
   onParametersClick: () => void;
+  onScheduleClick: () => void;
   onShowAllCodeClick?: () => void;
   onCacheKeyValuesClick: () => void;
   onSave: () => void;
@@ -71,6 +75,7 @@ function WorkflowHeader({
   isGeneratingCode,
   isTemplate,
   parametersPanelOpen,
+  schedulesPanelOpen,
   saving,
   showAllCode,
   onCacheKeyValueAccept,
@@ -78,12 +83,13 @@ function WorkflowHeader({
   onCacheKeyValuesFilter,
   onCacheKeyValuesKeydown,
   onParametersClick,
+  onScheduleClick,
   onShowAllCodeClick,
   onCacheKeyValuesClick,
   onSave,
   onRun,
   onHistory,
-}: Props) {
+}: Readonly<Props>) {
   const { title, setTitle } = useWorkflowTitleStore();
   const workflowChangesStore = useWorkflowHasChangesStore();
   const { workflowPermanentId } = useParams();
@@ -93,6 +99,7 @@ function WorkflowHeader({
   const { data: workflowRun } = useWorkflowRunQuery();
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
+  const schedulesEnabled = useFeatureFlag("WORKFLOW_SCHEDULES");
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const [chosenCacheKeyValue, setChosenCacheKeyValue] = useState<string | null>(
@@ -392,6 +399,22 @@ function WorkflowHeader({
                   <TooltipContent>History</TooltipContent>
                 </Tooltip>
               </TooltipProvider>
+            )}
+            {schedulesEnabled && (
+              <Button
+                disabled={isRecording}
+                variant="tertiary"
+                size="lg"
+                onClick={onScheduleClick}
+              >
+                <ClockIcon className="mr-2 h-5 w-5" />
+                <span className="mr-2">Schedule</span>
+                {schedulesPanelOpen ? (
+                  <ChevronUpIcon className="h-6 w-6" />
+                ) : (
+                  <ChevronDownIcon className="h-6 w-6" />
+                )}
+              </Button>
             )}
             <Button
               disabled={isRecording}
