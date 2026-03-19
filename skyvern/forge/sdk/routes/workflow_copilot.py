@@ -1,5 +1,4 @@
 import time
-import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -100,18 +99,6 @@ async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None)
     )
 
 
-def _escape_code_fences(text: str) -> str:
-    """Escape code fence delimiters in user content to prevent fence breakout.
-
-    The user-role template wraps untrusted variables in triple-backtick fences.
-    If user content contains ``` or ~~~ (both valid CommonMark fence delimiters),
-    the fence could close early and the remainder renders as raw text (potential
-    instructions). Replace both with spaced versions to neutralize the breakout.
-    """
-    text = unicodedata.normalize("NFKC", text)
-    return text.replace("```", "` ` `").replace("~~~", "~ ~ ~")
-
-
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
     chat_history_text = ""
     if chat_history:
@@ -150,24 +137,15 @@ async def copilot_call_llm(
 
     workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
 
-    # Render system prompt (trusted content only, security rules injected via AgentFunction)
-    security_rules = app.AGENT_FUNCTION.get_copilot_security_rules()
-    system_prompt = prompt_engine.load_prompt(
-        template="workflow-copilot-system",
+    llm_prompt = prompt_engine.load_prompt(
+        template="workflow-copilot",
         workflow_knowledge_base=workflow_knowledge_base,
+        workflow_yaml=chat_request.workflow_yaml or "",
+        user_message=chat_request.message,
+        chat_history=chat_history_text,
+        global_llm_context=global_llm_context or "",
         current_datetime=datetime.now(timezone.utc).isoformat(),
-        security_rules=security_rules,
-    )
-
-    # Render user prompt (untrusted content, each variable in code fences)
-    # Escape triple backticks to prevent code fence breakout
-    user_prompt = prompt_engine.load_prompt(
-        template="workflow-copilot-user",
-        workflow_yaml=_escape_code_fences(chat_request.workflow_yaml or ""),
-        user_message=_escape_code_fences(chat_request.message),
-        chat_history=_escape_code_fences(chat_history_text),
-        global_llm_context=_escape_code_fences(global_llm_context or ""),
-        debug_run_info=_escape_code_fences(debug_run_info_text),
+        debug_run_info=debug_run_info_text,
     )
 
     LOG.info(
@@ -184,8 +162,7 @@ async def copilot_call_llm(
         global_llm_context=global_llm_context or "",
         workflow_knowledge_base_len=len(workflow_knowledge_base),
         debug_run_info_len=len(debug_run_info_text),
-        system_prompt_len=len(system_prompt),
-        user_prompt_len=len(user_prompt),
+        llm_prompt_len=len(llm_prompt),
     )
     llm_api_handler = (
         await get_llm_handler_for_prompt_type("workflow-copilot", chat_request.workflow_permanent_id, organization_id)
@@ -193,10 +170,9 @@ async def copilot_call_llm(
     )
     llm_start_time = time.monotonic()
     llm_response = await llm_api_handler(
-        prompt=user_prompt,
+        prompt=llm_prompt,
         prompt_name="workflow-copilot",
         organization_id=organization_id,
-        system_prompt=system_prompt,
     )
     LOG.info(
         "LLM response",
@@ -303,30 +279,21 @@ async def _auto_correct_workflow_yaml(
     )
 
     workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
-
-    security_rules = app.AGENT_FUNCTION.get_copilot_security_rules()
-    system_prompt = prompt_engine.load_prompt(
-        template="workflow-copilot-system",
+    llm_prompt = prompt_engine.load_prompt(
+        template="workflow-copilot",
         workflow_knowledge_base=workflow_knowledge_base,
+        workflow_yaml=workflow_yaml,
+        user_message=f"Workflow YAML parsing failed, please fix it: {failure_reason}",
+        chat_history=_format_chat_history(new_chat_history),
+        global_llm_context=global_llm_context or "",
         current_datetime=datetime.now(timezone.utc).isoformat(),
-        security_rules=security_rules,
+        debug_run_info=debug_run_info_text,
     )
-
-    user_prompt = prompt_engine.load_prompt(
-        template="workflow-copilot-user",
-        workflow_yaml=_escape_code_fences(workflow_yaml),
-        user_message=_escape_code_fences(f"Workflow YAML parsing failed, please fix it: {failure_reason}"),
-        chat_history=_escape_code_fences(_format_chat_history(new_chat_history)),
-        global_llm_context=_escape_code_fences(global_llm_context or ""),
-        debug_run_info=_escape_code_fences(debug_run_info_text),
-    )
-
     llm_start_time = time.monotonic()
     llm_response = await llm_api_handler(
-        prompt=user_prompt,
+        prompt=llm_prompt,
         prompt_name="workflow-copilot",
         organization_id=organization_id,
-        system_prompt=system_prompt,
     )
     LOG.info(
         "Auto-correction LLM response",

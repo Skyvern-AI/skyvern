@@ -614,11 +614,3 @@ class AgentFunction:
 
     async def post_action_execution(self, action: Action) -> None:
         pass
-
-    def get_copilot_security_rules(self) -> str:
-        """Return security guardrails for the workflow copilot system prompt.
-
-        Override in cloud to inject prompt injection defenses.
-        OSS returns empty string (no hardening).
-        """
-        return ""
