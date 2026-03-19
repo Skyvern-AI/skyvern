@@ -31,6 +31,7 @@ import { getClient } from "@/api/AxiosClient";
 import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
+import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { WorkflowRunStream } from "@/routes/workflows/workflowRun/WorkflowRunStream";
@@ -94,6 +95,7 @@ import {
 } from "./workflowEditorUtils";
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
+import { WorkflowSchedulePanel } from "./panels/schedulePanel/WorkflowSchedulePanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
 import { WorkflowSettings } from "../types/workflowTypes";
 import { ProxyLocation } from "@/api/types";
@@ -115,6 +117,9 @@ import "./workspace-styles.css";
 const Constants = {
   NewBrowserCooldown: 30000,
 } as const;
+
+// How long to poll before recording one rate-limit attempt (60s)
+const POLL_ATTEMPT_THRESHOLD_MS = 60_000;
 
 type Props = Pick<FlowRendererProps, "initialTitle" | "workflow"> & {
   initialNodes: Array<AppNode>;
@@ -457,9 +462,13 @@ function Workspace({
       workflowPermanentId,
     });
 
+  const { isRateLimited, recordAttempt, resetOnSuccess } =
+    useBrowserSessionRateLimit(workflowPermanentId);
+
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
     enabled: shouldFetchDebugSession && !!workflowPermanentId,
+    isRateLimited,
   });
 
   const setCollapsed = useSidebarStore((state) => {
@@ -622,6 +631,7 @@ function Workspace({
     onSuccess: (response) => {
       const newDebugSession = response.data;
       setActiveDebugSession(newDebugSession);
+      resetOnSuccess();
 
       queryClient.invalidateQueries({
         queryKey: ["debugSession", workflowPermanentId],
@@ -636,6 +646,8 @@ function Workspace({
       afterCycleBrowser();
     },
     onError: (error: AxiosError) => {
+      recordAttempt();
+
       toast({
         variant: "destructive",
         title: "Failed to cycle browser",
@@ -676,23 +688,44 @@ function Workspace({
 
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const powerButtonTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const pollingStartRef = useRef<number | null>(null);
 
+  // Polling loop: invalidate the debug-session query on an interval while
+  // we're waiting for a browser session. Records a rate-limit attempt after
+  // sustained polling without success.
   useEffect(() => {
     if (
       (!debugSession || !debugSession.browser_session_id) &&
       shouldFetchDebugSession &&
-      workflowPermanentId
+      workflowPermanentId &&
+      !isRateLimited
     ) {
+      if (!pollingStartRef.current) {
+        pollingStartRef.current = Date.now();
+      }
+
       intervalRef.current = setInterval(() => {
+        // After sustained polling without success, record one attempt
+        if (
+          pollingStartRef.current &&
+          Date.now() - pollingStartRef.current >= POLL_ATTEMPT_THRESHOLD_MS
+        ) {
+          recordAttempt();
+          pollingStartRef.current = Date.now();
+        }
+
         queryClient.invalidateQueries({
           queryKey: ["debugSession", workflowPermanentId],
         });
-      }, 2000);
+      }, 5000);
     } else {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
         intervalRef.current = null;
       }
+      // Reset polling timer so it doesn't carry a stale timestamp into the
+      // next polling cycle (e.g. after a rate-limit window expires).
+      pollingStartRef.current = null;
 
       if (debugSession) {
         setActiveDebugSession(debugSession);
@@ -704,7 +737,23 @@ function Workspace({
         clearInterval(intervalRef.current);
       }
     };
-  }, [debugSession, shouldFetchDebugSession, workflowPermanentId, queryClient]);
+  }, [
+    debugSession,
+    shouldFetchDebugSession,
+    workflowPermanentId,
+    queryClient,
+    isRateLimited,
+    recordAttempt,
+  ]);
+
+  // Reset rate-limit state when a browser session is successfully acquired.
+  // Separated from the polling effect to avoid a circular dependency where
+  // resetOnSuccess is both called inside and listed as a dependency.
+  useEffect(() => {
+    if (debugSession?.browser_session_id) {
+      resetOnSuccess();
+    }
+  }, [debugSession?.browser_session_id, resetOnSuccess]);
 
   useEffect(() => {
     const splitLeft = dom.splitLeft.current;
@@ -1052,7 +1101,7 @@ function Workspace({
       runWith:
         workflowData.adaptive_caching && workflowData.run_with === "code"
           ? "code_v2"
-          : workflowData.run_with ?? null,
+          : workflowData.run_with ?? "agent",
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
       runSequentially: workflowData.run_sequentially ?? false,
@@ -1102,7 +1151,7 @@ function Workspace({
       runWith:
         selectedVersion.adaptive_caching && selectedVersion.run_with === "code"
           ? "code_v2"
-          : selectedVersion.run_with,
+          : selectedVersion.run_with ?? "agent",
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       runSequentially: selectedVersion.run_sequentially ?? false,
@@ -1222,6 +1271,10 @@ function Workspace({
             workflowPanelState.active &&
             workflowPanelState.content === "parameters"
           }
+          schedulesPanelOpen={
+            workflowPanelState.active &&
+            workflowPanelState.content === "schedules"
+          }
           showAllCode={showAllCode}
           onCacheKeyValueAccept={(v) => {
             setExplicitCacheKeyValue(v ?? "");
@@ -1257,6 +1310,19 @@ function Workspace({
               setWorkflowPanelState({
                 active: true,
                 content: "parameters",
+              });
+            }
+          }}
+          onScheduleClick={() => {
+            if (
+              workflowPanelState.active &&
+              workflowPanelState.content === "schedules"
+            ) {
+              closeWorkflowPanel();
+            } else {
+              setWorkflowPanelState({
+                active: true,
+                content: "schedules",
               });
             }
           }}
@@ -1331,6 +1397,11 @@ function Workspace({
               {workflowPanelState.content === "parameters" && (
                 <div className="z-30">
                   <WorkflowParametersPanel />
+                </div>
+              )}
+              {workflowPanelState.content === "schedules" && (
+                <div className="z-30">
+                  <WorkflowSchedulePanel />
                 </div>
               )}
               {workflowPanelState.content === "history" && (
@@ -1408,6 +1479,11 @@ function Workspace({
                       <WorkflowParametersPanel />
                     </div>
                   )}
+                  {workflowPanelState.content === "schedules" && (
+                    <div className="z-30">
+                      <WorkflowSchedulePanel />
+                    </div>
+                  )}
                   {workflowPanelState.content === "history" && (
                     <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30 h-[calc(100vh-14rem)]">
                       <WorkflowHistoryPanel
@@ -1461,6 +1537,9 @@ function Workspace({
             )}
             {workflowPanelState.content === "parameters" && (
               <WorkflowParametersPanel />
+            )}
+            {workflowPanelState.content === "schedules" && (
+              <WorkflowSchedulePanel />
             )}
             {workflowPanelState.content === "history" && (
               <div className="h-[calc(100vh-14rem)]">
@@ -1576,18 +1655,46 @@ function Workspace({
                 {(!activeDebugSession ||
                   activeDebugSession.vnc_streaming_supported) && (
                   <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                    <div key={reloadKey} className="w-full flex-1">
-                      <BrowserStream
-                        exfiltrate={recordingStore.isRecording}
-                        interactive={true}
-                        browserSessionId={
-                          activeDebugSession?.browser_session_id
-                        }
-                        showControlButtons={true}
-                        resizeTrigger={windowResizeTrigger}
-                        isExecuting={!!workflowRun && !isFinalized}
-                      />
-                    </div>
+                    {isRateLimited ? (
+                      <div
+                        data-testid="browser-rate-limit-message"
+                        className="flex w-full flex-1 items-center justify-center"
+                      >
+                        <div className="flex max-w-md flex-col items-center justify-center gap-4 rounded-md border border-slate-700 bg-slate-900 p-8 text-center">
+                          <p className="text-sm text-slate-300">
+                            Failed to load a browser. We have a high demand for
+                            browsers right now. The browser will become
+                            available again automatically in ~30 minutes. If the
+                            issue persists, please contact support.
+                          </p>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              resetOnSuccess();
+                              queryClient.invalidateQueries({
+                                queryKey: ["debugSession", workflowPermanentId],
+                              });
+                            }}
+                          >
+                            Try again
+                          </Button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div key={reloadKey} className="w-full flex-1">
+                        <BrowserStream
+                          exfiltrate={recordingStore.isRecording}
+                          interactive={true}
+                          browserSessionId={
+                            activeDebugSession?.browser_session_id
+                          }
+                          showControlButtons={true}
+                          resizeTrigger={windowResizeTrigger}
+                          isExecuting={!!workflowRun && !isFinalized}
+                        />
+                      </div>
+                    )}
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
                       <WorkflowCopilotButton
                         ref={copilotButtonRef}
@@ -1605,10 +1712,12 @@ function Workspace({
                           "mr-16": !blockLabel,
                         })}
                       >
-                        {!recordingStore.isRecording && showPowerButton && (
-                          <PowerButton onClick={() => cycle()} />
-                        )}
-                        {!recordingStore.isRecording && (
+                        {!recordingStore.isRecording &&
+                          showPowerButton &&
+                          !isRateLimited && (
+                            <PowerButton onClick={() => cycle()} />
+                          )}
+                        {!recordingStore.isRecording && !isRateLimited && (
                           <ReloadButton
                             isReloading={isReloading}
                             onClick={() => reload()}
