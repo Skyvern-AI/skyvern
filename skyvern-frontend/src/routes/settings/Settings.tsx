@@ -20,7 +20,7 @@ import { OnePasswordTokenForm } from "@/components/OnePasswordTokenForm";
 import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
 import { CustomCredentialServiceConfigForm } from "@/components/CustomCredentialServiceConfigForm";
 import { useVersionQuery } from "@/hooks/useVersionQuery";
-import { formatVersion } from "@/util/version";
+import { formatVersion, getAppVersion } from "@/util/version";
 
 function Settings() {
   const { environment, organization, setEnvironment, setOrganization } =
@@ -112,12 +112,12 @@ function Settings() {
           <CustomCredentialServiceConfigForm />
         </CardContent>
       </Card>
-      {(__APP_VERSION__ !== "development" || versionData?.version) && (
+      {(getAppVersion() !== "development" || versionData?.version) && (
         <p className="text-center text-xs text-muted-foreground/50">
-          {__APP_VERSION__ !== "development" && (
-            <>UI: {formatVersion(__APP_VERSION__)}</>
+          {getAppVersion() !== "development" && (
+            <>UI: {formatVersion(getAppVersion())}</>
           )}
-          {__APP_VERSION__ !== "development" && versionData?.version && " | "}
+          {getAppVersion() !== "development" && versionData?.version && " | "}
           {versionData?.version && (
             <>API: {formatVersion(versionData.version)}</>
           )}
