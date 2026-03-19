@@ -23,6 +23,7 @@ class LLMAPIHandler(Protocol):
         raw_response: bool = False,
         window_dimension: Resolution | None = None,
         force_dict: bool = True,
+        system_prompt: str | None = None,
     ) -> Awaitable[dict[str, Any] | Any]: ...
 
 
@@ -41,5 +42,6 @@ async def dummy_llm_api_handler(
     raw_response: bool = False,
     window_dimension: Resolution | None = None,
     force_dict: bool = True,
+    system_prompt: str | None = None,
 ) -> dict[str, Any] | Any:
     raise NotImplementedError("Your LLM provider is not configured. Please configure it in the .env file.")

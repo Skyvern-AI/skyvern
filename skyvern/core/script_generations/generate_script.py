@@ -2147,6 +2147,115 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
+def _build_conditional_statement(
+    block: dict[str, Any],
+    blocks_by_label: dict[str, dict[str, Any]],
+    consumed_labels: set[str],
+) -> list[cst.BaseStatement]:
+    """
+    Build if/elif/else statements for a conditional block.
+
+    Returns a list of statements:
+      1. result = await skyvern.conditional(label='...')
+      2. if/elif/else block with branch child blocks nested inside
+
+    An example:
+    ```
+    result = await skyvern.conditional(label='block_2')
+    if result.get('branch_index') == 0:
+        await skyvern.prompt(prompt='output: "expression 1 successful."', label='block_3')
+    else:
+        await skyvern.prompt(prompt='output: "expression 1 failed"', label='block_4')
+    ```
+    """
+    label = block.get("label", "conditional")
+    branches = block.get("branch_conditions") or block.get("branches") or block.get("ordered_branches") or []
+    merge_label = block.get("next_block_label")
+
+    # Separate non-default branches from the default (else) branch
+    non_default_branches: list[tuple[int, dict[str, Any]]] = []
+    default_branch: tuple[int, dict[str, Any]] | None = None
+    for i, branch in enumerate(branches):
+        if branch.get("is_default"):
+            default_branch = (i, branch)
+        else:
+            non_default_branches.append((i, branch))
+
+    def _collect_branch_body(start_label: str | None) -> list[cst.BaseStatement]:
+        """Follow next_block_label chain to collect all blocks in a branch.
+
+        Note: mutates ``consumed_labels`` (from enclosing scope) as a side effect
+        so the top-level iteration in _build_run_fn skips blocks already nested here.
+
+        Limitation: nested conditional blocks inside a branch are rendered via
+        _build_block_statement which falls through to the comment-string codepath.
+        Supporting recursive conditionals would require calling
+        _build_conditional_statement here, which is left for a future change.
+        """
+        stmts: list[cst.BaseStatement] = []
+        current = start_label
+        while current and current != merge_label:
+            b = blocks_by_label.get(current)
+            if b:
+                consumed_labels.add(current)
+                stmts.append(_build_block_statement(b, assign_output=False))
+                current = b.get("next_block_label")
+            else:
+                break
+        if not stmts:
+            stmts.append(cst.parse_statement("pass"))
+        return stmts
+
+    # Build the else clause (default branch) — only when there are non-default
+    # branches to form the if/elif chain. When only a default branch exists,
+    # we emit the body directly (handled below) and skip the orelse node.
+    orelse: cst.If | cst.Else | None = None
+    if default_branch and non_default_branches:
+        _, d_branch = default_branch
+        d_body = _collect_branch_body(d_branch.get("next_block_label"))
+        orelse = cst.Else(
+            body=cst.IndentedBlock(body=d_body),
+        )
+
+    # Build elif chain from bottom up (last non-default branch first)
+    for idx in range(len(non_default_branches) - 1, 0, -1):
+        branch_index, branch = non_default_branches[idx]
+        branch_body = _collect_branch_body(branch.get("next_block_label"))
+        orelse = cst.If(
+            test=cst.parse_expression(f"result.get('branch_index') == {branch_index}"),
+            body=cst.IndentedBlock(body=branch_body),
+            orelse=orelse,
+            leading_lines=[],
+            whitespace_before_test=cst.SimpleWhitespace(" "),
+        )
+
+    # Build the top-level if statement (first non-default branch)
+    # Return both the conditional call and the if/else block
+    conditional_call = cst.parse_statement(f"result = await skyvern.conditional(label='{label}')")
+
+    if non_default_branches:
+        first_index, first_branch = non_default_branches[0]
+        first_body = _collect_branch_body(first_branch.get("next_block_label"))
+        if_stmt = cst.If(
+            test=cst.parse_expression(f"result.get('branch_index') == {first_index}"),
+            body=cst.IndentedBlock(body=first_body),
+            orelse=orelse,
+            leading_lines=[],
+            whitespace_before_test=cst.SimpleWhitespace(" "),
+        )
+        return [conditional_call, if_stmt]
+
+    # Only a default branch exists — emit the conditional call and default body
+    # directly without an if/else wrapper (there's nothing to branch on).
+    if default_branch:
+        _, d_branch = default_branch
+        d_body = _collect_branch_body(d_branch.get("next_block_label"))
+        return [conditional_call, *d_body]
+
+    # No branches at all — just the conditional call
+    return [conditional_call]
+
+
 def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.For:
     """
     Build a for loop statement.
@@ -2468,9 +2577,21 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
         cst.parse_statement("page, context = await skyvern.setup(parameters, GeneratedWorkflowParameters)"),
     ]
 
+    # Build lookup for conditional branch resolution
+    blocks_by_label: dict[str, dict[str, Any]] = {label: b for b in blocks if (label := b.get("label")) is not None}
+    consumed_labels: set[str] = set()
+
     for block in blocks:
-        stmt = _build_block_statement(block, assign_output=False)
-        body.append(stmt)
+        label = block.get("label")
+        if label and label in consumed_labels:
+            continue
+
+        if block.get("block_type") == "conditional":
+            stmts = _build_conditional_statement(block, blocks_by_label, consumed_labels)
+            body.extend(stmts)
+        else:
+            stmt = _build_block_statement(block, assign_output=False)
+            body.append(stmt)
 
     params = cst.Parameters(
         params=[
