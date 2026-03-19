@@ -6456,6 +6456,10 @@ class AgentDB(BaseAlchemyDB):
             )
             if statuses:
                 query = query.filter(WorkflowScriptModel.status.in_(statuses))
+            # A single run can create multiple workflow_script entries (one per
+            # revision cycle).  Return the latest one so callers see the final
+            # version produced by the run.
+            query = query.order_by(WorkflowScriptModel.created_at.desc())
             workflow_script_model = (await session.scalars(query)).first()
             return WorkflowScript.model_validate(workflow_script_model) if workflow_script_model else None
 
@@ -6493,6 +6497,9 @@ class AgentDB(BaseAlchemyDB):
 
                 if workflow_run_id:
                     query = query.where(WorkflowScriptModel.workflow_run_id == workflow_run_id)
+                    # Pin to the script version that existed when this run's
+                    # workflow_script entry was created, not the latest version.
+                    query = query.where(ScriptModel.created_at <= WorkflowScriptModel.created_at)
 
                 if cache_key is not None:
                     query = query.where(WorkflowScriptModel.cache_key == cache_key)
@@ -6521,7 +6528,7 @@ class AgentDB(BaseAlchemyDB):
         try:
             async with self.Session() as session:
                 query = (
-                    select(func.count())
+                    select(func.count(distinct(WorkflowScriptModel.cache_key_value)))
                     .select_from(WorkflowScriptModel)
                     .filter_by(organization_id=organization_id)
                     .filter_by(workflow_permanent_id=workflow_permanent_id)
@@ -6553,7 +6560,7 @@ class AgentDB(BaseAlchemyDB):
         try:
             async with self.Session() as session:
                 query = (
-                    select(WorkflowScriptModel.cache_key_value)
+                    select(distinct(WorkflowScriptModel.cache_key_value))
                     .order_by(WorkflowScriptModel.cache_key_value.asc())
                     .filter_by(organization_id=organization_id)
                     .filter_by(workflow_permanent_id=workflow_permanent_id)
@@ -6696,8 +6703,9 @@ class AgentDB(BaseAlchemyDB):
         total_count is derived from the status_counts GROUP BY, and status_counts is a
         GROUP BY aggregation of statuses across all runs.
 
-        If created_after/created_before are provided, filters runs to those that started
-        within the time window (used for version-scoped queries).
+        If created_after/created_before are provided, filters by the workflow_script
+        entry's created_at (not the run's created_at), scoping to the version that
+        was active in that time window.
         """
         try:
             async with self.Session() as session:
@@ -6709,15 +6717,22 @@ class AgentDB(BaseAlchemyDB):
                     .filter(WorkflowScriptModel.workflow_run_id.isnot(None))
                 )
 
+                # Time-window filters scope by workflow_script creation time,
+                # which aligns with the script version that was created/used.
+                if created_after is not None:
+                    run_ids_subquery = run_ids_subquery.filter(
+                        WorkflowScriptModel.created_at >= created_after,
+                    )
+                if created_before is not None:
+                    run_ids_subquery = run_ids_subquery.filter(
+                        WorkflowScriptModel.created_at < created_before,
+                    )
+
                 # Base filter for workflow runs
                 base_filters = [
                     WorkflowRunModel.workflow_run_id.in_(run_ids_subquery),
                     WorkflowRunModel.organization_id == organization_id,
                 ]
-                if created_after is not None:
-                    base_filters.append(WorkflowRunModel.created_at >= created_after)
-                if created_before is not None:
-                    base_filters.append(WorkflowRunModel.created_at < created_before)
 
                 # Count statuses via GROUP BY (also gives us total_count)
                 status_query = (
