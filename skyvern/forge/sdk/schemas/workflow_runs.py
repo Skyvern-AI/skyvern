@@ -25,6 +25,7 @@ class WorkflowRunBlock(BaseModel):
     output: dict | list | str | None = None
     continue_on_failure: bool = False
     failure_reason: str | None = None
+    error_codes: list[str] = []
     engine: RunEngine | None = None
     task_id: str | None = None
     url: str | None = None
