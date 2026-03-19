@@ -19,6 +19,14 @@ export const ArtifactType = {
 
 export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
 
+export const TriggerType = {
+  Manual: "manual",
+  Api: "api",
+  Scheduled: "scheduled",
+} as const;
+
+export type TriggerType = (typeof TriggerType)[keyof typeof TriggerType];
+
 export const Status = {
   Created: "created",
   Running: "running",
@@ -394,6 +402,11 @@ export type WorkflowRunApiResponse = {
   script_run: boolean | null;
   status: Status;
   title?: string;
+  trigger_type?: TriggerType | null;
+  schedule_id?: string | null;
+  schedule_name?: string | null;
+  schedule_cron?: string | null;
+  scheduled_for?: string | null;
   webhook_callback_url: string;
   workflow_id: string;
   workflow_permanent_id: string;

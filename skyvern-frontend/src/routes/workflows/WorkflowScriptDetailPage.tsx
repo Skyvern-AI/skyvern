@@ -21,13 +21,14 @@ import {
   DrawingPinFilledIcon,
   DrawingPinIcon,
 } from "@radix-ui/react-icons";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { CodeEditor } from "./components/CodeEditor";
 import { usePinScriptMutation } from "./hooks/usePinScriptMutation";
 import { useScriptRunsQuery } from "./hooks/useScriptRunsQuery";
 import { useScriptVersionCodeQuery } from "./hooks/useScriptVersionCodeQuery";
 import { useScriptVersionsQuery } from "./hooks/useScriptVersionsQuery";
 import { useWorkflowScriptsQuery } from "./hooks/useWorkflowScriptsQuery";
+import { ScriptFixInput } from "./workflowRun/ScriptFixInput";
 
 const statusVariant: Record<string, "default" | "secondary" | "destructive"> = {
   completed: "default",
@@ -90,21 +91,28 @@ function StatusDistribution({
 
 function WorkflowScriptDetailPage() {
   const { workflowPermanentId, scriptId } = useParams();
+  const [searchParams] = useSearchParams();
+  const requestedVersion = searchParams.get("version");
 
   const { data: versions, isLoading: versionsLoading } = useScriptVersionsQuery(
     { scriptId },
   );
 
   const latestVersion = versions?.versions?.[0]?.version;
+  // If a specific version was requested via query param, use it; otherwise latest
+  const activeVersion =
+    requestedVersion != null ? Number(requestedVersion) : latestVersion;
+  const isLatest = activeVersion === latestVersion;
 
   const { data: codeData, isLoading: codeLoading } = useScriptVersionCodeQuery({
     scriptId,
-    version: latestVersion,
+    version: activeVersion,
   });
 
   const { data: runsData, isLoading: runsLoading } = useScriptRunsQuery({
     scriptId,
     pageSize: 50,
+    version: activeVersion,
   });
 
   const { data: scriptsData } = useWorkflowScriptsQuery({
@@ -121,10 +129,17 @@ function WorkflowScriptDetailPage() {
   });
 
   const mainScript = codeData?.main_script ?? "";
-  const latestVersionInfo = versions?.versions?.[0];
+  const activeVersionInfo = versions?.versions?.find(
+    (v) => v.version === activeVersion,
+  );
+  const newerCount = versions?.versions
+    ? versions.versions.filter((v) => v.version > (activeVersion ?? 0)).length
+    : 0;
   const runs = runsData?.runs ?? [];
   const statusCounts = runsData?.status_counts ?? {};
   const totalCount = runsData?.total_count ?? 0;
+  const successRate =
+    totalCount > 0 ? (statusCounts["completed"] ?? 0) / totalCount : null;
   const MAX_RUNS_SHOWN = 50;
 
   if (!workflowPermanentId || !scriptId) return null;
@@ -196,38 +211,78 @@ function WorkflowScriptDetailPage() {
 
       <div className="grid grid-cols-4 gap-4">
         <div className="rounded-md border p-4">
-          <p className="text-sm text-muted-foreground">Latest Version</p>
+          <p className="text-sm text-muted-foreground">Viewing Revision</p>
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-2">
+              <p className="text-2xl font-semibold">
+                {versionsLoading ? (
+                  <Skeleton className="h-8 w-12" />
+                ) : (
+                  `#${activeVersion ?? "?"}`
+                )}
+              </p>
+              {!versionsLoading && activeVersion != null && (
+                <Badge
+                  variant="secondary"
+                  className={
+                    isLatest
+                      ? "text-xs"
+                      : "border-amber-500/30 bg-amber-500/10 text-xs text-amber-500"
+                  }
+                >
+                  {isLatest ? "Latest" : `${newerCount} newer`}
+                </Badge>
+              )}
+            </div>
+            {!versionsLoading && activeVersionInfo && (
+              <p className="font-mono text-xs text-muted-foreground">
+                {activeVersionInfo.script_revision_id}
+              </p>
+            )}
+          </div>
+        </div>
+        <div className="rounded-md border p-4">
+          <p className="text-sm text-muted-foreground">Revision History</p>
           <p className="text-2xl font-semibold">
             {versionsLoading ? (
               <Skeleton className="h-8 w-12" />
             ) : (
-              `v${latestVersion ?? "?"}`
+              <>
+                {versions?.versions
+                  ? versions.versions.filter(
+                      (v) => v.version < (activeVersion ?? 0),
+                    ).length
+                  : 0}{" "}
+                <span className="text-sm font-normal text-muted-foreground">
+                  prior
+                </span>
+              </>
             )}
           </p>
         </div>
         <div className="rounded-md border p-4">
-          <p className="text-sm text-muted-foreground">Total Versions</p>
-          <p className="text-2xl font-semibold">
-            {versionsLoading ? (
-              <Skeleton className="h-8 w-12" />
-            ) : (
-              versions?.versions?.length ?? 0
-            )}
-          </p>
-        </div>
-        <div className="rounded-md border p-4">
-          <p className="text-sm text-muted-foreground">Total Runs</p>
+          <p className="text-sm text-muted-foreground">Runs (this revision)</p>
           <p className="text-2xl font-semibold">
             {runsLoading ? <Skeleton className="h-8 w-12" /> : totalCount}
           </p>
         </div>
         <div className="rounded-md border p-4">
-          <p className="text-sm text-muted-foreground">Completion Rate</p>
+          <p className="text-sm text-muted-foreground">Success Rate</p>
           <p className="text-2xl font-semibold">
             {runsLoading ? (
               <Skeleton className="h-8 w-12" />
-            ) : totalCount > 0 ? (
-              `${Math.round(((statusCounts["completed"] ?? 0) / totalCount) * 100)}%`
+            ) : successRate != null ? (
+              <span
+                className={
+                  successRate >= 0.8
+                    ? "text-green-500"
+                    : successRate >= 0.5
+                      ? "text-yellow-500"
+                      : "text-red-500"
+                }
+              >
+                {Math.round(successRate * 100)}%
+              </span>
             ) : (
               "N/A"
             )}
@@ -248,15 +303,25 @@ function WorkflowScriptDetailPage() {
       </div>
 
       <div className="space-y-3">
-        <h2 className="text-lg font-semibold">Script Code</h2>
-        {!codeLoading && !versionsLoading && latestVersionInfo?.run_id && (
+        <div className="flex items-center justify-between gap-4">
+          <h2 className="whitespace-nowrap text-lg font-semibold">
+            Script Code
+          </h2>
+          {workflowPermanentId && mainScript && (
+            <ScriptFixInput
+              workflowPermanentId={workflowPermanentId}
+              workflowRunId={activeVersionInfo?.run_id ?? undefined}
+            />
+          )}
+        </div>
+        {!codeLoading && !versionsLoading && activeVersionInfo?.run_id && (
           <p className="text-sm text-muted-foreground">
-            v{latestVersion} created on run{" "}
+            Revision #{activeVersion} created on run{" "}
             <Link
-              to={`/workflows/${workflowPermanentId}/${latestVersionInfo.run_id}/code`}
+              to={`/workflows/${workflowPermanentId}/${activeVersionInfo.run_id}/code`}
               className="font-mono text-blue-400 hover:underline"
             >
-              {latestVersionInfo.run_id}
+              {activeVersionInfo.run_id}
             </Link>
           </p>
         )}
