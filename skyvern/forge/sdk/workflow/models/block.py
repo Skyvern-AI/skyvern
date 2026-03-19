@@ -6085,10 +6085,15 @@ class ConditionalBlock(Block):
         }
 
         # Step 4: Create and execute single ExtractionBlock.
-        # When all expressions have been Jinja-rendered successfully, omit
-        # browser_session_id so the LLM won't reinterpret resolved literal
-        # values as on-screen references (SKY-7985).
-        effective_browser_session_id = browser_session_id if has_any_pure_natlang else None
+        # Always pass the browser_session_id so page-referencing conditions
+        # (e.g. "the date on the page matches X") can see the screenshot.
+        # The prompt template instructs the LLM to only use page content
+        # when the condition explicitly references the page, and to evaluate
+        # self-contained conditions purely from the expression text.
+        # NOTE: The previous approach of setting browser_session_id=None for
+        # Jinja-rendered expressions (SKY-7985) was ineffective because
+        # BaseTaskBlock.execute() finds the browser via workflow_run_id cache
+        # regardless of browser_session_id.
 
         output_param = OutputParameter(
             output_parameter_id=str(uuid.uuid4()),
@@ -6111,7 +6116,7 @@ class ConditionalBlock(Block):
             block_label=self.label,
             num_conditions=len(branches),
             extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-            has_browser_session=effective_browser_session_id is not None,
+            has_browser_session=browser_session_id is not None,
             has_any_pure_natlang=has_any_pure_natlang,
             has_context=context_json is not None,
         )
@@ -6121,7 +6126,7 @@ class ConditionalBlock(Block):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                browser_session_id=effective_browser_session_id,
+                browser_session_id=browser_session_id,
             )
 
             if not extraction_result.success:
