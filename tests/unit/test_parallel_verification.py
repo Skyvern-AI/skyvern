@@ -398,10 +398,8 @@ async def test_agent_step_persists_artifacts_when_using_speculative_plan(
     agent._persist_scrape_artifacts.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_persist_scrape_artifacts_records_all_files(monkeypatch: pytest.MonkeyPatch) -> None:
-    agent = ForgeAgent()
-    now = datetime.now(UTC)
+def _make_scrape_test_fixtures(now, monkeypatch):
+    """Shared setup for _persist_scrape_artifacts tests."""
     organization = make_organization(now)
     task = make_task(now, organization)
     step = make_step(
@@ -412,7 +410,6 @@ async def test_persist_scrape_artifacts_records_all_files(monkeypatch: pytest.Mo
         order=0,
         output=None,
     )
-
     browser_state, _, _ = make_browser_state()
 
     async def _dummy_cleanup(*_args, **_kwargs) -> list[dict]:
@@ -434,18 +431,21 @@ async def test_persist_scrape_artifacts_records_all_files(monkeypatch: pytest.Mo
 
     economy_tree_mock = MagicMock(return_value="<economy>")
     full_tree_mock = MagicMock(return_value="<full>")
+    monkeypatch.setattr(ScrapedPage, "build_economy_elements_tree", lambda self, *a, **kw: economy_tree_mock())
+    monkeypatch.setattr(ScrapedPage, "build_element_tree", lambda self, *a, **kw: full_tree_mock())
 
-    def economy_wrapper(self, *args, **kwargs):
-        return economy_tree_mock(self, *args, **kwargs)
+    return task, step, scraped_page, economy_tree_mock, full_tree_mock
 
-    def full_wrapper(self, *args, **kwargs):
-        return full_tree_mock(self, *args, **kwargs)
 
-    monkeypatch.setattr(ScrapedPage, "build_economy_elements_tree", economy_wrapper)
-    monkeypatch.setattr(ScrapedPage, "build_element_tree", full_wrapper)
+@pytest.mark.asyncio
+async def test_persist_scrape_artifacts_bundling_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With USE_ARTIFACT_BUNDLING on, all 6 scrape fields go into a single archive call."""
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    task, step, scraped_page, economy_tree_mock, full_tree_mock = _make_scrape_test_fixtures(now, monkeypatch)
 
-    artifact_mock = AsyncMock()
-    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", artifact_mock)
+    accumulate_mock = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_scrape_to_archive", accumulate_mock)
 
     context = SkyvernContext(
         task_id=task.task_id,
@@ -455,17 +455,49 @@ async def test_persist_scrape_artifacts_records_all_files(monkeypatch: pytest.Mo
         tz_info=ZoneInfo("UTC"),
     )
     context.enable_speed_optimizations = True
+    context.use_artifact_bundling = True
 
-    await agent._persist_scrape_artifacts(
-        task=task,
-        step=step,
-        scraped_page=scraped_page,
-        context=context,
-    )
+    await agent._persist_scrape_artifacts(task=task, step=step, scraped_page=scraped_page, context=context)
 
-    assert artifact_mock.await_count == 6
+    accumulate_mock.assert_called_once()
+    call_kwargs = accumulate_mock.call_args.kwargs
+    assert call_kwargs["html"] == b"<html></html>"
+    assert "node-1" in call_kwargs["id_css_map"].decode()
+    assert "node-1" in call_kwargs["id_frame_map"].decode()
+    assert call_kwargs["element_tree_in_prompt"] == b"<economy>"
     economy_tree_mock.assert_called_once()
     full_tree_mock.assert_not_called()
-    last_call = artifact_mock.await_args_list[-1]
-    assert last_call.kwargs["artifact_type"] == ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT
-    assert last_call.kwargs["data"] == b"<economy>"
+
+
+@pytest.mark.asyncio
+async def test_persist_scrape_artifacts_bundling_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With USE_ARTIFACT_BUNDLING off (default), 6 individual create_artifact calls are made."""
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    task, step, scraped_page, economy_tree_mock, full_tree_mock = _make_scrape_test_fixtures(now, monkeypatch)
+
+    create_artifact_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", create_artifact_mock)
+
+    context = SkyvernContext(
+        task_id=task.task_id,
+        step_id=None,
+        organization_id=task.organization_id,
+        workflow_run_id=task.workflow_run_id,
+        tz_info=ZoneInfo("UTC"),
+    )
+    context.enable_speed_optimizations = True
+    context.use_artifact_bundling = False  # default — individual uploads
+
+    await agent._persist_scrape_artifacts(task=task, step=step, scraped_page=scraped_page, context=context)
+
+    assert create_artifact_mock.await_count == 6
+    artifact_types = [call.kwargs["artifact_type"] for call in create_artifact_mock.await_args_list]
+    assert ArtifactType.HTML_SCRAPE in artifact_types
+    assert ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP in artifact_types
+    assert ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP in artifact_types
+    assert ArtifactType.VISIBLE_ELEMENTS_TREE in artifact_types
+    assert ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED in artifact_types
+    assert ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT in artifact_types
+    economy_tree_mock.assert_called_once()
+    full_tree_mock.assert_not_called()
