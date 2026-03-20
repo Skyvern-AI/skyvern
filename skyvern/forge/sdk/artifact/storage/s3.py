@@ -11,7 +11,7 @@ import zstandard as zstd
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
-from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass
+from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass, S3Uri
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -569,8 +569,24 @@ class S3Storage(BaseStorage):
         except Exception:
             return False
 
-    async def download_uploaded_file(self, uri: str) -> bytes | None:
-        """Download a user-uploaded file from S3."""
+    def assert_managed_file_access(self, uri: str, organization_id: str) -> None:
+        try:
+            parsed_uri = S3Uri(uri)
+        except Exception as e:
+            raise PermissionError(f"No permission to access storage URI: {uri}") from e
+
+        allowed_prefixes = (
+            f"{settings.ENV}/{organization_id}/",
+            f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
+        )
+        if parsed_uri.bucket != settings.AWS_S3_BUCKET_UPLOADS or not any(
+            parsed_uri.key.startswith(prefix) for prefix in allowed_prefixes
+        ):
+            raise PermissionError(f"No permission to access storage URI: {uri}")
+
+    async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:
+        """Download a managed org-scoped file from S3."""
+        self.assert_managed_file_access(uri, organization_id)
         return await self.async_client.download_file(uri, log_exception=False)
 
     async def file_exists(self, uri: str) -> bool:

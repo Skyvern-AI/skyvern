@@ -677,6 +677,19 @@ class WorkflowService:
         if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
             workflow_request.webhook_callback_url = workflow.webhook_callback_url
 
+        # Force ai_fallback=True for adaptive caching (code_v2) runs.
+        # Adaptive caching requires AI fallback to self-heal when cached scripts break.
+        # Without this, a caller sending ai_fallback=false would silently disable recovery.
+        if workflow_request.run_with == "code_v2" or (workflow_request.run_with is None and workflow.adaptive_caching):
+            if workflow_request.ai_fallback is False:
+                LOG.info(
+                    "Overriding ai_fallback to True for adaptive caching run",
+                    workflow_permanent_id=workflow_permanent_id,
+                    request_run_with=workflow_request.run_with,
+                    workflow_adaptive_caching=workflow.adaptive_caching,
+                )
+                workflow_request.ai_fallback = True
+
         # Create the workflow run and set skyvern context
         workflow_run = await self.create_workflow_run(
             workflow_request=workflow_request,
@@ -1098,12 +1111,20 @@ class WorkflowService:
             # Trigger AI Script Reviewer for adaptive caching workflows
             # Include terminated and failed runs (triage will filter non-code-fixable failures)
             # Skip canceled (user stopped) and timed_out (infrastructure issue)
+            # Only trigger if the script was actually executed this run — reviewing based on
+            # agent-only runs provides no signal about script quality and wastes LLM tokens.
             # Only trigger if this run used the latest script version — stale runs produce
             # episodes that may already be fixed in newer versions, and reviewing them creates
             # redundant/regressive versions.
-            if is_adaptive_caching(workflow, workflow_run) and pre_finally_status not in (
-                WorkflowRunStatus.canceled,
-                WorkflowRunStatus.timed_out,
+            is_script_execution = self.should_run_script(workflow, workflow_run)
+            if (
+                is_adaptive_caching(workflow, workflow_run)
+                and is_script_execution
+                and pre_finally_status
+                not in (
+                    WorkflowRunStatus.canceled,
+                    WorkflowRunStatus.timed_out,
+                )
             ):
                 should_trigger_reviewer = True
                 current_ctx = skyvern_context.current()
@@ -1126,6 +1147,12 @@ class WorkflowService:
                         self._trigger_script_reviewer(workflow, workflow_run, pre_finally_status=pre_finally_status),
                         name=f"script_reviewer_{workflow_run.workflow_run_id}",
                     )
+            elif is_adaptive_caching(workflow, workflow_run):
+                LOG.info(
+                    "Skipping script reviewer - script was not executed this run",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    run_with=workflow_run.run_with,
+                )
 
             # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
             should_run_finally = finally_block_label and pre_finally_status != WorkflowRunStatus.canceled
@@ -3417,6 +3444,8 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
                 run_with=workflow_run.run_with,
                 ai_fallback=workflow_run.ai_fallback,
+                trigger_type=workflow_run.trigger_type,
+                workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
         return workflow_run
 

@@ -1609,7 +1609,7 @@ async def handle_upload_file_action(
 
     locator = skyvern_element.locator
 
-    file_path = await handler_utils.download_file(file_url, action.model_dump())
+    file_path = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
     is_file_input = await skyvern_element.is_file_input()
 
     if not is_file_input:
@@ -2491,7 +2491,7 @@ async def chain_click(
     file = pending_upload_files or []
     if not file and action.file_url:
         file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
-        file = await handler_utils.download_file(file_url, action.model_dump())
+        file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
 
     is_filechooser_trigger = False
 

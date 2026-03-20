@@ -11,9 +11,13 @@ from skyvern.forge.sdk.api.files import download_file as download_file_api
 LOG = structlog.get_logger()
 
 
-async def download_file(file_url: str, action: dict[str, Any] | None = None) -> str | list[str]:
+async def download_file(
+    file_url: str,
+    action: dict[str, Any] | None = None,
+    organization_id: str | None = None,
+) -> str | list[str]:
     try:
-        return await download_file_api(file_url)
+        return await download_file_api(file_url, organization_id=organization_id)
     except Exception:
         LOG.exception(
             "Failed to download file, continuing without it",
