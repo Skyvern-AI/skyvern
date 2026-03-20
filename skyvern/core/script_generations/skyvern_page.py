@@ -929,7 +929,10 @@ class SkyvernPage(Page):
             error_to_raise = None
             if selector and files:
                 try:
-                    file_path = await download_file_from_url(files)
+                    file_path = await download_file_from_url(
+                        files,
+                        organization_id=context.organization_id if context else None,
+                    )
                     locator = self.page.locator(selector)
                     await locator.set_input_files(file_path, **kwargs)
                 except Exception as e:
@@ -964,7 +967,7 @@ class SkyvernPage(Page):
         if not files:
             raise ValueError("Parameter 'files' is required but was not provided")
 
-        file_path = await download_file_from_url(files)
+        file_path = await download_file_from_url(files, organization_id=context.organization_id if context else None)
         locator = self.page.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout, **kwargs)
         return files
@@ -1131,7 +1134,12 @@ class SkyvernPage(Page):
         # Use uuid as fallback for empty file_name, matching handler.py behavior
         file_name = file_name or str(uuid.uuid4())
 
-        file_path = await download_file_from_url(download_url, filename=file_name)
+        context = skyvern_context.current()
+        file_path = await download_file_from_url(
+            download_url,
+            filename=file_name,
+            organization_id=context.organization_id if context else None,
+        )
         return file_path
 
     @action_wrap(ActionType.RELOAD_PAGE)

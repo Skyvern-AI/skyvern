@@ -8,6 +8,7 @@ import aiofiles
 import structlog
 
 from skyvern.config import settings
+from skyvern.constants import DOWNLOAD_FILE_PREFIX
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     get_download_dir,
@@ -479,8 +480,28 @@ class LocalStorage(BaseStorage):
         )
         return target_path.exists()
 
-    async def download_uploaded_file(self, uri: str) -> bytes | None:
-        """Download a user-uploaded file from local filesystem."""
+    def assert_managed_file_access(self, uri: str, organization_id: str) -> None:
+        if not uri.startswith("file://"):
+            raise PermissionError(f"No permission to access storage URI: {uri}")
+
+        try:
+            file_path = Path(parse_uri_to_path(uri)).resolve()
+        except Exception as e:
+            raise PermissionError(f"No permission to access storage URI: {uri}") from e
+
+        allowed_dirs = (
+            (Path(self.artifact_path) / settings.ENV / organization_id).resolve(),
+            (Path(self.artifact_path) / DOWNLOAD_FILE_PREFIX / settings.ENV / organization_id).resolve(),
+        )
+        if not any(
+            os.path.commonpath([str(file_path), str(allowed_dir)]) == str(allowed_dir) for allowed_dir in allowed_dirs
+        ):
+            raise PermissionError(f"No permission to access storage URI: {uri}")
+
+    async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:
+        """Download a managed org-scoped file from local filesystem."""
+        self.assert_managed_file_access(uri, organization_id)
+
         try:
             file_path = parse_uri_to_path(uri)
             async with aiofiles.open(file_path, "rb") as f:

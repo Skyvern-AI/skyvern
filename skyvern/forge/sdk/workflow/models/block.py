@@ -56,9 +56,7 @@ from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
-    create_named_temporary_file,
     download_file,
-    download_from_s3,
     get_download_dir,
     get_path_for_workflow_download_directory,
     parse_uri_to_path,
@@ -2740,7 +2738,7 @@ class DownloadToS3Block(Block):
             )
 
         try:
-            file_path = await download_file(self.url, max_size_mb=10)
+            file_path = await download_file(self.url, max_size_mb=10, organization_id=organization_id)
         except Exception as e:
             LOG.error("DownloadToS3Block: Failed to download file", url=self.url, error=str(e))
             raise e
@@ -3263,6 +3261,7 @@ class SendEmailBlock(Block):
                 path.startswith("http://")
                 or path.startswith("https://")
                 or path.startswith("s3://")
+                or path.startswith("azure://")
                 or path.startswith("www.")
             ):
                 file_paths.append(path)
@@ -3270,13 +3269,6 @@ class SendEmailBlock(Block):
                 LOG.warning("SendEmailBlock: File not found", file_path=path)
 
         return file_paths
-
-    async def _download_from_s3(self, s3_uri: str) -> str:
-        client = self.get_async_aws_client()
-        downloaded_bytes = await client.download_file(uri=s3_uri)
-        file_path = create_named_temporary_file(delete=False)
-        file_path.write(downloaded_bytes)
-        return file_path.name
 
     def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
         recipients = []
@@ -3305,7 +3297,10 @@ class SendEmailBlock(Block):
         return recipients
 
     async def _build_email_message(
-        self, workflow_run_context: WorkflowRunContext, workflow_run_id: str
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        organization_id: str | None = None,
     ) -> EmailMessage:
         msg = EmailMessage()
         msg["Subject"] = (
@@ -3324,10 +3319,8 @@ class SendEmailBlock(Block):
         file_names_by_hash: dict[str, list[str]] = defaultdict(list)
 
         for filename in self._get_file_paths(workflow_run_context, workflow_run_id):
-            if filename.startswith("s3://"):
-                path = await download_from_s3(self.get_async_aws_client(), filename)
-            elif filename.startswith("http://") or filename.startswith("https://"):
-                path = await download_file(filename)
+            if filename.startswith(("s3://", "azure://", "http://", "https://")):
+                path = await download_file(filename, organization_id=organization_id)
             else:
                 LOG.info("SendEmailBlock: Looking for file locally", filename=filename)
                 if not os.path.exists(filename):
@@ -3434,7 +3427,11 @@ class SendEmailBlock(Block):
             smtp_host.starttls()
             smtp_host.login(smtp_username_value, smtp_password_value)
             LOG.info("SendEmailBlock: Logged in to SMTP server")
-            message = await self._build_email_message(workflow_run_context, workflow_run_id)
+            message = await self._build_email_message(
+                workflow_run_context,
+                workflow_run_id,
+                organization_id=organization_id,
+            )
             smtp_host.send_message(message)
             LOG.info("SendEmailBlock: Email sent")
         except Exception as e:
@@ -3876,11 +3873,8 @@ class FileParserBlock(Block):
             )
 
         try:
-            # Download the file
-            if self.file_url.startswith("s3://"):
-                file_path = await download_from_s3(self.get_async_aws_client(), self.file_url)
-            else:
-                file_path = await download_file(self.file_url)
+            # Download the file.
+            file_path = await download_file(self.file_url, organization_id=organization_id)
 
             # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
             if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
@@ -4030,12 +4024,8 @@ class PDFParserBlock(Block):
                 organization_id=organization_id,
             )
 
-        # Download the file
-        file_path = None
-        if self.file_url.startswith("s3://"):
-            file_path = await download_from_s3(self.get_async_aws_client(), self.file_url)
-        else:
-            file_path = await download_file(self.file_url)
+        # Download the file.
+        file_path = await download_file(self.file_url, organization_id=organization_id)
 
         try:
             extracted_text = extract_pdf_file(file_path, file_identifier=self.file_url)
@@ -4805,6 +4795,7 @@ class HttpRequestBlock(Block):
                 headers=self.headers,
                 output_dir=output_dir,
                 filename=self.download_filename,
+                organization_id=organization_id,
             )
 
             response_data = {
@@ -4944,11 +4935,11 @@ class HttpRequestBlock(Block):
                 else:
                     actual_file_path = file_path
 
-                # Check if file_path is a URL or S3 URI
+                # Check if file_path is a URL or managed storage URI
                 is_url = (
                     file_path.startswith("http://") or file_path.startswith("https://") or file_path.startswith("www.")
                 )
-                is_s3_uri = file_path.startswith("s3://")
+                is_managed_storage_uri = file_path.startswith("s3://") or file_path.startswith("azure://")
 
                 # Check if file is in allowed directories
                 is_allowed_local_file = False
@@ -4972,11 +4963,11 @@ class HttpRequestBlock(Block):
                             # Paths are on different drives (Windows) or incompatible
                             continue
 
-                # If not URL, S3 URI, or allowed local file, reject
-                if not (is_url or is_s3_uri or is_allowed_local_file):
+                # If not URL, managed storage URI, or allowed local file, reject
+                if not (is_url or is_managed_storage_uri or is_allowed_local_file):
                     return await self.build_block_result(
                         success=False,
-                        failure_reason=f"No permission to access local file: {file_path}. Only HTTP/HTTPS URLs, S3 URIs, or files in allowed directories are allowed.",
+                        failure_reason=f"No permission to access local file: {file_path}. Only HTTP/HTTPS URLs, managed storage URIs, or files in allowed directories are allowed.",
                         output_parameter_value=None,
                         status=BlockStatus.failed,
                         workflow_run_block_id=workflow_run_block_id,
@@ -5010,12 +5001,9 @@ class HttpRequestBlock(Block):
                             field_name=field_name,
                             file_path=file_path,
                             is_url=is_url,
-                            is_s3_uri=is_s3_uri,
+                            is_managed_storage_uri=is_managed_storage_uri,
                         )
-                        if is_s3_uri:
-                            local_file_path = await download_from_s3(self.get_async_aws_client(), file_path)
-                        else:
-                            local_file_path = await download_file(file_path)
+                        local_file_path = await download_file(file_path, organization_id=organization_id)
                         downloaded_files[field_name] = local_file_path
                         LOG.info(
                             "HttpRequestBlock: File downloaded successfully",

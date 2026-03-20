@@ -1,3 +1,4 @@
+import io
 from datetime import datetime
 from pathlib import Path
 from typing import Generator
@@ -76,6 +77,7 @@ def boto3_test_client(moto_server: str) -> Generator[S3Client, None, None]:
         endpoint_url=moto_server,
     )
     client.create_bucket(Bucket=TEST_BUCKET)  # Ensure the bucket exists for the test
+    client.create_bucket(Bucket=settings.AWS_S3_BUCKET_UPLOADS)
     yield client
 
 
@@ -377,32 +379,46 @@ class TestS3StorageBrowserSessionFiles:
         exists = await s3_storage.file_exists(uri)
         assert exists is False
 
-    async def test_download_uploaded_file(
-        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
-    ) -> None:
-        """Test downloading an uploaded file."""
-        test_data = b"uploaded file content"
-        test_file = tmp_path / "uploaded.pdf"
-        test_file.write_bytes(test_data)
-
-        uri = await s3_storage.sync_browser_session_file(
-            organization_id=TEST_ORGANIZATION_ID,
-            browser_session_id=TEST_BROWSER_SESSION_ID,
-            artifact_type="downloads",
-            local_file_path=str(test_file),
-            remote_path="uploaded.pdf",
+    async def test_assert_managed_file_access_accepts_org_scoped_uploads(self, s3_storage: S3Storage) -> None:
+        legacy_uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/uploaded.pdf"
+        downloads_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/downloads/{settings.ENV}/{TEST_ORGANIZATION_ID}/wr_123/uploaded.pdf"
         )
 
-        downloaded = await s3_storage.download_uploaded_file(uri)
+        s3_storage.assert_managed_file_access(legacy_uri, TEST_ORGANIZATION_ID)
+        s3_storage.assert_managed_file_access(downloads_uri, TEST_ORGANIZATION_ID)
+
+    async def test_assert_managed_file_access_rejects_other_org(self, s3_storage: S3Storage) -> None:
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_other/uploaded.pdf"
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            s3_storage.assert_managed_file_access(uri, TEST_ORGANIZATION_ID)
+
+    async def test_download_managed_file(self, s3_storage: S3Storage) -> None:
+        """Test downloading a managed file."""
+        test_data = b"uploaded file content"
+        saved = await s3_storage.save_legacy_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            filename="uploaded.pdf",
+            fileObj=io.BytesIO(test_data),
+        )
+        assert saved is not None
+
+        _, uri = saved
+        downloaded = await s3_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
         assert downloaded == test_data
 
-    async def test_download_uploaded_file_nonexistent(self, s3_storage: S3Storage) -> None:
-        """Test downloading a non-existent file returns None."""
-        uri = f"s3://{TEST_BUCKET}/nonexistent/path/file.txt"
-        downloaded = await s3_storage.download_uploaded_file(uri)
+    async def test_download_managed_file_nonexistent(self, s3_storage: S3Storage) -> None:
+        """Test downloading a non-existent managed file returns None."""
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/nonexistent/file.txt"
+        downloaded = await s3_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
         assert downloaded is None
 
-    def test_storage_type_property(self, s3_storage: S3Storage) -> None:
+    async def test_download_managed_file_rejects_other_org(self, s3_storage: S3Storage) -> None:
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_other/uploaded.pdf"
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await s3_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
+
+    async def test_storage_type_property(self, s3_storage: S3Storage) -> None:
         """Test storage_type returns 's3'."""
         assert s3_storage.storage_type == "s3"
 
