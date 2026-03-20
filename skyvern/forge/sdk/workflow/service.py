@@ -677,6 +677,19 @@ class WorkflowService:
         if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
             workflow_request.webhook_callback_url = workflow.webhook_callback_url
 
+        # Force ai_fallback=True for adaptive caching (code_v2) runs.
+        # Adaptive caching requires AI fallback to self-heal when cached scripts break.
+        # Without this, a caller sending ai_fallback=false would silently disable recovery.
+        if workflow_request.run_with == "code_v2" or (workflow_request.run_with is None and workflow.adaptive_caching):
+            if workflow_request.ai_fallback is False:
+                LOG.info(
+                    "Overriding ai_fallback to True for adaptive caching run",
+                    workflow_permanent_id=workflow_permanent_id,
+                    request_run_with=workflow_request.run_with,
+                    workflow_adaptive_caching=workflow.adaptive_caching,
+                )
+                workflow_request.ai_fallback = True
+
         # Create the workflow run and set skyvern context
         workflow_run = await self.create_workflow_run(
             workflow_request=workflow_request,
