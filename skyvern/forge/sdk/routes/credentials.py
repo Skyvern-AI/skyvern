@@ -67,7 +67,6 @@ from skyvern.forge.sdk.schemas.credentials import (
     TestCredentialStatusResponse,
     TestLoginRequest,
     TestLoginResponse,
-    TotpType,
     UpdateCredentialRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import (
@@ -339,46 +338,21 @@ async def create_credential(
         raise HTTPException(status_code=400, detail=f"Unsupported credential type: {data.credential_type}")
 
 
-DEFAULT_LOGIN_PROMPT = (
-    "Navigate to the login page if needed and log in with the provided credentials. "
-    "Fill in the username and password fields and submit the form. "
-    "After submitting, verify whether the login was successful by checking the page content. "
-    "IMPORTANT: If the page asks for a credential you were NOT provided (e.g., a phone number, "
-    "security question, or any field you don't have a value for), TERMINATE IMMEDIATELY and "
-    "report that the login requires additional information that was not provided. "
-    "Do NOT guess, make up values, or re-use other credentials in the wrong field. "
-    "CRITICAL RULE — YOU MUST FOLLOW THIS: You may only submit the login form ONCE. "
-    "After submitting, if the website shows ANY error or rejection — such as 'wrong password', "
-    "'invalid credentials', 'incorrect password', 'account locked', 'suspended', "
-    "'too many attempts', or any other error message — you MUST TERMINATE IMMEDIATELY. "
-    "Do NOT fill in the form again. Do NOT click submit again. Do NOT retry. "
-    "A failed login cannot be fixed by retrying with the same credentials. "
-    "Retrying will cause the account to be locked or suspended. "
-    "Report the exact error message from the website and terminate."
-)
-
-BROWSER_PROFILE_LOGIN_PROMPT = (
-    "A browser profile with saved session data has been loaded. "
+LOGIN_TEST_PROMPT = (
     "FIRST, check whether you are already logged in by examining the page content. "
     "Look for signs of an authenticated session such as a dashboard, welcome message, "
     "user menu, profile icon, or any content that indicates a logged-in state. "
     "If you are already logged in, report success immediately — do NOT interact with "
     "any form fields or attempt to log in again. "
-    "Only if the page clearly shows a login form and you are NOT logged in, "
-    "then log in with the provided credentials. Fill in the username and password fields "
-    "and submit the form. After submitting, verify whether the login was successful. "
-    "IMPORTANT: If the page asks for a credential you were NOT provided (e.g., a phone number, "
-    "security question, or any field you don't have a value for), TERMINATE IMMEDIATELY and "
-    "report that the login requires additional information that was not provided. "
+    "If you're not on the login page, navigate to login page and login using the credentials given. "
+    "First, take actions on promotional popups or cookie prompts that could prevent taking other action on the web page. "
+    "If a 2-factor step appears, enter the authentication code. "
+    "You may only submit the login form ONCE. Do NOT retry after a failed attempt. "
+    "If the page asks for a credential you were NOT provided (e.g., a phone number, "
+    "security question, or any field you don't have a value for), TERMINATE IMMEDIATELY. "
     "Do NOT guess, make up values, or re-use other credentials in the wrong field. "
-    "CRITICAL RULE — YOU MUST FOLLOW THIS: You may only submit the login form ONCE. "
-    "After submitting, if the website shows ANY error or rejection — such as 'wrong password', "
-    "'invalid credentials', 'incorrect password', 'account locked', 'suspended', "
-    "'too many attempts', or any other error message — you MUST TERMINATE IMMEDIATELY. "
-    "Do NOT fill in the form again. Do NOT click submit again. Do NOT retry. "
-    "A failed login cannot be fixed by retrying with the same credentials. "
-    "Retrying will cause the account to be locked or suspended. "
-    "Report the exact error message from the website and terminate."
+    "If the credentials are invalid, expired, or rejected by the website, terminate immediately and take no further actions. "
+    "If login is completed, you're successful."
 )
 
 LOGIN_TEST_TERMINATE_CRITERION = (
@@ -388,7 +362,11 @@ LOGIN_TEST_TERMINATE_CRITERION = (
     "(2) The page asks for information you were not provided (e.g., phone number, "
     "security question, verification code that isn't TOTP). "
     "(3) You have already submitted the login form once and it was not successful. "
-    "Never attempt to log in more than once. Never re-enter credentials after a failed attempt."
+    "(4) You see any indication of account lockout, suspension, or security alert — including "
+    "words like 'locked', 'suspended', 'blocked', 'disabled', 'deactivated', 'unusual activity', "
+    "'security alert', 'verify your identity', or 'rate limited'. "
+    "Never attempt to log in more than once. Never re-enter credentials after a failed attempt. "
+    "Account safety is the top priority — terminate immediately on any sign of failure."
 )
 
 
@@ -525,16 +503,13 @@ async def test_login(
         )
     ]
 
-    # 2FA flows need more steps (enter code, submit) than plain password logins
-    max_steps = 5 if data.totp_type != TotpType.NONE else 3
-
     login_block_yaml = LoginBlockYAML(
         label=label,
         title=label,
         url=data.url,
-        navigation_goal=_build_navigation_goal(DEFAULT_LOGIN_PROMPT, data.user_context),
+        navigation_goal=_build_navigation_goal(LOGIN_TEST_PROMPT, data.user_context),
         terminate_criterion=LOGIN_TEST_TERMINATE_CRITERION,
-        max_steps_per_run=max_steps,
+        max_steps_per_run=None,
         parameter_keys=[parameter_key],
         totp_verification_url=None,
         totp_identifier=data.totp_identifier,
@@ -700,7 +675,7 @@ async def test_credential(
         has_user_context=bool(data.user_context),
     )
 
-    base_prompt = BROWSER_PROFILE_LOGIN_PROMPT if existing_browser_profile_id else DEFAULT_LOGIN_PROMPT
+    base_prompt = LOGIN_TEST_PROMPT
     navigation_goal = _build_navigation_goal(base_prompt, data.user_context)
 
     parameter_key = "credential"
@@ -715,16 +690,13 @@ async def test_credential(
         )
     ]
 
-    # 2FA flows need more steps (enter code, submit) than plain password logins
-    max_steps = 5 if credential.totp_type != TotpType.NONE else 3
-
     login_block_yaml = LoginBlockYAML(
         label=label,
         title=label,
         url=data.url,
         navigation_goal=navigation_goal,
         terminate_criterion=LOGIN_TEST_TERMINATE_CRITERION,
-        max_steps_per_run=max_steps,
+        max_steps_per_run=None,
         parameter_keys=[parameter_key],
         totp_verification_url=None,
         totp_identifier=credential.totp_identifier,
