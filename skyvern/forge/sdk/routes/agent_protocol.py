@@ -34,6 +34,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.signing import ARTIFACT_URL_EXPIRY_SECONDS, parse_keyring, verify_artifact_signature
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
@@ -1421,10 +1422,103 @@ async def get_artifact(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
-    signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
-    if signed_urls and len(signed_urls) == 1:
-        artifact.signed_url = signed_urls[0]
+    signed_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
+    artifact.signed_url = signed_url
     return artifact
+
+
+_ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
+    ArtifactType.HTML_SCRAPE: "text/html; charset=utf-8",
+    ArtifactType.HTML_ACTION: "text/html; charset=utf-8",
+    ArtifactType.LLM_PROMPT: "text/plain; charset=utf-8",
+    ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT: "text/plain; charset=utf-8",
+    ArtifactType.BROWSER_CONSOLE_LOG: "text/plain; charset=utf-8",
+    ArtifactType.SKYVERN_LOG: "text/plain; charset=utf-8",
+    ArtifactType.SCREENSHOT_LLM: "image/png",
+    ArtifactType.SCREENSHOT_ACTION: "image/png",
+    ArtifactType.SCREENSHOT_FINAL: "image/png",
+    ArtifactType.RECORDING: "video/webm",
+}
+_ARTIFACT_CONTENT_TYPE_DEFAULT = "application/json"
+
+
+@base_router.get(
+    "/artifacts/{artifact_id}/content",
+    tags=["Artifacts"],
+    description="Download the raw content of an artifact (supports bundled artifacts).",
+    summary="Get artifact content",
+    responses={
+        200: {"description": "Raw artifact content"},
+        403: {"description": "Invalid or expired artifact URL"},
+        404: {"description": "Artifact not found or content unavailable"},
+    },
+    include_in_schema=True,
+)
+async def get_artifact_content(
+    artifact_id: str,
+    sig: Annotated[str | None, Query(include_in_schema=False)] = None,
+    expiry: Annotated[str | None, Query(include_in_schema=False)] = None,
+    kid: Annotated[str | None, Query(include_in_schema=False)] = None,
+    artifact_name: Annotated[str | None, Query(include_in_schema=False)] = None,
+    artifact_type: Annotated[str | None, Query(include_in_schema=False)] = None,
+    x_api_key: Annotated[str | None, Header(include_in_schema=False)] = None,
+    authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+) -> Response:
+    artifact = None
+
+    if sig is not None and expiry is not None and kid is not None:
+        # HMAC-signed URL path — no org-level API key required.
+        if not settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+            raise HTTPException(
+                status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Artifact URL signing is not configured on this server",
+            )
+        keyring = parse_keyring(settings.ARTIFACT_CONTENT_HMAC_KEYRING)
+        if not verify_artifact_signature(
+            artifact_id=artifact_id,
+            expiry=expiry,
+            kid=kid,
+            sig=sig,
+            keyring=keyring,
+        ):
+            raise HTTPException(
+                status_code=http_status.HTTP_403_FORBIDDEN,
+                detail="Invalid or expired artifact URL",
+            )
+        artifact = await app.DATABASE.get_artifact_by_id_no_org(artifact_id=artifact_id)
+    else:
+        # Standard org-auth path (existing behaviour).
+        current_org = await org_auth_service.get_current_org(
+            x_api_key=x_api_key,
+            authorization=authorization,
+        )
+        artifact = await app.DATABASE.get_artifact_by_id(
+            artifact_id=artifact_id,
+            organization_id=current_org.organization_id,
+        )
+
+    if not artifact:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Artifact not found {artifact_id}",
+        )
+    content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+    if content is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Artifact content not available",
+        )
+    media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
+    is_signed = sig is not None and expiry is not None and kid is not None
+    cache_control = f"private, max-age={ARTIFACT_URL_EXPIRY_SECONDS}" if is_signed else "private, no-cache"
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": "inline",
+            "Cache-Control": cache_control,
+        },
+    )
 
 
 @base_router.get(
@@ -1455,10 +1549,9 @@ async def get_run_artifacts(
     # Ensure we have a list of artifacts (since group_by_type=False, this will always be a list)
     artifacts_list = artifacts if isinstance(artifacts, list) else []
 
-    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
-    if signed_urls and len(signed_urls) == len(artifacts_list):
-        for i, artifact in enumerate(artifacts_list):
-            artifact.signed_url = signed_urls[i]
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts_list)
+    for i, artifact in enumerate(artifacts_list):
+        artifact.signed_url = signed_urls[i]
 
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts_list])
 
@@ -2119,10 +2212,9 @@ async def get_artifacts(
     }
     artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
 
-    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-    if signed_urls and len(signed_urls) == len(artifacts):
-        for i, artifact in enumerate(artifacts):
-            artifact.signed_url = signed_urls[i]
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
+    for i, artifact in enumerate(artifacts):
+        artifact.signed_url = signed_urls[i]
 
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
@@ -2157,10 +2249,9 @@ async def get_step_artifacts(
         step_id,
         organization_id=current_org.organization_id,
     )
-    signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-    if signed_urls and len(signed_urls) == len(artifacts):
-        for i, artifact in enumerate(artifacts):
-            artifact.signed_url = signed_urls[i]
+    signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
+    for i, artifact in enumerate(artifacts):
+        artifact.signed_url = signed_urls[i]
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 

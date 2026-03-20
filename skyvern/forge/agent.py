@@ -597,6 +597,7 @@ class ForgeAgent:
                         task,
                         status=TaskStatus.completed,
                     )
+                    await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                     await self.clean_up_task(
                         task=completed_task,
                         last_step=last_step,
@@ -609,6 +610,8 @@ class ForgeAgent:
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
                 maybe_next_step = await self.handle_failed_step(organization, task, step)
+                # Flush after handle_failed_step (no verification runs for failed steps).
+                await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                 # If there is no next step, it means that the task has failed
                 if maybe_next_step:
                     next_step = maybe_next_step
@@ -639,6 +642,10 @@ class ForgeAgent:
                     engine=engine,
                     complete_verification=complete_verification,
                 )
+                # Flush here (after handle_completed_step) so that verification LLM artifacts
+                # from check_user_goal_complete/complete_verify are included in the same
+                # step archive as the rest of the step data.
+                await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                 if is_task_completed is not None and maybe_last_step:
                     last_step = maybe_last_step
                     await self.clean_up_task(
@@ -664,6 +671,8 @@ class ForgeAgent:
                     "Unexpected step status after agent_step",
                     step_status=step.status,
                 )
+                # Flush for unexpected step status to release any buffered data.
+                await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
 
             cua_response_param = detailed_output.cua_response if detailed_output else None
             if not cua_response_param and cua_response:
@@ -1970,6 +1979,28 @@ class ForgeAgent:
 
         LOG.debug("Persisting speculative LLM metadata")
 
+        _ctx = skyvern_context.current()
+        if _ctx and _ctx.use_artifact_bundling and not step.is_speculative:
+            if screenshots:
+                app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                    step=step,
+                    screenshots=screenshots,
+                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                )
+            app.ARTIFACT_MANAGER.accumulate_llm_call_to_archive(
+                step=step,
+                prompt=metadata.prompt.encode("utf-8") if metadata.prompt else None,
+                request=metadata.llm_request_json.encode("utf-8") if metadata.llm_request_json else None,
+                response=metadata.llm_response_json.encode("utf-8") if metadata.llm_response_json else None,
+                parsed_response=metadata.parsed_response_json.encode("utf-8")
+                if metadata.parsed_response_json
+                else None,
+                rendered_response=metadata.rendered_response_json.encode("utf-8")
+                if metadata.rendered_response_json
+                else None,
+            )
+            return
+
         artifacts = []
         if metadata.prompt:
             artifacts.append(
@@ -2321,17 +2352,27 @@ class ForgeAgent:
             if skyvern_frame and x is not None and y is not None:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
                 LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
-                screenshot_request = await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                    data=screenshot,
-                    artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                    step=step,
-                )
-                if screenshot_request:
-                    artifacts.append(screenshot_request)
-                    for artifact_data in screenshot_request.artifacts:
-                        if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
-                            screenshot_artifact_id = artifact_data.artifact_model.artifact_id
-                            break
+                _ctx = skyvern_context.current()
+                if step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling:
+                    ids = app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                        step=step,
+                        screenshots=[screenshot],
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                    )
+                    if ids:
+                        screenshot_artifact_id = ids[0]
+                else:
+                    screenshot_request = await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                        data=screenshot,
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        step=step,
+                    )
+                    if screenshot_request:
+                        artifacts.append(screenshot_request)
+                        for artifact_data in screenshot_request.artifacts:
+                            if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
+                                screenshot_artifact_id = artifact_data.artifact_model.artifact_id
+                                break
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -2341,13 +2382,17 @@ class ForgeAgent:
         try:
             skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
             html = await skyvern_frame.get_content()
-            artifacts.append(
-                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                    data=html.encode(),
-                    artifact_type=ArtifactType.HTML_ACTION,
-                    step=step,
+            _ctx = skyvern_context.current()
+            if step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling:
+                app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(step=step, html_action=html.encode("utf-8"))
+            else:
+                artifacts.append(
+                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                        data=html.encode(),
+                        artifact_type=ArtifactType.HTML_ACTION,
+                        step=step,
+                    )
                 )
-            )
         except Exception:
             LOG.exception("Failed to record html after action")
 
@@ -2356,23 +2401,33 @@ class ForgeAgent:
                 await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
             except Exception:
                 LOG.warning("Failed to bulk create artifacts after action", exc_info=True)
+
+        if screenshot_artifact_id and action.action_id and action.organization_id:
+            action.screenshot_artifact_id = screenshot_artifact_id
+            _ctx = skyvern_context.current()
+            if step and _ctx and _ctx.use_artifact_bundling:
+                # Defer the DB write until _flush_step_archive so the artifact row
+                # exists before the action row references it.
+                app.ARTIFACT_MANAGER.queue_action_screenshot_update(
+                    step=step,
+                    organization_id=action.organization_id,
+                    action_id=action.action_id,
+                    artifact_id=screenshot_artifact_id,
+                )
             else:
-                if screenshot_artifact_id and action.action_id and action.organization_id:
-                    try:
-                        # TODO: consider batching screenshot artifact updates to reduce per-action DB writes.
-                        await app.DATABASE.update_action_screenshot_artifact_id(
-                            organization_id=action.organization_id,
-                            action_id=action.action_id,
-                            screenshot_artifact_id=screenshot_artifact_id,
-                        )
-                        action.screenshot_artifact_id = screenshot_artifact_id
-                    except Exception:
-                        LOG.warning(
-                            "Failed to update action with screenshot artifact id",
-                            action_id=action.action_id,
-                            screenshot_artifact_id=screenshot_artifact_id,
-                            exc_info=True,
-                        )
+                try:
+                    await app.DATABASE.update_action_screenshot_artifact_id(
+                        organization_id=action.organization_id,
+                        action_id=action.action_id,
+                        screenshot_artifact_id=screenshot_artifact_id,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to update action with screenshot artifact id",
+                        action_id=action.action_id,
+                        screenshot_artifact_id=screenshot_artifact_id,
+                        exc_info=True,
+                    )
 
         try:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
@@ -2522,6 +2577,28 @@ class ForgeAgent:
                     )
                     context.enable_speed_optimizations = False
 
+                try:
+                    distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+                    context.use_artifact_bundling = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        "USE_ARTIFACT_BUNDLING",
+                        distinct_id,
+                        properties={"organization_id": task.organization_id},
+                    )
+                    LOG.debug(
+                        "USE_ARTIFACT_BUNDLING flag resolved",
+                        use_artifact_bundling=context.use_artifact_bundling,
+                        distinct_id=distinct_id,
+                        organization_id=task.organization_id,
+                        task_id=task.task_id,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to check USE_ARTIFACT_BUNDLING feature flag",
+                        exc_info=True,
+                        task_id=task.task_id,
+                    )
+                    context.use_artifact_bundling = False
+
             # start the async tasks while running scrape_website
             if engine not in CUA_ENGINES:
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
@@ -2611,12 +2688,6 @@ class ForgeAgent:
         This is used both for regular runs and when adopting a speculative plan.
         """
 
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.HTML_SCRAPE,
-            data=scraped_page.html.encode(),
-        )
-
         element_tree_format = ElementTreeFormat.HTML
         element_tree_in_prompt = self._build_element_tree_for_prompt(
             scraped_page=scraped_page,
@@ -2626,31 +2697,45 @@ class ForgeAgent:
             element_tree_format=element_tree_format,
         )
 
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
-            data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
-            data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
-            data=json.dumps(scraped_page.element_tree, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
-            data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
-            data=element_tree_in_prompt.encode(),
-        )
+        if context and context.use_artifact_bundling:
+            app.ARTIFACT_MANAGER.accumulate_scrape_to_archive(
+                step=step,
+                html=scraped_page.html.encode("utf-8"),
+                id_css_map=json.dumps(scraped_page.id_to_css_dict, indent=2).encode("utf-8"),
+                id_frame_map=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode("utf-8"),
+                element_tree=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
+                element_tree_trimmed=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
+                element_tree_in_prompt=element_tree_in_prompt.encode("utf-8"),
+            )
+        else:
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step, artifact_type=ArtifactType.HTML_SCRAPE, data=scraped_page.html.encode("utf-8")
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+                data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode("utf-8"),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+                data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode("utf-8"),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
+                data=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+                data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+                data=element_tree_in_prompt.encode("utf-8"),
+            )
 
     def _build_element_tree_for_prompt(
         self,
@@ -3587,9 +3672,11 @@ class ForgeAgent:
             n=settings.TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
         )
         if latest_action_screenshot_artifacts:
-            latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(
+            raw_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(
                 latest_action_screenshot_artifacts
             )
+            filtered_urls = [url for url in raw_urls if url is not None]
+            latest_action_screenshot_urls = filtered_urls if filtered_urls else None
 
         if task.organization_id:
             try:
@@ -3671,33 +3758,52 @@ class ForgeAgent:
                     data=video_artifact.video_data,
                 )
 
+            _ctx = skyvern_context.current()
+            _use_bundling = _ctx.use_artifact_bundling if _ctx else False
+
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
             LOG.debug("Uploading har data", har_size=len(har_data))
-            if har_data:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.HAR,
-                    data=har_data,
-                )
 
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
                 task_id=task.task_id, browser_state=browser_state
             )
             LOG.debug("Uploading browser log", browser_log_size=len(browser_log))
-            if browser_log:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.BROWSER_CONSOLE_LOG,
-                    data=browser_log,
-                )
 
+            trace_data: bytes | None = None
             if browser_state.browser_context and browser_state.browser_artifacts.traces_dir:
                 trace_path = f"{browser_state.browser_artifacts.traces_dir}/{task.task_id}.zip"
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.TRACE,
-                    path=trace_path,
-                )
+                try:
+                    with open(trace_path, "rb") as f:
+                        trace_data = f.read()
+                except Exception:
+                    LOG.warning("Failed to read trace file", trace_path=trace_path, exc_info=True)
+
+            if _use_bundling:
+                task_archive_entries: dict[str, tuple[ArtifactType, bytes]] = {}
+                if har_data:
+                    task_archive_entries["har.har"] = (ArtifactType.HAR, har_data)
+                if browser_log:
+                    task_archive_entries["browser_console.log"] = (ArtifactType.BROWSER_CONSOLE_LOG, browser_log)
+                if trace_data:
+                    task_archive_entries["trace.zip"] = (ArtifactType.TRACE, trace_data)
+                if task_archive_entries:
+                    await app.ARTIFACT_MANAGER.create_task_archive(
+                        step=last_step,
+                        entries=task_archive_entries,
+                    )
+            else:
+                if har_data:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step, artifact_type=ArtifactType.HAR, data=har_data
+                    )
+                if browser_log:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step, artifact_type=ArtifactType.BROWSER_CONSOLE_LOG, data=browser_log
+                    )
+                if trace_data:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step, artifact_type=ArtifactType.TRACE, data=trace_data
+                    )
         else:
             LOG.warning(
                 "BrowserState is missing before sending response to webhook_callback_url",

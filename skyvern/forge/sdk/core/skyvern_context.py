@@ -42,6 +42,7 @@ class SkyvernContext:
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
     enable_speed_optimizations: bool = False
+    use_artifact_bundling: bool = False
 
     # script run context
     script_id: str | None = None
